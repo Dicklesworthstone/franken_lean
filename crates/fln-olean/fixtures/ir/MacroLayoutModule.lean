@@ -177,6 +177,13 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
 
 @[noinline] def tSyntaxGetString (value : @& Lean.StrLit) : String := value.getString
 
+@[noinline] def syntaxMkCharLit (value : Char) (info : Lean.SourceInfo) : Lean.Syntax :=
+  (Lean.Syntax.mkCharLit value info).raw
+
+@[noinline] def syntaxIsCharLit (value : @& Lean.Syntax) : Option Char := value.isCharLit?
+
+@[noinline] def tSyntaxGetChar (value : @& Lean.CharLit) : Char := value.getChar
+
 @[noinline] def syntaxMkNumLit (value : String) (info : Lean.SourceInfo) : Lean.Syntax :=
   (Lean.Syntax.mkNumLit value info).raw
 

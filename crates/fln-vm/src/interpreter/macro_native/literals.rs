@@ -1,6 +1,7 @@
 //! Pinned `Init.Meta.Defs` literal APIs. These decode syntax supplied by user
 //! macros, which need not be a spelling accepted by the source lexer.
 
+use super::super::scalar_code_point;
 use super::{
     IntrinsicFailure, Name, NameBudget, Obj, SyntaxKind, VmRefusal, child, expansion_layout,
     inject_name, layout, limit, name, source_info, string, syntax_kind,
@@ -50,8 +51,56 @@ pub(super) fn get_string(value: &Obj) -> Result<Obj, IntrinsicFailure> {
     Ok(decoded_value(value)?.unwrap_or_else(|| Obj::mk_string("")))
 }
 
+pub(super) fn mk_char_lit(value: &Obj, info: &Obj) -> Result<Obj, IntrinsicFailure> {
+    const OPERATION: &str = "Lean.Syntax.mkCharLit";
+    source_info(info)?;
+    let scalar = scalar_code_point(value, OPERATION, 0)?;
+    let character = char::from_u32(scalar).ok_or(VmRefusal::NatOverflow {
+        operation: OPERATION,
+    })?;
+    // A character spelling occupies at most six bytes, including delimiters.
+    let mut spelling = String::with_capacity(6);
+    spelling.push('\'');
+    match character {
+        '\n' => spelling.push_str("\\n"),
+        '\t' => spelling.push_str("\\t"),
+        '\\' => spelling.push_str("\\\\"),
+        '"' => spelling.push_str("\\\""),
+        '\'' => spelling.push_str("\\'"),
+        character if character <= '\u{1f}' || character == '\u{7f}' => {
+            let byte = character as u8;
+            let hex = b"0123456789abcdef";
+            spelling.push_str("\\x");
+            spelling.push(char::from(hex[usize::from(byte >> 4)]));
+            spelling.push(char::from(hex[usize::from(byte & 15)]));
+        }
+        character => spelling.push(character),
+    }
+    spelling.push('\'');
+    Ok(literal(
+        inject_name(&char_kind()),
+        Obj::mk_string(&spelling),
+        info.clone_ref(),
+    ))
+}
+
+pub(super) fn is_char_lit(value: &Obj) -> Result<Obj, IntrinsicFailure> {
+    Ok(option(
+        decoded_char(value)?.map(|character| Obj::mk_nat(character as usize)),
+    ))
+}
+
+pub(super) fn get_char(value: &Obj) -> Result<Obj, IntrinsicFailure> {
+    // The pin's Inhabited Char instance uses 'A', including for invalid literals.
+    Ok(Obj::mk_nat(decoded_char(value)?.unwrap_or('A') as usize))
+}
+
 fn str_kind() -> Name {
     Name::str(Name::anonymous(), "str")
+}
+
+fn char_kind() -> Name {
+    Name::str(Name::anonymous(), "char")
 }
 
 fn literal(kind: Obj, text: Obj, info: Obj) -> Obj {
@@ -99,6 +148,25 @@ fn decoded_value(value: &Obj) -> Result<Option<Obj>, IntrinsicFailure> {
         return Ok(None);
     };
     Ok(decode(literal_text(&text)?)?.map(|decoded| Obj::mk_string(&decoded)))
+}
+
+fn decoded_char(value: &Obj) -> Result<Option<char>, IntrinsicFailure> {
+    let Some(text) = literal_value(&char_kind(), value)? else {
+        return Ok(None);
+    };
+    // `decodeCharLit` reads byte position one without checking either quote
+    // or the tail. Invalid raw positions yield the default Char, just as in
+    // the string decoder; unknown escapes remain Option.none.
+    let mut cursor = Cursor {
+        text: literal_text(&text)?,
+        position: 1,
+    };
+    let character = cursor.read();
+    Ok(if character == '\\' {
+        quoted_char(cursor).map(|(character, _)| character)
+    } else {
+        Some(character)
+    })
 }
 
 pub(super) fn literal_text(value: &Obj) -> Result<&str, IntrinsicFailure> {

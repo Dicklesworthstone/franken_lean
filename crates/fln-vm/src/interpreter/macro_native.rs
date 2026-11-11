@@ -72,6 +72,9 @@ pub(super) enum Intrinsic {
     IsLit,
     IsStrLit,
     GetString,
+    MkCharLit,
+    IsCharLit,
+    GetChar,
     MkNumLit,
     MkNatLit,
     IsNatLit,
@@ -146,6 +149,9 @@ impl Intrinsic {
             "mirror:Lean.Syntax.isLit?" => Self::IsLit,
             "mirror:Lean.Syntax.isStrLit?" => Self::IsStrLit,
             "mirror:Lean.TSyntax.getString" => Self::GetString,
+            "mirror:Lean.Syntax.mkCharLit" => Self::MkCharLit,
+            "mirror:Lean.Syntax.isCharLit?" => Self::IsCharLit,
+            "mirror:Lean.TSyntax.getChar" => Self::GetChar,
             "mirror:Lean.Syntax.mkNumLit" => Self::MkNumLit,
             "mirror:Lean.Syntax.mkNatLit" => Self::MkNatLit,
             "mirror:Lean.Syntax.isNatLit?" => Self::IsNatLit,
@@ -229,6 +235,7 @@ impl Intrinsic {
                 | Self::SourceInfoFromRef
                 | Self::ReplaceRef
                 | Self::MkStrLit
+                | Self::MkCharLit
                 | Self::MkNumLit
                 | Self::MkNatLit
                 | Self::IsLit
@@ -677,6 +684,11 @@ impl Intrinsic {
             Self::IsLit => literals::is_lit(&args[0], &args[1]).map(IntrinsicResult::raw_object),
             Self::IsStrLit => literals::is_str_lit(&args[0]).map(IntrinsicResult::raw_object),
             Self::GetString => literals::get_string(&args[0]).map(IntrinsicResult::raw_object),
+            Self::MkCharLit => {
+                literals::mk_char_lit(&args[0], &args[1]).map(IntrinsicResult::raw_object)
+            }
+            Self::IsCharLit => literals::is_char_lit(&args[0]).map(IntrinsicResult::raw_object),
+            Self::GetChar => literals::get_char(&args[0]).map(IntrinsicResult::scalar),
             Self::MkNumLit => {
                 numbers::mk_num_lit(&args[0], &args[1]).map(IntrinsicResult::raw_object)
             }

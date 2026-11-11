@@ -1,5 +1,5 @@
 //! Actual imported user MacroM IR, selected under the hash-verified partition,
-//! executes every string-literal row and compares complete syntax with the pin.
+//! executes string/character literal rows and compares complete syntax with the pin.
 use super::*;
 use fln_core::name::LeafView;
 use std::{collections::BTreeMap, path::PathBuf, process::Command};
@@ -39,7 +39,12 @@ fn live_pinned_string_literals_preserve_spelling_metadata_state_and_native_prove
     std::fs::write(dir.join("StringMacroModule.lean"), fixture).unwrap();
     let compiled = Command::new(&reference)
         .current_dir(&dir)
-        .args(["-o", "StringMacroModule.olean", "StringMacroModule.lean"])
+        .args([
+            "-j1",
+            "-o",
+            "StringMacroModule.olean",
+            "StringMacroModule.lean",
+        ])
         .output()
         .unwrap();
     std::fs::write(dir.join("compile.stdout"), &compiled.stdout).unwrap();
@@ -71,6 +76,10 @@ fn live_pinned_string_literals_preserve_spelling_metadata_state_and_native_prove
         "inspectStringMacro",
         "typedStringMacro",
         "expandStringEcho",
+        "characterLiteralMacro",
+        "quotedCharacterMacro",
+        "inspectCharacterMacro",
+        "expandCharacterEcho",
     ];
     let macros: BTreeMap<_, _> = entries
         .into_iter()
@@ -196,6 +205,99 @@ fn live_pinned_string_literals_preserve_spelling_metadata_state_and_native_prove
         cases.push(("typedStringMacro", input.clone(), atom("")));
         cases.push(("inspectLiteralMacro", input, Syntax::Missing));
     }
+    for spelling in [
+        "'A'",
+        "'\\''",
+        "'\\\"'",
+        "'\\\\'",
+        "'\\n'",
+        "'\\t'",
+        "'\\x0d'",
+        "'\\x00'",
+        "'\\x1f'",
+        "'\\x7f'",
+        "'λ'",
+        "'🙂'",
+        "'\u{10ffff}'",
+    ] {
+        for info in [
+            SourceInfo::None,
+            SourceInfo::Synthetic {
+                pos: BytePos(0),
+                end_pos: BytePos(4),
+                canonical: false,
+            },
+            SourceInfo::Original {
+                leading: span(0, 1),
+                pos: BytePos(1),
+                trailing: span(3, 4),
+                end_pos: BytePos(3),
+            },
+        ] {
+            let input = lit("char", spelling, info);
+            cases.push(("characterLiteralMacro", input.clone(), input.clone()));
+            for entry in ["quotedCharacterMacro", "inspectCharacterMacro"] {
+                cases.push((
+                    entry,
+                    input.clone(),
+                    lit("char", spelling, SourceInfo::None),
+                ));
+            }
+            cases.push((
+                "expandCharacterEcho",
+                Syntax::node(name("characterEcho"), vec![atom("charEcho%"), input]),
+                lit("char", spelling, SourceInfo::None),
+            ));
+        }
+    }
+    for (spelling, normalized) in [
+        ("'🙂trailing", Some("'🙂'")),
+        ("'\\r'", Some("'\\x0d'")),
+        ("'\\x7F'", Some("'\\x7f'")),
+        ("'\\u03BB'", Some("'λ'")),
+        ("'\\uD800'", Some("'\\x00'")),
+        ("'\\x", Some("'\u{aa}'")),
+        ("'\\u0", Some("'\u{aaa}'")),
+        ("", Some("'A'")),
+        ("x", Some("'A'")),
+        ("λ", Some("'A'")),
+        ("🙂", Some("'A'")),
+        ("ab", Some("'b'")),
+        ("''", Some("'\\''")),
+        ("'\\", None),
+        ("'\\q'", None),
+        ("'\\x0g'", None),
+        ("'\\u0xyz'", None),
+        ("'\\\n'", None),
+    ] {
+        let input = lit("char", spelling, SourceInfo::None);
+        cases.push((
+            "inspectCharacterMacro",
+            input.clone(),
+            normalized.map_or(Syntax::Missing, |text| lit("char", text, SourceInfo::None)),
+        ));
+        cases.push((
+            "characterLiteralMacro",
+            input,
+            lit("char", normalized.unwrap_or("'A'"), SourceInfo::None),
+        ));
+    }
+    for input in [
+        Syntax::Missing,
+        atom("'x'"),
+        Syntax::node(name("char"), vec![]),
+        Syntax::node(name("char"), vec![atom("'x'"), atom("'y'")]),
+        Syntax::node(name("char"), vec![Syntax::Missing]),
+        Syntax::node(name("char"), vec![lit("char", "'x'", SourceInfo::None)]),
+        lit("Lean.char", "'x'", SourceInfo::None),
+    ] {
+        cases.push(("inspectCharacterMacro", input.clone(), Syntax::Missing));
+        cases.push((
+            "characterLiteralMacro",
+            input,
+            lit("char", "'A'", SourceInfo::None),
+        ));
+    }
     let state = MacroState {
         macro_scope: 23,
         trace_messages: vec![(name("trace"), "trace\0λ".into())],
@@ -241,32 +343,56 @@ fn live_pinned_string_literals_preserve_spelling_metadata_state_and_native_prove
         "Lean.Syntax.isLit?",
         "Lean.Syntax.isStrLit?",
         "Lean.TSyntax.getString",
+        "Lean.Syntax.mkCharLit",
+        "Lean.Syntax.isCharLit?",
+        "Lean.TSyntax.getChar",
     ] {
         assert!(
             rows.contains(&format!("mirror:{helper}")),
             "actual user IR missed {helper}"
         );
     }
-    let unsupported = macros["expandStringEcho"].execute(
-        &Syntax::Missing,
-        &source(),
-        &context(),
-        &state,
-        MacroLimits::default(),
-        None,
+    for entry in ["expandStringEcho", "expandCharacterEcho"] {
+        let unsupported = macros[entry].execute(
+            &Syntax::Missing,
+            &source(),
+            &context(),
+            &state,
+            MacroLimits::default(),
+            None,
+        );
+        assert!(
+            matches!(unsupported.outcome, Outcome::Complete(Ok(MacroResult::Unsupported { state: next })) if next == state)
+        );
+        checks.push(format!(
+            "checkStringUnsupported {entry} Lean.Syntax.missing"
+        ));
+    }
+    check_stops(
+        &macros["stringLiteralMacro"],
+        lit("str", "\"\\x00\"", SourceInfo::None),
+        8,
     );
-    assert!(
-        matches!(unsupported.outcome, Outcome::Complete(Ok(MacroResult::Unsupported { state: next })) if next == state)
+    check_stops(
+        &macros["characterLiteralMacro"],
+        lit("char", "'A'", SourceInfo::None),
+        6,
     );
-    check_stops(&macros["stringLiteralMacro"]);
+    // The oracle alone imports the private constructor/projection needed to
+    // compare all three state fields; imported user IR keeps its public API.
+    let oracle_fixture = fixture.replacen(
+        "public import Init\n",
+        "public import Init\nimport all Init.Prelude\n",
+        1,
+    );
     let oracle = format!(
-        "{fixture}\n{ORACLE}\n#eval ([{}] : List Bool).all id\n",
+        "{oracle_fixture}\n{ORACLE}\n#eval ([{}] : List Bool).all id\n",
         checks.join(",\n    ")
     );
     std::fs::write(dir.join("Oracle.lean"), oracle).unwrap();
     let observed = Command::new(&reference)
         .current_dir(&dir)
-        .arg("Oracle.lean")
+        .args(["-j1", "Oracle.lean"])
         .output()
         .unwrap();
     std::fs::write(dir.join("oracle.stdout"), &observed.stdout).unwrap();
@@ -280,7 +406,7 @@ fn live_pinned_string_literals_preserve_spelling_metadata_state_and_native_prove
     assert_eq!(observed.stdout, b"true\n", "{dir:?}");
     assert!(observed.stderr.is_empty());
     eprintln!(
-        "native and pinned string literal macros: {} complete syntax/state cases",
+        "native and pinned string/character literal macros: {} complete syntax/state cases",
         checks.len()
     );
 }
@@ -302,7 +428,7 @@ fn lit(kind: &str, text: &str, info: SourceInfo) -> Syntax {
     )
 }
 
-fn check_stops(compiled: &CompiledMacro) {
+fn check_stops(compiled: &CompiledMacro, expected: Syntax, max_bytes: usize) {
     let input = atom("\0");
     let state = MacroState::default();
     for syntax in [
@@ -311,7 +437,7 @@ fn check_stops(compiled: &CompiledMacro) {
             ..SyntaxLimits::default()
         },
         SyntaxLimits {
-            max_bytes: 8,
+            max_bytes,
             ..SyntaxLimits::default()
         },
     ] {
@@ -371,7 +497,7 @@ fn check_stops(compiled: &CompiledMacro) {
     );
     assert!(
         matches!(report.outcome, Outcome::Complete(Ok(MacroResult::Expanded { syntax, state: next }))
-        if syntax == lit("str", "\"\\x00\"", SourceInfo::None) && next == state)
+        if syntax == expected && next == state)
     );
 }
 
@@ -468,17 +594,21 @@ partial def sameSyntax : Lean.Syntax → Lean.Syntax → Bool
   | .node i k a, .node i' k' a' =>
     sameInfo i i' && k == k' && a.isEqv a' sameSyntax
   | _, _ => false
-def stringScopes : Nat → Lean.MacroM Unit
-  | 0 => pure ()
-  | n + 1 => Lean.Macro.withFreshMacroScope (stringScopes n)
+def stringState : Lean.Macro.State :=
+  ⟨23, [(`trace, "trace\x00λ")], [`previous, `older.expansion]⟩
+def sameStringState (next : Lean.Macro.State) : Bool :=
+  next.macroScope == stringState.macroScope && next.traceMsgs == stringState.traceMsgs &&
+  next.expandedMacroDecls == stringState.expandedMacroDecls
 def checkString (f : Lean.Syntax → Lean.MacroM Lean.Syntax)
     (input expected : Lean.Syntax) : Bool :=
   let ctx : Lean.Macro.Context := ⟨default, `Main, 17, 0, 512, input⟩
-  let state := match (do stringScopes 23; Lean.Macro.trace `trace "trace\x00λ") ctx default with
-    | .ok _ state => state
-    | .error _ state => state
-  match f input ctx state with
-  | .ok value next => sameSyntax value expected && next.macroScope == 23 &&
-    next.traceMsgs == [(`trace, "trace\x00λ")]
+  match f input ctx stringState with
+  | .ok value next => sameSyntax value expected && sameStringState next
+  | _ => false
+def checkStringUnsupported (f : Lean.Syntax → Lean.MacroM Lean.Syntax)
+    (input : Lean.Syntax) : Bool :=
+  let ctx : Lean.Macro.Context := ⟨default, `Main, 17, 0, 512, input⟩
+  match f input ctx stringState with
+  | .error .unsupportedSyntax next => sameStringState next
   | _ => false
 "#;

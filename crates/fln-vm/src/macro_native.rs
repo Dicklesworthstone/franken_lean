@@ -117,7 +117,7 @@ impl MirrorRow {
             .iter()
             .zip(self.parameters)
             .map(|(borrowed, parameter)| {
-                if *parameter == "u8" {
+                if matches!(*parameter, "u8" | "u32") {
                     ArgumentOwnership::Scalar
                 } else if *borrowed {
                     ArgumentOwnership::Borrowed
@@ -131,7 +131,7 @@ impl MirrorRow {
     pub fn result_ownership(&self) -> ResultOwnership {
         // Every non-scalar result is a fresh owned handle, including Syntax
         // missing and small Nat. RawObject records that erased representation.
-        if self.result_type == "u8" {
+        if matches!(self.result_type, "u8" | "u32") {
             ResultOwnership::Scalar
         } else {
             ResultOwnership::RawObject
@@ -265,6 +265,27 @@ pub const ROWS: &[MirrorRow] = &[
         borrowed: generated::TSYNTAX_GET_STRING_BORROWED,
         parameters: generated::TSYNTAX_GET_STRING_PARAMETERS,
         result_type: generated::TSYNTAX_GET_STRING_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.mkCharLit",
+        name: "Lean.Syntax.mkCharLit",
+        borrowed: generated::SYNTAX_MK_CHAR_LIT_BORROWED,
+        parameters: generated::SYNTAX_MK_CHAR_LIT_PARAMETERS,
+        result_type: generated::SYNTAX_MK_CHAR_LIT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.isCharLit?",
+        name: "Lean.Syntax.isCharLit?",
+        borrowed: generated::SYNTAX_IS_CHAR_LIT_BORROWED,
+        parameters: generated::SYNTAX_IS_CHAR_LIT_PARAMETERS,
+        result_type: generated::SYNTAX_IS_CHAR_LIT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.TSyntax.getChar",
+        name: "Lean.TSyntax.getChar",
+        borrowed: generated::TSYNTAX_GET_CHAR_BORROWED,
+        parameters: generated::TSYNTAX_GET_CHAR_PARAMETERS,
+        result_type: generated::TSYNTAX_GET_CHAR_RESULT,
     },
     MirrorRow {
         id: "mirror:Lean.Syntax.mkNumLit",

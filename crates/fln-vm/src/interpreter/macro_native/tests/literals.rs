@@ -20,6 +20,16 @@ fn option_string(value: &Obj) -> Option<String> {
     }
 }
 
+fn option_char(value: &Obj) -> Option<char> {
+    if value.is_scalar() {
+        assert_eq!(value.unbox(), expansion_layout::OPTION_NONE_TAG);
+        None
+    } else {
+        check_layout(value, expansion_layout::OPTION_SOME).unwrap();
+        Some(char::from_u32(child(value, 0).unwrap().unbox() as u32).unwrap())
+    }
+}
+
 #[test]
 fn literal_construction_keeps_atom_source_and_shared_kind_and_text() {
     let kind = inject_name(&Name::str(Name::anonymous(), "custom.literal"));
@@ -205,6 +215,201 @@ fn string_api_decoder_preserves_permissive_pin_behavior_and_empty_default() {
 }
 
 #[test]
+fn character_literals_preserve_pin_escapes_unicode_and_atom_source() {
+    let info = synthetic_info(Obj::mk_nat(3), Obj::mk_nat(9), false);
+    for (character, spelling) in [
+        ('A', "'A'"),
+        ('\'', "'\\''"),
+        ('"', "'\\\"'"),
+        ('\\', "'\\\\'"),
+        ('\n', "'\\n'"),
+        ('\t', "'\\t'"),
+        ('\r', "'\\x0d'"),
+        ('\0', "'\\x00'"),
+        ('\u{1f}', "'\\x1f'"),
+        ('\u{7f}', "'\\x7f'"),
+        ('λ', "'λ'"),
+        ('🙂', "'🙂'"),
+        ('\u{10ffff}', "'\u{10ffff}'"),
+    ] {
+        let literal = invoke(
+            Intrinsic::MkCharLit,
+            &[Obj::mk_nat(character as usize), info.clone_ref()],
+        );
+        let atom = literal_atom(&literal);
+        assert_eq!(
+            child(&atom, 0).unwrap().identity_token(),
+            info.identity_token()
+        );
+        assert_eq!(string(&child(&atom, 1).unwrap()).unwrap(), spelling);
+        assert_eq!(
+            Conversion::new()
+                .project_name(&child(&literal, 1).unwrap())
+                .unwrap(),
+            Name::str(Name::anonymous(), "char")
+        );
+        assert_eq!(
+            option_char(&invoke(Intrinsic::IsCharLit, &[literal.clone_ref()])),
+            Some(character)
+        );
+        assert_eq!(
+            invoke(Intrinsic::GetChar, &[literal]).unbox(),
+            character as usize
+        );
+    }
+}
+
+#[test]
+fn character_decoder_keeps_raw_position_escape_and_default_semantics() {
+    for (spelling, expected) in [
+        ("'λ'", Some('λ')),
+        ("'🙂trailing", Some('🙂')),
+        ("'\\r'", Some('\r')),
+        ("'\\x7F'", Some('\u{7f}')),
+        ("'\\u03BB'", Some('λ')),
+        ("'\\uD800'", Some('\0')),
+        ("'\\x", Some('\u{aa}')),
+        ("'\\u0", Some('\u{aaa}')),
+        ("", Some('A')),
+        ("x", Some('A')),
+        ("λ", Some('A')),
+        ("🙂", Some('A')),
+        ("ab", Some('b')),
+        ("''", Some('\'')),
+        ("'\\", None),
+        ("'\\q'", None),
+        ("'\\x0g'", None),
+        ("'\\u0xyz'", None),
+        ("'\\\n'", None),
+    ] {
+        let literal = node(Name::str(Name::anonymous(), "char"), vec![atom(spelling)]);
+        assert_eq!(
+            option_char(&invoke(Intrinsic::IsCharLit, &[literal.clone_ref()])),
+            expected,
+            "{spelling:?}"
+        );
+        assert_eq!(
+            invoke(Intrinsic::GetChar, &[literal]).unbox(),
+            expected.unwrap_or('A') as usize,
+            "{spelling:?}"
+        );
+    }
+    for syntax in [
+        Obj::mk_nat(layout::SYNTAX_MISSING_TAG),
+        atom("'x'"),
+        node(Name::str(Name::anonymous(), "str"), vec![atom("'x'")]),
+        node(Name::str(Name::anonymous(), "char"), vec![]),
+        node(
+            Name::str(Name::anonymous(), "char"),
+            vec![atom("'x'"), atom("'y'")],
+        ),
+    ] {
+        assert_eq!(
+            option_char(&invoke(Intrinsic::IsCharLit, &[syntax.clone_ref()])),
+            None
+        );
+        assert_eq!(invoke(Intrinsic::GetChar, &[syntax]).unbox(), 'A' as usize);
+    }
+}
+
+#[test]
+fn character_rows_reject_invalid_carriers_and_replay_scalar_abi_after_stops() {
+    for scalar in [0xd800, 0xdfff, 0x110000, usize::MAX >> 1] {
+        assert!(matches!(
+            Intrinsic::MkCharLit.invoke(
+                "mirror:Lean.Syntax.mkCharLit",
+                &[Obj::mk_nat(scalar), Obj::mk_nat(layout::SOURCE_NONE_TAG)]
+            ),
+            Err(IntrinsicFailure::Refused(VmRefusal::NatOverflow { .. }))
+        ));
+    }
+    let constructor = crate::macro_native::row_for_id("mirror:Lean.Syntax.mkCharLit").unwrap();
+    assert_eq!(
+        constructor.argument_ownership(),
+        [ArgumentOwnership::Scalar, ArgumentOwnership::Owned]
+    );
+    assert_eq!(
+        crate::macro_native::row_for_id("mirror:Lean.TSyntax.getChar")
+            .unwrap()
+            .result_ownership(),
+        ResultOwnership::Scalar
+    );
+    for row in [
+        "mirror:Lean.Syntax.mkCharLit",
+        "mirror:Lean.Syntax.isCharLit?",
+        "mirror:Lean.TSyntax.getChar",
+    ] {
+        let malformed = if row == constructor.id {
+            vec![Obj::mk_string("λ"), Obj::mk_nat(layout::SOURCE_NONE_TAG)]
+        } else {
+            vec![node(
+                Name::str(Name::anonymous(), "char"),
+                vec![Obj::mk_ctor(
+                    layout::SYNTAX_ATOM.tag,
+                    vec![Obj::mk_nat(layout::SOURCE_NONE_TAG), Obj::mk_nat(0)],
+                    &[],
+                )],
+            )]
+        };
+        assert!(matches!(
+            Intrinsic::for_row(row).unwrap().invoke(row, &malformed),
+            Err(IntrinsicFailure::Refused(_))
+        ));
+        let arguments = if row == constructor.id {
+            vec![
+                Obj::mk_nat('λ' as usize),
+                Obj::mk_nat(layout::SOURCE_NONE_TAG),
+            ]
+        } else {
+            vec![node(
+                Name::str(Name::anonymous(), "char"),
+                vec![atom("'λ'")],
+            )]
+        };
+        let program = lookup::callable_program(row);
+        for (limits, cancelled) in [
+            (
+                ExecutionLimits {
+                    max_steps: 0,
+                    ..ExecutionLimits::default()
+                },
+                false,
+            ),
+            (ExecutionLimits::default(), true),
+        ] {
+            assert!(matches!(
+                execute_function(
+                    &program,
+                    flbc::FunctionId::new(1),
+                    arguments.iter().map(Obj::clone_ref).collect(),
+                    limits,
+                    Some(&|| cancelled)
+                ),
+                Outcome::Inconclusive(_)
+            ));
+        }
+        let outcome = execute_function(
+            &program,
+            flbc::FunctionId::new(1),
+            arguments,
+            ExecutionLimits::default(),
+            None,
+        );
+        let Outcome::Complete(VmExit::Returned(result)) = outcome else {
+            panic!("{row}: {outcome:?}");
+        };
+        match row {
+            "mirror:Lean.Syntax.mkCharLit" => assert_eq!(
+                string(&child(&literal_atom(&result.value), 1).unwrap()).unwrap(),
+                "'λ'"
+            ),
+            "mirror:Lean.Syntax.isCharLit?" => assert_eq!(option_char(&result.value), Some('λ')),
+            _ => assert_eq!(result.value.unbox(), 'λ' as usize),
+        }
+    }
+}
+
+#[test]
 fn malformed_literal_carriers_are_refused_instead_of_decoded_as_none() {
     let kind = inject_name(&Name::str(Name::anonymous(), "str"));
     for (operation, row, arguments) in [
@@ -285,6 +490,14 @@ fn malformed_literal_carriers_are_refused_instead_of_decoded_as_none() {
 #[test]
 fn literal_limits_and_cancellation_stay_outside_option_and_default_results() {
     let huge = Obj::mk_string(&"x".repeat(16 * 1024 * 1024 + 1));
+    let character = node(
+        Name::str(Name::anonymous(), "char"),
+        vec![Obj::mk_ctor(
+            layout::SYNTAX_ATOM.tag,
+            vec![Obj::mk_nat(layout::SOURCE_NONE_TAG), huge.clone_ref()],
+            &[],
+        )],
+    );
     let syntax = node(
         Name::str(Name::anonymous(), "str"),
         vec![Obj::mk_ctor(
@@ -315,6 +528,8 @@ fn literal_limits_and_cancellation_stay_outside_option_and_default_results() {
         ),
         ("mirror:Lean.Syntax.isStrLit?", vec![syntax.clone_ref()]),
         ("mirror:Lean.TSyntax.getString", vec![syntax]),
+        ("mirror:Lean.Syntax.isCharLit?", vec![character.clone_ref()]),
+        ("mirror:Lean.TSyntax.getChar", vec![character]),
     ];
     for (row, arguments) in cases {
         assert!(matches!(
@@ -347,6 +562,12 @@ fn literal_limits_and_cancellation_stay_outside_option_and_default_results() {
             }
             "mirror:Lean.Syntax.isLit?" => {
                 vec![inject_name(&Name::str(Name::anonymous(), "str")), literal]
+            }
+            "mirror:Lean.Syntax.isCharLit?" | "mirror:Lean.TSyntax.getChar" => {
+                vec![node(
+                    Name::str(Name::anonymous(), "char"),
+                    vec![atom("'λ'")],
+                )]
             }
             _ => vec![literal],
         };
