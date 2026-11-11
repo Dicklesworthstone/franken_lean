@@ -429,7 +429,7 @@ fn escaped_completion_preserves_keywords_and_source_notation_identity() {
                 "match",
             ),
             (
-                "prelude\nnotation \"local_value\" => true\ndef pending («local_value» : Nat) : Nat := loc",
+                "prelude\ndef notation_value : Bool := true\nnotation \"local_value\" => notation_value\ndef pending («local_value» : Nat) : Nat := loc",
                 "loc",
                 "local_value",
             ),
@@ -448,7 +448,7 @@ fn escaped_completion_preserves_keywords_and_source_notation_identity() {
                 .unwrap_or_else(|| panic!("{source}: {result:?}"));
             assert_eq!(local.replacement, format!("«{expected}»"));
             let mut edited = source.to_owned();
-            edited.replace_range(result.range, &local.replacement);
+            edited.replace_range(result.range.clone(), &local.replacement);
             let entry = Name::from_components(["Main"]);
             assert!(
                 matches!(
@@ -463,6 +463,24 @@ fn escaped_completion_preserves_keywords_and_source_notation_identity() {
                 ),
                 "the offered local must retain its exact name: {edited}"
             );
+            if expected == "local_value" {
+                // The notation names the checked Bool helper. Inserting its
+                // raw spelling would change the term instead of selecting the
+                // Nat parameter that the completion actually observed.
+                let mut unescaped = source.to_owned();
+                unescaped.replace_range(result.range, expected);
+                let error = session
+                    .check(
+                        &[SourceModuleInput {
+                            name: &entry,
+                            source: unescaped.as_bytes(),
+                        }],
+                        &entry,
+                    )
+                    .expect_err("the Bool notation cannot inhabit the Nat result");
+                assert_eq!(error.disposition().2, 1, "{error}");
+                assert!(error.to_string().contains("Type mismatch"), "{error}");
+            }
         }
         let anonymous = "prelude\ndef pending (_ : Nat) : Nat := _local";
         assert!(

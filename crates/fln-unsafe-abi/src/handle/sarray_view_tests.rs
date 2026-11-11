@@ -122,13 +122,13 @@ fn owned_float_array_push_preserves_bits_capacity_and_shared_snapshots() {
         assert_eq!(snapshot.try_borrow_sarray_view().unwrap().3, original);
         let (width, size, _, bytes) = value.try_borrow_sarray_view().unwrap();
         assert_eq!((width, size), (8, 97));
-        for (index, word) in bytes.chunks_exact(8).enumerate() {
+        for (index, word) in bytes.as_chunks::<8>().0.iter().enumerate() {
             let expected = if index == 96 {
                 1
             } else {
                 bits[index % bits.len()]
             };
-            assert_eq!(u64::from_ne_bytes(word.try_into().unwrap()), expected);
+            assert_eq!(u64::from_ne_bytes(*word), expected);
         }
     }
     let (events, live) = shadow::disable_and_drain();

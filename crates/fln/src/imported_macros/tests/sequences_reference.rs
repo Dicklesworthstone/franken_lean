@@ -216,14 +216,21 @@ fn live_pinned_sequence_builders_preserve_syntax_state_and_generated_terms() {
             matches!(report.outcome, Outcome::Complete(Ok(MacroResult::Unsupported { state: next })) if next == state)
         );
         checks.push(format!(
-            "checkSequenceUnsupported ({})",
+            "checkSequenceUnsupported expandFirstSequence ({})",
             lean_syntax(&input)
         ));
     }
     check_stops(&macros);
     check_generated_source(&macros["expandFirstSequence"]);
+    // Only the oracle imports the private State constructor and projection
+    // needed to compare all three fields. The user IR fixture stays unchanged.
+    let oracle_fixture = fixture.replacen(
+        "public import Init\n",
+        "public import Init\nimport all Init.Prelude\n",
+        1,
+    );
     let oracle = format!(
-        "{fixture}\n{ORACLE}\n#eval ([{}] : List Bool).all id\n",
+        "{oracle_fixture}\n{ORACLE}\n#eval ([{}] : List Bool).all id\n",
         checks.join(",\n    ")
     );
     std::fs::write(dir.join("Oracle.lean"), oracle).unwrap();
@@ -595,9 +602,10 @@ def checkSequence (f : Lean.Syntax → Lean.MacroM Lean.Syntax)
   match f input ctx sequenceState with
   | .ok value next => sameSequenceSyntax value expected && sameSequenceState next
   | _ => false
-def checkSequenceUnsupported (input : Lean.Syntax) : Bool :=
+def checkSequenceUnsupported (f : Lean.Syntax → Lean.MacroM Lean.Syntax)
+    (input : Lean.Syntax) : Bool :=
   let ctx : Lean.Macro.Context := ⟨default, `Main, 17, 0, 512, input⟩
-  match expandFirstSequence input ctx sequenceState with
+  match f input ctx sequenceState with
   | .error .unsupportedSyntax next => sameSequenceState next
   | _ => false
 "#;
