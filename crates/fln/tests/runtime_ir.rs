@@ -58,7 +58,7 @@ fn export_cases() -> [(
     &'static str,
     &'static str,
     usize,
-); 36] {
+); 52] {
     [
         ("Nat", "42", "compiled", "Nat", "42", 0),
         (
@@ -320,6 +320,134 @@ fn export_cases() -> [(
             "true",
             2,
         ),
+        (
+            "Bool -> Nat",
+            "fun b => if b then 42 else 7",
+            "compiled true",
+            "Nat",
+            "42",
+            1,
+        ),
+        (
+            "Bool -> Nat",
+            "fun b => if b then 42 else 7",
+            "compiled false",
+            "Nat",
+            "7",
+            1,
+        ),
+        (
+            "Bool -> String",
+            "fun b => if b then \"yes branch\" else \"no branch\"",
+            "compiled true",
+            "String",
+            "\"yes branch\"",
+            1,
+        ),
+        (
+            "Bool -> String",
+            "fun b => if b then \"yes branch\" else \"no branch\"",
+            "compiled false",
+            "String",
+            "\"no branch\"",
+            1,
+        ),
+        (
+            "Nat -> Nat",
+            "fun n => n + 1",
+            "compiled 41",
+            "Nat",
+            "42",
+            1,
+        ),
+        (
+            "Nat -> Nat",
+            "fun n => n + 1",
+            "compiled 184467440737095516160",
+            "Nat",
+            "184467440737095516161",
+            1,
+        ),
+        (
+            "Nat -> Bool",
+            "fun n => Nat.beq n 42",
+            "compiled 42",
+            "Bool",
+            "true",
+            1,
+        ),
+        (
+            "Nat -> Bool",
+            "fun n => Nat.beq n 42",
+            "compiled 184467440737095516160",
+            "Bool",
+            "false",
+            1,
+        ),
+        (
+            "Bool -> Nat -> Nat -> Nat",
+            "fun b x y => if b then x else y",
+            "compiled true 42 7",
+            "Nat",
+            "42",
+            3,
+        ),
+        (
+            "Bool -> Nat -> Nat -> Nat",
+            "fun b x y => if b then x else y",
+            "compiled false 7 184467440737095516160",
+            "Nat",
+            "184467440737095516160",
+            3,
+        ),
+        (
+            "String -> String",
+            "fun text => String.append text \"!\"",
+            "compiled \"native\"",
+            "String",
+            "\"native!\"",
+            1,
+        ),
+        (
+            "Nat -> Nat",
+            "fun n => if Nat.beq n 0 then 7 else n + 1",
+            "compiled 0",
+            "Nat",
+            "7",
+            1,
+        ),
+        (
+            "Nat -> Nat",
+            "fun n => if Nat.beq n 0 then 7 else n + 1",
+            "compiled 41",
+            "Nat",
+            "42",
+            1,
+        ),
+        (
+            "Nat -> Nat",
+            "fun n => if Nat.beq n 0 then 7 else n + 1",
+            "compiled 184467440737095516160",
+            "Nat",
+            "184467440737095516161",
+            1,
+        ),
+        (
+            "Bool -> Nat",
+            "fun b => if b then (if b then 42 else 7) else 99",
+            "compiled true",
+            "Nat",
+            "42",
+            1,
+        ),
+        (
+            "Bool -> Nat -> String",
+            "fun b _ => if b then \"yes\" else \"no\"",
+            "compiled false 7",
+            "String",
+            "\"no\"",
+            2,
+        ),
     ]
 }
 
@@ -334,7 +462,7 @@ fn erased_positions(index: usize) -> &'static [usize] {
 
 fn boolean_positions(index: usize) -> &'static [usize] {
     match index {
-        25..=28 | 32 | 33 => &[0],
+        25..=28 | 32 | 33 | 36..=39 | 44 | 45 | 50 | 51 => &[0],
         29..=31 | 35 => &[1],
         34 => &[0, 1],
         _ => &[],
@@ -356,6 +484,60 @@ fn checked_definition(base: &Engine, source: &str) -> (fln::Declaration, Engine)
         panic!("source definition")
     };
     (fln::Declaration::Defn(definition.clone()), checked.engine)
+}
+
+#[test]
+fn arbitrary_fir_cannot_claim_the_closed_source_constructor_boundary() {
+    use fln_comp::fir::*;
+    let value = ValueId::new;
+    let constructor = ConstructorId::new(0);
+    let program = fln_comp::fir::validate(
+        Program::new(
+            FunctionId::new(0),
+            vec![ConstructorDecl {
+                id: constructor,
+                tag: 0,
+                fields: vec![ValueType::Bool],
+                static_scalar_bytes: vec![],
+            }],
+            vec![],
+            vec![],
+            vec![Function {
+                id: FunctionId::new(0),
+                parameters: vec![],
+                parameter_ownership: vec![],
+                result: ValueType::Constructor,
+                result_ownership: fln_comp::flbc::CallableResultOwnership::Owned,
+                blocks: vec![Block {
+                    id: BlockId::new(0),
+                    bindings: vec![
+                        Binding {
+                            id: value(0),
+                            ty: ValueType::Bool,
+                            operation: Operation::Bool(false),
+                        },
+                        Binding {
+                            id: value(1),
+                            ty: ValueType::Constructor,
+                            operation: Operation::Ctor {
+                                constructor,
+                                fields: vec![value(0)],
+                            },
+                        },
+                    ],
+                    terminator: Terminator::Return { value: value(1) },
+                }],
+            }],
+        ),
+        ValidationLimits::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        ir::compile(&program, &name("untrustedEntry"), CompileLimits::default()),
+        Err(ir::CompileError::Unsupported {
+            what: "non-pure boxed carrier"
+        })
+    ));
 }
 
 #[test]
@@ -533,6 +715,33 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
                 ))
             ),
             "{source}"
+        );
+        assert_eq!(base.logical_root(&options), original);
+    }
+    for (source, refused) in [
+        (
+            "def compiled (x y : Nat) : Nat := let b := true; if b then x else y",
+            "local Boolean source discriminator",
+        ),
+        (
+            "def compiled (h : Nat -> Nat) (b : Bool) : Nat := let x := 0; let y := 0; h (if b then x else y)",
+            "local Boolean source arm",
+        ),
+    ] {
+        let (declaration, _) = checked_definition(&base, source);
+        assert!(
+            matches!(
+                ir::compile_source_definition(
+                    &base,
+                    declaration,
+                    &options,
+                    limits(),
+                    CompileLimits::default(),
+                ),
+                Err(ir::DefinitionCompileError::Ir(ir::CompileError::Unsupported { what }))
+                    if what == refused
+            ),
+            "a local constant must not change the guessed reduced ABI: {source}"
         );
         assert_eq!(base.logical_root(&options), original);
     }
@@ -1064,6 +1273,7 @@ fn reduced_case(index: usize) -> Option<(&'static str, &'static str)> {
         28 => Some(("Nat -> Nat", "compiled 42")),
         29 | 31 | 34 => Some(("Bool -> Bool", "compiled true")),
         32 => Some(("String -> String", "compiled \"retained Boolean string\"")),
+        51 => Some(("Bool -> String", "compiled false")),
         _ => None,
     }
 }

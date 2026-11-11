@@ -104,7 +104,7 @@ fn receipt(
                 server_artifact: Some(&parts[1]),
                 private_artifact: Some(&parts[2]),
             }],
-            &[module.clone()],
+            std::slice::from_ref(&module),
             &KVMap::new(),
             SourceOleanImportLimits::new(OleanCheckLimits::new(
                 8 << 20,
@@ -137,7 +137,7 @@ fn missing(error: SourceModuleCheckError, declaration: &Name, missing: &Name) {
     assert_eq!(module, name("Implementations"));
     assert!(
         matches!(error.as_ref(), OleanCheckError::MissingConstants { declaration: actual, names }
-            if actual == declaration && names == &[missing.clone()]),
+            if actual == declaration && names == std::slice::from_ref(missing)),
         "{error:?}"
     );
 }
@@ -145,10 +145,13 @@ fn missing(error: SourceModuleCheckError, declaration: &Name, missing: &Name) {
 #[test]
 fn exported_unsafe_bodies_reuse_complete_admission_without_exposing_private_helpers() {
     let exported = owner(DefinitionSafety::Unsafe);
-    let receipt = receipt(&[exported.clone()], &[helper(), exported.clone()])
-        .unwrap()
-        .into_complete()
-        .unwrap();
+    let receipt = receipt(
+        std::slice::from_ref(&exported),
+        &[helper(), exported.clone()],
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap();
     let root = receipt.engine.logical_root(&KVMap::new());
     assert!(receipt.engine.environment().contains(&private("helper")));
     let checked = project(&receipt).unwrap().into_complete().unwrap();
@@ -181,10 +184,13 @@ fn exported_unsafe_bodies_reuse_complete_admission_without_exposing_private_help
 #[test]
 fn public_implementation_projection_still_checks_the_primary_independent_reading() {
     let exported = owner(DefinitionSafety::Unsafe);
-    let mut receipt = receipt(&[exported.clone()], &[helper(), exported])
-        .unwrap()
-        .into_complete()
-        .unwrap();
+    let mut receipt = receipt(
+        std::slice::from_ref(&exported),
+        &[helper(), exported.clone()],
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap();
     let public = receipt
         .contexts
         .modules
@@ -206,7 +212,7 @@ fn public_implementation_projection_still_checks_the_primary_independent_reading
 #[test]
 fn public_implementation_types_and_safe_bodies_still_require_public_dependencies() {
     let safe = owner(DefinitionSafety::Safe);
-    let checked = receipt(&[safe.clone()], &[helper(), safe])
+    let checked = receipt(std::slice::from_ref(&safe), &[helper(), safe.clone()])
         .unwrap()
         .into_complete()
         .unwrap();
@@ -227,10 +233,13 @@ fn public_implementation_types_and_safe_bodies_still_require_public_dependencies
         unreachable!()
     };
     value.base.type_ = constant(private("Carrier"));
-    let checked = receipt(&[unsafe_owner.clone()], &[helper(), carrier, unsafe_owner])
-        .unwrap()
-        .into_complete()
-        .unwrap();
+    let checked = receipt(
+        std::slice::from_ref(&unsafe_owner),
+        &[helper(), carrier, unsafe_owner.clone()],
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap();
     missing(
         project(&checked).unwrap_err(),
         &name("implementation"),
@@ -241,7 +250,11 @@ fn public_implementation_types_and_safe_bodies_still_require_public_dependencies
 #[test]
 fn missing_or_changed_private_implementations_never_create_a_public_receipt() {
     let exported = owner(DefinitionSafety::Unsafe);
-    let missing = receipt(&[exported.clone()], &[exported.clone()]).unwrap_err();
+    let missing = receipt(
+        std::slice::from_ref(&exported),
+        std::slice::from_ref(&exported),
+    )
+    .unwrap_err();
     assert!(
         missing
             .to_string()
@@ -261,5 +274,11 @@ fn missing_or_changed_private_implementations_never_create_a_public_receipt() {
         unreachable!()
     };
     value.value = constant(name("Bool.true"));
-    assert!(receipt(&[exported.clone()], &[ill_typed, exported]).is_err());
+    assert!(
+        receipt(
+            std::slice::from_ref(&exported),
+            &[ill_typed, exported.clone()]
+        )
+        .is_err()
+    );
 }

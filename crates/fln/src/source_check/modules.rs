@@ -20,6 +20,7 @@ pub mod reuse;
 pub(crate) mod visibility;
 pub use artifacts::{
     SourceModuleArtifact, SourceModuleBuild, SourceModuleBuildError, SourceModuleCompanions,
+    SourceModuleIrError, SourceModuleIrLimits,
 };
 pub use cache::{SourceModuleCacheLimits, SourceModuleSession, SourceModuleSessionCheck};
 pub use fln_parse::command_scope::imports::{SourceHeader, parse_source_header};

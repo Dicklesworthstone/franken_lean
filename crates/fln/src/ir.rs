@@ -1,7 +1,7 @@
-//! Native compilation of pure, straight-line FIR to the pinned boxed IR.
+//! Native compilation of pure FIR to the pinned boxed IR.
 //!
 //! The existing FIR lowering and independently checked ownership pass supply
-//! the register program. Every emitted function uses a boxed calling convention;
+//! the register program. Internal value functions use a boxed calling convention;
 //! the named entry has no parameters and returns the compiled expression value.
 //! This is not the source declaration's unboxed/exported ABI, nor a certificate
 //! of kernel admission or faithful byte identity. Module publication must bind
@@ -9,13 +9,18 @@
 //! `compile_source_definition` additionally exports closed Nat/String/Bool
 //! function signatures under their source names, with owned object arguments
 //! and the pin's UInt8 Boolean convention. Type-dependent runtime carriers and
-//! other scalar conventions remain unsupported. Type/proof slots retain their
-//! original source positions.
+//! other scalar conventions remain unsupported. Acyclic control flow preserves
+//! reachable branches and their ownership cleanup; expansion is work/depth bounded.
+//! Type/proof slots retain their original source positions.
+//! Closed source exports may use private binary decision objects internally.
+//! Those objects cannot cross the source ABI, and arbitrary FIR cannot enable
+//! this profile or claim the pin's distinct Decidable representation.
 
 use fln_comp::{fir, flbc};
 use fln_core::name::Name;
 use fln_olean::ir::{
-    IrArg, IrBody, IrDecl, IrExpr, IrLit, IrModule, IrNat, IrParam, IrStmt, IrTerminal, IrType,
+    IrAlt, IrArg, IrBody, IrCtorInfo, IrDecl, IrExpr, IrLit, IrModule, IrNat, IrParam, IrStmt,
+    IrTerminal, IrType,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -73,13 +78,14 @@ impl Budget {
     }
 }
 
-fn carrier(ty: fir::ValueType) -> Result<()> {
+fn carrier(ty: fir::ValueType, internal_decisions: bool) -> Result<()> {
     match ty {
         fir::ValueType::Unit
         | fir::ValueType::Bool
         | fir::ValueType::Nat
         | fir::ValueType::String
         | fir::ValueType::Closure(_) => Ok(()),
+        fir::ValueType::Constructor if internal_decisions => Ok(()),
         _ => Err(unsupported("non-pure boxed carrier")),
     }
 }
@@ -101,16 +107,17 @@ fn signature(
     ownership: &[flbc::ArgumentOwnership],
     result: fir::ValueType,
     result_ownership: flbc::CallableResultOwnership,
+    internal_decisions: bool,
     meter: &mut Budget,
 ) -> Result<()> {
     meter.charge(types.len().saturating_add(1))?;
-    carrier(result)?;
+    carrier(result, internal_decisions)?;
     let valid_result = match result {
         fir::ValueType::Unit | fir::ValueType::Bool => {
             result_ownership == flbc::CallableResultOwnership::Scalar
         }
         fir::ValueType::Nat => result_ownership == flbc::CallableResultOwnership::OwnedOrScalar,
-        fir::ValueType::String | fir::ValueType::Closure(_) => {
+        fir::ValueType::String | fir::ValueType::Closure(_) | fir::ValueType::Constructor => {
             result_ownership == flbc::CallableResultOwnership::Owned
         }
         _ => false,
@@ -122,7 +129,7 @@ fn signature(
         return Err(invariant("parameter ownership arity"));
     }
     for (ty, ownership) in types.iter().zip(ownership) {
-        carrier(*ty)?;
+        carrier(*ty, internal_decisions)?;
         match ownership {
             flbc::ArgumentOwnership::Unique => return Err(unsupported("uniqueness preconditions")),
             flbc::ArgumentOwnership::Scalar
@@ -136,10 +143,82 @@ fn signature(
     Ok(())
 }
 
+/// These operations already have pinned, generated native contracts. Keeping
+/// the value types explicit prevents caller-authored FIR from applying a Nat
+/// extern to a String merely by choosing a familiar row name.
+fn native_signature(row: &str) -> Result<(&'static [fir::ValueType], fir::ValueType)> {
+    use fir::ValueType::{Bool, Nat, String as Text};
+    match row {
+        "extern:Nat.add"
+        | "extern:Nat.sub"
+        | "extern:Nat.mul"
+        | "extern:Nat.div"
+        | "extern:Nat.mod"
+        | "extern:Nat.gcd"
+        | "extern:Nat.pow"
+        | "extern:Nat.land"
+        | "extern:Nat.lor"
+        | "extern:Nat.xor"
+        | "extern:Nat.shiftLeft"
+        | "extern:Nat.shiftRight" => Ok((&[Nat, Nat], Nat)),
+        "extern:Nat.pred" | "extern:Nat.log2" => Ok((&[Nat], Nat)),
+        "extern:Nat.beq" | "extern:Nat.ble" => Ok((&[Nat, Nat], Bool)),
+        "extern:String.append" => Ok((&[Text, Text], Text)),
+        _ => Err(unsupported("native intrinsic signature")),
+    }
+}
+
+fn native_name(row: &str) -> Result<Name> {
+    native_signature(row)?;
+    let generated = fln_vm::extern_table_generated::EXTERN_ROWS
+        .iter()
+        .find(|candidate| candidate.id == row)
+        .ok_or_else(|| invariant("pinned native row"))?;
+    Ok(Name::from_components(generated.name.split('.')))
+}
+
+fn validate_native(intrinsic: &fir::IntrinsicDecl, meter: &mut Budget) -> Result<()> {
+    meter.charge(intrinsic.arguments.len().saturating_add(1))?;
+    let (arguments, result) = native_signature(&intrinsic.row)?;
+    if intrinsic.arguments != arguments
+        || intrinsic.result != result
+        || intrinsic.effect != fir::EffectClass::Pure
+    {
+        return Err(unsupported("native intrinsic type or effect contract"));
+    }
+    let row = fln_vm::extern_table_generated::EXTERN_ROWS
+        .iter()
+        .find(|row| row.id == intrinsic.row)
+        .ok_or_else(|| invariant("pinned native row"))?;
+    if row.effect != "pure" || row.entry_class != "standard" || row.entry_scope != "all" {
+        return Err(unsupported("pinned native entry contract"));
+    }
+    let contract = fln_vm::extern_row::Ownership::parse(row.ownership)
+        .map_err(|_| invariant("pinned native ownership"))?;
+    let arguments = contract
+        .argument_ownership(arguments.len())
+        .map_err(|_| invariant("pinned native argument ownership"))?;
+    let result = contract
+        .result_ownership()
+        .map_err(|_| invariant("pinned native result ownership"))?;
+    if arguments.len() != intrinsic.argument_ownership.len()
+        || arguments
+            .iter()
+            .zip(&intrinsic.argument_ownership)
+            .any(|(expected, actual)| expected.as_str() != actual.token())
+        || result.as_str() != intrinsic.result_ownership.token()
+    {
+        return Err(unsupported("native intrinsic ownership contract"));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct Value {
     index: u64,
     owned: bool,
+    natural: Option<u64>,
+    decision_tags: u8,
 }
 
 struct Function<'a> {
@@ -147,6 +226,8 @@ struct Function<'a> {
     registers: Vec<Option<Value>>,
     next: u64,
     stmts: Vec<IrStmt>,
+    decision_tags: u8,
+    decision_type: Name,
     meter: &'a mut Budget,
 }
 
@@ -205,14 +286,41 @@ impl Function<'_> {
     fn bind(&mut self, ty: IrType, expr: IrExpr) -> Result<Value> {
         let index = self.next;
         self.next = self.next.checked_add(1).ok_or(CompileError::Limit)?;
+        let natural = match &expr {
+            IrExpr::Lit(IrLit::Num(IrNat::Small(value))) => Some(*value),
+            _ => None,
+        };
         self.emit(IrStmt::VDecl { x: index, ty, expr })?;
-        Ok(Value { index, owned: true })
+        Ok(Value {
+            index,
+            owned: true,
+            natural,
+            decision_tags: 0,
+        })
     }
     fn name(&self, id: flbc::FunctionId) -> Result<Name> {
         self.names
             .get(id.get() as usize)
             .cloned()
             .ok_or_else(|| invariant("callee name"))
+    }
+    fn snapshot(&mut self) -> Result<Vec<Option<Value>>> {
+        self.meter.charge(self.registers.len())?;
+        let mut saved = Vec::new();
+        saved
+            .try_reserve_exact(self.registers.len())
+            .map_err(|_| CompileError::Allocation)?;
+        saved.extend_from_slice(&self.registers);
+        Ok(saved)
+    }
+    fn refine_decision(&mut self, index: u64, tags: u8) -> Result<()> {
+        self.meter.charge(self.registers.len())?;
+        for value in self.registers.iter_mut().flatten() {
+            if value.index == index {
+                value.decision_tags = tags;
+            }
+        }
+        Ok(())
     }
     fn args(
         &mut self,
@@ -249,6 +357,15 @@ impl Function<'_> {
         args: &[flbc::Register],
         ownership: &[flbc::ArgumentOwnership],
     ) -> Result<Value> {
+        self.call_typed(function, args, ownership, IrType::TObject)
+    }
+    fn call_typed(
+        &mut self,
+        function: Name,
+        args: &[flbc::Register],
+        ownership: &[flbc::ArgumentOwnership],
+        result: IrType,
+    ) -> Result<Value> {
         // Golem keeps each borrowed operand alive for the whole call. The
         // same register may also supply a consuming operand, whose callee
         // can drop it before reading the borrow. Preserve that lifetime even
@@ -270,7 +387,7 @@ impl Function<'_> {
         }
         let args = self.args(args, ownership, false)?;
         let constant = args.is_empty();
-        let result = self.bind(IrType::TObject, IrExpr::Fap { function, args })?;
+        let result = self.bind(result, IrExpr::Fap { function, args })?;
         // A nullary FAP loads a borrowed value from the interpreter's
         // constant cache. FLBC calls return an owned value instead.
         if constant {
@@ -281,7 +398,7 @@ impl Function<'_> {
         }
         Ok(result)
     }
-    fn finish(mut self, value: Value) -> Result<IrBody> {
+    fn finish(&mut self, value: Value) -> Result<IrBody> {
         if !value.owned {
             self.retain(value)?;
         }
@@ -292,7 +409,7 @@ impl Function<'_> {
             }
         }
         Ok(IrBody {
-            stmts: self.stmts,
+            stmts: std::mem::take(&mut self.stmts),
             terminal: Box::new(IrTerminal::Ret(IrArg::Var(value.index))),
         })
     }
@@ -301,6 +418,8 @@ impl Function<'_> {
 fn compile_function(
     function: &flbc::Function,
     names: &[Name],
+    decision_tags: u8,
+    decision_type: &Name,
     meter: &mut Budget,
 ) -> Result<IrDecl> {
     meter.charge(usize::from(function.register_count))?;
@@ -315,6 +434,8 @@ fn compile_function(
         registers[i] = Some(Value {
             index: i as u64 + 1,
             owned: !borrow,
+            natural: None,
+            decision_tags: 0,
         });
         params.push(IrParam {
             x: i as u64 + 1,
@@ -331,149 +452,361 @@ fn compile_function(
         registers,
         next: u64::from(function.arity) + 1,
         stmts: Vec::new(),
+        decision_tags,
+        decision_type: decision_type.clone(),
         meter,
     };
-    for instruction in &function.code {
-        out.meter.charge(1)?;
-        use flbc::Instruction as I;
-        match instruction {
-            I::Nat { dst, value } => {
-                let v = out.bind(
-                    IrType::TObject,
-                    IrExpr::Lit(IrLit::Num(IrNat::Small(*value))),
-                )?;
-                out.set(*dst, v)?;
-            }
-            I::NatBig { dst, limbs_le } => {
-                out.meter.charge(limbs_le.len())?;
-                let v = out.bind(
-                    IrType::TObject,
-                    IrExpr::Lit(IrLit::Num(IrNat::Big(limbs_le.clone()))),
-                )?;
-                out.set(*dst, v)?;
-            }
-            I::String { dst, value } => {
-                out.meter.charge(value.len())?;
-                let v = out.bind(IrType::Object, IrExpr::Lit(IrLit::Str(value.clone())))?;
-                out.set(*dst, v)?;
-            }
-            I::Copy { dst, src } => {
-                let v = out.get(*src)?;
-                out.retain(v)?;
-                out.set(*dst, Value { owned: true, ..v })?;
-            }
-            I::Move { dst, src } => {
-                let v = out.take(*src)?;
-                if !v.owned {
-                    out.retain(v)?;
-                }
-                out.set(*dst, Value { owned: true, ..v })?;
-            }
-            I::Drop { src } => {
-                let v = out.take(*src)?;
-                out.drop_value(v)?;
-            }
-            I::Call {
-                dst,
-                function,
-                args,
-                argument_ownership,
-                ..
-            } => {
-                let function = out.name(*function)?;
-                let v = out.call(function, args, argument_ownership)?;
-                out.set(*dst, v)?;
-            }
-            I::Closure {
-                dst,
-                function,
-                captures,
-                capture_ownership,
-            } => {
-                // Applying a closure consumes all arguments, including its
-                // captures. The boxed entry releases the base's borrows.
-                let function = Name::str(out.name(*function)?, "_boxed");
-                let args = out.args(captures, capture_ownership, true)?;
-                let v = out.bind(IrType::Object, IrExpr::Pap { function, args })?;
-                out.set(*dst, v)?;
-            }
-            I::Apply {
-                dst,
-                closure,
-                args,
-                argument_ownership,
-                ..
-            } => {
-                let closure = out.get(*closure)?;
-                out.retain(closure)?;
-                let args = out.args(args, argument_ownership, true)?;
-                let v = out.bind(
-                    IrType::TObject,
-                    IrExpr::Ap {
-                        x: closure.index,
-                        args,
-                    },
-                )?;
-                out.set(*dst, v)?;
-            }
-            I::TailCall {
-                function,
-                args,
-                argument_ownership,
-                ..
-            } => {
-                let function = out.name(*function)?;
-                let v = out.call(function, args, argument_ownership)?;
-                return Ok(IrDecl::Function {
-                    name,
-                    params,
-                    result: IrType::TObject,
-                    body: out.finish(v)?,
-                    sorry_dep: None,
-                });
-            }
-            I::TailApply {
-                closure,
-                args,
-                argument_ownership,
-                ..
-            } => {
-                let closure = out.get(*closure)?;
-                out.retain(closure)?;
-                let args = out.args(args, argument_ownership, true)?;
-                let v = out.bind(
-                    IrType::TObject,
-                    IrExpr::Ap {
-                        x: closure.index,
-                        args,
-                    },
-                )?;
-                return Ok(IrDecl::Function {
-                    name,
-                    params,
-                    result: IrType::TObject,
-                    body: out.finish(v)?,
-                    sorry_dep: None,
-                });
-            }
-            I::Return { src } => {
-                let v = out.take(*src)?;
-                return Ok(IrDecl::Function {
-                    name,
-                    params,
-                    result: IrType::TObject,
-                    body: out.finish(v)?,
-                    sorry_dep: None,
-                });
-            }
-            _ => {
-                return Err(unsupported(
-                    "instruction outside the pure straight-line subset",
-                ));
-            }
-        }
+    let mut active = Vec::new();
+    out.meter.charge(function.code.len())?;
+    active
+        .try_reserve_exact(function.code.len())
+        .map_err(|_| CompileError::Allocation)?;
+    active.resize(function.code.len(), false);
+    let body = compile_body(function, &mut out, 0, &mut active, 0)?;
+    Ok(IrDecl::Function {
+        name,
+        params,
+        result: IrType::TObject,
+        body,
+        sorry_dep: None,
+    })
+}
+
+/// FLBC has already passed its independent ownership check. Branch expansion
+/// copies only the compile-time register map; each runtime path retains its
+/// original moves and drops. Global variable numbering is shared by all arms,
+/// matching the pin's declaration-wide uniqueness rule.
+fn decision_info(type_name: &Name, tag: u8) -> IrCtorInfo {
+    IrCtorInfo {
+        // This is the compiler's private heap representation, not the pin's
+        // immediate Decidable ABI. No source constructor uses this label.
+        name: Name::num(type_name.clone(), u64::from(tag)),
+        cidx: u64::from(tag),
+        size: 1,
+        usize: 0,
+        ssize: 0,
     }
-    Err(invariant("function has no return"))
+}
+
+fn compile_body(
+    function: &flbc::Function,
+    out: &mut Function<'_>,
+    start: usize,
+    active: &mut [bool],
+    depth: usize,
+) -> Result<IrBody> {
+    if depth >= 128 {
+        return Err(CompileError::Limit);
+    }
+    let mut path = Vec::new();
+    let result = (|| {
+        let mut pc = start;
+        loop {
+            let visiting = active
+                .get_mut(pc)
+                .ok_or_else(|| invariant("control-flow target"))?;
+            if *visiting {
+                return Err(unsupported("cyclic control-flow graph"));
+            }
+            *visiting = true;
+            path.try_reserve(1).map_err(|_| CompileError::Allocation)?;
+            path.push(pc);
+            let instruction = function
+                .code
+                .get(pc)
+                .ok_or_else(|| invariant("control-flow instruction"))?;
+            out.meter.charge(1)?;
+            use flbc::Instruction as I;
+            match instruction {
+                I::Nat { dst, value } => {
+                    let v = out.bind(
+                        IrType::TObject,
+                        IrExpr::Lit(IrLit::Num(IrNat::Small(*value))),
+                    )?;
+                    out.set(*dst, v)?;
+                }
+                I::NatBig { dst, limbs_le } => {
+                    out.meter.charge(limbs_le.len())?;
+                    let v = out.bind(
+                        IrType::TObject,
+                        IrExpr::Lit(IrLit::Num(IrNat::Big(limbs_le.clone()))),
+                    )?;
+                    out.set(*dst, v)?;
+                }
+                I::String { dst, value } => {
+                    out.meter.charge(value.len())?;
+                    let v = out.bind(IrType::Object, IrExpr::Lit(IrLit::Str(value.clone())))?;
+                    out.set(*dst, v)?;
+                }
+                I::Copy { dst, src } => {
+                    let v = out.get(*src)?;
+                    out.retain(v)?;
+                    out.set(*dst, Value { owned: true, ..v })?;
+                }
+                I::Move { dst, src } => {
+                    let v = out.take(*src)?;
+                    if !v.owned {
+                        out.retain(v)?;
+                    }
+                    out.set(*dst, Value { owned: true, ..v })?;
+                }
+                I::Drop { src } => {
+                    let v = out.take(*src)?;
+                    out.drop_value(v)?;
+                }
+                I::Ctor {
+                    dst,
+                    tag,
+                    fields,
+                    scalar_bytes,
+                } => {
+                    if out.decision_tags == 0
+                        || *tag > 1
+                        || fields.len() != 1
+                        || !scalar_bytes.is_empty()
+                    {
+                        return Err(unsupported("internal decision constructor layout"));
+                    }
+                    // FIR constructors borrow their fields. IR constructors
+                    // consume them, so the private object receives its own
+                    // references even while the original register stays live.
+                    let args = out.args(fields, &[flbc::ArgumentOwnership::Borrowed], true)?;
+                    let mut value = out.bind(
+                        IrType::Object,
+                        IrExpr::Ctor {
+                            info: decision_info(&out.decision_type, *tag),
+                            args,
+                        },
+                    )?;
+                    value.decision_tags = 1 << tag;
+                    out.set(*dst, value)?;
+                }
+                I::CtorTest {
+                    dst,
+                    src,
+                    expected_tag,
+                    expected_fields,
+                } => {
+                    if out.decision_tags == 0 || *expected_tag > 1 || *expected_fields != 1 {
+                        return Err(unsupported("internal decision constructor test"));
+                    }
+                    let source = out.get(*src)?;
+                    let possible = if source.decision_tags == 0 {
+                        out.decision_tags
+                    } else {
+                        source.decision_tags
+                    };
+                    let matched = 1 << expected_tag;
+                    if possible & matched == 0 || possible == matched {
+                        let value = out.bind(
+                            IrType::Tagged,
+                            IrExpr::Lit(IrLit::Num(IrNat::Small(u64::from(possible == matched)))),
+                        )?;
+                        out.set(*dst, value)?;
+                    } else {
+                        // Split at the TEST, while its borrowed constructor is
+                        // alive. The remaining FLBC may drop or overwrite it
+                        // before branching on the independently stored Bool.
+                        let saved = out.snapshot()?;
+                        let prefix = std::mem::take(&mut out.stmts);
+                        out.refine_decision(source.index, matched)?;
+                        let value =
+                            out.bind(IrType::Tagged, IrExpr::Lit(IrLit::Num(IrNat::Small(1))))?;
+                        out.set(*dst, value)?;
+                        let yes = compile_body(function, out, pc + 1, active, depth + 1)?;
+                        out.registers = saved;
+                        out.refine_decision(source.index, possible & !matched)?;
+                        let value =
+                            out.bind(IrType::Tagged, IrExpr::Lit(IrLit::Num(IrNat::Small(0))))?;
+                        out.set(*dst, value)?;
+                        let no = compile_body(function, out, pc + 1, active, depth + 1)?;
+                        return Ok(IrBody {
+                            stmts: prefix,
+                            terminal: Box::new(IrTerminal::Case {
+                                type_name: out.decision_type.clone(),
+                                x: source.index,
+                                x_type: IrType::Object,
+                                alts: vec![
+                                    IrAlt::Ctor {
+                                        info: decision_info(&out.decision_type, *expected_tag),
+                                        body: yes,
+                                    },
+                                    IrAlt::Default { body: no },
+                                ],
+                            }),
+                        });
+                    }
+                }
+                I::Call {
+                    dst,
+                    function,
+                    args,
+                    argument_ownership,
+                    ..
+                } => {
+                    let function = out.name(*function)?;
+                    let v = out.call(function, args, argument_ownership)?;
+                    out.set(*dst, v)?;
+                }
+                I::Intrinsic {
+                    dst,
+                    row,
+                    args,
+                    argument_ownership,
+                    ..
+                } => {
+                    let (_, result) = native_signature(row)?;
+                    let function = native_name(row)?;
+                    let ty = match result {
+                        fir::ValueType::Nat => IrType::TObject,
+                        fir::ValueType::String => IrType::Object,
+                        fir::ValueType::Bool => IrType::UInt8,
+                        _ => return Err(invariant("native result carrier")),
+                    };
+                    let mut value = out.call_typed(function, args, argument_ownership, ty)?;
+                    if result == fir::ValueType::Bool {
+                        value = out.bind(
+                            IrType::Tagged,
+                            IrExpr::Box {
+                                ty: IrType::UInt8,
+                                x: value.index,
+                            },
+                        )?;
+                    }
+                    out.set(*dst, value)?;
+                }
+                I::Closure {
+                    dst,
+                    function,
+                    captures,
+                    capture_ownership,
+                } => {
+                    // Applying a closure consumes all arguments, including its
+                    // captures. The boxed entry releases the base's borrows.
+                    let function = Name::str(out.name(*function)?, "_boxed");
+                    let args = out.args(captures, capture_ownership, true)?;
+                    let v = out.bind(IrType::Object, IrExpr::Pap { function, args })?;
+                    out.set(*dst, v)?;
+                }
+                I::Apply {
+                    dst,
+                    closure,
+                    args,
+                    argument_ownership,
+                    ..
+                } => {
+                    let closure = out.get(*closure)?;
+                    out.retain(closure)?;
+                    let args = out.args(args, argument_ownership, true)?;
+                    let v = out.bind(
+                        IrType::TObject,
+                        IrExpr::Ap {
+                            x: closure.index,
+                            args,
+                        },
+                    )?;
+                    out.set(*dst, v)?;
+                }
+                I::TailCall {
+                    function,
+                    args,
+                    argument_ownership,
+                    ..
+                } => {
+                    let function = out.name(*function)?;
+                    let v = out.call(function, args, argument_ownership)?;
+                    return out.finish(v);
+                }
+                I::TailApply {
+                    closure,
+                    args,
+                    argument_ownership,
+                    ..
+                } => {
+                    let closure = out.get(*closure)?;
+                    out.retain(closure)?;
+                    let args = out.args(args, argument_ownership, true)?;
+                    let v = out.bind(
+                        IrType::TObject,
+                        IrExpr::Ap {
+                            x: closure.index,
+                            args,
+                        },
+                    )?;
+                    return out.finish(v);
+                }
+                I::Return { src } => {
+                    let v = out.take(*src)?;
+                    return out.finish(v);
+                }
+                I::Jump { target } => {
+                    pc = usize::try_from(target.get()).map_err(|_| CompileError::Limit)?;
+                    continue;
+                }
+                I::JumpIfZero {
+                    cond,
+                    zero,
+                    nonzero,
+                } => {
+                    let condition = out.get(*cond)?;
+                    if let Some(value) = condition.natural {
+                        pc = usize::try_from(if value == 0 { zero } else { nonzero }.get())
+                            .map_err(|_| CompileError::Limit)?;
+                        continue;
+                    }
+                    let saved = out.snapshot()?;
+                    let prefix = std::mem::take(&mut out.stmts);
+                    let zero = compile_body(
+                        function,
+                        out,
+                        usize::try_from(zero.get()).map_err(|_| CompileError::Limit)?,
+                        active,
+                        depth + 1,
+                    )?;
+                    out.registers = saved;
+                    let nonzero = compile_body(
+                        function,
+                        out,
+                        usize::try_from(nonzero.get()).map_err(|_| CompileError::Limit)?,
+                        active,
+                        depth + 1,
+                    )?;
+                    // The FIR validator admits only Nat/Bool conditions. Zero is
+                    // the scalar tag zero for both. Every positive Nat, including
+                    // heap magnitudes, takes the default arm, as does Bool.true.
+                    return Ok(IrBody {
+                        stmts: prefix,
+                        terminal: Box::new(IrTerminal::Case {
+                            type_name: Name::from_components(["Nat"]),
+                            x: condition.index,
+                            x_type: IrType::TObject,
+                            alts: vec![
+                                IrAlt::Ctor {
+                                    info: IrCtorInfo {
+                                        name: Name::from_components(["Nat", "zero"]),
+                                        cidx: 0,
+                                        size: 0,
+                                        usize: 0,
+                                        ssize: 0,
+                                    },
+                                    body: zero,
+                                },
+                                IrAlt::Default { body: nonzero },
+                            ],
+                        }),
+                    });
+                }
+                _ => {
+                    return Err(unsupported("instruction outside the pure boxed subset"));
+                }
+            }
+            pc = pc.checked_add(1).ok_or(CompileError::Limit)?;
+        }
+    })();
+    for pc in path {
+        active[pc] = false;
+    }
+    result
 }
 
 fn boxed_wrapper(declaration: &IrDecl, meter: &mut Budget) -> Result<IrDecl> {
@@ -581,7 +914,7 @@ pub fn compile(
     limits: CompileLimits,
 ) -> Result<IrModule> {
     let mut meter = Budget(limits.max_work);
-    let module = compile_module(program, entry, limits, &mut meter)?;
+    let module = compile_module(program, entry, limits, None, &mut meter)?;
     validate_module(&module, &meter)?;
     Ok(module)
 }
@@ -590,38 +923,68 @@ fn compile_module(
     program: &fir::ValidatedProgram,
     entry: &Name,
     limits: CompileLimits,
+    source_exports: Option<&SourceSignature>,
     meter: &mut Budget,
 ) -> Result<IrModule> {
     if entry.is_anonymous() {
         return Err(unsupported("anonymous entry name"));
     }
+    // A checked source signature has only Nat/String/Bool leaves, recursively
+    // through callbacks. Thus no constructor can enter or leave through that
+    // ABI. With ABI erasure/casts, projections and constructor externs still
+    // refused, every internal constructor comes from these exact layouts.
+    // This closure justifies replacing the VM's tag+shape test by an IR case,
+    // and exhausting {0,1} proves the generated failure arm unreachable.
+    // The arbitrary-FIR API deliberately receives no such source guarantee.
+    let mut decision_tags = 0;
+    if source_exports.is_some() {
+        for constructor in program.constructors() {
+            meter.charge(constructor.fields.len().saturating_add(1))?;
+            if constructor.tag > 1
+                || constructor.fields != [fir::ValueType::Bool]
+                || !constructor.static_scalar_bytes.is_empty()
+            {
+                return Err(unsupported("internal decision constructor layout"));
+            }
+            decision_tags |= 1 << constructor.tag;
+        }
+    }
+    let internal_decisions = decision_tags != 0;
     for function in program.functions() {
         signature(
             &function.parameters,
             &function.parameter_ownership,
             function.result,
             function.result_ownership,
+            internal_decisions,
             meter,
         )?;
-        if function.blocks.len() != 1
-            || !matches!(
-                function.blocks[0].terminator,
-                fir::Terminator::Return { .. }
-            )
-        {
-            return Err(unsupported("control-flow graph"));
-        }
-        for binding in &function.blocks[0].bindings {
-            meter.charge(1)?;
-            carrier(binding.ty)?;
-        }
         let mut types: std::collections::BTreeMap<_, _> = function
             .parameters
             .iter()
             .enumerate()
             .map(|(i, ty)| (fir::ValueId::new(i as u32), *ty))
             .collect();
-        for binding in &function.blocks[0].bindings {
+        // Canonical block numbering need not be a topological order. FIR has
+        // already proved dominance; record every binding's type before looking
+        // up captures and application operands on any control-flow path.
+        for binding in function.blocks.iter().flat_map(|block| &block.bindings) {
+            meter.charge(1)?;
+            carrier(binding.ty, internal_decisions)?;
+            if binding.ty == fir::ValueType::Constructor
+                && !matches!(
+                    binding.operation,
+                    fir::Operation::Ctor { .. }
+                        | fir::Operation::Alias(_)
+                        | fir::Operation::Call { .. }
+                        | fir::Operation::Apply { .. }
+                )
+            {
+                return Err(unsupported("unproved internal constructor producer"));
+            }
+            types.insert(binding.id, binding.ty);
+        }
+        for binding in function.blocks.iter().flat_map(|block| &block.bindings) {
             let operands = match &binding.operation {
                 fir::Operation::Closure {
                     captures,
@@ -646,8 +1009,10 @@ fn compile_module(
                     )?;
                 }
             }
-            types.insert(binding.id, binding.ty);
         }
+    }
+    for intrinsic in program.intrinsics() {
+        validate_native(intrinsic, meter)?;
     }
     for closure in program.closure_types() {
         signature(
@@ -655,6 +1020,7 @@ fn compile_module(
             &closure.parameter_ownership,
             closure.result,
             closure.result_ownership,
+            internal_decisions,
             meter,
         )?;
     }
@@ -673,8 +1039,9 @@ fn compile_module(
         });
     }
     let mut declarations = Vec::new();
+    let decision_type = Name::str(entry.clone(), "_fln_decision");
     for function in lowered.program().functions() {
-        let declaration = compile_function(function, &names, meter)?;
+        let declaration = compile_function(function, &names, decision_tags, &decision_type, meter)?;
         // A boxed application always owns its operands. The wrapper releases
         // those whose base function borrows them, just as the pin's wrappers do.
         if !function.parameter_ownership.is_empty() {
@@ -690,11 +1057,23 @@ fn compile_module(
 }
 
 fn validate_module(module: &IrModule, meter: &Budget) -> Result<()> {
+    let externs: std::collections::BTreeMap<_, _> = fln_vm::extern_table_generated::EXTERN_ROWS
+        .iter()
+        .filter_map(|row| {
+            native_signature(row.id)
+                .ok()
+                .map(|(arguments, _)| (Name::from_components(row.name.split('.')), arguments.len()))
+        })
+        .collect();
     fln_olean::ir_types::validate_ir_types(
         std::slice::from_ref(module),
-        &std::collections::BTreeMap::new(),
+        &externs,
         fln_olean::ir_validate::IrValidationLimits {
-            max_declarations: module.decls.len(),
+            max_declarations: module
+                .decls
+                .len()
+                .checked_add(externs.len())
+                .ok_or(CompileError::Limit)?,
             max_work: meter.0,
             one_based_variables: true,
             ..fln_olean::ir_validate::IrValidationLimits::default()
@@ -717,11 +1096,97 @@ enum ReducedArgument {
     Erased,
 }
 
+fn source_without_metadata<'a>(
+    mut expression: &'a fln_core::expr::Expr,
+    meter: &mut Budget,
+) -> Result<&'a fln_core::expr::Expr> {
+    while let fln_core::expr::ExprNode::MData { expr, .. } = expression.node() {
+        meter.charge(1)?;
+        expression = expr;
+    }
+    Ok(expression)
+}
+
+fn source_spine<'a, const N: usize>(
+    expression: &'a fln_core::expr::Expr,
+    meter: &mut Budget,
+) -> Result<Option<(&'a fln_core::expr::Expr, [&'a fln_core::expr::Expr; N])>> {
+    use fln_core::expr::ExprNode;
+    let mut head = expression;
+    let mut arguments = [expression; N];
+    for argument in arguments.iter_mut().rev() {
+        meter.charge(1)?;
+        head = source_without_metadata(head, meter)?;
+        let ExprNode::App { f, a } = head.node() else {
+            return Ok(None);
+        };
+        *argument = source_without_metadata(a, meter)?;
+        head = f;
+    }
+    let head = source_without_metadata(head, meter)?;
+    Ok((!matches!(head.node(), ExprNode::App { .. })).then_some((head, arguments)))
+}
+
 // Reduction metadata can inline the full entry and call `f._redArg` instead.
 // Analyze an explicit lambda telescope, with closed let initializers. Calls
-// through source parameters stay opaque; named/local/beta-redex calls refuse
-// because further simplification could change the reduction mask. This is a
-// bounded source subset, not an approximation silently used for general code.
+// through source parameters stay opaque. A dynamic Boolean conditional uses
+// its scrutinee and both arms; its closed motive contributes no runtime uses.
+// Other named/local/beta-redex calls refuse when they could change a reduction mask.
+// This is a bounded source subset, not a guess about general simplification.
+fn source_boolean_case<'a>(
+    expression: &'a fln_core::expr::Expr,
+    meter: &mut Budget,
+) -> Result<Option<[&'a fln_core::expr::Expr; 3]>> {
+    use fln_core::expr::ExprNode;
+    if let Some((head, [motive, no, yes, condition])) = source_spine::<4>(expression, meter)?
+        && matches!(head.node(), ExprNode::Const { name, levels }
+            if name == &Name::from_components(["Bool", "rec"]) && levels.len() == 1)
+    {
+        let ExprNode::Lam { body, .. } = motive.node() else {
+            return Err(unsupported("source Boolean case motive"));
+        };
+        source_carrier(body, meter)?;
+        return Ok(Some([condition, no, yes]));
+    }
+    let Some((head, [ty, proposition, decision, yes, no])) = source_spine::<5>(expression, meter)?
+    else {
+        return Ok(None);
+    };
+    if !matches!(head.node(), ExprNode::Const { name, levels }
+        if name == &Name::from_components(["ite"]) && levels.len() == 1)
+    {
+        return Ok(None);
+    }
+    source_carrier(ty, meter)?;
+    let Some((equality, [boolean, condition, truth])) = source_spine::<3>(proposition, meter)?
+    else {
+        return Ok(None);
+    };
+    let constant = |expr: &fln_core::expr::Expr, parts: &[&str]| {
+        matches!(expr.node(), ExprNode::Const { name, levels }
+            if name == &Name::from_components(parts.iter().copied()) && levels.is_empty())
+    };
+    if !matches!(equality.node(), ExprNode::Const { name, levels }
+        if name == &Name::from_components(["Eq"]) && levels.len() == 1)
+        || !constant(boolean, &["Bool"])
+        || !constant(truth, &["Bool", "true"])
+    {
+        return Ok(None);
+    }
+    // An arbitrary decision procedure can have additional runtime dependencies.
+    // Only the canonical Bool equality application has this exact use mask.
+    let Some((dictionary, [left, right])) = source_spine::<2>(decision, meter)? else {
+        return Ok(None);
+    };
+    if !(constant(dictionary, &["instDecidableEqBool"]) || constant(dictionary, &["Bool", "decEq"]))
+        || left != condition
+        || right != truth
+    {
+        return Ok(None);
+    }
+    Ok(Some([condition, no, yes]))
+}
+
 fn source_parameter_uses(
     value: &fln_core::expr::Expr,
     arity: usize,
@@ -783,6 +1248,54 @@ fn source_parameter_uses(
                 }
             }
             ExprNode::App { f, a } => {
+                if let Some([condition, no, yes]) = source_boolean_case(expr, meter)? {
+                    // A literal scrutinee can erase an arm before the pin
+                    // chooses its reduced entry. Leave that optimization out
+                    // of multiargument source exports until it is modeled.
+                    if arity > 1 && !matches!(condition.node(), ExprNode::BVar { .. }) {
+                        return Err(unsupported("specializable Boolean source case"));
+                    }
+                    if arity > 1 {
+                        let original_parameter = |part: &fln_core::expr::Expr| {
+                            let ExprNode::BVar { idx } = part.node() else {
+                                return false;
+                            };
+                            depth
+                                .checked_sub(u64::from(*idx) + 1)
+                                .is_some_and(|level| levels.binary_search(&level).is_ok())
+                        };
+                        if !original_parameter(condition) {
+                            return Err(unsupported("local Boolean source discriminator"));
+                        }
+                        for arm in [no, yes] {
+                            if matches!(arm.node(), ExprNode::BVar { .. })
+                                && !original_parameter(arm)
+                            {
+                                return Err(unsupported("local Boolean source arm"));
+                            }
+                        }
+                        let leaf = |part: &fln_core::expr::Expr| match part.node() {
+                            ExprNode::BVar { .. } => part != condition,
+                            ExprNode::Lit { .. } => true,
+                            ExprNode::Const { name, levels } => {
+                                levels.is_empty()
+                                    && (name == &Name::from_components(["Bool", "true"])
+                                        || name == &Name::from_components(["Bool", "false"]))
+                            }
+                            _ => false,
+                        };
+                        if no == yes || !leaf(no) || !leaf(yes) {
+                            return Err(unsupported("specializable Boolean source arms"));
+                        }
+                    }
+                    pending
+                        .try_reserve(3)
+                        .map_err(|_| CompileError::Allocation)?;
+                    for part in [condition, no, yes] {
+                        pending.push((part, depth, initializer));
+                    }
+                    continue;
+                }
                 if !initializer && arity > 1 {
                     let mut head = f;
                     loop {
@@ -1198,6 +1711,147 @@ pub fn compile_source_definition(
     compile_definition_impl(engine, declaration, None, options, engine_limits, limits)
 }
 
+/// Compile an exact definition from a module's privately retained checked
+/// environment. The temporary admission is confined to a fresh private alias:
+/// neither that alias nor a successor environment is a module product.
+///
+/// The source signature still belongs to the original declaration. In
+/// particular, naming an existing definition cannot replace its exported ABI
+/// with the nullary value entry used internally by the compiler.
+pub(crate) fn compile_checked_source_definition(
+    engine: &crate::Engine,
+    name: &Name,
+    options: &fln_core::options::KVMap,
+    engine_limits: crate::EngineExecutionLimits,
+    limits: CompileLimits,
+) -> std::result::Result<fln_core::outcome::Outcome<IrModule>, DefinitionCompileError> {
+    use fln_core::outcome::Outcome;
+    use fln_env::constants::{ConstantInfo, DefinitionSafety};
+
+    let Some(ConstantInfo::Defn(definition)) = engine.environment().find(name) else {
+        return Err(DefinitionCompileError::Ir(unsupported(
+            "non-definition source export",
+        )));
+    };
+    let mut meter = Budget(limits.max_work);
+    meter.charge(1).map_err(DefinitionCompileError::Ir)?;
+    if definition.safety != DefinitionSafety::Safe {
+        return Err(DefinitionCompileError::Ir(unsupported(
+            "unsafe or partial source export",
+        )));
+    }
+    // Executable replacement and extern journals may change the body without
+    // changing its logical definition. Never export that logical body as if it
+    // were the separately selected executable implementation.
+    for journal in [
+        fln_elab::noncomputable::journal_name(),
+        fln_elab::implemented_by::journal_name(),
+        fln_elab::externs::journal_name(),
+    ] {
+        if let Some(state) = engine.environment().extension(&journal) {
+            for entry in state.entries() {
+                meter
+                    .charge(entry.payload.len().saturating_add(1))
+                    .map_err(DefinitionCompileError::Ir)?;
+            }
+        }
+    }
+    let noncomputable = fln_elab::noncomputable::read(engine.environment()).map_err(|error| {
+        DefinitionCompileError::Ir(match error {
+            fln_elab::noncomputable::NoncomputableError::Limit => CompileError::Limit,
+            _ => unsupported("invalid source noncomputable metadata"),
+        })
+    })?;
+    if noncomputable.contains(name) {
+        return Err(DefinitionCompileError::Ir(unsupported(
+            "noncomputable source export",
+        )));
+    }
+    let replacements =
+        fln_elab::implemented_by::ImplementedByTable::read_metered(engine.environment(), |work| {
+            meter.charge(work)
+        })
+        .map_err(|error| {
+            use fln_elab::implemented_by::{ImplementedByError, ImplementedByReadError};
+            DefinitionCompileError::Ir(match error {
+                ImplementedByReadError::Budget(error) => error,
+                ImplementedByReadError::Registry(ImplementedByError::Limit) => CompileError::Limit,
+                _ => unsupported("invalid source executable replacement metadata"),
+            })
+        })?;
+    let externs = fln_elab::externs::ExternTable::read_metered(engine.environment(), |work| {
+        meter.charge(work)
+    })
+    .map_err(|error| {
+        use fln_elab::externs::{ExternError, ExternReadError};
+        DefinitionCompileError::Ir(match error {
+            ExternReadError::Budget(error) => error,
+            ExternReadError::Registry(ExternError::Limit) => CompileError::Limit,
+            _ => unsupported("invalid source extern metadata"),
+        })
+    })?;
+    if replacements.get(name).is_some() || externs.get(name).is_some() {
+        return Err(DefinitionCompileError::Ir(unsupported(
+            "source export with an executable replacement or extern",
+        )));
+    }
+    let mut ingress = engine_limits.ingress;
+    ingress.max_nodes = ingress
+        .max_nodes
+        .min(usize::try_from(meter.0).unwrap_or(usize::MAX));
+    let (erasures, work) = crate::runtime::Preparation::new(engine.environment(), ingress)
+        .source_parameter_erasures(&definition.base.type_)
+        .map_err(|error| {
+            DefinitionCompileError::Engine(crate::EngineExecutionError::Ingress(error))
+        })?;
+    meter.charge(work).map_err(DefinitionCompileError::Ir)?;
+    let signature =
+        source_signature(definition, &erasures, &mut meter).map_err(DefinitionCompileError::Ir)?;
+    let mut alias = definition.clone();
+    let alias_root = Name::str(name.clone(), "_fln_compile");
+    let mut ordinal = 0_u64;
+    loop {
+        meter.charge(1).map_err(DefinitionCompileError::Ir)?;
+        alias.base.name = Name::num(alias_root.clone(), ordinal);
+        if !engine.environment().contains(&alias.base.name) {
+            break;
+        }
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or(DefinitionCompileError::Ir(CompileError::Limit))?;
+    }
+    alias.all = vec![alias.base.name.clone()];
+    let prepared = engine
+        .prepare_definition_entry_with_helpers(
+            crate::Declaration::Defn(alias),
+            &[],
+            options,
+            engine_limits,
+            crate::source_evaluation::Entry::SourceValue,
+        )
+        .map_err(DefinitionCompileError::Engine)?;
+    let prepared = match prepared {
+        Outcome::Complete(prepared) => prepared,
+        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+    };
+    let value_entry = Name::str(name.clone(), "_fln_value");
+    let mut module = compile_module(
+        &prepared.fir,
+        &value_entry,
+        limits,
+        Some(&signature),
+        &mut meter,
+    )
+    .map_err(DefinitionCompileError::Ir)?;
+    module.decls.extend(
+        export_source(signature, &value_entry, &mut meter).map_err(DefinitionCompileError::Ir)?,
+    );
+    module.decls.sort_by(|a, b| a.name().quick_cmp(b.name()));
+    validate_module(&module, &meter).map_err(DefinitionCompileError::Ir)?;
+    Ok(Outcome::Complete(module))
+}
+
 fn compile_definition_impl(
     engine: &crate::Engine,
     declaration: crate::Declaration,
@@ -1255,8 +1909,14 @@ fn compile_definition_impl(
             } else {
                 entry.clone()
             };
-            let mut module = compile_module(&prepared.fir, &value_entry, limits, &mut meter)
-                .map_err(DefinitionCompileError::Ir)?;
+            let mut module = compile_module(
+                &prepared.fir,
+                &value_entry,
+                limits,
+                signature.as_ref(),
+                &mut meter,
+            )
+            .map_err(DefinitionCompileError::Ir)?;
             if let Some(signature) = signature {
                 module.decls.extend(
                     export_source(signature, &value_entry, &mut meter)
@@ -1278,6 +1938,152 @@ fn compile_definition_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiler_expands_shared_control_flow_and_refuses_cycles() {
+        use fir::{Binding, Block, BlockId, FunctionId, Operation, Terminator, ValueId, ValueType};
+        let block = BlockId::new;
+        let value = ValueId::new;
+        let mut program = fir::Program::new(
+            FunctionId::new(0),
+            vec![],
+            vec![],
+            vec![],
+            vec![
+                fir::Function {
+                    id: FunctionId::new(0),
+                    parameters: vec![],
+                    parameter_ownership: vec![],
+                    result: ValueType::String,
+                    result_ownership: flbc::CallableResultOwnership::Owned,
+                    blocks: vec![Block {
+                        id: block(0),
+                        bindings: vec![
+                            Binding {
+                                id: value(0),
+                                ty: ValueType::Nat,
+                                operation: Operation::Nat(0),
+                            },
+                            Binding {
+                                id: value(1),
+                                ty: ValueType::String,
+                                operation: Operation::Call {
+                                    function: FunctionId::new(1),
+                                    args: vec![value(0)],
+                                },
+                            },
+                        ],
+                        terminator: Terminator::Return { value: value(1) },
+                    }],
+                },
+                fir::Function {
+                    id: FunctionId::new(1),
+                    // Keep the shared-tail condition dynamic in this function;
+                    // a literal in the entry would be folded before either arm.
+                    parameters: vec![ValueType::Nat],
+                    parameter_ownership: vec![flbc::ArgumentOwnership::Borrowed],
+                    result: ValueType::String,
+                    result_ownership: flbc::CallableResultOwnership::Owned,
+                    blocks: vec![
+                        Block {
+                            id: block(0),
+                            bindings: vec![Binding {
+                                id: value(1),
+                                ty: ValueType::String,
+                                operation: Operation::String("owned across both arms".into()),
+                            }],
+                            terminator: Terminator::BranchZero {
+                                condition: value(0),
+                                zero: block(1),
+                                nonzero: block(2),
+                            },
+                        },
+                        Block {
+                            id: block(1),
+                            bindings: vec![],
+                            terminator: Terminator::Jump { target: block(3) },
+                        },
+                        Block {
+                            id: block(2),
+                            bindings: vec![],
+                            terminator: Terminator::Jump { target: block(3) },
+                        },
+                        Block {
+                            id: block(3),
+                            bindings: vec![],
+                            terminator: Terminator::Return { value: value(1) },
+                        },
+                    ],
+                },
+            ],
+        );
+        let entry = Name::from_components(["sharedBranch"]);
+        let checked = fir::validate(program.clone(), Default::default()).unwrap();
+        compile(&checked, &entry, CompileLimits::default()).unwrap();
+        assert!(matches!(
+            compile(
+                &checked,
+                &entry,
+                CompileLimits {
+                    max_work: 8,
+                    ..CompileLimits::default()
+                }
+            ),
+            Err(CompileError::Limit)
+        ));
+
+        // The same public FIR boundary admits a well-formed nonterminating
+        // loop. This backend refuses it instead of recursively expanding it
+        // forever or returning a partly compiled artifact.
+        program.functions[0].blocks = vec![
+            Block {
+                id: block(0),
+                bindings: vec![],
+                terminator: Terminator::Jump { target: block(1) },
+            },
+            Block {
+                id: block(1),
+                bindings: vec![],
+                terminator: Terminator::Jump { target: block(1) },
+            },
+        ];
+        program.functions.truncate(1);
+        let cyclic = fir::validate(program, Default::default()).unwrap();
+        assert!(matches!(
+            compile(&cyclic, &entry, CompileLimits::default()),
+            Err(CompileError::Unsupported {
+                what: "cyclic control-flow graph"
+            })
+        ));
+    }
+
+    #[test]
+    fn compiler_refuses_forged_native_intrinsic_contracts() {
+        let valid = fir::IntrinsicDecl {
+            id: fir::IntrinsicId::new(0),
+            row: "extern:Nat.add".into(),
+            arguments: vec![fir::ValueType::Nat, fir::ValueType::Nat],
+            argument_ownership: vec![flbc::ArgumentOwnership::Borrowed; 2],
+            result: fir::ValueType::Nat,
+            result_ownership: flbc::ResultOwnership::Owned,
+            effect: fir::EffectClass::Pure,
+        };
+        validate_native(&valid, &mut Budget(1_000)).unwrap();
+        for changed in 0..4 {
+            let mut forged = valid.clone();
+            match changed {
+                0 => forged.arguments[0] = fir::ValueType::String,
+                1 => forged.result = fir::ValueType::Bool,
+                2 => forged.argument_ownership[0] = flbc::ArgumentOwnership::Owned,
+                3 => forged.effect = fir::EffectClass::Io,
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                validate_native(&forged, &mut Budget(1_000)),
+                Err(CompileError::Unsupported { .. })
+            ));
+        }
+    }
 
     #[test]
     fn export_validation_refuses_zero_variables_and_accepts_the_one_based_control() {

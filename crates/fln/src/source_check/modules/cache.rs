@@ -905,8 +905,9 @@ pub(super) fn run_collecting(
                         module.name,
                         header,
                         imported.environment(),
-                        checked.engine.environment(),
+                        &checked.engine,
                         public_base.as_ref().zip(public_environment.as_ref()),
+                        options,
                         &mut meter,
                     )?);
                     artifacts.push(Arc::clone(&artifact));

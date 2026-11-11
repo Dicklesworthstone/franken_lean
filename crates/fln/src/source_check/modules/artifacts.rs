@@ -1,7 +1,12 @@
 //! Per-module, checked declaration products for the native Lake `.olean` facet.
 use super::*;
-use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
+use fln_olean::write::source::{
+    CompilerSignature, SourceMetadata, encode_module_with_source_metadata,
+};
 use std::sync::Arc;
+
+mod ir;
+pub use ir::{SourceModuleIrError, SourceModuleIrLimits};
 
 fn artifact_discrimination_key(
     key: fln_elab::instances::discr_tree::Key,
@@ -29,6 +34,9 @@ pub struct SourceModuleArtifact {
     /// exports interfaces; the private region retains checked implementations.
     /// These are source artifacts; executable IR is a separate compiler facet.
     pub companions: Option<SourceModuleCompanions>,
+    /// The compiler consumes this private checked snapshot, never the caller-
+    /// editable artifact bytes or the final environment of a sibling module.
+    compiler: Arc<ir::CompilerInput>,
 }
 
 /// The source metadata and implementation companions of one module-system image.
@@ -100,10 +108,12 @@ impl SourceModuleBuildError {
 }
 
 pub(super) struct PendingArtifact {
-    public: ArtifactData,
-    private: Option<ArtifactData>,
+    public: Arc<ArtifactData>,
+    private: Option<Arc<ArtifactData>>,
+    compiler: Arc<ir::CompilerInput>,
 }
 
+#[derive(Debug)]
 struct ArtifactData {
     name: Name,
     imports: Vec<OleanModuleImport>,
@@ -798,15 +808,33 @@ impl ArtifactData {
         is_module: bool,
         base_addr: u64,
         budget: OleanWriteBudget,
+        compiler_signatures: &[CompilerSignature],
     ) -> Result<fln_olean::write::EncodedModule, SourceModuleBuildError> {
+        let metadata = if compiler_signatures.is_empty() {
+            None
+        } else {
+            let mut metadata = self.metadata.clone();
+            metadata.compiler_signatures = compiler_signatures.to_vec();
+            Some(metadata)
+        };
+        let extra_names: Vec<_> = if compiler_signatures.is_empty() {
+            Vec::new()
+        } else {
+            let declared: BTreeSet<_> = self.constants.iter().map(ConstantInfo::name).collect();
+            compiler_signatures
+                .iter()
+                .filter(|signature| !declared.contains(&signature.name))
+                .map(|signature| signature.name.clone())
+                .collect()
+        };
         let encoded = encode_module_with_source_metadata(
             OleanModuleWriteInput {
                 is_module,
                 imports: &self.imports,
                 constants: &self.constants,
-                extra_const_names: &[],
+                extra_const_names: &extra_names,
             },
-            &self.metadata,
+            metadata.as_ref().unwrap_or(&self.metadata),
             OleanWriteHeader {
                 version: OLEAN_ACCEPTED_VERSIONS[0],
                 flags: 1,
@@ -829,29 +857,65 @@ impl PendingArtifact {
         name: &Name,
         header: &SourceHeader,
         base: &Environment,
-        checked: &Environment,
+        checked: &Engine,
         public: Option<(&Environment, &Environment)>,
+        options: &KVMap,
         meter: &mut Meter,
     ) -> Result<Self, SourceModuleCheckError> {
-        match (header.module_system, public) {
-            (false, None) => Ok(Self {
-                public: ArtifactData::capture(name, header, base, checked, meter)?,
-                private: None,
-            }),
-            (true, Some((public_base, public_checked))) => Ok(Self {
-                public: ArtifactData::capture(name, header, public_base, public_checked, meter)?,
-                private: Some(ArtifactData::capture(name, header, base, checked, meter)?),
-            }),
-            _ => Err(SourceModuleCheckError::ImportContext {
-                module: name.clone(),
-                reason: "module artifact capture has no matching checked public world",
-            }),
-        }
+        let (public, private) = match (header.module_system, public) {
+            (false, None) => (
+                ArtifactData::capture(name, header, base, checked.environment(), meter)?,
+                None,
+            ),
+            (true, Some((public_base, public_checked))) => (
+                ArtifactData::capture(name, header, public_base, public_checked, meter)?,
+                Some(ArtifactData::capture(
+                    name,
+                    header,
+                    base,
+                    checked.environment(),
+                    meter,
+                )?),
+            ),
+            _ => {
+                return Err(SourceModuleCheckError::ImportContext {
+                    module: name.clone(),
+                    reason: "module artifact capture has no matching checked public world",
+                });
+            }
+        };
+        let public = Arc::new(public);
+        let private = private.map(Arc::new);
+        let implementation = private.as_ref().unwrap_or(&public);
+        let compiler = Arc::new(ir::CompilerInput {
+            engine: checked.clone(),
+            options: options.clone(),
+            name: name.clone(),
+            is_module: header.module_system,
+            imports: implementation.imports.clone(),
+            constants: implementation.constants.clone(),
+            public: Arc::clone(&public),
+            private: private.as_ref().map(Arc::clone),
+        });
+        Ok(Self {
+            public,
+            private,
+            compiler,
+        })
     }
 
     pub(super) fn encode(
         &self,
+        budget: OleanWriteBudget,
+    ) -> Result<SourceModuleArtifact, SourceModuleBuildError> {
+        self.encode_with_compiler_signatures(budget, &[], &[])
+    }
+
+    pub(super) fn encode_with_compiler_signatures(
+        &self,
         mut budget: OleanWriteBudget,
+        public_signatures: &[CompilerSignature],
+        private_signatures: &[CompilerSignature],
     ) -> Result<SourceModuleArtifact, SourceModuleBuildError> {
         let is_module = self.private.is_some();
         // Native placement policy for self-contained companion regions. Keep
@@ -862,7 +926,9 @@ impl PendingArtifact {
         } else {
             (OLEAN_REGION_ALIGN as u64) * 2
         };
-        let public = self.public.encode(is_module, base, budget)?;
+        let public = self
+            .public
+            .encode(is_module, base, budget, public_signatures)?;
         let companions = if let Some(private) = &self.private {
             let spend = |budget: &mut OleanWriteBudget,
                          base: &mut u64,
@@ -883,9 +949,9 @@ impl PendingArtifact {
                 Ok(())
             };
             spend(&mut budget, &mut base, public.report)?;
-            let server = self.public.encode(true, base, budget)?;
+            let server = self.public.encode(true, base, budget, public_signatures)?;
             spend(&mut budget, &mut base, server.report)?;
-            let private = private.encode(true, base, budget)?;
+            let private = private.encode(true, base, budget, private_signatures)?;
             Some(SourceModuleCompanions {
                 server: server.bytes,
                 private: private.bytes,
@@ -900,6 +966,7 @@ impl PendingArtifact {
             bytes: public.bytes,
             report: public.report,
             companions,
+            compiler: Arc::clone(&self.compiler),
         })
     }
 }

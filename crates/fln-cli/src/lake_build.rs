@@ -1,5 +1,5 @@
-//! Checked TOML and native Lean package module builds. Only the Reference's `+Module:olean`
-//! facet is complete here; library defaults also require other Lean artifacts.
+//! Checked TOML and native Lean package module builds. The `+Module:ir` facet
+//! also compiles the supported source ABI; library defaults require further artifacts.
 use super::*;
 use fln::source_check::modules::persisted::{ModuleProvenance, PersistedModules};
 use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
@@ -257,9 +257,9 @@ fn plan(
                 "default target `{target}` requires Lean artifacts or executable linking that are unavailable; request +Module:olean for a declared library module"
             )));
         };
-        if facet != "olean" {
+        if !matches!(facet, "olean" | "ir") {
             return Err(Failure::unsupported(format!(
-                "facet `{facet}` is unavailable; supported module facet: +Module:olean"
+                "facet `{facet}` is unavailable; supported module facets: +Module:olean, +Module:ir"
             )));
         }
         if !module.starts_with('+') && config.targets.iter().any(|target| target.name == module) {
@@ -346,6 +346,7 @@ struct CompanionArtifacts {
 struct ModuleArtifacts {
     exported: Vec<u8>,
     companions: Option<CompanionArtifacts>,
+    ir: Option<Vec<u8>>,
 }
 
 impl ModuleArtifacts {
@@ -359,6 +360,7 @@ impl ModuleArtifacts {
                     ("olean.private", parts.private.as_slice()),
                 ]
             })
+            .chain(self.ir.iter().map(|bytes| ("ir", bytes.as_slice())))
             .chain(std::iter::once(("olean", self.exported.as_slice())))
     }
 }
@@ -376,9 +378,37 @@ struct Compilation {
     macro_reports: Vec<(Name, source_check::ModuleMacroReport)>,
 }
 
+struct CompileFacets<'a> {
+    entries: &'a [Name],
+    executable: &'a BTreeSet<Name>,
+}
+
+/// Every local dependency of an executable target also needs its own companion.
+/// Other requested admission-only targets keep their independent facet contract.
+fn executable_modules(
+    targets: &[String],
+    modules: &BTreeMap<Name, Module>,
+) -> Result<BTreeSet<Name>, Failure> {
+    let mut pending = Vec::new();
+    for target in targets {
+        if let Some((module, "ir")) = target.split_once(':') {
+            pending.push(name(module.strip_prefix('+').unwrap_or(module))?);
+        }
+    }
+    let mut executable = BTreeSet::new();
+    while let Some(name) = pending.pop() {
+        if let Some(module) = modules.get(&name)
+            && executable.insert(name)
+        {
+            pending.extend(module.imports.iter().cloned());
+        }
+    }
+    Ok(executable)
+}
+
 fn compile(
     root: &Path,
-    entries: &[Name],
+    facets: CompileFacets<'_>,
     modules: &BTreeMap<Name, Module>,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
@@ -415,7 +445,7 @@ fn compile(
         }
     }
     let mut artifact_bytes = 0usize;
-    for entry in entries {
+    for entry in facets.entries {
         let mut closure = BTreeSet::new();
         let mut seen = BTreeSet::new();
         let mut external = Vec::new();
@@ -504,13 +534,45 @@ fn compile(
                 provenance.push(row);
             }
         }
-        for artifact in built.artifacts {
+        for mut artifact in built.artifacts {
+            let ir = if facets.executable.contains(&artifact.name) {
+                let mut limits = fln::source_check::modules::SourceModuleIrLimits::new(
+                    fln::EngineExecutionLimits::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
+                );
+                limits.writer.container.max_bytes = MAX_ARTIFACT_BYTES as u64;
+                let result = artifact.compile_ir(limits).map_err(|error| {
+                    let (class, authority, _) = error.disposition();
+                    Failure {
+                        class,
+                        authority,
+                        detail: error.to_string(),
+                    }
+                })?;
+                match result {
+                    Outcome::Complete(encoded) => Some(encoded.bytes),
+                    Outcome::Inconclusive(reason) => {
+                        return Err(Failure::new(
+                            "inconclusive",
+                            format!("module IR compilation exhausted its resources: {reason:?}"),
+                        ));
+                    }
+                    Outcome::InternalFault(fault) => {
+                        return Err(Failure::new(
+                            "internal-fault",
+                            format!("module IR compilation faulted: {fault:?}"),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
             let family = ModuleArtifacts {
                 exported: artifact.bytes,
                 companions: artifact.companions.map(|parts| CompanionArtifacts {
                     server: parts.server,
                     private: parts.private,
                 }),
+                ir,
             };
             if let Some(previous) = artifacts.get(&artifact.name) {
                 if previous != &family {
@@ -593,10 +655,12 @@ fn publish_with(
         let mut relative = source_import_relative_path(name)?;
         relative.set_extension("olean");
         let path = directory.join(relative);
-        // This facet cannot regenerate executable IR or retire old companions.
-        // Refuse either case before replacing any member of any module family.
+        // Never leave an old executable or implementation companion next to a
+        // new public root. Every existing family member must be regenerated.
         for suffix in ["ir", "olean.server", "olean.private"] {
-            if suffix != "ir" && family.companions.is_some() {
+            if (suffix == "ir" && family.ir.is_some())
+                || (suffix != "ir" && family.companions.is_some())
+            {
                 continue;
             }
             let existing = path.with_extension(suffix);
@@ -720,6 +784,7 @@ fn build(
     };
     let (libraries, entries) = plan(&root, &config, &targets)?;
     let modules = load_sources(&root, &libraries, &entries)?;
+    let executable = executable_modules(&targets, &modules)?;
     let records = macro_config
         .is_none()
         .then(|| source_check::module_records(posture));
@@ -736,7 +801,10 @@ fn build(
         macro_reports,
     } = compile(
         &root,
-        &entries,
+        CompileFacets {
+            entries: &entries,
+            executable: &executable,
+        },
         &modules,
         jobs,
         posture,
@@ -749,7 +817,7 @@ fn build(
         &root,
         &config,
         &libraries,
-        &entries,
+        &targets,
         &modules,
         &artifacts,
         &output_dir,
@@ -757,6 +825,11 @@ fn build(
         posture,
         records_state,
     );
+    let executable_count = artifacts
+        .values()
+        .filter(|family| family.ir.is_some())
+        .count();
+    let facet = if executable_count == 0 { "olean" } else { "ir" };
     let output = if json {
         let paths = paths
             .iter()
@@ -827,8 +900,9 @@ fn build(
             ),
         };
         format!(
-            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":\"olean\",\"modules_built\":{},\"modules_cached\":{cached_modules},\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\",\"import_posture\":{},\"imports\":[{imports}]{configuration_imports},\"module_records\":{}{unavailable},\"modules\":[{rows}]{macro_json},{snapshot}}}\n",
+            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":{},\"modules_built\":{},\"modules_cached\":{cached_modules},\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"executable_modules\":{executable_count},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\",\"import_posture\":{},\"imports\":[{imports}]{configuration_imports},\"module_records\":{}{unavailable},\"modules\":[{rows}]{macro_json},{snapshot}}}\n",
             json_string(&config.name),
+            json_string(facet),
             artifacts.len(),
             json_string(posture.as_str()),
             json_string(records_state),
@@ -855,8 +929,13 @@ fn build(
             Ok(()) => String::new(),
             Err(reason) => format!(" The build snapshot was not written: {reason}."),
         };
+        let executable = if executable_count == 0 {
+            String::new()
+        } else {
+            format!(" and {executable_count} native .ir companions")
+        };
         format!(
-            "Built {} checked .olean modules for {} ({elaborated_modules} elaborated, {cached_modules} re-admitted from verified records; {reused_modules} module checks reused).{imports}{configuration_imports}{macros}{snapshot}\n",
+            "Built {} checked .olean modules{executable} for {} ({elaborated_modules} elaborated, {cached_modules} re-admitted from verified records; {reused_modules} module checks reused).{imports}{configuration_imports}{macros}{snapshot}\n",
             artifacts.len(),
             config.name
         )
@@ -872,7 +951,7 @@ fn record_snapshot(
     root: &Path,
     config: &LakeConfig,
     libraries: &[Library],
-    entries: &[Name],
+    targets: &[String],
     modules: &BTreeMap<Name, Module>,
     artifacts: &BTreeMap<Name, ModuleArtifacts>,
     output_dir: &Path,
@@ -911,6 +990,7 @@ fn record_snapshot(
             imports: module.imports.iter().map(Name::to_display_string).collect(),
             artifact: relative(&output_dir.join(artifact)),
             artifact_digest: snapshot::digest(&family.exported),
+            ir_digest: family.ir.as_ref().map(|bytes| snapshot::digest(bytes)),
             companions: family
                 .companions
                 .as_ref()
@@ -940,10 +1020,7 @@ fn record_snapshot(
     let text = snapshot::Snapshot {
         posture: posture.as_str().to_owned(),
         records: records.to_owned(),
-        targets: entries
-            .iter()
-            .map(|entry| format!("+{}:olean", entry.to_display_string()))
-            .collect(),
+        targets: targets.to_vec(),
         modules: rows,
         externals,
     }
@@ -1044,6 +1121,7 @@ mod publication_tests {
                 server: format!("{prefix} server").into_bytes(),
                 private: format!("{prefix} private").into_bytes(),
             }),
+            ir: None,
         }
     }
 
@@ -1120,6 +1198,37 @@ mod publication_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn executable_companion_rolls_back_with_its_publication_family() {
+        let directory = Directory::new();
+        let mut old = family("old");
+        old.ir = Some(b"old executable".to_vec());
+        let mut next = family("new");
+        next.ir = Some(b"new executable".to_vec());
+        for (part, bytes) in old.parts() {
+            std::fs::write(directory.0.join("A.olean").with_extension(part), bytes).unwrap();
+        }
+        let artifacts = BTreeMap::from([(Name::from_components(["A"]), next)]);
+        let mut failed = false;
+        let result = publish_with(&directory.0, &directory.0, &artifacts, |bytes, path| {
+            fln::publish_file_atomic(bytes, path)?;
+            if path == directory.0.join("A.olean") && !failed {
+                failed = true;
+                assert_eq!(std::fs::read(directory.0.join("A.ir"))?, b"new executable");
+                return Err(std::io::Error::other("failure after new public root"));
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        for (part, bytes) in old.parts() {
+            assert_eq!(
+                std::fs::read(directory.0.join("A.olean").with_extension(part)).unwrap(),
+                bytes
+            );
+        }
+        assert!(!directory.0.join(".fln-olean-build.lock").exists());
     }
 
     #[test]

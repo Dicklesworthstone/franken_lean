@@ -50,7 +50,7 @@
 ```bash
 # 1.0 target: a drop-in, so your project, editor and lakefile stay unchanged. Today: see "Live today" below.
 cd my-mathlib-project        # lakefile.lean, lean-toolchain, everything as-is
-lake build                   # default facets unavailable; +Module:olean builds checked TOML library modules
+lake build                   # defaults unavailable; +Module:olean checks modules, +Module:ir adds supported native IR
 code .                       # vscode-lean4 connects to the daemon and cannot tell
 
 # The Independent Judge: re-check every mathlib olean on a foreign-blooded kernel
