@@ -657,6 +657,91 @@ impl ImportContexts {
         Ok(())
     }
 
+    /// The pin can export an unsafe implementation body while keeping its
+    /// compiler-generated dependencies in the private companion. Those exact
+    /// bodies have already passed admission with their complete dependency
+    /// closure. Project only their checked entries, never their private helpers.
+    /// Their types must still be closed in the selected public world.
+    ///
+    /// The caller subsequently checks the unmodified primary artifact. Its
+    /// ordinary already-present path verifies the independent primary reading;
+    /// real exported headers and all safe bodies retain ordinary admission.
+    fn project_checked_implementations(
+        &self,
+        name: &Name,
+        public: &PublicModule,
+        engine: &mut Engine,
+        limits: OleanCheckLimits,
+        meter: &mut Meter,
+    ) -> Result<(), SourceModuleCheckError> {
+        let names: BTreeSet<_> = public
+            .decoded
+            .constants
+            .iter()
+            .map(ConstantInfo::name)
+            .collect();
+        let mut presentations = 0;
+        for constant in &public.decoded.constants {
+            let ConstantInfo::Defn(definition) = constant else {
+                continue;
+            };
+            if definition.safety == DefinitionSafety::Safe {
+                continue;
+            }
+            let entry = self
+                .declarations
+                .environment()
+                .entry(constant.name())
+                .filter(|entry| entry.declaration() == constant)
+                .ok_or_else(|| {
+                    unavailable(name, "exported implementation has no exact checked entry")
+                })?;
+            let mut references = BTreeSet::new();
+            let before = presentations;
+            crate::collect_constant_references(
+                &definition.base.type_,
+                &mut references,
+                &mut presentations,
+                limits.max_dependency_presentations,
+            )
+            .map_err(|error| match error {
+                fln_admission::ConstantReferenceCollectionError::PresentationLimit {
+                    limit,
+                    ..
+                } => SourceModuleCheckError::Limit {
+                    resource: "exported implementation type dependencies",
+                    limit,
+                },
+                fln_admission::ConstantReferenceCollectionError::AllocationFailure { .. } => {
+                    unavailable(
+                        name,
+                        "exported implementation dependency allocation refused",
+                    )
+                }
+            })?;
+            meter.work(presentations - before)?;
+            references.retain(|dependency| {
+                !names.contains(dependency) && !engine.environment().contains(dependency)
+            });
+            if !references.is_empty() {
+                return Err(SourceModuleCheckError::ImportDeclarations {
+                    module: name.clone(),
+                    error: Box::new(OleanCheckError::MissingConstants {
+                        declaration: constant.name().clone(),
+                        names: references.into_iter().collect(),
+                    }),
+                });
+            }
+            engine.environment = crate::merge_frontier_entry(engine.environment.clone(), &entry)
+                .map_err(|error| SourceModuleCheckError::ImportDeclarations {
+                    module: name.clone(),
+                    error: Box::new(error),
+                })?;
+            engine.checker_environment = None;
+        }
+        Ok(())
+    }
+
     pub(super) fn project(
         &self,
         steps: &[Step],
@@ -718,6 +803,7 @@ impl ImportContexts {
                     )
                 })?;
                 limits.admission = meter.limits.source.admission;
+                self.project_checked_implementations(name, public, &mut engine, limits, meter)?;
                 engine =
                     match engine.check_decoded_olean((*public.decoded).clone(), options, limits) {
                         Ok(Outcome::Complete(checked)) => checked.engine,
@@ -897,6 +983,9 @@ impl imported::SourceOleanImport {
         }
     }
 }
+
+#[cfg(test)]
+mod public_implementations;
 
 #[cfg(test)]
 mod tests {
