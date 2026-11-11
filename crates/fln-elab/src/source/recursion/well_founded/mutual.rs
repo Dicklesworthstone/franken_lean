@@ -22,8 +22,8 @@
 //! The canonical Nat relation retains `WellFounded.Nat.fix`; other relations use
 //! the checked `invImage` and `WellFounded.fix` construction. Fixed parameters
 //! form one common unreordered
-//! prefix (`fixedArePrefix`), including the common section closure, and identical
-//! written universe parameters. Every other recursive component is a typed refusal, never a
+//! prefix (`fixedArePrefix`), including the common section closure, and one
+//! checked universe telescope, including auto-bound universes. Every other recursive component is a typed refusal, never a
 //! partial or unsafe fallback.
 use super::*;
 use std::sync::Arc;
@@ -40,6 +40,20 @@ pub(in crate::source) enum MemberHint {
     /// `termination_by e`: the measured member, or why it could not be measured.
     /// A failure matters only if the member turns out to be recursive.
     Measured(Result<Measured, NatDefinitionElabError>),
+    /// Elaborate a written measure only after its original body has fixed the
+    /// parameter universes. This state never reaches component planning.
+    Pending(Arc<PendingMeasure>),
+}
+
+pub(in crate::source) struct PendingMeasure {
+    parameters: Vec<LocalDecl>,
+    syntax: Syntax,
+    expected: Option<Expr>,
+    aliases: Vec<Option<Name>>,
+    measure: Syntax,
+    header_parameters: usize,
+    allowed: bool,
+    locals: LocalContext,
 }
 
 #[derive(Clone)]
@@ -399,10 +413,9 @@ impl Context {
         result
     }
 
-    /// The group's body pass: record this member's hint. A measure is elaborated
-    /// in a discarded probe, at the actual parameters the well-founded engine
-    /// would bind; a recoverable failure is kept until the member's component
-    /// is known, since the pin ignores the hints of a nonrecursive definition.
+    /// Save the original parameter scope for a written measure. Body elaboration
+    /// must generalize its universe metavariables first: a cloned early probe
+    /// cannot export unresolved universe identities into the body context.
     pub(in crate::source) fn record_mutual_member_hint(
         &mut self,
         parameters: &[LocalDecl],
@@ -418,28 +431,63 @@ impl Context {
                 MemberHint::DecreasingOnly
             }
             Some(TerminationHint::WellFounded { hint, allowed }) => {
-                let mut probe = self.clone();
-                let measured = probe.measure_mutual_member(
-                    parameters,
-                    syntax,
+                // Context checkpoints share this owned source snapshot instead
+                // of repeatedly deep-cloning its syntax tree.
+                MemberHint::Pending(Arc::new(PendingMeasure {
+                    parameters: parameters.to_vec(),
+                    syntax: syntax.clone(),
                     expected,
-                    hint,
+                    aliases: hint.aliases.clone(),
+                    measure: hint.measure.ok_or_else(scope)?.clone(),
                     header_parameters,
-                    *allowed,
-                );
-                self.txn.budget.heartbeats_consumed = probe.txn.budget.heartbeats_consumed;
-                match measured {
-                    Err(problem) if !tactics::backtrack::recoverable(&problem) => {
-                        return Err(problem);
-                    }
-                    measured => MemberHint::Measured(measured),
-                }
+                    allowed: *allowed,
+                    locals: self.txn.lctx.clone(),
+                }))
             }
         };
         if let Some(state) = self.partial.as_mut() {
             state.member_hint = Some(observed);
         }
         Ok(())
+    }
+
+    /// A discarded probe shares the completed body's assignments, but restores
+    /// exactly the lexical scope in which its hint was written. Only a closed
+    /// measure and spent work escape; a recoverable failure still matters only
+    /// for a recursive component, as at the pin.
+    pub(in crate::source) fn finish_mutual_member_hint(
+        &mut self,
+    ) -> Result<MemberHint, NatDefinitionElabError> {
+        let hint = self
+            .partial
+            .as_mut()
+            .and_then(|state| state.member_hint.take())
+            .unwrap_or(MemberHint::None);
+        let MemberHint::Pending(pending) = hint else {
+            return Ok(hint);
+        };
+        let mut probe = self.clone();
+        probe.txn.lctx = pending.locals.clone();
+        let hint = Hint {
+            aliases: pending.aliases.clone(),
+            measure: Some(&pending.measure),
+            decreasing: None,
+            inferred: None,
+            guess: Guess::None,
+        };
+        let measured = probe.measure_mutual_member(
+            &pending.parameters,
+            &pending.syntax,
+            pending.expected.clone(),
+            &hint,
+            pending.header_parameters,
+            pending.allowed,
+        );
+        self.txn.budget.heartbeats_consumed = probe.txn.budget.heartbeats_consumed;
+        match measured {
+            Err(problem) if !tactics::backtrack::recoverable(&problem) => Err(problem),
+            measured => Ok(MemberHint::Measured(measured)),
+        }
     }
 
     fn measure_mutual_member(

@@ -214,13 +214,7 @@ fn elaborate_with_meter(
             Some(&mut definition.value),
         )?;
         universes.push((context.level_params.clone(), context.explicit_levels));
-        hints.push(
-            context
-                .partial
-                .as_ref()
-                .and_then(|state| state.member_hint.clone())
-                .unwrap_or(MemberHint::None),
-        );
+        hints.push(context.finish_mutual_member_hint()?);
         meter.txn.budget = context.txn.budget;
         bodies.push(definition);
     }
@@ -302,7 +296,6 @@ fn elaborate_with_meter(
                 bodies: &bodies,
                 hints: &hints,
                 headers: &headers,
-                level_names: level_names.as_deref().unwrap_or_default(),
             };
             let structural = component
                 .iter()
@@ -390,7 +383,6 @@ struct Parts<'a> {
     bodies: &'a [DefinitionVal],
     hints: &'a [MemberHint],
     headers: &'a [ConstantVal],
-    level_names: &'a [Name],
 }
 
 /// Build every component against one below dictionary, then publish the fully checked
@@ -693,7 +685,6 @@ fn mutual_well_founded(
         bodies,
         hints,
         headers,
-        level_names,
     } = *parts;
     let unsupported = |shape| {
         failure(SourceInferenceError::Recursion(
@@ -727,6 +718,7 @@ fn mutual_well_founded(
                 return Err(unsupported("an incomplete set of termination_by measures"));
             }
             MemberHint::Structural => return Err(unsupported("structural mutual recursion")),
+            MemberHint::Pending(_) => return Err(failure(SourceInferenceError::Scope)),
         }
     }
     // Codomains and the selected relation are checked by the shared planner,
@@ -756,7 +748,7 @@ fn mutual_well_founded(
         }
     }
     let levels = bodies[component[0]].base.level_params.clone();
-    let written_levels: Vec<_> = levels
+    let header_levels: Vec<_> = levels
         .iter()
         .filter(|level| {
             !group
@@ -767,13 +759,29 @@ fn mutual_well_founded(
         .cloned()
         .collect();
     for &index in component {
-        if headers[index].level_params != level_names
-            || written_levels != level_names
-            || bodies[index].base.level_params != levels
+        if headers[index].level_params != header_levels || bodies[index].base.level_params != levels
         {
-            return Err(unsupported(
-                "universe parameters written identically on every member",
-            ));
+            return Err(unsupported("one universe telescope for all members"));
+        }
+    }
+    // Headers and bodies were elaborated independently. Equal parameter names
+    // alone do not establish a common universe telescope: each recursive call
+    // must instantiate its peer at those same levels. In particular, never
+    // silently replace a polymorphic call's instantiation when packing it into
+    // the single shared fixpoint. Both checked executable companions retain
+    // the complete original terms and their universe applications.
+    let recursive_levels: Vec<_> = levels.iter().cloned().map(Level::param).collect();
+    for &index in component {
+        for root in [&bodies[index].base.type_, &bodies[index].value] {
+            map(meter, root, &|_, expr| {
+                if let ExprNode::Const { name, levels } = expr.node()
+                    && component.iter().any(|&target| names[target] == *name)
+                    && levels != &recursive_levels
+                {
+                    return Err(unsupported("polymorphic recursive calls"));
+                }
+                Ok(None)
+            })?;
         }
     }
     let component_names: Vec<_> = component
