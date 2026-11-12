@@ -23,6 +23,10 @@ struct Package(PathBuf);
 
 impl Package {
     fn new(config: &str) -> Self {
+        Self::with_configuration("lakefile.toml", config)
+    }
+
+    fn with_configuration(file: &str, config: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
             "fln-lake-executable-{}-{}",
             std::process::id(),
@@ -30,7 +34,7 @@ impl Package {
         ));
         std::fs::create_dir_all(&path).unwrap();
         let package = Self(path);
-        package.write("lakefile.toml", config);
+        package.write(file, config);
         package
     }
 
@@ -139,6 +143,21 @@ const CONFIG: &str = concat!(
     "srcDir = \"application\"\n",
 );
 
+const LEAN_CONFIG: &str = r#"import Lake
+open System Lake DSL
+def entryName (suffix : String) : Lean.Name :=
+  Lean.Name.str (Lean.Name.str Lean.Name.anonymous "App") suffix
+package program where
+  srcDir := FilePath.mk ("s" ++ "rc")
+  buildDir := FilePath.mk "artifacts"
+lean_lib Core where
+  roots := #[`Shared]
+  srcDir := FilePath.mk ("lib" ++ "rary")
+@[default_target] lean_exe runner where
+  root := entryName "Main"
+  srcDir := FilePath.mk ("appli" ++ "cation")
+"#;
+
 const LIBRARY: &str = concat!(
     "prelude\nimport Init.System.IO\n",
     "def Shared.decorate (value : String) : String := \"prefix:\" ++ value\n",
@@ -205,6 +224,94 @@ fn configured_root_library_directory_and_raw_argv_match_the_reference() {
     let alias = native.run(&["exec", "runner", "alias"], Some(reference));
     assert_eq!(alias.status.code(), Some(7), "{alias:?}");
     assert_eq!(text(&alias.stdout), "prefix:alias\n");
+}
+
+#[test]
+fn checked_lean_configuration_computes_executable_roots_and_refuses_invalid_values() {
+    let _guard = serial_execution();
+    let Some(reference) = reference() else {
+        return;
+    };
+    let package = Package::with_configuration("lakefile.lean", LEAN_CONFIG);
+    let oracle = Package::with_configuration("lakefile.lean", LEAN_CONFIG);
+    for package in [&package, &oracle] {
+        package.write("src/library/Shared.lean", LIBRARY);
+        package.write("src/application/App/Main.lean", MAIN);
+    }
+
+    let presence = package.run(&["check-build"], Some(reference));
+    assert!(presence.status.success(), "{presence:?}");
+    let unavailable = package.run(&["build"], Some(reference));
+    assert_eq!(unavailable.status.code(), Some(1), "{unavailable:?}");
+    assert!(
+        text(&unavailable.stderr).contains("default library and executable facets are unavailable"),
+        "{unavailable:?}",
+    );
+    let output = package.run(&["exe", "runner", "computed"], Some(reference));
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    assert_eq!(text(&output.stdout), "prefix:computed\n", "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(!package.0.join("artifacts").exists());
+
+    let oracle = Command::new(&reference.lake)
+        .arg("--dir")
+        .arg(&oracle.0)
+        .args(["exe", "runner", "computed"])
+        .env("LEAN_PATH", &reference.lib)
+        .output()
+        .unwrap();
+    assert_eq!(oracle.status.code(), output.status.code(), "{oracle:?}");
+    assert_eq!(oracle.stdout, output.stdout, "{oracle:?}");
+
+    package.write(
+        "src/application/App/Other.lean",
+        "prelude\nimport Shared\ndef main : IO UInt32 := do\n  IO.println \"other\"\n  pure 11\n",
+    );
+    package.write(
+        "lakefile.lean",
+        &LEAN_CONFIG.replace("root := entryName \"Main\"", "root := entryName \"Other\""),
+    );
+    let changed = package.run(&["exe", "runner"], Some(reference));
+    assert_eq!(changed.status.code(), Some(11), "{changed:?}");
+    assert_eq!(text(&changed.stdout), "other\n", "{changed:?}");
+    assert!(changed.stderr.is_empty(), "{changed:?}");
+
+    for invalid in [
+        LEAN_CONFIG.replace("root := entryName \"Main\"", "root := (42 : Nat)"),
+        LEAN_CONFIG.replace(
+            "root := entryName \"Main\"",
+            "root := Lean.Name.str Lean.Name.anonymous \"../escape\"",
+        ),
+        LEAN_CONFIG.replace(
+            "root := entryName \"Main\"",
+            "root := Lean.Name.num Lean.Name.anonymous 1",
+        ),
+        format!("{LEAN_CONFIG}lean_exe other where\n  root := entryName \"Main\"\n  srcDir := \"other\"\n"),
+        LEAN_CONFIG.replace(
+            "srcDir := FilePath.mk (\"appli\" ++ \"cation\")",
+            "srcDir := FilePath.mk (\"appli\" ++ \"cation\")\n  moreLinkArgs := #[\"-unexpected\"]",
+        ),
+    ] {
+        package.write("lakefile.lean", &invalid);
+        let refused = package.run(&["exe", "runner", "must not print"], Some(reference));
+        assert_eq!(refused.status.code(), Some(1), "{invalid}\n{refused:?}");
+        assert!(refused.stdout.is_empty(), "{invalid}\n{refused:?}");
+        assert!(!package.0.join("artifacts").exists());
+    }
+    package.write("lakefile.lean", LEAN_CONFIG);
+    let repaired = package.run(&["exe", "runner", "repaired"], Some(reference));
+    assert_eq!(repaired.status.code(), Some(7), "{repaired:?}");
+    assert_eq!(text(&repaired.stdout), "prefix:repaired\n", "{repaired:?}");
+
+    let default = Package::with_configuration(
+        "lakefile.lean",
+        "import Lake\nopen Lake DSL\npackage defaulted\nlean_exe Main\n",
+    );
+    default.write("Main.lean", "def main : IO Unit := IO.println \"default-root\"\n");
+    let output = default.run(&["exe", "Main"], Some(reference));
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(text(&output.stdout), "default-root\n", "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[test]
@@ -342,6 +449,37 @@ fn unknown_targets_and_undeclared_source_imports_are_refused() {
     let library = package.run(&["exe", "Loose"], None);
     assert_eq!(library.status.code(), Some(1), "{library:?}");
     assert!(text(&library.stderr).contains("unknown executable"), "{library:?}");
+}
+
+#[test]
+fn executable_targets_cannot_alias_the_same_root_module() {
+    let config = format!(
+        "{SIMPLE_CONFIG}[[lean_exe]]\nname = \"other\"\nroot = \"Main\"\nsrcDir = \"other\"\n",
+    );
+    let package = Package::new(&config);
+    package.write("Main.lean", "prelude\n");
+    let refused = package.run(&["exe", "runner"], None);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(
+        text(&refused.stderr).contains("share root module `Main`"),
+        "{refused:?}",
+    );
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+
+    // Only the selected executable is read. Distinct, unused targets need not
+    // have source files before this program can reach its main check.
+    package.write(
+        "lakefile.toml",
+        &format!(
+            "{SIMPLE_CONFIG}[[lean_exe]]\nname = \"other\"\nroot = \"Other\"\nsrcDir = \"other\"\n",
+        ),
+    );
+    let distinct = package.run(&["exe", "runner"], None);
+    assert_eq!(distinct.status.code(), Some(1), "{distinct:?}");
+    assert!(
+        text(&distinct.stderr).contains("unknown executable declaration `main`"),
+        "{distinct:?}",
+    );
 }
 
 #[test]

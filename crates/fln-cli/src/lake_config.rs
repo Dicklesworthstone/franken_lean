@@ -1,8 +1,8 @@
-//! Native `package` / `lean_lib` configuration for checked module builds.
+//! Native `package`, `lean_lib` and `lean_exe` configuration for checked builds and execution.
 //!
 //! Lake's commands elaborate field terms at their declared types, then its loader evaluates
 //! the resulting configurations (`Lake/DSL/DeclUtil.lean`, `Lake/Load/Lean/Eval.lean`). This
-//! adapter implements that order for the supported library fields. It never executes Lake's
+//! adapter implements that order for supported target fields. It never executes Lake's
 //! upstream elaborator, interprets an expression as a Rust string, or invents a FilePath type.
 //! The field declarations and the user's definitions are admitted together against the real
 //! `Init.System.FilePath` import world. Only selected field values then enter Golem.
@@ -35,8 +35,9 @@ const LAKE_COMMANDS: [&str; 10] = [
 enum ConfigSlot {
     Source,
     Build,
-    Library(usize),
+    TargetSource(usize),
     LibraryRoots(usize),
+    ExecutableRoot(usize),
 }
 
 #[derive(Debug)]
@@ -161,18 +162,18 @@ impl Tokens {
             Some(TokenKind::Ident(name)) if !name.is_anonymous() => Ok(name.to_display_string()),
             Some(TokenKind::Literal(LiteralKind::Str)) => {
                 let value = self.spelling(at).and_then(decode_string).ok_or_else(|| {
-                    Failure::input("lakefile.lean: malformed package or library name")
+                    Failure::input("lakefile.lean: malformed package or target name")
                 })?;
                 if value.is_empty() {
                     return Err(Failure::input(
-                        "lakefile.lean: an empty package or library name",
+                        "lakefile.lean: an empty package or target name",
                     ));
                 }
                 // A string denotes one Name component, as expandIdentOrStrAsIdent does.
                 Ok(Name::str(Name::anonymous(), value).to_display_string())
             }
             _ => Err(Failure::unsupported(
-                "lakefile.lean: package and lean_lib currently require an explicit name",
+                "lakefile.lean: package and targets currently require an explicit name",
             )),
         }
     }
@@ -364,30 +365,30 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
         let (head, attributes) = tokens.head()?;
         let keyword = tokens.spelling(head).unwrap_or("");
         if LAKE_COMMANDS.contains(&keyword) {
-            if !matches!(keyword, "package" | "lean_lib") {
+            if !matches!(keyword, "package" | "lean_lib" | "lean_exe") {
                 return Err(Failure::unsupported(format!(
                     "lakefile.lean: `{keyword}` configuration is not implemented"
                 )));
             }
             if !dsl_open || scope_depth != 0 {
                 return Err(Failure::unsupported(
-                    "lakefile.lean: package and lean_lib must be at top level after `open Lake DSL`",
+                    "lakefile.lean: package and targets must be at top level after `open Lake DSL`",
                 ));
             }
             let mut default_target = false;
             for attribute in attributes {
-                if keyword != "lean_lib"
+                if !matches!(keyword, "lean_lib" | "lean_exe")
                     || attribute.len() != 1
                     || tokens.spelling(attribute.start) != Some("default_target")
                 {
                     return Err(Failure::unsupported(
-                        "lakefile.lean: only @[default_target] on lean_lib is supported",
+                        "lakefile.lean: only @[default_target] on lean_lib and lean_exe is supported",
                     ));
                 }
                 default_target = true;
             }
             let declaration = tokens.name(head + 1)?;
-            let library = if keyword == "package" {
+            let target = if keyword == "package" {
                 if !parsed.config.name.is_empty() {
                     return Err(Failure::input(
                         "lakefile.lean: multiple package declarations",
@@ -397,7 +398,9 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                 None
             } else {
                 if parsed.config.name.is_empty() {
-                    return Err(Failure::input("lakefile.lean: lean_lib precedes package"));
+                    return Err(Failure::input(format!(
+                        "lakefile.lean: {keyword} precedes package"
+                    )));
                 }
                 // The existing module planner accepts textual path components only.
                 name(&declaration)?;
@@ -409,13 +412,17 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                 if parsed.config.targets.len() >= MAX_MODULES {
                     return Err(Failure::new(
                         "resource",
-                        "lakefile.lean exceeds 256 libraries",
+                        "lakefile.lean exceeds 256 targets",
                     ));
                 }
                 let index = parsed.config.targets.len();
                 parsed.config.targets.push(LakeTarget {
                     name: declaration.clone(),
-                    kind: TargetKind::Library,
+                    kind: if keyword == "lean_exe" {
+                        TargetKind::Executable
+                    } else {
+                        TargetKind::Library
+                    },
                     roots: vec![declaration.clone()],
                     src_dir: None,
                 });
@@ -426,11 +433,16 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
             };
             let declaration_column = tokens.column(0).min(tokens.column(head));
             for (field, expression) in fields(command, &tokens, head + 2, declaration_column)? {
-                let slot = match (library, field.as_str()) {
+                let slot = match (target, field.as_str()) {
                     (None, "srcDir") => ConfigSlot::Source,
                     (None, "buildDir") => ConfigSlot::Build,
-                    (Some(index), "srcDir") => ConfigSlot::Library(index),
-                    (Some(index), "roots") => ConfigSlot::LibraryRoots(index),
+                    (Some(index), "srcDir") => ConfigSlot::TargetSource(index),
+                    (Some(index), "roots") if keyword == "lean_lib" => {
+                        ConfigSlot::LibraryRoots(index)
+                    }
+                    (Some(index), "root") if keyword == "lean_exe" => {
+                        ConfigSlot::ExecutableRoot(index)
+                    }
                     _ => {
                         return Err(Failure::unsupported(format!(
                             "lakefile.lean: `{keyword}` field `{field}` is not implemented"
@@ -442,6 +454,7 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                     .map_err(|_| Failure::input("lakefile.lean: expression is not UTF-8"))?;
                 let type_ = match slot {
                     ConfigSlot::LibraryRoots(_) => "_root_.Array _root_.Lean.Name",
+                    ConfigSlot::ExecutableRoot(_) => "_root_.Lean.Name",
                     _ => "_root_.System.FilePath",
                 };
                 parsed.program.push_str(&format!(
@@ -665,6 +678,10 @@ fn evaluate(
                 "def {projection} : _root_.Array _root_.Lean.Name := _root_.{}",
                 field.declaration
             ),
+            ConfigSlot::ExecutableRoot(_) => format!(
+                "def {projection} : _root_.Array _root_.Lean.Name := #[_root_.{}]",
+                field.declaration
+            ),
             _ => format!(
                 "def {projection} : _root_.String := _root_.System.FilePath.toString _root_.{}",
                 field.declaration
@@ -682,11 +699,27 @@ fn evaluate(
                 }
             })?;
         let execution = complete(execution, &field.label)?;
-        if let ConfigSlot::LibraryRoots(index) = field.slot {
-            // Replace the default even for #[]; absence and an explicit empty
-            // root set are different Lake configurations.
-            parsed.config.targets[index].roots = module_roots(&execution.exit, &field.label)?;
-            continue;
+        match field.slot {
+            ConfigSlot::LibraryRoots(index) => {
+                // Replace the default even for #[]; absence and an explicit empty
+                // root set are different Lake configurations.
+                parsed.config.targets[index].roots = module_roots(&execution.exit, &field.label)?;
+                continue;
+            }
+            ConfigSlot::ExecutableRoot(index) => {
+                // This typed singleton projection reuses the structural Name observer.
+                // Display strings never decide a root's module/path identity.
+                let roots = module_roots(&execution.exit, &field.label)?;
+                if roots.len() != 1 {
+                    return Err(Failure::new(
+                        "internal-fault",
+                        "executable root projection did not return exactly one Name",
+                    ));
+                }
+                parsed.config.targets[index].roots = roots;
+                continue;
+            }
+            _ => {}
         }
         let value = match &execution.exit {
             fln::VmExit::Returned(_) => match fln::closed_vm_value(&execution.exit) {
@@ -713,10 +746,13 @@ fn evaluate(
         match field.slot {
             ConfigSlot::Source => parsed.config.src_dir = path,
             ConfigSlot::Build => parsed.config.build_dir = path,
-            ConfigSlot::Library(index) => parsed.config.targets[index].src_dir = Some(path),
-            ConfigSlot::LibraryRoots(_) => unreachable!("root arrays were read above"),
+            ConfigSlot::TargetSource(index) => parsed.config.targets[index].src_dir = Some(path),
+            ConfigSlot::LibraryRoots(_) | ConfigSlot::ExecutableRoot(_) => {
+                unreachable!("module roots were read above")
+            }
         }
     }
+    validate_executable_roots(&parsed.config)?;
     Ok(parsed.config)
 }
 

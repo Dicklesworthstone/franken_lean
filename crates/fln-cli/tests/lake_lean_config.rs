@@ -256,7 +256,7 @@ fn checked_lean_configuration_builds_real_modules_and_refuses_atomically() {
             "srcDir := ◆ \"second\"",
             "srcDir := ◆ \"second\"\n  moreLeanArgs := #[\"--unexpected\"]",
         ),
-        format!("{changed_config}\nlean_exe Main\n"),
+        format!("{changed_config}\nlean_exe Main where\n  moreLinkArgs := #[\"-unexpected\"]\n"),
         changed_config
             .replace(
                 "package native where",

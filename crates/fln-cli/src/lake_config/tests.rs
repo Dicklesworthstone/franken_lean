@@ -26,7 +26,7 @@ fn native_lake_config_keeps_roots_as_typed_lean_expressions() {
     let parsed = parse(source).unwrap_or_else(|error| panic!("{}", error.detail));
     assert_eq!(parsed.fields.len(), 3);
     assert!(matches!(parsed.fields[0].slot, ConfigSlot::LibraryRoots(0)));
-    assert!(matches!(parsed.fields[1].slot, ConfigSlot::Library(0)));
+    assert!(matches!(parsed.fields[1].slot, ConfigSlot::TargetSource(0)));
     assert!(matches!(parsed.fields[2].slot, ConfigSlot::LibraryRoots(1)));
     let program = parsed.program.split_whitespace().collect::<String>();
     for (index, expression) in [(0, "names"), (2, "#[]")] {
@@ -39,6 +39,25 @@ fn native_lake_config_keeps_roots_as_typed_lean_expressions() {
     // defaults, including when the resulting array is explicitly empty.
     assert_eq!(parsed.config.targets[0].roots, ["Bundle"]);
     assert_eq!(parsed.config.targets[1].roots, ["Empty"]);
+}
+
+#[test]
+fn native_lake_config_keeps_executable_roots_typed_and_defaults_to_the_target_name() {
+    let source = b"import Lake\nopen Lake DSL\ndef selected : Lean.Name := `App.Main\npackage p\n@[default_target] lean_exe runner where\n  srcDir := System.FilePath.mk (\"ap\" ++ \"p\")\n  root := selected\nlean_exe Other\n";
+    let parsed = parse(source).unwrap_or_else(|error| panic!("{}", error.detail));
+    assert_eq!(parsed.config.default_targets, ["runner"]);
+    assert_eq!(parsed.config.targets[0].kind, TargetKind::Executable);
+    assert_eq!(parsed.config.targets[0].roots, ["runner"]);
+    assert_eq!(parsed.config.targets[1].kind, TargetKind::Executable);
+    assert_eq!(parsed.config.targets[1].roots, ["Other"]);
+    assert_eq!(parsed.fields.len(), 2);
+    assert!(matches!(parsed.fields[0].slot, ConfigSlot::TargetSource(0)));
+    assert!(matches!(parsed.fields[1].slot, ConfigSlot::ExecutableRoot(0)));
+    let program = parsed.program.split_whitespace().collect::<String>();
+    assert!(program.contains(&format!(
+        "def{}:_root_.Lean.Name:=(selected)",
+        parsed.fields[1].declaration
+    )));
 }
 
 #[test]
@@ -68,7 +87,11 @@ fn native_lake_config_comments_strings_and_nested_terms_are_not_commands() {
 #[test]
 fn native_lake_config_refuses_unimplemented_build_semantics() {
     for body in [
-        "package p\nlean_exe Main\n",
+        "package p\nlean_exe Main where\n  moreLinkArgs := #[\"-unexpected\"]\n",
+        "package p\nlean_exe Main where\n  roots := #[`Main]\n",
+        "package p\nlean_lib Main where\n  root := `Main\n",
+        "package p\nlean_lib Main\nlean_exe Main\n",
+        "lean_exe Main\npackage p\n",
         "package p\nrequire dep from git \"https://example.test/dep\"\n",
         "package p\nscript hi := return 0\n",
         "package p where\n  moreLeanArgs := #[\"--foo\"]\nlean_lib P\n",

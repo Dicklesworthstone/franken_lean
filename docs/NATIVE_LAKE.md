@@ -97,14 +97,15 @@ Without explicit fields, package `srcDir` is `.`, `buildDir` is `.lake/build`,
 and library `srcDir` is `.`. When both configuration files exist, TOML retains
 precedence.
 
-The native adapter handles `import Lake`, `package` and `lean_lib` itself.
+The native adapter handles `import Lake`, `package`, `lean_lib`, and `lean_exe` itself.
 It loads the real pinned `Init.System.FilePath` artifact closure using the
 selected import posture; that closure must be available through `LEAN_PATH`
 or the installed pinned toolchain. Every ordinary declaration and generated
 field definition is checked before any configuration expression executes.
 Directory fields have the actual `System.FilePath` type, including the imported
-String coercion; `roots` has type `Array Lean.Name`. Only the selected directory
-fields' String projections and roots arrays execute on Golem;
+String coercion; library `roots` has type `Array Lean.Name`, and executable
+`root` has type `Lean.Name`. Only the selected directory fields' String
+projections and structural name projections execute on Golem;
 unused closed definitions are checked but are not evaluated. No upstream Lake
 elaborator or loader executes, and no replacement logical FilePath is seeded.
 Names are read component by component, so the single quoted component `«A.B»`
@@ -115,10 +116,13 @@ and 64 KiB of aggregate returned text. Execution budget exhaustion remains
 inconclusive rather than being accepted as an empty configuration.
 
 This configuration slice supports the ordinary `import Lake` header,
-top-level `package` and `lean_lib` after `open Lake DSL`, package `srcDir` and
-`buildDir`, and library `srcDir` and `roots`. Layout `where` fields and empty configurations
-are supported. Additional imports, commands such as `require`, `lean_exe` or
-scripts, other fields, arbitrary declaration attributes,
+top-level `package`, `lean_lib`, and `lean_exe` after `open Lake DSL`, package
+`srcDir` and `buildDir`, library `srcDir` and `roots`, and executable `srcDir`
+and `root`. An executable's default root is its target name. Executable targets
+must have distinct roots, even when their source directories differ.
+`@[default_target]` also accepts executable targets. Layout `where` fields and
+empty configurations are supported. Additional imports, commands such as
+`require` or scripts, other fields, arbitrary declaration attributes,
 same-line field separators, and trailing local `where` declarations are
 explicitly refused. All configured directories must remain within the package.
 Bad types, invalid later declarations, unsafe execution, or failed evaluation
@@ -205,6 +209,61 @@ imported environment, so a module under the implicit `Init` pays for the reused
 `Init` closure even when nothing changed. `--import-posture recheck` elaborates
 every module and reads and writes no record.
 
+### Running declared executables
+
+`lake exe TARGET [ARGS...]` and its `lake exec` alias run a declared
+`lean_exe` through the checked native Golem pipeline. The target may come from
+`lakefile.toml` or the supported typed `lakefile.lean` configuration slice.
+The entry source path combines package `srcDir`, target `srcDir`, and the
+target's exact hierarchical root module name.
+
+For example:
+
+```toml
+name = "native_program"
+srcDir = "src"
+
+[[lean_exe]]
+name = "runner"
+root = "App.Main"
+srcDir = "application"
+```
+
+Place this program in `src/application/App/Main.lean`:
+
+```lean
+def main (args : List String) : IO UInt32 := do
+  for value in args do
+    IO.println value
+  pure 7
+```
+
+With the pinned imports available, `lake exe runner --help "" "hello world"`
+passes those three arguments to the program and preserves its nonzero status.
+Every word after the target belongs to the program, including `--`, option-like
+arguments, empty strings, and Unicode. Lake options, including `--dir`,
+`--jobs`, `--import-posture`, `--fln-max-steps`, and `--fln-max-frames`, must
+precede the target. Invalid UTF-8 and oversized argv are refused before any
+Lean configuration is evaluated.
+
+Local dependencies must belong to declared libraries with their configured
+roots and source directories. Loose source files and other executable targets
+do not become ambient libraries. The captured source closure goes through the
+same import admission, module checking, and `main` contract as `lean --run`.
+Implicit `Init` is loaded for ordinary files. Changes to local dependencies
+are checked on the next invocation. A failed dependency prevents `main` from
+running; completed frontend output precedes the single `main` invocation.
+
+Supported entry types are `IO Unit`, `IO UInt32`, and either of those with
+one `List String` argument. Existing compiler, runtime-capability, and resource
+limits still apply. VM exhaustion remains an inconclusive result.
+
+This route executes source and does not emit a linked binary or a Lake build
+snapshot. It inherits the caller's working directory and environment; Lake's
+augmented subprocess environment is not installed. Native executable build
+facets, linking, dependency fetching, and full Lake configuration remain
+outside this execution path.
+
 ### Executable module companions
 
 `lake build +Module:ir` additionally compiles native executable IR for that
@@ -225,6 +284,7 @@ public import Init.Notation
 public def Demo.choose (flag : Bool) (left right : Nat) : Nat :=
   if flag then left else right
 public def Demo.increment (n : Nat) : Nat := Nat.add n 1
+public opaque Demo.answer : Nat := 42
 ```
 
 With the pinned imports available, `lake build +Demo:ir` produces executable
@@ -243,11 +303,18 @@ pure body compilable. Unsupported definitions refuse the entire facet before
 any existing output is replaced. Explicit noncomputable definitions and
 theorem bodies need no executable entries.
 
+Safe opaque definitions use their checked private implementation for code
+generation while their logical declarations remain opaque. Compilation rechecks
+the body through a fresh private alias, preserves the original exported ABI,
+and never publishes that alias or changes the declaration's logical
+transparency. Downstream execution consumes the emitted `.ir`; logical
+consumers still cannot unfold the opaque body with `rfl`.
+
 This remains a bounded compiler facet. Legacy modules require IR embedded in
-their `.olean` and are refused here. Opaque definitions, unsafe or partial
-exports, definitions carrying executable-replacement or extern attributes,
-unsupported source carriers, and cyclic control flow are also refused. Native
-object-code generation, linking, and executable targets remain unavailable.
+their `.olean` and are refused here. Unsafe or partial exports, definitions
+carrying executable-replacement or extern attributes, unsupported source
+carriers, and cyclic control flow are also refused. Native object-code
+generation, linking, and executable build facets remain unavailable.
 
 The JSON report uses `fln.lake-build/2`, identifies `ir` when executable
 companions are produced and otherwise `olean`, and lists every emitted path.
@@ -279,7 +346,7 @@ is reported as non-authoritative failure, never as successful compilation.
 
 Bare `lake build` of a library still refuses: its default `leanArts` facet also
 requires products such as `.ilean` and additional compiler outputs. Executable
-targets and native linking, dependency fetching, custom globs, custom compiler
+build facets and native linking, dependency fetching, custom globs, custom compiler
 options, Lake configuration outside the slice above, and native
 extension metadata without a pinned export encoding remain unsupported.
 Unsupported TOML build settings are rejected rather than silently ignored.
@@ -326,8 +393,8 @@ or check package sources, freshness, or artifacts. Empty or omitted
 not a default target. Human success is silent. The native JSON extension labels
 its check `default-target-presence`. Additional target arguments are rejected.
 
-The same checked native Lean configuration slice serves `check-build` and
-`build`; unsupported configuration is never replaced with metadata guessed
+The same checked native Lean configuration slice serves `check-build`,
+`build`, and `exe`; unsupported configuration is never replaced with metadata guessed
 from its directory name. Supported declarative `lakefile.toml` configuration
 remains available. Malformed default-target array elements are rejected, not
 silently filtered out.
@@ -369,3 +436,11 @@ trees, emitted artifacts decode and can be imported by a separate client, and
 invalid configuration preserves previous outputs. The companion internal
 configuration test bounds Golem instructions so accidentally evaluating an
 unused ten-million-step computation fails, while the selected fields complete.
+
+`crates/fln-cli/tests/lake_executable.rs` exercises installed Golem execution,
+computed Lean executable roots and source directories, raw argv, local source
+changes, output ordering, main types, exit status, import failures, and
+nonpublication. Pin-dependent cases include actual Reference Lake consumers;
+configuration controls retain type, name, duplicate-root, safety, and resource
+refusals. The module artifact suite additionally checks opaque IR execution,
+logical opacity in both readers, cache stability, and unsafe-export rollback.

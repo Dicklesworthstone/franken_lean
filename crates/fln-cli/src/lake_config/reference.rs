@@ -122,31 +122,39 @@ lean_lib Empty where
   roots := #[]
 lean_lib Literals where
   roots := #[`Literal.Root, `Other]
+@[default_target] lean_exe runner where
+  srcDir := FilePath.mk ("ap" ++ "p")
+  root := libraryRoot ("Ma" ++ "in")
 "#;
     let config = configured(&engine, declarations, limits)
         .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
     assert_eq!(config.src_dir, PathBuf::from("src/lean"));
     assert_eq!(config.build_dir, PathBuf::from(".lake/native"));
     assert_eq!(config.targets[0].src_dir, Some(PathBuf::from("proofs")));
-    assert_eq!(config.default_targets, ["Demo"]);
+    assert_eq!(config.default_targets, ["Demo", "runner"]);
     assert_eq!(
         config.targets[0].roots,
         ["Demo.Extra", "Other", "Demo.Extra"]
     );
     assert!(config.targets[1].roots.is_empty());
     assert_eq!(config.targets[2].roots, ["Literal.Root", "Other"]);
+    assert_eq!(config.targets[3].kind, TargetKind::Executable);
+    assert_eq!(config.targets[3].roots, ["Demo.Main"]);
+    assert_eq!(config.targets[3].src_dir, Some(PathBuf::from("app")));
 
     // A field-free ordinary package retains Lake's defaults without evaluating
     // even one of the user's closed definitions.
     let default = configured(
         &engine,
-        "import Lake\nopen Lake DSL\npackage bare\n@[default_target] lean_lib Bare\n",
+        "import Lake\nopen Lake DSL\npackage bare\n@[default_target] lean_lib Bare\nlean_exe Main\n",
         limits,
     )
     .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
     assert_eq!(default.src_dir, PathBuf::from("."));
     assert_eq!(default.build_dir, PathBuf::from(".lake/build"));
     assert_eq!(default.targets[0].roots, ["Bare"]);
+    assert_eq!(default.targets[1].kind, TargetKind::Executable);
+    assert_eq!(default.targets[1].roots, ["Main"]);
 
     for source in [
         "import Lake\nopen Lake DSL\npackage bad where\n  srcDir := (42 : Nat)\nlean_lib Bad\n",
@@ -154,6 +162,8 @@ lean_lib Literals where
         "import Lake\nopen Lake DSL\npackage bad where\n  srcDir := \"src\"\ndef invalidUnused : Nat := \"wrong\"\nlean_lib Bad\n",
         "import Lake\nopen Lake DSL\npackage bad\nlean_lib Bad where\n  roots := (#[1] : Array Nat)\n",
         "import Lake\nopen Lake DSL\npackage bad where\n  srcDir := \"src\"\nlean_lib Bad where\n  roots := (42 : Nat)\n",
+        "import Lake\nopen Lake DSL\npackage bad\nlean_exe runner where\n  root := (#[`Main] : Array Lean.Name)\n",
+        "import Lake\nopen Lake DSL\npackage bad\nlean_exe runner where\n  root := (42 : Nat)\n",
     ] {
         let error = configured(&engine, source, limits).unwrap_err();
         assert_eq!(error.class, "elaboration", "{}", error.detail);
@@ -164,6 +174,8 @@ lean_lib Literals where
         "import Lake\nopen Lake DSL\n@[extern \"foreign_lake_path\"] def foreignPath : System.FilePath := System.FilePath.mk \"src\"\npackage bad where\n  srcDir := foreignPath\nlean_lib Bad\n",
         "import Lake\nopen Lake DSL\nunsafe def unsafeRoots : Array Lean.Name := #[Lean.Name.str Lean.Name.anonymous \"Bad\"]\npackage bad\nlean_lib Bad where\n  roots := unsafeRoots\n",
         "import Lake\nopen Lake DSL\n@[extern \"foreign_lake_roots\"] def foreignRoots : Array Lean.Name := #[Lean.Name.str Lean.Name.anonymous \"Bad\"]\npackage bad\nlean_lib Bad where\n  roots := foreignRoots\n",
+        "import Lake\nopen Lake DSL\nunsafe def unsafeRoot : Lean.Name := `Main\npackage bad\nlean_exe runner where\n  root := unsafeRoot\n",
+        "import Lake\nopen Lake DSL\n@[extern \"foreign_lake_root\"] def foreignRoot : Lean.Name := `Main\npackage bad\nlean_exe runner where\n  root := foreignRoot\n",
     ] {
         assert!(configured(&engine, source, limits).is_err());
     }
@@ -207,14 +219,32 @@ lean_lib Literals where
             "quoted or special module-name components",
         ),
     ] {
-        let source = format!(
-            "import Lake\nopen Lake DSL\npackage invalid\nlean_lib Invalid where\n  roots := #[{expression}]\n"
-        );
-        let error = configured(&engine, &source, limits).unwrap_err();
-        assert_eq!(error.class, "unsupported", "{expression}: {}", error.detail);
-        assert!(error.detail.contains(diagnostic), "{}", error.detail);
-        assert!(!error.authority);
+        for (command, field, value) in [
+            ("lean_lib", "roots", format!("#[{expression}]")),
+            ("lean_exe", "root", expression.to_owned()),
+        ] {
+            let source = format!(
+                "import Lake\nopen Lake DSL\npackage invalid\n{command} Invalid where\n  {field} := {value}\n"
+            );
+            let error = configured(&engine, &source, limits).unwrap_err();
+            assert_eq!(error.class, "unsupported", "{expression}: {}", error.detail);
+            assert!(error.detail.contains(diagnostic), "{}", error.detail);
+            assert!(!error.authority);
+        }
     }
+
+    // Executable root identity is checked after evaluating the typed fields.
+    // Distinct names and directories do not make the same module two targets.
+    let conflicting = "import Lake\nopen Lake DSL\ndef entry : Lean.Name := Lean.Name.str Lean.Name.anonymous (\"Ma\" ++ \"in\")\npackage invalid\nlean_exe Main\nlean_exe runner where\n  srcDir := \"other\"\n  root := entry\n";
+    let error = configured(&engine, conflicting, limits).unwrap_err();
+    assert_eq!(error.class, "input", "{}", error.detail);
+    assert!(error.detail.contains("share root module `Main`"), "{}", error.detail);
+    assert!(!error.authority);
+    let distinct = conflicting.replace("(\"Ma\" ++ \"in\")", "(\"Ot\" ++ \"her\")");
+    let config = configured(&engine, &distinct, limits)
+        .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
+    assert_eq!(config.targets[0].roots, ["Main"]);
+    assert_eq!(config.targets[1].roots, ["Other"]);
 
     assert_root_bounds(&engine, limits);
 
@@ -226,6 +256,14 @@ lean_lib Literals where
     let error = configured(
         &engine,
         "import Lake\nopen Lake DSL\npackage bounded\nlean_lib Bounded where\n  roots := #[Lean.Name.str Lean.Name.anonymous \"Actual\"]\n",
+        exhausted,
+    )
+    .unwrap_err();
+    assert_eq!(error.class, "inconclusive", "{}", error.detail);
+    assert!(!error.authority);
+    let error = configured(
+        &engine,
+        "import Lake\nopen Lake DSL\npackage bounded\nlean_exe runner where\n  root := `Main\n",
         exhausted,
     )
     .unwrap_err();

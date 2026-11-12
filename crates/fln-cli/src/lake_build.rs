@@ -211,14 +211,40 @@ fn config(root: &Path) -> Result<LakeConfig, Failure> {
     let bytes = read_bounded(&path, 64 * 1024, "Lake configuration")?;
     let text =
         std::str::from_utf8(&bytes).map_err(|_| Failure::input("lakefile.toml is not UTF-8"))?;
-    LakeConfig::parse_toml_for_build(text).map_err(|error| {
+    let config = LakeConfig::parse_toml_for_build(text).map_err(|error| {
         let class = if matches!(error, fln_lake::LakeParseError::UnsupportedBuildSetting(_)) {
             "unsupported"
         } else {
             "input"
         };
         Failure::new(class, error.to_string())
-    })
+    })?;
+    validate_executable_roots(&config)?;
+    Ok(config)
+}
+
+/// Lake rejects executable targets that claim the same root module, even when
+/// their target names or source directories differ.
+fn validate_executable_roots(config: &LakeConfig) -> Result<(), Failure> {
+    let mut roots = BTreeMap::new();
+    for target in &config.targets {
+        if target.kind != TargetKind::Executable {
+            continue;
+        }
+        let [root] = target.roots.as_slice() else {
+            return Err(Failure::input(
+                "an executable must have exactly one root module",
+            ));
+        };
+        let module = name(root)?;
+        if let Some(previous) = roots.insert(module, &target.name) {
+            return Err(Failure::input(format!(
+                "executable targets `{previous}` and `{}` share root module `{root}`",
+                target.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn library_sources(root: &Path, config: &LakeConfig) -> Result<Vec<Library>, Failure> {

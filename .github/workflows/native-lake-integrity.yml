@@ -121,12 +121,16 @@ jobs:
           printf '%s\n' "$ELAN_HOME/bin" >> "$GITHUB_PATH"
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Check typed executable and library configurations
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p fln-cli --lib lake_build::lean_config --no-fail-fast -- --nocapture --test-threads=1
       - name: Execute configured programs, dependency changes, argv and exit status
         if: ${{ !cancelled() }}
         run: cargo test --locked -p fln-cli --test lake_executable --no-fail-fast -- --nocapture --test-threads=1
       - name: Verify artifact interchange, opacity, rollback and command compatibility
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p fln-cli --test lake_module_build --test lake_build_session --test cli_personalities_and_verbs --no-fail-fast -- --nocapture --test-threads=1
+        run: cargo test --locked -p fln-cli --test lake_module_build --test lake_build_session --test lake_lean_config --test cli_personalities_and_verbs --no-fail-fast -- --nocapture --test-threads=1
       - name: Preserve existing installed Lean main execution
         if: ${{ !cancelled() }}
         run: |
