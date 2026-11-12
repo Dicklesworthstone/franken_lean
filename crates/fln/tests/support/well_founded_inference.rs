@@ -120,9 +120,6 @@ const REFUSALS: &[&str] = &[
     "def bad (n : Nat) (xs : List Nat) : Nat := if h : 0 < n then bad 0 (0 :: xs) else 0\ndecreasing_by\n  have copied : List Nat := xs\n  exact h",
     // This bounded supplied-script path cannot skip earlier non-Nat SizeOf candidates.
     "def unsupportedLeadingSizeOf (xs : List Nat) (n : Nat) : Nat := if h : 0 < n then unsupportedLeadingSizeOf (0 :: xs) 0 else 0\ndecreasing_by exact h",
-    // The pin's search also tries `n - i` for the hypothesis `i < n` (accepted there,
-    // `termination_by (b, n - i)`); this one does not.
-    "def needsDifference (i n b : Nat) : Nat := if hb : 0 < b then needsDifference i n (b - 1) else if h : i < n then needsDifference (i + 1) n b else 0",
     // Both measure selection and the final relation honor instance shadowing.
     "def bad [SizeOf Nat] (n : Nat) : Nat := if h : 0 < n then bad 0 else 0\ndecreasing_by exact h",
     "local instance : SizeOf Nat := ⟨fun _ => 0⟩\ndef bad (n : Nat) : Nat := if h : 0 < n then bad 0 else 0\ndecreasing_by exact h",
@@ -275,6 +272,113 @@ pub(super) fn assert_omitted_result_types(base: &Engine) {
         ),
         "a non-decreasing definition must be refused semantically: {error:?}"
     );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+pub(super) fn assert_complex_measures(base: &Engine) {
+    let root = base.logical_root(&KVMap::new());
+    let mut failures = Vec::new();
+    for (definition, application) in [
+        (
+            "def countUp (i n : Nat) : Nat := if h : i < n then countUp (i + 1) n + 1 else 0",
+            "countUp 0 42",
+        ),
+        (
+            "def negatedBound (i n : Nat) : Nat := if h : n ≤ i then 0 else negatedBound (i + 1) n + 1",
+            "negatedBound 0 42",
+        ),
+        (
+            "def greaterBound (i n : Nat) : Nat := if h : n > i then greaterBound (i + 1) n + 1 else 0",
+            "greaterBound 0 42",
+        ),
+        (
+            "def duplicateBounds (i n : Nat) : Nat := if h : i < n then if again : i < n then duplicateBounds (i + 1) n + 1 else 0 else 0",
+            "duplicateBounds 0 42",
+        ),
+        (
+            "def remainingDistance (i n : Nat) : Nat := if h : 0 < n - i then remainingDistance (i + 1) n + 1 else 0",
+            "remainingDistance 0 42",
+        ),
+        (
+            // The direct b prefix decreases the first call; n - i handles the second.
+            "def needsDifference (i n b : Nat) : Nat := if hb : 0 < b then needsDifference i n (b - 1) + 1 else if h : i < n then needsDifference (i + 1) n b + 1 else 0",
+            "needsDifference 0 40 2",
+        ),
+        (
+            // Here b grows at the second call: select n - i first, then retry b only
+            // on the remaining first call. Dropping failed simple candidates is wrong.
+            "def resetCounter (i n b : Nat) : Nat := if hb : 0 < b then resetCounter i n (b - 1) + 1 else if h : i < n then resetCounter (i + 1) n 3 + 1 else 0",
+            "resetCounter 0 9 6",
+        ),
+    ] {
+        let source = format!("{definition}\ndef answer : Nat := {application}");
+        match base.execute_source_definitions(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            EngineExecutionLimits::new(super::limits().kernel),
+        ) {
+            Ok(result) => {
+                let result = result
+                    .into_complete()
+                    .expect("complex-measure computation finishes");
+                let values: Vec<_> = result
+                    .executions
+                    .iter()
+                    .filter_map(|execution| {
+                        fln::closed_vm_value(&execution.exit).expect("normal native VM exit")
+                    })
+                    .collect();
+                assert_eq!(values, vec![ClosedVmValue::Scalar(42)], "{source}");
+            }
+            Err(error) => failures.push(format!("{source}\n{error:?}")),
+        }
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    for source in [
+        // A useful comparison in the context is not itself a termination proof.
+        "def noProgress (i n : Nat) : Nat := if h : i < n then noProgress i n else 0",
+        "def movingBound (i n : Nat) : Nat := if h : i < n then movingBound (i + 1) (n + 1) else 0",
+        // The pin's n - i guess does not strictly decrease at the inclusive endpoint.
+        "def inclusiveBound (i n : Nat) : Nat := if h : i ≤ n then inclusiveBound (i + 1) n else 0",
+        // A branch-local bound cannot become a captured definition-wide measure.
+        "def localBound (i : Nat) : Nat := let n := i + 1; if h : i < n then localBound (i + 1) else 0",
+        // An explicit measure and proof remain authoritative; inference cannot replace them.
+        "def wrongMeasure (i n : Nat) : Nat := if h : i < n then wrongMeasure (i + 1) n else 0\ntermination_by i",
+        "def wrongProof (i n : Nat) : Nat := if h : i < n then wrongProof (i + 1) n else 0\ntermination_by n - i\ndecreasing_by exact h",
+    ] {
+        match base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(super::limits()),
+        ) {
+            Ok(_) => failures.push(format!("incorrectly accepted: {source}")),
+            Err(error)
+                if format!("{error:?}").contains("Frontend(Parse(")
+                    || matches!(
+                        error.disposition().0,
+                        "resource" | "inconclusive" | "internal-fault"
+                    ) =>
+            {
+                failures.push(format!("expected a semantic refusal: {source}\n{error:?}"));
+            }
+            Err(_) => {}
+        }
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    // `assumption` can unfold this semireducible alias, but the pin's default
+    // omega fragment leaves it opaque. A checked shortcut must retain that limit.
+    let hidden_bound = b"def hiddenBound (i n : Nat) : Prop := i < n\ninstance hiddenBoundDec (i n : Nat) : Decidable (hiddenBound i n) := Nat.decLt i n\ndef hiddenRec (i n : Nat) : Nat := if h : hiddenBound i n then hiddenRec (i + 1) n else 0\ntermination_by n - i";
+    match base.check_source_files(
+        &[hidden_bound],
+        &KVMap::new(),
+        SourceCheckLimits::new(super::limits()),
+    ) {
+        Err(problem) if format!("{problem:?}").contains("ArithmeticNoContradiction") => {}
+        result => failures.push(format!(
+            "an opaque bound must reach and fail the ordinary decreasing proof: {result:?}"
+        )),
+    }
     assert_eq!(base.logical_root(&KVMap::new()), root);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

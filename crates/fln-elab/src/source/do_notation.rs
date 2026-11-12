@@ -426,16 +426,17 @@ impl Context {
         if syntax.kind() == Some(&parser_kind(&["Term", "doIf"])) {
             return nest_else_ifs(syntax);
         }
-        // `leftArrow doElemParser` with a `doIf`/`doMatch` (`let x ← if …`, `x ← match …`): the
-        // pin compiles that element as the one-element sequence of `let x ← do if …`
-        // (`doSeqToCode [doElem]`), so it becomes that nested sequence, which shares the
-        // surrounding control scope.
+        // `leftArrow doElemParser`: the pin compiles a compound element as a one-element
+        // nested sequence (`doSeqToCode [doElem]`), sharing the surrounding control scope.
+        // This pass is postorder: an ordinary try has already become `doExpr`, whereas a
+        // try containing a return or loop exit retains the `nativeDoTry` control marker.
         if (syntax.kind() == Some(&parser_kind(&["Term", "doIdDecl"]))
             || syntax.kind() == Some(&parser_kind(&["Term", "doPatDecl"])))
             && matches!(&syntax, Syntax::Node { args, .. }
             if args.get(3).is_some_and(|element| {
                 element.kind() == Some(&parser_kind(&["Term", "doIf"]))
                     || element.kind() == Some(&parser_kind(&["Term", "doMatch"]))
+                    || element.kind() == Some(&parser_kind(&["Term", "nativeDoTry"]))
             }))
         {
             if pattern {
@@ -523,7 +524,7 @@ impl Context {
     /// The monad application a `do` block's expected type names, as the pin's `extractMonadInfo`
     /// finds it (`Lean/Elab/Do/Basic.lean:743-757`): an application `m α` whose argument is a
     /// type (`splitMonadApp?`, `:313-318`); otherwise `whnfCore`, then a metavariable head (a
-    /// monad still unknown), then one `unfoldDefinition?` step, each tried again. `None` is the
+    /// fresh unknown monad/result), then one `unfoldDefinition?` step, each tried again. `None` is the
     /// pin's refusal. The block is elaborated at the application found, so an alias of `IO Nat`
     /// elaborates its statements in `IO`. A full WHNF instead would unfold `IO Nat` past its
     /// application, through `EIO` and `EStateM`, to the function type underneath. Whether the
@@ -551,13 +552,40 @@ impl Context {
                 continue;
             }
             if matches!(operators::spine(&type_).0.node(), ExprNode::MVar { .. }) {
-                return Ok(Some(type_));
+                // `?Result action` is an unknown result, not a monad applied
+                // to a type: action was rejected by splitMonadApp above. Keep
+                // that ordering even for a family ending in a type parameter.
+                return self.do_unknown_monad_type().map(Some);
             }
             match self.unfold_head_definition(&type_)? {
                 Some(unfolded) => type_ = unfolded,
                 None => return Ok(None),
             }
         }
+    }
+
+    /// The pin's `mkUnknownMonadResult`: separate well-kinded holes for
+    /// `m : Type u → Type v` and `α : Type u`. The caller checks the block
+    /// against `m α` and retains any original expected type as an obligation.
+    pub(super) fn do_unknown_monad_type(&mut self) -> Result<Expr, NatDefinitionElabError> {
+        let domain = Expr::sort(
+            self.level()?
+                .succ()
+                .map_err(|_| failure(SourceInferenceError::Scope))?,
+        );
+        let codomain = Expr::sort(
+            self.level()?
+                .succ()
+                .map_err(|_| failure(SourceInferenceError::Scope))?,
+        );
+        let monad = self.hole(Expr::forall_e(
+            Name::anonymous(),
+            domain.clone(),
+            codomain,
+            BinderInfo::Default,
+        ))?;
+        let result = self.hole(domain)?;
+        Ok(Expr::app(monad, result))
     }
 
     /// The pin's `isType`: the argument's type reduces to a sort. An argument whose type is not

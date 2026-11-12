@@ -4,6 +4,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/imported-ir-reference.yml'
+      - 'crates/fln-admission/src/reuse.rs'
       - 'crates/fln/src/imported_ir.rs'
       - 'crates/fln/src/imported_ir/**'
       - 'crates/fln/src/imported_macros.rs'
@@ -57,6 +58,12 @@ jobs:
           git rev-parse 'HEAD^{tree}' > target/imported-ir-reference/tree.txt
           rustup show active-toolchain
           rustc -Vv > target/imported-ir-reference/rustc.txt
+      - name: Check cancellable import reconstruction
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-admission --lib reuse -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/import-cancellation.log
       - name: Check native Syntax runtime
         shell: bash
         run: |
@@ -99,6 +106,20 @@ jobs:
         run: |
           set -uo pipefail
           status=0
+          cargo test --locked -p fln --lib source_check::modules::reuse -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/import-reuse.log || status=1
+          cargo test --locked -p fln-vm --test float_arrays -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/float-array-vm.log || status=1
+          cargo test --locked -p fln-vm -p fln-unsafe-abi --lib float_array -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/float-array-boundary.log || status=1
+          cargo test --locked -p fln-parse --test macro_body_construction -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/macro-construction-parser.log || status=1
+          cargo test --locked --no-fail-fast -p fln \
+            --test source_notation --test source_module_grammar -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/macro-construction-source.log || status=1
+          cargo test --locked -p fln --test source_mutual_well_founded \
+            inferred_mutual -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/mutual-inference.log || status=1
           cargo test --locked -p fln --lib imported_ir:: -- --nocapture \
             2>&1 | tee target/imported-ir-reference/tests.log || status=1
           cargo test --locked -p fln --test source_imported_syntax_methods -- --nocapture \
@@ -117,9 +138,12 @@ jobs:
           python3 -I -S scripts/extract/gen_macro_runtime_contract.py \
             --lean "$FLN_REFERENCE_LEAN" --check \
             2>&1 | tee target/imported-ir-reference/macro-contract.log || status=1
-          cargo clippy --locked -p fln -p fln-cli --lib --tests -- -D warnings \
+          cargo clippy --locked -p fln-admission -p fln -p fln-cli --lib --tests -- -D warnings \
             2>&1 | tee target/imported-ir-reference/clippy.log || status=1
-          files=(crates/fln/src/imported_ir/constructor_updates.rs
+          files=(crates/fln-admission/src/reuse.rs
+            crates/fln/src/source_check/modules/reuse.rs
+            crates/fln/src/source_check/modules/reuse/composed_tests.rs
+            crates/fln/src/imported_ir/constructor_updates.rs
             crates/fln/src/lib.rs
             crates/fln/src/imported_ir/native_signature.rs
             crates/fln/src/source_records/equation_theorems.rs

@@ -191,10 +191,10 @@ impl DoScopes {
         })
     }
 
-    /// `leftArrow doElemParser` (`doIdDecl`, `doPatDecl`, `nestedAction`): an `if` or `match` right
-    /// after a `←` is a do element, not a term. `doIf`'s `withPositionAfterLinebreak` anchors it at
-    /// its own column after a line break, and otherwise at the enclosing sequence's position, which
-    /// a bracket's `withoutPosition` clears.
+    /// `leftArrow doElemParser` (`doIdDecl`, `doPatDecl`, `nestedAction`): an `if`, `match` or
+    /// `try` right after a `←` is a do element, not a term. `withPositionAfterLinebreak`
+    /// anchors it at its own column after a line break, and otherwise at the enclosing
+    /// sequence's position, which a bracket's `withoutPosition` clears.
     pub(super) fn arrow_element(
         &self,
         view: &SourceView,
@@ -204,7 +204,9 @@ impl DoScopes {
     ) -> Option<usize> {
         if at == 0
             || !(is_symbol(tokens, at - 1, "←") || is_symbol(tokens, at - 1, "<-"))
-            || !(is_symbol(tokens, at, "if") || is_symbol(tokens, at, "match"))
+            || !(is_symbol(tokens, at, "if")
+                || is_symbol(tokens, at, "match")
+                || is_symbol(tokens, at, "try"))
         {
             return None;
         }

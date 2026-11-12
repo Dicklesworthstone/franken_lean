@@ -13,6 +13,7 @@ pub(super) struct Export {
     pub(super) declarations: Vec<Declaration>,
     extensions: Vec<ExtensionSuffix>,
     private: Option<Box<Export>>,
+    source_import: bool,
 }
 fn extension_error(
     module: &Name,
@@ -50,6 +51,21 @@ impl Export {
     /// roots continue to use the exported interface. Both follow normal replay.
     pub(super) fn with_private(mut self, private: Self) -> Self {
         self.private = Some(Box::new(private));
+        self
+    }
+
+    /// Source-file state and imported state differ for local simp erasures.
+    /// Mark only completed source modules, preserving the raw journal for
+    /// persisted re-admission and leaving mid-file and foreign replay intact.
+    pub(super) fn for_source_imports(mut self) -> Self {
+        let mut current = &mut self;
+        loop {
+            current.source_import = true;
+            let Some(private) = &mut current.private else {
+                break;
+            };
+            current = private;
+        }
         self
     }
 
@@ -167,6 +183,7 @@ impl Export {
             declarations,
             extensions,
             private: None,
+            source_import: false,
         })
     }
 
@@ -250,6 +267,18 @@ impl Export {
                     return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
                         "source-modules/replay-extension",
                     )));
+                }
+                if self.source_import
+                    && fln_elab::source::scope::simp::export::supports(&suffix.descriptor)
+                    && !fln_elab::source::scope::simp::export::persistent_source_entry(
+                        &engine.environment,
+                        entry,
+                    )
+                    .map_err(|_| {
+                        extension_error(module, name, "invalid source simp export entry")
+                    })?
+                {
+                    continue;
                 }
                 engine.environment = engine
                     .environment

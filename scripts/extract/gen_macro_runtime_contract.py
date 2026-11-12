@@ -22,6 +22,7 @@ CONSTRUCTORS = {
     "SYNTAX_NODE": "Lean.Syntax.node",
     "SYNTAX_ATOM": "Lean.Syntax.atom",
     "SYNTAX_IDENT": "Lean.Syntax.ident",
+    "SYNTAX_RANGE": "Lean.Syntax.Range.mk",
     "SUBSTRING_RAW": "Substring.Raw.mk",
     "PRERESOLVED_NAMESPACE": "Lean.Syntax.Preresolved.namespace",
     "PRERESOLVED_DECL": "Lean.Syntax.Preresolved.decl",
@@ -42,20 +43,67 @@ SCALARS = {
 FUNCTIONS = {
     "NAME_MK_STR1": "nameMkStr1",
     "NAME_STR": "nameStr",
+    "NAME_HAS_MACRO_SCOPES": "nameHasMacroScopes",
+    "NAME_ERASE_MACRO_SCOPES": "nameEraseMacroScopes",
     "ADD_MACRO_SCOPE": "addMacroScope",
     "MACRO_ADD_MACRO_SCOPE": "macroAddMacroScope",
     "SYNTAX_IS_OF_KIND": "syntaxIsOfKind",
     "SYNTAX_GET_ARG": "syntaxGetArg",
     "SYNTAX_GET_NUM_ARGS": "syntaxGetNumArgs",
+    "SYNTAX_IS_NODE_OF": "syntaxIsNodeOf",
+    "SYNTAX_MATCHES_NULL": "syntaxMatchesNull",
+    "SYNTAX_MATCHES_IDENT": "syntaxMatchesIdent",
+    "SYNTAX_MATCHES_LIT": "syntaxMatchesLit",
+    "SYNTAX_GET_OPTIONAL": "syntaxGetOptional",
+    "SYNTAX_MK_LIT": "syntaxMkLit",
+    "SYNTAX_MK_STR_LIT": "syntaxMkStrLit",
+    "SYNTAX_IS_LIT": "syntaxIsLit",
+    "SYNTAX_IS_STR_LIT": "syntaxIsStrLit",
+    "TSYNTAX_GET_STRING": "tSyntaxGetString",
+    "SYNTAX_MK_CHAR_LIT": "syntaxMkCharLit",
+    "SYNTAX_IS_CHAR_LIT": "syntaxIsCharLit",
+    "TSYNTAX_GET_CHAR": "tSyntaxGetChar",
+    "SYNTAX_MK_NUM_LIT": "syntaxMkNumLit",
+    "SYNTAX_MK_NAT_LIT": "syntaxMkNatLit",
+    "SYNTAX_IS_NAT_LIT": "syntaxIsNatLit",
+    "TSYNTAX_GET_NAT": "tSyntaxGetNat",
+    "NAT_REPR_FAST": "natReprFast",
     "SYNTAX_GET_KIND": "syntaxGetKind",
     "SYNTAX_SET_KIND": "syntaxSetKind",
     "SYNTAX_GET_ARGS": "syntaxGetArgs",
+    "SYNTAX_GET_SEP_ARGS": "syntaxGetSepArgs",
+    "MK_SEP_ARRAY": "mkSepArray",
+    "SYNTAX_MK_SEP": "syntaxMkSep",
+    "SEP_ARRAY_GET_ELEMS": "sepArrayGetElems",
+    "TSEP_ARRAY_GET_ELEMS": "tSepArrayGetElems",
+    "SEP_ARRAY_OF_ELEMS": "sepArrayOfElems",
+    "TSEP_ARRAY_PUSH": "tSepArrayPush",
     "SYNTAX_SET_ARGS": "syntaxSetArgs",
     "SYNTAX_SET_ARG": "syntaxSetArg",
     "SYNTAX_IS_ATOM": "syntaxIsAtom",
     "SYNTAX_GET_ATOM_VAL": "syntaxGetAtomVal",
     "SYNTAX_SET_ATOM_VAL": "syntaxSetAtomVal",
     "SYNTAX_GET_HEAD_INFO": "syntaxGetHeadInfo",
+    "SYNTAX_GET_INFO": "syntaxGetInfo",
+    "SYNTAX_GET_HEAD_INFO_OPTIONAL": "syntaxGetHeadInfoOptional",
+    "SYNTAX_GET_RANGE": "syntaxGetRange",
+    "SYNTAX_HAS_MISSING": "syntaxHasMissing",
+    "SYNTAX_REPRINT": "syntaxReprint",
+    "SOURCE_INFO_GET_POS": "sourceInfoGetPos",
+    "SOURCE_INFO_GET_TAIL_POS": "sourceInfoGetTailPos",
+    "SYNTAX_GET_POS": "syntaxGetPos",
+    "SYNTAX_GET_TAIL_POS": "syntaxGetTailPos",
+    "SOURCE_INFO_FROM_REF": "sourceInfoFromRef",
+    "MK_ATOM": "mkAtom",
+    "MK_ATOM_FROM": "mkAtomFrom",
+    "MK_IDENT": "mkIdent",
+    "MK_IDENT_FROM": "mkIdentFrom",
+    "MK_CIDENT": "mkCIdent",
+    "MK_CIDENT_FROM": "mkCIdentFrom",
+    "REPLACE_REF": "replaceRef",
+    "MACRO_THROW_ERROR": "macroThrowError",
+    "MACRO_THROW_ERROR_AT": "macroThrowErrorAt",
+    "MACRO_THROW_UNSUPPORTED": "macroThrowUnsupported",
     "SYNTAX_SET_INFO": "syntaxSetInfo",
     "SYNTAX_IS_MISSING": "syntaxIsMissing",
     "SYNTAX_IS_IDENT": "syntaxIsIdent",
@@ -64,6 +112,50 @@ FUNCTIONS = {
     "MACRO_HAS_DECL": "macroHasDecl",
     "MACRO_RESOLVE_NAMESPACE": "macroResolveNamespace",
     "MACRO_RESOLVE_GLOBAL_NAME": "macroResolveGlobalName",
+}
+
+FORWARDED_FUNCTIONS = {
+    "nameHasMacroScopes": "Lean.Name.hasMacroScopes",
+    "nameEraseMacroScopes": "Lean.Name.eraseMacroScopes",
+    "syntaxIsNodeOf": "Lean.Syntax.isNodeOf",
+    "syntaxMatchesNull": "Lean.Syntax.matchesNull",
+    "syntaxMatchesIdent": "Lean.Syntax.matchesIdent",
+    "syntaxMatchesLit": "Lean.Syntax.matchesLit",
+    "syntaxGetOptional": "Lean.Syntax.getOptional?",
+    "syntaxGetSepArgs": "Lean.Syntax.getSepArgs",
+    "mkSepArray": "Lean.mkSepArray",
+    "syntaxMkSep": "Lean.Syntax.mkSep",
+    "sepArrayGetElems": "Lean.Syntax.SepArray.getElems._redArg",
+    "tSepArrayGetElems": "Lean.Syntax.TSepArray.getElems._redArg",
+    "sepArrayOfElems": "Lean.Syntax.SepArray.ofElems",
+    "tSepArrayOfElems": "Lean.Syntax.SepArray.ofElems",
+    "tSepArrayPush": "Lean.Syntax.TSepArray.push._redArg",
+    "syntaxMkLit": "Lean.Syntax.mkLit",
+    "syntaxMkStrLit": "Lean.Syntax.mkStrLit",
+    "syntaxIsLit": "Lean.Syntax.isLit?",
+    "syntaxIsStrLit": "Lean.Syntax.isStrLit?",
+    "tSyntaxGetString": "Lean.TSyntax.getString",
+    "syntaxMkCharLit": "Lean.Syntax.mkCharLit",
+    "syntaxIsCharLit": "Lean.Syntax.isCharLit?",
+    "tSyntaxGetChar": "Lean.TSyntax.getChar",
+    "syntaxMkNumLit": "Lean.Syntax.mkNumLit",
+    "syntaxMkNatLit": "Lean.Syntax.mkNatLit",
+    "syntaxIsNatLit": "Lean.Syntax.isNatLit?",
+    "tSyntaxGetNat": "Lean.TSyntax.getNat",
+    "natReprFast": "Nat.reprFast",
+    "syntaxGetInfo": "Lean.Syntax.getInfo?",
+    "syntaxGetHeadInfoOptional": "Lean.Syntax.getHeadInfo?",
+    "syntaxGetRange": "Lean.Syntax.getRange?",
+    "syntaxHasMissing": "Lean.Syntax.hasMissing",
+    "syntaxReprint": "Lean.Syntax.reprint",
+    "mkIdent": "Lean.mkIdent",
+    "mkIdentFrom": "Lean.mkIdentFrom",
+    "mkCIdent": "Lean.mkCIdent",
+    "mkCIdentFrom": "Lean.mkCIdentFrom",
+    "replaceRef": "Lean.replaceRef",
+    "macroThrowError": "Lean.Macro.throwError._redArg",
+    "macroThrowErrorAt": "Lean.Macro.throwErrorAt._redArg",
+    "macroThrowUnsupported": "Lean.Macro.throwUnsupported._redArg",
 }
 
 
@@ -96,6 +188,23 @@ def generate(lean):
         name_str[3],
     ) is None:
         raise ValueError("Name.str constructor wrapper does not forward the reviewed override")
+    # Generic MacroM error helpers compile to reduced-arity runtime functions.
+    # Require a direct forwarding body with the same parameter order, so the
+    # wrapper's extracted ABI cannot silently describe another callable.
+    for wrapper, callee in FORWARDED_FUNCTIONS.items():
+        forwarded = re.search(
+            rf"(?m)^    def FrankenLean\.MacroLayout\.{wrapper} (.*?) : (\w+) :=\n"
+            r"(.*?)(?=^    def |^\[|\Z)", trace, re.S,
+        )
+        if forwarded is None:
+            raise ValueError(f"missing native forwarding wrapper: {wrapper}")
+        parameters = re.findall(r"\((x_\d+) : (?:@& )?\w+\)", forwarded[1])
+        arguments = " ".join(re.escape(parameter) for parameter in parameters)
+        if not parameters or re.fullmatch(
+            rf"\s*let (x_\d+) : {re.escape(forwarded[2])} := {re.escape(callee)} "
+            rf"{arguments};\s*ret \1\s*", forwarded[3],
+        ) is None:
+            raise ValueError(f"native wrapper is not the reviewed direct forwarder: {wrapper}")
     layouts = {}
     pattern = r"ctor_(\d+)(?:\.(\d+)\.(\d+))?\[([^\]]+)\]([^;\n]*);"
     for match in re.finditer(pattern, trace):
@@ -134,6 +243,96 @@ def generate(lean):
         ])
     for constant, tag in scalars.items():
         lines.append(f"pub const {constant}: usize = {tag};")
+    # Range fields remain arbitrary Nat objects at runtime. Extract their
+    # positions from the compiler's getters rather than assuming source order.
+    for function, constant in [
+        ("syntaxRangeStart", "SYNTAX_RANGE_START_FIELD"),
+        ("syntaxRangeStop", "SYNTAX_RANGE_STOP_FIELD"),
+    ]:
+        getter = re.search(
+            rf"(?m)^    def FrankenLean\.MacroLayout\.{function} \((x_\d+) : @& obj\) : tobj :=\n"
+            r"(.*?)(?=^    def |^\[|\Z)", trace, re.S,
+        )
+        if getter is None:
+            raise ValueError(f"missing Syntax.Range getter: {function}")
+        projection = re.fullmatch(
+            rf"\s*let (x_\d+) : tobj := proj\[(\d+)\] {re.escape(getter[1])};\s*inc \1;\s*ret \1\s*", getter[2],
+        )
+        if projection is None:
+            raise ValueError(f"Syntax.Range getter is not one object projection: {function}")
+        field = int(projection[2])
+        if field >= layouts[CONSTRUCTORS["SYNTAX_RANGE"]][1]:
+            raise ValueError(f"Syntax.Range getter is outside the extracted layout: {function}")
+        lines.extend(["", f"pub const {constant}: usize = {field};"])
+    # Derive positional fields from the pin's compiled pattern projections.
+    # SourceInfo positions are erased Nat values, not host-width integers.
+    for function, constant, constructor in [
+        ("sourceOriginalPos", "SOURCE_ORIGINAL_POS_FIELD", "SOURCE_ORIGINAL"),
+        ("sourceOriginalTailPos", "SOURCE_ORIGINAL_TAIL_POS_FIELD", "SOURCE_ORIGINAL"),
+        ("sourceSyntheticPos", "SOURCE_SYNTHETIC_POS_FIELD", "SOURCE_SYNTHETIC"),
+        ("sourceSyntheticTailPos", "SOURCE_SYNTHETIC_TAIL_POS_FIELD", "SOURCE_SYNTHETIC"),
+    ]:
+        getter = re.search(
+            rf"(?m)^    def FrankenLean\.MacroLayout\.{function} \((x_\d+) : @& tobj\) : tobj :=\n"
+            r"(.*?)(?=^    def |^\[|\Z)", trace, re.S,
+        )
+        if getter is None:
+            raise ValueError(f"missing SourceInfo getter: {function}")
+        projection = re.fullmatch(
+            rf"\s*case {re.escape(getter[1])} : tobj of\s*"
+            rf"{re.escape(CONSTRUCTORS[constructor])} →\s*"
+            rf"let (x_\d+) : tobj := proj\[(\d+)\] {re.escape(getter[1])};\s*inc \1;\s*ret \1\s*"
+            r"default →\s*let (x_\d+) : tagged := 0;\s*ret \3\s*", getter[2],
+        )
+        if projection is None:
+            raise ValueError(f"SourceInfo getter is not the reviewed projection: {function}")
+        field = int(projection[2])
+        if field >= layouts[CONSTRUCTORS[constructor]][1]:
+            raise ValueError(f"SourceInfo getter is outside the extracted layout: {function}")
+        lines.extend(["", f"pub const {constant}: usize = {field};"])
+    for function, constant in [
+        ("sourceOriginalLeading", "SOURCE_ORIGINAL_LEADING_FIELD"),
+        ("sourceOriginalTrailing", "SOURCE_ORIGINAL_TRAILING_FIELD"),
+    ]:
+        getter = re.search(
+            rf"(?m)^    def FrankenLean\.MacroLayout\.{function} \((x_\d+) : @& tobj\) : obj :=\n"
+            r"(.*?)(?=^    def |^\[|\Z)", trace, re.S,
+        )
+        if getter is None:
+            raise ValueError(f"missing SourceInfo trivia getter: {function}")
+        projection = re.fullmatch(
+            rf"\s*case {re.escape(getter[1])} : tobj of\s*Lean\.SourceInfo\.original →\s*"
+            rf"let (x_\d+) : obj := proj\[(\d+)\] {re.escape(getter[1])};\s*inc \1;\s*ret \1\s*"
+            r"default →\s*let (x_\d+) : obj := FrankenLean\.MacroLayout\.\w+\._closed_\d+;\s*inc \3;\s*ret \3\s*",
+            getter[2],
+        )
+        if projection is None:
+            raise ValueError(f"SourceInfo trivia getter is not the reviewed projection: {function}")
+        field = int(projection[2])
+        if field >= layouts[CONSTRUCTORS["SOURCE_ORIGINAL"]][1]:
+            raise ValueError(f"SourceInfo trivia getter is outside the extracted layout: {function}")
+        lines.extend(["", f"pub const {constant}: usize = {field};"])
+    canonical = re.search(
+        r"(?m)^    def FrankenLean\.MacroLayout\.sourceSyntheticCanonical \((x_\d+) : @& tobj\) : u8 :=\n"
+        r"(.*?)(?=^    def |^\[|\Z)", trace, re.S,
+    )
+    if canonical is None:
+        raise ValueError("missing SourceInfo canonical getter")
+    projection = re.fullmatch(
+        rf"\s*case {re.escape(canonical[1])} : tobj of\s*Lean\.SourceInfo\.synthetic →\s*"
+        rf"let (x_\d+) : u8 := sproj\[(\d+), (\d+)\] {re.escape(canonical[1])};\s*ret \1\s*"
+        r"default →\s*let (x_\d+) : u8 := 0;\s*ret \4\s*", canonical[2],
+    )
+    if projection is None:
+        raise ValueError("SourceInfo canonical getter is not the reviewed scalar projection")
+    objects, offset = int(projection[2]), int(projection[3])
+    _, fields, scalar_bytes = layouts[CONSTRUCTORS["SOURCE_SYNTHETIC"]]
+    if objects != fields or offset >= scalar_bytes:
+        raise ValueError("SourceInfo canonical flag is outside the extracted layout")
+    lines.extend([
+        "", f"pub const SOURCE_SYNTHETIC_CANONICAL_OBJECT_FIELDS: usize = {objects};",
+        f"pub const SOURCE_SYNTHETIC_CANONICAL_BYTE_OFFSET: usize = {offset};",
+    ])
     # The confinement boundary must not hand-copy the opaque field's offset.
     # Require the exact getter emitted by the pin, not an arbitrary projection
     # elsewhere in the trace or a fallback to a remembered source field order.

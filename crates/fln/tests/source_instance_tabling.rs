@@ -42,7 +42,7 @@ fn all_consumers_of_a_cyclic_query_share_its_first_ground_answer() {
     // The pinned table publishes lowB before highA completes. A later highB
     // answer has the same type B and is discarded by isNewAnswer, so both
     // consumers retain B's published value 1, irrespective of their paths.
-    checked(
+    let base = checked(
         &engine(),
         r#"class A where
   value : Nat
@@ -59,6 +59,88 @@ instance pair [a : A] [b : B] : Pair := Pair.mk a.value b.value
 def result : Pair := inferInstance
 theorem leftValue : result.left = 1 := by rfl
 theorem rightValue : result.right = 1 := by rfl"#,
+    );
+    // A quantified request uses the same generator/consumer order. Opening
+    // an unused binder must not switch to path-sensitive depth-first search,
+    // which selects highB (value 3) for the second prerequisite.
+    let quantified = checked(
+        &base,
+        "def quantified : Nat -> Pair := inferInstance\n\
+         theorem quantifiedLeft : (quantified 0).left = 1 := by rfl\n\
+         theorem quantifiedRight : (quantified 0).right = 1 := by rfl\n\
+         def quantifiedA : Nat -> A := inferInstance\n\
+         theorem quantifiedAValue : (quantifiedA 0).value = 3 := by rfl\n\
+         def quantifiedB : Nat -> B := inferInstance\n\
+         theorem quantifiedBValue : (quantifiedB 0).value = 3 := by rfl",
+    );
+    // The root's full telescope remains distinct from a body-only query
+    // created after removing unused arguments. Otherwise quantifiedA would
+    // incorrectly share the recursive A query and return 1 instead of 3.
+    let before = quantified.logical_root(&KVMap::new());
+    for source in [
+        "theorem stalePair : (quantified 0).right = 3 := by rfl",
+        "theorem erasedRootA : (quantifiedA 0).value = 1 := by rfl",
+        "theorem erasedRootB : (quantifiedB 0).value = 1 := by rfl",
+    ] {
+        assert!(
+            quantified
+                .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(quantified.logical_root(&KVMap::new()), before);
+    }
+}
+
+#[test]
+fn quantified_direct_cycles_wait_before_removing_unused_arguments() {
+    let base = checked(
+        &engine(),
+        r#"class Choice where
+  value : Nat
+instance low : Choice := Choice.mk 1
+instance high [previous : Choice] : Choice := Choice.mk 3
+def single : Nat -> Choice := inferInstance
+theorem singleValue : (single 0).value = 1 := by rfl
+def multiple : Nat -> Bool -> Choice := inferInstance
+theorem multipleValue : (multiple 0 true).value = 1 := by rfl
+def dependentDomains : (A : Type) -> A -> Choice := inferInstance
+theorem dependentDomainsValue : (dependentDomains Nat 7).value = 1 := by rfl"#,
+    );
+    // `consume` tries the unpruned telescope first. Pruning first would create
+    // a new Choice generator and let high wrap that generator's low answer.
+    let before = base.logical_root(&KVMap::new());
+    for source in [
+        "theorem wrongSingle : (single 0).value = 3 := by rfl",
+        "theorem wrongMultiple : (multiple 0 true).value = 3 := by rfl",
+        "theorem wrongDependentDomains : (dependentDomains Nat 7).value = 3 := by rfl",
+    ] {
+        assert!(
+            base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+    }
+}
+
+#[test]
+fn dependent_quantified_queries_keep_the_existing_scoped_search() {
+    // A dependent telescope is not an unused-argument query. Its recursive
+    // goal has to retain the same n; it must not be identified with a body-only
+    // generator just because the result is ground in the opened local context.
+    checked(
+        &engine(),
+        r#"class IndexedA (n : Nat) where
+  value : Nat
+class IndexedB (n : Nat) where
+  value : Nat
+instance indexedLowA (n : Nat) : IndexedA n := IndexedA.mk 2
+instance indexedLowB (n : Nat) : IndexedB n := IndexedB.mk 1
+instance indexedHighA (n : Nat) [b : IndexedB n] : IndexedA n := IndexedA.mk b.value
+instance indexedHighB (n : Nat) [a : IndexedA n] : IndexedB n := IndexedB.mk 3
+def indexed : (n : Nat) -> IndexedA n := inferInstance
+theorem indexedValue (n : Nat) : (indexed n).value = 1 := by rfl"#,
     );
 }
 
@@ -80,6 +162,7 @@ fn cached_answer_size_counts_every_use_and_the_scoped_bound_recovers() {
         "def tooLarge : D7 := inferInstance",
         "def tooLargeFunction : Nat -> D7 := inferInstance",
         "set_option synthInstance.maxSize 254 in\ndef tooLarge : D7 := inferInstance",
+        "set_option synthInstance.maxSize 381 in\ndef tooLargeFunction : Nat -> D7 := inferInstance",
         "set_option synthInstance.maxSize 0 in\ndef evenLeaf : D0 := inferInstance",
     ] {
         let error = base
@@ -98,7 +181,10 @@ fn cached_answer_size_counts_every_use_and_the_scoped_bound_recovers() {
     );
     checked(
         &base,
-        "set_option synthInstance.maxSize 255 in\ndef functionAllowed : Nat -> D7 := inferInstance\ntheorem correct : (functionAllowed 0).value = 7 := by rfl",
+        // The first unused-argument reduction consumes D6 once to create its
+        // body goal and again for the original function goal. Its 127 nodes
+        // are additional to D7's ordinary 255-node answer (pin v4.32.0).
+        "set_option synthInstance.maxSize 382 in\ndef functionAllowed : Nat -> D7 := inferInstance\ntheorem correct : (functionAllowed 0).value = 7 := by rfl",
     );
     assert!(
         raised
@@ -108,6 +194,52 @@ fn cached_answer_size_counts_every_use_and_the_scoped_bound_recovers() {
                 limits(),
             )
             .is_err()
+    );
+}
+
+#[test]
+fn unused_argument_reduction_charges_new_body_answers_but_not_cache_hits_twice() {
+    let base = checked(
+        &engine(),
+        r#"class SizeLeaf where
+  value : Nat
+instance sizeLeaf : SizeLeaf := SizeLeaf.mk 7
+class SizeRoot where
+  value : Nat"#,
+    );
+    let single = checked(
+        &base,
+        "instance only [l : SizeLeaf] : SizeRoot := SizeRoot.mk l.value",
+    );
+    let before = single.logical_root(&KVMap::new());
+    assert!(
+        single
+            .check_source_files(
+                &[b"set_option synthInstance.maxSize 2 in\ndef tooSmall : Nat -> SizeRoot := inferInstance"],
+                &KVMap::new(),
+                limits(),
+            )
+            .is_err()
+    );
+    assert_eq!(single.logical_root(&KVMap::new()), before);
+    checked(
+        &single,
+        "set_option synthInstance.maxSize 3 in\ndef enough : Nat -> SizeRoot := inferInstance\n\
+         theorem enoughValue : (enough 0).value = 7 := by rfl",
+    );
+
+    let alternatives = checked(
+        &base,
+        "instance fallback : SizeRoot := SizeRoot.mk 1\n\
+         instance older [l : SizeLeaf] : SizeRoot := SizeRoot.mk 2\n\
+         instance newer [l : SizeLeaf] : SizeRoot := SizeRoot.mk 3",
+    );
+    checked(
+        &alternatives,
+        "set_option synthInstance.maxSize 2 in\ndef small : Nat -> SizeRoot := inferInstance\n\
+         theorem smallValue : (small 0).value = 2 := by rfl\n\
+         set_option synthInstance.maxSize 3 in\ndef large : Nat -> SizeRoot := inferInstance\n\
+         theorem largeValue : (large 0).value = 3 := by rfl",
     );
 }
 

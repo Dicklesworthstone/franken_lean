@@ -170,10 +170,10 @@ pub(super) fn journal_digest(env: &Environment) -> Option<[u8; 32]> {
         .map(|extension| extension.content_digest().0)
 }
 
-/// Read only the authoritative imported class policies for native artifact
-/// export. Instance rows need no revalidation here: they are not exported or
-/// changed, and the caller has already admitted its import base. Row traversal,
-/// payload bytes and declaration telescope visits are charged before use.
+/// Read the authoritative imported class policies for native artifact export.
+/// Instance models are inspected separately when this module registers their
+/// declarations again. Row traversal, payload bytes and declaration telescope
+/// visits are charged before use.
 pub(super) fn export_classes(
     env: &Environment,
     work_left: &mut usize,
@@ -240,6 +240,79 @@ pub(super) fn export_classes(
         validate_indices(&parameters.out_params, binders)?;
         validate_indices(&parameters.out_level_params, info.level_params.len())?;
         result.insert(class, parameters);
+    }
+    Ok((result, bytes_read))
+}
+
+/// Read the original index of an imported instance that this module registers
+/// again. Native search keeps these imported paths and prerequisite schedules;
+/// the exporter must compare them with the newly derived registration before
+/// publishing it. Unselected instances retain their admitted import identity
+/// and need no telescope walk or allocation here.
+pub(super) fn export_instances(
+    env: &Environment,
+    declarations: &BTreeSet<Name>,
+    work_left: &mut usize,
+) -> Result<(BTreeMap<Name, InstanceParameters>, usize), InstanceRegistryError> {
+    if declarations.is_empty() {
+        return Ok((BTreeMap::new(), 0));
+    }
+    let Some(extension) = env.extension(&name()) else {
+        return Ok((BTreeMap::new(), 0));
+    };
+    if extension.descriptor != descriptor() {
+        return Err(InstanceRegistryError::Malformed);
+    }
+    if extension.len() > MAX_ROWS {
+        return Err(InstanceRegistryError::Limit);
+    }
+    let mut result = BTreeMap::new();
+    let mut bytes_read = 0usize;
+    for (entry, validation) in env.metadata_validation_entries(&name()) {
+        *work_left = work_left
+            .checked_sub(entry.payload.len().saturating_add(1))
+            .ok_or(InstanceRegistryError::Limit)?;
+        bytes_read += entry.payload.len();
+        if entry.payload.len() > MAX_ENTRY_BYTES {
+            return Err(InstanceRegistryError::Limit);
+        }
+        let mut bytes = entry
+            .payload
+            .strip_prefix(MAGIC)
+            .ok_or(InstanceRegistryError::Malformed)?;
+        match take(&mut bytes, 1)?[0] {
+            0 => continue,
+            1 => {}
+            _ => return Err(InstanceRegistryError::Malformed),
+        }
+        let declaration = read_name(&mut bytes)?;
+        if !declarations.contains(&declaration) {
+            continue;
+        }
+        let priority = u32::from_le_bytes(
+            take(&mut bytes, 4)?
+                .try_into()
+                .map_err(|_| InstanceRegistryError::Malformed)?,
+        );
+        let scope = match take(&mut bytes, 1)?[0] {
+            0 => None,
+            1 => Some(read_name(&mut bytes)?),
+            _ => return Err(InstanceRegistryError::Malformed),
+        };
+        let parameters = InstanceParameters {
+            priority,
+            scope,
+            synth_order: indices(&mut bytes)?,
+            keys: super::discr_tree::read_keys(&mut bytes)?,
+        };
+        if !bytes.is_empty()
+            || declaration.is_anonymous()
+            || !validation.contains(&declaration)
+            || parameters.scope.as_ref().is_some_and(Name::is_anonymous)
+        {
+            return Err(InstanceRegistryError::Malformed);
+        }
+        result.insert(declaration, parameters);
     }
     Ok((result, bytes_read))
 }

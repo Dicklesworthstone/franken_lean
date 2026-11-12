@@ -6,6 +6,34 @@
 use super::*;
 
 impl Context {
+    /// A structural discriminant may use `@` to preserve an implicit
+    /// parameter's exact value. Parentheses and explicit markers do not turn
+    /// that parameter into a computed expression; applications still do.
+    pub(super) fn structural_discriminant<'a>(
+        &mut self,
+        mut syntax: &'a Syntax,
+    ) -> Result<&'a Syntax, NatDefinitionElabError> {
+        loop {
+            self.tick()?;
+            if let Some(inner) = parenthesized_inner(syntax)? {
+                syntax = inner;
+                continue;
+            }
+            if syntax.kind() == Some(&parser_kind(&["Term", "explicit"])) {
+                let parts = expect_node(
+                    syntax,
+                    &parser_kind(&["Term", "explicit"]),
+                    2,
+                    "explicit structural discriminant",
+                )?;
+                expect_atom(&parts[0], "@", "explicit structural discriminant")?;
+                syntax = &parts[1];
+                continue;
+            }
+            return Ok(syntax);
+        }
+    }
+
     /// Look through source parentheses and leading lambdas without entering
     /// their domains. Pattern preprocessing uses this same boundary to retain
     /// a local recursive match until its actual parameters have been opened.
@@ -19,11 +47,11 @@ impl Context {
                 syntax = inner;
                 continue;
             }
-            if syntax.kind() != Some(&parser_kind(&["Term", "fun"])) {
+            let Some((lambda, _)) = self.lambda_syntax(syntax)? else {
                 return Ok(syntax);
-            }
+            };
             let parts = expect_node(
-                syntax,
+                lambda,
                 &parser_kind(&["Term", "fun"]),
                 2,
                 "recursive lambda",
@@ -57,11 +85,11 @@ impl Context {
                 syntax = inner;
                 continue;
             }
-            if syntax.kind() != Some(&parser_kind(&["Term", "fun"])) {
+            let Some((lambda, _)) = self.lambda_syntax(syntax)? else {
                 break;
-            }
+            };
             let parts = expect_node(
-                syntax,
+                lambda,
                 &parser_kind(&["Term", "fun"]),
                 2,
                 "recursive lambda",

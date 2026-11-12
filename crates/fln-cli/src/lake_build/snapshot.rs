@@ -8,7 +8,8 @@ use fln_hash::domain::{Domain, DomainHasher};
 
 /// Beside the outputs, under the package's build directory.
 pub(crate) const FILE: &str = "fln-build.snapshot";
-const SCHEMA: &str = "fln.lake-build-snapshot/2";
+const SCHEMA: &str = "fln.lake-build-snapshot/3";
+const COMPANION_SCHEMA: &str = "fln.lake-build-snapshot/2";
 const LEGACY_SCHEMA: &str = "fln.lake-build-snapshot/1";
 /// More than a build may hold (256 modules, 4,096 imports, Init's 601 external modules).
 const MAX_LINES: usize = 1 << 20;
@@ -38,6 +39,7 @@ pub(crate) struct ModuleRow {
     /// Relative to the package root.
     pub(crate) artifact: String,
     pub(crate) artifact_digest: String,
+    pub(crate) ir_digest: Option<String>,
     pub(crate) companions: Option<CompanionDigests>,
     pub(crate) key: Option<String>,
     pub(crate) decision: String,
@@ -65,6 +67,15 @@ impl ModuleRow {
                 ),
             ]);
         }
+        if let Some(digest) = &self.ir_digest {
+            files.push((
+                std::path::Path::new(&self.artifact)
+                    .with_extension("ir")
+                    .display()
+                    .to_string(),
+                digest,
+            ));
+        }
         files
     }
 }
@@ -80,7 +91,7 @@ pub(crate) struct ExternalRow {
 pub(crate) struct Snapshot {
     pub(crate) posture: String,
     pub(crate) records: String,
-    /// The targets the build was asked for, as `+Module:olean`.
+    /// The exact module/facet targets requested by the build.
     pub(crate) targets: Vec<String>,
     pub(crate) modules: Vec<ModuleRow>,
     pub(crate) externals: Vec<ExternalRow>,
@@ -151,6 +162,9 @@ impl Snapshot {
             if let Some(parts) = &module.companions {
                 text.push_str(&line(&["companions", &parts.server, &parts.private]));
             }
+            if let Some(digest) = &module.ir_digest {
+                text.push_str(&line(&["ir", digest]));
+            }
             for import in &module.imports {
                 text.push_str(&line(&["import", import]));
             }
@@ -171,7 +185,7 @@ impl Snapshot {
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
         let mut lines = text.split('\n');
         let schema = lines.next();
-        if !matches!(schema, Some(SCHEMA | LEGACY_SCHEMA)) {
+        if !matches!(schema, Some(SCHEMA | COMPANION_SCHEMA | LEGACY_SCHEMA)) {
             return Err(format!("not a {SCHEMA} snapshot"));
         }
         let mut snapshot = Snapshot {
@@ -221,6 +235,7 @@ impl Snapshot {
                         source_digest: fields[3].clone(),
                         artifact: fields[4].clone(),
                         artifact_digest: fields[5].clone(),
+                        ir_digest: None,
                         companions: None,
                         key: (fields[6] != "-").then(|| fields[6].clone()),
                         decision: fields[7].clone(),
@@ -228,7 +243,9 @@ impl Snapshot {
                     });
                 }
                 ("companions", 3)
-                    if schema == Some(SCHEMA) && stage == 2 && owner == Some(true) =>
+                    if matches!(schema, Some(SCHEMA | COMPANION_SCHEMA))
+                        && stage == 2
+                        && owner == Some(true) =>
                 {
                     let module = snapshot.modules.last_mut().ok_or_else(bad)?;
                     if module.companions.is_some()
@@ -251,6 +268,16 @@ impl Snapshot {
                         digest: fields[2].clone(),
                         imports: Vec::new(),
                     });
+                }
+                ("ir", 2) if schema == Some(SCHEMA) && stage == 2 && owner == Some(true) => {
+                    let module = snapshot.modules.last_mut().ok_or_else(bad)?;
+                    if module.ir_digest.is_some()
+                        || !module.imports.is_empty()
+                        || fields[1].is_empty()
+                    {
+                        return Err(bad());
+                    }
+                    module.ir_digest = Some(fields[1].clone());
                 }
                 ("import", 2) => match owner {
                     Some(true) => snapshot
@@ -297,6 +324,7 @@ mod tests {
                 imports: vec!["Init".to_owned(), "Lib.Base".to_owned()],
                 artifact: ".lake/build/lib/lean/Lib/Top.olean".to_owned(),
                 artifact_digest: digest(b"artifact"),
+                ir_digest: None,
                 companions: None,
                 key: None,
                 decision: "elaborated".to_owned(),
@@ -341,6 +369,10 @@ mod tests {
         let text = snapshot.to_text();
         assert_eq!(Snapshot::parse(&text).unwrap(), snapshot);
         assert_eq!(snapshot.modules[0].output_files().len(), 3);
+        assert_eq!(
+            Snapshot::parse(&text.replace(SCHEMA, COMPANION_SCHEMA)).unwrap(),
+            snapshot
+        );
         let row = text
             .lines()
             .find(|line| line.starts_with("companions\t"))
@@ -352,6 +384,29 @@ mod tests {
             text.replace(row, &format!("{row}\n{row}")),
             text.replace(row, &format!("import\tLate\n{row}")),
             text.replace("end\n", &format!("{row}\nend\n")),
+        ] {
+            assert!(Snapshot::parse(&broken).is_err(), "{broken}");
+        }
+    }
+
+    #[test]
+    fn executable_companions_participate_in_output_change_detection() {
+        let mut snapshot = sample();
+        snapshot.targets = vec!["+Lib.Top:ir".to_owned()];
+        let ir_digest = digest(b"native executable IR");
+        snapshot.modules[0].ir_digest = Some(ir_digest.clone());
+        let text = snapshot.to_text();
+        assert_eq!(Snapshot::parse(&text).unwrap(), snapshot);
+        assert!(snapshot.modules[0].output_files().contains(&(
+            ".lake/build/lib/lean/Lib/Top.ir".to_owned(),
+            ir_digest.as_str(),
+        )));
+        let row = format!("ir\t{ir_digest}");
+        for broken in [
+            text.replace(SCHEMA, COMPANION_SCHEMA),
+            text.replace(&row, "ir\t"),
+            text.replace(&row, &format!("{row}\n{row}")),
+            text.replace(&row, &format!("import\tLate\n{row}")),
         ] {
             assert!(Snapshot::parse(&broken).is_err(), "{broken}");
         }

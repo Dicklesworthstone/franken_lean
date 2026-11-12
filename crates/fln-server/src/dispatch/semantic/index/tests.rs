@@ -225,6 +225,7 @@ fn completion_preserves_native_order_and_requires_a_covering_edit_range() {
         .map(|name| CompletionItem {
             label: name.into(),
             replacement: name.into(),
+            kind: super::super::CompletionItemKind::Variable,
         })
         .to_vec();
     let answer = Answer::Completion {

@@ -3,8 +3,6 @@
 //! cannot manufacture a location for an unchecked or stale declaration.
 use super::*;
 use fln_core::expr::ExprNode;
-use fln_parse::command_scope::ScopeCommand;
-use fln_syntax::tree::Syntax;
 use std::ops::Range;
 
 /// Independent bounds for the source-location pass. Inspection also remains
@@ -27,7 +25,8 @@ impl Default for DefinitionLookupLimits {
     }
 }
 
-/// The explicit source identifier of an already checked definition or theorem.
+/// The explicit source identifier of an already checked declaration, constructor
+/// or structure field.
 /// `range` is in the ORIGINAL UTF-8 bytes of `module`, not normalized parser text.
 /// This metadata confers no admission authority on the command at the cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +38,7 @@ pub struct SourceDefinition {
 
 impl SourceModuleSession {
     /// Locate an elaborator-resolved global in the exact checked source closure.
-    /// Locals, seed constants, generated declarations and unsupported source
+    /// Locals, seed constants, generated helpers and unsupported source
     /// declaration shapes return `None`, never a same-spelled global substitute.
     pub fn definition(
         &mut self,
@@ -83,7 +82,12 @@ impl SourceModuleSession {
             return Ok(Outcome::Complete(None));
         }
         let mut found = None;
-        let mut visited = 0usize;
+        let mut budget = symbols::SourceOriginBudget::new(DocumentSymbolLimits {
+            max_source_bytes: limits.max_source_bytes,
+            max_modules: limits.max_modules,
+            max_commands: limits.max_commands,
+            ..DocumentSymbolLimits::default()
+        });
         for module in &inspected.prefix.checked.module_order {
             let input = inputs
                 .iter()
@@ -92,121 +96,72 @@ impl SourceModuleSession {
                     importer: entry.clone(),
                     module: module.clone(),
                 })?;
-            let header = modules::parse_source_header(input.source).map_err(|error| {
-                SourceModuleCheckError::Header {
-                    module: module.clone(),
-                    error,
-                }
-            })?;
-            let commands = fln_parse::command_scope::partition(
-                &input.source[header.body_start.0..],
-            )
-            .map_err(|error| SourceModuleCheckError::Header {
-                module: module.clone(),
-                error: error.with_original_offset(header.body_start),
-            })?;
             // Inspection checked only the current command's prefix, NOT its
             // body or later commands. Never search those unchecked bytes.
-            let count = if module == entry {
-                commands
-                    .iter()
-                    .rposition(|(start, _)| header.body_start.0 + start.0 <= offset)
-                    .unwrap_or(0)
-            } else {
-                commands.len()
-            };
-            // Only namespace/section lifetimes affect a declaration's absolute
-            // name. Other controls already passed the ordinary checker and must
-            // not be executed again (including variable/attribute journals).
-            let mut scopes = super::super::scopes::Scopes::default();
-            for (command_index, (start, command)) in commands.iter().take(count).enumerate() {
-                visited = visited
-                    .checked_add(1)
-                    .filter(|n| *n <= limits.max_commands)
-                    .ok_or_else(|| limit("definition commands", limits.max_commands))?;
-                let mut base = header.body_start.0 + start.0;
-                let mut command: &[u8] = command;
-                // `open A in <command>`: the open changes no declaration's absolute name, so
-                // navigation reads the inner command at its own offset.
-                let control = loop {
-                    let control = fln_parse::command_scope::parse(command).map_err(|error| {
-                        SourceModuleCheckError::Header {
-                            module: module.clone(),
-                            error: error.with_original_offset(fln_parse::BytePos(base)),
-                        }
-                    })?;
-                    match control {
-                        Some(
-                            ScopeCommand::OpenIn { body, .. }
-                            | ScopeCommand::SetOptionIn { body, .. }
-                            | ScopeCommand::GuardMsgs { body, .. }
-                            | ScopeCommand::In { body, .. },
-                        ) => {
-                            base += body;
-                            command = &command[body..];
-                        }
-                        other => break other,
-                    }
-                };
-                if let Some(control) = control {
-                    if matches!(
-                        control,
-                        ScopeCommand::Namespace(_)
-                            | ScopeCommand::Section(_)
-                            | ScopeCommand::End(_)
-                    ) {
-                        scopes
-                            .check_limits(&control)
-                            .map_err(|(resource, size)| limit(resource, size))?;
-                        scopes.apply(control).map_err(|message| {
-                            source_error(module, command_index, base, message)
-                        })?;
-                    }
-                    continue;
-                }
-                let parsed = fln_parse::parse_definition(command).map_err(|error| {
+            let source = if module == entry {
+                let header = modules::parse_source_header(input.source).map_err(|error| {
                     SourceModuleCheckError::Header {
                         module: module.clone(),
-                        error: error.with_original_offset(fln_parse::BytePos(base)),
+                        error,
                     }
                 })?;
-                let Some((name, range)) = explicit_name(parsed.syntax()) else {
-                    continue;
-                };
-                let absolute = scopes.current.declaration_name(name).map_err(|error| {
-                    source_error(module, command_index, base, error.to_string())
-                })?;
-                if &absolute != target {
+                let commands =
+                    fln_parse::command_scope::partition(&input.source[header.body_start.0..])
+                        .map_err(|error| SourceModuleCheckError::Header {
+                            module: module.clone(),
+                            error: error.with_original_offset(header.body_start),
+                        })?;
+                let end = commands
+                    .iter()
+                    .rev()
+                    .find(|(start, _)| header.body_start.0 + start.0 <= offset)
+                    .map_or(header.body_start.0, |(start, _)| {
+                        header.body_start.0 + start.0
+                    });
+                &input.source[..end]
+            } else {
+                input.source
+            };
+            let origins = match self
+                .declaration_origins(inputs, module, source, environment, &mut budget)
+                .map_err(|error| match error {
+                    SourceModuleCheckError::Limit {
+                        resource: "document symbol commands",
+                        limit: bound,
+                    } => limit("definition commands", bound),
+                    SourceModuleCheckError::Limit {
+                        resource: "document symbol syntax",
+                        limit: bound,
+                    } => limit("definition source syntax", bound),
+                    error => error,
+                })? {
+                Outcome::Complete(origins) => origins,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            for origin in origins {
+                if &origin.name != target {
                     continue;
                 }
-                let range = base
-                    + parsed
-                        .source_view()
-                        .to_original(fln_parse::BytePos(range.start))
-                        .0
-                    ..base
-                        + parsed
-                            .source_view()
-                            .to_original(fln_parse::BytePos(range.end))
-                            .0;
+                let range = origin.symbol.selection_range;
                 let text = std::str::from_utf8(input.source).map_err(|_| {
                     source_error(
                         module,
-                        command_index,
-                        base,
+                        0,
+                        range.start,
                         "definition source is not UTF-8".into(),
                     )
                 })?;
                 if range.is_empty() || text.get(range.clone()).is_none() || found.is_some() {
                     return Err(source_error(
                         module,
-                        command_index,
-                        base,
+                        0,
+                        range.start,
                         "definition location is invalid or ambiguous".into(),
                     ));
                 }
                 found = Some(SourceDefinition {
-                    name: absolute,
+                    name: origin.name,
                     module: module.clone(),
                     range,
                 });
@@ -252,34 +207,4 @@ fn constant_head(
         }
     }
     Err(limit("definition expression head", max_steps))
-}
-
-/// Inspect only the declaration header, never identifiers inside a body, local
-/// helper, quotation or example. More generated shapes require explicit origins.
-fn explicit_name(syntax: &Syntax) -> Option<(&Name, Range<usize>)> {
-    let Syntax::Node { kind, args, .. } = syntax else {
-        return None;
-    };
-    if kind != &Name::from_components(["Lean", "Parser", "Command", "declaration"]) {
-        return None;
-    }
-    let Syntax::Node { kind, args, .. } = args.get(1)? else {
-        return None;
-    };
-    if !["definition", "theorem", "abbrev", "opaque"]
-        .iter()
-        .any(|name| kind == &Name::from_components(["Lean", "Parser", "Command", *name]))
-    {
-        return None;
-    }
-    let Syntax::Node { kind, args, .. } = args.get(1)? else {
-        return None;
-    };
-    if kind != &Name::from_components(["Lean", "Parser", "Command", "declId"]) {
-        return None;
-    }
-    let Syntax::Ident { val, info, .. } = args.first()? else {
-        return None;
-    };
-    Some((val, info.pos(true)?.0..info.end_pos(true)?.0))
 }

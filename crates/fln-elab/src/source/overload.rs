@@ -10,9 +10,11 @@
 //! `P.foo : Nat`, `def x : Nat := foo` is ambiguous, while with `P.foo : Bool` only
 //! the root interpretation has type `Nat` and the pin accepts it.
 //!
-//! Each interpretation is elaborated here in a speculative copy of the context, from
-//! the same syntax with its head written `_root_.<candidate>`, which names exactly
-//! that declaration. The spent budget carries over from one copy to the next.
+//! Each interpretation is elaborated here in a speculative copy of the context.
+//! Captured identifiers keep their spelling and scopes with a singleton `.decl`
+//! metadata list, including private identities that have no source spelling.
+//! Ordinary global names use `_root_.<candidate>` to name exactly that declaration.
+//! The spent budget carries over from one copy to the next.
 //! Dotted identifiers enter these same trials after resolving their namespace from
 //! the expected type; finding several candidates does not unfold that type further.
 //!
@@ -63,6 +65,7 @@ impl Context {
         name: &Name,
         candidates: &[Name],
         expected: Option<&Expr>,
+        explicit: bool,
     ) -> Result<Typed, NatDefinitionElabError> {
         if self.overload_depth >= MAX_OVERLOAD_DEPTH {
             return Err(failure(SourceInferenceError::ResourceLimit));
@@ -72,7 +75,8 @@ impl Context {
         let mut undetermined: Option<Name> = None;
         for candidate in candidates {
             self.tick()?;
-            let syntax = interpretation_syntax(head, arguments, candidate, &self.source_scope)?;
+            let syntax =
+                interpretation_syntax(head, arguments, candidate, &self.source_scope, explicit)?;
             let mut trial = Box::new(self.clone());
             trial.overload_depth += 1;
             let outcome = trial.interpretation(&syntax, expected);
@@ -188,7 +192,10 @@ pub(super) fn ambiguous_head(
     match error {
         NatDefinitionElabError::Inference(SourceInferenceError::NameScope(
             scope::ScopeError::Ambiguous(name, candidates),
-        )) if matches!(head, Syntax::Ident { .. }) && name == val => {
+        )) if (matches!(head, Syntax::Ident { .. })
+            || head.kind() == Some(&parser_kind(&["Term", "explicitUniv"])))
+            && name == val =>
+        {
             Some((name.clone(), candidates.clone()))
         }
         NatDefinitionElabError::Inference(SourceInferenceError::DottedIdent(
@@ -200,11 +207,29 @@ pub(super) fn ambiguous_head(
     }
 }
 
-/// The source location of an ordinary or dotted overloaded name. Rewriting only
-/// this identifier retains the user's span while replacing the resolved head.
+/// Whether application lookup must use captured declaration identities before
+/// considering the use site's namespaces or dotted field notation.
+pub(super) fn has_preresolved_head(head: &Syntax) -> bool {
+    if !matches!(head, Syntax::Ident { .. })
+        && head.kind() != Some(&parser_kind(&["Term", "explicitUniv"]))
+    {
+        return false;
+    }
+    matches!(head_identifier(head), Some(Syntax::Ident { preresolved, .. })
+        if preresolved.iter().any(|entry| matches!(entry, fln_syntax::tree::Preresolved::Decl { .. })))
+}
+
+/// The source location of an ordinary, universe-instantiated or dotted overloaded
+/// name. Rewriting only this identifier retains the user's span and universes.
 fn head_identifier(head: &Syntax) -> Option<&Syntax> {
     match head {
         Syntax::Ident { .. } => Some(head),
+        Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Term", "explicitUniv"]) => {
+            let [id @ Syntax::Ident { .. }, _, _, _] = args.as_slice() else {
+                return None;
+            };
+            Some(id)
+        }
         Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Term", "dotIdent"]) => {
             let [Syntax::Atom { val, .. }, id @ Syntax::Ident { .. }] = args.as_slice() else {
                 return None;
@@ -231,35 +256,71 @@ impl Context {
     }
 }
 
-/// An exact candidate, applied to `arguments` when present. Public names use
-/// `_root_`; a current-module private core identity is already exact.
+/// An exact candidate, applied to `arguments` when present. A captured identifier
+/// retains its scopes and exact metadata; ordinary public names use `_root_`, and
+/// a current-module private core identity is already exact.
 fn interpretation_syntax(
     head: &Syntax,
     arguments: Option<&[Syntax]>,
     candidate: &Name,
     scope: &scope::SourceScope,
+    explicit: bool,
 ) -> Result<Syntax, NatDefinitionElabError> {
-    let Some(Syntax::Ident { info, raw_val, .. }) = head_identifier(head) else {
+    let Some(Syntax::Ident {
+        info, raw_val, val, ..
+    }) = head_identifier(head)
+    else {
         return Err(failure(SourceInferenceError::Scope));
     };
-    let head = Syntax::Ident {
+    let captured = has_preresolved_head(head);
+    let resolved = Syntax::Ident {
         info: *info,
         raw_val: raw_val.clone(),
-        val: if scope.user_name(candidate) != *candidate {
+        val: if captured {
+            val.clone()
+        } else if scope.user_name(candidate) != *candidate {
             candidate.clone()
         } else {
             Name::from_components(["_root_"]).append_core(candidate)
         },
-        preresolved: Vec::new(),
+        preresolved: if captured {
+            vec![fln_syntax::tree::Preresolved::Decl {
+                name: candidate.clone(),
+                fields: Vec::new(),
+            }]
+        } else {
+            Vec::new()
+        },
     };
+    let mut head = if let Syntax::Node {
+        info, kind, args, ..
+    } = head
+        && kind == &parser_kind(&["Term", "explicitUniv"])
+    {
+        let mut args = args.clone();
+        args[0] = resolved;
+        Syntax::Node {
+            info: *info,
+            kind: kind.clone(),
+            args,
+        }
+    } else {
+        resolved
+    };
+    if explicit {
+        head = Syntax::node(
+            parser_kind(&["Term", "explicit"]),
+            vec![Syntax::atom(*info, "@"), head],
+        );
+    }
     Ok(match arguments {
-        Some(arguments) => Syntax::node(
+        Some(arguments) if !arguments.is_empty() => Syntax::node(
             parser_kind(&["Term", "app"]),
             vec![
                 head,
                 Syntax::node(Name::from_components(["null"]), arguments.to_vec()),
             ],
         ),
-        None => head,
+        _ => head,
     })
 }

@@ -3,6 +3,8 @@
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Name, Outcome, SourceCheckLimits};
 use fln_core::expr::{Expr, ExprNode, Literal, NatLit};
 use fln_env::constants::ConstantInfo;
+use fln_syntax::source::SourceInfo;
+use fln_syntax::tree::Syntax;
 
 fn base() -> Engine {
     Engine::with_source_seed(EngineAdmissionLimits::new(Budget::for_stack_bytes(
@@ -76,6 +78,165 @@ fn ascribed_value(term: &Expr, carrier: &str) -> Expr {
     constant(type_, carrier);
     assert_eq!(body, &Expr::bvar(0).unwrap());
     value.clone()
+}
+
+fn generated_numeral(source: &str, spelling: &str) -> Syntax {
+    fn replace(syntax: &mut Syntax, spelling: &str) -> usize {
+        let Syntax::Node { kind, args, .. } = syntax else {
+            return 0;
+        };
+        if kind == &Name::from_components(["num"]) {
+            *syntax = Syntax::node(
+                Name::from_components(["num"]),
+                vec![Syntax::atom(SourceInfo::None, spelling)],
+            );
+            1
+        } else {
+            args.iter_mut().map(|arg| replace(arg, spelling)).sum()
+        }
+    }
+    let mut syntax = fln_parse::parse_definition(source.as_bytes())
+        .unwrap()
+        .syntax()
+        .clone();
+    assert_eq!(replace(&mut syntax, spelling), 1);
+    syntax
+}
+
+#[test]
+fn generated_numerals_keep_their_value_and_ordinary_dictionary_admission() {
+    let base = base();
+    let options = KVMap::new();
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    for (spelling, expected) in [
+        ("0x", NatLit::from_u64(0)),
+        ("0b__", NatLit::from_u64(0)),
+        ("0o_", NatLit::from_u64(0)),
+        ("1_", NatLit::from_u64(1)),
+        ("0x_f_", NatLit::from_u64(15)),
+        ("0b1_01_", NatLit::from_u64(5)),
+        ("00_1", NatLit::from_u64(1)),
+        (
+            "0x1_0000_0000_0000_0000_",
+            NatLit::from_limbs_le(vec![0, 1]),
+        ),
+        ("18446744073709551617_", NatLit::from_limbs_le(vec![1, 1])),
+    ] {
+        for (carrier, raw) in [("Nat", false), ("Float", false), ("Nat", true)] {
+            let prefix = if raw { "nat_lit " } else { "" };
+            let syntax =
+                generated_numeral(&format!("def generated : {carrier} := {prefix}7"), spelling);
+            let declaration = fln_elab::elaborate_definition_in_with_budget(
+                &syntax,
+                base.environment(),
+                limits.kernel,
+            )
+            .unwrap_or_else(|error| panic!("{carrier}, raw={raw}, {spelling}: {error:?}"));
+            let admitted = base
+                .admit_declaration(declaration, &options, limits)
+                .unwrap()
+                .into_complete()
+                .expect("generated numeric syntax must pass both admission seats");
+            let value = value(&admitted.engine, "generated");
+            let expected = Expr::lit(Literal::Nat(expected.clone()));
+            if raw {
+                assert_eq!(value, expected);
+            } else {
+                let (head, args) = application(value);
+                constant(&head, "OfNat.ofNat");
+                assert_eq!(args.len(), 3);
+                constant(&args[0], carrier);
+                assert_eq!(args[1], expected);
+                let (dictionary, arguments) = application(args[2].clone());
+                constant(&dictionary, &format!("instOfNat{carrier}"));
+                assert_eq!(arguments, [expected]);
+            }
+        }
+    }
+}
+
+#[test]
+fn generated_numerals_refuse_invalid_atoms_in_ordinary_and_raw_contexts() {
+    let base = base();
+    for spelling in [
+        "", "_1", "0_", "0_1", "0__1", "0b2", "0o8", "0xg", "-1", "٠1",
+    ] {
+        for source in [
+            "def generated : Nat := 7",
+            "def generated : Nat := nat_lit 7",
+        ] {
+            let result = fln_elab::elaborate_definition_in_with_budget(
+                &generated_numeral(source, spelling),
+                base.environment(),
+                Budget::for_stack_bytes(2 * 1024 * 1024),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(fln_elab::NatDefinitionElabError::InvalidNaturalLiteral)
+                ),
+                "{source}, {spelling:?}: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn source_numerals_preserve_the_pins_prefix_boundary_and_strict_lexing() {
+    let base = base();
+    checked(
+        &base,
+        "def ordinary : Nat := 00_1\ndef repeated : Nat := 1__2\ndef raw : Nat := nat_lit 00_1\n\
+         theorem ordinary_ok : ordinary = 1 := rfl\n\
+         theorem repeated_ok : repeated = 12 := rfl\n\
+         theorem raw_ok : raw = 1 := rfl",
+    );
+    let options = KVMap::new();
+    let before = base.logical_root(&options);
+    for source in [
+        "def bad : Nat := 0_1",
+        "def bad : Nat := 0__1",
+        "def bad : Nat := nat_lit 0_1",
+        "def bad (n : Nat) : Nat := match n with | 0_1 => 7 | _ => 11",
+    ] {
+        assert!(fln_parse::parse_definition(source.as_bytes()).is_ok());
+        let error = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &options,
+                SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(
+                    2 * 1024 * 1024,
+                ))),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                fln::SourceCheckError::Command { error, .. }
+                    if matches!(
+                        error.as_ref(),
+                        fln::EngineExecutionError::Frontend(
+                            fln::NatDefinitionFrontendError::Elaborate(
+                                fln_elab::NatDefinitionElabError::InvalidNaturalLiteral
+                            )
+                        )
+                    )
+            ),
+            "{source}: {error:?}"
+        );
+        // Malformed literal data uses the existing input-error taxonomy,
+        // distinct from the inference-failure elaboration branch.
+        assert_eq!(error.disposition(), ("input", false, 1));
+        assert_eq!(base.logical_root(&options), before);
+    }
+    // Only generated Syntax bypasses lexing. These spellings remain invalid
+    // as source tokens even though the public numeric decoder can read them.
+    for spelling in ["0x", "0b", "0o", "1_", "0x1_"] {
+        assert!(
+            fln_parse::parse_definition(format!("def bad : Nat := {spelling}").as_bytes()).is_err(),
+            "{spelling}"
+        );
+    }
 }
 
 #[test]

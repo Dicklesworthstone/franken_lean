@@ -243,3 +243,82 @@ fn failed_prefix_cannot_reuse_a_previous_definition_answer_and_recovery_relocate
         assert_location(&messages, 42, uri, 1, 4);
     }
 }
+
+fn outline_request(id: usize, uri: &str) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"textDocument/documentSymbol\",\"params\":{{\"textDocument\":{{\"uri\":{}}}}}}}",
+        quoted(uri)
+    )
+}
+
+#[test]
+fn both_front_doors_publish_checked_document_outlines_and_recover_after_edits() {
+    let uri = "file:///tmp/franken-lean-outline.lean";
+    let first =
+        "namespace Outer\r\nnamespace Inner\r\ndef value : Nat := 7\r\nend Inner\r\nend Outer\r\n";
+    let changed = "-- 😀 moved\r\nnamespace Outer\r\ndef other : Nat := 8\r\nend Outer\r\n";
+    let invalid = "theorem bad : False := by exact True.intro";
+    for (binary, arg) in front_doors() {
+        let messages = run(
+            binary,
+            arg,
+            &[
+                open(uri, first),
+                outline_request(50, uri),
+                change(uri, 2, changed),
+                outline_request(51, uri),
+                change(uri, 3, invalid),
+                outline_request(52, uri),
+                change(uri, 4, "-- empty document"),
+                outline_request(53, uri),
+            ],
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains(r#""documentSymbolProvider":true"#))
+        );
+        let before = response(&messages, 50);
+        assert!(
+            before.contains(r#""name":"Outer.Inner.value","kind":6"#),
+            "{before}"
+        );
+        assert!(before.contains(r#""selectionRange":{"start":{"line":2,"character":4},"end":{"line":2,"character":9}}"#), "{before}");
+        let after = response(&messages, 51);
+        assert!(after.contains(r#""name":"Outer.other""#), "{after}");
+        assert!(!after.contains("Inner.value"));
+        assert!(response(&messages, 52).contains(r#""error":{"code":-32803"#));
+        assert!(response(&messages, 53).contains(r#""result":[]"#));
+    }
+}
+
+#[test]
+fn both_front_doors_navigate_data_members_and_include_their_explicit_outline_origins() {
+    let uri = "file:///tmp/franken-lean-data-navigation.lean";
+    let source = "-- 😀\r\nnamespace Domain\r\ninductive Signal where\r\n  | ready\r\nstructure Box where\r\n  value : Nat\r\ndef choose : Signal := Signal.ready\r\ndef project (box : Box) : Nat := box.value\r\nend Domain\r\n";
+    for (binary, arg) in front_doors() {
+        let messages = run(
+            binary,
+            arg,
+            &[
+                open(uri, source),
+                request(60, uri, source, source.rfind("Signal.ready").unwrap()),
+                request(61, uri, source, source.rfind("box.value").unwrap()),
+                outline_request(62, uri),
+            ],
+        );
+        assert_location(&messages, 60, uri, 3, 4);
+        assert_location(&messages, 61, uri, 5, 2);
+        let outline = response(&messages, 62);
+        assert!(
+            outline.contains(r#""name":"Domain.Signal.ready""#),
+            "{outline}"
+        );
+        assert!(
+            outline.contains(r#""name":"Domain.Box.value""#),
+            "{outline}"
+        );
+        assert!(!outline.contains("Domain.Box.mk"), "{outline}");
+        assert!(!outline.contains("Domain.Signal.rec"), "{outline}");
+    }
+}

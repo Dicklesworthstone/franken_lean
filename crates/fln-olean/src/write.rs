@@ -314,6 +314,9 @@ struct Encoder {
     levels: HashMap<Level, Obj>,
     strings: HashMap<String, Obj>,
     exprs: HashMap<*const ExprNode, Obj>,
+    // Generated compiler carriers have no caller-owned Expr graph. Keep their
+    // roots alive until encoding ends: `exprs` preserves allocation identity.
+    compiler_types: HashMap<&'static str, Expr>,
     expr_presentations: u64,
 }
 
@@ -350,6 +353,7 @@ impl Encoder {
             levels: HashMap::new(),
             strings: HashMap::new(),
             exprs: HashMap::new(),
+            compiler_types: HashMap::new(),
             expr_presentations: 0,
         })
     }

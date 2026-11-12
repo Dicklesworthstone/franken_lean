@@ -641,6 +641,13 @@ impl Preparation<'_> {
                                 work.push(Frame::Visit(body, expected));
                                 continue;
                             }
+                            if let Some(inlined) =
+                                self.local_record_template(binder_name, type_, value, body)?
+                            {
+                                reserve(&mut work, self.limits.max_nodes)?;
+                                work.push(Frame::Visit(inlined, expected));
+                                continue;
+                            }
                             // `let x : T := v; x` has no use site to specialize:
                             // substituting would only drop the typed binding that
                             // `annotate_callable_tail` uses to keep a staged

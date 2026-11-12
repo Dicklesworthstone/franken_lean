@@ -3,7 +3,9 @@
 //! A document whose imports include `.olean` modules is checked against that import
 //! world, resolved and obtained exactly as `fln check-source` obtains it, under the
 //! `reuse-verified` posture (bead `fln-uyuz`). The world's bytes are read afresh on
-//! every check; the worker keeps its session only while they are byte-identical.
+//! every check; the worker reuses a bounded set of sessions only when the
+//! corresponding closure is byte-identical. Switching between documents does
+//! not discard another document's admitted world or checked source prefixes.
 use super::imports::EditorWorld;
 use super::imports::editor::{self, Sources};
 use super::*;
@@ -12,6 +14,7 @@ use fln::source_check::modules::{
     SourceModuleCacheLimits, SourceModuleCheckError, SourceModuleCheckLimits, SourceModuleSession,
 };
 use fln_server::dispatch::OpenDocumentSource;
+use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 mod completion;
@@ -230,18 +233,26 @@ fn failure(
     }
 }
 
-/// The worker's sessions: one over the native seed for documents without `.olean`
-/// imports, and at most one over an `.olean` world.
+/// The worker's sessions: separate seed/unseeded worlds and a bounded LRU of
+/// admitted `.olean` closures. These are process-local checked objects, never
+/// producer-trusted serialized environments.
 #[derive(Default)]
 struct Sessions {
     seed: Option<SourceModuleSession>,
     unseeded: Option<SourceModuleSession>,
-    world: Option<World>,
+    worlds: VecDeque<World>,
 }
 
-/// An `.olean` world's session, kept while the world's bytes are unchanged.
+// Bound both the number of independent source caches and their import input
+// weight. Encoded bytes are an admission-input bound, not an RSS estimate:
+// decoded terms and source-module caches have their own existing limits.
+const MAX_RETAINED_WORLDS: usize = 4;
+const MAX_RETAINED_ARTIFACT_BYTES: usize = 1 << 30;
+
+/// An `.olean` world's session, reusable only for the exact captured closure.
 struct World {
     identity: fln_hash::domain::Digest,
+    artifact_bytes: usize,
     report: ImportPostureReport,
     session: SourceModuleSession,
 }
@@ -268,9 +279,10 @@ fn check_limits() -> SourceModuleCheckLimits {
     SourceModuleCheckLimits::new(limits)
 }
 
-/// The session a document is checked in. With `.olean` imports, the world is read
-/// afresh and kept only if its bytes are identical; otherwise the old world is
-/// dropped before the new one is admitted, so two are never resident.
+/// The session a document is checked in. Every lookup first reads and hashes
+/// the current complete artifact closure. A stale or damaged artifact cannot
+/// select a cached world by path, module name, mtime, or a prior success.
+/// Misses evict least recently used worlds before admitting a new one.
 fn select<'a>(
     sessions: &'a mut Sessions,
     sources: &Sources,
@@ -298,12 +310,35 @@ fn select<'a>(
     }
     let world =
         EditorWorld::read(&sources.olean_roots, &sources.root).map_err(Unavailable::Failure)?;
-    let retained = sessions
-        .world
-        .as_ref()
-        .is_some_and(|kept| kept.identity == world.identity);
-    if !retained {
-        sessions.world = None;
+    let position = sessions
+        .worlds
+        .iter()
+        .position(|kept| kept.identity == world.identity);
+    let retained = position.is_some();
+    if let Some(position) = position {
+        let kept = sessions
+            .worlds
+            .remove(position)
+            .expect("matched retained world");
+        sessions.worlds.push_back(kept);
+    } else {
+        let artifact_bytes = world.artifact_bytes();
+        let Some(remaining) = MAX_RETAINED_ARTIFACT_BYTES.checked_sub(artifact_bytes) else {
+            return Err(Unavailable::Snapshot(Box::new(nonanswer(
+                "resource",
+                "editor import world exceeds its retained artifact byte limit",
+            ))));
+        };
+        while sessions.worlds.len() >= MAX_RETAINED_WORLDS
+            || sessions
+                .worlds
+                .iter()
+                .map(|kept| kept.artifact_bytes)
+                .sum::<usize>()
+                > remaining
+        {
+            sessions.worlds.pop_front();
+        }
         let jobs = std::thread::available_parallelism()
             .ok()
             .and_then(|n| std::num::NonZeroUsize::new(n.get().min(8)))
@@ -311,8 +346,9 @@ fn select<'a>(
         let (receipt, report) = world
             .admit(jobs, ImportPosture::ReuseVerified)
             .map_err(Unavailable::Failure)?;
-        sessions.world = Some(World {
+        sessions.worlds.push_back(World {
             identity: world.identity,
+            artifact_bytes,
             report,
             session: SourceModuleSession::from_imports(
                 receipt,
@@ -322,7 +358,7 @@ fn select<'a>(
             ),
         });
     }
-    let kept = sessions.world.as_mut().expect("admitted world");
+    let kept = sessions.worlds.back_mut().expect("admitted world");
     let imports = format!("{{{}}}", posture_json(&kept.report));
     Ok((&mut kept.session, Some(WorldUse { imports, retained })))
 }
@@ -514,6 +550,9 @@ fn inspect_sources(
         QueryKind::Definition => {
             return navigation::definition(session, sources, &inputs, offset);
         }
+        QueryKind::DocumentSymbols => {
+            return navigation::document_symbols(session, sources, &inputs);
+        }
         QueryKind::Completion => {
             return completion::complete(session, sources, &inputs, offset);
         }
@@ -532,6 +571,9 @@ fn inspect_sources(
     };
     Ok(match inspected.observation {
         None => None,
+        Some(SourceObservation::Completion { .. }) => {
+            return Err("completion context reached a different editor query".to_owned());
+        }
         Some(SourceObservation::Goals { range, goals })
             if matches!(
                 kind,

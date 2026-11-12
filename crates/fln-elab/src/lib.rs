@@ -280,53 +280,12 @@ fn expect_atom<'a>(
     Ok(val)
 }
 
-fn natural_digit(byte: u8) -> Option<u64> {
-    match byte {
-        b'0'..=b'9' => Some(u64::from(byte - b'0')),
-        b'a'..=b'f' => Some(u64::from(byte - b'a') + 10),
-        b'A'..=b'F' => Some(u64::from(byte - b'A') + 10),
-        _ => None,
-    }
-}
-
+// Elaboration reads numeric Syntax, including atoms constructed by macros.
+// The pin's public decoder accepts more spellings than its source lexer, and
+// retains a leading-zero restriction (`0_1` is invalid; `00_1` is one).
 fn decode_natural(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
-    let (radix, digits) = match spelling.as_bytes() {
-        [b'0', b'b' | b'B', digits @ ..] => (2, digits),
-        [b'0', b'o' | b'O', digits @ ..] => (8, digits),
-        [b'0', b'x' | b'X', digits @ ..] => (16, digits),
-        digits => (10, digits),
-    };
-    if digits.is_empty()
-        || digits.last() == Some(&b'_')
-        || (radix == 10 && !digits.first().is_some_and(u8::is_ascii_digit))
-    {
-        return Err(NatDefinitionElabError::InvalidNaturalLiteral);
-    }
-    let compact = digits
-        .iter()
-        .copied()
-        .filter(|byte| *byte != b'_')
-        .collect::<Vec<_>>();
-    if compact.is_empty() {
-        return Err(NatDefinitionElabError::InvalidNaturalLiteral);
-    }
-
-    let value = if radix == 10 {
-        let decimal = std::str::from_utf8(&compact)
-            .map_err(|_| NatDefinitionElabError::InvalidNaturalLiteral)?;
-        BigNat::from_decimal(decimal).ok_or(NatDefinitionElabError::InvalidNaturalLiteral)?
-    } else {
-        let scale = BigNat::from_u64(radix);
-        let mut value = BigNat::zero();
-        for byte in compact {
-            let digit = natural_digit(byte).ok_or(NatDefinitionElabError::InvalidNaturalLiteral)?;
-            if digit >= radix {
-                return Err(NatDefinitionElabError::InvalidNaturalLiteral);
-            }
-            value = value.mul(&scale).add(&BigNat::from_u64(digit));
-        }
-        value
-    };
+    let value = fln_bignum::nat::literal::decode_nat_literal(spelling)
+        .ok_or(NatDefinitionElabError::InvalidNaturalLiteral)?;
     Ok(Literal::Nat(literal_from_bignat(&value)))
 }
 
@@ -2045,7 +2004,7 @@ mod tests {
                 expected: "Lean.Parser.Term.paren"
             })
         ));
-        for malformed in ["", "_1", "1_", "0x", "0x1_", "0b2"] {
+        for malformed in ["", "_1", "0_1", "0__1", "0b2", "0o8", "0xg", "٠1"] {
             assert_eq!(
                 decode_natural(malformed),
                 Err(NatDefinitionElabError::InvalidNaturalLiteral)

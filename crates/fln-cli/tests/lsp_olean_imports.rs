@@ -80,16 +80,19 @@ impl Project {
         self.write(&format!("{directory}/Ext/A.lean"), a);
         self.write(&format!("{directory}/Ext/B.lean"), EXT_B);
         for target in ["+Ext.A:olean", "+Ext.B:olean"] {
-            let output = Command::new(env!("CARGO_BIN_EXE_lake"))
-                .arg("--dir")
-                .arg(self.0.join(directory))
-                .args(["build", target])
-                .env("LEAN_PATH", self.0.join("no-imports"))
-                .env("FLN_IMPORT_REUSE_DIR", self.0.join("lake-records"))
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
+            self.build(directory, target);
         }
+    }
+    fn build(&self, directory: &str, target: &str) {
+        let output = Command::new(env!("CARGO_BIN_EXE_lake"))
+            .arg("--dir")
+            .arg(self.0.join(directory))
+            .args(["build", target])
+            .env("LEAN_PATH", self.0.join("no-imports"))
+            .env("FLN_IMPORT_REUSE_DIR", self.0.join("lake-records"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
     }
     fn search(&self) -> PathBuf {
         self.0.join("producer/.lake/build/lib/lean")
@@ -339,6 +342,7 @@ fn a_second_session_re_proves_the_record_instead_of_admitting_again() {
         let opened = session.check(&open(&uri, USE));
         let notification = opened.clean().to_owned();
         let hovered = session.hover(&uri, line, column);
+        assert!(hovered.contains("Ext.A :"), "{hovered}");
         session.finish();
         results.push((notification, hovered));
     }
@@ -373,7 +377,8 @@ fn a_second_session_re_proves_the_record_instead_of_admitting_again() {
 /// Within one server, the world is kept while its bytes are identical and obtained
 /// again the moment they are not. A rebuilt `.olean` is re-admitted under a new key;
 /// a damaged one is refused, never answered from the old world; restoring the
-/// original bytes hits the original record.
+/// original bytes may reuse the still-retained original world, after re-reading
+/// the closure. No old-world success is used while the artifact is damaged.
 #[test]
 fn within_a_session_the_world_is_kept_only_while_its_bytes_are_unchanged() {
     let project = Project::new();
@@ -435,17 +440,107 @@ fn within_a_session_the_world_is_kept_only_while_its_bytes_are_unchanged() {
     std::fs::write(project.olean(), &original).unwrap();
     let restored = session.check(&change(&uri, 5, USE));
     let restored = restored.clean().to_owned();
-    assert_eq!(
-        world(&restored),
-        (
-            "obtained".into(),
-            "reuse-verified".into(),
-            "reused".into(),
-            "hit".into(),
-            String::new()
-        )
-    );
+    let mut original_world = world(&first);
+    original_world.0 = "retained".into();
+    assert_eq!(world(&restored), original_world);
     assert_eq!(field(&restored, "closureKey"), field(&first, "closureKey"));
+    let absent_again = session.check(&change(&uri, 6, &uses_extra));
+    assert!(absent_again.source_check.is_none());
+    assert!(
+        absent_again
+            .diagnostics
+            .contains("Unknown identifier `Ext.extra`"),
+        "{}",
+        absent_again.diagnostics
+    );
+    session.finish();
+}
+
+/// Switching open documents must preserve their distinct admitted import worlds
+/// and source caches. A declaration present only in another world stays absent.
+#[test]
+fn alternating_documents_reuse_their_own_worlds_without_leaking_declarations() {
+    let project = Project::new();
+    let uri_a = project.uri();
+    let uri_b = format!("file://{}", project.0.join("consumer/Other.lean").display());
+    let use_b = USE
+        .replace("Ext.A", "Ext.B")
+        .replace("Use.first", "Other.first");
+    let mut session = Session::start(&project);
+    let first_a = session.check(&open(&uri_a, USE)).clean().to_owned();
+    let first_b = session.check(&open(&uri_b, &use_b)).clean().to_owned();
+    assert_eq!(world(&first_a).0, "obtained");
+    assert_eq!(world(&first_b).0, "obtained");
+    assert_ne!(field(&first_a, "closureKey"), field(&first_b, "closureKey"));
+
+    for version in 2..=3 {
+        for (uri, source, original) in [(&uri_a, USE, &first_a), (&uri_b, use_b.as_str(), &first_b)]
+        {
+            let checked = session.check(&change(uri, version, source));
+            let checked = checked.clean();
+            assert_eq!(world(checked).0, "retained", "{checked}");
+            assert_eq!(field(checked, "closureKey"), field(original, "closureKey"));
+            assert!(checked.contains("\"elaboratedModules\":0"), "{checked}");
+        }
+    }
+    let leaked = use_b.replace("Ext.B P (Local.id P h)", "Ext.A P h");
+    let rejected = session.check(&change(&uri_b, 4, &leaked));
+    assert!(rejected.source_check.is_none());
+    assert!(
+        rejected.diagnostics.contains("Unknown identifier `Ext.A`"),
+        "{}",
+        rejected.diagnostics
+    );
+    let restored = session.check(&change(&uri_b, 5, &use_b));
+    assert_eq!(world(restored.clean()).0, "retained");
+    let (line, column) = position(USE, "Ext.A P");
+    let hovered = session.hover(&uri_a, line, column);
+    assert!(hovered.contains("Ext.A :"), "{hovered}");
+    session.finish();
+}
+
+/// A bounded cache must evict by use, not insertion, and an evicted world must
+/// traverse the ordinary verified-record path before it is available again.
+#[test]
+fn import_world_retention_evicts_the_least_recently_used_closure() {
+    let project = Project::new();
+    for module in ["C", "D", "E"] {
+        project.write(
+            &format!("producer/Ext/{module}.lean"),
+            &format!("prelude\ndef Ext.{module} (P : Prop) (h : P) : P := h\n"),
+        );
+        project.build("producer", &format!("+Ext.{module}:olean"));
+    }
+    let uri = project.uri();
+    let mut session = Session::start(&project);
+    let mut keys = std::collections::BTreeMap::new();
+    for (version, module) in ["A", "B", "C", "D", "A", "E", "A", "B"]
+        .into_iter()
+        .enumerate()
+    {
+        let source = USE.replace("Ext.A", &format!("Ext.{module}"));
+        let message = if version == 0 {
+            open(&uri, &source)
+        } else {
+            change(&uri, version as i64 + 1, &source)
+        };
+        let checked = session.check(&message);
+        let checked = checked.clean();
+        let report = world(checked);
+        if matches!(version, 4 | 6) {
+            assert_eq!(report.0, "retained", "{checked}");
+        } else {
+            assert_eq!(report.0, "obtained", "{checked}");
+        }
+        if version == 7 {
+            assert_eq!(report.2, "reused", "{checked}");
+            assert_eq!(report.3, "hit", "{checked}");
+        }
+        let key = field(checked, "closureKey");
+        if let Some(original) = keys.insert(module, key.to_owned()) {
+            assert_eq!(key, original);
+        }
+    }
     session.finish();
 }
 

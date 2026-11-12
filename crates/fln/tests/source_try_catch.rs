@@ -16,6 +16,9 @@ fn checked(base: &Engine, s: &str) -> Engine {
         .engine
 }
 const CLASSES: &str = r#"
+inductive Sum (α : Type u) (β : Type v) where
+  | inl (val : α)
+  | inr (val : β)
 class Pure (m : Type -> Type) where
   pure : {A : Type} -> A -> m A
 class Bind (m : Type -> Type) where
@@ -256,6 +259,173 @@ theorem caught_value : result (value 37) = 42 := rfl
 #eval result success
 "#,
         &["42", "42"],
+    );
+}
+
+#[test]
+fn bound_try_values_resume_after_success_recovery_and_typed_rethrows() {
+    execute(
+        &base(),
+        r#"
+def boundSuccess : Trial Nat := do
+  let n ← try
+    succeed (7 : Nat)
+  catch _ =>
+    raise (999 : Nat)
+  succeed (n + 1)
+def boundRecovery : Trial Nat := do
+  let n ← try
+    raise (5 : Nat)
+  catch e =>
+    succeed (e + 2)
+  succeed (n + 1)
+def boundRethrows : Trial Nat := do
+  let n : Nat ← try
+    raise (3 : Nat)
+  catch e : Nat =>
+    raise (e + 1)
+  catch e : Nat =>
+    succeed (e + 2)
+  succeed (n + 1)
+def boundSuffixError : Trial Nat := do
+  let n ← try
+    succeed (7 : Nat)
+  catch _ =>
+    succeed (0 : Nat)
+  raise (n + 2)
+theorem recovered_value : result boundRecovery = 8 := rfl
+#eval result boundSuccess
+#eval result boundRecovery
+#eval result boundRethrows
+#eval result boundSuffixError
+"#,
+        &["8", "8", "7", "109"],
+    );
+}
+
+#[test]
+fn bound_try_returns_keep_the_outer_result_and_bypass_the_value_continuation() {
+    execute(
+        &base(),
+        r#"
+def boundProtectedReturn : Trial Nat := do
+  let n : Nat ← try
+    return 3
+  catch _ =>
+    succeed (4 : Nat)
+  succeed (n + 100)
+def boundHandlerReturn : Trial Nat := do
+  let n : Nat ← try
+    raise (5 : Nat)
+  catch e =>
+    return e
+  succeed (n + 100)
+def boundDifferentTypes (stop fail : Bool) : Trial Bool := do
+  let n : Nat ← try
+    if stop then return true
+    if fail then raise (5 : Nat)
+    succeed (7 : Nat)
+  catch _ =>
+    return false
+  match n with
+  | Nat.zero => succeed false
+  | Nat.succ _ => succeed true
+def boolResult (x : Trial Bool) : Nat :=
+  match x with
+  | Attempt.ok b =>
+    match b with
+    | true => 1
+    | false => 0
+  | Attempt.error e => e + 100
+theorem protected_return_value : result boundProtectedReturn = 3 := rfl
+theorem handler_return_value : result boundHandlerReturn = 5 := rfl
+#eval result boundProtectedReturn
+#eval result boundHandlerReturn
+#eval boolResult (boundDifferentTypes true false)
+#eval boolResult (boundDifferentTypes false true)
+#eval boolResult (boundDifferentTypes false false)
+"#,
+        &["3", "5", "1", "0", "1"],
+    );
+}
+
+#[test]
+fn bound_try_mutable_results_and_local_mutation_preserve_outer_reads() {
+    execute(
+        &base(),
+        r#"
+def assignedResult : Trial Nat := do
+  let mut n := 0
+  n ← try
+    succeed (7 : Nat)
+  catch _ =>
+    succeed (8 : Nat)
+  succeed n
+def readsOuter : Trial Nat := do
+  let mut outer := 4
+  let n ← try
+    succeed (outer + 1)
+  catch _ =>
+    succeed outer
+  succeed (n + outer)
+def localMutation : Trial Nat := do
+  let mut outer := 4
+  let n ← try
+    let mut inner := 2
+    inner := inner + 1
+    succeed (inner + outer)
+  catch _ =>
+    succeed outer
+  succeed (n + outer)
+def nestedBindings : Trial Nat := do
+  let mut outer := 4
+  let n ← try
+    let inner ← try
+      raise (outer + 1)
+    catch e =>
+      succeed e
+    succeed inner
+  catch _ =>
+    succeed outer
+  succeed (n + outer)
+#eval result assignedResult
+#eval result readsOuter
+#eval result localMutation
+#eval result nestedBindings
+"#,
+        &["7", "9", "11", "9"],
+    );
+}
+
+#[test]
+fn bound_try_rejects_invalid_scopes_types_and_mutable_shadowing_atomically() {
+    let engine = base();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    for source in [
+        // Normal values must fit the written bound domain, even on an unused path.
+        "def bad : Trial Nat := do { let n : Nat ← try { succeed 1 } catch _ => { succeed true }; succeed n }",
+        // The handler binder and protected locals do not escape into the suffix.
+        "def bad : Trial Nat := do { let n ← try { succeed (1 : Nat) } catch e => { succeed e }; succeed (n + e) }",
+        "def bad : Trial Nat := do { let n ← try { let hidden := 1; succeed hidden } catch _ => { succeed 2 }; succeed (n + hidden) }",
+        // Both ordinary and returning regions enforce the pin's mutable-shadow rule.
+        "def bad : Trial Nat := do { let mut e := 0; let n : Nat ← try { succeed 1 } catch e => { succeed e }; succeed (n + e) }",
+        "def bad : Trial Nat := do { let mut e := 0; let n : Nat ← try { return 1 } catch e => { succeed e }; succeed (n + e) }",
+        "def bad : Trial Nat := do { let mut e := 0; let n ← try { let e := 1; succeed e } catch _ => { succeed 2 }; succeed (n + e) }",
+        "def bad : Trial Nat := do { let e := 0; let n ← try { e := 1; succeed e } catch _ => { succeed 2 }; succeed (n + e) }",
+    ] {
+        assert!(
+            engine
+                .check_source_files(&[source.as_bytes()], &options, limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(engine.logical_root(&options), root);
+    }
+    execute(
+        &engine,
+        "def retry : Trial Nat := do { let n ← try { raise (5 : Nat) } catch e => { succeed (e + 2) }; succeed (n + 1) }\n#eval result retry",
+        &["8"],
     );
 }
 

@@ -59,7 +59,7 @@ impl Default for MacroRegistryLimits {
         Self {
             max_modules: 4096,
             max_declarations: 1 << 20,
-            max_macros: 256,
+            max_macros: 4096,
             metadata: DecodeLimits::default(),
             compilation: IrExecutionLimits::default(),
         }

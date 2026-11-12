@@ -432,3 +432,44 @@ pub(super) fn definition_result(value: &str) -> bool {
     plain_string_member(root, "uri")
         && matches!(range_points(object_member(root, "range")), Some((start, end)) if start < end)
 }
+
+/// The native outline profile is a flat, source-ordered DocumentSymbol array.
+/// Every declaration has a nonempty name and range, the pin's method kind, and
+/// a nonempty selection contained in its own declaration. No source text or
+/// synthesized namespace hierarchy is part of this response.
+pub(super) fn document_symbols_result(value: &str) -> bool {
+    if value.len() > 1024 * 1024 {
+        return false;
+    }
+    let Some(symbols) = array_elements(value, 4096) else {
+        return false;
+    };
+    let mut previous = None;
+    for symbol in symbols {
+        let symbol = RawField::Value(symbol);
+        let Some((start, end)) = range_points(object_member(symbol, "range")) else {
+            return false;
+        };
+        let Some((selection_start, selection_end)) =
+            range_points(object_member(symbol, "selectionRange"))
+        else {
+            return false;
+        };
+        if !plain_string_member(symbol, "name")
+            || !matches!(
+                object_integer_member(symbol, "kind"),
+                VersionField::Valid(6)
+            )
+            || !matches!(object_member(symbol, "children"), RawField::Missing)
+            || start >= end
+            || selection_start >= selection_end
+            || selection_start < start
+            || selection_end > end
+            || previous.is_some_and(|previous| start < previous)
+        {
+            return false;
+        }
+        previous = Some(start);
+    }
+    true
+}

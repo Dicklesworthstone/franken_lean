@@ -732,6 +732,17 @@ pub(in crate::source_check) struct EditorWorld {
 }
 
 impl EditorWorld {
+    /// Encoded bytes retained by this closure, including server/private parts.
+    /// The loader has already checked their total against `MAX_OLEAN_BYTES`.
+    pub(in crate::source_check) fn artifact_bytes(&self) -> usize {
+        self.loaded
+            .oleans
+            .iter()
+            .flat_map(|module| &module.parts)
+            .map(Vec::len)
+            .sum()
+    }
+
     pub(in crate::source_check) fn read(roots: &[Name], root: &Path) -> Result<Self, Failure> {
         let oleans = load_olean_closure(roots, root)?;
         let inputs: Vec<fln::OleanModuleInput<'_>> = oleans

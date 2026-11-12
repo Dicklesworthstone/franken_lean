@@ -9783,6 +9783,82 @@ fn generated_byte_array_push_refuses_wrong_categories_and_wide_bytes() {
 }
 
 #[test]
+fn generated_byte_array_reads_replay_and_recover_from_resource_stops() {
+    let _guard = lock();
+    let text = "aλ😀\0z".repeat(257);
+    let expected = text.bytes().map(u64::from).sum::<u64>() + text.len() as u64;
+    let mut code = vec![
+        Instruction::String {
+            dst: r(0),
+            value: text.clone(),
+        },
+        intrinsic(r(0), "extern:String.toByteArray", vec![r(0)]),
+        Instruction::Nat {
+            dst: r(1),
+            value: 0,
+        },
+    ];
+    for index in 0..text.len() {
+        code.push(Instruction::Nat {
+            dst: r(2),
+            value: index as u64,
+        });
+        let row = match index % 3 {
+            0 => "extern:ByteArray.get",
+            1 => "extern:ByteArray.get!",
+            _ => "extern:ByteArray.uget",
+        };
+        code.push(intrinsic(r(3), row, vec![r(0), r(2)]));
+        code.push(intrinsic(r(1), "extern:Nat.add", vec![r(1), r(3)]));
+    }
+    code.extend([
+        intrinsic(r(2), "extern:ByteArray.size", vec![r(0)]),
+        intrinsic(r(1), "extern:Nat.add", vec![r(1), r(2)]),
+        Instruction::Return { src: r(1) },
+    ]);
+    let expected_steps = code.len() as u64;
+    let program = validated(vec![function(0, 0, 4, code)]);
+    let bytes = encode_canonical(&program, CodecLimits::default()).expect("encode byte reads");
+    let program = decode_canonical(&bytes, CodecLimits::default()).expect("decode byte reads");
+
+    shadow::enable();
+    let first = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(nat_limbs(&first.value), vec![expected]);
+    assert_eq!(first.usage.steps, expected_steps);
+    let expected_usage = first.usage;
+    drop(first);
+    let stopped = execute(
+        &program,
+        ExecutionLimits {
+            max_steps: 10,
+            ..ExecutionLimits::default()
+        },
+        None,
+    );
+    match stopped {
+        Outcome::Inconclusive(inconclusive) => match inconclusive.cause {
+            InconclusiveCause::ResourceExhausted { usage } => {
+                assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
+                assert_eq!(usage.allowed, 10);
+                assert_eq!(usage.observed, 11);
+            }
+            other => panic!("expected byte-read step exhaustion, got {other:?}"),
+        },
+        other => panic!("expected byte-read Inconclusive, got {other:?}"),
+    }
+    let retry = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(nat_limbs(&retry.value), vec![expected]);
+    assert_eq!(retry.usage, expected_usage);
+    drop(retry);
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+    )));
+}
+
+#[test]
 fn generated_string_bootstrap_aliases_and_comparisons_execute_with_utf8_positions() {
     let _guard = lock();
     let program = validated(vec![function(
@@ -12249,19 +12325,289 @@ fn float_unary_math_and_pow_atan2_execute_on_the_owned_numerics_plane() {
         "atan2(y=1, x=0) = {quadrant}"
     );
     assert_eq!(quadrant.to_bits(), fln_libm::atan2(1.0, 0.0).to_bits());
-    // frExp's pair result remains outside this adapter's supported shape.
-    let refusal = float_program(
-        "extern:Float.frExp",
-        vec![float_operand(r(0), false, 1.5)],
-        true,
+}
+
+#[test]
+fn float_frexp_returns_owned_pairs_with_exact_signed_ieee_decomposition() {
+    let _guard = lock();
+    shadow::enable();
+    for (family, binary32) in [("Float", false), ("Float32", true)] {
+        let mut cases = vec![
+            (0.0, 0.0, 0),
+            (-0.0, -0.0, 0),
+            (1.0, 0.5, 1),
+            (-1.0, -0.5, 1),
+            (1.5, 0.75, 1),
+            (-6.0, -0.75, 3),
+            (0.25, 0.5, -1),
+            (-0.125, -0.5, -2),
+            (f64::INFINITY, f64::INFINITY, 0),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY, 0),
+            (f64::NAN, f64::NAN, 0),
+        ];
+        // Exact IEEE endpoints, independently specified rather than read
+        // back from fln-libm. The largest subnormal is two significand ULPs
+        // below 1; the largest finite value is one ULP below 1.
+        if binary32 {
+            cases.extend([
+                (f64::from(f32::from_bits(1)), 0.5, -148),
+                (-f64::from(f32::from_bits(1)), -0.5, -148),
+                (
+                    f64::from(f32::from_bits(0x007f_ffff)),
+                    f64::from(f32::from_bits(0x3f7f_fffe)),
+                    -126,
+                ),
+                (f64::from(f32::MIN_POSITIVE), 0.5, -125),
+                (
+                    f64::from(f32::MAX),
+                    f64::from(f32::from_bits(0x3f7f_ffff)),
+                    128,
+                ),
+            ]);
+        } else {
+            cases.extend([
+                (f64::from_bits(1), 0.5, -1073),
+                (-f64::from_bits(1), -0.5, -1073),
+                (
+                    f64::from_bits(0x000f_ffff_ffff_ffff),
+                    f64::from_bits(0x3fef_ffff_ffff_fffe),
+                    -1022,
+                ),
+                (f64::MIN_POSITIVE, 0.5, -1021),
+                (f64::MAX, f64::from_bits(0x3fef_ffff_ffff_ffff), 1024),
+            ]);
+        }
+        let row = format!("extern:{family}.frExp");
+        assert_eq!(contract_result_ownership(&row), ResultOwnership::Owned);
+        for (input, expected_fraction, expected_exponent) in cases {
+            let pair = run_float(&row, vec![float_operand(r(0), binary32, input)], true);
+            assert_eq!(pair.header().tag, 0, "{family}.frExp({input})");
+            assert_eq!(pair.header().other, 2, "the result is Prod with two fields");
+            let fraction = float_contents(&pair.ctor_child(0), binary32);
+            let exponent = pair.ctor_child(1);
+            assert!(
+                exponent.is_scalar(),
+                "every IEEE exponent fits a scalar Int"
+            );
+            assert_eq!(exponent.unbox() as u32 as i32, expected_exponent);
+            if expected_fraction.is_nan() {
+                // The pin documents nonfinite significands as undefined;
+                // its runtime explicitly fixes their exponent to zero.
+                assert!(fraction.is_nan());
+            } else {
+                assert_eq!(
+                    fraction.to_bits(),
+                    expected_fraction.to_bits(),
+                    "{family}.frExp({input})"
+                );
+            }
+        }
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "frExp releases both the pair and its boxed float");
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
+}
+
+#[test]
+fn float_frexp_pairs_project_and_recompose_through_cached_vm_execution() {
+    let _guard = lock();
+    shadow::enable();
+    for (family, binary32, input) in [
+        ("Float", false, -f64::from_bits(1)),
+        ("Float32", true, -f64::from(f32::from_bits(1))),
+        ("Float", false, f64::MAX),
+        ("Float32", true, f64::from(f32::MAX)),
+        ("Float", false, -0.0),
+        ("Float32", true, -0.0),
+    ] {
+        let program = validated(vec![function_with_callable_result(
+            0,
+            Vec::new(),
+            CallableResultOwnership::Owned,
+            5,
+            vec![
+                float_operand(r(0), binary32, input),
+                intrinsic(r(1), &format!("extern:{family}.frExp"), vec![r(0)]),
+                Instruction::CtorField {
+                    dst: r(2),
+                    src: r(1),
+                    expected_tag: 0,
+                    expected_fields: 2,
+                    field: 0,
+                },
+                Instruction::CtorField {
+                    dst: r(3),
+                    src: r(1),
+                    expected_tag: 0,
+                    expected_fields: 2,
+                    field: 1,
+                },
+                intrinsic(r(4), &format!("extern:{family}.scaleB"), vec![r(2), r(3)]),
+                Instruction::Return { src: r(4) },
+            ],
+        )]);
+        let bytes = encode_canonical(&program, CodecLimits::default()).unwrap();
+        let decoded = decode_canonical(&bytes, CodecLimits::default()).unwrap();
+        let uncached = returned(execute(&decoded, ExecutionLimits::default(), None));
+        assert_eq!(
+            float_contents(&uncached.value, binary32).to_bits(),
+            input.to_bits()
+        );
+        drop(uncached);
+        let mut caches = InlineCaches::try_new(8).unwrap();
+        for _ in 0..2 {
+            let cached = returned(execute_cached(
+                &decoded,
+                ExecutionLimits::default(),
+                None,
+                cache_context(91, 17, Mode::Sound),
+                &mut caches,
+            ));
+            assert_eq!(
+                float_contents(&cached.value, binary32).to_bits(),
+                input.to_bits()
+            );
+        }
+        assert!(
+            caches.stats().hits > 0,
+            "repeat execution uses the validated intrinsic plans"
+        );
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(
+        live, 0,
+        "projecting the pair does not leak or duplicate its children"
     );
-    assert!(matches!(
-        execute(&refusal, ExecutionLimits::default(), None),
-        Outcome::Complete(VmExit::Refused {
-            refusal: VmRefusal::UnsupportedIntrinsic { .. },
-            ..
-        })
-    ));
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
+}
+
+#[test]
+fn float_frexp_refuses_invalid_contracts_and_reclaims_unpublished_pairs() {
+    let _guard = lock();
+    shadow::enable();
+    for (family, binary32) in [("Float", false), ("Float32", true)] {
+        let row = format!("extern:{family}.frExp");
+        let malformed = float_program(
+            &row,
+            vec![Instruction::Nat {
+                dst: r(0),
+                value: 0,
+            }],
+            true,
+        );
+        assert!(matches!(
+            execute(&malformed, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::TypeMismatch { argument: 0, .. },
+                ..
+            })
+        ));
+        let wrong_arity = validated(vec![function_with_callable_result(
+            0,
+            Vec::new(),
+            CallableResultOwnership::Owned,
+            1,
+            vec![
+                Instruction::Intrinsic {
+                    dst: r(0),
+                    row: row.clone(),
+                    args: Vec::new(),
+                    argument_ownership: Vec::new(),
+                    result_ownership: ResultOwnership::Owned,
+                },
+                Instruction::Return { src: r(0) },
+            ],
+        )]);
+        assert!(matches!(
+            execute(&wrong_arity, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::IntrinsicOwnershipContract { .. },
+                ..
+            })
+        ));
+        let wrong_result = validated(vec![function_with_callable_result(
+            0,
+            Vec::new(),
+            CallableResultOwnership::Owned,
+            2,
+            vec![
+                float_operand(r(0), binary32, 6.0),
+                Instruction::Intrinsic {
+                    dst: r(1),
+                    row: row.clone(),
+                    args: vec![r(0)],
+                    argument_ownership: contract_argument_ownership(&row, 1),
+                    result_ownership: ResultOwnership::Scalar,
+                },
+                Instruction::Return { src: r(1) },
+            ],
+        )]);
+        assert!(matches!(
+            execute(&wrong_result, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::IntrinsicResultOwnershipMismatch {
+                    expected: ResultOwnership::Owned,
+                    actual: ResultOwnership::Scalar,
+                    ..
+                },
+                ..
+            })
+        ));
+        let program = float_program(&row, vec![float_operand(r(0), binary32, 6.0)], true);
+        // Before the intrinsic, then after the pair and its float child
+        // are allocated but before Return can publish either of them.
+        for completed_steps in [1, 2] {
+            let stopped = execute(
+                &program,
+                ExecutionLimits {
+                    max_steps: completed_steps,
+                    ..ExecutionLimits::default()
+                },
+                None,
+            );
+            assert_eq!(stopped.authority(), Authority::NonAuthoritative);
+            assert!(matches!(
+                stopped,
+                Outcome::Inconclusive(ref inconclusive)
+                    if matches!(inconclusive.cause,
+                        InconclusiveCause::ResourceExhausted { ref usage }
+                            if usage.reason == ResourceReason::ExecutionSteps)
+            ));
+            let polls = Cell::new(0);
+            let cancel = || {
+                polls.set(polls.get() + 1);
+                polls.get() == completed_steps + 1
+            };
+            let stopped = execute(&program, ExecutionLimits::default(), Some(&cancel));
+            assert_eq!(stopped.authority(), Authority::NonAuthoritative);
+            assert!(matches!(
+                stopped,
+                Outcome::Inconclusive(ref inconclusive)
+                    if matches!(inconclusive.cause, InconclusiveCause::Cancelled { .. })
+            ));
+        }
+        let recovered = returned(execute(&program, ExecutionLimits::default(), None));
+        assert_eq!(
+            float_contents(&recovered.value.ctor_child(0), binary32),
+            0.75
+        );
+        assert_eq!(recovered.value.ctor_child(1).unbox(), 3);
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(
+        live, 0,
+        "frExp refusals and nonanswers retain no pair or child"
+    );
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
 }
 
 fn float_scaling_program(binary32: bool, bits: u64, exponent: i64) -> ValidatedProgram {

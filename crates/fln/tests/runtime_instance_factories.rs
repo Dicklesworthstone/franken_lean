@@ -28,6 +28,58 @@ fn execute(source: &str, expected: &str) -> u64 {
     value.usage.steps
 }
 
+fn strict_dictionary(source: &str, caller: &str) {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let source = |cost| format!("{source}\n#eval {caller} {cost} {{ value := 42 }}");
+    let run = |cost| {
+        base.execute_source_definitions(&[source(cost).as_bytes()], &options, limits())
+            .unwrap_or_else(|error| panic!("{}\n{error:?}", source(cost)))
+            .into_complete()
+            .expect("the complete dictionary has a uniform executable layout")
+    };
+    let idle = run(0);
+    let busy = run(30);
+    let mut steps = Vec::new();
+    for report in [&idle, &busy] {
+        let execution = report.executions.last().unwrap();
+        let VmExit::Returned(value) = &execution.exit else {
+            panic!("dictionary method did not return");
+        };
+        assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some("42"));
+        steps.push(value.usage.steps);
+        let replay =
+            fln::execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                .unwrap()
+                .into_complete()
+                .unwrap();
+        let VmExit::Returned(value) = replay else {
+            panic!("dictionary artifact did not return");
+        };
+        assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some("42"));
+    }
+    assert!(
+        steps[1] > steps[0] + 30,
+        "the unused dictionary field must still execute: {steps:?}"
+    );
+    let mut bounded = limits();
+    bounded.vm.max_steps = steps[0];
+    assert!(matches!(
+        base.execute_source_definitions(&[source(30).as_bytes()], &options, bounded)
+            .unwrap(),
+        fln::Outcome::Inconclusive(_)
+    ));
+    assert_eq!(base.logical_root(&options), root);
+    let retry = run(30);
+    assert_eq!(
+        busy.executions.last().unwrap().flbc_artifact,
+        retry.executions.last().unwrap().flbc_artifact
+    );
+    assert_eq!(busy.result_logical_root, retry.result_logical_root);
+    assert_eq!(base.logical_root(&options), root);
+}
+
 const ECHO: &str = r#"
 class Echo (K : Type) where
   echo : {A : Type} -> A -> A
@@ -160,7 +212,7 @@ def forwardProofSelected (n : Nat) : Nat := consumeProofSelected (n := n)
 }
 
 #[test]
-fn scoped_polymorphic_dictionary_specialization_keeps_computed_siblings_strict() {
+fn scoped_polymorphic_dictionaries_can_retain_computed_constructor_fields() {
     let source = r#"
 class PickAt (n : Nat) where
   pick : {A : Type} -> A -> A -> A
@@ -173,22 +225,185 @@ def consume {n : Nat} {A : Type} [PickAt n] (x y : A) : A :=
 def forward (n : Nat) : Nat := consume (n := n) 42 9
 #eval forward 30
 "#;
-    let error = engine()
-        .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
-        .expect_err("an unselected computation cannot become inert dictionary evidence");
-    let mut cause = &error;
-    while let fln::EngineExecutionError::BatchCommand { error, .. } = cause {
-        cause = error;
+    execute(source, "42");
+}
+
+const COMPUTED_AMOUNT: &str = r#"
+class RuntimeAmount (n : Nat) where
+  amount : {A : Type} -> A -> Nat
+  unused : Nat
+def amountWork (n : Nat) : Nat := match n with | 0 => 0 | k + 1 => amountWork k + 1
+instance runtimeAmount (n : Nat) : RuntimeAmount n :=
+  let paid : Nat := amountWork n
+  { amount := fun _ => paid, unused := amountWork n }
+def amountOnce {n : Nat} [RuntimeAmount n] : Nat :=
+  RuntimeAmount.amount (n := n) "λ"
+def amountTwice {n : Nat} [RuntimeAmount n] : Nat :=
+  RuntimeAmount.amount (n := n) 20 + RuntimeAmount.amount (n := n) "λ"
+def forwardAmount (n : Nat) : Nat := amountOnce (n := n)
+def forwardAmountTwice (n : Nat) : Nat := amountTwice (n := n)
+"#;
+
+#[test]
+fn computed_polymorphic_dictionary_captures_run_once_across_method_uses() {
+    let program = |caller, cost| format!("{COMPUTED_AMOUNT}\n#eval {caller} {cost}");
+    let once =
+        execute(&program("forwardAmount", 30), "30") - execute(&program("forwardAmount", 0), "0");
+    let twice = execute(&program("forwardAmountTwice", 30), "60")
+        - execute(&program("forwardAmountTwice", 0), "0");
+    assert!(once > 30, "the live factory capture was not evaluated");
+    assert_eq!(twice, once, "the shared factory capture was duplicated");
+    execute(
+        r#"
+class RuntimeChoice (n : Nat) where
+  choose : {A : Type} -> A -> A -> A
+  unused : Nat
+def choiceWork (n : Nat) : Nat := match n with | 0 => 0 | k + 1 => choiceWork k + 1
+instance runtimeChoice (n : Nat) : RuntimeChoice n :=
+  let selected := choiceWork n
+  { choose := fun x y => match selected with | 0 => x | _ + 1 => y,
+    unused := choiceWork n }
+def chooseValue {n : Nat} {A : Type} [RuntimeChoice n] (x y : A) : A :=
+  RuntimeChoice.choose (n := n) x y
+def chooseLengths (n : Nat) : Nat :=
+  String.length (chooseValue (n := n) "a" "λab") + chooseValue (n := n) 10 39
+#eval chooseLengths 30
+"#,
+        "42",
+    );
+}
+
+#[test]
+fn residual_dictionary_captures_replay_and_recover_after_budget_exhaustion() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let program = |cost| format!("{COMPUTED_AMOUNT}\n#eval forwardAmount {cost}");
+    let run = |cost| {
+        base.execute_source_definitions(&[program(cost).as_bytes()], &options, limits())
+            .unwrap()
+            .into_complete()
+            .unwrap()
+    };
+    let idle = run(0);
+    let busy = run(30);
+    let VmExit::Returned(idle_value) = &idle.executions.last().unwrap().exit else {
+        panic!("idle dictionary did not return");
+    };
+    let execution = busy.executions.last().unwrap();
+    let VmExit::Returned(value) = &execution.exit else {
+        panic!("computed dictionary did not return");
+    };
+    assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some("30"));
+    assert!(value.usage.steps > idle_value.usage.steps + 30);
+    let replay = fln::execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(replayed) = replay else {
+        panic!("computed dictionary artifact did not return");
+    };
+    assert_eq!(fln::nat_decimal(&replayed.value).as_deref(), Some("30"));
+    assert_eq!(replayed.usage.steps, value.usage.steps);
+    let mut bounded = limits();
+    bounded.vm.max_steps = idle_value.usage.steps;
+    assert!(matches!(
+        base.execute_source_definitions(&[program(30).as_bytes()], &options, bounded)
+            .unwrap(),
+        fln::Outcome::Inconclusive(_)
+    ));
+    assert_eq!(base.logical_root(&options), root);
+    let retried = run(30);
+    assert_eq!(
+        retried.executions.last().unwrap().flbc_artifact,
+        execution.flbc_artifact
+    );
+    assert_eq!(retried.result_logical_root, busy.result_logical_root);
+    assert_eq!(base.logical_root(&options), root);
+}
+
+#[test]
+fn residual_dictionary_exposure_preserves_foreign_factory_and_consumer_authority() {
+    let options = KVMap::new();
+    let clean = engine()
+        .check_source_files(
+            &[COMPUTED_AMOUNT.as_bytes()],
+            &options,
+            fln::SourceCheckLimits::new(limits().admission()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    for declaration in ["runtimeAmount", "amountOnce"] {
+        let decorated = Engine::from_environment(
+            fln_elab::externs::register(
+                clean.environment(),
+                &fln::Name::from_components([declaration]),
+                vec![fln_elab::externs::ExternEntry::Standard {
+                    backend: fln::Name::from_components(["all"]),
+                    symbol: "foreign_dictionary_execution".to_owned(),
+                }],
+            )
+            .unwrap(),
+        );
+        let root = decorated.logical_root(&options);
+        let mut error = decorated
+            .execute_source_definitions(&[b"#eval forwardAmount 30"], &options, limits())
+            .expect_err("a selected foreign dictionary cannot use its logical body");
+        while let fln::EngineExecutionError::BatchCommand { error: inner, .. } = error {
+            error = *inner;
+        }
+        assert!(
+            matches!(error, fln::EngineExecutionError::Ingress(_)),
+            "{declaration}: {error:?}"
+        );
+        assert_eq!(decorated.logical_root(&options), root);
+    }
+}
+
+#[test]
+fn a_dynamic_generic_dictionary_method_retains_a_typed_refusal() {
+    let source = r#"
+class DynamicAmount where
+  amount : (A : Type) -> A -> Nat
+def chooseMethod (flag : Bool) : (A : Type) -> A -> Nat :=
+  if flag then (fun A x => 41) else (fun A x => 42)
+def makeDynamic (flag : Bool) : DynamicAmount := { amount := chooseMethod flag }
+def consumeDynamic [chosen : DynamicAmount] : Nat := DynamicAmount.amount Nat 0
+"#;
+    let options = KVMap::new();
+    let base = engine()
+        .check_source_files(
+            &[source.as_bytes()],
+            &options,
+            fln::SourceCheckLimits::new(limits().admission()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let root = base.logical_root(&options);
+    let mut error = base
+        .execute_source_definitions(
+            &[b"#eval consumeDynamic (chosen := makeDynamic true)"],
+            &options,
+            limits(),
+        )
+        .expect_err("an unknown generic method cannot acquire a guessed runtime ABI");
+    while let fln::EngineExecutionError::BatchCommand { error: inner, .. } = error {
+        error = *inner;
     }
     assert!(
         matches!(
-            cause,
+            error,
             fln::EngineExecutionError::Ingress(
                 fln_comp::ingress::IngressError::UnsupportedCallableSignature { .. }
             )
         ),
         "{error:?}"
     );
+    assert_eq!(base.logical_root(&options), root);
 }
 
 #[test]
@@ -292,9 +507,6 @@ def fromBox (n delta x : Nat) : Nat :=
 
 #[test]
 fn inherited_methods_cannot_discard_a_computed_sibling() {
-    let base = engine();
-    let options = KVMap::new();
-    let root = base.logical_root(&options);
     let source = r#"
 structure IndexedBox (A : Type) (n : Nat) where
   value : A
@@ -308,32 +520,12 @@ instance makeBothAt (n : Nat) {A : Type} : BothAt (IndexedBox A n) A (fun _ _ =>
 def fromBox (n : Nat) (xs : IndexedBox Nat n) : Nat :=
   @GetAt.get (IndexedBox Nat n) Nat (fun _ _ => n = n)
     (@BothAt.toGetAt (IndexedBox Nat n) Nat (fun _ _ => n = n) (makeBothAt n (A := Nat))) xs 0 rfl
-#eval fromBox 30 { value := 42 }
 "#;
-    let error = base
-        .execute_source_definitions(&[source.as_bytes()], &options, limits())
-        .expect_err("an inherited method cannot erase its outer dictionary's strict work");
-    let mut cause = &error;
-    while let fln::EngineExecutionError::BatchCommand { error, .. } = cause {
-        cause = error;
-    }
-    assert!(
-        matches!(
-            cause,
-            fln::EngineExecutionError::Ingress(
-                fln_comp::ingress::IngressError::UnsupportedCallableSignature { name }
-            ) if name.to_display_string().starts_with("_fln_runtime_specialization.")
-        ),
-        "{error:?}"
-    );
-    assert_eq!(base.logical_root(&options), root);
+    strict_dictionary(source, "fromBox");
 }
 
 #[test]
 fn dependent_computed_dictionary_fields_are_not_discarded_as_inert_metadata() {
-    let base = engine();
-    let options = KVMap::new();
-    let root = base.logical_root(&options);
     let source = r#"
 structure IndexedBox (A : Type) (n : Nat) where
   value : A
@@ -347,30 +539,8 @@ instance makeGetAt (n : Nat) {A : Type} :
 def fromIndexedBox (n : Nat) (xs : IndexedBox Nat n) : Nat :=
   @GetAt.get (IndexedBox Nat n) Nat (fun _ _ => n = n)
     (makeGetAt n (A := Nat)) xs 0 rfl
-#eval fromIndexedBox 30 { value := 42 }
 "#;
-    let error = base
-        .execute_source_definitions(&[source.as_bytes()], &options, limits())
-        .expect_err("an unsupported strict dictionary must not become a fabricated inert method");
-    let mut cause = &error;
-    while let fln::EngineExecutionError::BatchCommand { error, .. } = cause {
-        cause = error;
-    }
-    assert!(
-        matches!(
-            cause,
-            fln::EngineExecutionError::Ingress(
-                fln_comp::ingress::IngressError::UnsupportedCallableSignature { name }
-            ) if name.to_display_string().starts_with("_fln_runtime_specialization.")
-        ),
-        "{error:?}"
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("supported ground runtime signature")
-    );
-    assert_eq!(base.logical_root(&options), root);
+    strict_dictionary(source, "fromIndexedBox");
 }
 
 #[test]

@@ -25,7 +25,7 @@ use super::{
 const MAX_STRING_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 // Native list work is distinct from FLBC instructions. An output-byte limit
 // alone cannot stop a cyclic spine or a long list of empty strings.
-const MAX_INTERCALATE_LIST_NODES: usize = 65_536;
+const MAX_STRING_LIST_NODES: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Intrinsic {
@@ -44,6 +44,8 @@ pub(super) enum Intrinsic {
     Utf8Set,
     /// `lean_string_data`: the string's scalars, in order, as a list.
     Data,
+    /// `lean_string_mk`: encode a list of Unicode scalar values in order.
+    FromList,
     Front,
     PosMin,
     PosSub,
@@ -94,6 +96,7 @@ impl Intrinsic {
                 Self::Utf8Set
             }
             "extern:String.toList" | "extern:String.data" => Self::Data,
+            "extern:String.ofList" | "extern:String.mk" => Self::FromList,
             "extern:String.Internal.front" => Self::Front,
             "extern:String.Pos.Raw.Internal.min" => Self::PosMin,
             "extern:String.Pos.Raw.Internal.sub" => Self::PosSub,
@@ -128,6 +131,7 @@ impl Intrinsic {
             Self::Utf8NextFast => "String.Pos.Raw.next'",
             Self::Utf8Set => "String.Pos.Raw.set",
             Self::Data => "String.toList",
+            Self::FromList => "String.ofList",
             Self::Front => "String.Internal.front",
             Self::PosMin => "String.Pos.Raw.Internal.min",
             Self::PosSub => "String.Pos.Raw.Internal.sub",
@@ -169,6 +173,7 @@ impl Intrinsic {
                 Self::Memcmp => 5,
                 Self::Pushn | Self::Utf8Set | Self::SubstringExtract => 3,
                 Self::Data
+                | Self::FromList
                 | Self::Front
                 | Self::Hash
                 | Self::SliceHash
@@ -193,6 +198,7 @@ impl Intrinsic {
             Self::Memcmp => return memcmp(args),
             Self::Intercalate => return intercalate(args),
             Self::Data => return data(&args[0], operation),
+            Self::FromList => return from_list(&args[0], operation),
             Self::Front => {
                 let buffer = string_buffer(&args[0], operation, 0)?;
                 let code = if buffer.len() == 1 {
@@ -277,6 +283,7 @@ impl Intrinsic {
             | Self::Utf8NextFast
             | Self::Utf8Set
             | Self::Data
+            | Self::FromList
             | Self::Front
             | Self::PosMin
             | Self::PosSub
@@ -674,11 +681,11 @@ fn intercalate(args: &[Obj]) -> Result<IntrinsicResult, IntrinsicFailure> {
     let mut count = 0usize;
     let mut size = 0usize;
     while let Some((head, tail)) = step(&list)? {
-        if count == MAX_INTERCALATE_LIST_NODES {
+        if count == MAX_STRING_LIST_NODES {
             return Err(IntrinsicFailure::StringBytesResource {
                 operation: OPERATION,
                 error: ResourceError::TraversalLimit {
-                    allowed: MAX_INTERCALATE_LIST_NODES as u64,
+                    allowed: MAX_STRING_LIST_NODES as u64,
                     observed: count as u64 + 1,
                 },
             });
@@ -778,6 +785,69 @@ fn data(value: &Obj, operation: &'static str) -> Result<IntrinsicResult, Intrins
         list = Obj::mk_ctor(1, vec![Obj::mk_nat(character as usize), list], &[]);
     }
     Ok(IntrinsicResult::owned(list))
+}
+
+/// `lean_string_mk` (`object.cpp:2158`): traverse the complete list before
+/// allocating its UTF-8 result. Both compiled constructor nil and the pin's
+/// scalar nil are admitted, but a malformed tail or a non-scalar Char is not
+/// silently truncated. The caller owns the input throughout both passes, so
+/// shared lists remain valid and the native owned-argument rule consumes only
+/// this invocation's handle.
+fn from_list(value: &Obj, operation: &'static str) -> Result<IntrinsicResult, IntrinsicFailure> {
+    let step = |list: &Obj| -> Result<Option<(char, Obj)>, VmRefusal> {
+        match value_kind(list) {
+            ValueKind::Scalar if list.unbox() == 0 => Ok(None),
+            ValueKind::Ctor(0) if list.header().other == 0 => Ok(None),
+            ValueKind::Ctor(1) if list.header().other == 2 => {
+                let head = list
+                    .try_ctor_child(0)
+                    .ok_or_else(|| type_mismatch(operation, 0, "List Char", list))?;
+                let tail = list
+                    .try_ctor_child(1)
+                    .ok_or_else(|| type_mismatch(operation, 0, "List Char", list))?;
+                // Char's compiled representation is an unboxed UInt32. A
+                // forged mpz or record is not a Char even if its low word is.
+                if !head.is_scalar() {
+                    return Err(type_mismatch(operation, 0, "Char", &head));
+                }
+                let code = scalar_code_point(&head, operation, 0)?;
+                let character = char::from_u32(code).ok_or(VmRefusal::NatOverflow { operation })?;
+                Ok(Some((character, tail)))
+            }
+            _ => Err(type_mismatch(operation, 0, "List Char", list)),
+        }
+    };
+    let mut list = value.clone_ref();
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    while let Some((character, tail)) = step(&list)? {
+        if count == MAX_STRING_LIST_NODES {
+            return Err(IntrinsicFailure::StringBytesResource {
+                operation,
+                error: ResourceError::TraversalLimit {
+                    allowed: MAX_STRING_LIST_NODES as u64,
+                    observed: count as u64 + 1,
+                },
+            });
+        }
+        bytes += character.len_utf8();
+        count += 1;
+        list = tail;
+    }
+    // The bounded node count also bounds UTF-8 output at four bytes per node.
+    let mut output = String::new();
+    output
+        .try_reserve_exact(bytes)
+        .map_err(|_| IntrinsicFailure::StringBytesResource {
+            operation,
+            error: ResourceError::Allocation { requested: bytes },
+        })?;
+    let mut list = value.clone_ref();
+    while let Some((character, tail)) = step(&list)? {
+        output.push(character);
+        list = tail;
+    }
+    Ok(IntrinsicResult::owned(Obj::mk_string(&output)))
 }
 
 /// `lean_char_default_value` (`lean.h:1211`): the `Inhabited Char` value `'A'`.

@@ -15,6 +15,7 @@ mod empty;
 mod evaluation;
 mod floats;
 mod fs;
+mod generic_records;
 mod global;
 mod implemented_by;
 mod indexed;
@@ -1501,6 +1502,16 @@ pub(super) fn is_template(definition: &DefinitionVal) -> bool {
             _ => return false,
         }
     }
+}
+/// A record can hide a type-polymorphic method behind an ordinary explicit
+/// parameter or result. Discover that requirement from admitted field types,
+/// before deciding whether this declaration is a standalone executable entry.
+pub(super) fn is_record_template(
+    environment: &Environment,
+    definition: &DefinitionVal,
+    limits: IngressLimits,
+) -> Result<bool, IngressError> {
+    Preparation::new(environment, limits).contains_generic_record(&definition.base.type_)
 }
 fn polymorphic_callback_kind(mut type_: &Expr) -> bool {
     loop {

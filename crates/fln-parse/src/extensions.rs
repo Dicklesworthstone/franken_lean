@@ -80,6 +80,7 @@ mod categories;
 pub(crate) use categories::{category_for_quotation, parse_category_quotation};
 mod commands;
 mod local_rules;
+mod macro_body;
 mod macro_rules;
 mod modules;
 mod quotation;
@@ -1675,6 +1676,18 @@ impl FileGrammar {
     /// declares, as the pin's elaborator does. `Ok(None)` for any other command; `Err` names
     /// what is not translated, and nothing is registered then.
     pub fn declare(&mut self, command: &Syntax) -> Result<Option<Arc<SyntaxDecl>>, &'static str> {
+        self.declare_with_macro_pure(command, &|_| false)
+    }
+
+    /// Register syntax while resolving a macro body's explicit `pure` calls.
+    /// The host must return true only for a name resolving to the ordinary
+    /// `Pure.pure` projection; lexical macro bindings still shadow that name.
+    /// `return`, quotation, and immutable bindings need no name callback.
+    pub fn declare_with_macro_pure(
+        &mut self,
+        command: &Syntax,
+        is_pure: &dyn Fn(&Name) -> bool,
+    ) -> Result<Option<Arc<SyntaxDecl>>, &'static str> {
         let Syntax::Node { kind, args, .. } = command else {
             return Ok(None);
         };
@@ -1900,7 +1913,10 @@ impl FileGrammar {
                     .ok_or("a macro's right-hand side")?;
                 // A template this does not translate leaves the syntax without a rule: its uses
                 // reach the elaborator unexpanded and are refused there.
-                let translated = macro_template(template, &category, &variables).and_then(|rhs| {
+                let translated = macro_body::direct(
+                    template, &category, &variables, &items, is_pure,
+                )
+                .and_then(|rhs| {
                     quotation::capture_kinds::direct(&rhs, &variables, &items)?;
                     Ok(rhs)
                 });
@@ -1929,7 +1945,7 @@ impl FileGrammar {
                 }
             }
             ["Lean", "Parser", "Command", "macro_rules"] => {
-                self.declare_macro_rules(args)?;
+                self.declare_macro_rules(args, is_pure)?;
                 return Ok(None);
             }
             _ => return Ok(None),
@@ -1975,8 +1991,12 @@ impl FileGrammar {
     }
 
     /// Interpret the file's quoted macro registrations without executing MacroM.
-    fn declare_macro_rules(&mut self, args: &[Syntax]) -> Result<(), &'static str> {
-        macro_rules::declare(self, args)
+    fn declare_macro_rules(
+        &mut self,
+        args: &[Syntax],
+        is_pure: &dyn Fn(&Name) -> bool,
+    ) -> Result<(), &'static str> {
+        macro_rules::declare(self, args, is_pure)
     }
 
     fn expander(&self) -> Expander {
@@ -3002,36 +3022,7 @@ fn antiquotation_name(syntax: &Syntax) -> Option<Name> {
     }
 }
 
-/// A macro's template: the quotation of its category (`` `(…) `` for `term`, `` `(tactic| …) ``
-/// for one tactic), its contents with each antiquotation `$x` the variable `x` binds. A
-/// quotation of another category, a sequence of tactics, a nested quotation, an antiquotation of
-/// no variable or of an expression, are not translated.
-fn macro_template(
-    rhs: &Syntax,
-    category: &Name,
-    variables: &[(Vec<usize>, Name)],
-) -> Result<Syntax, &'static str> {
-    let (actual, contents) =
-        quotation_contents(rhs).ok_or("a macro whose right-hand side is not a quotation")?;
-    if actual != *category {
-        return Err("a macro whose right-hand side is not a quotation of its category");
-    }
-    quotation::templates::checked(contents, variables)
-}
-
-/// `macro_rules` produces a raw Macro (Syntax -> MacroM Syntax), not a
-/// TSyntax of its input category. The resulting syntax is elaborated normally;
-/// a template of another category is not by itself an ill-typed declaration.
-fn macro_rule_template(
-    rhs: &Syntax,
-    variables: &[(Vec<usize>, Name)],
-) -> Result<Syntax, &'static str> {
-    let (_, contents) =
-        quotation_contents(rhs).ok_or("a macro rule whose right-hand side is not a quotation")?;
-    quotation::templates::checked(contents, variables)
-}
-
-/// Template nodes [`macro_template`] walks before refusing.
+/// Template nodes the macro body compiler walks before refusing.
 const MAX_TEMPLATE_NODES: usize = 4096;
 
 /// An identifier the template itself supplies: no source position of its own.

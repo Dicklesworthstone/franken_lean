@@ -24,17 +24,18 @@
 //! `preresolved`), and a use takes those constants before any of its own scope: a notation
 //! declared in `namespace A` over `A.foo` means `A.foo` wherever it is used, a root `foo`
 //! notwithstanding. Each template identifier keeps its original spelling while macros match
-//! and recursively expand, with the chosen declaration in `preresolved`. Only the finished
-//! expansion writes `_root_.<constant>` for the native term elaborator. A name that resolves to
-//! several declarations (which the pin would elaborate as overloaded) is refused as not
-//! implemented.
+//! and recursively expand, with every captured declaration in `preresolved`. The finished
+//! expansion anchors a single target as `_root_.<constant>`; an overloaded identifier retains
+//! its exact candidate list for the term elaborator to try against the application and expected
+//! type. Later namespace opens and declarations cannot add candidates to that captured list.
 //!
 //! A `macro`, and `macro_rules` for a syntax the file declared, expand the same way
 //! (`fln_parse::extensions`): quoted clauses try in textual order, with newer registrations
 //! before older fallbacks. Nested captures retain the syntax they matched before expansion.
 //! Template names are not prechecked (the pin refuses an unknown one only where it is used).
-//! A `macro` this does not translate (a `do` block, a sequence of tactics, a splice) registers
-//! its syntax without a rule; an unsupported `macro_rules` registration blocks older rules
+//! Pure MacroM bodies compose quotations, captured syntax, immutable lets, and monadic binds.
+//! An effectful body this does not translate registers its syntax without a rule;
+//! an unsupported `macro_rules` registration blocks older rules
 //! rather than silently retaining their meaning. `elab` is not read. Artifact syntax is entered only where its
 //! native expansion is implemented and its module has been admitted. The other census
 //! registrations remain absent: their expansions are not in the census, so their uses would
@@ -358,7 +359,13 @@ impl SourceGrammar {
             return Ok(false);
         }
         self.file
-            .declare(syntax)
+            .declare_with_macro_pure(syntax, &|name| match resolve(name) {
+                Resolution::Global(resolved) => resolved == Name::from_components(["Pure", "pure"]),
+                Resolution::Unchecked => ["pure", "Pure.pure", "_root_.Pure.pure"]
+                    .into_iter()
+                    .any(|candidate| *name == Name::from_components(candidate.split('.'))),
+                _ => false,
+            })
             .map_err(|feature| EngineExecutionError::NotImplemented { feature })?;
         let macro_rules = syntax.kind()
             == Some(&Name::from_components([
@@ -450,12 +457,14 @@ pub(crate) enum Resolution {
     Global(Name),
     /// A constructor, whose bare use in a match pattern is not a variable.
     Constructor(Name),
+    /// Known declarations in the order the term elaborator tries them.
+    Overloaded(Vec<Name>),
     /// A lexical section parameter. Capturing its declaration-site identity
     /// across later expansions is not represented by the current journal.
     SectionVariable,
     /// Nothing: the quotation precheck refuses the notation.
     Nothing,
-    /// Several declarations, or the scope tables could not be read.
+    /// The scope tables could not be read.
     Undetermined,
     /// Not resolved here: the preflight, which parses and elaborates nothing.
     Unchecked,
@@ -516,6 +525,9 @@ pub(crate) fn resolver<'e>(
                 }
             }
             Ok(None) => Resolution::Nothing,
+            Err(fln_elab::source::scope::ScopeError::Ambiguous(_, candidates)) => {
+                Resolution::Overloaded(candidates)
+            }
             Err(_) => Resolution::Undetermined,
         }
     }

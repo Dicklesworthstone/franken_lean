@@ -86,6 +86,23 @@ fn offsets_cancel_without_discarding_the_symbolic_base() {
 }
 
 #[test]
+fn offsets_recognize_definitionally_equal_nat_addition_instances() {
+    for declaration in [
+        "abbrev alternateAdd : Add Nat := instAddNat",
+        "@[implicit_reducible] def alternateAdd : Add Nat := instAddNat",
+    ] {
+        for equation in [
+            "@Add.add Nat alternateAdd n 1 = Nat.succ n",
+            "@HAdd.hAdd Nat Nat Nat (@instHAdd Nat alternateAdd) n 1 = Nat.succ n",
+        ] {
+            accepted(&format!(
+                "{declaration}\ntheorem t (n : Nat) : {equation} := by with_reducible rfl\n"
+            ));
+        }
+    }
+}
+
+#[test]
 fn arithmetic_offsets_preserve_wrong_result_refusal_and_recovery() {
     let base = base();
     let options = KVMap::new();

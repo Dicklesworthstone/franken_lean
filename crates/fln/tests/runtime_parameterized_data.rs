@@ -63,7 +63,7 @@ fn closed_polymorphic_callbacks_execute_at_distinct_types() {
 }
 
 #[test]
-fn polymorphic_callback_initializers_remain_strict_and_shared() {
+fn polymorphic_callback_initializers_discard_dead_work() {
     let definitions = "def expensive (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\n\
         def polyOnce (f : (A : Type) -> A -> A) : Nat := f Nat 42\n\
         def polyTwice (f : (A : Type) -> A -> A) : Nat := f Nat 36 + String.length (f String \"answer\")\n";
@@ -77,10 +77,13 @@ fn polymorphic_callback_initializers_remain_strict_and_shared() {
                 - run(&format!("{source}#eval use 0"), "42"),
         );
     }
-    assert!(deltas[0] > 100, "callback initialization was erased");
+    // Pinned v4.32.0 retains this let in the elaborated term but removes its
+    // unused initializer during compilation. A noinline initializer containing
+    // dbg_trace runs only in the direct-call control, never in these callbacks.
+    // The following test consumes its capture to check actual work and sharing.
     assert!(
-        deltas.iter().all(|delta| *delta == deltas[0]),
-        "callback initialization was duplicated or dropped: {deltas:?}"
+        deltas.iter().all(|delta| *delta == 0),
+        "a dead callback initializer executed: {deltas:?}"
     );
     for (domain, tail, body) in [
         (
@@ -101,7 +104,46 @@ fn polymorphic_callback_initializers_remain_strict_and_shared() {
             )
         };
         let delta = run(&source(100), "42") - run(&source(0), "42");
-        assert_eq!(delta, deltas[0], "a strict type-application stage changed");
+        assert_eq!(delta, 0, "a dead type-application initializer executed");
+    }
+}
+
+#[test]
+fn polymorphic_callback_initializers_share_live_captured_work() {
+    // Every step contributes to the returned sum. Reading this capture tests
+    // both missing work and recomputation at separate carrier instantiations.
+    let definitions = "def expensive (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih + k) n\n\
+        def polyOnce (f : (A : Type) -> A -> Nat) : Nat := f Nat 42\n\
+        def polyTwice (f : (A : Type) -> A -> Nat) : Nat := f Nat 36 + f String \"answer\"\n";
+    let mut shared_delta = None;
+    for callback in [
+        "(by let paid := expensive cost; intro A x; exact paid)",
+        "(let paid := expensive cost; fun A x => paid)",
+    ] {
+        let mut deltas = Vec::new();
+        for (body, expensive_result, cheap_result) in [
+            ("polyOnce saved", "4950", "0"),
+            ("polyTwice saved", "9900", "0"),
+            ("42", "42", "42"),
+        ] {
+            let source = format!(
+                "{definitions}def use (cost : Nat) : Nat := let saved : (A : Type) -> A -> Nat := {callback}; {body}\n"
+            );
+            deltas.push(
+                run(&format!("{source}#eval use 100"), expensive_result)
+                    - run(&format!("{source}#eval use 0"), cheap_result),
+            );
+        }
+        assert!(deltas[0] > 100, "live captured work did not execute");
+        assert_eq!(
+            deltas[1], deltas[0],
+            "specializing at two carrier types duplicated the capture: {deltas:?}"
+        );
+        assert_eq!(deltas[2], 0, "an ignored callback evaluated its capture");
+        match shared_delta {
+            Some(expected) => assert_eq!(deltas[0], expected),
+            None => shared_delta = Some(deltas[0]),
+        }
     }
 }
 

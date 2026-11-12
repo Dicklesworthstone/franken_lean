@@ -7,9 +7,14 @@ use fln_olean::ir::{
 use fln_syntax::source::{BytePos, ByteSpan, SourceInfo};
 use fln_syntax::tree::Preresolved;
 
+mod identifiers_reference;
 #[cfg(test)]
 mod lookup_reference;
+mod numbers_reference;
 mod reference;
+mod sequences_reference;
+mod source_queries_reference;
+mod strings_reference;
 
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))

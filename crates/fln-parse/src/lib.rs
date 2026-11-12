@@ -4205,7 +4205,9 @@ fn bounded_term_prefix(
         }?;
         term_locals::Prefix::Do(Box::new(prefix))
     } else if matches!(&tokens[index].kind, TokenKind::Symbol(symbol)
-        if matches!(symbol.as_str(), "forall" | "∀" | "∃" | "Σ" | "Σ'" | "fun" | "λ"))
+        if matches!(symbol.as_str(), "forall" | "∀" | "∃" | "Σ" | "Σ'" | "fun" | "λ")
+            || (symbol == "exists"
+                && extensions::declares_kind(&Name::from_components(["termExists_,_"]))))
     {
         term_binders::Prefix::start(leaves, view, tokens, index, cursor, end)?.into()
     } else if term_locals::word(tokens, index, "dbg_trace")

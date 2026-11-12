@@ -22,6 +22,9 @@ pub(in crate::source) struct StructuralPlan {
     /// Source positions of the family's indices, in the family's telescope order.
     /// They occupy the varying prefix before the major, but need not occur in that order.
     indices: Vec<usize>,
+    /// Other arguments between the fixed prefix and major, in source order. Each
+    /// product component quantifies them so recursive calls may supply new values.
+    generalized: Vec<usize>,
     family: Name,
     family_parameters: usize,
     /// The domain is closed over the source prefix before the major. The recursor is
@@ -30,7 +33,8 @@ pub(in crate::source) struct StructuralPlan {
     recursor: Expr,
     recursor_type: Expr,
     /// Each component is closed over the fixed prefix, family-ordered indices and major.
-    /// Its value is the Pi type of trailing varying arguments followed by the member result.
+    /// Its value quantifies generalized prefix arguments, then trailing arguments,
+    /// followed by the member result.
     components: Vec<Expr>,
 }
 
@@ -202,7 +206,8 @@ impl Context {
 
     /// Construct a shared motive over one inductive family. Independent local indices may
     /// occur between the common fixed prefix and the major; the motive abstracts them in
-    /// family order. Component result types and trailing argument telescopes may differ.
+    /// family order. Other arguments in that prefix are quantified inside each component,
+    /// whose result type and trailing argument telescope may differ between members.
     pub(in crate::source) fn mutual_structural_plan(
         &mut self,
         names: Vec<Name>,
@@ -271,8 +276,28 @@ impl Context {
                 }
                 index_positions.push(position);
             }
-            if indices.len() != decreasing - fixed {
-                return Err(unsupported("only structural indices before the major"));
+            let generalized_positions: Vec<_> = (fixed..decreasing)
+                .filter(|position| !index_positions.contains(position))
+                .collect();
+            let generalized: Vec<_> = generalized_positions
+                .iter()
+                .map(|&position| prefix_locals[position].clone())
+                .collect();
+            // Family parameters and index domains live outside the component's
+            // generalized arguments. Check this reordered telescope before closing
+            // it, so a dependency cannot escape its binder into the shared motive.
+            let mut preceding: HashSet<_> =
+                fixed_locals.iter().map(|local| local.id.clone()).collect();
+            for parameter in parameters {
+                if !self.elimination_reads(parameter)?.is_subset(&preceding) {
+                    return Err(unsupported("family parameters in the common fixed prefix"));
+                }
+            }
+            for index in &indices {
+                if !self.elimination_reads(&index.type_)?.is_subset(&preceding) {
+                    return Err(unsupported("structural index domains in family order"));
+                }
+                preceding.insert(index.id.clone());
             }
             let brec = Name::str(family_name.clone(), "brecOn");
             if !self.is_auxiliary_recursor(&brec)? {
@@ -320,7 +345,8 @@ impl Context {
                 if !self.defeq_guarded(binder_type, &domain)? {
                     return Err(unsupported("the same structural family in every member"));
                 }
-                components.push(self.substitute(body, &Expr::fvar(major.id.clone()))?);
+                let component = self.substitute(body, &Expr::fvar(major.id.clone()))?;
+                components.push(self.structural_close(&component, &generalized, false)?);
             }
             let mut product = components.last().cloned().ok_or_else(scope)?;
             for component in components.iter().rev().skip(1) {
@@ -373,6 +399,7 @@ impl Context {
                 fixed,
                 decreasing,
                 indices: index_positions,
+                generalized: generalized_positions,
                 family: family_name.clone(),
                 family_parameters: family.num_params as usize,
                 domain: self.structural_close(&domain, &prefix_locals, true)?,
@@ -498,6 +525,11 @@ impl Context {
             .iter()
             .map(|local| Expr::fvar(local.id.clone()))
             .collect();
+        let generalized: Vec<_> = plan
+            .generalized
+            .iter()
+            .map(|&position| parameters[position].clone())
+            .collect();
         let major = &parameters[plan.decreasing];
         let major_value = Expr::fvar(major.id.clone());
         let (_, _, below_type) =
@@ -563,6 +595,7 @@ impl Context {
                 return Err(error(RecursionError::PartialApplication));
             }
             value = self.structural_close(&value, &parameters[plan.decreasing + 1..], true)?;
+            value = self.structural_close(&value, &generalized, true)?;
             value = self.structural_close(&value, std::slice::from_ref(&below), true)?;
             value = self.structural_close(&value, std::slice::from_ref(major), true)?;
             value = self.structural_close(&value, &indices, true)?;
@@ -596,6 +629,10 @@ impl Context {
         }
         wrapper = Expr::app(wrapper, major_value);
         wrapper = project(wrapper, member.index, plan.names.len());
+        for parameter in &generalized {
+            self.tick()?;
+            wrapper = Expr::app(wrapper, Expr::fvar(parameter.id.clone()));
+        }
         for parameter in &parameters[plan.decreasing + 1..] {
             wrapper = Expr::app(wrapper, Expr::fvar(parameter.id.clone()));
         }
@@ -673,6 +710,10 @@ impl Context {
         let entry =
             self.select_course_entry(&below, &plan.family, plan.family_parameters, &requested)?;
         let mut result = project(entry, target, plan.names.len());
+        for &position in &plan.generalized {
+            self.tick()?;
+            result = Expr::app(result, arguments[position].clone());
+        }
         for argument in arguments.into_iter().skip(plan.decreasing + 1) {
             self.tick()?;
             result = Expr::app(result, argument);

@@ -1269,7 +1269,7 @@ impl Engine<'_> {
         locals: &LocalContext,
         pending: &mut VecDeque<Equation>,
     ) -> Result<bool, UnificationError> {
-        match self.class_offset_equation(left, right)? {
+        match self.class_offset_equation(left, right, locals)? {
             reduce::ClassOffset::Undecided => Ok(false),
             reduce::ClassOffset::Equal => Ok(true),
             reduce::ClassOffset::Refuted => Err(UnificationError::Deferred(

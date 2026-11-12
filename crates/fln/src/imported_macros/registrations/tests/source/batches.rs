@@ -1214,33 +1214,92 @@ fn mixed_source_tactic_registrations_keep_native_proof_backtracking() {
 fn mixed_source_templates_keep_specialized_metadata_refusals_explicit() {
     let (engine, registry) = artifact_fixture();
     let before = engine.logical_root(&KVMap::new());
-    for source in [
-        "def checkedPrefix : Nat := 0 + 11\n\
-         macro \"fromMatch \" x:term:max : term => `(match $x:term with | Nat.zero => 41 | Nat.succ n => n)\n\
-         def specialized : Nat := fromMatch (0 : Nat)",
-        "def checkedPrefix : Nat := 0 + 11\n\
-         macro \"fromApply\" : term => `(by apply Eq.refl)\n\
-         theorem specialized : (0 : Nat) = 0 := fromApply",
-    ] {
-        let report = batch(
-            &engine,
-            &registry,
-            &[source.as_bytes()],
-            MacroTreeLimits::default(),
-            None,
-        );
-        let Outcome::Complete(Err(error)) = &report.outcome else {
-            panic!("{report:?}")
-        };
-        assert_eq!(error.disposition(), ("capability", false, 5), "{report:?}");
-        assert!(
-            format!("{error:?}").contains("PreresolvedReference"),
-            "{report:?}"
-        );
-        assert!(report.state.is_none());
-        assert_eq!(engine.logical_root(&KVMap::new()), before);
-        assert!(!engine.environment().contains(&name("checkedPrefix")));
-        assert!(!engine.environment().contains(&name("specialized")));
+    let report = batch(
+        &engine,
+        &registry,
+        &[b"def checkedPrefix : Nat := 0 + 11\n\
+            macro \"fromMatch \" x:term:max : term => `(match $x:term with | Nat.zero => 41 | Nat.succ n => n)\n\
+            def specialized : Nat := fromMatch (0 : Nat)"],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let Outcome::Complete(Err(error)) = &report.outcome else {
+        panic!("{report:?}")
+    };
+    assert_eq!(error.disposition(), ("capability", false, 5), "{report:?}");
+    assert!(
+        format!("{error:?}").contains("PreresolvedReference"),
+        "{report:?}"
+    );
+    assert!(report.state.is_none());
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+    assert!(!engine.environment().contains(&name("checkedPrefix")));
+    assert!(!engine.environment().contains(&name("specialized")));
+
+    // `apply` elaborates a complete term, so its quoted declaration target
+    // remains usable even when a local shadows the target's namespace.
+    let accepted = batch(
+        &engine,
+        &registry,
+        &[b"def checkedPrefix : Nat := 0 + 11\n\
+            macro \"fromApply\" : term => `(by apply Eq.refl)\n\
+            theorem specialized (Eq : Nat) : (0 : Nat) = 0 := fromApply"],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = succeeded(&accepted);
+    assert_eq!(checked.theorems, 1);
+    assert_declared_value(&checked.engine, "checkedPrefix", 11);
+    assert!(accepted.state.is_some());
+    assert!(!accepted.attempts.is_empty());
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+    assert!(!engine.environment().contains(&name("checkedPrefix")));
+    assert!(!engine.environment().contains(&name("specialized")));
+}
+
+#[test]
+fn generated_match_terms_keep_preresolved_globals_under_local_shadowing() {
+    let (engine, registry) = artifact_fixture();
+    let before = engine.logical_root(&KVMap::new());
+    let source = b"macro_rules | `(typedMatch) => `(match (20 : Nat) with | _ => (match (Nat.succ Nat.zero : Nat) with | _ => Nat.succ Nat.zero))\n\
+        def generatedMatchWithShadow (Nat : Type) : _root_.Nat := typedMatch\n\
+        def generatedMatchValue : Nat := generatedMatchWithShadow Bool";
+    let report = batch(
+        &engine,
+        &registry,
+        &[source],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert_declared_value(&succeeded(&report).engine, "generatedMatchValue", 1);
+    assert!(report.state.is_some());
+    assert!(!report.attempts.is_empty());
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+
+    // Only complete term operands may use ordinary pre-resolution. The
+    // constructor name in a pattern is still consumed by a specialized path;
+    // accepting it by its visible spelling would discard its quoted target.
+    let refused = batch(
+        &engine,
+        &registry,
+        &[b"def checkedPrefix : Nat := 7\n\
+            macro_rules | `(constructorPattern) => `(match (Nat.zero : Nat) with | Nat.zero => Nat.succ Nat.zero | _ => Nat.zero)\n\
+            def generatedPattern : Nat := constructorPattern"],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let Outcome::Complete(Err(error)) = &refused.outcome else {
+        panic!("{refused:?}")
+    };
+    assert_eq!(error.disposition(), ("capability", false, 5), "{refused:?}");
+    assert!(
+        format!("{error:?}").contains("PreresolvedReference"),
+        "{refused:?}"
+    );
+    assert!(refused.state.is_none());
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+    for label in ["checkedPrefix", "generatedPattern", "generatedMatchValue"] {
+        assert!(!engine.environment().contains(&name(label)));
     }
 }
 
@@ -1829,6 +1888,31 @@ fn generated_atomic_pattern_chains_count_the_outer_owned_expansion() {
         "{report:?}"
     );
     assert!(report.state.is_none());
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+    assert!(!engine.environment().contains(&name("generatedPattern")));
+
+    // With enough depth, the same generated discriminant type and literal
+    // pattern chain must elaborate and reduce. The resource result above is
+    // not allowed to mask a metadata refusal or leave the provider unusable.
+    let recovered_context = MacroContext {
+        max_recursion_depth: 128,
+        ..context
+    };
+    let recovered = engine.check_source_files_with_imported_macros(
+        &[source.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(admission()),
+        SourceMacroInvocation {
+            registry: &registry,
+            context: &recovered_context,
+            state: MacroState::default(),
+            lookup: None,
+            limits: MacroTreeLimits::default(),
+            cancellation: None,
+        },
+    );
+    assert_declared_value(&succeeded(&recovered).engine, "generatedPattern", 42);
+    assert!(recovered.state.is_some());
     assert_eq!(engine.logical_root(&KVMap::new()), before);
     assert!(!engine.environment().contains(&name("generatedPattern")));
 }

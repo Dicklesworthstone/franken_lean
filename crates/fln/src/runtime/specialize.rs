@@ -43,6 +43,14 @@ pub(super) struct Store {
     types: HashMap<Expr, Expr>,
     constructor_types: HashMap<Name, Expr>,
 }
+
+#[cfg(test)]
+impl Store {
+    pub(super) fn factory_values_is_empty(&self) -> bool {
+        self.factory_values.is_empty()
+    }
+}
+
 pub(super) fn closed(expr: &Expr) -> bool {
     !expr.has_loose_bvars()
         && !expr.has_fvar()

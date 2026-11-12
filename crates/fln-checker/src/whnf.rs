@@ -7,7 +7,8 @@
 //! projection and registered quotient computation (KR-955) — plus recursor reduction: iota (KR-316) with the K-flagged
 //! corner (KR-317, `to_cnstr_when_K`). Unsafe and partial definitions stay
 //! stuck. Nat literal majors are exposed one constructor layer at a time;
-//! string literal majors and native extensions remain outside this layer.
+//! String literal majors expand through the checker-owned KR-314 path before
+//! their constructor rule is applied. Native extensions remain outside this layer.
 
 mod free_bindings;
 mod memo;
@@ -1021,6 +1022,7 @@ struct RecursorFrame {
     delta_mode: DeltaMode,
     unfolded_bindings: BTreeSet<usize>,
     force_string_delta: bool,
+    expanded_string_major: bool,
     progress: ProgressMark,
 }
 
@@ -2884,15 +2886,14 @@ impl<'a, 'c> Reducer<'a, 'c> {
     }
 
     /// KR-316 (`inductive_reduce_rec`, inductive.h:76): a recursor application
-    /// KR-316 (`inductive_reduce_rec`, inductive.h:76): a recursor application
     /// fires when its major premise reduces to a constructor of the recursor's
     /// inductive. The matching rule's right-hand side is instantiated with the
     /// recursor's levels and applied to the spine's parameters, motives, and
     /// minor premises (the indices are consumed by the motive, never applied
     /// to the rule), then the constructor's fields, then the trailing
     /// arguments. Nat literal majors expose one compact constructor layer;
-    /// structure-eta coercion reduces non-Prop structures; String literal
-    /// majors remain unsupported.
+    /// structure-eta coercion reduces non-Prop structures; the recursor frame
+    /// expands String literal majors and normalizes `String.ofList` first.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn apply_recursor_rule(
@@ -3029,16 +3030,12 @@ impl<'a, 'c> Reducer<'a, 'c> {
             )?
         {
             major = replacement;
-        } else if let Some(replacement) = self.recursor_major_to_structure_constructor(
-            &level_parameters,
-            &recursor_type,
-            current,
-            &levels,
-            arguments,
-            major_index,
-        )? {
-            major = replacement;
         }
+        // Structure eta follows major normalization at the pin. In particular,
+        // a let, beta redex, or definition may expose a String literal whose
+        // constructor fields must come from KR-314, not projections of the
+        // unnormalized major. The resumed frame handles eta if no literal or
+        // constructor rule applies.
         let prefix = parameter_count
             .saturating_add(usize::try_from(metadata.num_motives()).unwrap_or(usize::MAX))
             .saturating_add(usize::try_from(metadata.num_minors()).unwrap_or(usize::MAX));
@@ -3075,6 +3072,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             delta_mode: self.delta_mode,
             unfolded_bindings: self.unfolded_bindings.clone(),
             force_string_delta: self.force_string_delta,
+            expanded_string_major: false,
             progress: ProgressMark {
                 reductions: self.control.reductions,
                 delta_reductions: self.delta_reductions,
@@ -3747,6 +3745,24 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     continue;
                 }
                 ReductionFrame::Recursor(mut frame) => {
+                    if !frame.expanded_string_major
+                        && stuck.args.is_empty()
+                        && let ExprNode::StringLiteral(value) = self.node(&stuck.head)?
+                    {
+                        // KR-314 (inductive.h): normalize the constructor
+                        // expansion before ordinary iota. Resuming this frame
+                        // also covers literals exposed by beta, zeta, or a
+                        // shared thunk, without recursing on the host stack.
+                        let major = self.expand_string(value, stuck.head.root.index())?;
+                        frame.expanded_string_major = true;
+                        frames.push(ReductionFrame::Recursor(frame));
+                        self.delta_mode = DeltaMode::Eager;
+                        self.force_string_delta = false;
+                        return Ok(Resumed::Continue(Spine {
+                            head: major,
+                            args: VecDeque::new(),
+                        }));
+                    }
                     self.delta_mode = frame.delta_mode;
                     self.unfolded_bindings = frame.unfolded_bindings;
                     self.force_string_delta = frame.force_string_delta;
@@ -3771,7 +3787,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                         std::mem::replace(&mut frame.arguments[frame.major_index], reduced_major);
 
                     let mut alt_major = None;
-                    if frame.metadata.k() {
+                    if !frame.expanded_string_major && frame.metadata.k() {
                         if let Some(replacement) = self.recursor_major_to_nullary_constructor(
                             &frame.level_parameters,
                             &frame.recursor_type,
@@ -3783,14 +3799,16 @@ impl<'a, 'c> Reducer<'a, 'c> {
                         )? {
                             alt_major = Some(replacement);
                         }
-                    } else if let Some(replacement) = self.recursor_major_to_structure_constructor(
-                        &frame.level_parameters,
-                        &frame.recursor_type,
-                        &frame.head,
-                        &frame.levels,
-                        &frame.arguments,
-                        frame.major_index,
-                    )? {
+                    } else if !frame.expanded_string_major
+                        && let Some(replacement) = self.recursor_major_to_structure_constructor(
+                            &frame.level_parameters,
+                            &frame.recursor_type,
+                            &frame.head,
+                            &frame.levels,
+                            &frame.arguments,
+                            frame.major_index,
+                        )?
+                    {
                         alt_major = Some(replacement);
                     }
 

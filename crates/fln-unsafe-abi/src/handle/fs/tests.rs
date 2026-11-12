@@ -57,6 +57,144 @@ fn no_leaks() {
     assert!(faults.is_empty(), "ownership faults: {faults:?}");
 }
 
+fn mutation_succeeded(result: Result<Obj, FileIoError>) {
+    let packet = result.unwrap();
+    assert_eq!(field(&packet, 1).unbox(), 1);
+    assert_eq!(field(&packet, 0).unbox(), 0);
+}
+
+#[test]
+fn path_mutations_preserve_borrows_and_native_filesystem_semantics() {
+    let _guard = lock();
+    let directory = path("mutations-λ🙂");
+    let original = directory.join("original");
+    let linked = directory.join("link");
+    let renamed = directory.join("renamed");
+    shadow::enable();
+    {
+        let world = Obj::mk_nat(0);
+        let dirname = Obj::mk_string(directory.to_str().unwrap());
+        let from = Obj::mk_string(original.to_str().unwrap());
+        let link = Obj::mk_string(linked.to_str().unwrap());
+        let to = Obj::mk_string(renamed.to_str().unwrap());
+        let aliases = [
+            dirname.clone_ref(),
+            from.clone_ref(),
+            link.clone_ref(),
+            to.clone_ref(),
+        ];
+        mutation_succeeded(Obj::try_create_dir(&dirname, &world));
+        assert!(directory.is_dir());
+        let duplicate = Obj::try_create_dir(&dirname, &world).unwrap();
+        assert_eq!(field(&duplicate, 1).unbox(), 0);
+        assert_eq!(text(&field(&duplicate, 5)), text(&dirname));
+        drop(duplicate);
+
+        std::fs::write(&original, b"original bytes").unwrap();
+        mutation_succeeded(Obj::try_hard_link(&from, &link, &world));
+        std::fs::write(&original, "shared λ bytes").unwrap();
+        assert_eq!(std::fs::read(&linked).unwrap(), "shared λ bytes".as_bytes());
+        mutation_succeeded(Obj::try_rename(&link, &to, &world));
+        assert!(!linked.exists());
+        assert_eq!(
+            std::fs::read(&renamed).unwrap(),
+            "shared λ bytes".as_bytes()
+        );
+        let nonempty = Obj::try_remove_dir(&dirname, &world).unwrap();
+        assert_eq!(field(&nonempty, 1).unbox(), 0);
+        assert!(original.exists() && renamed.exists());
+        drop(nonempty);
+
+        mutation_succeeded(Obj::try_remove_file(&from, &world));
+        assert!(!original.exists());
+        assert_eq!(
+            std::fs::read(&renamed).unwrap(),
+            "shared λ bytes".as_bytes()
+        );
+        mutation_succeeded(Obj::try_remove_file(&to, &world));
+        mutation_succeeded(Obj::try_remove_dir(&dirname, &world));
+        assert!(!directory.exists());
+
+        let rename_error = Obj::try_rename(&from, &to, &world).unwrap();
+        assert_eq!(field(&rename_error, 1).unbox(), 0);
+        assert_eq!(
+            text(&field(&rename_error, 5)),
+            format!("{} and/or {}", text(&from), text(&to))
+        );
+        drop(rename_error);
+        let link_error = Obj::try_hard_link(&from, &to, &world).unwrap();
+        assert_eq!(field(&link_error, 1).unbox(), 0);
+        assert_eq!(text(&field(&link_error, 5)), text(&from));
+        drop(link_error);
+        for (value, alias) in [&dirname, &from, &link, &to].into_iter().zip(&aliases) {
+            assert_eq!(value.header().rc, 2);
+            assert_eq!(text(value), text(alias));
+        }
+    }
+    no_leaks();
+}
+
+#[test]
+fn path_mutations_validate_all_inputs_before_effects() {
+    let _guard = lock();
+    let directory = path("mutation-preconditions");
+    std::fs::create_dir(&directory).unwrap();
+    let original = directory.join("original");
+    let destination = directory.join("destination");
+    std::fs::write(&original, b"preserved").unwrap();
+    let from = Obj::mk_string(original.to_str().unwrap());
+    let to = Obj::mk_string(destination.to_str().unwrap());
+    let dirname = Obj::mk_string(directory.to_str().unwrap());
+    let world = Obj::mk_nat(0);
+    let bad = Obj::mk_nat(1);
+    for operation in [
+        Obj::try_create_dir,
+        Obj::try_remove_dir,
+        Obj::try_remove_file,
+    ] {
+        assert_eq!(
+            operation(&bad, &world).err().unwrap(),
+            FileIoError::InvalidFilename
+        );
+        assert_eq!(
+            operation(&from, &bad).err().unwrap(),
+            FileIoError::InvalidWorld
+        );
+    }
+    for operation in [Obj::try_rename, Obj::try_hard_link] {
+        assert_eq!(
+            operation(&bad, &to, &world).err().unwrap(),
+            FileIoError::InvalidFilename
+        );
+        assert_eq!(
+            operation(&from, &bad, &world).err().unwrap(),
+            FileIoError::InvalidFilename
+        );
+        assert_eq!(
+            operation(&from, &to, &bad).err().unwrap(),
+            FileIoError::InvalidWorld
+        );
+    }
+    let from_nul = Obj::mk_string(&format!("{}\0suffix", original.display()));
+    let to_nul = Obj::mk_string(&format!("{}\0suffix", destination.display()));
+    let directory_nul = Obj::mk_string(&format!("{}\0suffix", directory.display()));
+    for result in [
+        Obj::try_create_dir(&to_nul, &world),
+        Obj::try_remove_dir(&directory_nul, &world),
+        Obj::try_remove_file(&from_nul, &world),
+        Obj::try_rename(&from, &to_nul, &world),
+        Obj::try_rename(&from_nul, &to, &world),
+        Obj::try_hard_link(&from, &to_nul, &world),
+        Obj::try_hard_link(&from_nul, &to, &world),
+    ] {
+        assert_eq!(field(&result.unwrap(), 1).unbox(), 0);
+    }
+    assert!(directory.is_dir());
+    assert_eq!(std::fs::read(original).unwrap(), b"preserved");
+    assert!(!destination.exists());
+    assert_eq!(text(&dirname), directory.to_str().unwrap());
+}
+
 #[test]
 fn path_observations_preserve_native_results_errors_and_filename_ownership() {
     let _guard = lock();

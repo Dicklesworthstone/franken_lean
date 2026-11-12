@@ -1207,7 +1207,17 @@ impl Admitted {
         if roots.len() > limits.max_roots {
             return Err(ImportCouncilError::Limit("import roots").into());
         }
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "import-reuse/before-key",
+            )));
+        }
         let key = ImportClosureKey::compute(modules, roots, options, reuse.checker);
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "import-reuse/after-key",
+            )));
+        }
         let record = match reuse.store.load(key) {
             Ok(None) => RecordLookup::Absent,
             Err(error) => RecordLookup::Unreadable(error),
@@ -1868,7 +1878,11 @@ impl Admitted {
             deltas.push(delta);
             pending.push((module.name.clone(), decoded, declarations));
         }
-        let roots = module_roots(base, &deltas, options, limits.read_jobs);
+        let roots = match module_roots(base, &deltas, options, limits.read_jobs, cancellation) {
+            Outcome::Complete(roots) => roots,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         let mut previous = base;
         let mut checked_modules = Vec::with_capacity(pending.len());
         for ((name, decoded, declarations), root) in pending.into_iter().zip(roots) {
@@ -1881,7 +1895,13 @@ impl Admitted {
             });
             previous = root;
         }
-        if environment.logical_root(options) != previous {
+        let result_root = environment.logical_root(options);
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "import-reuse/assemble-result",
+            )));
+        }
+        if result_root != previous {
             return Ok(Outcome::InternalFault(InternalFault::new(
                 "import reuse",
                 "composed module roots differ from the assembled environment",
@@ -1981,6 +2001,11 @@ impl Admitted {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "import-reuse/after-activation",
+            )));
+        }
         if import.result_logical_root().0 != record.result_root {
             return Ok(Outcome::Complete(ImportReuse::Refused(
                 ImportReuseRefusal::Root {
@@ -2019,12 +2044,15 @@ impl Admitted {
         if !self.environment.is_empty() || !self.imported_modules.is_empty() {
             return refuse(ImportReuseRefusal::NonEmptyBase);
         }
-        let ordered = match self.decode_olean_module_set(
-            modules,
-            limits,
-            crate::CheckerReading::Skip,
-            jobs,
-        ) {
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Outcome::Inconclusive(Inconclusive::cancelled("import-reuse/before-decode"));
+        }
+        let decoded =
+            self.decode_olean_module_set(modules, limits, crate::CheckerReading::Skip, jobs);
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Outcome::Inconclusive(Inconclusive::cancelled("import-reuse/after-decode"));
+        }
+        let ordered = match decoded {
             Ok(ordered) => ordered,
             Err(error) => return refuse(ImportReuseRefusal::Decode(Box::new(error))),
         };
@@ -2057,7 +2085,11 @@ impl Admitted {
         let mut pending = Vec::with_capacity(ordered.len());
         // Each declaration's digest and preflight read only the declaration, so they
         // are measured for the whole closure at once; publication stays in order.
-        let mut measured = measure_closure(&ordered, jobs).into_iter();
+        let mut measured = match measure_closure(&ordered, jobs, cancellation) {
+            Outcome::Complete(measured) => measured.into_iter(),
+            Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+        };
         for (name, decoded) in ordered {
             if cancellation.is_some_and(CancellationProbe::is_cancelled) {
                 return Outcome::Inconclusive(Inconclusive::cancelled("import-reuse/module"));
@@ -2117,7 +2149,11 @@ impl Admitted {
             deltas.push(delta);
             pending.push((name, decoded));
         }
-        let roots = module_roots(base_logical_root, &deltas, options, jobs);
+        let roots = match module_roots(base_logical_root, &deltas, options, jobs, cancellation) {
+            Outcome::Complete(roots) => roots,
+            Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+        };
         let mut checked_modules = Vec::with_capacity(pending.len());
         let mut module_base_root = base_logical_root;
         for (((name, decoded), recorded), root) in
@@ -2168,7 +2204,11 @@ impl Admitted {
         }
         // The accumulated roots stand in for `Environment::logical_root`; if they
         // ever disagree that is a defect here, never a property of the record.
-        if environment.logical_root(options) != root {
+        let result_root = environment.logical_root(options);
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Outcome::Inconclusive(Inconclusive::cancelled("import-reuse/result"));
+        }
+        if result_root != root {
             return Outcome::InternalFault(InternalFault::new(
                 "import reuse",
                 "the accumulated logical root differs from the environment's",
@@ -2213,121 +2253,200 @@ impl Admitted {
     }
 }
 
-/// [`Environment::measure_declaration`] for every declaration of every module, in
-/// module and table order, `jobs.threads` modules at once. A measurement reads only
-/// its declaration, so the result does not depend on `jobs`.
-fn measure_closure(
-    ordered: &[(Name, DecodedOlean)],
+/// Run independent reconstruction jobs while retaining the caller's potentially
+/// non-`Sync` probe on the coordinator. Workers receive only a shared stop flag.
+/// All workers drain before cancellation returns; incomplete slots never rerun work.
+fn rebuild_in_order<T: Send>(
+    count: usize,
     jobs: OleanFrontierJobs,
-) -> Vec<Vec<Outcome<MeasuredDeclaration>>> {
-    let measure_module = |decoded: &DecodedOlean| {
-        decoded
-            .constants
-            .iter()
-            .map(|info| {
-                Environment::measure_declaration(info.clone(), DeclarationBudget::UNBOUNDED, None)
-            })
-            .collect::<Vec<_>>()
+    cancellation: Option<&dyn CancellationProbe>,
+    at: &'static str,
+    work: impl Fn(usize, &dyn CancellationProbe) -> Option<T> + Sync,
+) -> Outcome<Vec<T>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+    use std::time::Duration;
+
+    let stopped = AtomicBool::new(false);
+    let cancel = || {
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            stopped.store(true, Ordering::Relaxed);
+        }
+        stopped.load(Ordering::Relaxed)
     };
-    let threads = jobs.threads.get().min(ordered.len());
-    if threads <= 1 {
-        return ordered
-            .iter()
-            .map(|(_, decoded)| measure_module(decoded))
-            .collect();
+    if cancel() {
+        return Outcome::Inconclusive(Inconclusive::cancelled(at));
     }
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<std::sync::OnceLock<Vec<Outcome<MeasuredDeclaration>>>> =
-        ordered.iter().map(|_| std::sync::OnceLock::new()).collect();
+    let threads = jobs.threads.get().min(count);
+    if threads <= 1 {
+        let probe = cancellation.unwrap_or(&stopped);
+        let mut results = Vec::with_capacity(count);
+        for index in 0..count {
+            if cancel() {
+                return Outcome::Inconclusive(Inconclusive::cancelled(at));
+            }
+            let Some(result) = work(index, probe) else {
+                return Outcome::Inconclusive(Inconclusive::cancelled(at));
+            };
+            results.push(result);
+        }
+        return if cancel() {
+            Outcome::Inconclusive(Inconclusive::cancelled(at))
+        } else {
+            Outcome::Complete(results)
+        };
+    }
+    let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
+        let (sender, receiver) = sync_channel(threads);
         for _ in 0..threads {
-            scope.spawn(|| {
+            let sender = sender.clone();
+            let work = &work;
+            let stopped = &stopped;
+            let next = &next;
+            scope.spawn(move || {
                 loop {
-                    let module = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let (Some(slot), Some((_, decoded))) = (slots.get(module), ordered.get(module))
-                    else {
-                        return;
-                    };
-                    let _ = slot.set(measure_module(decoded));
+                    if stopped.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= count {
+                        break;
+                    }
+                    let result = work(index, stopped);
+                    if result.is_none() {
+                        stopped.store(true, Ordering::Relaxed);
+                    }
+                    if sender.send((index, result)).is_err() {
+                        break;
+                    }
                 }
             });
         }
-    });
-    slots
-        .into_iter()
-        .zip(ordered)
-        .map(|(slot, (_, decoded))| slot.into_inner().unwrap_or_else(|| measure_module(decoded)))
-        .collect()
+        drop(sender);
+        let mut slots: Vec<Option<T>> = (0..count).map(|_| None).collect();
+        loop {
+            cancel();
+            let result = if cancellation.is_some() {
+                receiver.recv_timeout(Duration::from_millis(10))
+            } else {
+                receiver.recv().map_err(|_| RecvTimeoutError::Disconnected)
+            };
+            match result {
+                Ok((index, result)) => slots[index] = result,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        if cancel() {
+            return Outcome::Inconclusive(Inconclusive::cancelled(at));
+        }
+        let mut results = Vec::with_capacity(count);
+        for slot in slots {
+            let Some(result) = slot else {
+                return Outcome::InternalFault(InternalFault::new(
+                    "import reuse",
+                    "a completed reconstruction job has no result",
+                ));
+            };
+            results.push(result);
+        }
+        Outcome::Complete(results)
+    })
+}
+
+/// `Environment::measure_declaration` for every declaration in module/table order.
+/// A running declaration's Merkle hash completes before its existing preflight
+/// observes cancellation; no subsequent declaration starts after the stop is seen.
+fn measure_closure(
+    ordered: &[(Name, DecodedOlean)],
+    jobs: OleanFrontierJobs,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Outcome<Vec<Vec<Outcome<MeasuredDeclaration>>>> {
+    rebuild_in_order(
+        ordered.len(),
+        jobs,
+        cancellation,
+        "import-reuse/measure-declaration",
+        |index, probe| {
+            let decoded = &ordered[index].1;
+            let mut measured = Vec::with_capacity(decoded.constants.len());
+            for info in &decoded.constants {
+                if probe.is_cancelled() {
+                    return None;
+                }
+                let measurement = Environment::measure_declaration(
+                    info.clone(),
+                    DeclarationBudget::UNBOUNDED,
+                    Some(probe),
+                );
+                if matches!(&measurement, Outcome::Inconclusive(reason)
+                    if matches!(&reason.cause, fln_core::outcome::InconclusiveCause::Cancelled { .. }))
+                {
+                    return None;
+                }
+                measured.push(measurement);
+            }
+            Some(measured)
+        },
+    )
 }
 
 /// The logical root after each module of a rebuilt closure: module `k`'s root is the
 /// root over every pair published by modules `0..=k`, and `base` while none has
-/// published anything. This is exactly the root a builder accumulating those pairs
-/// would finalize to after module `k` ([`fln_hash::root::declaration_root`] is that
-/// encoding), so the result does not depend on `jobs`; only the wall time does.
+/// published anything. Cancellation never exposes a digest of an incomplete stream.
 fn module_roots(
     base: LogicalRoot,
     deltas: &[Vec<(Vec<u8>, Digest)>],
     options: &KVMap,
     jobs: OleanFrontierJobs,
-) -> Vec<LogicalRoot> {
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Outcome<Vec<LogicalRoot>> {
     // Every published pair once, in canonical name order, tagged by its module.
-    let mut sorted: Vec<(&[u8], &Digest, usize)> = deltas
-        .iter()
-        .enumerate()
-        .flat_map(|(module, delta)| {
-            delta
-                .iter()
-                .map(move |(name, digest)| (name.as_slice(), digest, module))
-        })
-        .collect();
-    sorted.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let mut sorted = Vec::new();
+    let mut counts = Vec::with_capacity(deltas.len());
     let mut published = 0_usize;
-    let counts: Vec<usize> = deltas
-        .iter()
-        .map(|delta| {
-            published += delta.len();
-            published
-        })
-        .collect();
-    let root_of = |module: usize| {
-        if counts[module] == 0 {
-            return base;
+    for (module, delta) in deltas.iter().enumerate() {
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Outcome::Inconclusive(Inconclusive::cancelled("import-reuse/module-roots"));
         }
-        fln_hash::root::declaration_root(
-            counts[module],
-            sorted
-                .iter()
-                .filter(|(_, _, owner)| *owner <= module)
-                .map(|(name, digest, _)| (*name, *digest)),
-            Some(options),
-        )
-    };
-    let threads = jobs.threads.get().min(deltas.len());
-    if threads <= 1 {
-        return (0..deltas.len()).map(root_of).collect();
+        for (name, digest) in delta {
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Outcome::Inconclusive(Inconclusive::cancelled("import-reuse/module-roots"));
+            }
+            sorted.push((name.as_slice(), digest, module));
+        }
+        published += delta.len();
+        counts.push(published);
     }
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<std::sync::OnceLock<LogicalRoot>> =
-        deltas.iter().map(|_| std::sync::OnceLock::new()).collect();
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let module = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(slot) = slots.get(module) else {
-                        return;
-                    };
-                    let _ = slot.set(root_of(module));
-                }
-            });
-        }
-    });
-    slots
-        .into_iter()
-        .enumerate()
-        .map(|(module, slot)| slot.into_inner().unwrap_or_else(|| root_of(module)))
-        .collect()
+    sorted.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    rebuild_in_order(
+        deltas.len(),
+        jobs,
+        cancellation,
+        "import-reuse/module-roots",
+        |module, probe| {
+            if counts[module] == 0 {
+                return Some(base);
+            }
+            let mut stopped = false;
+            let root = fln_hash::root::declaration_root(
+                counts[module],
+                sorted
+                    .iter()
+                    // Observe excluded entries too: scanning another module's
+                    // large suffix is still work that must be abandonable.
+                    .take_while(|_| {
+                        stopped = probe.is_cancelled();
+                        !stopped
+                    })
+                    .filter(|(_, _, owner)| *owner <= module)
+                    .map(|(name, digest, _)| (*name, *digest)),
+                Some(options),
+            );
+            (!stopped).then_some(root)
+        },
+    )
 }
 
 impl Admitted {
@@ -2391,5 +2510,196 @@ impl Admitted {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
         Ok(Outcome::Complete(checked))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fln_core::outcome::InconclusiveCause;
+    use fln_hash::root::LogicalRootBuilder;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Deliberately not Sync: callers need not make their probes thread-safe.
+    struct Probe<F> {
+        poll: F,
+        reads: Cell<usize>,
+    }
+
+    impl<F: Fn(usize) -> bool> CancellationProbe for Probe<F> {
+        fn is_cancelled(&self) -> bool {
+            let reads = self.reads.get() + 1;
+            self.reads.set(reads);
+            (self.poll)(reads)
+        }
+    }
+
+    fn jobs(threads: usize) -> OleanFrontierJobs {
+        OleanFrontierJobs {
+            threads: std::num::NonZeroUsize::new(threads).unwrap(),
+            ..OleanFrontierJobs::SERIAL
+        }
+    }
+
+    fn cancelled<T>(outcome: Outcome<T>) {
+        assert!(matches!(outcome, Outcome::Inconclusive(reason)
+            if matches!(reason.cause, InconclusiveCause::Cancelled { .. })));
+    }
+
+    #[test]
+    fn reconstruction_keeps_order_and_never_starts_cancelled_work() {
+        for threads in [1, 8] {
+            let probe = Probe {
+                poll: |_| false,
+                reads: Cell::new(0),
+            };
+            let results =
+                rebuild_in_order(32, jobs(threads), Some(&probe), "test", |i, _| Some(i * i))
+                    .into_complete()
+                    .expect("uncancelled reconstruction completes");
+            assert_eq!(results, (0..32).map(|i| i * i).collect::<Vec<_>>());
+            assert!(probe.reads.get() > 0);
+
+            let stopped = Probe {
+                poll: |_| true,
+                reads: Cell::new(0),
+            };
+            cancelled(rebuild_in_order::<usize>(
+                32,
+                jobs(threads),
+                Some(&stopped),
+                "test",
+                |_, _| panic!("an already-cancelled job must never start"),
+            ));
+        }
+    }
+
+    #[test]
+    fn active_reconstruction_stops_and_joins_without_recomputing_slots() {
+        for threads in [1, 8] {
+            let started = AtomicUsize::new(0);
+            let active = AtomicUsize::new(0);
+            let probe = Probe {
+                poll: |_| started.load(Ordering::Relaxed) != 0,
+                reads: Cell::new(0),
+            };
+            cancelled(rebuild_in_order::<usize>(
+                32,
+                jobs(threads),
+                Some(&probe),
+                "test",
+                |_, stop| {
+                    started.fetch_add(1, Ordering::Relaxed);
+                    active.fetch_add(1, Ordering::Relaxed);
+                    // A deadline only bounds a broken cancellation protocol; no
+                    // assertion depends on scheduler speed or relative timings.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while !stop.is_cancelled() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "stop never reached worker"
+                        );
+                        std::thread::yield_now();
+                    }
+                    active.fetch_sub(1, Ordering::Relaxed);
+                    None
+                },
+            ));
+            assert_eq!(active.load(Ordering::Relaxed), 0, "all workers joined");
+            assert!((1..=threads).contains(&started.load(Ordering::Relaxed)));
+        }
+    }
+
+    #[test]
+    fn completed_jobs_cannot_outrun_the_callers_cancellation() {
+        for threads in [1, 8] {
+            let completed = AtomicUsize::new(0);
+            let probe = Probe {
+                poll: |_| completed.load(Ordering::Relaxed) == 16,
+                reads: Cell::new(0),
+            };
+            cancelled(rebuild_in_order(
+                16,
+                jobs(threads),
+                Some(&probe),
+                "test",
+                |index, _| {
+                    completed.fetch_add(1, Ordering::Relaxed);
+                    Some(index)
+                },
+            ));
+            assert_eq!(completed.load(Ordering::Relaxed), 16);
+        }
+    }
+
+    #[test]
+    fn cumulative_roots_match_the_builder_and_discard_cancelled_streams() {
+        let mut options = KVMap::new();
+        options.insert(
+            Name::str(Name::anonymous(), "rootOption"),
+            fln_core::options::DataValue::OfBool(true),
+        );
+        let entries = [
+            Vec::new(),
+            vec![(Name::str(Name::anonymous(), "z"), Digest([1; 32]))],
+            Vec::new(),
+            vec![
+                (Name::str(Name::anonymous(), "a"), Digest([2; 32])),
+                (Name::str(Name::anonymous(), "b"), Digest([3; 32])),
+            ],
+        ];
+        let mut builder = LogicalRootBuilder::new();
+        builder.set_options(&options);
+        let base = builder.finalize();
+        let expected: Vec<_> = entries
+            .iter()
+            .map(|delta| {
+                for (name, digest) in delta {
+                    builder.add_decl(name, *digest);
+                }
+                builder.finalize()
+            })
+            .collect();
+        let deltas: Vec<Vec<_>> = entries
+            .iter()
+            .map(|delta| {
+                delta
+                    .iter()
+                    .map(|(name, digest)| (name.to_canonical_bytes(), *digest))
+                    .collect()
+            })
+            .collect();
+        for threads in [1, 8] {
+            assert_eq!(
+                module_roots(base, &deltas, &options, jobs(threads), None)
+                    .into_complete()
+                    .expect("complete roots"),
+                expected
+            );
+        }
+        let count = Probe {
+            poll: |_| false,
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            module_roots(base, &deltas, &options, jobs(1), Some(&count))
+                .into_complete()
+                .expect("counted roots"),
+            expected
+        );
+        for stop_at in 1..=count.reads.get() {
+            let probe = Probe {
+                poll: |read| read >= stop_at,
+                reads: Cell::new(0),
+            };
+            cancelled(module_roots(base, &deltas, &options, jobs(1), Some(&probe)));
+        }
+        assert_eq!(
+            module_roots(base, &deltas, &options, jobs(8), None)
+                .into_complete()
+                .expect("cancelled roots can be retried"),
+            expected
+        );
     }
 }

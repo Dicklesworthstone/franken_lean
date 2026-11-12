@@ -30,7 +30,7 @@ impl Preparation<'_> {
         else {
             return Ok(None);
         };
-        if parameters == 0 || self.has_implementation(name)? {
+        if self.has_implementation(name)? {
             return Ok(None);
         }
         // A dynamic class receiver still needs its catalog-backed calling
@@ -51,6 +51,13 @@ impl Preparation<'_> {
                 ..
             }
         );
+        let generic_field = match type_.node() {
+            ExprNode::ForallE { body, .. } => self.polymorphic_callback_type(body)?,
+            _ => false,
+        };
+        if parameters == 0 && !class_receiver && !generic_field {
+            return Ok(None);
+        }
         // An explicit extern owns the executable semantics, even for a
         // generated field. Do not turn its logical body into a fallback.
         source_intrinsics::check_selected_extern_attribute(
@@ -69,7 +76,7 @@ impl Preparation<'_> {
         }
         let mut body =
             self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
-        if class_receiver {
+        if class_receiver || generic_field {
             if arguments.len() <= parameters {
                 return Ok(None);
             }
@@ -79,7 +86,7 @@ impl Preparation<'_> {
                     return Ok(None);
                 }
                 let ExprNode::Lam { body: next, .. } = body.node() else {
-                    return Err(unsupported("generated class projection telescope"));
+                    return Err(unsupported("generated callable projection telescope"));
                 };
                 body = self.substitution(next, argument)?;
             }
@@ -91,7 +98,17 @@ impl Preparation<'_> {
             else {
                 return Ok(None);
             };
-            let Some(method) = self.known_instance_method(struct_name, *idx, expr)? else {
+            // Generic fields have no single callable ABI. Expose only a known
+            // checked constructor, naming any live computations once before
+            // selecting the method. Monomorphic class projections retain the
+            // existing inert-only path and ordinary runtime catalog fallback.
+            let prefix = if generic_field {
+                self.residual_instance_constructor(expr)?
+            } else {
+                None
+            };
+            let receiver = prefix.as_ref().map_or(expr, |prefix| &prefix.value);
+            let Some(method) = self.known_instance_method(struct_name, *idx, receiver)? else {
                 return Ok(None);
             };
             // A factory can expose a polymorphic lambda rather than a named
@@ -99,17 +116,29 @@ impl Preparation<'_> {
             // layout discovery visits the body. Runtime arguments stay applied
             // exactly once, with their original evaluation order.
             let mut method = method;
+            let extra = match &prefix {
+                Some(prefix) => prefix.depth(self)?,
+                None => 0,
+            };
             for argument in &arguments[parameters + 1..] {
                 self.tick()?;
+                let argument = if extra == 0 {
+                    argument.clone()
+                } else {
+                    self.lift(argument, extra)?
+                };
                 method = if let ExprNode::Lam {
                     binder_type, body, ..
                 } = method.node()
                     && self.type_parameter(binder_type)?
                 {
-                    self.substitution(body, argument)?
+                    self.substitution(body, &argument)?
                 } else {
-                    Expr::app(method, argument.clone())
+                    Expr::app(method, argument)
                 };
+            }
+            if let Some(prefix) = prefix {
+                method = prefix.bind(self, method)?;
             }
             return Ok(Some(method));
         }

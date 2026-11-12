@@ -1,4 +1,4 @@
-//! Defaults instantiate registered checked bodies before dependent fields.
+//! Defaults instantiate checked bodies before dependent fields.
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Outcome, SourceCheckLimits};
 use fln_core::name::Name;
@@ -471,7 +471,8 @@ fn registration_checks_helper_signatures_and_rejects_duplicates_atomically() {
             field: 0,
         }
     };
-    assert!(register_defaults(e.environment(), &[row("Good")]).is_err());
+    let registered = register_defaults(e.environment(), &[row("Good")]).unwrap();
+    assert!(register_defaults(&registered, &[row("Good")]).is_err());
     assert!(register_defaults(e.environment(), &[row("Wrong")]).is_err());
     assert_eq!(e.logical_root(&KVMap::new()), root);
 }
@@ -500,7 +501,7 @@ fn ordered_files_share_only_successful_default_registrations() {
 }
 
 #[test]
-fn admission_root_includes_the_default_registration_and_helpers() {
+fn admission_root_includes_the_structure_interface_and_default_helpers() {
     let e = engine();
     let result = e
         .admit_source_command(
@@ -522,11 +523,11 @@ fn admission_root_includes_the_default_registration_and_helpers() {
     );
     let record = Name::from_components(["Count"]);
     let helper = helper_name(&record, &Name::from_components(["value"]));
-    assert_eq!(
+    assert!(
         RecordDefaults::read(result.engine.environment())
             .unwrap()
-            .helper(&record, 0),
-        Some(&helper)
+            .helper(&record, 0)
+            .is_none()
     );
     assert!(result.engine.environment().contains(&helper));
     // The block, projection, flat constructor, default helper, recOn, and casesOn.

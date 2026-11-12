@@ -427,6 +427,395 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
         );
     }
 
+    let positions = prepare(&name("syntaxPositionsMacro"));
+    let canonical_positions = prepare(&name("canonicalSyntaxPositionsMacro"));
+    let info_positions = prepare(&name("infoPositionsMacro"));
+    let canonical_info_positions = prepare(&name("canonicalInfoPositionsMacro"));
+    let noncanonical = SourceInfo::Synthetic {
+        pos: BytePos(0),
+        end_pos: BytePos(4),
+        canonical: false,
+    };
+    let no_info = Syntax::atom(SourceInfo::None, "none");
+    let filtered_node = Syntax::Node {
+        info: noncanonical,
+        kind: name("outer"),
+        args: vec![leaf()],
+    };
+    let position_output = |start: Option<usize>, end: Option<usize>| {
+        let atom = |position: Option<usize>, label| {
+            position.map_or(Syntax::Missing, |position| {
+                Syntax::atom(
+                    SourceInfo::Synthetic {
+                        pos: BytePos(position),
+                        end_pos: BytePos(position),
+                        canonical: true,
+                    },
+                    label,
+                )
+            })
+        };
+        Syntax::node(
+            name("positions"),
+            vec![atom(start, "start"), atom(end, "end")],
+        )
+    };
+    let state = MacroState {
+        macro_scope: 23,
+        trace_messages: vec![(name("Positions"), "preserved".into())],
+        expanded_macro_declarations: vec![name("Earlier.macro")],
+    };
+    for (input, all, canonical, info, canonical_info) in [
+        (
+            leaf(),
+            (Some(1), Some(3)),
+            (Some(1), Some(3)),
+            (Some(1), Some(3)),
+            (Some(1), Some(3)),
+        ),
+        (
+            Syntax::Missing,
+            (None, None),
+            (None, None),
+            (None, None),
+            (None, None),
+        ),
+        (
+            Syntax::atom(noncanonical, "synthetic"),
+            (Some(0), Some(4)),
+            (None, None),
+            (Some(0), Some(4)),
+            (None, None),
+        ),
+        (
+            Syntax::node(
+                name("outer"),
+                vec![Syntax::Missing, leaf(), no_info.clone()],
+            ),
+            (Some(1), Some(3)),
+            (Some(1), Some(3)),
+            (Some(1), Some(3)),
+            (Some(1), Some(3)),
+        ),
+        (
+            Syntax::node(name("outer"), vec![no_info, leaf()]),
+            (None, Some(3)),
+            (None, Some(3)),
+            (None, None),
+            (None, None),
+        ),
+        (
+            filtered_node,
+            (Some(0), Some(4)),
+            (None, Some(3)),
+            (Some(0), Some(4)),
+            (None, None),
+        ),
+    ] {
+        for (compiled, (start, end)) in [
+            (&positions, all),
+            (&canonical_positions, canonical),
+            (&info_positions, info),
+            (&canonical_info_positions, canonical_info),
+        ] {
+            let report = compiled.execute(
+                &input,
+                &source(),
+                &context(),
+                &state,
+                MacroLimits::default(),
+                None,
+            );
+            native_rows.extend(report.native_functions);
+            assert!(
+                report.reference_functions.iter().all(|function| {
+                    function.producer() == "reference"
+                        && !function.name.to_display_string().starts_with("Lean.")
+                }),
+                "toolchain position methods must run natively"
+            );
+            let Outcome::Complete(Ok(MacroResult::Expanded {
+                syntax,
+                state: next,
+            })) = report.outcome
+            else {
+                panic!(
+                    "source positions did not complete for {input:?}: {:?}",
+                    report.outcome
+                );
+            };
+            assert_eq!(
+                syntax,
+                position_output(start, end),
+                "source positions for {input:?}"
+            );
+            assert_eq!(
+                next, state,
+                "position inspection preserves all MacroM state"
+            );
+        }
+    }
+    for row in [
+        "mirror:Lean.SourceInfo.getPos?",
+        "mirror:Lean.SourceInfo.getTailPos?",
+        "mirror:Lean.Syntax.getPos?",
+        "mirror:Lean.Syntax.getTailPos?",
+    ] {
+        assert!(
+            native_rows.contains(row),
+            "actual imported MacroM did not select {row}"
+        );
+    }
+
+    let reference_info = prepare(&name("referenceInfoMacro"));
+    let canonical_reference_info = prepare(&name("canonicalReferenceInfoMacro"));
+    let atom_from = prepare(&name("atomFromMacro"));
+    let canonical_atom_from = prepare(&name("canonicalAtomFromMacro"));
+    let plain_atom = prepare(&name("atomMacro"));
+    for (input, ordinary, preferred) in [
+        (leaf(), Some((1, 3, false)), Some((1, 3, true))),
+        (Syntax::Missing, None, None),
+        (Syntax::atom(SourceInfo::None, "none"), None, None),
+        (
+            Syntax::atom(noncanonical, "synthetic"),
+            Some((0, 4, false)),
+            Some((0, 4, false)),
+        ),
+        (
+            Syntax::Node {
+                info: noncanonical,
+                kind: name("outer"),
+                args: vec![leaf()],
+            },
+            Some((0, 4, false)),
+            Some((0, 4, false)),
+        ),
+        (
+            Syntax::node(
+                name("outer"),
+                vec![Syntax::atom(SourceInfo::None, "no head"), leaf()],
+            ),
+            None,
+            None,
+        ),
+        (
+            Syntax::node(
+                name("outer"),
+                vec![leaf(), Syntax::atom(noncanonical, "last")],
+            ),
+            Some((1, 4, false)),
+            Some((1, 3, true)),
+        ),
+        (
+            Syntax::node(
+                name("outer"),
+                vec![Syntax::atom(noncanonical, "first"), leaf()],
+            ),
+            Some((0, 3, false)),
+            Some((0, 3, false)),
+        ),
+    ] {
+        for (compiled, expected) in [
+            (&reference_info, ordinary),
+            (&canonical_reference_info, preferred),
+            (&atom_from, ordinary),
+            (&canonical_atom_from, preferred),
+        ] {
+            let report = compiled.execute(
+                &input,
+                &source(),
+                &context(),
+                &state,
+                MacroLimits::default(),
+                None,
+            );
+            native_rows.extend(report.native_functions);
+            assert!(
+                report.reference_functions.iter().all(|function| {
+                    function.producer() == "reference"
+                        && !function.name.to_display_string().starts_with("Lean.")
+                }),
+                "source constructors must run natively"
+            );
+            let Outcome::Complete(Ok(MacroResult::Expanded {
+                syntax,
+                state: next,
+            })) = report.outcome
+            else {
+                panic!(
+                    "source construction did not complete for {input:?}: {:?}",
+                    report.outcome
+                );
+            };
+            let info = expected.map_or(SourceInfo::None, |(start, stop, canonical)| {
+                SourceInfo::Synthetic {
+                    pos: BytePos(start),
+                    end_pos: BytePos(stop),
+                    canonical,
+                }
+            });
+            assert_eq!(
+                syntax,
+                Syntax::atom(info, "reference\0λ"),
+                "source construction for {input:?}"
+            );
+            assert_eq!(
+                next, state,
+                "source construction preserves every MacroM state field"
+            );
+        }
+    }
+    for (input, expected) in [
+        (leaf(), ""),
+        (Syntax::atom(noncanonical, "λ\0🙂"), "λ\0🙂"),
+        (Syntax::Missing, ""),
+    ] {
+        let report = plain_atom.execute(
+            &input,
+            &source(),
+            &context(),
+            &state,
+            MacroLimits::default(),
+            None,
+        );
+        native_rows.extend(report.native_functions);
+        assert!(report.reference_functions.iter().all(|function| {
+            function.producer() == "reference"
+                && !function.name.to_display_string().starts_with("Lean.")
+        }));
+        assert!(
+            matches!(report.outcome, Outcome::Complete(Ok(MacroResult::Expanded { syntax, state: next }))
+            if syntax == Syntax::atom(SourceInfo::None, expected) && next == state)
+        );
+    }
+    for row in [
+        "mirror:Lean.SourceInfo.fromRef",
+        "mirror:Lean.mkAtomFrom",
+        "mirror:Lean.mkAtom",
+    ] {
+        assert!(
+            native_rows.contains(row),
+            "actual imported MacroM did not select {row}"
+        );
+    }
+
+    let scoped_ref = prepare(&name("referenceScopeMacro"));
+    let public_error = prepare(&name("publicErrorMacro"));
+    let located_error = prepare(&name("publicErrorAtMacro"));
+    let public_unsupported = prepare(&name("publicUnsupportedMacro"));
+    let old_ref = leaf();
+    let positioned = Syntax::atom(
+        SourceInfo::Synthetic {
+            pos: BytePos(0),
+            end_pos: BytePos(4),
+            canonical: false,
+        },
+        "positioned",
+    );
+    let no_head = Syntax::node(
+        name("headNone"),
+        vec![Syntax::atom(SourceInfo::None, "none"), leaf()],
+    );
+    let invoke_with_ref = |compiled: &CompiledMacro, input: &Syntax| {
+        let report = compiled.execute_with_methods(
+            input,
+            MacroInvocation {
+                source: &source(),
+                context: &context(),
+                state: &state,
+                lookup: None,
+            },
+            MacroLimits::default(),
+            None,
+            None,
+            Some(&old_ref),
+        );
+        assert!(report.reference_functions.iter().all(|function| {
+            function.producer() == "reference"
+                && !function.name.to_display_string().starts_with("Lean.")
+        }));
+        report
+    };
+    for (input, selected) in [
+        (Syntax::Missing, old_ref.clone()),
+        (Syntax::node(name("empty"), vec![]), old_ref.clone()),
+        (no_head, old_ref.clone()),
+        (positioned.clone(), positioned.clone()),
+        (old_ref.clone(), old_ref.clone()),
+        (
+            Syntax::node(name("skipped"), vec![Syntax::Missing, positioned.clone()]),
+            Syntax::node(name("skipped"), vec![Syntax::Missing, positioned]),
+        ),
+    ] {
+        let report = invoke_with_ref(&scoped_ref, &input);
+        native_rows.extend(report.native_functions);
+        assert_eq!(
+            completed_macro_result(report.outcome),
+            MacroResult::Expanded {
+                syntax: Syntax::node(
+                    name("refs"),
+                    vec![old_ref.clone(), selected.clone(), old_ref.clone()]
+                ),
+                state: state.clone(),
+            }
+        );
+        let report = invoke_with_ref(&located_error, &input);
+        native_rows.extend(report.native_functions);
+        assert_eq!(
+            completed_macro_result(report.outcome),
+            MacroResult::Error {
+                reference: selected,
+                message: "public\0λ".into(),
+                state: state.clone(),
+            }
+        );
+    }
+    for (compiled, row, missing) in [
+        (
+            &public_error,
+            "mirror:Lean.Macro.throwError._redArg",
+            MacroResult::Error {
+                reference: old_ref.clone(),
+                message: "public\0λ".into(),
+                state: state.clone(),
+            },
+        ),
+        (
+            &public_unsupported,
+            "mirror:Lean.Macro.throwUnsupported._redArg",
+            MacroResult::Unsupported {
+                state: state.clone(),
+            },
+        ),
+    ] {
+        // The retained error branch is present in the imported IR closure even
+        // when the actual invocation takes the successful branch.
+        let success = invoke_with_ref(compiled, &old_ref);
+        assert!(success.native_functions.iter().any(|native| native == row));
+        assert_eq!(
+            completed_macro_result(success.outcome),
+            MacroResult::Expanded {
+                syntax: old_ref.clone(),
+                state: state.clone()
+            }
+        );
+        let failure = invoke_with_ref(compiled, &Syntax::Missing);
+        native_rows.extend(failure.native_functions);
+        assert_eq!(completed_macro_result(failure.outcome), missing);
+    }
+    for row in [
+        "mirror:Lean.replaceRef",
+        "mirror:Lean.Macro.throwError._redArg",
+        "mirror:Lean.Macro.throwErrorAt._redArg",
+        "mirror:Lean.Macro.throwUnsupported._redArg",
+    ] {
+        assert!(
+            native_rows.contains(row),
+            "actual user MacroM did not select {row}"
+        );
+    }
+    check_public_error_dispatch(&dir, &module, &users, &state);
+
     let mut exhausted = MacroLimits::default();
     exhausted.vm.max_steps = 0;
     assert!(matches!(
@@ -595,7 +984,7 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
     );
     assert_eq!(
         oracle.stdout,
-        b"[true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true]\n"
+        b"[true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true]\n[true, true, true, true, true, true]\n[true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true, true, true, true, true]\n"
     );
     assert!(oracle.stderr.is_empty());
 
@@ -659,6 +1048,223 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
         panic!("{wrong:?}")
     };
     assert_ne!(wrong, cases[0].1);
+}
+
+fn completed_macro_result(
+    outcome: Outcome<Result<MacroResult, MacroExecutionError>>,
+) -> MacroResult {
+    match outcome {
+        Outcome::Complete(Ok(result)) => result,
+        other => panic!("native MacroM invocation did not complete: {other:?}"),
+    }
+}
+
+fn check_public_error_dispatch(
+    dir: &std::path::Path,
+    module: &IrModule,
+    users: &BTreeSet<Name>,
+    state: &MacroState,
+) {
+    use crate::imported_macros::registrations::{
+        MacroDispatchLimits, MacroRegistrationModule, MacroRegistryLimits, RegisteredExpansion,
+        RegisteredMacros,
+    };
+    use fln_olean::region::{OleanView, WalkBudget};
+
+    let public = std::fs::read(dir.join("NativeMacroModule.olean")).unwrap();
+    let server = std::fs::read(dir.join("NativeMacroModule.olean.server")).unwrap();
+    let private = std::fs::read(dir.join("NativeMacroModule.olean.private")).unwrap();
+    let decoded = crate::decode_olean_module_artifacts(
+        &public,
+        &server,
+        &private,
+        crate::OleanDecodeLimits::new(public.len() + server.len() + private.len()),
+    )
+    .unwrap();
+    let extensions = OleanView::parse_with_dependencies(&private, &[&public, &server])
+        .unwrap()
+        .extension_payloads(WalkBudget::default(), 32 * 1024 * 1024)
+        .unwrap();
+    // Test the decoded-owner caller boundary with actual pinned journals and
+    // IR. This does not claim admission of Init or synthesize a census gate.
+    let root = crate::Environment::new().logical_root(&crate::KVMap::new());
+    let checked = crate::CheckedOleanModule {
+        name: name("NativeMacroModule"),
+        decoded,
+        base_logical_root: root,
+        result_logical_root: root,
+        declarations: Vec::new(),
+    };
+    let admitted = checked
+        .decoded
+        .constants
+        .iter()
+        .fold(crate::Environment::new(), |environment, declaration| {
+            environment.add_decl(declaration.clone()).unwrap()
+        });
+    let registry = RegisteredMacros::prepare(
+        &[MacroRegistrationModule {
+            checked: &checked,
+            extensions: &extensions,
+        }],
+        &admitted,
+        std::slice::from_ref(module),
+        &VerifiedPartition::user_fixture(),
+        users,
+        MacroRegistryLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        registry
+            .declarations(&name("referenceChoice"))
+            .cloned()
+            .collect::<Vec<_>>(),
+        [name("referenceGuard"), name("referenceFallback")]
+    );
+    let input = |candidate| {
+        Syntax::node(
+            name("referenceChoice"),
+            vec![
+                Syntax::atom(SourceInfo::None, "referenceChoice%"),
+                candidate,
+            ],
+        )
+    };
+    let dispatch = |input: &Syntax| {
+        registry.expand_root(
+            input,
+            &source(),
+            &context(),
+            state.clone(),
+            MacroDispatchLimits::default(),
+            None,
+        )
+    };
+    let fallthrough = dispatch(&input(Syntax::Missing));
+    let mut expected_state = state.clone();
+    expected_state.macro_scope += 3;
+    expected_state
+        .expanded_macro_declarations
+        .insert(0, name("referenceFallback"));
+    let expected = Syntax::node(
+        fln_syntax::hygiene::add_macro_scope(
+            &name("Main"),
+            &name("fallback"),
+            state.macro_scope + 2,
+        )
+        .unwrap(),
+        vec![],
+    );
+    assert!(
+        matches!(&fallthrough.outcome, Outcome::Complete(Ok(RegisteredExpansion::Expanded { declaration, syntax, state, .. }))
+        if declaration == &name("referenceFallback") && syntax == &expected && state == &expected_state),
+        "{fallthrough:?}"
+    );
+    assert_eq!(fallthrough.attempts.len(), 2);
+    assert!(
+        fallthrough.attempts[0]
+            .native_functions
+            .iter()
+            .any(|row| row == "mirror:Lean.Macro.throwUnsupported._redArg")
+    );
+    let unsupported = dispatch(&Syntax::node(name("referenceChoice"), vec![]));
+    expected_state.expanded_macro_declarations = state.expanded_macro_declarations.clone();
+    assert!(
+        matches!(&unsupported.outcome, Outcome::Complete(Ok(RegisteredExpansion::Unsupported { state })) if state == &expected_state),
+        "{unsupported:?}"
+    );
+    assert_eq!(unsupported.attempts.len(), 2);
+
+    let mut noncanonical = leaf();
+    if let Syntax::Ident { info, .. } = &mut noncanonical {
+        *info = SourceInfo::Synthetic {
+            pos: BytePos(0),
+            end_pos: BytePos(4),
+            canonical: false,
+        };
+    }
+    let no_head = Syntax::node(
+        name("headNone"),
+        vec![Syntax::atom(SourceInfo::None, "no head"), leaf()],
+    );
+    let skipped = Syntax::node(name("skipped"), vec![Syntax::Missing, leaf()]);
+    expected_state.macro_scope = state.macro_scope + 2;
+    for (candidate, own_ref) in [
+        (leaf(), true),
+        (noncanonical, true),
+        (no_head, false),
+        (skipped, true),
+    ] {
+        let input = input(candidate.clone());
+        let reference = if own_ref { candidate } else { input.clone() };
+        let report = dispatch(&input);
+        assert!(
+            matches!(&report.outcome, Outcome::Complete(Ok(RegisteredExpansion::Error { declaration, reference: actual, message, state, .. }))
+            if declaration == &name("referenceGuard") && actual == &reference && message == "located\0λ" && state == &expected_state),
+            "{report:?}"
+        );
+        assert_eq!(
+            report.attempts.len(),
+            1,
+            "a located diagnostic must terminate this candidate chain"
+        );
+        assert!(
+            report.attempts[0]
+                .native_functions
+                .iter()
+                .any(|row| row == "mirror:Lean.Macro.throwErrorAt._redArg")
+        );
+    }
+    let nested = Syntax::node(
+        name("referenceOuter"),
+        vec![
+            Syntax::atom(SourceInfo::None, "referenceOuter%"),
+            input(Syntax::atom(SourceInfo::None, "plain")),
+        ],
+    );
+    let report = dispatch(&nested);
+    expected_state.macro_scope = state.macro_scope + 3;
+    assert!(
+        matches!(&report.outcome, Outcome::Complete(Ok(RegisteredExpansion::Error { reference, message, state, .. }))
+        if reference == &nested && message == "outer\0λ" && state == &expected_state),
+        "{report:?}"
+    );
+    assert_eq!(report.attempts.len(), 2);
+    assert!(
+        report.attempts[1]
+            .native_functions
+            .iter()
+            .any(|row| row == "mirror:Lean.Macro.throwError._redArg")
+    );
+    for attempt in &report.attempts {
+        assert!(
+            attempt
+                .reference_functions
+                .iter()
+                .all(|function| !function.name.to_display_string().starts_with("Lean."))
+        );
+    }
+    let mut limited = MacroDispatchLimits::default();
+    limited.execution.vm.max_steps = 0;
+    for (limits, cancel) in [(limited, false), (MacroDispatchLimits::default(), true)] {
+        let stopped = registry.expand_root(
+            &input(Syntax::Missing),
+            &source(),
+            &context(),
+            state.clone(),
+            limits,
+            Some(&|| cancel),
+        );
+        assert!(matches!(stopped.outcome, Outcome::Inconclusive(_)));
+        assert!(
+            stopped.attempts.len() <= 1,
+            "a VM stop must not select the fallback"
+        );
+    }
+    assert!(matches!(
+        dispatch(&input(Syntax::Missing)).outcome,
+        Outcome::Complete(Ok(RegisteredExpansion::Expanded { .. }))
+    ));
 }
 
 // The oracle checks every field of the sensitive returned identifier, including
@@ -804,4 +1410,106 @@ def scopeName (counter : Nat) : Lean.Name := .num (.str scopeBase "_hyg") counte
     | .ok (.atom .none "unchanged") state => scopeStateExact 10 state
     | _ => false
   [attached, firstOk, secondOk, changed, atom]
+
+def positionOutputExact (start stop : Option Nat) : Lean.Syntax → Bool
+  | .node .none kind args =>
+    let one (expected : Option Nat) (label : String) (actual : Lean.Syntax) :=
+      match expected, actual with
+      | none, .missing => true
+      | some p, .atom (.synthetic first last canonical) text =>
+        first.byteIdx == p && last.byteIdx == p && canonical && text == label
+      | _, _ => false
+    kind == `positions && args.size == 2 && one start "start" args[0]! && one stop "end" args[1]!
+  | _ => false
+def checkPositions (input : Lean.Syntax)
+    (all canonical info canonicalInfo : Option Nat × Option Nat) : Bool :=
+  inspectResult syntaxPositionsMacro input (positionOutputExact all.1 all.2) &&
+  inspectResult canonicalSyntaxPositionsMacro input (positionOutputExact canonical.1 canonical.2) &&
+  inspectResult infoPositionsMacro input (positionOutputExact info.1 info.2) &&
+  inspectResult canonicalInfoPositionsMacro input (positionOutputExact canonicalInfo.1 canonicalInfo.2)
+#eval show List Bool from
+  let known := (some 1, some 3)
+  let absent := (none, none)
+  let synthetic := (some 0, some 4)
+  let tailOnly := (none, some 3)
+  let noInfo := Lean.Syntax.atom .none "none"
+  [checkPositions sampleLeaf known known known known,
+   checkPositions .missing absent absent absent absent,
+   checkPositions (.atom (.synthetic ⟨0⟩ ⟨4⟩ false) "synthetic") synthetic absent synthetic absent,
+   checkPositions (.node .none `outer #[.missing, sampleLeaf, noInfo]) known known known known,
+   checkPositions (.node .none `outer #[noInfo, sampleLeaf]) tailOnly tailOnly absent absent,
+   checkPositions (.node (.synthetic ⟨0⟩ ⟨4⟩ false) `outer #[sampleLeaf]) synthetic tailOnly synthetic absent]
+
+def referenceAtomExact (expected : Option (Nat × Nat × Bool)) : Lean.Syntax → Bool
+  | .atom info text =>
+    text == "reference\x00λ" && match expected, info with
+      | none, .none => true
+      | some (start, stop, canonical), .synthetic actualStart actualStop actualCanonical =>
+        actualStart.byteIdx == start && actualStop.byteIdx == stop && actualCanonical == canonical
+      | _, _ => false
+  | _ => false
+def checkReferenceAtoms (input : Lean.Syntax)
+    (ordinary preferred : Option (Nat × Nat × Bool)) : Bool :=
+  inspectResult referenceInfoMacro input (referenceAtomExact ordinary) &&
+  inspectResult canonicalReferenceInfoMacro input (referenceAtomExact preferred) &&
+  inspectResult atomFromMacro input (referenceAtomExact ordinary) &&
+  inspectResult canonicalAtomFromMacro input (referenceAtomExact preferred)
+def plainAtomExact (expected : String) : Lean.Syntax → Bool
+  | .atom .none text => text == expected
+  | _ => false
+#eval show List Bool from
+  let noncanonical := Lean.SourceInfo.synthetic ⟨0⟩ ⟨4⟩ false
+  let synthetic := some (0, 4, false)
+  [checkReferenceAtoms sampleLeaf (some (1, 3, false)) (some (1, 3, true)),
+   checkReferenceAtoms .missing none none,
+   checkReferenceAtoms (.atom .none "none") none none,
+   checkReferenceAtoms (.atom noncanonical "synthetic") synthetic synthetic,
+   checkReferenceAtoms (.node noncanonical `outer #[sampleLeaf]) synthetic synthetic,
+   checkReferenceAtoms (.node .none `outer #[.atom .none "no head", sampleLeaf]) none none,
+   checkReferenceAtoms (.node .none `outer #[sampleLeaf, .atom noncanonical "last"])
+     (some (1, 4, false)) (some (1, 3, true)),
+   checkReferenceAtoms (.node .none `outer #[.atom noncanonical "first", sampleLeaf])
+     (some (0, 3, false)) (some (0, 3, false)),
+   inspectResult atomMacro sampleLeaf (plainAtomExact "") &&
+   inspectResult atomMacro (.atom noncanonical "λ\x00🙂") (plainAtomExact "λ\x00🙂") &&
+   inspectResult atomMacro .missing (plainAtomExact "")]
+
+def referenceScopeExact (check : Lean.Syntax → Bool) : Lean.Syntax → Bool
+  | .node .none kind args => kind == `refs && args.size == 3 &&
+    leafExact args[0]! && check args[1]! && leafExact args[2]!
+  | _ => false
+def publicErrorExact (macroFn : Lean.Syntax → Lean.MacroM Lean.Syntax)
+    (input : Lean.Syntax) (check : Lean.Syntax → Bool) : Bool :=
+  match macroFn input sampleContext scopeState with
+  | .error (.error ref msg) state => check ref && msg == "public\x00λ" && scopeStateExact 10 state
+  | _ => false
+def checkReferenceSelection (input : Lean.Syntax) (check : Lean.Syntax → Bool) : Bool :=
+  let scopedResult := match referenceScopeMacro input sampleContext scopeState with
+    | .ok output state => referenceScopeExact check output && scopeStateExact 10 state
+    | _ => false
+  scopedResult && publicErrorExact publicErrorAtMacro input check
+def zeroPositionExact : Lean.Syntax → Bool
+  | .atom (.synthetic start stop canonical) text =>
+    start.byteIdx == 0 && stop.byteIdx == 4 && !canonical && text == "positioned"
+  | _ => false
+def skippedReferenceExact : Lean.Syntax → Bool
+  | .node .none kind args => kind == `skipped && args.size == 2 &&
+    args[0]!.isMissing && zeroPositionExact args[1]!
+  | _ => false
+#eval show List Bool from
+  let positioned := Lean.Syntax.atom (.synthetic ⟨0⟩ ⟨4⟩ false) "positioned"
+  let guardSuccess := [publicErrorMacro, publicUnsupportedMacro].all fun macroFn =>
+    match macroFn sampleLeaf sampleContext scopeState with
+    | .ok output state => leafExact output && scopeStateExact 10 state
+    | _ => false
+  let unsupported := match publicUnsupportedMacro .missing sampleContext scopeState with
+    | .error .unsupportedSyntax state => scopeStateExact 10 state
+    | _ => false
+  [checkReferenceSelection .missing leafExact,
+   checkReferenceSelection (.node .none `empty #[]) leafExact,
+   checkReferenceSelection (.node .none `headNone #[.atom .none "none", sampleLeaf]) leafExact,
+   checkReferenceSelection positioned zeroPositionExact,
+   checkReferenceSelection sampleLeaf leafExact,
+   checkReferenceSelection (.node .none `skipped #[.missing, positioned]) skippedReferenceExact,
+   guardSuccess, publicErrorExact publicErrorMacro .missing leafExact, unsupported]
 "#;

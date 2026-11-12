@@ -1,8 +1,8 @@
-# Native editor goals, hover, definition and completion
+# Native editor queries and document outlines
 
 Both `fln serve-lsp` and `lean --server` answer `$/lean/plainGoal`,
-`textDocument/hover`, `textDocument/definition` and `textDocument/completion`
-using the native source elaborator. Hover, definition and completion are
+`textDocument/hover`, `textDocument/definition`, `textDocument/completion` and
+`textDocument/documentSymbol` using the native source elaborator. These LSP features are
 advertised in initialization, on the semantic-capable path only. Goal requests
 return the Lean `rendered`/`goals` object; hover returns plaintext contents and
 the selected identifier's UTF-16 range.
@@ -60,7 +60,7 @@ this profile. Engine API: `SourceModuleSession::complete`.
 
 ## Current scope
 
-Inspection is synchronous on the existing stack-calibrated proof worker. It
+Cursor inspection is synchronous on the existing stack-calibrated proof worker. It
 reuses the checked-prefix/module cache but re-elaborates the current declaration
 to the selected boundary; this is not an O(1) goal snapshot or asynchronous
 cancellation claim. Source syntax must be supported by the native parser;
@@ -73,3 +73,35 @@ they implement the new typed `WorkspaceChecker` query interface.
 Installed regression tests: `cargo test --locked -p fln-cli --test lsp_goals
 --test lsp_definition_navigation --test lsp_completion`.
 Engine regression tests: `cargo test --locked -p fln --test source_goal_inspection`.
+
+## Document symbols
+
+`textDocument/documentSymbol` populates the editor's outline with explicitly named,
+admitted declarations in the requested document. Requests require `textDocument.uri`
+and do not require a cursor position. The result is a flat `DocumentSymbol[]` in
+source order, with fully qualified names such as `Outer.Inner.value`. Each entry
+has the pin's declaration kind (`SymbolKind.Method`, 6), its declaration range,
+and an identifier `selectionRange`, all in UTF-16 coordinates from the accepted
+unsaved source. CRLF and Unicode are mapped through the original source bytes.
+
+Definitions, theorems, abbreviations, opaque declarations, axioms, inductive and
+structure/class headers, named instances, and explicit members of mutual groups
+are included when supported by ordinary native checking. Imports, local binders,
+anonymous instances/examples, generated helpers and macro-generated declarations
+without an explicit declaration identifier are omitted. Namespace nesting is
+represented in qualified names; namespace containers are not synthesized.
+
+The complete source and its import closure are checked before an outline is
+published. Extraction then replays imported and local syntax in lexical order,
+including sections and temporary `open … in` scopes. A valid empty document
+returns `[]`; failed or inconclusive checking, invalidated text, and resource
+limits are request errors, never an empty success or a previous version's outline.
+This runs on the same synchronous proof worker as the other native queries.
+Engine API: `SourceModuleSession::document_symbols`, with separate source,
+module, command and syntax-walk bounds in `DocumentSymbolLimits`.
+
+The transcript correlator's `fln.lsp-method-response/5` profile validates this
+flat result's names, declaration kind, nonempty nested ranges and source order.
+It distinguishes `[]`, unavailable information (`null`) and typed query errors.
+Regression tests are included in `source_definition_navigation`,
+`lsp_definition_navigation` and `lsp_semantic_correlation`.

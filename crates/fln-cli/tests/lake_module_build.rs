@@ -89,6 +89,299 @@ fn module_library() -> Package {
     package
 }
 
+#[test]
+fn unsupported_ir_facet_preserves_the_previous_admission_artifacts() {
+    let package = module_library();
+    success(&package.build(&["+Lib.Top:olean"]));
+    let previous: Vec<_> = ["Lib.Base", "Lib.Top"]
+        .into_iter()
+        .map(|name| family_bytes(&package, name))
+        .collect();
+    let report = failure(&package.build(&["+Lib.Top:ir"]));
+    assert!(report.contains("source export carrier"), "{report}");
+    for (name, original) in ["Lib.Base", "Lib.Top"].into_iter().zip(previous) {
+        assert_eq!(family_bytes(&package, name), original);
+        assert!(!package.artifact(name).with_extension("ir").exists());
+    }
+    assert!(
+        !package
+            .0
+            .join(".lake/build/lib/lean/.fln-olean-build.lock")
+            .exists()
+    );
+}
+
+#[test]
+fn legacy_nat_modules_refuse_unusable_standalone_ir_without_replacing_artifacts() {
+    let package = Package::new(CONFIG);
+    package.write(
+        "Lib/Top.lean",
+        concat!(
+            "prelude\n",
+            "inductive Nat where | zero | succ (n : Nat)\n",
+            "def Lib.answer : Nat := Nat.zero\n",
+        ),
+    );
+    success(&package.build(&["+Lib.Top:olean"]));
+    let artifact = package.artifact("Lib.Top");
+    let previous = std::fs::read(&artifact).unwrap();
+    let snapshot = package.0.join(".lake/build/fln-build.snapshot");
+    let previous_snapshot = std::fs::read(&snapshot).unwrap();
+    let report = failure(&package.build(&["+Lib.Top:ir"]));
+    assert!(
+        report.contains("standalone IR requires a module-system file"),
+        "{report}"
+    );
+    assert_eq!(std::fs::read(&artifact).unwrap(), previous);
+    assert_eq!(std::fs::read(&snapshot).unwrap(), previous_snapshot);
+    assert!(!artifact.with_extension("ir").exists());
+    assert!(
+        !package
+            .0
+            .join(".lake/build/lib/lean/.fln-olean-build.lock")
+            .exists()
+    );
+}
+
+#[test]
+fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
+    let Some(reference) = pinned_family_reference() else {
+        return;
+    };
+    let lib = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| reference.parent().unwrap().join("../lib/lean"));
+    let package = Package::new(CONFIG);
+    package.write(
+        "Lib/Base.lean",
+        concat!(
+            "module\nprelude\npublic import Init.Notation\n",
+            "@[expose] public def Lib.choose (b : Bool) (x y : Nat) : Nat := if b then x else y\n",
+            "public def Lib.answer : Nat := 42\n",
+        ),
+    );
+    package.write(
+        "Lib/Top.lean",
+        concat!(
+            "module\nprelude\npublic import Lib.Base\n",
+            "@[expose] public def Lib.increment (n : Nat) : Nat := Nat.add n 1\n",
+            "@[expose] public def Lib.selection : Nat := Lib.choose true 41 6\n",
+        ),
+    );
+    let build = || {
+        Command::new(env!("CARGO_BIN_EXE_lake"))
+            .arg("--dir")
+            .arg(&package.0)
+            .args(["--json", "build", "+Lib.Top:ir", "+Lib.Base:olean"])
+            .env("LEAN_PATH", &lib)
+            .env("FLN_IMPORT_REUSE_DIR", package.0.join(".records"))
+            .output()
+            .unwrap()
+    };
+    let report = success(&build());
+    assert!(report.contains("\"modules_built\":2"), "{report}");
+    assert!(report.contains("\"facet\":\"ir\""), "{report}");
+    assert!(report.contains("\"executable_modules\":2"), "{report}");
+    let mut originals = Vec::new();
+    for name in ["Lib.Base", "Lib.Top"] {
+        let path = package.artifact(name).with_extension("ir");
+        assert!(report.contains(&path.display().to_string()), "{report}");
+        let bytes = std::fs::read(&path).unwrap();
+        let view = fln_olean::region::OleanView::parse(&bytes).unwrap();
+        let blocks = view
+            .extension_payloads(fln_olean::region::WalkBudget::default(), 16 << 20)
+            .unwrap();
+        let ir =
+            fln_olean::ir::decode_ir(&blocks, fln_olean::ir::IrDecodeLimits::default()).unwrap();
+        assert!(!ir.decls.is_empty());
+        assert!(ir.initializers.is_empty());
+        originals.push(bytes);
+    }
+    // Re-encoding a checked cache hit must replace the entire family, including
+    // executable code, without treating disk IR as checked compiler input.
+    success(&build());
+    for (name, original) in ["Lib.Base", "Lib.Top"].into_iter().zip(&originals) {
+        assert_eq!(
+            &std::fs::read(package.artifact(name).with_extension("ir")).unwrap(),
+            original
+        );
+    }
+    package.write(
+        "Consumer.lean",
+        concat!(
+            "import Lib.Top\n",
+            "#eval Lib.answer\n",
+            "#eval Lib.choose true 41 6\n",
+            "#eval Lib.choose false 41 6\n",
+            "#eval Lib.increment 41\n",
+            "#eval Lib.selection\n",
+        ),
+    );
+    let output = Command::new(&reference)
+        .arg(package.0.join("Consumer.lean"))
+        .current_dir(&package.0)
+        .env("LEAN_PATH", package.0.join(".lake/build/lib/lean"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "42\n41\n6\n42\n41\n"
+    );
+    // Runtime lookup prevents `[expose]` companion bodies from being inlined
+    // into the consumer. The interpreter must load these exact emitted IR
+    // functions, including the Boolean source ABI and both case arms.
+    package.write(
+        "Runtime.lean",
+        concat!(
+            "import Lean\n",
+            "unsafe def main : IO Unit := do\n",
+            "  Lean.enableInitializersExecution\n",
+            "  let env ← Lean.importModules #[{ module := `Lib.Top, isMeta := true }] {} (loadExts := true)\n",
+            "  match env.evalConst Nat {} `Lib.answer (checkMeta := false) with\n",
+            "  | .ok answer => IO.println answer\n",
+            "  | .error message => throw (IO.userError message)\n",
+            "  match env.evalConst (Bool → Nat → Nat → Nat) {} `Lib.choose (checkMeta := false),\n",
+            "        env.evalConst (Nat → Nat) {} `Lib.increment (checkMeta := false) with\n",
+            "  | .ok choose, .ok increment =>\n",
+            "    IO.println (choose true 41 6)\n",
+            "    IO.println (choose false 41 6)\n",
+            "    IO.println (increment 41)\n",
+            "  | .error message, _ => throw (IO.userError message)\n",
+            "  | _, .error message => throw (IO.userError message)\n",
+        ),
+    );
+    let interpret = || {
+        let output = Command::new(&reference)
+            .args(["--run", "Runtime.lean"])
+            .current_dir(&package.0)
+            .env("LEAN_PATH", package.0.join(".lake/build/lib/lean"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(interpret(), "42\n41\n6\n42\n");
+
+    // Change only the source-facing entry, preserving its checked logical
+    // companion and every internal helper. Direct lookup must observe 99.
+    use fln_olean::ir::write::{IrWriteInput, IrWriteLimits, encode_ir};
+    use fln_olean::ir::{IrArg, IrBody, IrDecl, IrExpr, IrLit, IrNat, IrStmt, IrTerminal};
+    use fln_olean::write::{ModuleWriteInput, OleanWriteHeader};
+    let original = &originals[1];
+    let view = fln_olean::region::OleanView::parse(original).unwrap();
+    let metadata = view
+        .module_data(fln_olean::region::WalkBudget::default())
+        .unwrap();
+    let blocks = view
+        .extension_payloads(fln_olean::region::WalkBudget::default(), 16 << 20)
+        .unwrap();
+    let mut ir = fln_olean::ir::decode_ir(&blocks, Default::default()).unwrap();
+    let exported = ir
+        .decls
+        .iter_mut()
+        .find(|declaration| declaration.name().to_display_string() == "Lib.increment")
+        .unwrap();
+    let IrDecl::Function {
+        params,
+        result,
+        body,
+        ..
+    } = exported
+    else {
+        panic!("compiled source function")
+    };
+    assert_eq!(params.len(), 1);
+    assert!(!params[0].borrow);
+    let returned = params[0].x + 1;
+    *body = IrBody {
+        stmts: vec![
+            IrStmt::Dec {
+                x: params[0].x,
+                n: 1,
+                checked: true,
+                persistent: false,
+            },
+            IrStmt::VDecl {
+                x: returned,
+                ty: result.clone(),
+                expr: IrExpr::Lit(IrLit::Num(IrNat::Small(99))),
+            },
+        ],
+        terminal: Box::new(IrTerminal::Ret(IrArg::Var(returned))),
+    };
+    let extra_names = view
+        .extra_const_names(fln_olean::region::WalkBudget::default())
+        .unwrap();
+    let mutant = encode_ir(
+        IrWriteInput {
+            module: ModuleWriteInput {
+                is_module: metadata.is_module,
+                imports: &metadata.imports,
+                constants: &[],
+                extra_const_names: &extra_names,
+            },
+            declarations: &ir.decls,
+            initializers: &ir.initializers,
+            additional_extensions: &[],
+        },
+        OleanWriteHeader {
+            version: view.header.version,
+            flags: view.header.flags,
+            lean_version: &view.header.lean_version,
+            githash: &view.header.githash,
+            base_addr: view.header.base_addr,
+        },
+        IrWriteLimits::default(),
+    )
+    .unwrap();
+    let output_ir = package.artifact("Lib.Top").with_extension("ir");
+    std::fs::write(&output_ir, &mutant.bytes).unwrap();
+    assert_eq!(interpret(), "42\n41\n6\n99\n");
+    std::fs::write(output_ir, original).unwrap();
+    // Imported HAdd carries a runtime dictionary; explicit Nat.add has the
+    // supported primitive ABI. Refusing that still-unsupported dictionary and
+    // a later source error must preserve every last-good output and snapshot.
+    let families: Vec<_> = ["Lib.Base", "Lib.Top"]
+        .into_iter()
+        .map(|name| family_bytes(&package, name))
+        .collect();
+    let snapshot = package.0.join(".lake/build/fln-build.snapshot");
+    let previous_snapshot = std::fs::read(&snapshot).unwrap();
+    for (source, unsupported_dictionary) in [
+        (
+            "module\nprelude\npublic import Lib.Base\npublic def Lib.increment (n : Nat) : Nat := n + 1\n",
+            true,
+        ),
+        (
+            "module\nprelude\npublic import Lib.Base\npublic def bad : Nat := true\n",
+            false,
+        ),
+    ] {
+        package.write("Lib/Top.lean", source);
+        let failed = build();
+        assert!(!failed.status.success(), "{failed:?}");
+        if unsupported_dictionary {
+            let report = failure(&failed);
+            assert!(
+                report.contains("internal decision constructor layout"),
+                "{report}"
+            );
+            assert!(report.contains("\"class\":\"unsupported\""), "{report}");
+        }
+        for (index, name) in ["Lib.Base", "Lib.Top"].into_iter().enumerate() {
+            assert_eq!(family_bytes(&package, name), families[index]);
+            assert_eq!(
+                std::fs::read(package.artifact(name).with_extension("ir")).unwrap(),
+                originals[index]
+            );
+        }
+        assert_eq!(std::fs::read(&snapshot).unwrap(), previous_snapshot);
+    }
+}
+
 fn family_bytes(package: &Package, module: &str) -> Vec<Vec<u8>> {
     FAMILY_PARTS
         .iter()

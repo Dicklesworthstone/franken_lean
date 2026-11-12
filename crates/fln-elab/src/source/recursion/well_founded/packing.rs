@@ -21,6 +21,69 @@ impl Context {
         Ok(function)
     }
 
+    /// `ArgsPacker.casesOn` and `WF.process{Sum,PSigma}CasesOn` choose the
+    /// recursor's result universe from the complete motive, including its
+    /// continuation. Preserve that exact level and the packed domain's levels:
+    /// the constraint solver can simplify an `imax` more than the pinned kernel
+    /// equivalence relation, so inferring a fresh recursor universe can produce
+    /// an application that the kernel rightly refuses.
+    pub(super) fn well_founded_cases_on(
+        &mut self,
+        family: &str,
+        domain: &Expr,
+        motive: &Expr,
+        major: &Expr,
+        minors: &[Expr],
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let domain = self.whnf(domain)?;
+        let (head, parameters) = operators::spine(&domain);
+        let family_name = Name::from_components([family]);
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Err(failure(SourceInferenceError::ExpectedType));
+        };
+        if name != &family_name || parameters.len() != 2 {
+            return Err(failure(SourceInferenceError::ExpectedType));
+        }
+        let codomain = Expr::app(motive.clone(), major.clone());
+        let codomain_type = self
+            .known_type(&codomain)?
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        let mut recursor_levels = vec![self.sort_level(&Typed {
+            value: codomain,
+            type_: codomain_type,
+        })?];
+        recursor_levels.extend(levels.iter().cloned());
+        let name = Name::str(family_name, "casesOn");
+        let info = self
+            .txn
+            .env
+            .find(&name)
+            .cloned()
+            .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(name.clone())))?;
+        self.note_resolved_recursor(&name, &info)?;
+        let base = info.constant_val();
+        if base.level_params.len() != recursor_levels.len() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let mut function = Typed {
+            type_: self.instantiate_params(&base.type_, &base.level_params, &recursor_levels)?,
+            value: Expr::const_(name, recursor_levels),
+        };
+        for value in parameters
+            .iter()
+            .cloned()
+            .chain([motive.clone(), major.clone()])
+            .chain(minors.iter().cloned())
+        {
+            self.tick()?;
+            let type_ = self
+                .known_type(&value)?
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+            function = self.match_apply(function, Typed { value, type_ })?;
+        }
+        Ok(function)
+    }
+
     /// `Unary.packType`: the last argument is the tail, so a unary function
     /// keeps its original domain and no artificial Unit field is introduced.
     pub(super) fn well_founded_domain(
@@ -214,16 +277,12 @@ impl Context {
                     self.well_founded_motive(&parameters[index..], &tail.type_, &result_type)?;
                 let minor = self.packing_lambda(&tails[index + 1], body)?;
                 let minor = self.packing_lambda(&parameters[index], minor)?;
-                let (type_, family) = self.sigma_parts(&tail.type_)?;
-                body = self.packing_apply(
-                    &["PSigma", "casesOn"],
-                    [
-                        type_,
-                        family,
-                        motive,
-                        Expr::fvar(tail.id.clone()),
-                        minor.value,
-                    ],
+                body = self.well_founded_cases_on(
+                    "PSigma",
+                    &tail.type_,
+                    &motive,
+                    &Expr::fvar(tail.id.clone()),
+                    &[minor.value],
                 )?;
             }
             self.packing_lambda(&tails[0], body)

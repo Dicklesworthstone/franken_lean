@@ -61,6 +61,7 @@ use std::fmt;
 mod array_construction;
 mod arrays;
 mod diagnostics;
+mod float_arrays;
 mod floats;
 mod macro_native;
 mod packed_constructors;
@@ -898,6 +899,11 @@ enum IntrinsicImplementation {
     FilePathReadDir,
     IoCurrentDir,
     FileRealPath,
+    FileCreateDir,
+    FileRemoveDir,
+    FileRemoveFile,
+    FileRename,
+    FileHardLink,
     IoGetEnv,
     IoGetTaskState,
     IoWait,
@@ -921,6 +927,7 @@ enum IntrinsicImplementation {
     TaskBind,
     ArrayConstruction(array_construction::Intrinsic),
     ArrayExtra(arrays::Intrinsic),
+    FloatArray(float_arrays::Intrinsic),
     Unsupported,
 }
 
@@ -1282,6 +1289,11 @@ impl IntrinsicImplementation {
             "extern:System.FilePath.readDir" => Self::FilePathReadDir,
             "extern:IO.currentDir" => Self::IoCurrentDir,
             "extern:IO.FS.realPath" => Self::FileRealPath,
+            "extern:IO.FS.createDir" => Self::FileCreateDir,
+            "extern:IO.FS.removeDir" => Self::FileRemoveDir,
+            "extern:IO.FS.removeFile" => Self::FileRemoveFile,
+            "extern:IO.FS.rename" => Self::FileRename,
+            "extern:IO.FS.hardLink" => Self::FileHardLink,
             "extern:IO.getEnv" => Self::IoGetEnv,
             "extern:IO.getTaskState" => Self::IoGetTaskState,
             "extern:IO.wait" => Self::IoWait,
@@ -1308,6 +1320,7 @@ impl IntrinsicImplementation {
                 .or_else(|| {
                     array_construction::Intrinsic::for_row(row).map(Self::ArrayConstruction)
                 })
+                .or_else(|| float_arrays::Intrinsic::for_row(row).map(Self::FloatArray))
                 .or_else(|| floats::Intrinsic::for_row(row).map(Self::Float))
                 .or_else(|| strings::Intrinsic::for_row(row).map(Self::StringInternal))
                 .or_else(|| string_fold::Intrinsic::for_row(row).map(Self::StringTraversal))
@@ -3190,10 +3203,11 @@ fn run(
                             }
                         }
                         IntrinsicImplementation::MacroNative(intrinsic) => intrinsic
-                            .invoke_with_lookup(
+                            .invoke_owned_with_lookup(
                                 plan.row,
-                                &values,
+                                values,
                                 macro_methods.and_then(|methods| methods.lookup),
+                                limits.max_nat_magnitude_bytes,
                             ),
                         implementation => invoke_intrinsic(
                             implementation,
@@ -4705,6 +4719,8 @@ fn finish_intrinsic_result(
     }
     let boxed_integer = floats::boxed_integer_result(row)
         || strings::Intrinsic::for_row(row).is_some_and(strings::Intrinsic::has_wide_result)
+        || float_arrays::Intrinsic::for_row(row)
+            .is_some_and(float_arrays::Intrinsic::has_wide_result)
         || matches!(
             row,
             "extern:ByteArray.hash" | "extern:ByteArray.usize" | "extern:Array.usize"
@@ -5052,6 +5068,12 @@ fn invoke_intrinsic(
     if let IntrinsicImplementation::ArrayExtra(intrinsic) = implementation {
         return intrinsic.invoke(row, args);
     }
+    if let IntrinsicImplementation::FloatArray(intrinsic) = implementation {
+        return intrinsic.invoke(row, args);
+    }
+    if let IntrinsicImplementation::MacroNative(intrinsic) = implementation {
+        return intrinsic.invoke_owned_with_lookup(row, args, None, max_nat_magnitude_bytes);
+    }
     if implementation == IntrinsicImplementation::ByteArrayPush {
         expect_arity(row, &args, 2)?;
         if value_kind(&args[0]) != ValueKind::ScalarArray {
@@ -5065,6 +5087,63 @@ fn invoke_intrinsic(
         let array = args.into_iter().next().expect("checked byte push arity");
         return array
             .try_byte_array_push(value)
+            .map(IntrinsicResult::owned)
+            .map_err(|_| VmRefusal::InvalidByteArrayObject.into());
+    }
+    if matches!(
+        implementation,
+        IntrinsicImplementation::ByteArraySet
+            | IntrinsicImplementation::ByteArraySetBang
+            | IntrinsicImplementation::ByteArrayUset
+    ) {
+        expect_arity(row, &args, 3)?;
+        let machine_index = implementation == IntrinsicImplementation::ByteArrayUset;
+        let operation = if machine_index {
+            "ByteArray.uset"
+        } else {
+            "ByteArray.set"
+        };
+        let size = byte_array_bytes(&args[0], operation, 0)?.len();
+        let index = if machine_index {
+            usize_argument(&args[1], operation, 1)?
+        } else {
+            nat_as_usize(&args[1], operation, 1)?.unwrap_or(usize::MAX)
+        };
+        // Keep the proof-bearing USize path's precondition order: its index
+        // is validated before the new byte, as on the borrowed dispatch path.
+        if machine_index && index >= size {
+            return Err(VmRefusal::ArrayIndexOutOfBounds { index, size }.into());
+        }
+        let value = byte_argument(&args[2], operation, 2)?;
+        if index >= size && implementation != IntrinsicImplementation::ByteArraySetBang {
+            return Err(VmRefusal::ArrayIndexOutOfBounds { index, size }.into());
+        }
+        let array = args.into_iter().next().expect("checked byte update arity");
+        let result = if index < size {
+            array
+                .try_sarray_set(index, &[value])
+                .map_err(|_| VmRefusal::InvalidByteArrayObject)?
+        } else {
+            array
+        };
+        return Ok(if machine_index {
+            IntrinsicResult::raw_object(result)
+        } else {
+            IntrinsicResult::owned(result)
+        });
+    }
+    if implementation == IntrinsicImplementation::ByteArrayCopySlice {
+        expect_arity(row, &args, 6)?;
+        byte_array_bytes(&args[0], "ByteArray.copySlice", 0)?;
+        let source_offset = nat_as_usize(&args[1], "ByteArray.copySlice", 1)?.unwrap_or(usize::MAX);
+        byte_array_bytes(&args[2], "ByteArray.copySlice", 2)?;
+        let destination_offset =
+            nat_as_usize(&args[3], "ByteArray.copySlice", 3)?.unwrap_or(usize::MAX);
+        let length = nat_as_usize(&args[4], "ByteArray.copySlice", 4)?.unwrap_or(usize::MAX);
+        let exact = bool_value(&args[5], "ByteArray.copySlice", 5)?;
+        let [source, _, destination, _, _, _] = exact_owned_args(row, args)?;
+        return destination
+            .try_byte_array_copy_slice(&source, source_offset, destination_offset, length, exact)
             .map(IntrinsicResult::owned)
             .map_err(|_| VmRefusal::InvalidByteArrayObject.into());
     }
@@ -5086,12 +5165,19 @@ fn dispatch_intrinsic(
             .saturating_mul(8),
     );
     match implementation {
-        IntrinsicImplementation::MacroNative(intrinsic) => intrinsic.invoke(row, args),
+        IntrinsicImplementation::MacroNative(intrinsic) => {
+            intrinsic.invoke_with_lookup(row, args, None, max_nat_magnitude_bytes)
+        }
         IntrinsicImplementation::PanicCore => diagnostics::panic(row, args),
         IntrinsicImplementation::ArrayConstruction(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::ArrayExtra(_)
+        | IntrinsicImplementation::FloatArray(_)
         | IntrinsicImplementation::ArrayPush
         | IntrinsicImplementation::ByteArrayPush
+        | IntrinsicImplementation::ByteArraySet
+        | IntrinsicImplementation::ByteArraySetBang
+        | IntrinsicImplementation::ByteArrayUset
+        | IntrinsicImplementation::ByteArrayCopySlice
         | IntrinsicImplementation::VoidMk => {
             unreachable!("owned operations are dispatched before borrowing arguments")
         }
@@ -7281,42 +7367,6 @@ fn dispatch_intrinsic(
             };
             Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(byte))))
         }
-        IntrinsicImplementation::ByteArraySet | IntrinsicImplementation::ByteArraySetBang => {
-            expect_arity(row, args, 3)?;
-            let bytes = byte_array_bytes(&args[0], "ByteArray.set", 0)?;
-            let index = nat_as_usize(&args[1], "ByteArray.set", 1)?.unwrap_or(usize::MAX);
-            let value = byte_argument(&args[2], "ByteArray.set", 2)?;
-            if implementation == IntrinsicImplementation::ByteArraySet && index >= bytes.len() {
-                return Err(VmRefusal::ArrayIndexOutOfBounds {
-                    index,
-                    size: bytes.len(),
-                }
-                .into());
-            }
-            if index < bytes.len() {
-                let mut updated = bytes;
-                updated[index] = value;
-                Ok(IntrinsicResult::owned(mk_byte_array(&updated)))
-            } else {
-                Ok(IntrinsicResult::owned(args[0].clone_ref()))
-            }
-        }
-        IntrinsicImplementation::ByteArrayUset => {
-            expect_arity(row, args, 3)?;
-            let bytes = byte_array_bytes(&args[0], "ByteArray.uset", 0)?;
-            let index = usize_argument(&args[1], "ByteArray.uset", 1)?;
-            if index >= bytes.len() {
-                return Err(VmRefusal::ArrayIndexOutOfBounds {
-                    index,
-                    size: bytes.len(),
-                }
-                .into());
-            }
-            let value = byte_argument(&args[2], "ByteArray.uset", 2)?;
-            let mut updated = bytes;
-            updated[index] = value;
-            Ok(IntrinsicResult::raw_object(mk_byte_array(&updated)))
-        }
         IntrinsicImplementation::ByteArrayMk => {
             expect_arity(row, args, 1)?;
             let (size, _) = array_value(&args[0], "ByteArray.mk", 0)?;
@@ -7354,26 +7404,13 @@ fn dispatch_intrinsic(
             let bytes = byte_array_bytes(&args[0], "ByteArray.hash", 0)?;
             // The UInt64 result retains all 64 bits, including the high bit.
             Ok(uint64_result(fln_core::lean_hash::murmur_hash_64a(
-                &bytes, 11,
+                bytes, 11,
             )))
-        }
-        IntrinsicImplementation::ByteArrayCopySlice => {
-            expect_arity(row, args, 6)?;
-            let source = byte_array_bytes(&args[0], "ByteArray.copySlice", 0)?;
-            let src_off = nat_as_usize(&args[1], "ByteArray.copySlice", 1)?.unwrap_or(usize::MAX);
-            let dest = byte_array_bytes(&args[2], "ByteArray.copySlice", 2)?;
-            let dest_off = nat_as_usize(&args[3], "ByteArray.copySlice", 3)?.unwrap_or(usize::MAX);
-            let len = nat_as_usize(&args[4], "ByteArray.copySlice", 4)?.unwrap_or(usize::MAX);
-            // `exact` only shapes the C capacity policy; values are identical.
-            bool_value(&args[5], "ByteArray.copySlice", 5)?;
-            Ok(IntrinsicResult::owned(mk_byte_array(&copy_slice_bytes(
-                &source, src_off, &dest, dest_off, len,
-            ))))
         }
         IntrinsicImplementation::ByteArrayValidateUtf8 => {
             expect_arity(row, args, 1)?;
             let bytes = byte_array_bytes(&args[0], "ByteArray.validateUTF8", 0)?;
-            let valid = validate_utf8_bytes(&bytes);
+            let valid = validate_utf8_bytes(bytes);
             Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(valid))))
         }
         IntrinsicImplementation::PlatformNumBits => {
@@ -7520,6 +7557,32 @@ fn dispatch_intrinsic(
         IntrinsicImplementation::FileRealPath => {
             expect_arity(row, args, 1)?;
             Obj::try_real_path(&args[0], &Obj::mk_nat(0))
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
+        IntrinsicImplementation::FileCreateDir
+        | IntrinsicImplementation::FileRemoveDir
+        | IntrinsicImplementation::FileRemoveFile => {
+            expect_arity(row, args, 1)?;
+            let world = Obj::mk_nat(0);
+            let result = match implementation {
+                IntrinsicImplementation::FileCreateDir => Obj::try_create_dir(&args[0], &world),
+                IntrinsicImplementation::FileRemoveDir => Obj::try_remove_dir(&args[0], &world),
+                _ => Obj::try_remove_file(&args[0], &world),
+            };
+            result
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
+        IntrinsicImplementation::FileRename | IntrinsicImplementation::FileHardLink => {
+            expect_arity(row, args, 2)?;
+            let world = Obj::mk_nat(0);
+            let result = if implementation == IntrinsicImplementation::FileRename {
+                Obj::try_rename(&args[0], &args[1], &world)
+            } else {
+                Obj::try_hard_link(&args[0], &args[1], &world)
+            };
+            result
                 .map(IntrinsicResult::owned)
                 .map_err(|error| VmRefusal::NativeFileIo { error }.into())
         }
@@ -8177,6 +8240,11 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::FilePathReadDir
         | IntrinsicImplementation::IoCurrentDir
         | IntrinsicImplementation::FileRealPath
+        | IntrinsicImplementation::FileCreateDir
+        | IntrinsicImplementation::FileRemoveDir
+        | IntrinsicImplementation::FileRemoveFile
+        | IntrinsicImplementation::FileRename
+        | IntrinsicImplementation::FileHardLink
         | IntrinsicImplementation::IoGetEnv
         | IntrinsicImplementation::IoGetTaskState
         | IntrinsicImplementation::IoWait
@@ -8197,6 +8265,7 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::TaskGet
         | IntrinsicImplementation::ArrayConstruction(_)
         | IntrinsicImplementation::ArrayExtra(_)
+        | IntrinsicImplementation::FloatArray(_)
         | IntrinsicImplementation::Float(_)
         | IntrinsicImplementation::StringInternal(_)
         | IntrinsicImplementation::MacroNative(_)
@@ -8818,16 +8887,18 @@ fn string_bytes_exhausted(operation: &str, error: strings::ResourceError, locati
 
 /// The bytes of a Marrow `ByteArray`: a scalar array whose element size is
 /// exactly one. Any other scalar-array element size is a different type and
-/// refuses here rather than aliasing its payload.
-fn byte_array_bytes(
-    value: &Obj,
+/// refuses here rather than aliasing its payload. The live byte slice borrows
+/// the checked owning handle: observing a size or element never copies the
+/// buffer, and scans do not allocate a snapshot of their input.
+fn byte_array_bytes<'a>(
+    value: &'a Obj,
     operation: &'static str,
     argument: usize,
-) -> Result<Vec<u8>, VmRefusal> {
+) -> Result<&'a [u8], VmRefusal> {
     if value_kind(value) != ValueKind::ScalarArray {
         return Err(type_mismatch(operation, argument, "ByteArray", value));
     }
-    let Some((elem_size, _, _, data)) = value.try_sarray_view() else {
+    let Some((elem_size, _, _, data)) = value.try_borrow_sarray_view() else {
         return Err(VmRefusal::InvalidByteArrayObject);
     };
     if elem_size != 1 {
@@ -8968,32 +9039,6 @@ fn signed_width_result(row: &str, value: i64) -> Result<IntrinsicResult, VmRefus
         }),
     }
 }
-/// Exact port of the pin's `lean_byte_array_copy_slice` value semantics:
-/// a source offset past the source returns the destination unchanged; the
-/// length clamps to the remaining source; a destination offset past the
-/// destination clamps to the destination end (so no gap past the old end is
-/// ever reachable); and the result grows to `max(dest_len, dest_off + len)`.
-/// The copy-always discipline makes the pin's exclusivity fast path
-/// observationally identical.
-fn copy_slice_bytes(
-    source: &[u8],
-    src_off: usize,
-    dest: &[u8],
-    dest_off: usize,
-    len: usize,
-) -> Vec<u8> {
-    if src_off > source.len() {
-        return dest.to_vec();
-    }
-    let len = len.min(source.len() - src_off);
-    let dest_off = dest_off.min(dest.len());
-    let new_size = dest.len().max(dest_off + len);
-    let mut out = vec![0u8; new_size];
-    out[..dest.len()].copy_from_slice(dest);
-    out[dest_off..dest_off + len].copy_from_slice(&source[src_off..src_off + len]);
-    out
-}
-
 /// Exact port of the pin's `validate_utf8`/`validate_utf8_one`
 /// (src/runtime/utf8.cpp): full sequence validation with the overlong,
 /// surrogate, and range checks the C encodes inline.
@@ -9759,7 +9804,82 @@ mod tests {
 
     fn ba_bytes(result: Result<Obj, VmRefusal>) -> Vec<u8> {
         let object = result.expect("the intrinsic answers");
-        byte_array_bytes(&object, "test projection", 0).expect("a byte-array result")
+        byte_array_bytes(&object, "test projection", 0)
+            .expect("a byte-array result")
+            .to_vec()
+    }
+
+    #[test]
+    fn byte_array_observation_borrows_live_storage_and_keeps_shared_updates_independent() {
+        let input: Vec<_> = (0..8192).map(|index| (index % 256) as u8).collect();
+        let array = ba(&input);
+        let alias = array.clone_ref();
+        for owner in [&array, &alias] {
+            let source = owner.try_borrow_sarray_view().unwrap().3;
+            let observed = byte_array_bytes(owner, "test borrowed bytes", 0).unwrap();
+            assert!(
+                std::ptr::eq(source, observed),
+                "observing a byte array must borrow its live buffer"
+            );
+            assert_eq!(observed, input.as_slice());
+        }
+        let observed = byte_array_bytes(&array, "test retained bytes", 0).unwrap();
+        for row in [
+            "extern:ByteArray.set",
+            "extern:ByteArray.set!",
+            "extern:ByteArray.uset",
+        ] {
+            let updated = invoke(row, &[alias.clone_ref(), n(1), n(255)]).unwrap();
+            let bytes = byte_array_bytes(&updated, "test updated bytes", 0).unwrap();
+            assert_eq!(bytes.len(), input.len());
+            assert_eq!(bytes[1], 255);
+            assert_eq!(&bytes[2..], &input[2..]);
+            assert_eq!(observed, input.as_slice());
+        }
+        assert_eq!(
+            byte_array_bytes(&alias, "test unchanged alias", 0).unwrap(),
+            input.as_slice()
+        );
+    }
+
+    #[test]
+    fn byte_array_observers_validate_categories_before_exposing_bytes() {
+        let wrong_width = Obj::mk_sarray(2, &[1, 2, 3, 4]);
+        for row in [
+            "extern:ByteArray.size",
+            "extern:ByteArray.usize",
+            "extern:ByteArray.data",
+            "extern:ByteArray.hash",
+            "extern:ByteArray.validateUTF8",
+        ] {
+            assert!(matches!(
+                invoke(row, &[wrong_width.clone_ref()]),
+                Err(VmRefusal::InvalidByteArrayObject)
+            ));
+            assert!(matches!(
+                invoke(row, &[n(0)]),
+                Err(VmRefusal::TypeMismatch {
+                    expected: "ByteArray",
+                    ..
+                })
+            ));
+        }
+        for row in [
+            "extern:ByteArray.get",
+            "extern:ByteArray.get!",
+            "extern:ByteArray.uget",
+        ] {
+            assert!(matches!(
+                invoke(row, &[wrong_width.clone_ref(), n(0)]),
+                Err(VmRefusal::InvalidByteArrayObject)
+            ));
+        }
+        for row in ["extern:ByteArray.beq", "extern:ByteArray.decEq"] {
+            assert!(matches!(
+                invoke(row, &[ba(&[1, 2, 3, 4]), wrong_width.clone_ref()]),
+                Err(VmRefusal::InvalidByteArrayObject)
+            ));
+        }
     }
 
     #[test]

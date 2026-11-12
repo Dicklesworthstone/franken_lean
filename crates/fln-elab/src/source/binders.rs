@@ -116,6 +116,37 @@ fn names(syntax: &[Syntax]) -> Result<Vec<Name>, NatDefinitionElabError> {
 }
 
 impl Context {
+    /// The leading lambda under parentheses and explicit-term wrappers. Keep
+    /// `@` attached to this telescope: it suppresses its implicit prefix, not
+    /// implicit lambdas in its domains or body.
+    pub(super) fn lambda_syntax<'a>(
+        &mut self,
+        mut syntax: &'a Syntax,
+    ) -> Result<Option<(&'a Syntax, bool)>, NatDefinitionElabError> {
+        let mut explicit = false;
+        loop {
+            self.tick()?;
+            if let Some(inner) = parenthesized_inner(syntax)? {
+                syntax = inner;
+                continue;
+            }
+            if syntax.kind() == Some(&parser_kind(&["Term", "explicit"])) {
+                let parts = expect_node(
+                    syntax,
+                    &parser_kind(&["Term", "explicit"]),
+                    2,
+                    "explicit lambda",
+                )?;
+                expect_atom(&parts[0], "@", "explicit lambda prefix")?;
+                syntax = &parts[1];
+                explicit = true;
+                continue;
+            }
+            return Ok((syntax.kind() == Some(&parser_kind(&["Term", "fun"])))
+                .then_some((syntax, explicit)));
+        }
+    }
+
     fn term_binder<'a>(
         &mut self,
         syntax: &'a Syntax,
@@ -244,6 +275,11 @@ impl Context {
         expected: Option<Expr>,
         lambda: bool,
     ) -> Result<Telescope<'a>, NatDefinitionElabError> {
+        let (syntax, explicit) = if lambda {
+            self.lambda_syntax(syntax)?.ok_or_else(invalid)?
+        } else {
+            (syntax, false)
+        };
         let dependent = syntax.kind() == Some(&parser_kind(&["Term", "depArrow"]));
         let (raw, annotation, body) = if dependent {
             let parts = expect_node(
@@ -338,7 +374,9 @@ impl Context {
             lambda,
             body,
         };
-        self.open_implicit_lambda_prefix(&mut state)?;
+        if !explicit {
+            self.open_implicit_lambda_prefix(&mut state)?;
+        }
         Ok(state)
     }
 
@@ -755,6 +793,8 @@ fn exists_kind() -> Name {
 fn binder_notation(kind: &Name) -> Option<(&'static str, Name)> {
     if kind == &exists_kind() {
         Some(("∃", Name::from_components(["Exists"])))
+    } else if kind == &Name::str(Name::anonymous(), "termExists_,_") {
+        Some(("exists", Name::from_components(["Exists"])))
     } else if kind == &Name::str(Name::anonymous(), "termΣ_,_") {
         Some(("Σ", Name::from_components(["_root_", "Sigma"])))
     } else if kind == &Name::str(Name::anonymous(), "termΣ'_,_") {
@@ -819,9 +859,9 @@ impl Context {
         if pattern {
             return Err(invalid());
         }
-        // `Σ` and `Σ'` exist where their declaring module (`Init.NotationExtra`) is imported, as
-        // its `ParserDescr` constant witnesses: without it the pin's parser has no such token
-        // (`prelude` + `import Init.Core` says "expected token").
+        // ASCII `exists`, `Σ` and `Σ'` need their declaring module (`Init.NotationExtra`),
+        // as its `ParserDescr` constant witnesses. The `exists` tactic token alone does
+        // not provide the term notation (`prelude` + `import Init.Core`).
         if word != "∃"
             && !self
                 .txn

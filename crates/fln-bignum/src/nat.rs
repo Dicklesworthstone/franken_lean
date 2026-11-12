@@ -25,6 +25,8 @@
 
 use std::cmp::Ordering;
 
+pub mod literal;
+
 /// Arbitrary-precision unsigned natural number (KR-313 / plan §8.4).
 ///
 /// Invariant: `limbs` is little-endian and normalized (no trailing zeros).

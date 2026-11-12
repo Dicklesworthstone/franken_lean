@@ -1,6 +1,7 @@
 //! Completion shares the proof worker and the exact unsaved import overlay.
 use super::*;
-use fln_server::dispatch::semantic::CompletionItem;
+use fln::source_check::inspect::SourceCompletionKind;
+use fln_server::dispatch::semantic::{CompletionItem, CompletionItemKind};
 
 pub(super) fn complete(
     session: &mut SourceModuleSession,
@@ -24,6 +25,10 @@ pub(super) fn complete(
                 .map(|item| CompletionItem {
                     label: item.label,
                     replacement: item.replacement,
+                    kind: match item.kind {
+                        SourceCompletionKind::Local => CompletionItemKind::Variable,
+                        SourceCompletionKind::Global => CompletionItemKind::Constant,
+                    },
                 })
                 .collect(),
             range: completion.range,

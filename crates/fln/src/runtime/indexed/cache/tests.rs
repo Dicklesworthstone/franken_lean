@@ -31,6 +31,9 @@ inductive CacheVec (A : Type) : Nat -> Type where
   | nil : CacheVec A 0
   | cons (n : Nat) (head : A) (tail : CacheVec A n) : CacheVec A (Nat.succ n)
 def cacheIndexAlias (A : Type) (n : Nat) : Type := CacheVec A n
+class CacheGet (C A : Type) (valid : C -> Nat -> Prop) where
+  get : (xs : C) -> (i : Nat) -> valid xs i -> A
+  unused : Nat
 structure CachePayload where
   flag : Bool
   value : if flag then Nat else String
@@ -123,6 +126,76 @@ fn universe_syntax_needs_one_visit_and_no_cache_row() {
 }
 
 #[test]
+fn unchanged_deep_types_retain_allocation_sharing_and_bounded_work() {
+    // Source admission uses its normal stack; only the heap-backed runtime
+    // traversal and destruction run on the deliberately small worker stack.
+    let engine = engine();
+    std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(move || {
+            let depth = 2_048;
+            let budget = depth * 32 + 128;
+            let domain = c("Nat");
+            let family = c("CacheVec");
+            let binder = name("kept");
+            let mut telescope = domain.clone();
+            let mut type_function = domain.clone();
+            let mut data = domain.clone();
+            for _ in 0..depth {
+                telescope = Expr::forall_e(
+                    binder.clone(),
+                    domain.clone(),
+                    telescope,
+                    BinderInfo::Default,
+                );
+                type_function = Expr::lam(
+                    binder.clone(),
+                    domain.clone(),
+                    type_function,
+                    BinderInfo::Default,
+                );
+                // The index has already been erased, as in a runtime layout
+                // key. Head normalization still rebuilds this one-argument
+                // spine unless erasure preserves the original allocation.
+                data = Expr::app(family.clone(), data);
+            }
+            for source in [telescope, type_function, data] {
+                let mut preparation = Preparation::new(
+                    &engine.environment,
+                    IngressLimits {
+                        max_nodes: budget,
+                        ..IngressLimits::default()
+                    },
+                );
+                let result = preparation.erase_data_indices(&source).unwrap();
+                // A visit bound alone misses uncharged equality work. Sharing
+                // proves that equal suffixes were not rebuilt at every level.
+                assert_eq!(result.allocation_identity(), source.allocation_identity());
+                let needed = preparation.visited;
+                let mut limited = Preparation::new(
+                    &engine.environment,
+                    IngressLimits {
+                        max_nodes: needed - 1,
+                        ..IngressLimits::default()
+                    },
+                );
+                nodes_error(limited.erase_data_indices(&source), needed - 1);
+                assert!(limited.specializations.index_types.entries.is_empty());
+                limited.limits.max_nodes = budget * 2 + 1;
+                let retried = limited.erase_data_indices(&source).unwrap();
+                assert_eq!(retried.allocation_identity(), source.allocation_identity());
+                let before = limited.visited;
+                let cached = limited.erase_data_indices(&source).unwrap();
+                assert_eq!(cached.allocation_identity(), source.allocation_identity());
+                assert_eq!(limited.visited, before + 1);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn completed_exact_types_reuse_results_without_conflating_static_arguments_or_running_indices() {
     let engine = engine();
     let root = engine.logical_root(&KVMap::new());
@@ -194,6 +267,64 @@ fn open_inputs_and_results_do_not_publish_closed_type_evidence() {
         );
     }
     assert!(preparation.specializations.index_types.entries.is_empty());
+}
+
+#[test]
+fn nested_index_erasure_closes_later_predicate_domains_before_layout_selection() {
+    let engine = engine();
+    let root = engine.logical_root(&KVMap::new());
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    let dictionary = |element| {
+        let container = vector(element, b(0));
+        let predicate = Expr::lam(
+            name("xs"),
+            container.clone(),
+            Expr::lam(
+                name("i"),
+                c("Nat"),
+                app(
+                    Expr::const_(name("Eq"), vec![Level::one()]),
+                    [c("Nat"), b(2), b(2)],
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        app(c("CacheGet"), [container, c("Nat"), predicate])
+    };
+    let source = dictionary(c("Nat"));
+    assert!(source.has_loose_bvars());
+    let erased = preparation.erase_data_indices(&source).unwrap();
+    assert!(!erased.has_loose_bvars(), "{erased:?}");
+    assert!(!erased.has_fvar());
+    assert_eq!(preparation.erase_data_indices(&erased).unwrap(), erased);
+    assert_eq!(
+        preparation.value_type(&source).unwrap(),
+        Some(ValueType::Constructor)
+    );
+    // A real runtime type parameter cannot acquire a guessed carrier through
+    // the same retry. Only the family's proved uniform indices disappear.
+    let unknown = app(c("CacheGet"), [b(0), c("Nat"), b(1)]);
+    assert!(
+        preparation
+            .erase_data_indices(&unknown)
+            .unwrap()
+            .has_loose_bvars()
+    );
+    assert_eq!(preparation.value_type(&unknown).unwrap(), None);
+    // Closing a predicate is not evidence for the carrier's layout. A real
+    // checked record whose payload type varies with a stored Bool still
+    // cannot inhabit a uniform container, even after this same retry closes
+    // its index-dependent predicate.
+    let nonuniform = dictionary(c("CachePayload"));
+    assert!(
+        !preparation
+            .erase_data_indices(&nonuniform)
+            .unwrap()
+            .has_loose_bvars()
+    );
+    assert_eq!(preparation.value_type(&nonuniform).unwrap(), None);
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
 }
 
 #[test]

@@ -35,6 +35,31 @@ fn tactic_and_exact_calculations_use_native_proof_scripts() {
     );
     prove("theorem chain (a : Nat) : a = a := by\n  exact calc\n    a = a := by rfl");
 }
+
+#[test]
+fn parenthesized_tactics_wait_for_calculation_endpoints() {
+    for source in [
+        "theorem chain : 3 = 3 := calc\n  _ = 3 := (by decide)",
+        "theorem chain : 3 = 3 := by\n  calc\n    _ = 3 := ((by decide))",
+        "theorem chain : 3 = 3 := calc\n  3 = _ := (by decide)",
+        "theorem chain : 3 = 3 := calc\n  _ = 3 := (by decide)\n  _ = _ := ((by decide))",
+    ] {
+        prove(source);
+    }
+    for source in [
+        "theorem wrong : 3 = 4 := calc\n  _ = 4 := (by decide)",
+        "theorem wrong : 3 = 3 := calc\n  _ = 4 := ((by decide))\n  _ = _ := (by decide)",
+    ] {
+        let base = engine();
+        let before = base.environment().len();
+        assert!(
+            base.admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(base.environment().len(), before);
+    }
+}
 /// A first step on the `calc` line leaves the remaining steps a position of their own
 /// (`calcSteps := withPosition(calcFirstStep) withPosition((calcStep ppLine)*)`), here left of it.
 #[test]

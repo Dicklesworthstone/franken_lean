@@ -11,7 +11,7 @@ use fln_core::outcome::{Authority, InconclusiveCause, Outcome};
 use fln_rt::obj::{Obj, StdoutCapture, StdoutCaptureError, shadow};
 use fln_vm::extern_row::{ArgumentOwnership as CA, Ownership, ResultOwnership as CR};
 use fln_vm::extern_table_generated::EXTERN_ROWS;
-use fln_vm::interpreter::{ExecutionLimits, VmExit, VmRefusal, execute};
+use fln_vm::interpreter::{ExecutionLimits, VmExit, VmRefusal, execute, execute_function};
 use std::cell::Cell;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -90,7 +90,7 @@ fn byte_input(bytes: &[u8]) -> Vec<I> {
     code
 }
 fn replay(code: Vec<I>, owned: bool) -> ValidatedProgram {
-    let mut program = flbc::validate(Program::new(
+    let program = flbc::validate(Program::new(
         FunctionId::new(0),
         vec![Function {
             id: FunctionId::new(0),
@@ -102,6 +102,9 @@ fn replay(code: Vec<I>, owned: bool) -> ValidatedProgram {
         }],
     ))
     .unwrap();
+    canonical(program, owned)
+}
+fn canonical(mut program: ValidatedProgram, owned: bool) -> ValidatedProgram {
     if owned {
         let candidate = flbc::insert_ownership(&program, OwnershipLimits::default()).unwrap();
         flbc::validate_ownership_candidate(
@@ -120,6 +123,43 @@ fn replay(code: Vec<I>, owned: bool) -> ValidatedProgram {
         bytes
     );
     decoded
+}
+fn owned_function(arity: u16, code: Vec<I>, owned: bool) -> ValidatedProgram {
+    let program = flbc::validate(Program::new(
+        FunctionId::new(0),
+        vec![
+            Function {
+                id: FunctionId::new(0),
+                arity: 0,
+                parameter_ownership: vec![],
+                result_ownership: C::Scalar,
+                register_count: 1,
+                code: vec![nat(0, 0), I::Return { src: r(0) }],
+            },
+            Function {
+                id: FunctionId::new(1),
+                arity,
+                parameter_ownership: vec![A::Owned; usize::from(arity)],
+                result_ownership: C::Owned,
+                register_count: 64,
+                code,
+            },
+        ],
+    ))
+    .unwrap();
+    canonical(program, owned)
+}
+fn returned_function(program: &ValidatedProgram, arguments: Vec<Obj>) -> Obj {
+    match execute_function(
+        program,
+        FunctionId::new(1),
+        arguments,
+        ExecutionLimits::default(),
+        None,
+    ) {
+        Outcome::Complete(VmExit::Returned(result)) => result.value,
+        other => panic!("expected native owned array result: {other:?}"),
+    }
 }
 fn returned(program: &ValidatedProgram) -> Obj {
     match execute(program, ExecutionLimits::default(), None) {
@@ -141,6 +181,98 @@ fn clean_shadow() {
         event.kind,
         shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
     )));
+}
+
+#[test]
+fn generated_byte_array_updates_reuse_unique_storage_and_copy_shared_snapshots() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    shadow::enable();
+    for owned in [false, true] {
+        for row in [
+            "extern:ByteArray.set",
+            "extern:ByteArray.set!",
+            "extern:ByteArray.uset",
+        ] {
+            let mut code = Vec::new();
+            for index in 0..64 {
+                code.push(nat(1, index));
+                if row.ends_with("uset") {
+                    code.push(call(1, "extern:USize.ofNat", &[1]));
+                }
+                code.extend([nat(2, (index * 7) % 256), call(0, row, &[0, 1, 2])]);
+            }
+            code.push(I::Return { src: r(0) });
+            let program = owned_function(1, code, owned);
+            for shared in [false, true] {
+                let input = Obj::mk_sarray(1, &[0; 64]);
+                let identity = input.identity_token();
+                let snapshot = shared.then(|| input.clone_ref());
+                let result = returned_function(&program, vec![input]);
+                assert_eq!(result.identity_token() == identity, !shared, "{row}");
+                assert_eq!(
+                    bytes(&result),
+                    (0..64).map(|i| (i * 7) as u8).collect::<Vec<_>>()
+                );
+                if let Some(snapshot) = snapshot {
+                    assert_eq!(bytes(&snapshot), [0; 64]);
+                }
+            }
+        }
+    }
+    clean_shadow();
+}
+
+#[test]
+fn generated_byte_array_slice_copy_preserves_borrows_overlap_and_native_capacity() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    shadow::enable();
+    for owned in [false, true] {
+        for exact in [false, true] {
+            let program = owned_function(
+                2,
+                vec![
+                    nat(2, 0),
+                    huge(3),
+                    huge(4),
+                    nat(5, u64::from(exact)),
+                    call(6, "extern:ByteArray.copySlice", &[0, 2, 1, 3, 4, 5]),
+                    I::Return { src: r(6) },
+                ],
+                owned,
+            );
+            let source = Obj::mk_sarray(1, b"ABCDE");
+            let source_snapshot = source.clone_ref();
+            let destination = Obj::mk_sarray(1, b"x");
+            let snapshot = destination.clone_ref();
+            let result = returned_function(&program, vec![source, destination]);
+            assert_eq!(bytes(&result), b"xABCDE");
+            assert_eq!(
+                result.try_borrow_sarray_view().unwrap().2,
+                if exact { 6 } else { 12 }
+            );
+            assert_eq!(bytes(&snapshot), b"x");
+            assert_eq!(bytes(&source_snapshot), b"ABCDE");
+        }
+        let overlap = owned_function(
+            1,
+            vec![
+                nat(1, 0),
+                nat(2, 1),
+                nat(3, 4),
+                nat(4, 0),
+                call(5, "extern:ByteArray.copySlice", &[0, 1, 0, 2, 3, 4]),
+                I::Return { src: r(5) },
+            ],
+            owned,
+        );
+        let input = Obj::mk_sarray(1, b"ABCDE");
+        let snapshot = input.clone_ref();
+        let result = returned_function(&overlap, vec![input]);
+        assert_eq!(bytes(&result), b"AABCD");
+        assert_eq!(bytes(&snapshot), b"ABCDE");
+        assert_ne!(result.identity_token(), snapshot.identity_token());
+    }
+    clean_shadow();
 }
 
 #[test]

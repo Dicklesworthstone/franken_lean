@@ -827,3 +827,48 @@ fn flat_nat_batch_errors_keep_file_offsets_without_publishing_the_prefix() {
     );
     assert_eq!(base.logical_root(&options), before);
 }
+
+#[test]
+fn constructed_macro_bodies_keep_definition_site_names_after_module_replay() {
+    let base = engine();
+    let files = [
+        (
+            "Main",
+            "import Lib\ndef offset : Nat := 100\n\
+             theorem result : importedConstruct! (41 : Nat) = 42 := rfl",
+        ),
+        (
+            "Lib",
+            r#"namespace Library
+def offset : Nat := 1
+macro "importedConstruct! " x:term : term => do
+  let input := x
+  let output ← `(Nat.add $input offset)
+  return output
+end Library"#,
+        ),
+    ];
+    let imported = checked(&base, &files).checked.engine;
+    let options = KVMap::new();
+    let before = imported.logical_root(&options);
+    let good = imported
+        .check_source_files(
+            &[b"theorem replayed : importedConstruct! (1 : Nat) = 2 := rfl"],
+            &options,
+            limits().source,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(good.theorems, 1);
+    assert!(
+        imported
+            .check_source_files(
+                &[b"theorem wrong : importedConstruct! (1 : Nat) = 101 := rfl"],
+                &options,
+                limits().source,
+            )
+            .is_err()
+    );
+    assert_eq!(imported.logical_root(&options), before);
+}

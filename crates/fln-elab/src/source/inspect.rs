@@ -16,6 +16,9 @@ pub use super::instances::audit::{
 pub enum ObservationKind {
     Goals,
     Term,
+    /// The actual local context before an identifier is resolved. The selected
+    /// identifier may be incomplete; no term or declaration is manufactured.
+    Completion,
     /// A term's type in its actual local context, including the inferred-type
     /// fallback used by the pin's plainTermGoal. The observation is `Goals`
     /// with one provisional goal, never a declaration-admission certificate.
@@ -45,11 +48,17 @@ pub enum SourceObservation {
         type_: Expr,
         locals: LocalContext,
     },
+    Completion {
+        range: Range<usize>,
+        locals: LocalContext,
+    },
 }
 impl SourceObservation {
     pub fn range(&self) -> Range<usize> {
         match self {
-            Self::Goals { range, .. } | Self::Term { range, .. } => range.clone(),
+            Self::Goals { range, .. }
+            | Self::Term { range, .. }
+            | Self::Completion { range, .. } => range.clone(),
         }
     }
 }
@@ -60,6 +69,7 @@ enum Site {
     By(Range<usize>),
     End(Range<usize>),
     Term(Range<usize>),
+    Completion(Range<usize>),
     TermGoal {
         range: Range<usize>,
         /// None identifies an identifier; nodes retain their exact parser kind.
@@ -69,7 +79,7 @@ enum Site {
 impl Site {
     fn range(&self) -> &Range<usize> {
         match self {
-            Self::Tactic(r) | Self::By(r) | Self::End(r) | Self::Term(r) => r,
+            Self::Tactic(r) | Self::By(r) | Self::End(r) | Self::Term(r) | Self::Completion(r) => r,
             Self::TermGoal { range, .. } => range,
         }
     }
@@ -240,8 +250,14 @@ fn select(
                 }
                 _ => {}
             }
-        } else if wanted == ObservationKind::Term && matches!(node, Syntax::Ident { .. }) {
-            sites.push(Site::Term(r));
+        } else if matches!(wanted, ObservationKind::Term | ObservationKind::Completion)
+            && matches!(node, Syntax::Ident { .. })
+        {
+            sites.push(if wanted == ObservationKind::Completion {
+                Site::Completion(r)
+            } else {
+                Site::Term(r)
+            });
         } else if wanted == ObservationKind::Goals
             && let Syntax::Node { kind, args, .. } = node
         {
@@ -313,6 +329,35 @@ fn select(
 }
 
 impl Context {
+    /// Stop on the ordinary term driver's local scope, before looking up the
+    /// partial name. Earlier type errors and resource stops still propagate.
+    pub(super) fn observe_completion(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<(), NatDefinitionElabError> {
+        let Some(Probe {
+            site: Site::Completion(range),
+            ..
+        }) = &self.inspection
+        else {
+            return Ok(());
+        };
+        if !matches!(syntax, Syntax::Ident { .. })
+            || syntax.info().pos(true).is_none_or(|p| p.0 != range.start)
+            || syntax.info().end_pos(true).is_none_or(|p| p.0 != range.end)
+        {
+            return Ok(());
+        }
+        self.flush(true)?;
+        let locals = self.observation_locals(&self.txn.lctx.clone(), &[])?;
+        let probe = self.inspection.as_mut().expect("selected completion probe");
+        probe.result = Some(SourceObservation::Completion {
+            range: probe.site.range().clone(),
+            locals,
+        });
+        Err(failure(SourceInferenceError::ObservationComplete))
+    }
+
     pub(super) fn observation_extent(
         &mut self,
         syntax: &Syntax,
@@ -338,10 +383,30 @@ impl Context {
     fn observation_locals(
         &mut self,
         source: &LocalContext,
+        roots: &[&Expr],
     ) -> Result<LocalContext, NatDefinitionElabError> {
-        let mut result = LocalContext::new();
-        for local in source.decls() {
+        let mut needed = std::collections::HashSet::new();
+        for root in roots {
+            needed.extend(self.elimination_reads(root)?);
+        }
+        let mut retained = Vec::new();
+        // The predefinition's auxiliary self is not a user hypothesis. Keep it
+        // only when the observed term/goal or a visible local actually uses it.
+        // Local declarations depend on earlier ones, so reverse traversal also
+        // closes dependencies through retained local types and let values.
+        for local in source.decls().iter().rev() {
             self.tick()?;
+            let private_self = self.is_private_self(&local.id)
+                || self
+                    .partial
+                    .as_ref()
+                    .and_then(|partial| partial.reference.as_ref())
+                    .is_some_and(|reference| {
+                        matches!(reference.term.value.node(), ExprNode::FVar { id } if id == &local.id)
+                    });
+            if private_self && !needed.contains(&local.id) {
+                continue;
+            }
             let mut local = local.clone();
             local.type_ = self.instantiate(&local.type_)?;
             local.value = local
@@ -349,6 +414,15 @@ impl Context {
                 .as_ref()
                 .map(|value| self.instantiate(value))
                 .transpose()?;
+            needed.extend(self.elimination_reads(&local.type_)?);
+            if let Some(value) = &local.value {
+                needed.extend(self.elimination_reads(value)?);
+            }
+            retained.push(local);
+        }
+        let mut result = LocalContext::new();
+        for local in retained.into_iter().rev() {
+            self.tick()?;
             if let Some(value) = local.value {
                 result.add_let(local.id, local.user_name, local.type_, value);
             } else {
@@ -405,7 +479,7 @@ impl Context {
             // An invalid selected term still fails rather than inventing info.
             self.flush(true)?;
             let target = self.instantiate(&term.type_)?;
-            let locals = self.observation_locals(&locals)?;
+            let locals = self.observation_locals(&locals, &[&target])?;
             let probe = self.inspection.as_mut().expect("selected term-goal probe");
             probe.result = Some(SourceObservation::Goals {
                 range: probe.site.range().clone(),
@@ -421,7 +495,7 @@ impl Context {
         self.flush(true)?;
         let expression = self.instantiate(&term.value)?;
         let type_ = self.instantiate(&term.type_)?;
-        let locals = self.observation_locals(&locals)?;
+        let locals = self.observation_locals(&locals, &[&expression, &type_])?;
         let probe = self.inspection.as_mut().expect("selected probe");
         probe.result = Some(SourceObservation::Term {
             range: probe.site.range().clone(),
@@ -492,7 +566,7 @@ impl Context {
         let mut observed = Vec::new();
         for goal in goals {
             let target = self.instantiate(&goal.target)?;
-            let locals = self.observation_locals(&goal.lctx)?;
+            let locals = self.observation_locals(&goal.lctx, &[&target])?;
             observed.push(ObservedGoal {
                 id: Some(goal.id.clone()),
                 user_name: self

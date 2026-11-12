@@ -4,13 +4,17 @@
 use super::*;
 mod completion;
 mod navigation;
-pub use completion::{CompletionLookupLimits, SourceCompletion, SourceCompletionItem};
+mod symbols;
+pub use completion::{
+    CompletionLookupLimits, SourceCompletion, SourceCompletionItem, SourceCompletionKind,
+};
 pub use fln_elab::source::inspect::{ObservationKind, ObservedGoal, SourceObservation};
 pub use fln_elab::source::scope::SourceScope;
 use modules::{
     SourceModuleCheckError, SourceModuleCheckLimits, SourceModuleSession, SourceModuleSessionCheck,
 };
 pub use navigation::{DefinitionLookupLimits, SourceDefinition};
+pub use symbols::{DocumentSymbolLimits, SourceDocumentSymbol};
 
 /// The prefix is checked; the observation is provisional elaboration state.
 /// In particular, `Goals { goals: [] }` is not a proof-checking certificate.
@@ -241,7 +245,8 @@ pub(super) fn module(
                 if let Some(observation) = &mut observation {
                     let range = match observation {
                         SourceObservation::Goals { range, .. }
-                        | SourceObservation::Term { range, .. } => range,
+                        | SourceObservation::Term { range, .. }
+                        | SourceObservation::Completion { range, .. } => range,
                     };
                     let view = parsed.source_view();
                     let start = view.to_original(fln_parse::BytePos(range.start)).0;

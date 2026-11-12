@@ -16,6 +16,9 @@ fn checked(base: &Engine, source: &str) -> Engine {
         .engine
 }
 const FIXTURE: &str = r#"
+inductive Sum (α : Type u) (β : Type v) where
+  | inl (val : α)
+  | inr (val : β)
 structure Prod (A B : Type) where
   fst : A
   snd : B
@@ -387,5 +390,151 @@ def cleanupFailure : Logged Nat := failureQuoted
             "{source}\n{error:?}"
         );
         assert_eq!(base.logical_root(&KVMap::new()), before);
+    }
+}
+
+#[test]
+fn bound_try_cleanup_finishes_before_the_value_continuation() {
+    execute(
+        &base(),
+        r#"
+def boundSuccess : Logged Nat := do
+  let n ← try
+    mark 1
+    succeed (7 : Nat)
+  finally
+    mark 2
+  mark 3
+  succeed (n + 1)
+def boundRecovery : Logged Nat := do
+  let n ← try
+    mark 1
+    raise (5 : Nat)
+  catch e =>
+    mark 2
+    succeed (e + 2)
+  finally
+    mark 3
+  mark 4
+  succeed (n + 1)
+def boundSuffixError : Logged Nat := do
+  let n ← try
+    mark 1
+    succeed (7 : Nat)
+  catch _ =>
+    mark 9
+    succeed (0 : Nat)
+  finally
+    mark 2
+  mark 3
+  raise (n + 2)
+#eval observed boundSuccess
+#eval observed boundRecovery
+#eval observed boundSuffixError
+"#,
+        &["123008", "1234008", "123109"],
+    );
+}
+
+#[test]
+fn bound_try_returns_evaluate_the_payload_then_cleanup_and_skip_the_suffix() {
+    execute(
+        &base(),
+        r#"
+def boundProtectedReturn : Logged Nat := do
+  let n : Nat ← try
+    mark 1
+    return 7
+  finally
+    mark 2
+  mark 3
+  succeed (n + 100)
+def boundHandlerReturn : Logged Nat := do
+  let n : Nat ← try
+    mark 1
+    raise (5 : Nat)
+  catch e =>
+    mark 2
+    return (e + 2)
+  finally
+    mark 3
+  mark 4
+  succeed (n + 100)
+def boundEffectfulReturn : Logged Nat := do
+  let n : Nat ← try
+    mark 1
+    return (← do mark 4; succeed (7 : Nat))
+  finally
+    mark 2
+  mark 3
+  succeed (n + 100)
+#eval observed boundProtectedReturn
+#eval observed boundHandlerReturn
+#eval observed boundEffectfulReturn
+"#,
+        &["12007", "123007", "142007"],
+    );
+}
+
+#[test]
+fn bound_try_finalizer_errors_replace_normal_and_returning_payloads() {
+    execute(
+        &base(),
+        r#"
+def boundValue : Logged Nat := do
+  let n ← try
+    mark 1
+    succeed (7 : Nat)
+  finally
+    mark 2
+    (raise (9 : Nat) : Logged PUnit)
+  mark 3
+  succeed (n + 100)
+def boundReturn : Logged Nat := do
+  let n : Nat ← try
+    mark 1
+    return 7
+  finally
+    mark 2
+    (raise (9 : Nat) : Logged PUnit)
+  mark 3
+  succeed (n + 100)
+def boundError : Logged Nat := do
+  let n : Nat ← try
+    mark 1
+    raise (5 : Nat)
+  catch e =>
+    raise (e + 1)
+  finally
+    mark 2
+    (raise (9 : Nat) : Logged PUnit)
+  mark 3
+  succeed (n + 100)
+#eval observed boundValue
+#eval observed boundReturn
+#eval observed boundError
+"#,
+        &["12109", "12109", "12109"],
+    );
+}
+
+#[test]
+fn bound_try_finalizers_cannot_escape_or_read_protected_and_handler_locals() {
+    let engine = base();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    for source in [
+        "def bad : Logged Nat := do { let n ← try { succeed (7 : Nat) } finally { return 8 }; succeed n }",
+        "def bad : Logged Nat := do { let n ← try { let hidden := 7; succeed hidden } finally { mark hidden }; succeed n }",
+        "def bad : Logged Nat := do { let n ← try { raise (5 : Nat) } catch e => { succeed e } finally { mark e }; succeed n }",
+        "def bad : Logged Nat := do { let n ← try { succeed (7 : Nat) } finally { mark n }; succeed n }",
+    ] {
+        assert!(
+            engine
+                .check_source_files(&[source.as_bytes()], &options, limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(engine.logical_root(&options), root);
     }
 }

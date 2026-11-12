@@ -603,7 +603,10 @@ fn retained_simp_suffixes_preserve_source_order_and_redundant_events() {
     let rows = native::read(replayed.environment()).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].proof, Some(n("proof")));
-    assert_eq!(rows[0].order, 2);
+    assert_eq!(
+        rows[0].order, 0,
+        "re-adding a proof retains its original slot"
+    );
 }
 
 #[test]

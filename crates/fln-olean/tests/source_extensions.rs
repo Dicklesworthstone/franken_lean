@@ -276,6 +276,48 @@ fn real_prelude_decodes_the_reducibility_status_the_pin_reports() {
     }
 }
 
+#[test]
+fn extra_reducibility_decodes_the_pins_scope_wrapper_without_losing_repeated_updates() {
+    let core = entry("reducibilityCore");
+    let expected = read(&one("reducibilityCore", &core))
+        .unwrap()
+        .reducibility
+        .remove(0);
+    // ScopedEnvExtension.Entry.global and .scoped have the same shape as the
+    // pinned instance extension, with the core pair as their entry payload.
+    let global = Obj::mk_ctor(0, vec![core.clone_ref()], &[]);
+    let scoped = Obj::mk_ctor(1, vec![inject_name(&n("Visible")), core.clone_ref()], &[]);
+    let captured = vec![OpaqueExtensionBlock {
+        name: n("reducibilityExtra"),
+        entries: [&global, &scoped, &global]
+            .map(|obj| compact(obj, 0).unwrap())
+            .to_vec(),
+    }];
+    let decoded = read(&captured).unwrap();
+    assert!(decoded.reducibility.is_empty());
+    assert!(decoded.uninterpreted.is_empty());
+    assert_eq!(decoded.reducibility_extra.len(), 3);
+    assert_eq!(decoded.reducibility_extra[0], decoded.reducibility_extra[2]);
+    for row in &decoded.reducibility_extra {
+        assert_eq!(row.declaration, expected.declaration);
+        assert_eq!(row.status, expected.status);
+    }
+    assert!(decoded.reducibility_extra[0].scope.is_none());
+    assert_eq!(decoded.reducibility_extra[1].scope, Some(n("Visible")));
+    for malformed in [
+        core.clone_ref(),
+        Obj::mk_nat(0),
+        Obj::mk_ctor(2, vec![core.clone_ref()], &[]),
+        Obj::mk_ctor(1, vec![core.clone_ref()], &[]),
+        Obj::mk_ctor(1, vec![inject_name(&Name::anonymous()), core], &[]),
+    ] {
+        assert!(matches!(
+            read(&one("reducibilityExtra", &malformed)),
+            Err(DecodeError::Shape { .. })
+        ));
+    }
+}
+
 /// The Prelude's `Lean.Compiler.inlineAttrs` entries. Its written `@[macro_inline]` declarations
 /// are the twelve the vendored `src/Init/Prelude.lean` tags (`rg -n -A2 macro_inline`), the two
 /// anonymous instances under the names the pin gives them (`instDecidableAnd`,

@@ -840,23 +840,122 @@ fn diamond_artifacts_export_only_the_modules_own_simp_additions() {
 }
 
 #[test]
-fn erasing_simp_before_export_refuses_without_publishing_partial_artifacts() {
+fn simp_erasures_remain_local_while_owned_and_imported_additions_persist() {
     let initial = Engine::builder().build_empty();
-    let source = format!("{WRAP}\nattribute [-simp] wrap");
-    for files in [
-        vec![("Main", source.as_str())],
-        vec![
-            ("Base", WRAP),
-            ("Main", "prelude\nimport Base\nattribute [-simp] wrap"),
-        ],
+    let root = initial.logical_root(&KVMap::new());
+    let probe = "theorem use.{u} {A : Sort u} (x : A) : wrap (wrap x) = x := by simp";
+    let false_goal = "theorem wrong.{u} {A : Sort u} (x y : A) : wrap x = y := by simp";
+    for (declaration, origin, expected_rows) in [
+        (
+            "@[simp] def wrap.{u} {A : Sort u} (x : A) : A := x",
+            "wrap",
+            3,
+        ),
+        (
+            "def wrap.{u} {A : Sort u} (x : A) : A := x\n\
+             @[simp 900] theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl",
+            "unwrap",
+            1,
+        ),
     ] {
-        let error = build(&initial, &files, OleanWriteBudget::default()).unwrap_err();
+        let library = format!("prelude\n{EQUALITY}{declaration}\nattribute [irreducible] wrap");
+        let erased = format!("{library}\nattribute [-simp] {origin}");
+        let owned = compiled(&[("Main", &erased)]);
+        assert!(
+            simp::read(owned.checked.checked.engine.environment())
+                .unwrap()
+                .is_empty()
+        );
+        refused(&owned.checked.checked.engine, probe);
+        assert_eq!(
+            metadata(&owned.artifacts[0].bytes).simps.len(),
+            expected_rows
+        );
+        let physical = imported(&owned);
+        accepted(&physical.engine, probe);
+        refused(&physical.engine, false_goal);
+        aliases::reference_import(&owned, &format!("prelude\nimport Main\n{probe}"), true);
+        aliases::reference_import(
+            &owned,
+            &format!("prelude\nimport Main\nattribute [-simp] {origin}\n{probe}"),
+            false,
+        );
+
+        // An adapter containing only an erasure exports no simp operations.
+        // Its consumer still receives the provider's original registration.
+        let adapter = format!("prelude\nimport Base\nattribute [-simp] {origin}");
+        let consumer = format!(
+            "prelude\nimport Adapter\n{}",
+            probe.replace("theorem use.", "theorem fromImport.")
+        );
+        let graph = compiled(&[
+            ("Main", &consumer),
+            ("Adapter", &adapter),
+            ("Base", &library),
+        ]);
+        assert_eq!(graph.artifacts[1].report.constants, 0);
+        assert!(metadata(&graph.artifacts[1].bytes).simps.is_empty());
+        let physical = imported(&graph);
+        for engine in [&graph.checked.checked.engine, &physical.engine] {
+            accepted(engine, probe);
+            refused(engine, false_goal);
+        }
+        aliases::reference_import(&graph, &format!("prelude\nimport Main\n{probe}"), true);
+
+        let invalid = format!("{erased}\n{probe}");
         assert!(matches!(
-            error,
-            SourceModuleBuildError::Check(SourceModuleCheckError::Extension { extension, .. })
-                if extension == simp::export::journal_name()
+            build(&initial, &[("Main", &invalid)], OleanWriteBudget::default()),
+            Err(SourceModuleBuildError::Check(
+                SourceModuleCheckError::Source { .. }
+            ))
         ));
-        assert!(initial.environment().is_empty());
+        assert_eq!(initial.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
+fn erasing_and_readding_simp_preserves_original_tie_slots_and_new_priorities() {
+    let declarations = format!(
+        "prelude\n{EQUALITY}\
+         def choose.{{u}} {{A : Sort u}} (x : A) : A := x\n\
+         def first.{{u}} {{A : Sort u}} (x : A) : A := x\n\
+         def second.{{u}} {{A : Sort u}} (x : A) : A := x\n\
+         @[simp 900] theorem pickFirst.{{u}} {{A : Sort u}} (x : A) : choose x = first x := by rfl\n\
+         @[simp 900] theorem pickSecond.{{u}} {{A : Sort u}} (x : A) : choose x = second x := by rfl\n\
+         attribute [irreducible] choose first second\n\
+         attribute [-simp] pickFirst"
+    );
+    for (priority, selected, rejected) in [(900, "second", "first"), (1200, "first", "second")] {
+        let source = format!("{declarations}\nattribute [simp {priority}] pickFirst");
+        let built = compiled(&[("Main", &source)]);
+        let rows = metadata(&built.artifacts[0].bytes).simps;
+        assert_eq!(
+            rows.len(),
+            3,
+            "erasure must not replace the chronological additions"
+        );
+        let priorities: Vec<_> = rows
+            .iter()
+            .map(|row| match &row.kind {
+                SimpKind::Theorem(theorem) => theorem.priority,
+                other => panic!("unexpected simp row: {other:?}"),
+            })
+            .collect();
+        assert_eq!(priorities, [900, 900, priority]);
+        let proof = |target| {
+            format!(
+                "theorem chosen.{{u}} {{A : Sort u}} (x : A) (P : A -> Prop) (h : P ({target} x)) : P (choose x) := by simpa using h"
+            )
+        };
+        let good = proof(selected);
+        let bad = proof(rejected);
+        let physical = imported(&built);
+        for engine in [&built.checked.checked.engine, &physical.engine] {
+            accepted(engine, &good);
+            refused(engine, &bad);
+        }
+        aliases::reference_import(&built, &format!("prelude\nimport Main\n{good}"), true);
+        aliases::reference_import(&built, &format!("prelude\nimport Main\n{bad}"), false);
     }
 }
 

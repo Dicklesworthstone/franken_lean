@@ -1609,6 +1609,209 @@ fn native_arrays_feed_imported_list_recursion_and_preserve_shared_inputs() {
     );
 }
 
+fn assert_native_string_replay(compiled: &CompiledIr, expected: &str) {
+    let bytes = flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default())
+        .expect("encode native String/List bridge");
+    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default())
+        .expect("decode native String/List bridge");
+    assert_eq!(
+        flbc::encode_canonical(&replay, flbc::CodecLimits::default()).unwrap(),
+        bytes
+    );
+    for program in [compiled.program.program(), &replay] {
+        let Outcome::Complete(exit @ VmExit::Returned(_)) =
+            fln_vm::interpreter::execute(program, ExecutionLimits::default(), None)
+        else {
+            panic!("native String/List bridge did not return");
+        };
+        assert_eq!(
+            crate::closed_vm_value(&exit).unwrap(),
+            Some(crate::ClosedVmValue::String(expected.to_owned()))
+        );
+    }
+}
+
+#[test]
+fn imported_string_from_list_preserves_shared_lists_and_native_provenance() {
+    for target in ["String.ofList", "String.mk"] {
+        let entry = function(
+            "NativeStrings.roundTrip",
+            1,
+            vec![
+                call(2, "String.toList", &[1]),
+                call(3, target, &[2]),
+                call(4, target, &[2]),
+                call(5, "String.append", &[3, 4]),
+            ],
+            IrArg::Var(5),
+        );
+        // A supplied body cannot override the native census row, even when
+        // its declaration is otherwise executable and passes IR validation.
+        let forged = function(
+            target,
+            1,
+            vec![binding(2, IrExpr::Lit(IrLit::Str("wrong".to_owned())))],
+            IrArg::Var(2),
+        );
+        for source in ["", "aλ😀", "a\0b", "e\u{301}\u{10ffff}"] {
+            let compiled = compile(
+                &[module(vec![entry.clone(), forged.clone()])],
+                &name("NativeStrings.roundTrip"),
+                &[EntryArgument::String(source.to_owned())],
+                &bounded_partition(&[]),
+                &BTreeSet::from([name("NativeStrings.roundTrip")]),
+                IrExecutionLimits::default(),
+            )
+            .expect("native list-to-string is linked from its reviewed census row");
+            assert_native_string_replay(&compiled, &format!("{source}{source}"));
+            assert!(
+                compiled
+                    .native_externs()
+                    .contains(&format!("extern:{target}"))
+            );
+            assert_eq!(compiled.reference_functions().len(), 1);
+            assert_eq!(
+                compiled.reference_functions()[0].name,
+                name("NativeStrings.roundTrip")
+            );
+            assert_eq!(compiled.reference_functions()[0].producer(), "reference");
+        }
+    }
+}
+
+#[test]
+fn imported_string_from_list_refuses_non_list_operands() {
+    let entry = function(
+        "NativeStrings.invalid",
+        1,
+        vec![call(2, "String.ofList", &[1])],
+        IrArg::Var(2),
+    );
+    for argument in [nat(1), EntryArgument::String("not a List Char".to_owned())] {
+        let compiled = compile_users(
+            vec![entry.clone()],
+            "NativeStrings.invalid",
+            &[argument],
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled.execute(ExecutionLimits::default(), None).outcome,
+            Outcome::Complete(VmExit::Refused {
+                refusal: fln_vm::interpreter::VmRefusal::TypeMismatch {
+                    expected: "List Char",
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn pinned_string_list_ir_executes_native_conversions_and_replays() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let library = PathBuf::from(std::env::var_os("FLN_REFERENCE_LIB")?);
+            Some(library.parent()?.parent()?.join("bin/lean"))
+        });
+    let Some(reference) = reference else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "pinned Reference required for live String/List IR"
+        );
+        eprintln!("SKIP: live String/List IR requires FLN_REFERENCE_LEAN");
+        return;
+    };
+    let version = Command::new(&reference).arg("--githash").output().unwrap();
+    let pin = include_str!("../../../../SUITE.lock")
+        .lines()
+        .find(|line| line.starts_with("reference "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|part| part.strip_prefix("commit="))
+        })
+        .unwrap();
+    assert!(version.status.success());
+    assert_eq!(String::from_utf8(version.stdout).unwrap().trim(), pin);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!(
+            "string-list-reference-{}-{unique}",
+            std::process::id()
+        ));
+    std::fs::create_dir_all(&root).unwrap();
+    let source = r#"import Init
+@[noinline] def listStringRoundTrip (text : String) : String := String.ofList text.toList
+set_option linter.deprecated false in
+@[noinline] def listStringLegacy (text : String) : String := String.mk text.toList
+@[noinline] def listStringTwice (text : String) : String :=
+  let chars := text.toList
+  String.ofList chars ++ String.ofList chars
+#eval listStringRoundTrip "aλ😀" == "aλ😀"
+#eval listStringLegacy "a\x00b" == "a\x00b"
+#eval listStringTwice "a\x00b" == "a\x00ba\x00b"
+"#;
+    std::fs::write(root.join("NativeListString.lean"), source).unwrap();
+    let oracle = Command::new(&reference)
+        .current_dir(&root)
+        .args(["-o", "NativeListString.olean", "NativeListString.lean"])
+        .output()
+        .unwrap();
+    assert!(
+        oracle.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&oracle.stdout),
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(oracle.stdout).unwrap(),
+        "true\ntrue\ntrue\n"
+    );
+    assert!(oracle.stderr.is_empty());
+    let module = crate::decode_ir_artifact(
+        &std::fs::read(root.join("NativeListString.ir")).unwrap(),
+        32 * 1024 * 1024,
+    )
+    .unwrap();
+    let entries = ["listStringRoundTrip", "listStringLegacy", "listStringTwice"];
+    let users = entries.map(name).into_iter().collect();
+    for entry in entries {
+        for input in ["", "aλ😀", "a\0b", "e\u{301}\u{10ffff}"] {
+            let compiled = compile(
+                std::slice::from_ref(&module),
+                &name(entry),
+                &[EntryArgument::String(input.to_owned())],
+                &bounded_partition(&[]),
+                &users,
+                IrExecutionLimits::default(),
+            )
+            .unwrap_or_else(|error| panic!("{entry}: {error:?}"));
+            let expected = if entry == "listStringTwice" {
+                format!("{input}{input}")
+            } else {
+                input.to_owned()
+            };
+            assert_native_string_replay(&compiled, &expected);
+            assert!(
+                compiled
+                    .native_externs()
+                    .iter()
+                    .any(|row| row == "extern:String.ofList" || row == "extern:String.mk")
+            );
+        }
+    }
+}
+
 fn assert_native_owned_result(compiled: &CompiledIr, expected: &str) {
     assert_eq!(returned(compiled), expected);
     let bytes = flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default())

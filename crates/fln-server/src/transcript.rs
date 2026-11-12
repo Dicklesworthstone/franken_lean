@@ -108,6 +108,7 @@ fn known_method_contract(method: &str) -> Option<KnownMethodContract> {
         | "$/lean/rpc/call"
         | "textDocument/completion"
         | "textDocument/definition"
+        | "textDocument/documentSymbol"
         | "textDocument/hover"
         | "textDocument/waitForDiagnostics" => Some(request(KnownParamsContract::Object)),
         "shutdown" => Some(request(KnownParamsContract::OptionalEmpty)),

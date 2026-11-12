@@ -109,6 +109,14 @@ fn assert_scalar_bounds(h: &crate::rc::Header, byte_off: usize, size: usize) {
     );
 }
 
+fn sarray_allocation_fits(element_size: u8, capacity: usize) -> bool {
+    element_size != 0
+        && capacity
+            .checked_mul(usize::from(element_size))
+            .and_then(|bytes| bytes.checked_add(size_of::<crate::layout::LeanSarrayObject>()))
+            .is_some_and(|bytes| bytes <= isize::MAX as usize)
+}
+
 // UNSAFE-LEDGER: FLN-UL-0049
 #[allow(unsafe_code)]
 impl Obj {
@@ -219,6 +227,123 @@ impl Obj {
             return Err(self);
         }
         Ok(Obj(export::export_lean_byte_array_push(
+            self.into_raw(),
+            value,
+        )))
+    }
+
+    /// Replace one scalar-array element, reusing exclusive storage.
+    ///
+    /// The supplied bytes must match the array's element width exactly. Shared,
+    /// persistent and MT arrays copy their initialized payload and retain spare
+    /// capacity. Invalid layouts, indices or widths return the original handle
+    /// before any mutation or reference transfer.
+    pub fn try_sarray_set(self, index: usize, value: &[u8]) -> Result<Obj, Obj> {
+        let Some((width, size, capacity, _)) = self.try_borrow_sarray_view() else {
+            return Err(self);
+        };
+        if index >= size
+            || value.len() != usize::from(width)
+            || !sarray_allocation_fits(width, capacity)
+        {
+            return Err(self);
+        }
+        let array = if self.header().rc == 1 {
+            self
+        } else {
+            // SAFETY: the checked header has size <= capacity and allocation
+            // arithmetic fits isize. Copy only initialized bytes into distinct
+            // fresh storage; self releases its own reference afterwards.
+            unsafe {
+                let copy = object::alloc_sarray(width, size, capacity);
+                let (_, _, _, source) = object::sarray_fields(self.0);
+                let (_, _, _, destination) = object::sarray_fields(copy);
+                core::ptr::copy_nonoverlapping(source, destination, size * usize::from(width));
+                Obj(copy)
+            }
+        };
+        // SAFETY: index < size and value is exactly one element wide. The
+        // destination is exclusively owned. A slice borrowing an alias of the
+        // input keeps it shared, so that case took the distinct-copy branch.
+        unsafe {
+            let (_, _, _, destination) = object::sarray_fields(array.0);
+            core::ptr::copy_nonoverlapping(
+                value.as_ptr(),
+                destination.add(index * usize::from(width)),
+                value.len(),
+            );
+        }
+        Ok(array)
+    }
+
+    /// Copy a bounded source slice into an owned byte-array destination.
+    ///
+    /// Source offsets beyond the end leave the destination unchanged; lengths
+    /// clamp to the source remainder and destination offsets clamp to its end.
+    /// The native export preserves exclusive capacity and copies shared inputs,
+    /// including when source and destination are aliases of the same array.
+    pub fn try_byte_array_copy_slice(
+        self,
+        source: &Obj,
+        source_offset: usize,
+        destination_offset: usize,
+        length: usize,
+        exact: bool,
+    ) -> Result<Obj, Obj> {
+        let Some((1, source_size, source_capacity, _)) = source.try_borrow_sarray_view() else {
+            return Err(self);
+        };
+        let Some((1, size, capacity, _)) = self.try_borrow_sarray_view() else {
+            return Err(self);
+        };
+        if !sarray_allocation_fits(1, source_capacity) || !sarray_allocation_fits(1, capacity) {
+            return Err(self);
+        }
+        if source_offset > source_size {
+            return Ok(self);
+        }
+        let length = length.min(source_size - source_offset);
+        let destination_offset = destination_offset.min(size);
+        let Some(end) = destination_offset.checked_add(length) else {
+            return Err(self);
+        };
+        let new_size = size.max(end);
+        let new_capacity = if new_size <= capacity {
+            capacity
+        } else if exact {
+            new_size
+        } else {
+            let Some(doubled) = new_size.checked_mul(2) else {
+                return Err(self);
+            };
+            doubled
+        };
+        if !sarray_allocation_fits(1, new_capacity) {
+            return Err(self);
+        }
+        // The validated sizes and clamped offsets fit the small-Nat payload.
+        // Source stays borrowed until the export returns; an aliased destination
+        // therefore has at least two references and must copy before writing.
+        Ok(Obj(export::export_lean_byte_array_copy_slice(
+            source.0,
+            tagged::boxi(source_offset),
+            self.into_raw(),
+            tagged::boxi(destination_offset),
+            tagged::boxi(length),
+            exact,
+        )))
+    }
+
+    /// Append a Float, preserving exclusive capacity and shared snapshots.
+    ///
+    /// The checked eight-byte element width authenticates the native FloatArray
+    /// representation before the existing COW export consumes this handle.
+    /// Invalid categories and headers return the original owned handle.
+    pub fn try_float_array_push(self, value: f64) -> Result<Obj, Obj> {
+        if !matches!(self.try_borrow_sarray_view(), Some((8, _, _, _))) {
+            return Err(self);
+        }
+        Ok(Obj(export::export_lean_float_array_push(
             self.into_raw(),
             value,
         )))

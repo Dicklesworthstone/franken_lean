@@ -1371,3 +1371,207 @@ fn admission_checkpoints_survive_metadata_failure_and_reprove_on_retry() {
         }
     });
 }
+
+#[test]
+fn warm_reconstruction_cancellation_preserves_records_and_recovers() {
+    use fln_core::outcome::InconclusiveCause;
+    use std::cell::Cell;
+    use std::collections::BTreeSet;
+
+    // Arm only after the whole-closure lookup, so the test reaches warm
+    // reconstruction rather than stopping in the source host's preflight.
+    // Both the store and the caller's probe are deliberately non-Sync.
+    struct StopOnLookup<'a> {
+        store: &'a Memory,
+        key: ImportClosureKey,
+        only_modules: bool,
+        stop_at: usize,
+        loaded: Cell<bool>,
+        reads: Cell<usize>,
+        loads: Cell<usize>,
+        writes: Cell<usize>,
+    }
+    impl<'a> StopOnLookup<'a> {
+        fn new(
+            store: &'a Memory,
+            key: ImportClosureKey,
+            only_modules: bool,
+            stop_at: usize,
+        ) -> Self {
+            Self {
+                store,
+                key,
+                only_modules,
+                stop_at,
+                loaded: Cell::new(false),
+                reads: Cell::new(0),
+                loads: Cell::new(0),
+                writes: Cell::new(0),
+            }
+        }
+    }
+    impl ImportReuseStore for StopOnLookup<'_> {
+        fn load(&self, key: ImportClosureKey) -> std::result::Result<Option<Vec<u8>>, String> {
+            self.loads.set(self.loads.get() + 1);
+            if key == self.key {
+                self.loaded.set(true);
+                if self.only_modules {
+                    return Ok(None);
+                }
+            }
+            self.store.load(key)
+        }
+        fn save(&self, key: ImportClosureKey, bytes: &[u8]) -> std::result::Result<(), String> {
+            self.writes.set(self.writes.get() + 1);
+            self.store.save(key, bytes)
+        }
+    }
+    impl CancellationProbe for StopOnLookup<'_> {
+        fn is_cancelled(&self) -> bool {
+            if self.stop_at == 0 {
+                return true;
+            }
+            if !self.loaded.get() {
+                return false;
+            }
+            let reads = self.reads.get() + 1;
+            self.reads.set(reads);
+            reads >= self.stop_at
+        }
+    }
+    fn stopped_at<T>(outcome: Outcome<T>) -> String {
+        let Outcome::Inconclusive(reason) = outcome else {
+            panic!("cancellation must be a nonanswer, never success or refusal");
+        };
+        let InconclusiveCause::Cancelled { at } = reason.cause else {
+            panic!("cancellation must keep its classification");
+        };
+        at.text().to_owned()
+    }
+
+    on_import_stack(|| {
+        let artifacts = source_diamond("");
+        let all = inputs(&artifacts);
+        let roots = [n("Main")];
+        let options = KVMap::new();
+        let checker = identity("warm reconstruction cancellation");
+        let store = Memory::default();
+        let (cold, _) = import_with(&all, &roots, ImportPostureRequest::Recheck);
+        let (_, initial) = import_with(&all, &roots, reuse(checker, &store));
+        let key = initial.key.expect("the council recorded the closure");
+        let record = ImportReuseRecord::parse(&store.load(key).unwrap().unwrap()).unwrap();
+        let base = Engine::builder().build_empty();
+        let base_root = base.logical_root(&options);
+        let run = |probe: &StopOnLookup<'_>, threads| {
+            base.import_olean_modules_with_posture(
+                &all,
+                &roots,
+                &options,
+                limits(threads),
+                reuse(checker, probe),
+                Some(probe),
+            )
+            .expect("cancellation is not an import error")
+        };
+
+        let cancelled = StopOnLookup::new(&store, key, false, 0);
+        let host = SourceImportHost::new(&base, limits(1));
+        assert_eq!(
+            stopped_at(
+                base.admitted()
+                    .import_olean_modules_with_posture(
+                        &host,
+                        &all,
+                        &roots,
+                        &options,
+                        limits(1).council_limits(),
+                        reuse(checker, &cancelled),
+                        Some(&cancelled),
+                    )
+                    .expect("an already-cancelled request is a nonanswer"),
+            ),
+            "import-reuse/before-key"
+        );
+        assert_eq!(cancelled.loads.get(), 0);
+        assert_eq!(cancelled.writes.get(), 0);
+
+        // Cancellation observed after a failed decode also remains a nonanswer
+        // at the direct rebuild boundary, instead of becoming a cache refusal.
+        let invalid = [OleanModuleInput {
+            name: &roots[0],
+            artifact: b"not an olean",
+            server_artifact: None,
+            private_artifact: None,
+        }];
+        let during_decode = StopOnLookup::new(&store, key, false, 2);
+        during_decode.loaded.set(true);
+        assert_eq!(
+            stopped_at(base.admitted().rebuild_reused_olean_set(
+                &invalid,
+                &options,
+                limits(1).check,
+                OleanFrontierJobs::SERIAL,
+                &record,
+                Some(&during_decode),
+            )),
+            "import-reuse/after-decode"
+        );
+        assert!(matches!(
+            base.admitted().rebuild_reused_olean_set(
+                &invalid,
+                &options,
+                limits(1).check,
+                OleanFrontierJobs::SERIAL,
+                &record,
+                None,
+            ),
+            Outcome::Complete(Err(ImportReuseRefusal::Decode(_)))
+        ));
+
+        for only_modules in [false, true] {
+            let count = StopOnLookup::new(&store, key, only_modules, usize::MAX);
+            let (warm, report) = run(&count, 1)
+                .into_complete()
+                .expect("warm import completes");
+            assert_eq!((report.reused_modules, report.council_modules), (4, 0));
+            same_import(&cold, &warm);
+            let before = store.0.lock().unwrap().clone();
+            let mut stops = BTreeSet::new();
+            for stop_at in 1..=count.reads.get() {
+                let probe = StopOnLookup::new(&store, key, only_modules, stop_at);
+                stops.insert(stopped_at(run(&probe, 1)));
+                assert_eq!(probe.writes.get(), 0, "cancelled work writes no records");
+                if !only_modules {
+                    assert_eq!(probe.loads.get(), 1, "an exact hit never falls back");
+                }
+                assert_eq!(*store.0.lock().unwrap(), before);
+                assert_eq!(base.logical_root(&options), base_root);
+            }
+            assert!(stops.contains("import-reuse/module-roots"));
+            if only_modules {
+                assert!(stops.contains("import-reuse/assemble-result"));
+            } else {
+                assert!(stops.contains("import-reuse/measure-declaration"));
+                assert!(stops.contains("import-reuse/result"));
+                assert!(stops.contains("import-reuse/after-activation"));
+            }
+
+            // A non-Sync caller also crosses the parallel reconstruction door.
+            // Worker cancellation and joining are synchronized in admission's
+            // helper tests; this checks the real encoded import's propagation.
+            let probe = StopOnLookup::new(&store, key, only_modules, 4);
+            stopped_at(run(&probe, 8));
+            assert_eq!(probe.writes.get(), 0);
+            assert_eq!(*store.0.lock().unwrap(), before);
+            assert_eq!(base.logical_root(&options), base_root);
+
+            let retry = StopOnLookup::new(&store, key, only_modules, usize::MAX);
+            let (recovered, report) = run(&retry, 8)
+                .into_complete()
+                .expect("an uncancelled parallel retry completes");
+            assert_eq!((report.reused_modules, report.council_modules), (4, 0));
+            same_import(&cold, &recovered);
+            same_source_contexts(&cold, &recovered);
+        }
+    });
+}

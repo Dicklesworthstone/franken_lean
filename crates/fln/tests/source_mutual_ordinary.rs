@@ -119,6 +119,156 @@ example (A : Type u) (n : Nat) (a : A) (tail : MutualVec A n) :
 }
 
 #[test]
+fn mutual_structural_generalizes_varying_accumulator_before_major() {
+    for hint in ["", "\n termination_by structural n"] {
+        let source = format!(
+            r#"
+mutual
+ def beforeLeft (acc n : Nat) : Nat := match n with
+  | 0 => acc
+  | k+1 => beforeRight (acc+1) k{hint}
+ def beforeRight (acc n : Nat) : Nat := match n with
+  | 0 => acc
+  | k+1 => beforeLeft (acc+2) k{hint}
+end
+example : beforeLeft 10 3 = 14 := rfl
+example : beforeRight 10 3 = 15 := rfl
+example (acc n : Nat) : beforeLeft acc (n+1) = beforeRight (acc+1) n := rfl
+example (acc n : Nat) : beforeRight acc (n+1) = beforeLeft (acc+2) n := rfl
+"#
+        );
+        let base = check(&source);
+        run(&base, "#eval beforeLeft 10 3", "14");
+        run(&base, "#eval beforeRight 10 3", "15");
+    }
+}
+
+#[test]
+fn mutual_structural_generalizes_higher_order_arguments_with_mixed_binder_styles() {
+    let base = check(
+        r#"
+mutual
+ def functionLeft {f : Nat -> Nat} (n : Nat) : Nat := match n with
+  | 0 => f 0
+  | k+1 => functionRight (fun x => f (x+1)) k
+ def functionRight (f : Nat -> Nat) (n : Nat) : Nat := match n with
+  | 0 => f 0
+  | k+1 => functionLeft (f := fun x => f (x+2)) k
+end
+example : functionLeft (f := fun x => x+10) 3 = 14 := rfl
+example : functionRight (fun x => x+10) 3 = 15 := rfl
+example (f : Nat -> Nat) (n : Nat) :
+ functionLeft (f := f) (n+1) = functionRight (fun x => f (x+1)) n := rfl
+"#,
+    );
+    run(&base, "#eval functionLeft (f := fun x => x+10) 3", "14");
+    run(&base, "#eval functionRight (fun x => x+10) 3", "15");
+}
+
+#[test]
+fn mutual_structural_generalizes_dependent_arguments_between_reordered_indices() {
+    let base = check_below(
+        r#"
+inductive GeneralizedGrid : Nat -> Nat -> Type where
+ | empty : GeneralizedGrid 0 0
+ | row (rows cols : Nat) : GeneralizedGrid rows cols -> GeneralizedGrid (rows+1) cols
+ | col (rows cols : Nat) : GeneralizedGrid rows cols -> GeneralizedGrid rows (cols+1)
+mutual
+ def gridBeforeLeft (cols seed : Nat) (_h : seed = seed) (rows : Nat) (grid : GeneralizedGrid rows cols) : Nat := match grid with
+  | .empty => seed
+  | .row r c tail => gridBeforeRight c (seed+1) rfl r tail
+  | .col r c tail => gridBeforeRight c (seed+1) rfl r tail
+ termination_by structural grid
+ def gridBeforeRight (cols seed : Nat) (_h : seed = seed) (rows : Nat) (grid : GeneralizedGrid rows cols) : Nat := match grid with
+  | .empty => seed
+  | .row r c tail => gridBeforeLeft c (seed+2) rfl r tail
+  | .col r c tail => gridBeforeLeft c (seed+2) rfl r tail
+ termination_by structural grid
+end
+example : gridBeforeLeft 1 10 rfl 2 (.row 1 1 (.col 1 0 (.row 0 0 .empty))) = 14 := rfl
+example : gridBeforeRight 1 10 rfl 2 (.row 1 1 (.col 1 0 (.row 0 0 .empty))) = 15 := rfl
+example (r c seed : Nat) (tail : GeneralizedGrid r c) :
+ gridBeforeLeft c seed rfl (r+1) (.row r c tail) = gridBeforeRight c (seed+1) rfl r tail := rfl
+"#,
+    );
+    run(
+        &base,
+        "#eval gridBeforeLeft 1 10 rfl 2 (.row 1 1 (.col 1 0 (.row 0 0 .empty)))",
+        "14",
+    );
+    run(
+        &base,
+        "#eval gridBeforeRight 1 10 rfl 2 (.row 1 1 (.col 1 0 (.row 0 0 .empty)))",
+        "15",
+    );
+}
+
+#[test]
+fn mutual_structural_generalizes_index_dependent_proofs_and_preserves_results() {
+    let source = format!(
+        "{MUTUAL_VEC}\n{}",
+        r#"
+mutual
+ def copyBeforeLeft.{u} {A : Type u} (n : Nat) (h : n = n) (xs : MutualVec A n) : MutualVec A n := match xs with
+  | .nil => .nil
+  | .cons k a tail => .cons k a (copyBeforeRight k rfl tail)
+ termination_by structural xs
+ def copyBeforeRight.{u} {A : Type u} (n : Nat) (h : n = n) (xs : MutualVec A n) : MutualVec A n := match xs with
+  | .nil => .nil
+  | .cons k a tail => .cons k a (copyBeforeLeft k rfl tail)
+ termination_by structural xs
+end
+example : copyBeforeLeft 2 rfl (.cons 1 11 (.cons 0 22 .nil)) = MutualVec.cons 1 11 (MutualVec.cons 0 22 MutualVec.nil) := rfl
+example : copyBeforeRight 2 rfl (.cons 1 11 (.cons 0 22 .nil)) = MutualVec.cons 1 11 (MutualVec.cons 0 22 MutualVec.nil) := rfl
+example (A : Type u) (n : Nat) (a : A) (tail : MutualVec A n) :
+ copyBeforeLeft (n+1) rfl (.cons n a tail) = MutualVec.cons n a (copyBeforeRight n rfl tail) := rfl
+"#
+    );
+    check_below(&source);
+}
+
+#[test]
+fn mutual_structural_generalized_arguments_preserve_termination_and_typing() {
+    let (base, limits) = engine();
+    let root = base.logical_root(&KVMap::new());
+    for body in [
+        "badRight (acc+1) (k+1)",
+        "let unused := badRight (acc+1) (k+1); badRight (acc+1) k",
+        "let invalid : Bool := acc; badRight (acc+1) k",
+        "badRight true k",
+    ] {
+        let source = format!(
+            r#"
+mutual
+ def badLeft (acc n : Nat) : Nat := match n with
+  | 0 => acc
+  | k+1 => {body}
+ termination_by structural n
+ def badRight (acc n : Nat) : Nat := match n with
+  | 0 => acc
+  | k+1 => badLeft (acc+2) k
+ termination_by structural n
+end
+"#
+        );
+        oracle(&source, false);
+        assert!(
+            base.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .is_err(),
+            "invalid generalized component must not be admitted: {source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        for label in ["badLeft", "badRight", "badLeft._mutual"] {
+            assert!(!base.environment().contains(&name(label)));
+        }
+    }
+}
+
+#[test]
 fn mutual_structural_hint_selects_indexed_major_and_generalizes_accumulator() {
     let source = format!(
         "{MUTUAL_VEC}\n{}",
@@ -847,14 +997,24 @@ fn polymorphic_forward_references_close_their_universe_parameters() {
 }
 #[test]
 fn every_cycle_is_refused_before_any_declaration_can_be_published() {
-    for source in [
-        "mutual\n def first : Nat := second\n def second : Nat := first\nend",
-        "mutual\n theorem first : False := second\n theorem second : False := first\nend",
-        "mutual\n def independent : Nat := 0\n def first (n : Nat) : Nat := second n\n def second (n : Nat) : Nat := first n\nend",
-        "mutual\n def first (n : Nat) : Nat := first n\nend",
+    for (source, probes_well_founded) in [
+        (
+            "mutual\n def first : Nat := second\n def second : Nat := first\nend",
+            true,
+        ),
+        (
+            "mutual\n theorem first : False := second\n theorem second : False := first\nend",
+            false,
+        ),
+        (
+            "mutual\n def independent : Nat := 0\n def first (n : Nat) : Nat := second n\n def second (n : Nat) : Nat := first n\nend",
+            true,
+        ),
+        ("mutual\n def first (n : Nat) : Nat := first n\nend", false),
     ] {
         oracle(source, false);
         let (base, limits) = engine();
+        assert!(!base.environment().contains(&name("WellFoundedRelation")));
         let before = base.logical_root(&KVMap::new());
         let members = fln_parse::command_scope::mutual::parse(source.as_bytes())
             .unwrap()
@@ -865,17 +1025,54 @@ fn every_cycle_is_refused_before_any_declaration_can_be_published() {
             limits.kernel,
             &fln_elab::source::scope::SourceScope::default(),
         );
-        assert!(
+        let error = result.err().unwrap_or_else(|| {
+            panic!("a nonterminating group must not produce declarations:\n{source}")
+        });
+        // These two definition cycles reach the well-founded relation probe
+        // before it checks for a varying measure. The bounded seed has no such
+        // class, so instance search rejects that exact target. The theorem and
+        // singleton cycles are refused before this probe. Keep each path exact.
+        let refused = if probes_well_founded {
             matches!(
-                result,
-                Err(fln_elab::NatDefinitionElabError::UnexpectedSyntax {
+                &error,
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::InvalidInstanceBinder
+                )
+            )
+        } else {
+            matches!(
+                &error,
+                fln_elab::NatDefinitionElabError::UnexpectedSyntax {
                     expected: "recursive ordinary mutual component requires termination elaboration"
-                })
-            ),
-            "{source}"
+                }
+            )
+        };
+        assert!(refused, "{source}\nactual refusal: {error:?}");
+        let publication = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("nontermination must also fail source admission:\n{source}"));
+        assert_eq!(
+            publication.disposition().2,
+            1,
+            "a semantic refusal, not a resource stop or fault: {publication:?}"
         );
         assert_eq!(base.logical_root(&KVMap::new()), before);
-        assert!(!base.environment().contains(&name("independent")));
+        for candidate in [
+            "independent",
+            "first",
+            "second",
+            "first._mutual",
+            "second._mutual",
+            "first._unsafe_rec",
+            "second._unsafe_rec",
+        ] {
+            assert!(!base.environment().contains(&name(candidate)));
+        }
     }
 }
 #[test]

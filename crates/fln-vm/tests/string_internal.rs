@@ -141,6 +141,225 @@ fn assert_clean_shadow() {
     }));
 }
 
+fn character_list_code(characters: &[u32], scalar_nil: bool) -> Vec<I> {
+    let mut code = vec![if scalar_nil {
+        nat(0, 0)
+    } else {
+        I::Ctor {
+            dst: r(0),
+            tag: 0,
+            fields: vec![],
+            scalar_bytes: vec![],
+        }
+    }];
+    for character in characters.iter().rev() {
+        code.push(nat(1, u64::from(*character)));
+        code.push(I::Ctor {
+            dst: r(0),
+            tag: 1,
+            fields: vec![r(1), r(0)],
+            scalar_bytes: vec![],
+        });
+    }
+    code
+}
+
+#[test]
+fn string_from_list_roundtrips_unicode_nuls_and_shared_native_lists() {
+    let _guard = lock();
+    shadow::enable();
+    // Compared with the exact pin: scalar boundaries, embedded NULs and
+    // combining characters preserve both order and logical character count.
+    for source in [
+        "",
+        "aλ😀",
+        "a\0b",
+        "\0é\0🦀\0",
+        "e\u{301}",
+        "\u{7f}\u{80}\u{7ff}\u{800}\u{d7ff}\u{e000}\u{10000}\u{10ffff}",
+    ] {
+        let characters: Vec<_> = source.chars().map(u32::from).collect();
+        for scalar_nil in [false, true] {
+            let mut code = character_list_code(&characters, scalar_nil);
+            code.extend([
+                I::Copy {
+                    dst: r(2),
+                    src: r(0),
+                },
+                I::Copy {
+                    dst: r(3),
+                    src: r(0),
+                },
+                call(8, "extern:String.ofList", &[0]),
+                call(9, "extern:String.mk", &[2]),
+                call(10, "extern:String.toList", &[8]),
+                call(11, "extern:String.ofList", &[10]),
+                I::Array {
+                    dst: r(12),
+                    items: vec![r(3), r(9), r(11)],
+                },
+                I::Return { src: r(12) },
+            ]);
+            let program = replay(code);
+            for _ in 0..2 {
+                let result = returned(&program);
+                assert_eq!(text(&result.array_child(1)), source);
+                assert_eq!(text(&result.array_child(2)), source);
+                let mut list = result.array_child(0);
+                for character in &characters {
+                    assert_eq!(list.header().tag, 1);
+                    assert_eq!(list.try_ctor_child(0).unwrap().unbox(), *character as usize);
+                    list = list.try_ctor_child(1).unwrap();
+                }
+                if scalar_nil {
+                    assert!(list.is_scalar());
+                    assert_eq!(list.unbox(), 0);
+                } else {
+                    assert_eq!(list.header().tag, 0);
+                    assert_eq!(list.header().other, 0);
+                }
+            }
+        }
+    }
+    assert_clean_shadow();
+}
+
+#[test]
+fn string_from_list_refuses_malformed_late_tails_without_truncation() {
+    let _guard = lock();
+    shadow::enable();
+    for row in ["extern:String.ofList", "extern:String.mk"] {
+        for bad_tail in [
+            nat(0, 1),
+            string(0, "not a list"),
+            I::Array {
+                dst: r(0),
+                items: vec![],
+            },
+            I::Ctor {
+                dst: r(0),
+                tag: 2,
+                fields: vec![],
+                scalar_bytes: vec![],
+            },
+            I::Ctor {
+                dst: r(0),
+                tag: 1,
+                fields: vec![r(1)],
+                scalar_bytes: vec![],
+            },
+            I::Ctor {
+                dst: r(0),
+                tag: 0,
+                fields: vec![r(1)],
+                scalar_bytes: vec![],
+            },
+        ] {
+            let program = replay(vec![
+                nat(1, u64::from('λ')),
+                bad_tail,
+                I::Ctor {
+                    dst: r(0),
+                    tag: 1,
+                    fields: vec![r(1), r(0)],
+                    scalar_bytes: vec![],
+                },
+                call(8, row, &[0]),
+                I::Return { src: r(8) },
+            ]);
+            assert!(matches!(
+                execute(&program, ExecutionLimits::default(), None),
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::TypeMismatch {
+                        expected: "List Char",
+                        ..
+                    },
+                    ..
+                })
+            ));
+        }
+    }
+    assert_clean_shadow();
+}
+
+#[test]
+fn string_from_list_refuses_invalid_characters_and_keeps_a_clean_retry() {
+    let _guard = lock();
+    shadow::enable();
+    for row in ["extern:String.ofList", "extern:String.mk"] {
+        for character in [0xd800, 0xdfff, 0x110000, u32::MAX] {
+            let mut code = character_list_code(&[u32::from('a'), character], true);
+            code.extend([call(8, row, &[0]), I::Return { src: r(8) }]);
+            assert!(matches!(
+                execute(&replay(code), ExecutionLimits::default(), None),
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::NatOverflow { .. },
+                    ..
+                })
+            ));
+        }
+        for bad_head in [
+            string(1, "a"),
+            I::NatBig {
+                dst: r(1),
+                limbs_le: vec![0, 1],
+            },
+            I::Ctor {
+                dst: r(1),
+                tag: 0,
+                fields: vec![],
+                scalar_bytes: vec![],
+            },
+        ] {
+            let program = replay(vec![
+                nat(0, 0),
+                bad_head,
+                I::Ctor {
+                    dst: r(0),
+                    tag: 1,
+                    fields: vec![r(1), r(0)],
+                    scalar_bytes: vec![],
+                },
+                call(8, row, &[0]),
+                I::Return { src: r(8) },
+            ]);
+            assert!(matches!(
+                execute(&program, ExecutionLimits::default(), None),
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::TypeMismatch {
+                        expected: "Char",
+                        ..
+                    },
+                    ..
+                })
+            ));
+        }
+        let mut code = character_list_code(&[u32::from('λ'), 0, u32::from('😀')], false);
+        code.extend([call(8, row, &[0]), I::Return { src: r(8) }]);
+        assert_eq!(text(&returned(&replay(code))), "λ\0😀");
+    }
+    assert_clean_shadow();
+}
+
+#[test]
+fn string_from_list_traversal_exhaustion_is_inconclusive() {
+    let _guard = lock();
+    let mut code = character_list_code(&vec![u32::from('a'); 65_537], true);
+    code.extend([
+        call(8, "extern:String.ofList", &[0]),
+        I::Return { src: r(8) },
+    ]);
+    let program = replay(code);
+    shadow::enable();
+    let outcome = execute(&program, ExecutionLimits::default(), None);
+    assert_eq!(outcome.authority(), Authority::NonAuthoritative);
+    assert!(matches!(outcome, Outcome::Inconclusive(ref stop)
+        if matches!(&stop.cause, InconclusiveCause::ResourceExhausted { usage }
+            if usage.reason == ResourceReason::ExecutionSteps
+                && usage.allowed == 65_536 && usage.observed == 65_537)));
+    assert_clean_shadow();
+}
+
 fn intercalate_program(separator: &str, entries: &[&str], scalar_nil: bool) -> ValidatedProgram {
     let mut code = vec![string(0, separator)];
     code.push(if scalar_nil {

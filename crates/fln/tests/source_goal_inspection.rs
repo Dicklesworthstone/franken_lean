@@ -150,6 +150,230 @@ fn term_inspection_uses_lexical_identity_not_same_named_globals() {
     assert_eq!(type_, h.type_);
     assert_eq!(&source[range], "h");
 }
+
+#[test]
+fn definition_observations_survive_rollback_without_admitting_the_definition() {
+    for (source, local_name) in [
+        ("def pending (n : Nat) : Nat := n", "n"),
+        ("def pending (n : Nat) : Nat := by exact n", "n"),
+        // Unsafe definitions use the same body checkpoint as singleton partial
+        // definitions, without extending inspection's partial-modifier door.
+        ("unsafe def pending (n : Nat) : Nat := pending n", "n"),
+        (
+            "def pending (n : Nat) : Nat := match n with\n  | 0 => 0\n  | Nat.succ k => pending k",
+            "k",
+        ),
+        // Observing the measure crosses both its own speculative checkpoint
+        // and the enclosing recursive-body checkpoint.
+        (
+            "def pending (n : Nat) : Nat := match n with\n  | 0 => 0\n  | Nat.succ k => pending k\ntermination_by structural n",
+            "n",
+        ),
+    ] {
+        let at = source.rfind(local_name).unwrap();
+        let result = observe(source, at, ObservationKind::Term);
+        assert!(
+            !result
+                .prefix
+                .checked
+                .checked
+                .engine
+                .environment()
+                .contains(&name("pending")),
+            "{source}"
+        );
+        let Some(SourceObservation::Term {
+            expression,
+            type_,
+            locals,
+            range,
+        }) = result.observation
+        else {
+            panic!("expected definition-body term: {source}")
+        };
+        let local = locals.find_by_user_name(&name(local_name)).unwrap();
+        // Matching retains a source binder as a let alias to its constructor
+        // field; identifier elaboration uses that field's original identity.
+        assert_eq!(
+            expression,
+            local
+                .value
+                .clone()
+                .unwrap_or_else(|| fln::Expr::fvar(local.id.clone())),
+            "{source}"
+        );
+        let fln::ExprNode::FVar { id } = expression.node() else {
+            panic!("expected the observed variable's local identity: {source}")
+        };
+        assert!(
+            locals.find(id).is_some(),
+            "the observed variable must stay bound"
+        );
+        assert_eq!(type_, fln::Expr::const_(name("Nat"), vec![]), "{source}");
+        assert_eq!(&source[range], local_name, "{source}");
+        assert!(
+            locals
+                .decls()
+                .iter()
+                .all(|local| !local.user_name.is_anonymous()
+                    || !matches!(local.type_.node(), fln::ExprNode::ForallE { .. })),
+            "an unused private self escaped in {source}"
+        );
+    }
+}
+
+#[test]
+fn applied_global_head_is_observed_against_its_checked_prefix() {
+    let source = "def Library.identity (P : Prop) (h : P) : P := h\ndef pending (P : Prop) (h : P) : P := Library.identity P h";
+    let result = observe(
+        source,
+        source.rfind("Library.identity").unwrap() + 2,
+        ObservationKind::Term,
+    );
+    let environment = result.prefix.checked.checked.engine.environment();
+    let declared_type = environment
+        .find(&name("Library.identity"))
+        .unwrap()
+        .constant_val()
+        .type_
+        .clone();
+    assert!(!environment.contains(&name("pending")));
+    let Some(SourceObservation::Term {
+        expression,
+        type_,
+        range,
+        ..
+    }) = result.observation
+    else {
+        panic!("expected the applied global head")
+    };
+    assert_eq!(
+        expression,
+        fln::Expr::const_(name("Library.identity"), vec![])
+    );
+    assert_eq!(type_, declared_type);
+    assert_eq!(&source[range], "Library.identity");
+}
+
+#[test]
+fn definition_body_tactic_goals_survive_rollback_without_publishing_a_definition() {
+    for source in [
+        "def pending (n : Nat) : Nat := by exact n",
+        "unsafe def pending (n : Nat) : Nat := by exact pending n",
+        "def pending (n : Nat) : Nat := match n with\n  | 0 => 0\n  | Nat.succ k => by exact pending k",
+    ] {
+        let observed = goals(observe(
+            source,
+            source.rfind("exact").unwrap(),
+            ObservationKind::Goals,
+        ));
+        assert_eq!(observed.len(), 1, "{source}");
+        assert_eq!(
+            observed[0].target,
+            fln::Expr::const_(name("Nat"), vec![]),
+            "{source}"
+        );
+        assert!(
+            observed[0]
+                .locals
+                .decls()
+                .iter()
+                .all(|local| !local.user_name.is_anonymous()
+                    || !matches!(local.type_.node(), fln::ExprNode::ForallE { .. })),
+            "an unused private self escaped in {source}"
+        );
+    }
+}
+
+#[test]
+fn recursive_self_hover_retains_the_binding_its_expression_needs() {
+    for source in [
+        "def pending (n : Nat) : Nat := match n with\n  | 0 => 0\n  | Nat.succ k => pending k",
+        "unsafe def pending (n : Nat) : Nat := pending n",
+    ] {
+        let result = observe(
+            source,
+            source.rfind("pending").unwrap(),
+            ObservationKind::Term,
+        );
+        assert!(
+            !result
+                .prefix
+                .checked
+                .checked
+                .engine
+                .environment()
+                .contains(&name("pending")),
+            "{source}"
+        );
+        let Some(SourceObservation::Term {
+            expression,
+            type_,
+            locals,
+            range,
+        }) = result.observation
+        else {
+            panic!("expected a recursive-self term: {source}")
+        };
+        let fln::ExprNode::FVar { id } = expression.node() else {
+            panic!("recursive self must retain its provisional local identity")
+        };
+        let binding = locals.find(id).expect("the observed self must stay bound");
+        assert_eq!(type_, binding.type_);
+        assert_eq!(&source[range], "pending");
+    }
+}
+
+#[test]
+fn observations_retain_self_dependencies_of_visible_local_types_and_values() {
+    let source = "def pending (n : Nat) : Nat :=\n  let self := pending\n  let equation : self n = self n := rfl\n  by exact n";
+    let observed = goals(observe(
+        source,
+        source.rfind("exact").unwrap(),
+        ObservationKind::Goals,
+    ));
+    assert_eq!(observed.len(), 1);
+    let locals = &observed[0].locals;
+    let alias = locals.find_by_user_name(&name("self")).unwrap();
+    let fln::ExprNode::FVar { id } = alias.value.as_ref().unwrap().node() else {
+        panic!("expected the source let to retain its recursive-self value")
+    };
+    assert!(locals.find(id).is_some(), "the source let must stay closed");
+    let equation = locals.find_by_user_name(&name("equation")).unwrap();
+    assert!(
+        equation
+            .type_
+            .abstract_fvar(&alias.id, 0)
+            .unwrap()
+            .has_loose_bvar(0),
+        "the visible type must retain its source-let dependency"
+    );
+}
+
+#[test]
+fn a_goal_using_recursive_self_retains_its_private_binding() {
+    let source = "def pending (n : Nat) : Nat := by\n  have equation : pending n = pending n := by rfl\n  exact n";
+    let observed = goals(observe(
+        source,
+        source.find("rfl").unwrap(),
+        ObservationKind::Goals,
+    ));
+    assert_eq!(observed.len(), 1);
+    let recursive_self = observed[0]
+        .locals
+        .decls()
+        .iter()
+        .find(|local| local.user_name.is_anonymous())
+        .expect("the target's recursive self must stay bound");
+    assert!(
+        observed[0]
+            .target
+            .abstract_fvar(&recursive_self.id, 0)
+            .unwrap()
+            .has_loose_bvar(0)
+    );
+}
+
 #[test]
 fn imported_and_namespaced_prefix_is_checked_before_inspection() {
     let main = name("Main");

@@ -782,6 +782,7 @@ fn is_request_method(method: &str) -> bool {
             | "$/lean/rpc/call"
             | "textDocument/completion"
             | "textDocument/definition"
+            | "textDocument/documentSymbol"
             | "textDocument/hover"
             | "textDocument/waitForDiagnostics"
     )
@@ -1111,6 +1112,7 @@ fn serve_inner(
             | ("$/lean/plainTermGoal", Some(request_id), state)
             | ("textDocument/hover", Some(request_id), state)
             | ("textDocument/definition", Some(request_id), state)
+            | ("textDocument/documentSymbol", Some(request_id), state)
             | ("textDocument/completion", Some(request_id), state) => {
                 if running_request(output, state, request_id)? {
                     semantic::handle(

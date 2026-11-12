@@ -7,7 +7,7 @@
 //! (upstream `tests/elab/2095.lean`). A second test judges steps proved by hypotheses against
 //! relations whose numerals have no type yet.
 //!
-//! Every program was run through the pinned `lean` v4.32.0 with the same header first (2026-10-29),
+//! Every program was run through the pinned `lean` v4.32.0 with the same header first,
 //! and the pin is consulted again when it is present.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
@@ -18,12 +18,18 @@ const HEADER: &str =
 
 /// Programs the pin accepts, printing nothing: holes on either end that only the expected type
 /// fixes, in term and tactic mode, with an equality step between, and a one-step chain.
+/// Parentheses preserve the tactic's postponement, including nested parentheses.
 const ACCEPTED: &[&str] = &[
     "example : 3 < 5 :=\n  calc\n    _ < 4 := by decide\n    _ < _ := by decide\n",
     "example : 3 < 5 := by\n  calc\n    _ < 4 := by decide\n    _ < _ := by decide\n",
     "example : 3 < 5 := by\n  calc\n    3 < 4 := by decide\n    _ < _ := by decide\n",
     "example : 3 < 5 := by\n  calc\n    _ < 4 := by decide\n    _ = 4 := by rfl\n    _ < _ := by decide\n",
     "example : 3 < 4 := by\n  calc\n    _ < 4 := by decide\n",
+    "example : 3 < 5 :=\n  calc\n    _ < 4 := (by decide)\n    _ < _ := (by decide)\n",
+    "example : 3 < 5 := by\n  calc\n    _ < 4 := ((by decide))\n    _ < _ := (by decide)\n",
+    "example : 3 < 5 :=\n  calc\n    3 < 4 := (by decide)\n    _ < _ := ((by decide))\n",
+    "example : 3 < 5 :=\n  calc\n    _ < 4 := (by decide)\n    _ = 4 := ((by rfl))\n    _ < _ := (by decide)\n",
+    "example : 3 < 4 := by\n  calc\n    _ < 4 := ((by decide))\n",
 ];
 
 /// Programs the pin rejects: a chain that ends past the goal, a step `decide` refutes once its
@@ -32,6 +38,9 @@ const REFUSED: &[&str] = &[
     "example : 3 < 5 :=\n  calc\n    _ < 4 := by decide\n    _ < 6 := by decide\n",
     "example : 3 < 5 :=\n  calc\n    _ < 2 := by decide\n    _ < _ := by decide\n",
     "example : 3 < 5 :=\n  calc\n    _ < 4 := by rfl\n    _ < _ := by decide\n",
+    "example : 3 < 5 :=\n  calc\n    _ < 4 := (by decide)\n    _ < 6 := ((by decide))\n",
+    "example : 3 < 5 :=\n  calc\n    _ < 2 := ((by decide))\n    _ < _ := (by decide)\n",
+    "example : 3 < 5 :=\n  calc\n    _ < 4 := (by rfl)\n    _ < _ := ((by decide))\n",
 ];
 
 /// Programs the pin accepts, printing nothing, whose steps are proved by hypotheses against

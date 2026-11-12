@@ -1,6 +1,41 @@
 //! Native definition lookup shares the proof worker and its exact import overlay.
 use super::*;
 
+pub(super) fn document_symbols(
+    session: &mut SourceModuleSession,
+    sources: &Sources,
+    inputs: &[fln::SourceModuleInput<'_>],
+) -> Result<Option<Answer>, String> {
+    let entry = sources
+        .names
+        .first()
+        .ok_or("document symbols have no entry module")?;
+    let symbols = match session
+        .document_symbols(inputs, entry)
+        .map_err(|error| error.to_string())?
+    {
+        fln::Outcome::Complete(symbols) => symbols,
+        fln::Outcome::Inconclusive(reason) => {
+            return Err(format!(
+                "native document symbols were inconclusive: {reason:?}"
+            ));
+        }
+        fln::Outcome::InternalFault(reason) => {
+            return Err(format!("native document symbols fault: {reason:?}"));
+        }
+    };
+    Ok(Some(Answer::DocumentSymbols {
+        symbols: symbols
+            .into_iter()
+            .map(|symbol| fln_server::dispatch::semantic::DocumentSymbol {
+                name: symbol.name.to_display_string(),
+                range: symbol.range,
+                selection_range: symbol.selection_range,
+            })
+            .collect(),
+    }))
+}
+
 pub(super) fn definition(
     session: &mut SourceModuleSession,
     sources: &Sources,

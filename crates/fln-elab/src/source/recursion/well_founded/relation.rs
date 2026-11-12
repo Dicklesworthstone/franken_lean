@@ -181,10 +181,18 @@ impl Context {
                     .as_ref()
                     .is_some_and(|state| state.natural_measure)
                 {
-                    // Keep the existing direct-Nat comparison used by
-                    // GuessLex probes. Nat.fix's relation is a lambda over
-                    // the standard LT dictionary, definitionally Nat.lt.
-                    Expr::const_(Name::from_components(["Nat", "lt"]), Vec::new())
+                    if self
+                        .well_founded
+                        .as_ref()
+                        .is_some_and(|state| state.mutual.is_some())
+                    {
+                        // Keep the existing mutual proof representation.
+                        Expr::const_(Name::from_components(["Nat", "lt"]), Vec::new())
+                    } else {
+                        // Nat.fix's relation is a lambda over this standard LT
+                        // dictionary, also used by GuessLex's generated probes.
+                        inferred_nat_relation(true)
+                    }
                 } else {
                     arguments[2].clone()
                 },

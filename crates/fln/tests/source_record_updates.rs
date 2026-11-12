@@ -30,6 +30,92 @@ fn updates_copy_unspecified_fields_without_mutating_the_source() {
         "structure Point where\n  x : Nat\n  y : Nat\ndef p : Point := { x := 3, y := 5 }\ndef q := { p with x := p.x + 1 }\ntheorem q_x : q.x = 4 := by rfl\ntheorem q_y : q.y = 5 := by rfl\ntheorem unchanged : p.x = 3 := by rfl",
     );
 }
+
+#[test]
+fn inferred_updates_reinfer_parameters_and_universes_from_actual_fields() {
+    check(
+        &engine(),
+        r#"
+universe u v
+structure Box (A : Type u) where
+  value : A
+  tag : Nat := 7
+def p : Box Nat := { value := 3 }
+def text := { p with value := "hello" }
+def types := { p with value := Nat }
+def retained := { p with tag := 20 }
+def change {A : Type u} {B : Type v} (p : Box A) (value : B) := { p with value := value }
+theorem text_value : text.value = "hello" := by rfl
+theorem text_tag : text.tag = 7 := by rfl
+theorem type_value : types.value = Nat := by rfl
+theorem retained_value : retained.value = 3 := by rfl
+theorem retained_tag : retained.tag = 20 := by rfl
+theorem changed_value : (change p "other").value = "other" := by rfl
+theorem changed_tag : (change p "other").tag = 7 := by rfl
+"#,
+    );
+}
+
+#[test]
+fn inferred_updates_preserve_surrounding_hints_and_failed_checks_are_atomic() {
+    let base = check(
+        &engine(),
+        r#"
+structure Box (A : Type) where
+  value : A
+  tag : Nat := 7
+def p : Box Nat := { value := 3 }
+def choose {A : Type} (first second : A) : A := first
+def beforeHint := choose { p with value := "first" } ({ value := "second" : Box String })
+def afterHint := choose ({ value := "first" : Box String }) { p with value := "second" }
+theorem before_value : beforeHint.value = "first" := by rfl
+theorem after_value : afterHint.value = "first" := by rfl
+structure Alternate (A : Type) where
+  value : A
+  tag : Nat
+  extra : Nat := 42
+def alternate : Alternate String := { value := "second", tag := 9 }
+def laterStructure := choose { p with value := "later" } alternate
+theorem later_value : laterStructure.value = "later" := by rfl
+theorem later_tag : laterStructure.tag = 7 := by rfl
+theorem later_extra : laterStructure.extra = 42 := by rfl
+structure PairBox (A : Type) where
+  first : A
+  second : A
+def pair : PairBox Nat := { first := 1, second := 2 }
+"#,
+    )
+    .engine;
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "def bad : Box Nat := { p with value := \"bad\" }",
+        "def bad := choose { p with value := \"bad\" } p",
+        "def bad := choose p { p with value := \"bad\" }",
+        "def bad {A : Type} (p : Box Nat) : A := { p with value := 3 }",
+        "def bad := { pair with first := \"bad\" }",
+        "theorem bad : beforeHint.value = \"second\" := by rfl",
+        "theorem bad : laterStructure.tag = 9 := by rfl",
+    ] {
+        let refusal = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err("an inferred update retains every field and expected-type constraint");
+        assert_eq!(
+            refusal.disposition(),
+            ("elaboration", false, 1),
+            "{source}: {refusal:?}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    check(
+        &base,
+        "def recovered := { p with value := \"recovered\" }\ntheorem recovered_value : recovered.value = \"recovered\" := by rfl",
+    );
+}
+
 #[test]
 fn dependent_updates_substitute_all_replaced_fields_in_telescope_order() {
     check(

@@ -34,6 +34,45 @@ fn handlers_preserve_source_leaves_and_categories() {
         assert_eq!(count(p.syntax(), "doCatch"), 1);
     }
 }
+
+#[test]
+fn bound_exception_elements_keep_their_do_category_and_original_source() {
+    for source in [
+        "def f := do\n  let value ← try\n    action\n  catch error =>\n    recover error\n  after value",
+        "def f := do { let value <- try { action } catch _ => { fallback }; after value }",
+        "def f := do\r\n  let «𝒙» : Nat ← try\r\n    action -- protected\r\n  catch «é» : Error =>\r\n    recover «é»\r\n  finally\r\n    cleanup\r\n  after «𝒙»",
+        "def f := do { let (left, right) ← try { action } catch error => { recover error }; after left right }",
+    ] {
+        let parsed =
+            parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        assert_eq!(
+            parsed.reconstruct_normalized().unwrap(),
+            source.replace("\r\n", "\n").as_bytes()
+        );
+        assert_eq!(count(parsed.syntax(), "do"), 1);
+        assert_eq!(count(parsed.syntax(), "doTry"), 1);
+        let mut pending = vec![parsed.syntax()];
+        let mut bound = 0;
+        while let Some(syntax) = pending.pop() {
+            if let Syntax::Node { kind, args, .. } = syntax {
+                if ["doIdDecl", "doPatDecl"]
+                    .iter()
+                    .any(|label| kind == &Name::from_components(["Lean", "Parser", "Term", label]))
+                {
+                    assert_eq!(
+                        args[3].kind(),
+                        Some(&Name::from_components(["Lean", "Parser", "Term", "doTry"]))
+                    );
+                    bound += 1;
+                }
+                pending.extend(args);
+            }
+        }
+        assert_eq!(bound, 1, "{source}");
+    }
+}
+
 #[test]
 fn nested_tries_handlers_and_statement_conditionals_keep_their_owners() {
     for s in [

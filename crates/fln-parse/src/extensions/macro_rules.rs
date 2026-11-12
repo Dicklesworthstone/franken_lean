@@ -2,7 +2,11 @@
 //! Unsupported registrations are barriers, never permission to use an older rule.
 use super::*;
 
-pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) -> Result<(), &'static str> {
+pub(super) fn declare(
+    file: &mut FileGrammar,
+    args: &[Syntax],
+    is_pure: &dyn Fn(&Name) -> bool,
+) -> Result<(), &'static str> {
     let [_, _, attr_kind, _, opt_kind, alternatives] = args else {
         return Ok(());
     };
@@ -82,7 +86,7 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) -> Result<(), &'s
             continue;
         }
         let translated = quotation::variables(&children).and_then(|variables| {
-            macro_rule_template(rhs, &variables).and_then(|rhs| {
+            macro_body::rule(rhs, &variables, &children, is_pure).and_then(|rhs| {
                 quotation::capture_kinds::pattern(&rhs, &variables, &children)?;
                 Ok(NotationRule {
                     variables,

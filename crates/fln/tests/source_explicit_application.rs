@@ -224,3 +224,93 @@ fn malformed_or_missing_explicit_arguments_cannot_publish() {
     }
     check(&base, "theorem recovery : @identity Nat 7 = 7 := by rfl");
 }
+
+#[test]
+fn explicit_lambdas_consume_expected_implicit_and_instance_binders() {
+    check(
+        &engine(),
+        "def identity : {A : Type} -> A -> A := @fun A a => a\n\
+         theorem identity_ok : identity 7 = 7 := by rfl\n\
+         class Boxed where\n  n : Nat\n\
+         def number : [b : Boxed] -> Nat := @fun b => b.n\n\
+         theorem number_ok : @number (Boxed.mk 11) = 11 := by rfl",
+    );
+}
+
+#[test]
+fn explicit_lambda_markers_do_not_change_calls_or_nested_implicit_lambdas() {
+    check(
+        &engine(),
+        "def ordinaryCall : Nat := (@fun {A : Type} (a : A) => a) 7\n\
+         theorem ordinary_ok : ordinaryCall = 7 := by rfl\n\
+         def nested : {A : Type} -> ({B : Type} -> B -> B) := @fun A => fun b => b\n\
+         theorem nested_ok : @nested Nat Bool true = true := by rfl\n\
+         def grouped : {n : Nat} -> Nat := @(fun n => n + 1)\n\
+         theorem grouped_ok : @grouped 11 = 12 := by rfl",
+    );
+}
+
+#[test]
+fn explicit_pattern_lambdas_and_local_equations_match_implicit_columns() {
+    check(
+        &engine(),
+        r"def fromPattern : {n : Nat} -> Nat := @fun | 0 => 7 | n+1 => n
+theorem pattern_zero : @fromPattern 0 = 7 := by rfl
+theorem pattern_succ : @fromPattern 12 = 11 := by rfl
+def localPick (n : Nat) : Nat :=
+  let choose : {m : Nat} -> Nat | 0 => 7 | k+1 => k
+  @choose n
+theorem local_ok : localPick 12 = 11 := by rfl",
+    );
+}
+
+#[test]
+fn recursive_equations_and_where_helpers_preserve_explicit_lambda_telescopes() {
+    check(
+        &engine(),
+        r"def count (n : Nat) : Nat :=
+  let rec go : {m : Nat} -> Nat | 0 => 0 | k+1 => @go k + 1
+  @go n
+theorem count_ok : count 4 = 4 := by rfl
+def viaWhere (n : Nat) : Nat := @go n
+where
+  go : {m : Nat} -> Nat | 0 => 0 | k+1 => @go k + 1
+theorem where_ok : viaWhere 5 = 5 := by rfl",
+    );
+}
+
+#[test]
+fn explicit_local_patterns_preserve_polymorphic_function_arguments() {
+    check(
+        &engine(),
+        r"def applyPoly (f : {A : Type} -> A -> A) : Nat :=
+  let use : ({A : Type} -> A -> A) -> Nat | g => @g Nat 7
+  use f
+theorem apply_ok : applyPoly (@fun A a => a) = 7 := by rfl",
+    );
+}
+
+#[test]
+fn invalid_explicit_lambda_bodies_and_recursive_calls_cannot_publish() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    for text in [
+        "def wrong : {A : Type} -> A -> A := @fun A a => true",
+        "def wrong : {n : Nat} -> Nat := @fun (n : Bool) => 7",
+        "def wrong : {n : Nat} -> Nat := @fun | 0 => 7",
+        "def wrong (n : Nat) : Nat := let rec go : {m : Nat} -> Nat | k => @go k; @go n",
+        "def wrong : Nat := let choose : {m : Nat} -> Nat | _ => true; @choose 0",
+    ] {
+        assert!(
+            base.check_source_files(&[text.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "{text}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(
+            !base
+                .environment()
+                .contains(&Name::from_components(["wrong"]))
+        );
+    }
+}

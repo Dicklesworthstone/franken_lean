@@ -1,4 +1,4 @@
-//! Mutually recursive `def`s with `termination_by` measures, judged against the pin.
+//! Mutually recursive `def`s with explicit and inferred measures, judged against the pin.
 //!
 //! The pin (`Lean/Elab/PreDefinition/WF/Main.lean`, `Mutual.lean`, `PackMutual.lean`)
 //! packs a recursive group's varying arguments into a right-nested `PSum` of each
@@ -14,6 +14,7 @@ use fln::{
     OleanCheckLimits, OleanDecodeLimits, OleanModuleInput, SourceCheckLimits, olean_module_imports,
 };
 use fln_core::expr::{Expr, ExprNode};
+use fln_core::level::Level;
 use fln_elab::reducibility::{Reducibility, table};
 use fln_env::constants::{ConstantInfo, DefinitionSafety};
 use std::collections::BTreeSet;
@@ -22,6 +23,22 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 const STACK: usize = 256 * 1024 * 1024;
+
+// The pin's `tests/elab/psumAtWF.lean`: α auto-binds an arbitrary Sort,
+// and the members have different varying-argument telescopes.
+const AUTO_UNIVERSE: &str = "mutual
+def fn (f : α → α) (a : α) (n : Nat) : α :=
+  match n with
+  | 0 => a
+  | n+1 => gn f (f (f a)) (f a) n
+termination_by n
+def gn (f : α → α) (a b : α) (n : Nat) : α :=
+  match n with
+  | 0 => b
+  | n+1 => fn f (f b) n
+termination_by n
+end
+";
 
 fn n(text: &str) -> Name {
     Name::from_components(text.split('.'))
@@ -828,9 +845,131 @@ end
     });
 }
 
+#[test]
+fn inferred_mutual_nat_measures_use_one_checked_fixpoint() {
+    let source = r#"mutual
+def descendLeft (n : Nat) : Nat :=
+  if h : n = 0 then 7 else descendRight (n - 1)
+def descendRight (n : Nat) : Nat :=
+  if h : n = 0 then 9 else descendLeft (n - 1)
+end
+"#;
+    on_large_stack(move |base| {
+        assert_eq!(
+            oracle(
+                &format!("{source}#eval descendLeft 4\n#eval descendLeft 5\n"),
+                true,
+            ),
+            "7\n9\n",
+        );
+        let engine = check(base, source);
+        assert_auxiliary(&engine, "descendLeft._mutual");
+        assert_companions(&engine, &["descendLeft", "descendRight"]);
+        for name in ["descendLeft", "descendRight"] {
+            assert_eq!(
+                table(engine.environment()).unwrap().status(&n(name)),
+                Reducibility::Irreducible,
+            );
+            assert_eq!(definition(&engine, name).safety, DefinitionSafety::Safe);
+        }
+        assert_eq!(
+            evaluate(&engine, "#eval descendLeft 4"),
+            ClosedVmValue::Scalar(7)
+        );
+        assert_eq!(
+            evaluate(&engine, "#eval descendLeft 5"),
+            ClosedVmValue::Scalar(9)
+        );
+    });
+}
+
+#[test]
+fn inferred_mutual_measures_try_later_and_nonuniform_parameter_positions() {
+    let source = r#"mutual
+def accLeft (a n : Nat) : Nat :=
+  if h : n = 0 then a else accRight (a + 1) (n - 1)
+def accRight (a n : Nat) : Nat :=
+  if h : n = 0 then a else accLeft (a + 2) (n - 1)
+end
+mutual
+def swappedLeft (n a : Nat) : Nat :=
+  if h : n = 0 then a else swappedRight (a + 1) (n - 1)
+def swappedRight (a n : Nat) : Nat :=
+  if h : n = 0 then a else swappedLeft (n - 1) (a + 2)
+end
+"#;
+    on_large_stack(move |base| {
+        assert_eq!(
+            oracle(
+                &format!("{source}#eval accLeft 10 5\n#eval swappedLeft 5 10\n"),
+                true,
+            ),
+            "17\n17\n",
+        );
+        let engine = check(base, source);
+        for expression in ["#eval accLeft 10 5", "#eval swappedLeft 5 10"] {
+            assert_eq!(evaluate(&engine, expression), ClosedVmValue::Scalar(17));
+        }
+        assert_auxiliary(&engine, "accLeft._mutual");
+        assert_auxiliary(&engine, "swappedLeft._mutual");
+    });
+}
+
+#[test]
+fn inferred_mutual_measures_retain_fixed_prefixes_and_decreasing_scripts() {
+    let source = r#"mutual
+def proofLeft (offset n : Nat) : Nat :=
+  if h : n = 0 then offset else proofRight offset (n - 1)
+decreasing_by omega
+def proofRight (offset n : Nat) : Nat :=
+  if h : n = 0 then offset + 1 else proofLeft offset (n - 1)
+decreasing_by omega
+end
+"#;
+    on_large_stack(move |base| {
+        assert_eq!(
+            oracle(&format!("{source}#eval proofLeft 8 5\n"), true),
+            "9\n"
+        );
+        let engine = check(base, source);
+        assert_auxiliary(&engine, "proofLeft._mutual");
+        assert_eq!(
+            evaluate(&engine, "#eval proofLeft 8 5"),
+            ClosedVmValue::Scalar(9)
+        );
+    });
+}
+
+#[test]
+fn inferred_mutual_measures_refuse_nondecreasing_calls_and_recover() {
+    let source = r#"mutual
+def badLeft (n : Nat) : Nat := badRight (n + 1)
+def badRight (n : Nat) : Nat := badLeft n
+end
+"#;
+    on_large_stack(move |base| {
+        oracle(source, false);
+        refuse(base, source);
+        for name in [
+            "badLeft",
+            "badRight",
+            "badLeft._mutual",
+            "badLeft._unsafe_rec",
+        ] {
+            assert!(!base.environment().contains(&n(name)));
+        }
+        let recovery = "mutual\ndef badLeft (n : Nat) : Nat := if h : n = 0 then 3 else badRight (n - 1)\ndef badRight (n : Nat) : Nat := if h : n = 0 then 5 else badLeft (n - 1)\nend\n";
+        oracle(recovery, true);
+        let engine = check(base, recovery);
+        assert_eq!(
+            evaluate(&engine, "#eval badLeft 1"),
+            ClosedVmValue::Scalar(5)
+        );
+    });
+}
+
 /// The pin reports "incomplete set of termination hints" (exit 1) and then still
-/// defines the group by GuessLex. We refuse the whole group: the exit code agrees,
-/// but GuessLex across a group is not implemented, so this is not parity.
+/// defines the group by GuessLex. The source transaction refuses the whole group.
 #[test]
 fn a_member_without_a_measure_is_refused() {
     let source = "mutual
@@ -1089,29 +1228,156 @@ fn section_captures_exclude_hint_only_variables_and_nondecreasing_calls() {
     });
 }
 
-/// Outside the supported slice a group stays a typed refusal: never a resource
-/// stop, a fault, or a partial publication. The pin's verdict is recorded for
-/// each; where it accepts, this is a known gap, not parity.
 #[test]
-fn shapes_outside_the_slice_stay_typed_refusals() {
-    // `vendor/lean4-src/tests/elab/psumAtWF.lean`: the members auto-bind a
-    // universe (`α : Sort u_1`); the pin accepts.
-    let universe = "mutual
+fn auto_bound_mutual_universes_preserve_checked_interfaces_and_execution() {
+    on_generic_stack(move |base| {
+        let source = format!(
+            "{AUTO_UNIVERSE}\
+             example : True := fn (fun (_ : True) => True.intro) True.intro 4\n\
+             def higherUniverse : Type := fn (fun (A : Type) => A) Nat 2\n"
+        );
+        let printed = oracle(
+            &format!(
+                "{source}\
+                 #eval fn (fun (n : Nat) => n + 1) 4 7\n\
+                 #eval gn (fun (n : Nat) => n + 1) 0 5 4\n"
+            ),
+            true,
+        );
+        for expected in ["11", "9"] {
+            assert!(printed.lines().any(|line| line == expected), "{printed}");
+        }
+        let engine = check(base, &source);
+        let levels = definition(&engine, "fn").base.level_params;
+        assert_eq!(levels.len(), 1, "α ranges over Sort u, including Prop");
+        for name in ["fn", "gn", "fn._unsafe_rec", "gn._unsafe_rec"] {
+            let member = definition(&engine, name);
+            assert_eq!(member.base.level_params, levels, "{name}");
+            let ExprNode::ForallE { binder_type, .. } = member.base.type_.node() else {
+                panic!("{name} binds α");
+            };
+            assert_eq!(binder_type, &Expr::sort(Level::param(levels[0].clone())));
+            assert!(!member.base.type_.has_level_mvar());
+            assert!(!member.value.has_level_mvar());
+        }
+        assert_auxiliary(&engine, "fn._mutual");
+        assert_eq!(definition(&engine, "fn._mutual").base.level_params, levels);
+        assert_companions(&engine, &["fn", "gn"]);
+        assert_eq!(
+            evaluate(&engine, "#eval fn (fun (n : Nat) => n + 1) 4 7"),
+            ClosedVmValue::Scalar(11)
+        );
+        assert_eq!(
+            evaluate(&engine, "#eval gn (fun (n : Nat) => n + 1) 0 5 4"),
+            ClosedVmValue::Scalar(9)
+        );
+    });
+}
 
-def fn (f : α → α) (a : α) (n : Nat) : α :=
+#[test]
+fn auto_bound_mutual_measures_support_independent_universes_and_lambda_aliases() {
+    let independent = "mutual
+def universeLeft (f : α → β) (a : α) (n : Nat) : β :=
   match n with
-  | 0 => a
-  | n+1 => gn f (f (f a)) (f a) n
+  | 0 => f a
+  | n+1 => universeRight f a n
 termination_by n
-
-def gn (f : α → α) (a b : α) (n : Nat) : α :=
+def universeRight (f : α → β) (a : α) (n : Nat) : β :=
   match n with
-  | 0 => b
-  | n+1 => fn f (f b) n
+  | 0 => f a
+  | n+1 => universeLeft f a n
 termination_by n
-
 end
 ";
+    let lambdas = "mutual
+def lambdaLeft (f : α → α) (a : α) : Nat → α := fun n =>
+  match n with
+  | 0 => a
+  | n+1 => lambdaRight f (f a) n
+termination_by n => n
+def lambdaRight (f : α → α) (a : α) : Nat → α := fun n =>
+  match n with
+  | 0 => a
+  | n+1 => lambdaLeft f (f a) n
+termination_by n => n
+end
+";
+    on_generic_stack(move |base| {
+        for (source, member, peer, universes, query, expected) in [
+            (
+                independent,
+                "universeLeft",
+                "universeRight",
+                2,
+                "#eval universeLeft (fun (n : Nat) => n + 7) 3 5",
+                10,
+            ),
+            (
+                lambdas,
+                "lambdaLeft",
+                "lambdaRight",
+                1,
+                "#eval lambdaLeft (fun (n : Nat) => n + 1) 3 5",
+                8,
+            ),
+        ] {
+            let printed = oracle(&format!("{source}{query}\n"), true);
+            assert!(
+                printed.lines().any(|line| line == expected.to_string()),
+                "{printed}"
+            );
+            let engine = check(base, source);
+            let levels = definition(&engine, member).base.level_params;
+            assert_eq!(levels.len(), universes);
+            assert_eq!(definition(&engine, peer).base.level_params, levels);
+            assert_auxiliary(&engine, &format!("{member}._mutual"));
+            assert_companions(&engine, &[member, peer]);
+            assert_eq!(evaluate(&engine, query), ClosedVmValue::Scalar(expected));
+        }
+    });
+}
+
+#[test]
+fn auto_bound_mutual_universes_reject_bad_bodies_and_preserve_resource_stops() {
+    on_generic_stack(move |base| {
+        for source in [
+            AUTO_UNIVERSE.replace("gn f (f (f a)) (f a) n", "gn f (f (f a)) (f a) (n+1)"),
+            AUTO_UNIVERSE.replace("| 0 => a", "| 0 => true"),
+            AUTO_UNIVERSE.replace("termination_by n", "termination_by missingMeasure"),
+        ] {
+            oracle(&source, false);
+            refuse(base, &source);
+            assert!(!base.environment().contains(&n("fn")));
+            assert!(!base.environment().contains(&n("fn._mutual")));
+        }
+        let before = base.logical_root(&KVMap::new());
+        let mut low = limits();
+        low.kernel.steps = 1;
+        match base.check_source_files(
+            &[AUTO_UNIVERSE.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(low),
+        ) {
+            Err(error) => assert!(
+                matches!(error.disposition().0, "resource" | "inconclusive"),
+                "exhaustion is not a semantic refusal: {error:?}"
+            ),
+            Ok(fln::Outcome::Inconclusive(_)) => {}
+            Ok(_) => panic!("a one-step budget cannot publish the mutual group"),
+        }
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+        let recovered = check(base, AUTO_UNIVERSE);
+        assert_eq!(
+            evaluate(&recovered, "#eval fn (fun (n : Nat) => n + 1) 4 7"),
+            ClosedVmValue::Scalar(11)
+        );
+    });
+}
+
+/// Outside the supported slice a group stays a typed refusal: never a resource
+/// stop, a fault, or a partial publication.
+#[test]
+fn shapes_outside_the_slice_stay_typed_refusals() {
     // `vendor/lean4-src/tests/elab_fail/mutwf1.lean`: the pin refuses both groups.
     let failing = "namespace Ex2
 mutual
@@ -1131,26 +1397,7 @@ end
 end Ex2
 ";
     on_large_stack(move |base| {
-        for (source, accepted) in [(universe, true), (failing, false)] {
-            oracle(source, accepted);
-            let root = base.logical_root(&KVMap::new());
-            let error = base
-                .check_source_files(
-                    &[source.as_bytes()],
-                    &KVMap::new(),
-                    SourceCheckLimits::new(limits()),
-                )
-                .err()
-                .unwrap_or_else(|| panic!("outside the supported slice:\n{source}"));
-            assert!(
-                !matches!(
-                    error.disposition().0,
-                    "resource" | "inconclusive" | "internal-fault"
-                ),
-                "a refusal, not a stop: {error:?}"
-            );
-            assert_eq!(base.logical_root(&KVMap::new()), root);
-            eprintln!("outside the slice (pin accepts: {accepted}): {error:?}");
-        }
+        oracle(failing, false);
+        refuse(base, failing);
     });
 }

@@ -28,6 +28,7 @@ pub(super) fn signature(
         .or_else(|| string(row))
         .or_else(|| word(row))
         .or_else(|| floating(row))
+        .or_else(|| float_array(row))
     else {
         return Ok(None);
     };
@@ -53,6 +54,94 @@ pub(super) fn signature(
         });
     }
     Ok(Some(review.signature))
+}
+
+/// FloatArray is an opaque packed object in native IR, while every element
+/// crosses its scalar ABI as Float. The proof-bearing methods are covered by
+/// array_proofs so their erased suffix remains in first-class boxed calls.
+fn float_array(row: &GeneratedExternRow) -> Option<Review> {
+    let (name, symbol, kind, ownership, parameters, result): (
+        _,
+        _,
+        _,
+        _,
+        &'static [IrType],
+        &'static IrType,
+    ) = match row.id {
+        "extern:FloatArray.mk" => (
+            "FloatArray.mk",
+            "lean_float_array_mk",
+            "ctor",
+            "abi((a: owned_arg) -> owned_res)",
+            &[IrType::Object],
+            &IrType::Object,
+        ),
+        "extern:FloatArray.data" => (
+            "FloatArray.data",
+            "lean_float_array_data",
+            "defn",
+            "abi((a: owned_arg) -> owned_res)",
+            &[IrType::Object],
+            &IrType::Object,
+        ),
+        "extern:FloatArray.emptyWithCapacity" => (
+            "FloatArray.emptyWithCapacity",
+            "lean_mk_empty_float_array",
+            "defn",
+            "abi((capacity: borrowed_arg) -> owned_res)",
+            &[IrType::TObject],
+            &IrType::Object,
+        ),
+        "extern:FloatArray.push" => (
+            "FloatArray.push",
+            "lean_float_array_push",
+            "defn",
+            "abi((a: owned_arg, d: value) -> owned_res)",
+            &[IrType::Object, IrType::Float],
+            &IrType::Object,
+        ),
+        "extern:FloatArray.get!" => (
+            "FloatArray.get!",
+            "lean_float_array_get",
+            "defn",
+            "abi((a: borrowed_arg, i: borrowed_arg) -> value)",
+            &[IrType::Object, IrType::TObject],
+            &IrType::Float,
+        ),
+        "extern:FloatArray.set!" => (
+            "FloatArray.set!",
+            "lean_float_array_set",
+            "defn",
+            "abi((a: owned_arg, i: borrowed_arg, d: value) -> owned_res)",
+            &[IrType::Object, IrType::TObject, IrType::Float],
+            &IrType::Object,
+        ),
+        "extern:FloatArray.size" => (
+            "FloatArray.size",
+            "lean_float_array_size",
+            "defn",
+            "abi((a: borrowed_arg) -> owned_res)",
+            &[IrType::Object],
+            &IrType::Tagged,
+        ),
+        "extern:FloatArray.usize" => (
+            "FloatArray.usize",
+            "lean_sarray_size",
+            "defn",
+            "abi((o: borrowed_arg) -> value)",
+            &[IrType::Object],
+            &IrType::USize,
+        ),
+        _ => return None,
+    };
+    Some(Review {
+        name,
+        symbol,
+        module: "Init.Data.FloatArray.Basic",
+        kind,
+        ownership,
+        signature: PrimitiveSignature { parameters, result },
+    })
 }
 
 /// The pin boxes Float/Float32 closures as constructor objects, including

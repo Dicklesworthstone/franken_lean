@@ -307,7 +307,9 @@ impl Context {
             budget.transparency = UnificationTransparency::Instances;
             budget.zeta_delta = false;
             budget.max_assignments = 0;
-            self.proof_types_match_with_budget(&dictionary, &expected, budget)?
+            // The pin's `matchesInstance` fixes `instances` transparency;
+            // an ambient `with_reducible` must not narrow this query.
+            self.proof_types_match_at(&dictionary, &expected, budget)?
         };
         Ok(valid.then_some((operation, operands)))
     }

@@ -166,6 +166,9 @@ fn direct_and_retried_casts_preserve_read_only_editor_observations() {
                             .type_
                     );
                 }
+                Some(SourceObservation::Completion { .. }) => {
+                    panic!("completion context reached {kind:?} cast inspection: {source}")
+                }
                 None => panic!("cast trial discarded its observation: {source}"),
             }
         }

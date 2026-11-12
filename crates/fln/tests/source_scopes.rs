@@ -369,6 +369,55 @@ fn source_module_execution_preserves_file_boundaries_for_control_commands() {
     );
 }
 #[test]
+fn executable_module_imports_keep_registrations_after_local_simp_erasure() {
+    let base = engine();
+    let before = base.logical_root(&KVMap::new());
+    let rules = n("Rules");
+    let adapter = n("Adapter");
+    let main = n("Main");
+    let mut modules = [
+        fln::SourceModuleInput {
+            name: &rules,
+            source: b"def wrap (n : Nat) : Nat := n\n\
+                      @[simp] theorem unwrap (n : Nat) : wrap n = n := by rfl\n\
+                      attribute [irreducible] wrap\nattribute [-simp] unwrap",
+        },
+        fln::SourceModuleInput {
+            name: &adapter,
+            source: b"import Rules\nattribute [-simp] unwrap",
+        },
+        fln::SourceModuleInput {
+            name: &main,
+            source: b"import Adapter\n\
+                      theorem retained (n : Nat) : wrap (wrap n) = n := by simp",
+        },
+    ];
+    let completed = base
+        .execute_source_modules(
+            &modules,
+            &main,
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(completed.engine.environment().contains(&n("retained")));
+    modules[2].source = b"import Adapter\nattribute [-simp] unwrap\n\
+                          theorem erased (n : Nat) : wrap n = n := by simp";
+    assert!(
+        base.execute_source_modules(
+            &modules,
+            &main,
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .is_err()
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+}
+
+#[test]
 fn nested_namespaces_reopen_and_resolve_relative_and_absolute_names() {
     let result = checked(
         &engine(),

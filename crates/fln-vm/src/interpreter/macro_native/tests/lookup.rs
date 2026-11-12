@@ -75,6 +75,7 @@ fn native_lookups_use_explicit_authority_and_preserve_state() {
             "mirror:Lean.Macro.getCurrNamespace",
             &[context.clone_ref(), state.clone_ref()],
             Some(&lookup),
+            ExecutionLimits::default().max_nat_magnitude_bytes,
         )
         .unwrap_or_else(|_| panic!("valid namespace lookup was refused"))
         .into_object();
@@ -98,6 +99,7 @@ fn native_lookups_use_explicit_authority_and_preserve_state() {
                     state.clone_ref(),
                 ],
                 Some(&lookup),
+                ExecutionLimits::default().max_nat_magnitude_bytes,
             )
             .unwrap_or_else(|_| panic!("valid declaration lookup was refused"))
             .into_object();
@@ -139,6 +141,7 @@ fn malformed_macro_carriers_do_not_invoke_host_lookups() {
                 "mirror:Lean.Macro.getCurrNamespace",
                 &[context, state],
                 Some(&lookup),
+                ExecutionLimits::default().max_nat_magnitude_bytes,
             ),
             Err(IntrinsicFailure::Refused(VmRefusal::InvalidCtorObject))
         ));
@@ -148,6 +151,7 @@ fn malformed_macro_carriers_do_not_invoke_host_lookups() {
             "mirror:Lean.Macro.hasDecl",
             &[Obj::mk_string("not a Name"), context(), state()],
             Some(&lookup),
+            ExecutionLimits::default().max_nat_magnitude_bytes,
         ),
         Err(IntrinsicFailure::Refused(_))
     ));
@@ -352,6 +356,7 @@ fn native_resolution_preserves_overload_projection_order_and_complete_state() {
                 row,
                 &[inject_name(&lookup.requested), context(), state.clone_ref()],
                 Some(&lookup),
+                ExecutionLimits::default().max_nat_magnitude_bytes,
             )
             .unwrap_or_else(|_| panic!("{row} refused an authorized query"))
             .into_object();
@@ -479,7 +484,8 @@ fn resolution_validates_arguments_and_does_not_invent_missing_authority() {
             intrinsic.invoke_with_lookup(
                 row,
                 &[inject_name(&provider.requested), context(), state()],
-                Some(&minimal)
+                Some(&minimal),
+                ExecutionLimits::default().max_nat_magnitude_bytes,
             ),
             Err(IntrinsicFailure::Refused(
                 VmRefusal::MacroLookupUnavailable { .. }
@@ -491,7 +497,12 @@ fn resolution_validates_arguments_and_does_not_invent_missing_authority() {
             vec![inject_name(&provider.requested), context(), Obj::mk_nat(0)],
         ] {
             assert!(matches!(
-                intrinsic.invoke_with_lookup(row, &arguments, Some(&provider)),
+                intrinsic.invoke_with_lookup(
+                    row,
+                    &arguments,
+                    Some(&provider),
+                    ExecutionLimits::default().max_nat_magnitude_bytes
+                ),
                 Err(IntrinsicFailure::Refused(_))
             ));
         }

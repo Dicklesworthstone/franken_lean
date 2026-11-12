@@ -7,12 +7,13 @@ use super::*;
 use crate::source_extension_format as layout;
 use crate::source_extensions::{
     AliasEntry, ClassEntry, DefaultEntry, DiscrTreeKey, ExternAttribute, ExternEntry,
-    ImplementedByEntry, InlineEntry, InstanceEntry, ReducibilityEntry, SimpEntry, SimpKind,
-    SimpTheorem, StructureEntry, StructureField, StructureParent,
+    ImplementedByEntry, InlineEntry, InstanceEntry, ReducibilityEntry, ReducibilityExtraEntry,
+    SimpEntry, SimpKind, SimpTheorem, StructureEntry, StructureField, StructureParent,
 };
 use std::collections::HashSet;
 
 mod aliases;
+mod compiler;
 mod defaults;
 mod executable;
 mod inlining;
@@ -21,6 +22,8 @@ mod namespaces;
 mod reducibility;
 mod simp;
 mod structures;
+
+pub use compiler::CompilerSignature;
 
 #[derive(Debug, Clone, Default)]
 pub struct SourceMetadata {
@@ -58,6 +61,9 @@ pub struct SourceMetadata {
     /// This module's final status for each owned declaration. The writer sorts
     /// these by Name.quickLt for the pin's per-module binary search.
     pub reducibility: Vec<ReducibilityEntry>,
+    /// Chronological overrides in the pin's scoped extra map. Repeated updates
+    /// remain ordered and are never folded into the owned core map.
+    pub reducibility_extra: Vec<ReducibilityExtraEntry>,
     /// Final inlining kind for each module-owned declaration, written as the
     /// pin's `inlineAttrs` enum map in `Name.quickLt` order.
     pub inline: Vec<InlineEntry>,
@@ -70,6 +76,10 @@ pub struct SourceMetadata {
     /// Module-owned structure interfaces, including physical parent subobjects.
     /// The writer preserves field/parent order and sorts only the pin's indexes.
     pub structures: Vec<StructureEntry>,
+    /// Exact compiled calling conventions, with opaque IR headers for downstream
+    /// compilation. Empty on declaration-only builds. These are serialized data,
+    /// not evidence of admission, termination, or an executable implementation.
+    pub compiler_signatures: Vec<CompilerSignature>,
 }
 
 /// Encode source journals and the namespaces implied by local declarations.
@@ -147,6 +157,9 @@ impl Encoder {
         if !metadata.structures.is_empty() {
             blocks.push(self.structure_block(&metadata.structures)?);
         }
+        if !metadata.compiler_signatures.is_empty() {
+            blocks.extend(self.compiler_blocks(&metadata.compiler_signatures)?);
+        }
         if !metadata.protected.is_empty() {
             blocks.push(self.tagged_names_block(
                 layout::PROTECTED_EXTENSION,
@@ -163,6 +176,9 @@ impl Encoder {
         }
         if !metadata.reducibility.is_empty() {
             blocks.push(self.reducibility_block(&metadata.reducibility)?);
+        }
+        if !metadata.reducibility_extra.is_empty() {
+            blocks.push(self.reducibility_extra_block(&metadata.reducibility_extra)?);
         }
         if !metadata.inline.is_empty() {
             blocks.push(self.inline_block(&metadata.inline)?);

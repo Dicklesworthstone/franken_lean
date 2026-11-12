@@ -821,3 +821,181 @@ fn imported_dotted_overloads_use_the_whole_application() {
         .join()
         .expect("the checking thread completes");
 }
+
+/// Quotations store the declaration-site overload set. The expected type and
+/// complete application select among those declarations at the use site;
+/// later namespaces and locals cannot replace the stored candidates.
+#[test]
+fn quoted_overloads_match_the_reference_and_survive_source_module_replay() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| lib.parent().unwrap().parent().unwrap().join("bin/lean"));
+    let version = std::process::Command::new(&reference)
+        .arg("--githash")
+        .output()
+        .expect("the pinned Reference executable");
+    assert!(version.status.success(), "{version:?}");
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap().trim(),
+        fln::OLEAN_PIN_COMMIT
+    );
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let (engine, _) = import_pinned(&lib, INIT_CORE);
+            let limits =
+                SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
+            let options = KVMap::new();
+            let root = engine.logical_root(&options);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "fln-quoted-overloads-{}-{stamp}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            let provider = r#"
+namespace NumberChoice
+def choiceValue : Nat := 13
+def choiceFn (n : Nat) : Nat := n + 1
+def choicePoly.{u} {α : Sort u} (x : α) : α := x
+end NumberChoice
+namespace BoolChoice
+def choiceValue : Bool := true
+def choiceFn (_n : Nat) : Bool := true
+def choicePoly.{u} {α : Sort u} (_x : α) : Bool := true
+end BoolChoice
+open NumberChoice BoolChoice
+macro "chosenValue" : term => `(choiceValue)
+macro "chosenCall " x:term : term => `(choiceFn $x)
+macro "chosenExplicit" : term => `(@choicePoly.{1} Nat 7)
+notation "chosenNotation" => choiceValue
+"#;
+            let consumer = r#"
+def number : Nat := chosenValue
+def boolean : Bool := chosenValue
+def fromNotation : Nat := chosenNotation
+def applied : Nat := chosenCall 4
+def appliedBool : Bool := chosenCall (4 : Nat)
+def explicit : Nat := chosenExplicit
+namespace Client
+def choiceValue : Nat := 99
+def number : Nat := chosenValue
+def underLocal (choiceValue : Nat) : Nat := (chosenValue : Nat) + choiceValue
+end Client
+namespace LaterChoice
+def choiceValue : Nat := 101
+end LaterChoice
+open LaterChoice
+def preserved : Nat := chosenValue
+theorem number_correct : number = 13 := rfl
+theorem boolean_correct : boolean = true := rfl
+theorem notation_correct : fromNotation = 13 := rfl
+theorem application_correct : applied = 5 := rfl
+theorem boolean_application_correct : appliedBool = true := rfl
+theorem explicit_application_correct : explicit = 7 := rfl
+theorem client_namespace_correct : Client.number = 13 := rfl
+theorem client_local_correct : Client.underLocal 99 = 112 := rfl
+theorem captured_namespaces_correct : preserved = 13 := rfl
+"#;
+            let accepted = format!("{provider}\n{consumer}");
+            let ambiguous = r#"
+namespace FirstChoice
+def choiceValue : Nat := 13
+end FirstChoice
+namespace SecondChoice
+def choiceValue : Nat := 99
+end SecondChoice
+open FirstChoice SecondChoice
+macro "ambiguousValue" : term => `(choiceValue)
+def rejected : Nat := ambiguousValue
+"#;
+            let mismatched = format!("{provider}\ndef rejected : String := chosenValue");
+            let no_expected = format!("{provider}\ndef rejected := chosenValue");
+            for (index, (source, succeeds)) in [
+                (accepted.as_str(), true),
+                (ambiguous, false),
+                (mismatched.as_str(), false),
+                (no_expected.as_str(), false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let file = directory.join(format!("case-{index}.lean"));
+                std::fs::write(&file, format!("prelude\nimport Init.Core\n{source}")).unwrap();
+                let oracle = std::process::Command::new(&reference)
+                    .arg(&file)
+                    .output()
+                    .unwrap();
+                assert_eq!(oracle.status.success(), succeeds, "{source}: {oracle:?}");
+                let checked = engine.check_source_files(&[source.as_bytes()], &options, limits);
+                if succeeds {
+                    let checked = checked
+                        .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+                        .into_complete()
+                        .expect("quotation elaboration completes");
+                    assert_eq!(checked.theorems, 9);
+                    for (declaration, selected) in [
+                        ("number", "NumberChoice.choiceValue"),
+                        ("boolean", "BoolChoice.choiceValue"),
+                        ("fromNotation", "NumberChoice.choiceValue"),
+                        ("applied", "NumberChoice.choiceFn"),
+                        ("appliedBool", "BoolChoice.choiceFn"),
+                        ("explicit", "NumberChoice.choicePoly"),
+                        ("Client.number", "NumberChoice.choiceValue"),
+                        ("preserved", "NumberChoice.choiceValue"),
+                    ] {
+                        let Some(fln_env::constants::ConstantInfo::Defn(value)) = checked
+                            .engine
+                            .environment()
+                            .find(&Name::from_components(declaration.split('.')))
+                        else {
+                            panic!("missing checked declaration {declaration}");
+                        };
+                        assert!(
+                            mentions(&value.value, &Name::from_components(selected.split('.'))),
+                            "{declaration} must reference exactly its captured {selected}"
+                        );
+                    }
+                } else {
+                    let error = checked.expect_err(source);
+                    assert_eq!(error.disposition().0, "elaboration", "{source}: {error}");
+                }
+                assert_eq!(engine.logical_root(&options), root);
+            }
+
+            let library = Name::from_components(["QuotedOverloads"]);
+            let client = Name::from_components(["QuotedClient"]);
+            let source = format!("import QuotedOverloads\n{consumer}");
+            let checked = engine
+                .check_source_modules(
+                    &[
+                        fln::SourceModuleInput {
+                            name: &library,
+                            source: provider.as_bytes(),
+                        },
+                        fln::SourceModuleInput {
+                            name: &client,
+                            source: source.as_bytes(),
+                        },
+                    ],
+                    &client,
+                    &options,
+                    fln::source_check::modules::SourceModuleCheckLimits::new(limits),
+                )
+                .expect("the imported grammar journal retains every captured overload")
+                .into_complete()
+                .expect("native module replay completes");
+            assert_eq!(checked.checked.theorems, 9);
+            assert_eq!(engine.logical_root(&options), root);
+        })
+        .expect("spawn the checking thread")
+        .join()
+        .expect("the checking thread completes");
+}

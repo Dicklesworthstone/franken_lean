@@ -23,7 +23,9 @@ use std::collections::{HashMap, HashSet};
 pub(super) use well_founded::Executable as WellFoundedExecutable;
 pub(super) use well_founded::State as WellFounded;
 pub(in crate::source) use well_founded::decreasing_tactic_expansion;
-pub(in crate::source) use well_founded::mutual::{MemberHint, MutualMember, strongly_connected};
+pub(in crate::source) use well_founded::mutual::{
+    MemberHint, MutualMember, Plan as WellFoundedPlan, strongly_connected,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecursionError {
@@ -63,6 +65,14 @@ pub enum RecursionError {
     /// A mutual well-founded group outside the supported slice: Nat measures on
     /// every member, fixed parameters as one common unreordered prefix.
     MutualWellFoundedUnsupported(&'static str),
+    /// Internal result of a discarded mutual GuessLex candidate. No declaration
+    /// is produced until all calls in the component have selected one measure.
+    MutualMeasureProbe {
+        strict: usize,
+        total: usize,
+        unknown: bool,
+        complex: bool,
+    },
     /// A structurally recursive SCC outside the admitted shared-family construction.
     MutualStructuralUnsupported(&'static str),
 }
@@ -86,6 +96,7 @@ impl std::fmt::Display for RecursionError {
             Self::MutualWellFoundedUnsupported(shape) => {
                 return write!(f, "mutual well-founded recursion is not supported here: {shape}");
             }
+            Self::MutualMeasureProbe { .. } => "internal mutual termination-measure probe",
             Self::MutualStructuralUnsupported(shape) => {
                 return write!(f, "mutual structural recursion is not supported here: {shape}");
             }
@@ -398,6 +409,26 @@ pub(super) struct Recursion {
     pub(super) equation_goals: HashMap<MVarId, ConstrainedBranch>,
 }
 impl Context {
+    /// Roll back a failed body without losing the editor's terminal observation.
+    /// The observation owns its provisional terms and local context; it is not
+    /// an elaboration success and never grants declaration admission.
+    fn restore_recursion_error(&mut self, snapshot: Self, problem: &NatDefinitionElabError) {
+        let inspection = if matches!(
+            problem,
+            NatDefinitionElabError::Inference(SourceInferenceError::ObservationComplete)
+        ) {
+            self.inspection.take()
+        } else {
+            None
+        };
+        let spent = self.txn.budget.heartbeats_consumed;
+        *self = snapshot;
+        self.txn.budget.heartbeats_consumed = spent;
+        if let Some(inspection) = inspection {
+            self.inspection = Some(inspection);
+        }
+    }
+
     /// Elaborate the measure in the header-plus-alias scope, as the pin's
     /// `TerminationMeasure.elab` does. The result must be the actual free
     /// variable, not merely definitionally equal to one. Restore all speculative
@@ -498,9 +529,13 @@ impl Context {
             }
             Err(error(RecursionError::StructuralMeasureNotParameter))
         })();
-        let spent = self.txn.budget.heartbeats_consumed;
-        *self = snapshot;
-        self.txn.budget.heartbeats_consumed = spent;
+        if let Err(problem) = &result {
+            self.restore_recursion_error(snapshot, problem);
+        } else {
+            let spent = self.txn.budget.heartbeats_consumed;
+            *self = snapshot;
+            self.txn.budget.heartbeats_consumed = spent;
+        }
         result
     }
 
@@ -936,10 +971,8 @@ impl Context {
             // a different successful branch and silently change the program.
             // Mutual groups already register all peer headers before bodies.
             let result = self.partial_definition_body(name, parameters, syntax, expected);
-            if result.is_err() {
-                let spent = self.txn.budget.heartbeats_consumed;
-                *self = snapshot;
-                self.txn.budget.heartbeats_consumed = spent;
+            if let Err(problem) = &result {
+                self.restore_recursion_error(snapshot, problem);
             }
             return result;
         }
@@ -955,9 +988,7 @@ impl Context {
             Ok(InitialBody::Complete(body)) => return Ok(body),
             Ok(InitialBody::Recursive) => {}
             Err(problem) => {
-                let spent = self.txn.budget.heartbeats_consumed;
-                *self = snapshot;
-                self.txn.budget.heartbeats_consumed = spent;
+                self.restore_recursion_error(snapshot, &problem);
                 return Err(problem);
             }
         }
@@ -1074,10 +1105,8 @@ impl Context {
             }
             self.close_recursive_lambdas(&lambdas, body)
         })();
-        if result.is_err() {
-            let spent = self.txn.budget.heartbeats_consumed;
-            *self = snapshot;
-            self.txn.budget.heartbeats_consumed = spent;
+        if let Err(problem) = &result {
+            self.restore_recursion_error(snapshot, problem);
         }
         result
     }
@@ -1211,9 +1240,7 @@ impl Context {
                         break;
                     }
                     Err(problem) => {
-                        let spent = self.txn.budget.heartbeats_consumed;
-                        *self = snapshot;
-                        self.txn.budget.heartbeats_consumed = spent;
+                        self.restore_recursion_error(snapshot, &problem);
                         return Err(problem);
                     }
                 }
@@ -1225,9 +1252,11 @@ impl Context {
         Err(first_error.unwrap_or_else(|| error(RecursionError::RootMatchRequired)))
     }
 
-    /// A structural candidate must be an actual explicit header parameter, not
-    /// a computed expression. Each input identity is enumerated once; motive
-    /// discovery can retry it with more generalized parameters. The pattern
+    /// A structural candidate must be an actual telescope parameter, not
+    /// a computed expression. Implicit parameters retain their binder kinds
+    /// in the recursive reference and are equally eligible. Each input
+    /// identity is enumerated once; motive discovery can retry it with more
+    /// generalized parameters. The pattern
     /// matrix still checks every source discriminant and every row.
     pub(super) fn recursion_columns(
         &mut self,
@@ -1265,18 +1294,13 @@ impl Context {
                 2,
                 "recursive discriminant",
             )?;
-            let mut value = &parts[1];
-            while let Some(inner) = parenthesized_inner(value)? {
-                self.tick()?;
-                value = inner;
-            }
+            let value = self.structural_discriminant(&parts[1])?;
             if let Syntax::Ident { val, .. } = value
                 && let Some((position_in_header, parameter)) = parameters
                     .iter()
                     .enumerate()
                     .rev()
                     .find(|(_, p)| &p.user_name == val)
-                && parameter.binder_info == BinderInfo::Default
                 && seen.insert(parameter.id.clone())
             {
                 columns.push((position / 2, position_in_header));
@@ -1319,11 +1343,7 @@ impl Context {
             2,
             "recursive discriminant",
         )?;
-        let mut discriminant = &first[1];
-        while let Some(inner) = parenthesized_inner(discriminant)? {
-            self.tick()?;
-            discriminant = inner;
-        }
+        let discriminant = self.structural_discriminant(&first[1])?;
         let Syntax::Ident { val, .. } = discriminant else {
             return Err(error(RecursionError::RootMatchRequired));
         };
@@ -1331,9 +1351,6 @@ impl Context {
             .iter()
             .rposition(|local| &local.user_name == val)
             .ok_or_else(|| error(RecursionError::RootMatchRequired))?;
-        if parameters[decreasing].binder_info != BinderInfo::Default {
-            return Err(error(RecursionError::ExplicitParameterRequired));
-        }
         let reference = self.reference_result(expected);
         let mut full_type = self.instantiate(&reference)?;
         for local in parameters.iter().rev() {

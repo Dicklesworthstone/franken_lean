@@ -1348,9 +1348,7 @@ impl Context {
         sources: Vec<Typed>,
     ) -> Result<RecordFrame<'a>, NatDefinitionElabError> {
         self.flush(false)?;
-        let expected = expected
-            .or_else(|| sources.first().map(|source| source.type_.clone()))
-            .ok_or_else(|| error(RecordTermError::ExpectedRecordType))?;
+        let expected = self.record_expected_type(expected, &sources)?;
         let target = self.whnf(&expected)?;
         let mut head = &target;
         let mut arguments = Vec::new();
@@ -1513,6 +1511,73 @@ impl Context {
             defaults,
             levels,
         })
+    }
+
+    /// An unresolved expected type does not hide the update source's structure.
+    /// Only its identity is inherited: the pin's `getStructName`/`mkCtorHeader`
+    /// makes fresh parameters, so replacing a `Box Nat` field may produce a
+    /// `Box String`, and copied fields constrain the parameters they retain.
+    fn record_expected_type(
+        &mut self,
+        expected: Option<Expr>,
+        sources: &[Typed],
+    ) -> Result<Expr, NatDefinitionElabError> {
+        if let Some(expected) = &expected {
+            let target = self.whnf(expected)?;
+            let mut head = &target;
+            while let ExprNode::App { f, .. } = head.node() {
+                self.tick()?;
+                head = f;
+            }
+            if matches!(head.node(), ExprNode::Const { .. }) {
+                // A concrete expected type wins over every source, including
+                // the error when that type is not a structure.
+                return Ok(expected.clone());
+            }
+        }
+        let source = sources
+            .first()
+            .ok_or_else(|| error(RecordTermError::ExpectedRecordType))?;
+        let source_type = self.whnf(&source.type_)?;
+        let mut head = &source_type;
+        while let ExprNode::App { f, .. } = head.node() {
+            self.tick()?;
+            head = f;
+        }
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Err(error(RecordTermError::ExpectedRecordType));
+        };
+        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(name) else {
+            return Err(error(RecordTermError::ExpectedRecordType));
+        };
+        let parameters = family.num_params;
+        let mut target = self.constant(name)?;
+        for _ in 0..parameters {
+            self.tick()?;
+            let type_ = self.whnf(&target.type_)?;
+            let ExprNode::ForallE {
+                binder_type,
+                binder_info,
+                body,
+                ..
+            } = type_.node()
+            else {
+                return Err(error(RecordTermError::ExpectedRecordType));
+            };
+            let argument = if *binder_info == BinderInfo::InstImplicit {
+                self.instance_hole(binder_type.clone())?
+            } else {
+                self.hole(binder_type.clone())?
+            };
+            target.type_ = self.substitute(body, &argument)?;
+            target.value = Expr::app(target.value, argument);
+        }
+        if let Some(expected) = expected {
+            // Keep the surrounding declaration/application's obligation.
+            // Inference from a source must never discard a conflicting hint.
+            self.constrain_type(&target.value, &expected)?;
+        }
+        Ok(target.value)
     }
 
     pub(super) fn next_record_field<'a>(
@@ -1759,6 +1824,13 @@ impl Context {
                     };
                     value.value = self.substitute(body, &argument)?;
                 }
+                let value = self.finish_term(value, Some(binder_type))?;
+                return Ok(RecordStep::Copy {
+                    value,
+                    target: RecordTarget::Constructor(body.clone()),
+                });
+            }
+            if let Some(value) = self.physical_record_default(state, binder_name)? {
                 let value = self.finish_term(value, Some(binder_type))?;
                 return Ok(RecordStep::Copy {
                     value,

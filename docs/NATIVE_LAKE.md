@@ -205,8 +205,55 @@ imported environment, so a module under the implicit `Init` pays for the reused
 `Init` closure even when nothing changed. `--import-posture recheck` elaborates
 every module and reads and writes no record.
 
-The JSON report uses `fln.lake-build/2`, identifies the `olean` facet, and lists
-the emitted paths. It also reports:
+### Executable module companions
+
+`lake build +Module:ir` additionally compiles native executable IR for that
+module and every local source dependency. It requires module-system source
+files (those beginning with `module`) and publishes each `.ir` together with
+the checked `.olean`, `.olean.server`, and `.olean.private` family. The logical
+companions also carry the signatures needed by downstream Lean compilation.
+Mixed
+`:ir` and `:olean` targets are supported; an admission-only target outside an
+executable target's dependency closure does not acquire an IR requirement.
+
+For example, a module under a declared `Demo` library root can contain:
+
+```lean
+module
+prelude
+public import Init.Notation
+public def Demo.choose (flag : Bool) (left right : Nat) : Nat :=
+  if flag then left else right
+public def Demo.increment (n : Nat) : Nat := Nat.add n 1
+```
+
+With the pinned imports available, `lake build +Demo:ir` produces executable
+companions under `.lake/build/lib/lean`. The compiler consumes the exact
+checked implementation environment, including private bodies, on both fresh
+and reused builds. It does not recover compiler authority from output files.
+Supported source signatures use Nat, String, Bool, and the compiler's supported
+function carriers; the backend handles pure closures, acyclic branches, and
+the vetted explicit Nat operations and `String.append`. Imported typeclass
+dictionaries, including the dictionary used by ordinary `n + 1`, can require
+unsupported runtime layouts; use the explicit primitive when it has the same
+intended operation. Source-body analysis also conservatively refuses some
+multiargument calls and local Boolean bindings when it cannot establish the
+pinned reduced calling convention. Supported carriers alone do not make every
+pure body compilable. Unsupported definitions refuse the entire facet before
+any existing output is replaced. Explicit noncomputable definitions and
+theorem bodies need no executable entries.
+
+This remains a bounded compiler facet. Legacy modules require IR embedded in
+their `.olean` and are refused here. Opaque definitions, unsafe or partial
+exports, definitions carrying executable-replacement or extern attributes,
+unsupported source carriers, and cyclic control flow are also refused. Native
+object-code generation, linking, and executable targets remain unavailable.
+
+The JSON report uses `fln.lake-build/2`, identifies `ir` when executable
+companions are produced and otherwise `olean`, and lists every emitted path.
+It also reports:
+
+- `executable_modules`: modules with an emitted `.ir` companion;
 - `modules_cached`: modules re-admitted from records;
 - `module_elaborations`;
 - `module_checks_reused`: modules reused from an earlier target of the same
@@ -231,9 +278,9 @@ work also use the ordinary bounded source-check budgets. Resource exhaustion
 is reported as non-authoritative failure, never as successful compilation.
 
 Bare `lake build` of a library still refuses: its default `leanArts` facet also
-requires products such as `.ilean` and compiler outputs. Executable/native
-facets, dependency fetching, custom globs, custom compiler options, Lake
-configuration outside the slice above, new module-system artifact families, and native
+requires products such as `.ilean` and additional compiler outputs. Executable
+targets and native linking, dependency fetching, custom globs, custom compiler
+options, Lake configuration outside the slice above, and native
 extension metadata without a pinned export encoding remain unsupported.
 Unsupported TOML build settings are rejected rather than silently ignored.
 These boundaries are not full Lake compatibility, fresh-artifact byte identity

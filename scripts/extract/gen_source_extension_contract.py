@@ -534,6 +534,11 @@ def render():
     if not re.search(r"name\s*:=\s*`reducibilityCore\s*$", reducibility, re.M):
         raise ValueError("reducibilityCore extension name drift")
     lines.append('pub const REDUCIBILITY_EXTENSION: &str = "reducibilityCore";')
+    if not re.search(r"builtin_initialize\s+reducibilityExtraExt\s*:\s*SimpleScopedEnvExtension\s+\(Name × ReducibilityStatus\)\s+\(SMap Name ReducibilityStatus\)", reducibility):
+        raise ValueError("extension schema moved: reducibilityExtraExt")
+    if not re.search(r"name\s*:=\s*`reducibilityExtra\s*$", reducibility, re.M):
+        raise ValueError("reducibilityExtra extension name drift")
+    lines.append('pub const REDUCIBILITY_EXTRA_EXTENSION: &str = "reducibilityExtra";')
     for index, status in enumerate(statuses):
         constant = re.sub(r"(?<!^)([A-Z])", r"_\1", status).upper()
         lines.append(f"pub const REDUCIBILITY_{constant}: usize = {index};")

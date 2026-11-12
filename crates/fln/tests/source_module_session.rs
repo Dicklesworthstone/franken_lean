@@ -186,6 +186,49 @@ fn cache_cannot_lend_removed_imports_names_or_metadata() {
 }
 
 #[test]
+fn cached_source_exports_preserve_simp_additions_after_local_erasure() {
+    let mut session = session();
+    let files = [
+        (
+            "Main",
+            "import Rules\ntheorem use (n : Nat) : wrap (wrap n) = n := by simp",
+        ),
+        (
+            "Rules",
+            "def wrap (n : Nat) : Nat := n\n\
+             @[simp] theorem unwrap (n : Nat) : wrap n = n := by rfl\n\
+             attribute [irreducible] wrap\nattribute [-simp] unwrap",
+        ),
+    ];
+    let cold = checked(&mut session, &files);
+    assert_eq!((cold.reused_modules, cold.elaborated_modules), (0, 2));
+    let warm = checked(&mut session, &files);
+    assert_eq!((warm.reused_modules, warm.elaborated_modules), (2, 0));
+    assert_eq!(
+        cold.checked.checked.result_logical_root,
+        warm.checked.checked.result_logical_root
+    );
+    // Changing the consumer forces replay of the cached provider's export.
+    let mut changed = files;
+    changed[0].1 = "import Rules\ntheorem useAgain (n : Nat) : wrap (wrap (wrap n)) = n := by simp";
+    let replayed = checked(&mut session, &changed);
+    assert_eq!(
+        (replayed.reused_modules, replayed.elaborated_modules),
+        (1, 1)
+    );
+    let rules =
+        fln_elab::source::scope::simp::read(replayed.checked.checked.engine.environment()).unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].declaration, n("unwrap"));
+
+    changed[0].1 = "import Rules\nattribute [-simp] unwrap\n\
+                    theorem locallyErased (n : Nat) : wrap n = n := by simp";
+    assert!(check_with(&mut session, &changed, None).is_err());
+    changed[0].1 = "import Rules\ntheorem useAgain (n : Nat) : wrap (wrap (wrap n)) = n := by simp";
+    assert_eq!(checked(&mut session, &changed).reused_modules, 2);
+}
+
+#[test]
 fn changing_imported_instances_rechecks_consumers_but_not_independent_siblings() {
     let mut session = session();
     let mut files = [

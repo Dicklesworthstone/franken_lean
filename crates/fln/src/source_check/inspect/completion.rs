@@ -1,10 +1,12 @@
-//! Global-name completion over the ordinary dual-checked command prefix.
+//! Global and local completion over the ordinary dual-checked command prefix.
 //!
 //! The token under the cursor is only a filter. It is never elaborated, installed
 //! in an environment, or used to look up a previous successful result. Every
-//! replacement is root-qualified, so a local with the same spelling cannot turn
-//! a suggested global into another term. Local/field/tactic completion is outside
-//! this query's profile.
+//! global replacement is root-qualified, so a local with the same spelling cannot
+//! turn a suggested global into another term. Local suggestions come only from
+//! the native elaborator's context before resolving the selected identifier.
+//! Malformed or unsupported current syntax retains global-only completion;
+//! field and tactic-name completion remain outside this query's profile.
 use super::*;
 use fln_core::name::LeafView;
 use fln_syntax::source::{BytePos, SourceText};
@@ -40,11 +42,19 @@ impl Default for CompletionLookupLimits {
     }
 }
 
-/// A checked global, not a candidate declaration or an admission certificate.
+/// Which native scope supplied a completion candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SourceCompletionKind {
+    Local,
+    Global,
+}
+
+/// A global in the checked prefix, or a local observed during native elaboration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceCompletionItem {
     pub label: String,
     pub replacement: String,
+    pub kind: SourceCompletionKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,6 +341,55 @@ impl SourceModuleSession {
         let matching = absolute_filter.unwrap_or(&filter);
         let mut names = BTreeMap::new();
         let mut incomplete = false;
+        if !filter.contains('.') {
+            let locals = match self.completion_locals(inputs, entry, index, &range)? {
+                Outcome::Complete(locals) => locals,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            if let Some(locals) = locals {
+                let mut seen = std::collections::HashSet::new();
+                for (index, local) in locals.decls().iter().rev().enumerate() {
+                    if index >= limits.max_candidates {
+                        return Err(limit("completion locals", limits.max_candidates));
+                    }
+                    // Resolution selects the last binder of the exact user name.
+                    // Never erase macro scopes or print a hidden binder under a
+                    // fresh spelling: that spelling would name a different local.
+                    if !seen.insert(&local.user_name)
+                        || !local.user_name.parent().is_anonymous()
+                        || local.user_name.has_macro_scopes()
+                    {
+                        continue;
+                    }
+                    let Some((label, _)) =
+                        source_name(&local.user_name, limits.max_name_bytes, None)
+                            .map_err(|()| limit("completion name bytes", limits.max_name_bytes))?
+                    else {
+                        continue;
+                    };
+                    if label == "_" || !label.starts_with(matching) {
+                        continue;
+                    }
+                    // Escaping preserves this exact local identifier even if
+                    // the current or imported grammar reserves its spelling.
+                    // The label remains ordinary text for editor filtering.
+                    let replacement = format!("«{label}»");
+                    names.insert(
+                        (label.clone(), SourceCompletionKind::Local),
+                        SourceCompletionItem {
+                            label,
+                            replacement,
+                            kind: SourceCompletionKind::Local,
+                        },
+                    );
+                    if names.len() > limits.max_items {
+                        let _ = names.pop_last();
+                        incomplete = true;
+                    }
+                }
+            }
+        }
         for (index, (name, _)) in environment.constants().enumerate() {
             if index >= limits.max_candidates {
                 // Do not expose an arbitrary prefix of an implementation-defined
@@ -348,7 +407,14 @@ impl SourceModuleSession {
                 continue;
             }
             let replacement = format!("_root_.{label}");
-            names.insert(label.clone(), SourceCompletionItem { label, replacement });
+            names.insert(
+                (label.clone(), SourceCompletionKind::Global),
+                SourceCompletionItem {
+                    label,
+                    replacement,
+                    kind: SourceCompletionKind::Global,
+                },
+            );
             if names.len() > limits.max_items {
                 let _ = names.pop_last();
                 incomplete = true;
@@ -374,6 +440,58 @@ impl SourceModuleSession {
             items,
             is_incomplete: incomplete,
         })))
+    }
+
+    fn completion_locals(
+        &mut self,
+        inputs: &[SourceModuleInput<'_>],
+        entry: &Name,
+        index: usize,
+        range: &Range<usize>,
+    ) -> Result<Outcome<Option<fln_elab::lctx::LocalContext>>, SourceModuleCheckError> {
+        let source = inputs[index].source;
+        let mut selected = inputs.to_vec();
+        // First exclude all later bytes. If a parenthesis or binder needs its
+        // actual closing syntax, retry with the original document. Neither
+        // attempt inserts text or elaborates the partial identifier itself.
+        for end in [range.end, source.len()] {
+            selected[index].source = &source[..end];
+            match self.inspect(&selected, entry, range.start, ObservationKind::Completion) {
+                Ok(Outcome::Complete(inspected)) => {
+                    return Ok(Outcome::Complete(match inspected.observation {
+                        Some(SourceObservation::Completion {
+                            range: observed,
+                            locals,
+                        }) if &observed == range => Some(locals),
+                        _ => None,
+                    }));
+                }
+                Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
+                Ok(Outcome::InternalFault(fault)) => return Ok(Outcome::InternalFault(fault)),
+                Err(error) => {
+                    if error.disposition().2 != 1 {
+                        return Err(error);
+                    }
+                    // Only a parse refusal may need the unedited suffix. A
+                    // failed semantic prefix cannot be rescued by later text.
+                    let parse_refusal = match &error {
+                        SourceModuleCheckError::Header { .. } => true,
+                        SourceModuleCheckError::Source {
+                            error: SourceCheckError::Command { error, .. },
+                            ..
+                        } => matches!(
+                            error.as_ref(),
+                            EngineExecutionError::Frontend(DefinitionFrontendError::Parse(_))
+                        ),
+                        _ => false,
+                    };
+                    if !parse_refusal {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(Outcome::Complete(None))
     }
 }
 

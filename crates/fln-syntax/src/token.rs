@@ -339,63 +339,9 @@ impl TokenError {
     }
 }
 
-/// `«` — upstream `idBeginEscape`.
-pub const ID_BEGIN_ESCAPE: char = '«';
-/// `»` — upstream `idEndEscape`.
-pub const ID_END_ESCAPE: char = '»';
-
-/// Upstream `isIdFirst` (`Init/Meta/Defs.lean:120`): ASCII alpha, `_`, or letter-like.
-///
-/// `Char.isAlpha` upstream is **ASCII only** (`isUpper || isLower`, each a range check on
-/// `A-Z`/`a-z`), so every non-ASCII identifier character arrives through `is_letter_like` —
-/// not through Rust's `char::is_alphabetic`, which accepts vastly more. Using the Rust
-/// predicate here would accept identifiers the Reference rejects, which is a silent
-/// widening of the accepted language.
-pub fn is_id_first(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_' || is_letter_like(c)
-}
-
-/// Upstream `isIdRest` (`Init/Meta/Defs.lean:133`).
-///
-/// Note `!` and `?` and `'`: `foo!`, `foo?` and `h'` are each **one identifier**, not an
-/// identifier followed by a symbol. This is where a from-scratch lexer usually diverges,
-/// because `!` and `?` look like operators everywhere else.
-pub fn is_id_rest(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || c == '_'
-        || c == '\''
-        || c == '!'
-        || c == '?'
-        || is_letter_like(c)
-        || is_subscript_alnum(c)
-}
-
-/// Upstream `isLetterLike` (`Init/Meta/Defs.lean:101`), ranges transcribed exactly.
-///
-/// The exclusions are the interesting part and are not decorative: lower-case lambda
-/// (U+03BB) is excluded because `λ` is a *token*, and upper-case Pi (U+03A0) and Sigma
-/// (U+03A3) are excluded for the same reason. Include them and `λ x => x` lexes as one
-/// identifier named `λ` and nothing works.
-pub fn is_letter_like(c: char) -> bool {
-    let v = c as u32;
-    (0x3b1..=0x3c9).contains(&v) && v != 0x3bb // lower Greek, but not λ
-        || (0x391..=0x3A9).contains(&v) && v != 0x3A0 && v != 0x3A3 // upper Greek, but not Π Σ
-        || (0x3ca..=0x3fb).contains(&v) // Coptic
-        || (0x1f00..=0x1ffe).contains(&v) // polytonic Greek
-        || (0x2100..=0x214f).contains(&v) // letter-like block
-        || (0x1d49c..=0x1d59f).contains(&v) // script / double-struck / fraktur
-        || (0x00c0..=0x00ff).contains(&v) && v != 0x00d7 && v != 0x00f7 // Latin-1, but not × ÷
-        || (0x0100..=0x017f).contains(&v) // Latin Extended-A
-}
-
-/// Upstream `isSubScriptAlnum` (`Init/Meta/Defs.lean:114`).
-pub fn is_subscript_alnum(c: char) -> bool {
-    let v = c as u32;
-    (0x2080..=0x2089).contains(&v)
-        || (0x2090..=0x209c).contains(&v)
-        || (0x1d62..=0x1d6a).contains(&v)
-        || v == 0x2c7c
-}
+pub use fln_core::name::identifier::{
+    ID_BEGIN_ESCAPE, ID_END_ESCAPE, is_id_first, is_id_rest, is_letter_like, is_subscript_alnum,
+};
 
 /// Lex one token at `from`, which must already be past any trivia.
 ///

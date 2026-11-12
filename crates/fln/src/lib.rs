@@ -4377,9 +4377,24 @@ impl Engine {
             // Parametric definitions are checked templates, not standalone VM
             // entry points. Compile concrete uses on demand; never use a failed
             // compilation as a reason to silently admit an executable command.
-            let is_template = !is_evaluation
-                && matches!(&declaration,
-                Declaration::Defn(definition) if runtime::is_template(definition));
+            let is_template = match &declaration {
+                Declaration::Defn(definition) if !is_evaluation => {
+                    runtime::is_template(definition)
+                        || runtime::is_record_template(
+                            engine.environment(),
+                            definition,
+                            limits.ingress,
+                        )
+                        .map_err(|error| {
+                            EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(EngineExecutionError::Ingress(error)),
+                                at: Some(original_offset),
+                            }
+                        })?
+                }
+                _ => false,
+            };
             // A named proof definition has no runtime result. Classify its
             // closed header before compilation, then retain its original
             // definition and the ordinary dual-admission evidence below.

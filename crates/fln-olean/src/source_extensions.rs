@@ -21,7 +21,7 @@ pub use format::{
     CLASS_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION, DEPRECATED_EXTENSION, EXTERN_EXTENSION,
     IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION, INSTANCE_EXTENSION, NONCOMPUTABLE_EXTENSION,
     PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION, PROTECTED_EXTENSION,
-    REDUCIBILITY_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
+    REDUCIBILITY_EXTENSION, REDUCIBILITY_EXTRA_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
 };
 mod deprecations;
 pub use deprecations::DeprecationEntry;
@@ -144,6 +144,15 @@ pub struct ReducibilityEntry {
     pub status: ReducibilityStatus,
 }
 
+/// A `reducibilityExtra` update, whose scope wrapper and order are significant.
+/// Global entries override the status in the declaration's owning module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReducibilityExtraEntry {
+    pub scope: Option<Name>,
+    pub declaration: Name,
+    pub status: ReducibilityStatus,
+}
+
 /// The pin's `InlineAttributeKind` (vendored `src/Lean/Compiler/InlineAttrs.lean`), in
 /// constructor order. Only `MacroInline` changes what a program computes: the pin's compiler
 /// inlines such a definition before any argument is evaluated (`macroInline`, vendored
@@ -194,6 +203,8 @@ pub struct SourceExtensions {
     pub structures: Vec<StructureEntry>,
     /// Reducibility statuses (the pin's `reducibilityCore`), in journal order.
     pub reducibility: Vec<ReducibilityEntry>,
+    /// Chronological extra updates, kept separate from the per-module core map.
+    pub reducibility_extra: Vec<ReducibilityExtraEntry>,
     /// Explicit extern bindings. Consumers must validate their declarations and
     /// selected backend/symbol before granting executable authority.
     pub externs: Vec<ExternAttribute>,
@@ -494,6 +505,28 @@ impl Reader {
             status,
         })
     }
+    fn reducibility_extra(&mut self, obj: &Obj) -> Result<ReducibilityExtraEntry, DecodeError> {
+        if obj.is_scalar() {
+            return Err(shape("reducibility extra entry lacks its scope wrapper"));
+        }
+        let (scope, entry) = match obj.obj_tag() as u8 {
+            format::SCOPE_GLOBAL => {
+                constructor(obj, format::SCOPE_GLOBAL, 1)?;
+                (None, field(obj, 0)?)
+            }
+            format::SCOPE_SCOPED => {
+                constructor(obj, format::SCOPE_SCOPED, 2)?;
+                (Some(self.name(&field(obj, 0)?)?), field(obj, 1)?)
+            }
+            _ => return Err(shape("unknown reducibility extra scope tag")),
+        };
+        let row = self.reducibility(&entry)?;
+        Ok(ReducibilityExtraEntry {
+            scope,
+            declaration: row.declaration,
+            status: row.status,
+        })
+    }
     /// A scope-wrapped `KeyedDeclsAttribute.OLeanEntry` (the same `ScopedEnvExtension.Entry`
     /// wrapper as an instance's).
     fn app_unexpander(&mut self, obj: &Obj) -> Result<AppUnexpanderEntry, DecodeError> {
@@ -639,6 +672,7 @@ fn decode_batch(
         name(format::INLINE_EXTENSION),
         namespace_extension_name(),
         name(format::DEPRECATED_EXTENSION),
+        name(format::REDUCIBILITY_EXTRA_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -796,7 +830,10 @@ fn decode_batch(
                     }
                     out.deprecations.push(entry);
                 }
-                _ => unreachable!("twenty-two selected extension families"),
+                22 => out
+                    .reducibility_extra
+                    .push(reader.reducibility_extra(&obj)?),
+                _ => unreachable!("twenty-three selected extension families"),
             }
         }
     }

@@ -3,6 +3,9 @@
 //! src/Lean/Compiler/IR/Basic.lean: sha256 4f67ddee0a326b2caae8bbcaab2488a99823bf0d10da7c3a17bd7972e4723d25
 //! src/Lean/Compiler/ExternAttr.lean: sha256 b7fc317ef4457ee6383d2c85a264361b1960d0ce1109c8d2fe5901144d323345
 //! src/Lean/Compiler/IR/CompilerM.lean: sha256 fa67405b0bc83900ffd0a7c88bb7934e9fcd2255761a89400a73847a85cc3235
+//! src/Lean/Compiler/LCNF/Basic.lean: sha256 58601e9868b1d38f6901bb6296fcf6172cf2417d6eaec0b57f95b61a07e9e3fc
+//! src/Lean/Compiler/LCNF/PhaseExt.lean: sha256 12612f44a6a76e7bdb3f4c208553b77bc15fb6025f6e8c9ab4fecd453a79cb9a
+//! src/Lean/Expr.lean: sha256 7d4418bf9fef6f72eac422db70613848f849f074573392e79fb86fe745e79f7e
 #![allow(dead_code)]
 
 // IRType: a constructor without fields is the boxed tag.
@@ -263,4 +266,20 @@ pub const PARAM_BORROW_SCALAR: usize = 0;
 pub const PARAM_POINTERS: usize = 2;
 pub const PARAM_SCALAR_BYTES: usize = 1;
 
+pub const LCNF_PARAM_FVAR_ID: usize = 0;
+pub const LCNF_PARAM_BINDER_NAME: usize = 1;
+pub const LCNF_PARAM_TYPE: usize = 2;
+pub const LCNF_PARAM_BORROW_SCALAR: usize = 0;
+pub const LCNF_PARAM_POINTERS: usize = 3;
+pub const LCNF_PARAM_SCALAR_BYTES: usize = 1;
+
+pub const LCNF_SIGNATURE_NAME: usize = 0;
+pub const LCNF_SIGNATURE_LEVEL_PARAMS: usize = 1;
+pub const LCNF_SIGNATURE_TYPE: usize = 2;
+pub const LCNF_SIGNATURE_PARAMS: usize = 3;
+pub const LCNF_SIGNATURE_SAFE_SCALAR: usize = 0;
+pub const LCNF_SIGNATURE_POINTERS: usize = 4;
+pub const LCNF_SIGNATURE_SCALAR_BYTES: usize = 1;
+
 pub const DECL_MAP_EXTENSION: &str = "Lean.IR.declMapExt";
+pub const LCNF_IMPURE_SIGNATURE_EXTENSION: &str = "Lean.Compiler.LCNF.impureSigExt";

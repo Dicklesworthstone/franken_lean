@@ -22,8 +22,8 @@
 //! The canonical Nat relation retains `WellFounded.Nat.fix`; other relations use
 //! the checked `invImage` and `WellFounded.fix` construction. Fixed parameters
 //! form one common unreordered
-//! prefix (`fixedArePrefix`), including the common section closure, and identical
-//! written universe parameters. Every other recursive component is a typed refusal, never a
+//! prefix (`fixedArePrefix`), including the common section closure, and one
+//! checked universe telescope, including auto-bound universes. Every other recursive component is a typed refusal, never a
 //! partial or unsafe fallback.
 use super::*;
 use std::sync::Arc;
@@ -40,6 +40,20 @@ pub(in crate::source) enum MemberHint {
     /// `termination_by e`: the measured member, or why it could not be measured.
     /// A failure matters only if the member turns out to be recursive.
     Measured(Result<Measured, NatDefinitionElabError>),
+    /// Elaborate a written measure only after its original body has fixed the
+    /// parameter universes. This state never reaches component planning.
+    Pending(Arc<PendingMeasure>),
+}
+
+pub(in crate::source) struct PendingMeasure {
+    parameters: Vec<LocalDecl>,
+    syntax: Syntax,
+    expected: Option<Expr>,
+    aliases: Vec<Option<Name>>,
+    measure: Syntax,
+    header_parameters: usize,
+    allowed: bool,
+    locals: LocalContext,
 }
 
 #[derive(Clone)]
@@ -81,15 +95,24 @@ pub(in crate::source) struct MutualMember {
     index: usize,
     captures: Vec<LocalDecl>,
     piece: Option<Expr>,
+    /// A discarded GuessLex pass classifies each call without manufacturing a
+    /// proof of a weak comparison or publishing an unfinished fixpoint.
+    probing: bool,
 }
 
 impl MutualMember {
-    pub(in crate::source) fn new(plan: Arc<Plan>, index: usize, captures: Vec<LocalDecl>) -> Self {
+    pub(in crate::source) fn new(
+        plan: Arc<Plan>,
+        index: usize,
+        captures: Vec<LocalDecl>,
+        probing: bool,
+    ) -> Self {
         Self {
             plan,
             index,
             captures,
             piece: None,
+            probing,
         }
     }
 
@@ -342,10 +365,57 @@ fn strip_metadata(mut expr: &Expr) -> &Expr {
 }
 
 impl Context {
-    /// The group's body pass: record this member's hint. A measure is elaborated
-    /// in a discarded probe, at the actual parameters the well-founded engine
-    /// would bind; a recoverable failure is kept until the member's component
-    /// is known, since the pin ignores the hints of a nonrecursive definition.
+    /// GuessLex's direct-Nat `simpleMeasures`, in the varying telescope's
+    /// order. The common fixed prefix has already been computed from all call
+    /// edges. Other SizeOf measures retain their explicit-measure boundary:
+    /// skipping one could select a different earlier lexicographic prefix.
+    pub(in crate::source) fn mutual_nat_measures(
+        &mut self,
+        type_: &Expr,
+        arity: usize,
+        fixed: usize,
+    ) -> Result<Vec<Expr>, NatDefinitionElabError> {
+        let saved = self.txn.lctx.clone();
+        let result = (|| {
+            self.txn.lctx = LocalContext::new();
+            let parameters = self.open_mutual_fixed(type_, arity)?;
+            if !self.native_nat_well_founded_relation()? {
+                return Err(error(RecursionError::WellFoundedRelationUnsupported));
+            }
+            let mut measures = Vec::new();
+            for parameter in parameters.iter().skip(fixed) {
+                self.tick()?;
+                let type_ = self.reduce_source_head(
+                    &parameter.type_,
+                    UnificationTransparency::Abbreviations,
+                    true,
+                )?;
+                if !matches!(type_.node(), ExprNode::Const { name, levels }
+                    if name == &Name::from_components(["Nat"]) && levels.is_empty())
+                    || !self.native_nat_size_measure(parameter)?
+                {
+                    return Err(unsupported(
+                        "inferred measures over non-Nat or nonstandard SizeOf parameters",
+                    ));
+                }
+                measures.push(self.close_mutual_fixed(
+                    &Expr::fvar(parameter.id.clone()),
+                    &parameters,
+                    true,
+                )?);
+            }
+            if measures.is_empty() {
+                return Err(error(RecursionError::WellFoundedMeasureRequired));
+            }
+            Ok(measures)
+        })();
+        self.txn.lctx = saved;
+        result
+    }
+
+    /// Save the original parameter scope for a written measure. Body elaboration
+    /// must generalize its universe metavariables first: a cloned early probe
+    /// cannot export unresolved universe identities into the body context.
     pub(in crate::source) fn record_mutual_member_hint(
         &mut self,
         parameters: &[LocalDecl],
@@ -361,28 +431,63 @@ impl Context {
                 MemberHint::DecreasingOnly
             }
             Some(TerminationHint::WellFounded { hint, allowed }) => {
-                let mut probe = self.clone();
-                let measured = probe.measure_mutual_member(
-                    parameters,
-                    syntax,
+                // Context checkpoints share this owned source snapshot instead
+                // of repeatedly deep-cloning its syntax tree.
+                MemberHint::Pending(Arc::new(PendingMeasure {
+                    parameters: parameters.to_vec(),
+                    syntax: syntax.clone(),
                     expected,
-                    hint,
+                    aliases: hint.aliases.clone(),
+                    measure: hint.measure.ok_or_else(scope)?.clone(),
                     header_parameters,
-                    *allowed,
-                );
-                self.txn.budget.heartbeats_consumed = probe.txn.budget.heartbeats_consumed;
-                match measured {
-                    Err(problem) if !tactics::backtrack::recoverable(&problem) => {
-                        return Err(problem);
-                    }
-                    measured => MemberHint::Measured(measured),
-                }
+                    allowed: *allowed,
+                    locals: self.txn.lctx.clone(),
+                }))
             }
         };
         if let Some(state) = self.partial.as_mut() {
             state.member_hint = Some(observed);
         }
         Ok(())
+    }
+
+    /// A discarded probe shares the completed body's assignments, but restores
+    /// exactly the lexical scope in which its hint was written. Only a closed
+    /// measure and spent work escape; a recoverable failure still matters only
+    /// for a recursive component, as at the pin.
+    pub(in crate::source) fn finish_mutual_member_hint(
+        &mut self,
+    ) -> Result<MemberHint, NatDefinitionElabError> {
+        let hint = self
+            .partial
+            .as_mut()
+            .and_then(|state| state.member_hint.take())
+            .unwrap_or(MemberHint::None);
+        let MemberHint::Pending(pending) = hint else {
+            return Ok(hint);
+        };
+        let mut probe = self.clone();
+        probe.txn.lctx = pending.locals.clone();
+        let hint = Hint {
+            aliases: pending.aliases.clone(),
+            measure: Some(&pending.measure),
+            decreasing: None,
+            inferred: None,
+            guess: Guess::None,
+        };
+        let measured = probe.measure_mutual_member(
+            &pending.parameters,
+            &pending.syntax,
+            pending.expected.clone(),
+            &hint,
+            pending.header_parameters,
+            pending.allowed,
+        );
+        self.txn.budget.heartbeats_consumed = probe.txn.budget.heartbeats_consumed;
+        match measured {
+            Err(problem) if !tactics::backtrack::recoverable(&problem) => Err(problem),
+            measured => Ok(MemberHint::Measured(measured)),
+        }
     }
 
     fn measure_mutual_member(
@@ -953,17 +1058,7 @@ impl Context {
             result?
         };
         Ok(self
-            .mutual_apply(
-                &["PSum", "casesOn"],
-                [
-                    left,
-                    right,
-                    motive.clone(),
-                    major.clone(),
-                    first.clone(),
-                    minor,
-                ],
-            )?
+            .well_founded_cases_on("PSum", domain, motive, major, &[first.clone(), minor])?
             .value)
     }
 
@@ -1214,12 +1309,14 @@ impl Context {
         if plan.names.get(index) != Some(name) || self.well_founded.is_some() {
             return Err(scope());
         }
-        let Some(TerminationHint::WellFounded {
-            hint,
-            allowed: true,
-        }) = hint
-        else {
-            return Err(scope());
+        let automatic = Hint::automatic();
+        let hint = match hint {
+            Some(TerminationHint::WellFounded {
+                hint,
+                allowed: true,
+            }) => hint,
+            None | Some(TerminationHint::Automatic) => &automatic,
+            _ => return Err(scope()),
         };
         let mut parameters = parameters.to_vec();
         let (body, expected, lambdas) =
@@ -1234,6 +1331,20 @@ impl Context {
                 "a member binding the same parameters in its body pass and its fixpoint",
             ));
         }
+        // Replaying the source header introduces fresh auto-bound universe
+        // metavariables. Bind its entire telescope, including section captures
+        // and leading body lambdas, to the already planned member type before
+        // opening any shared fixpoint terms. Comparing only the result would
+        // leave the Sort of an auto-bound type parameter unconstrained.
+        for level in &plan.level_params {
+            self.tick()?;
+            if !self.level_params.contains(level) {
+                self.level_params.push(level.clone());
+            }
+        }
+        let signature = self.close_mutual_fixed(&expected, &parameters, false)?;
+        self.unify_source_batch(&[(signature, plan.types[index].clone())], true)
+            .map_err(|problem| failure(SourceInferenceError::Unification(Box::new(problem))))?;
         let fixed_values: Vec<_> = parameters[..plan.fixed]
             .iter()
             .map(|parameter| Expr::fvar(parameter.id.clone()))
@@ -1377,8 +1488,39 @@ impl Context {
                     }
                 };
                 let prepared = self.lower_pattern_matrices(proof)?;
+                if member.probing {
+                    let mut strict = 0;
+                    let mut unknown = false;
+                    let varying: Vec<_> = (plan.fixed..parameters.len()).collect();
+                    let complex = self.complex_measure_possible(&goals, &parameters, &varying)?;
+                    for goal in &goals {
+                        self.tick()?;
+                        match self.classify_call(&prepared, goal, &goal.target, false)? {
+                            Ok(CallRelation::Lt) => strict += 1,
+                            Ok(CallRelation::Eq | CallRelation::Le) => {}
+                            Err(_) => {
+                                unknown = true;
+                                break;
+                            }
+                        }
+                    }
+                    return Err(error(RecursionError::MutualMeasureProbe {
+                        strict,
+                        total: goals.len(),
+                        unknown,
+                        complex,
+                    }));
+                }
                 self.prove_decreasing_goals(&prepared, goals, hint.decreasing.is_some())?;
                 self.assign_decreasing_transports(obligations)?;
+            }
+            if member.probing {
+                return Err(error(RecursionError::MutualMeasureProbe {
+                    strict: 0,
+                    total: 0,
+                    unknown: false,
+                    complex: false,
+                }));
             }
             let mut value = self.instantiate(&value)?;
             self.require_resolved_terms(std::slice::from_ref(&value))?;

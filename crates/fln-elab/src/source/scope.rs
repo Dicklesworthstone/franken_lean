@@ -612,6 +612,29 @@ impl Context {
                         pending.push((&args[1], false));
                         continue;
                     }
+                    // Match discriminants and alternative bodies reach the
+                    // ordinary term elaborator with their complete identifier
+                    // metadata. Only the discriminant's optional name and the
+                    // alternative's patterns use the specialized name paths.
+                    // Reset this boundary even inside a generated match or
+                    // equation block; nested tactic syntax establishes its own
+                    // restrictions when visited below.
+                    let term_child =
+                        if kind == &parser_kind(&["Term", "matchDiscr"]) && args.len() == 2 {
+                            Some(1)
+                        } else if kind == &parser_kind(&["Term", "matchAlt"]) && args.len() == 4 {
+                            Some(3)
+                        } else {
+                            None
+                        };
+                    if let Some(term_child) = term_child {
+                        pending.extend(
+                            args.iter()
+                                .enumerate()
+                                .map(|(index, arg)| (arg, index != term_child)),
+                        );
+                        continue;
+                    }
                     let specialized = specialized
                         || kind.parent() == parser_kind(&["Tactic"])
                         || kind == &parser_kind(&["Term", "match"])
@@ -705,20 +728,18 @@ impl Context {
             return Err(failure(SourceInferenceError::Scope));
         };
         let ordinary = self.resolve_source_candidates(val)?;
-        let mut declaration = None;
-        let mut multiple = false;
+        let mut declarations = Vec::new();
         for entry in preresolved {
             self.tick()?;
             if let Preresolved::Decl { name, fields } = entry {
-                multiple |= declaration.is_some();
-                declaration = Some((name, fields));
+                declarations.push((name, fields));
             }
         }
-        let Some((target, fields)) = declaration else {
+        if declarations.is_empty() {
             return ordinary
                 .map(|name| (name, false))
                 .map_err(|candidates| error(ScopeError::Ambiguous(val.clone(), candidates)));
-        };
+        }
         if let Ok(Some(name)) = &ordinary
             && !is_root_qualified(val)
             && ((!val.has_macro_scopes() && self.txn.lctx.find_by_user_name(name).is_some())
@@ -745,27 +766,41 @@ impl Context {
                 feature,
             })
         };
-        if multiple {
-            return Err(unsupported("overloaded pre-resolved declarations"));
+        // Validate the complete captured set before trying any interpretation.
+        // An unsupported entry cannot silently disappear and make another one
+        // appear to be the unique successful overload.
+        for (target, fields) in &declarations {
+            if !fields.is_empty() {
+                return Err(unsupported("pre-resolved field projections"));
+            }
+            if self
+                .source_scope
+                .variables
+                .locals()
+                .find_by_user_name(target)
+                .is_some()
+            {
+                return Err(unsupported("captured section-variable identities"));
+            }
+            if !self.txn.env.contains(target)
+                && super::equation_theorems::target(&self.txn.env, target).is_none()
+            {
+                return Err(unsupported("an available exact declaration target"));
+            }
         }
-        if !fields.is_empty() {
-            return Err(unsupported("pre-resolved field projections"));
+        // Term.resolveName's mkConsts prepends each .decl to the resolutions.
+        // Keep that order, including repeated candidates, for the same overload
+        // trials and ambiguity diagnostics as the pin.
+        let mut candidates: Vec<Name> = declarations
+            .into_iter()
+            .rev()
+            .map(|(target, _)| target.clone())
+            .collect();
+        if candidates.len() == 1 {
+            Ok((candidates.pop(), true))
+        } else {
+            Err(error(ScopeError::Ambiguous(val.clone(), candidates)))
         }
-        if self
-            .source_scope
-            .variables
-            .locals()
-            .find_by_user_name(target)
-            .is_some()
-        {
-            return Err(unsupported("captured section-variable identities"));
-        }
-        if !self.txn.env.contains(target)
-            && super::equation_theorems::target(&self.txn.env, target).is_none()
-        {
-            return Err(unsupported("an available exact declaration target"));
-        }
-        Ok((Some(target.clone()), true))
     }
 
     /// Probe a single global candidate before falling back to full term elaboration.

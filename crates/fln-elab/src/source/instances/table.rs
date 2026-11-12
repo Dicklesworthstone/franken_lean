@@ -8,8 +8,9 @@
 //! Fresh, typed output holes are alpha-keyed; their selected values are replayed
 //! by native unification, never by copying assignments. Cached open answers keep
 //! lazy search continuations. Independent universe variants may share answer
-//! keys without changing cycle-key equality. Open inputs, newly opened binders and
-//! pending equations remain untabled.
+//! keys without changing cycle-key equality. Open inputs, prerequisite binders and
+//! pending equations remain untabled. A closed root with unused binders retains
+//! its telescope identity until the pin's unused-argument lookup removes it.
 //! Exhausted entries mean every candidate was tried under that exact key, not
 //! that a resource limit, cancellation or temporarily blocked input was seen.
 use super::*;
@@ -27,6 +28,7 @@ pub(super) struct Key {
     output_types: Vec<Expr>,
     syntax_units: usize,
     locals: LocalContext,
+    root_telescope: Vec<LocalDecl>,
     ancestors: Vec<(Expr, Vec<Expr>)>,
 }
 
@@ -38,6 +40,7 @@ impl PartialEq for Key {
         self.expected == other.expected
             && self.output_types == other.output_types
             && self.locals == other.locals
+            && self.root_telescope == other.root_telescope
             && self.ancestors == other.ancestors
     }
 }
@@ -48,6 +51,7 @@ impl Key {
         1 + self.syntax_units
             + self.output_types.len()
             + self.locals.len()
+            + self.root_telescope.len()
             + self
                 .ancestors
                 .iter()
@@ -57,6 +61,11 @@ impl Key {
 
     pub(super) fn bucket(&self) -> &Expr {
         &self.expected
+    }
+
+    pub(super) fn with_root_telescope(mut self, binders: &[LocalDecl]) -> Self {
+        self.root_telescope = binders.to_vec();
+        self
     }
 }
 
@@ -98,12 +107,17 @@ fn replayable_target(context: &mut Context, frame: &Frame) -> Result<bool, NatDe
     }
 }
 
-fn ground_locals(
-    context: &mut Context,
-    locals: &LocalContext,
-) -> Result<bool, NatDefinitionElabError> {
-    for local in locals.decls() {
+fn ground_locals(context: &mut Context, saved: &Context) -> Result<bool, NatDefinitionElabError> {
+    for local in saved.txn.lctx.decls() {
         context.tick()?;
+        // An inferred declaration's private self parameter has a provisional
+        // type. It is never an instance candidate, so that unsolved type must
+        // not force ordinary source inference back to depth-first search.
+        // The complete local context, including this parameter, stays in the
+        // key; all user locals must still be ground before answers are shared.
+        if saved.is_private_self(&local.id) && local.value.is_none() {
+            continue;
+        }
         if !ground(&local.type_) || local.value.as_ref().is_some_and(|value| !ground(value)) {
             return Ok(false);
         }
@@ -125,7 +139,7 @@ pub(super) fn same_goal(
     if !left.binders.is_empty()
         || !right.binders.is_empty()
         || left.base.txn.lctx != right.base.txn.lctx
-        || !ground_locals(context, &left.base.txn.lctx)?
+        || !ground_locals(context, &left.base)?
     {
         return Ok(false);
     }
@@ -177,18 +191,25 @@ pub(super) fn replay_outputs(
 /// first requested it. Cycles become waiters, so this key needs no DFS cycle
 /// path. The outer query is keyed by its preprocessed outputs; prerequisites
 /// retain the original typed output pattern, including known output values.
+/// An unused root telescope is opened once for the search and remains part of
+/// its key. Its body-only prerequisites must not collide with that root until
+/// the full, unpruned query has been looked up. Dependent or open quantified
+/// queries need scope abstraction and remain outside this fragment.
 pub(super) fn shared_key(
     context: &mut Context,
     frame: &Frame,
     outer: bool,
 ) -> Result<Option<Key>, NatDefinitionElabError> {
     context.tick()?;
-    if !frame.binders.is_empty()
+    if (!outer && !frame.binders.is_empty())
         || !frame.base.equations.is_empty()
         || frame.base.txn.lctx.len() >= MAX_KEY_UNITS
         || !replayable_target(context, frame)?
-        || !ground_locals(context, &frame.base.txn.lctx)?
+        || !ground_locals(context, &frame.base)?
     {
+        return Ok(None);
+    }
+    if !frame.binders.is_empty() && !independent_ground_target(context, frame, &frame.binders)? {
         return Ok(None);
     }
     let prepared;
@@ -209,9 +230,34 @@ pub(super) fn shared_key(
         output_types: canonical.types,
         syntax_units: canonical.units,
         locals: frame.base.txn.lctx.clone(),
+        root_telescope: frame.binders.clone(),
         ancestors: Vec::new(),
     };
     Ok((key.units() <= MAX_KEY_UNITS).then_some(key))
+}
+
+/// The ground fragment makes the pin's `removeUnusedArguments?` exact without
+/// representing lifted metavariables (`?arg xs`). A dependent target or any
+/// expression/universe hole keeps the existing search strategy for the entire
+/// invocation, rather than silently erasing its dependence on the telescope.
+pub(super) fn independent_ground_target(
+    context: &mut Context,
+    frame: &Frame,
+    binders: &[LocalDecl],
+) -> Result<bool, NatDefinitionElabError> {
+    context.tick()?;
+    if !ground(&frame.target) || !ground(&frame.expected) {
+        return Ok(false);
+    }
+    let target_reads = context.elimination_reads(&frame.target)?;
+    let expected_reads = context.elimination_reads(&frame.expected)?;
+    for binder in binders {
+        context.tick()?;
+        if target_reads.contains(&binder.id) || expected_reads.contains(&binder.id) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn key(
@@ -231,7 +277,7 @@ fn key(
     if 1 + locals.len() + ancestors.len() > MAX_KEY_UNITS {
         return Ok(None);
     }
-    if !ground_locals(context, locals)? {
+    if !ground_locals(context, &frame.base)? {
         return Ok(None);
     }
     let Some(canonical) = outputs::canonical_with_ancestors(context, frame, ancestors)? else {
@@ -268,6 +314,7 @@ fn key(
         output_types: canonical.types,
         syntax_units,
         locals: locals.clone(),
+        root_telescope: Vec::new(),
         ancestors: path,
     }))
 }
@@ -530,6 +577,102 @@ mod tests {
         assert!(table.exhausted(&mut context, &target, &path).is_err());
         assert_eq!(table.entries, 0);
         assert!(table.answers.is_empty());
+    }
+
+    #[test]
+    fn provisional_private_self_types_do_not_disable_shared_queries() {
+        let mut context = context();
+        let mut target = frame("C");
+        let id = FVarId(Name::from_components(["privateSelf"]));
+        let provisional = Expr::mvar(MVarId(Name::from_components(["resultType"])));
+        target.base.txn.lctx.add_param(
+            id.clone(),
+            Name::anonymous(),
+            provisional.clone(),
+            BinderInfo::Default,
+        );
+        assert!(shared_key(&mut context, &target, true).unwrap().is_none());
+        target.base.private_self_ids.insert(id);
+        let stored = shared_key(&mut context, &target, true).unwrap().unwrap();
+        assert_eq!(stored.locals, target.base.txn.lctx);
+        assert!(Some(stored) != shared_key(&mut context, &frame("C"), true).unwrap());
+
+        let user = FVarId(Name::from_components(["user"]));
+        target
+            .base
+            .txn
+            .lctx
+            .add_param(user.clone(), user.0, provisional, BinderInfo::Default);
+        assert!(shared_key(&mut context, &target, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn quantified_root_identity_survives_until_unused_argument_lookup() {
+        let mut context = context();
+        let mut target = frame("C");
+        let id = FVarId(Name::from_components(["argument"]));
+        let binder = target
+            .base
+            .txn
+            .lctx
+            .add_param(
+                id.clone(),
+                id.0.clone(),
+                constant("Nat"),
+                BinderInfo::Default,
+            )
+            .clone();
+        target.binders.push(binder);
+        let full = shared_key(&mut context, &target, true).unwrap().unwrap();
+        assert!(shared_key(&mut context, &target, false).unwrap().is_none());
+
+        let mut body = target.clone();
+        body.binders.clear();
+        let pruned = shared_key(&mut context, &body, false).unwrap().unwrap();
+        assert!(full != pruned);
+        assert_eq!(full.units(), pruned.units() + 1);
+        assert!(full == pruned.with_root_telescope(&target.binders));
+
+        // Exact binder types and identities matter even when the result does
+        // not mention the argument. Neither can be reused across scopes.
+        let mut other = target.binders.clone();
+        other[0].type_ = constant("Bool");
+        assert!(full != full.clone().with_root_telescope(&other));
+        other[0] = target.binders[0].clone();
+        other[0].id = FVarId(Name::from_components(["otherArgument"]));
+        assert!(full != full.clone().with_root_telescope(&other));
+    }
+
+    #[test]
+    fn dependent_and_open_quantified_targets_keep_scope_aware_fallback() {
+        let mut context = context();
+        let mut target = frame("C");
+        let id = FVarId(Name::from_components(["argument"]));
+        let binder = target
+            .base
+            .txn
+            .lctx
+            .add_param(
+                id.clone(),
+                id.0.clone(),
+                constant("Nat"),
+                BinderInfo::Default,
+            )
+            .clone();
+        target.binders.push(binder);
+        for argument in [
+            Expr::fvar(id),
+            Expr::mvar(MVarId(Name::from_components(["unknownOutput"]))),
+            Expr::sort(Level::mvar(LMVarId(Name::from_components([
+                "unknownLevel",
+            ])))),
+        ] {
+            target.expected = Expr::app(constant("C"), argument);
+            target.target = target.expected.clone();
+            target.key = target.expected.clone();
+            assert!(shared_key(&mut context, &target, true).unwrap().is_none());
+            assert!(!independent_ground_target(&mut context, &target, &target.binders).unwrap());
+        }
     }
 
     #[test]

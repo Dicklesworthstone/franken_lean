@@ -1,7 +1,7 @@
 //! Ordinary mutual predefinitions, following MutualDef's header/body boundary
 //! and dependency partition. Headers are private candidate data, never
 //! temporary environment axioms. Same-family structural components share one
-//! course-of-values recursor; components with explicit `termination_by` measures
+//! course-of-values recursor; explicit measures and inferred direct-Nat measures
 //! share one well-founded fixpoint. Unsupported components are never downgraded
 //! to partial logical definitions.
 use super::*;
@@ -214,13 +214,7 @@ fn elaborate_with_meter(
             Some(&mut definition.value),
         )?;
         universes.push((context.level_params.clone(), context.explicit_levels));
-        hints.push(
-            context
-                .partial
-                .as_ref()
-                .and_then(|state| state.member_hint.clone())
-                .unwrap_or(MemberHint::None),
-        );
+        hints.push(context.finish_mutual_member_hint()?);
         meter.txn.budget = context.txn.budget;
         bodies.push(definition);
     }
@@ -302,7 +296,6 @@ fn elaborate_with_meter(
                 bodies: &bodies,
                 hints: &hints,
                 headers: &headers,
-                level_names: level_names.as_deref().unwrap_or_default(),
             };
             let structural = component
                 .iter()
@@ -390,7 +383,6 @@ struct Parts<'a> {
     bodies: &'a [DefinitionVal],
     hints: &'a [MemberHint],
     headers: &'a [ConstantVal],
-    level_names: &'a [Name],
 }
 
 /// Build every component against one below dictionary, then publish the fully checked
@@ -465,9 +457,9 @@ fn mutual_structural(
         return Err(refusal("fresh distinct ordinary mutual names"));
     }
     // An indexed family's major follows its varying index binders. Try each source
-    // position in order; a candidate must account for every preceding varying binder
-    // as one of that family's independent indices. Each attempt has fresh contexts,
-    // and failed attempts still charge the shared budget.
+    // position in order; preceding varying binders are either independent family
+    // indices or arguments generalized within each component. Each attempt has fresh
+    // contexts, and failed attempts still charge the shared budget.
     let candidates = arities.iter().copied().min().unwrap_or(0);
     let mut last = None;
     for decreasing in fixed..candidates {
@@ -675,7 +667,7 @@ fn mutual_implementations(
     Ok(implementations)
 }
 
-/// A recursive component of two or more definitions with explicit measures:
+/// A recursive component of two or more definitions with explicit or inferred measures:
 /// the pin's `wfRecursion` over the component (see
 /// `recursion::well_founded::mutual`). Returns `<first>._mutual`, the members'
 /// wrappers in SCC order, and their `_unsafe_rec` executable companions.
@@ -688,12 +680,11 @@ fn mutual_well_founded(
 ) -> Result<(DefinitionVal, Vec<DefinitionVal>, Vec<DefinitionVal>), NatDefinitionElabError> {
     let Parts {
         group,
-        members,
+        members: _,
         names,
         bodies,
         hints,
         headers,
-        level_names,
     } = *parts;
     let unsupported = |shape| {
         failure(SourceInferenceError::Recursion(
@@ -706,14 +697,9 @@ fn mutual_well_founded(
         ));
     }
     let component_hints: Vec<_> = component.iter().map(|&index| &hints[index]).collect();
-    if component_hints
+    let inferred = component_hints
         .iter()
-        .all(|hint| matches!(hint, MemberHint::None))
-    {
-        return Err(refusal(
-            "recursive ordinary mutual component requires termination elaboration",
-        ));
-    }
+        .all(|hint| matches!(hint, MemberHint::None | MemberHint::DecreasingOnly));
     if component_hints
         .iter()
         .any(|hint| matches!(hint, MemberHint::Structural))
@@ -725,14 +711,14 @@ fn mutual_well_founded(
         match hint {
             MemberHint::Measured(Ok(member)) => measured.push(member.clone()),
             MemberHint::Measured(Err(problem)) => return Err(problem.clone()),
-            // The pin reports an incomplete set of termination hints and
-            // guesses every measure (GuessLex), which this group does not.
+            MemberHint::None | MemberHint::DecreasingOnly if inferred => {}
+            // A mixture of explicit and missing hints is an error at the pin.
+            // Do not infer a measure and silently turn that error into acceptance.
             MemberHint::None | MemberHint::DecreasingOnly => {
-                return Err(unsupported(
-                    "a member without a termination_by measure (the pin's GuessLex)",
-                ));
+                return Err(unsupported("an incomplete set of termination_by measures"));
             }
             MemberHint::Structural => return Err(unsupported("structural mutual recursion")),
+            MemberHint::Pending(_) => return Err(failure(SourceInferenceError::Scope)),
         }
     }
     // Codomains and the selected relation are checked by the shared planner,
@@ -762,7 +748,7 @@ fn mutual_well_founded(
         }
     }
     let levels = bodies[component[0]].base.level_params.clone();
-    let written_levels: Vec<_> = levels
+    let header_levels: Vec<_> = levels
         .iter()
         .filter(|level| {
             !group
@@ -773,32 +759,63 @@ fn mutual_well_founded(
         .cloned()
         .collect();
     for &index in component {
-        if headers[index].level_params != level_names
-            || written_levels != level_names
-            || bodies[index].base.level_params != levels
+        if headers[index].level_params != header_levels || bodies[index].base.level_params != levels
         {
-            return Err(unsupported(
-                "universe parameters written identically on every member",
-            ));
+            return Err(unsupported("one universe telescope for all members"));
+        }
+    }
+    // Headers and bodies were elaborated independently. Equal parameter names
+    // alone do not establish a common universe telescope: each recursive call
+    // must instantiate its peer at those same levels. In particular, never
+    // silently replace a polymorphic call's instantiation when packing it into
+    // the single shared fixpoint. Both checked executable companions retain
+    // the complete original terms and their universe applications.
+    let recursive_levels: Vec<_> = levels.iter().cloned().map(Level::param).collect();
+    for &index in component {
+        for root in [&bodies[index].base.type_, &bodies[index].value] {
+            map(meter, root, &|_, expr| {
+                if let ExprNode::Const { name, levels } = expr.node()
+                    && component.iter().any(|&target| names[target] == *name)
+                    && levels != &recursive_levels
+                {
+                    return Err(unsupported("polymorphic recursive calls"));
+                }
+                Ok(None)
+            })?;
         }
     }
     let component_names: Vec<_> = component
         .iter()
         .map(|&index| names[index].clone())
         .collect();
-    let arities: Vec<_> = measured
-        .iter()
-        .map(|member| {
-            member
-                .arity
-                .checked_add(captures.len())
-                .ok_or_else(|| failure(SourceInferenceError::Scope))
-        })
-        .collect::<Result<_, _>>()?;
     let values: Vec<_> = component
         .iter()
         .map(|&index| bodies[index].value.clone())
         .collect();
+    let arities: Vec<_> = if inferred {
+        let mut arities = Vec::new();
+        for value in &values {
+            let mut cursor = value;
+            let mut arity = 0;
+            while let ExprNode::Lam { body, .. } = cursor.node() {
+                meter.tick()?;
+                arity += 1;
+                cursor = body;
+            }
+            arities.push(arity);
+        }
+        arities
+    } else {
+        measured
+            .iter()
+            .map(|member| {
+                member
+                    .arity
+                    .checked_add(captures.len())
+                    .ok_or_else(|| failure(SourceInferenceError::Scope))
+            })
+            .collect::<Result<_, _>>()?
+    };
     let fixed = meter
         .mutual_fixed_prefix(&values, &arities, &component_names)?
         .ok_or_else(|| {
@@ -822,68 +839,114 @@ fn mutual_well_founded(
         .iter()
         .map(|&index| bodies[index].base.type_.clone())
         .collect();
-    let measures: Vec<_> = measured
-        .iter()
-        .map(|member| meter.close_mutual_fixed(&member.measure, &captures, true))
-        .collect::<Result<_, _>>()?;
-    let mut planner = Context::scoped(environment, kernel, scope)?;
-    planner.txn.budget = meter.txn.budget.clone();
-    let plan = std::sync::Arc::new(planner.mutual_well_founded_plan(
-        component_names.clone(),
-        types,
-        arities,
-        &measures,
-        fixed,
-        levels,
-    )?);
-    meter.txn.budget = planner.txn.budget;
+    let mut choices = Vec::new();
+    if inferred {
+        let mut planner = Context::scoped(environment, kernel, scope)?;
+        planner.txn.budget = meter.txn.budget.clone();
+        planner.level_params = levels.clone();
+        planner.explicit_levels = levels.len();
+        for (type_, &arity) in types.iter().zip(&arities) {
+            let result = planner.mutual_nat_measures(type_, arity, fixed);
+            meter.txn.budget = planner.txn.budget.clone();
+            choices.push(result?);
+        }
+    } else {
+        for member in &measured {
+            choices.push(vec![meter.close_mutual_fixed(
+                &member.measure,
+                &captures,
+                true,
+            )?]);
+        }
+    }
+    let combinations =
+        mutual_measure_combinations(&choices.iter().map(Vec::len).collect::<Vec<_>>())
+            .ok_or_else(|| unsupported("too many inferred measure combinations"))?;
+    let mut selected = None;
+    let mut complex = false;
+    for combination in combinations {
+        meter.tick()?;
+        // Complex measures are appended to each member's simple measures by
+        // GuessLex, so their uniform combinations precede these nonuniform
+        // ones. Never silently jump over an unsupported earlier candidate.
+        if complex && combination.iter().any(|index| index != &combination[0]) {
+            return Err(unsupported("earlier complex inferred measures"));
+        }
+        let measures: Vec<_> = choices
+            .iter()
+            .zip(&combination)
+            .map(|(choices, &index)| choices[index].clone())
+            .collect();
+        let mut planner = Context::scoped(environment, kernel, scope)?;
+        planner.txn.budget = meter.txn.budget.clone();
+        let planned = planner.mutual_well_founded_plan(
+            component_names.clone(),
+            types.clone(),
+            arities.clone(),
+            &measures,
+            fixed,
+            levels.clone(),
+        );
+        meter.txn.budget = planner.txn.budget;
+        let plan = std::sync::Arc::new(planned?);
+        if inferred {
+            let mut strict = 0;
+            let mut total = 0;
+            let mut unknown = false;
+            for (position, &index) in component.iter().enumerate() {
+                match mutual_well_founded_member(
+                    meter,
+                    (environment, kernel, scope),
+                    parts,
+                    plan.clone(),
+                    (position, index),
+                    &captures,
+                    true,
+                ) {
+                    Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
+                        recursion::RecursionError::MutualMeasureProbe {
+                            strict: member_strict,
+                            total: member_total,
+                            unknown: member_unknown,
+                            complex: member_complex,
+                        },
+                    ))) => {
+                        strict += member_strict;
+                        total += member_total;
+                        unknown |= member_unknown;
+                        complex |= member_complex;
+                    }
+                    Err(problem) => return Err(problem),
+                    Ok(_) => return Err(failure(SourceInferenceError::Scope)),
+                }
+            }
+            if unknown || strict == 0 {
+                continue;
+            }
+            if strict != total {
+                return Err(unsupported("an earlier lexicographic inferred measure"));
+            }
+        }
+        selected = Some(plan);
+        break;
+    }
+    let plan = selected.ok_or_else(|| {
+        failure(SourceInferenceError::Recursion(
+            recursion::RecursionError::WellFoundedMeasureSearchFailed,
+        ))
+    })?;
     let mut wrappers = Vec::new();
     let mut pieces = Vec::new();
     for (position, &index) in component.iter().enumerate() {
-        let member = &members[index];
-        let mut context = Context::scoped(environment, kernel, scope)?;
-        context.txn.budget = meter.txn.budget.clone();
-        // Termination proofs run after MutualClosure. Unused section locals
-        // are no longer in scope, even when their names could solve a goal.
-        context.txn.lctx = LocalContext::new();
-        for capture in &captures {
-            context.tick()?;
-            tactics::eliminate::add_local(&mut context.txn.lctx, capture);
-        }
-        context.partial = Some(State {
-            kind: Kind::Unsafe,
-            group: Some(group.clone()),
-            ordinary: true,
-            ..State::default()
-        });
-        context.mutual_member = Some(recursion::MutualMember::new(
+        let (wrapper, piece) = mutual_well_founded_member(
+            meter,
+            (environment, kernel, scope),
+            parts,
             plan.clone(),
-            position,
-            captures.clone(),
-        ));
-        let Declaration::Mutual(mut definitions) = definition_in_context(member, &mut context)?
-        else {
-            return Err(refusal("one ordinary body per mutual header"));
-        };
-        let (Some(mut wrapper), true) = (definitions.pop(), definitions.is_empty()) else {
-            return Err(refusal("one ordinary body per mutual header"));
-        };
-        if context.noncomputable_definition {
-            return Err(refusal("computable ordinary mutual definition"));
-        }
-        let piece = context
-            .mutual_member
-            .as_ref()
-            .and_then(|member| member.piece())
-            .cloned()
-            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-        meter.txn.budget = context.txn.budget;
-        wrapper.safety = DefinitionSafety::Safe;
-        wrapper.hints = ReducibilityHints::Regular(1);
-        wrapper.all = component_names.clone();
-        if wrapper.base.name != component_names[position] {
-            return Err(failure(SourceInferenceError::Scope));
-        }
+            (position, index),
+            &captures,
+            false,
+        )?;
         wrappers.push(wrapper);
         pieces.push(piece);
     }
@@ -899,10 +962,133 @@ fn mutual_well_founded(
     Ok((mutual, wrappers, implementations))
 }
 
+/// The pin's `generateCombinations?`: uniform measure positions first, then
+/// the remaining product in telescope order, with its 32-combination bound.
+fn mutual_measure_combinations(counts: &[usize]) -> Option<Vec<Vec<usize>>> {
+    if counts.is_empty() || counts.contains(&0) {
+        return Some(Vec::new());
+    }
+    let total = counts
+        .iter()
+        .try_fold(1usize, |total, count| total.checked_mul(*count))?;
+    if total > 32 {
+        return None;
+    }
+    let mut combinations = Vec::with_capacity(total);
+    for index in 0..*counts.iter().min()? {
+        combinations.push(vec![index; counts.len()]);
+    }
+    let mut current = vec![0; counts.len()];
+    loop {
+        if current.iter().any(|index| index != &current[0]) {
+            combinations.push(current.clone());
+        }
+        let mut position = counts.len();
+        loop {
+            if position == 0 {
+                return Some(combinations);
+            }
+            position -= 1;
+            current[position] += 1;
+            if current[position] < counts[position] {
+                break;
+            }
+            current[position] = 0;
+        }
+    }
+}
+
+/// Every candidate uses a fresh context over the same admitted predecessor.
+/// A failed probe retains spent work, but no assignments or unfinished proof
+/// can reach the selected component's declaration assembly.
+fn mutual_well_founded_member(
+    meter: &mut Context,
+    (environment, kernel, scope): (&Environment, Budget, &SourceScope),
+    parts: &Parts<'_>,
+    plan: std::sync::Arc<recursion::WellFoundedPlan>,
+    (position, index): (usize, usize),
+    captures: &[LocalDecl],
+    probing: bool,
+) -> Result<(DefinitionVal, Expr), NatDefinitionElabError> {
+    let mut context = Context::scoped(environment, kernel, scope)?;
+    context.txn.budget = meter.txn.budget.clone();
+    context.txn.nat_sub_model_cache = meter.txn.nat_sub_model_cache.clone();
+    let result = (|| {
+        // Termination proofs run after MutualClosure. Unused section locals
+        // are no longer in scope, even when their names could solve a goal.
+        context.txn.lctx = LocalContext::new();
+        for capture in captures {
+            context.tick()?;
+            tactics::eliminate::add_local(&mut context.txn.lctx, capture);
+        }
+        context.partial = Some(State {
+            kind: Kind::Unsafe,
+            group: Some(parts.group.clone()),
+            ordinary: true,
+            ..State::default()
+        });
+        context.mutual_member = Some(recursion::MutualMember::new(
+            plan.clone(),
+            position,
+            captures.to_vec(),
+            probing,
+        ));
+        let Declaration::Mutual(mut definitions) =
+            definition_in_context(&parts.members[index], &mut context)?
+        else {
+            return Err(refusal("one ordinary body per mutual header"));
+        };
+        let (Some(mut wrapper), true) = (definitions.pop(), definitions.is_empty()) else {
+            return Err(refusal("one ordinary body per mutual header"));
+        };
+        if context.noncomputable_definition {
+            return Err(refusal("computable ordinary mutual definition"));
+        }
+        let piece = context
+            .mutual_member
+            .as_ref()
+            .and_then(|member| member.piece())
+            .cloned()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        wrapper.safety = DefinitionSafety::Safe;
+        wrapper.hints = ReducibilityHints::Regular(1);
+        wrapper.all = plan.names.clone();
+        if wrapper.base.name != plan.names[position] {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        Ok((wrapper, piece))
+    })();
+    meter.txn.budget = context.txn.budget;
+    meter.txn.nat_sub_model_cache = context.txn.nat_sub_model_cache;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     const SOURCE: &[u8] = b"mutual\n def first (n : Nat) : Nat := last n\n def middle (n : Nat) : Nat := n\n def last (n : Nat) : Nat := n\nend";
+    #[test]
+    fn mutual_measure_order_matches_guesslex_uniform_then_product_order() {
+        assert_eq!(
+            mutual_measure_combinations(&[2, 3]),
+            Some(vec![
+                vec![0, 0],
+                vec![1, 1],
+                vec![0, 1],
+                vec![0, 2],
+                vec![1, 0],
+                vec![1, 2],
+            ]),
+        );
+        assert_eq!(
+            mutual_measure_combinations(&[1, 1, 1]),
+            Some(vec![vec![0, 0, 0]]),
+        );
+        assert_eq!(mutual_measure_combinations(&[4, 8]).unwrap().len(), 32);
+        assert!(mutual_measure_combinations(&[4, 9]).is_none());
+        assert!(mutual_measure_combinations(&[usize::MAX, 2]).is_none());
+    }
+
     #[test]
     fn acyclic_order_is_deterministic_and_every_candidate_is_safe() {
         let kernel = Budget::for_stack_bytes(2 * 1024 * 1024);

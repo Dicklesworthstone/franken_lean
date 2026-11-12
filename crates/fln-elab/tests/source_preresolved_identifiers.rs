@@ -149,16 +149,20 @@ fn declaration_metadata_overrides_namespace_spelling_without_reparsing() {
 #[test]
 fn local_spelling_wins_but_a_different_local_cannot_capture_the_exact_target() {
     let env = environment();
-    let syntax = parsed(
-        "def chosen (shadow : Nat) : Nat := shadow",
-        "shadow",
-        target("available"),
-    );
-    let chosen = checked(&syntax, &env);
-    let ExprNode::Lam { body, .. } = chosen.value.node() else {
-        panic!("expected a lambda");
-    };
-    assert_eq!(body, &Expr::bvar(0).unwrap());
+    let mut overloaded = target("available");
+    overloaded.extend(target("Client.shadow"));
+    for metadata in [target("available"), overloaded] {
+        let syntax = parsed(
+            "def chosen (shadow : Nat) : Nat := shadow",
+            "shadow",
+            metadata,
+        );
+        let chosen = checked(&syntax, &env);
+        let ExprNode::Lam { body, .. } = chosen.value.node() else {
+            panic!("expected a lambda");
+        };
+        assert_eq!(body, &Expr::bvar(0).unwrap());
+    }
 
     let syntax = parsed(
         "def chosen (available : Nat) : Nat := shadow",
@@ -247,19 +251,6 @@ fn unsupported_metadata_is_a_capability_stop_and_never_falls_back_to_spelling() 
             "pre-resolved field projections",
         ),
         (
-            vec![
-                Preresolved::Decl {
-                    name: n("available"),
-                    fields: vec![],
-                },
-                Preresolved::Decl {
-                    name: n("Client.shadow"),
-                    fields: vec![],
-                },
-            ],
-            "overloaded pre-resolved declarations",
-        ),
-        (
             target("Unavailable"),
             "an available exact declaration target",
         ),
@@ -275,6 +266,134 @@ fn unsupported_metadata_is_a_capability_stop_and_never_falls_back_to_spelling() 
             ),
             "{expected}"
         );
+    }
+}
+
+#[test]
+fn overloaded_metadata_keeps_all_exact_candidates_in_the_pins_order() {
+    let env = environment();
+    let mut metadata = target("available");
+    metadata.extend(target("Client.shadow"));
+    metadata.push(Preresolved::Namespace { ns: n("Ignored") });
+    let syntax = parsed("def chosen : Nat := shadow", "shadow", metadata);
+    let result = elaborate_definition_in_scope_with_budget(&syntax, &env, budget(), &scope());
+    assert!(
+        matches!(result,
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::AmbiguousTerm {
+                name, interpretations,
+            })) if name == n("shadow")
+                && interpretations == vec![n("Client.shadow"), n("available")]),
+        "Term.mkConsts reverses the declaration metadata before trying each candidate"
+    );
+}
+
+#[test]
+fn overloaded_metadata_keeps_imported_private_identities_out_of_textual_resolution() {
+    let private = Name::num(n("_private.Library"), 0).append_core(&n("choice"));
+    let mut declaration = definition(
+        "choice",
+        Expr::const_(n("Nat"), vec![]),
+        Expr::lit(Literal::Nat(NatLit::from_u64(7))),
+        vec![],
+    );
+    let Declaration::Defn(value) = &mut declaration else {
+        unreachable!();
+    };
+    value.base.name = private.clone();
+    value.all = vec![private.clone()];
+    let env = publish(&environment(), declaration);
+    let mut metadata = target("available");
+    metadata.push(Preresolved::Decl {
+        name: private.clone(),
+        fields: Vec::new(),
+    });
+    let syntax = parsed("def chosen : Nat := shadow", "shadow", metadata);
+    let result = elaborate_definition_in_scope_with_budget(&syntax, &env, budget(), &scope());
+    assert!(
+        matches!(&result,
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::AmbiguousTerm {
+                interpretations, ..
+            })) if interpretations == &vec![private, n("available")]),
+        "captured internal names resolve by identity, not by source components: {result:?}"
+    );
+}
+
+#[test]
+fn overloaded_metadata_is_used_for_whole_applications_and_explicit_universes() {
+    let u = n("u");
+    let domain = Expr::sort(Level::param(u.clone()));
+    let mut env = environment();
+    for name in ["First.identity", "Second.identity"] {
+        env = publish(
+            &env,
+            definition(
+                name,
+                Expr::forall_e(n("a"), domain.clone(), domain.clone(), BinderInfo::Default),
+                Expr::lam(
+                    n("a"),
+                    domain.clone(),
+                    Expr::bvar(0).unwrap(),
+                    BinderInfo::Default,
+                ),
+                vec![u.clone()],
+            ),
+        );
+    }
+    let mut metadata = target("First.identity");
+    metadata.extend(target("Second.identity"));
+    for source in [
+        "def chosen : Type := shadow Nat",
+        "def chosen : Type := shadow.{1} Nat",
+        "def chosen : Type := @shadow.{1} Nat",
+        "def chosen : Type → Type := @shadow.{1}",
+    ] {
+        let syntax = parsed(source, "shadow", metadata.clone());
+        let result = elaborate_definition_in_scope_with_budget(&syntax, &env, budget(), &scope());
+        assert!(
+            matches!(&result,
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::AmbiguousTerm {
+                    name, interpretations,
+                })) if name == &n("shadow")
+                    && interpretations == &vec![n("Second.identity"), n("First.identity")]),
+            "{source}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn every_preresolved_candidate_is_validated_before_overload_trials() {
+    let env = environment();
+    for (invalid, feature) in [
+        (
+            target("Unavailable"),
+            "an available exact declaration target",
+        ),
+        (
+            vec![Preresolved::Decl {
+                name: n("Client.shadow"),
+                fields: vec!["field".into()],
+            }],
+            "pre-resolved field projections",
+        ),
+    ] {
+        for invalid_first in [false, true] {
+            let mut metadata = target("available");
+            if invalid_first {
+                metadata.splice(0..0, invalid.clone());
+            } else {
+                metadata.extend(invalid.clone());
+            }
+            let syntax = parsed("def chosen : Nat := shadow", "shadow", metadata);
+            assert!(
+                matches!(
+                    elaborate_definition_in_scope_with_budget(&syntax, &env, budget(), &scope()),
+                    Err(NatDefinitionElabError::Inference(SourceInferenceError::PreresolvedReference {
+                        name, feature: actual,
+                    })) if name == n("shadow") && actual == feature
+                ),
+                "invalid candidate must not disappear: {feature}, first={invalid_first}"
+            );
+        }
     }
 }
 
@@ -296,7 +415,6 @@ fn specialized_name_only_paths_refuse_metadata_before_dropping_it() {
     let env = environment();
     for source in [
         "def chosen (x : Nat) : Nat := match x with | shadow => x",
-        "def chosen : Nat := by apply shadow",
         "def chosen : Nat → Nat | shadow => 13",
     ] {
         let syntax = parsed(source, "shadow", target("available"));
@@ -313,43 +431,49 @@ fn specialized_name_only_paths_refuse_metadata_before_dropping_it() {
 }
 
 #[test]
-fn exact_tactic_terms_preserve_declaration_metadata_and_local_priority() {
+fn exact_and_apply_tactic_terms_preserve_declaration_metadata_and_local_priority() {
     let env = environment();
-    let syntax = parsed(
-        "def chosen : Nat := by exact shadow",
-        "shadow",
-        target("available"),
-    );
-    assert_eq!(
-        checked(&syntax, &env).value,
-        Expr::const_(n("available"), vec![])
-    );
+    for tactic in ["exact", "apply"] {
+        let syntax = parsed(
+            &format!("def chosen : Nat := by {tactic} shadow"),
+            "shadow",
+            target("available"),
+        );
+        // `available` is 13, whereas spelling-only resolution in this scope
+        // would choose `Client.shadow`, whose value is 99. Both tactics send
+        // their complete operand through the ordinary identifier resolver.
+        assert_eq!(
+            checked(&syntax, &env).value,
+            Expr::const_(n("available"), vec![]),
+            "{tactic} must use the pre-resolved declaration, not its spelling"
+        );
 
-    // The same metadata still cannot capture a use-site local, and an
-    // unavailable exact declaration is never replaced with namespace lookup.
-    let local = parsed(
-        "def chosen (shadow : Nat) : Nat := by exact shadow",
-        "shadow",
-        target("available"),
-    );
-    let checked_local = checked(&local, &env);
-    assert!(
-        matches!(checked_local.value.node(), ExprNode::Lam { body, .. } if body == &Expr::bvar(0).unwrap())
-    );
-    let missing = parsed(
-        "def chosen : Nat := by exact shadow",
-        "shadow",
-        target("Unavailable"),
-    );
-    assert!(matches!(
-        elaborate_definition_in_scope_with_budget(&missing, &env, budget(), &scope()),
-        Err(NatDefinitionElabError::Inference(
-            SourceInferenceError::PreresolvedReference {
-                feature: "an available exact declaration target",
-                ..
-            }
-        ))
-    ));
+        // The same metadata still cannot capture a use-site local, and an
+        // unavailable exact declaration is never replaced with namespace lookup.
+        let local = parsed(
+            &format!("def chosen (shadow : Nat) : Nat := by {tactic} shadow"),
+            "shadow",
+            target("available"),
+        );
+        let checked_local = checked(&local, &env);
+        assert!(
+            matches!(checked_local.value.node(), ExprNode::Lam { body, .. } if body == &Expr::bvar(0).unwrap())
+        );
+        let missing = parsed(
+            &format!("def chosen : Nat := by {tactic} shadow"),
+            "shadow",
+            target("Unavailable"),
+        );
+        assert!(matches!(
+            elaborate_definition_in_scope_with_budget(&missing, &env, budget(), &scope()),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::PreresolvedReference {
+                    feature: "an available exact declaration target",
+                    ..
+                }
+            ))
+        ));
+    }
 }
 
 /// Deferred literal macros can introduce identifiers after the declaration's

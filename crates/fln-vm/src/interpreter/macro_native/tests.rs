@@ -5,7 +5,13 @@ use super::super::{
 use super::*;
 use fln_comp::flbc;
 
+mod identifiers;
+mod literals;
 mod lookup;
+mod numbers;
+mod patterns;
+mod sequences;
+mod source_queries;
 mod syntax_editing;
 
 fn atom(text: &str) -> Obj {
@@ -32,20 +38,67 @@ fn invoke(intrinsic: Intrinsic, args: &[Obj]) -> Obj {
     let id = match intrinsic {
         Intrinsic::NameStr => "mirror:Lean.Name.str._override",
         Intrinsic::MkStr1 => "mirror:Lean.Name.mkStr1",
+        Intrinsic::NameHasMacroScopes => "mirror:Lean.Name.hasMacroScopes",
+        Intrinsic::NameEraseMacroScopes => "mirror:Lean.Name.eraseMacroScopes",
         Intrinsic::AddMacroScope => "mirror:Lean.addMacroScope",
         Intrinsic::MacroAddMacroScope => "mirror:Lean.Macro.addMacroScope",
         Intrinsic::IsOfKind => "mirror:Lean.Syntax.isOfKind",
         Intrinsic::GetArg => "mirror:Lean.Syntax.getArg",
         Intrinsic::GetNumArgs => "mirror:Lean.Syntax.getNumArgs",
+        Intrinsic::IsNodeOf => "mirror:Lean.Syntax.isNodeOf",
+        Intrinsic::MatchesNull => "mirror:Lean.Syntax.matchesNull",
+        Intrinsic::MatchesIdent => "mirror:Lean.Syntax.matchesIdent",
+        Intrinsic::MatchesLit => "mirror:Lean.Syntax.matchesLit",
+        Intrinsic::GetOptional => "mirror:Lean.Syntax.getOptional?",
         Intrinsic::GetKind => "mirror:Lean.Syntax.getKind",
         Intrinsic::SetKind => "mirror:Lean.Syntax.setKind",
         Intrinsic::GetArgs => "mirror:Lean.Syntax.getArgs",
+        Intrinsic::GetSepArgs => "mirror:Lean.Syntax.getSepArgs",
+        Intrinsic::MkSepArray => "mirror:Lean.mkSepArray",
+        Intrinsic::MkSep => "mirror:Lean.Syntax.mkSep",
+        Intrinsic::SepArrayGetElems => "mirror:Lean.Syntax.SepArray.getElems._redArg",
+        Intrinsic::TSepArrayGetElems => "mirror:Lean.Syntax.TSepArray.getElems._redArg",
+        Intrinsic::SepArrayOfElems => "mirror:Lean.Syntax.SepArray.ofElems",
+        Intrinsic::TSepArrayPush => "mirror:Lean.Syntax.TSepArray.push._redArg",
         Intrinsic::SetArgs => "mirror:Lean.Syntax.setArgs",
         Intrinsic::SetArg => "mirror:Lean.Syntax.setArg",
         Intrinsic::IsAtom => "mirror:Lean.Syntax.isAtom",
         Intrinsic::GetAtomVal => "mirror:Lean.Syntax.getAtomVal",
         Intrinsic::SetAtomVal => "mirror:Lean.Syntax.setAtomVal",
         Intrinsic::GetHeadInfo => "mirror:Lean.Syntax.getHeadInfo",
+        Intrinsic::GetInfo => "mirror:Lean.Syntax.getInfo?",
+        Intrinsic::GetHeadInfoOptional => "mirror:Lean.Syntax.getHeadInfo?",
+        Intrinsic::GetRange => "mirror:Lean.Syntax.getRange?",
+        Intrinsic::HasMissing => "mirror:Lean.Syntax.hasMissing",
+        Intrinsic::Reprint => "mirror:Lean.Syntax.reprint",
+        Intrinsic::SourceInfoGetPos => "mirror:Lean.SourceInfo.getPos?",
+        Intrinsic::SourceInfoGetTailPos => "mirror:Lean.SourceInfo.getTailPos?",
+        Intrinsic::GetPos => "mirror:Lean.Syntax.getPos?",
+        Intrinsic::GetTailPos => "mirror:Lean.Syntax.getTailPos?",
+        Intrinsic::SourceInfoFromRef => "mirror:Lean.SourceInfo.fromRef",
+        Intrinsic::MkAtom => "mirror:Lean.mkAtom",
+        Intrinsic::MkAtomFrom => "mirror:Lean.mkAtomFrom",
+        Intrinsic::MkIdent => "mirror:Lean.mkIdent",
+        Intrinsic::MkIdentFrom => "mirror:Lean.mkIdentFrom",
+        Intrinsic::MkCIdent => "mirror:Lean.mkCIdent",
+        Intrinsic::MkCIdentFrom => "mirror:Lean.mkCIdentFrom",
+        Intrinsic::MkLit => "mirror:Lean.Syntax.mkLit",
+        Intrinsic::MkStrLit => "mirror:Lean.Syntax.mkStrLit",
+        Intrinsic::IsLit => "mirror:Lean.Syntax.isLit?",
+        Intrinsic::IsStrLit => "mirror:Lean.Syntax.isStrLit?",
+        Intrinsic::GetString => "mirror:Lean.TSyntax.getString",
+        Intrinsic::MkCharLit => "mirror:Lean.Syntax.mkCharLit",
+        Intrinsic::IsCharLit => "mirror:Lean.Syntax.isCharLit?",
+        Intrinsic::GetChar => "mirror:Lean.TSyntax.getChar",
+        Intrinsic::MkNumLit => "mirror:Lean.Syntax.mkNumLit",
+        Intrinsic::MkNatLit => "mirror:Lean.Syntax.mkNatLit",
+        Intrinsic::IsNatLit => "mirror:Lean.Syntax.isNatLit?",
+        Intrinsic::GetNat => "mirror:Lean.TSyntax.getNat",
+        Intrinsic::NatReprFast => "mirror:Nat.reprFast",
+        Intrinsic::ReplaceRef => "mirror:Lean.replaceRef",
+        Intrinsic::ThrowError => "mirror:Lean.Macro.throwError._redArg",
+        Intrinsic::ThrowErrorAt => "mirror:Lean.Macro.throwErrorAt._redArg",
+        Intrinsic::ThrowUnsupported => "mirror:Lean.Macro.throwUnsupported._redArg",
         Intrinsic::SetInfo => "mirror:Lean.Syntax.setInfo",
         Intrinsic::IsMissing => "mirror:Lean.Syntax.isMissing",
         Intrinsic::IsIdent => "mirror:Lean.Syntax.isIdent",

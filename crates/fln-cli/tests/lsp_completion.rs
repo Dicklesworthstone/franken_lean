@@ -427,3 +427,109 @@ fn public_theorem_completion_switches_from_public_header_to_private_proof() {
         }
     }
 }
+
+#[test]
+fn both_front_doors_complete_locals_and_keep_shadowed_globals_distinct() {
+    let uri = "file:///tmp/fln-local-completion.lean";
+    let source = "prelude\ndef value : Bool := true\ndef pending (value : Bool) : Nat := let value := 7; val";
+    let proof =
+        "prelude\ntheorem pending (P : Prop) : P -> P := by\n  intro hypothesis\n  exact hyp";
+    for (binary, arg) in front_doors() {
+        let messages = run(
+            binary,
+            arg,
+            &[
+                open(uri, source),
+                request(60, uri, source, source.len()),
+                change(uri, 2, proof),
+                request(61, uri, proof, proof.len()),
+            ],
+        );
+        let value = response(&messages, 60);
+        assert!(value.contains(r#""label":"value","kind":6"#), "{value}");
+        assert!(value.contains(r#""newText":"«value»""#), "{value}");
+        assert!(value.contains(r#""filterText":"value""#), "{value}");
+        assert!(value.contains(r#""label":"value","kind":21"#), "{value}");
+        assert!(value.contains(r#""newText":"_root_.value""#), "{value}");
+        assert_eq!(value.matches(r#""label":"value","kind":6"#).count(), 1);
+        let proof = response(&messages, 61);
+        assert!(
+            proof.contains(r#""label":"hypothesis","kind":6"#),
+            "{proof}"
+        );
+        assert!(proof.contains(r#""newText":"«hypothesis»""#), "{proof}");
+    }
+}
+
+#[test]
+fn both_front_doors_rebuild_local_contexts_after_edits_and_invalidated_overlays() {
+    let uri = "file:///tmp/fln-local-completion-edits.lean";
+    let good = "prelude\ndef local_global : Nat := 1\ndef pending (local_old : Nat) : Nat := loc";
+    let bad =
+        "prelude\ndef local_global : Nat := 1\ndef pending (local_bad : MissingType) : Nat := loc";
+    let recovered = "prelude\ndef pending (local_new : Nat) : Nat := loc";
+    for (binary, arg) in front_doors() {
+        let messages = run(
+            binary,
+            arg,
+            &[
+                open(uri, good),
+                request(70, uri, good, good.len()),
+                change(uri, 2, bad),
+                request(71, uri, bad, bad.len()),
+                change(uri, 3, recovered),
+                request(72, uri, recovered, recovered.len()),
+                format!(
+                    r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":{},"version":4}},"contentChanges":null}}}}"#,
+                    quoted(uri)
+                ),
+                request(73, uri, recovered, recovered.len()),
+                change(uri, 5, recovered),
+                request(74, uri, recovered, recovered.len()),
+            ],
+        );
+        assert!(has_item(&messages, 70, "local_old"));
+        assert!(!has_item(&messages, 71, "local_old"));
+        assert!(!has_item(&messages, 71, "local_bad"));
+        assert!(has_item(&messages, 71, "local_global"));
+        for id in [72, 74] {
+            assert!(
+                has_item(&messages, id, "local_new"),
+                "{}",
+                response(&messages, id)
+            );
+            assert!(!has_item(&messages, id, "local_old"));
+        }
+        assert!(response(&messages, 73).contains(r#""error":{"code":-32803"#));
+        assert!(!response(&messages, 73).contains("\"result\""));
+    }
+}
+
+#[test]
+fn local_completion_edits_have_exact_utf16_ranges_with_original_suffixes() {
+    let uri = "file:///tmp/fln-local-completion-unicode.lean";
+    let source = "prelude\r\ndef pending (αvalue : Nat) : Nat := /- 😀 -/ (αvalue)\r\n";
+    let start = source.rfind("αvalue").unwrap();
+    let column = source[..start]
+        .rsplit('\n')
+        .next()
+        .unwrap()
+        .encode_utf16()
+        .count();
+    let cursor = start + "αva".len();
+    let expected = format!(
+        "\"range\":{{\"start\":{{\"line\":1,\"character\":{column}}},\"end\":{{\"line\":1,\"character\":{}}}}}",
+        column + 6
+    );
+    for (binary, arg) in front_doors() {
+        let messages = run(
+            binary,
+            arg,
+            &[open(uri, source), request(90, uri, source, cursor)],
+        );
+        let result = response(&messages, 90);
+        assert!(result.contains(r#""label":"αvalue","kind":6"#), "{result}");
+        assert!(result.contains(r#""newText":"«αvalue»""#), "{result}");
+        assert!(result.contains(&expected), "{result}");
+    }
+}

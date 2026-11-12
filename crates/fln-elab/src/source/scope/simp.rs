@@ -842,7 +842,8 @@ fn decode_entry(payload: &[u8], order: usize) -> Result<JournalEntry, SimpSetErr
     }
 }
 
-/// Read active rows in deterministic priority order (newer ties first).
+/// Read active rows in deterministic priority order (newer first registrations
+/// win ties). Re-registering a proof updates its original discrimination slot.
 /// Corrupt entries and dangling references are errors, never an empty simp set.
 pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
     Ok(read_state(env)?.rows)
@@ -864,12 +865,16 @@ fn read_state(env: &Environment) -> Result<SimpState, SimpSetError> {
     }
     check_journal_capacity(extension.len(), extension.payload_bytes())?;
     let mut active: BTreeMap<Name, BTreeMap<Option<Name>, SimpEntry>> = BTreeMap::new();
+    let mut positions = BTreeMap::new();
     let mut unfold_theorems: BTreeMap<Name, Vec<Name>> = BTreeMap::new();
     let mut erase_work = MAX_JOURNAL_BYTES;
     for (order, (row, validation)) in env.metadata_validation_entries(&expected.name).enumerate() {
         match decode_entry(&row.payload, order)? {
-            JournalEntry::Add { entry, .. } if entry.proof.is_none() => {
+            JournalEntry::Add { mut entry, .. } if entry.proof.is_none() => {
                 validate(validation, &entry.declaration, entry.reverse)?;
+                entry.order = *positions
+                    .entry((entry.declaration.clone(), entry.reverse))
+                    .or_insert(order);
                 active.insert(entry.declaration.clone(), BTreeMap::from([(None, entry)]));
             }
             JournalEntry::Erase(declaration) => {
@@ -898,12 +903,18 @@ fn read_state(env: &Environment) -> Result<SimpState, SimpSetError> {
                 // an equation origin must still be erased by the definition.
                 unfold_theorems.insert(declaration, theorems);
             }
-            JournalEntry::Add { entry, .. } => {
+            JournalEntry::Add { mut entry, .. } => {
                 let proof = entry.proof.as_ref().ok_or(SimpSetError::Malformed)?;
                 if !validation.contains(&entry.declaration) {
                     return Err(SimpSetError::UnknownDeclaration(entry.declaration));
                 }
                 imports::validate_proof(validation, proof)?;
+                // The pin compares simp entries by their proof and updates an
+                // existing leaf slot in place. Erasure only hides that slot;
+                // re-adding it at equal priority does not make a newer rule.
+                entry.order = *positions
+                    .entry((proof.clone(), entry.reverse))
+                    .or_insert(order);
                 // A persisted theorem group replaces a prior ordinary source
                 // selection, but its auxiliary lemmas coexist with each other.
                 let group = active.entry(entry.declaration.clone()).or_default();

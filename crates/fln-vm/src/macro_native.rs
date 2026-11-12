@@ -115,8 +115,11 @@ impl MirrorRow {
     pub fn argument_ownership(&self) -> Vec<ArgumentOwnership> {
         self.borrowed
             .iter()
-            .map(|borrowed| {
-                if *borrowed {
+            .zip(self.parameters)
+            .map(|(borrowed, parameter)| {
+                if matches!(*parameter, "u8" | "u32") {
+                    ArgumentOwnership::Scalar
+                } else if *borrowed {
                     ArgumentOwnership::Borrowed
                 } else {
                     ArgumentOwnership::Owned
@@ -128,7 +131,7 @@ impl MirrorRow {
     pub fn result_ownership(&self) -> ResultOwnership {
         // Every non-scalar result is a fresh owned handle, including Syntax
         // missing and small Nat. RawObject records that erased representation.
-        if self.result_type == "u8" {
+        if matches!(self.result_type, "u8" | "u32") {
             ResultOwnership::Scalar
         } else {
             ResultOwnership::RawObject
@@ -150,6 +153,20 @@ pub const ROWS: &[MirrorRow] = &[
         borrowed: generated::NAME_MK_STR1_BORROWED,
         parameters: generated::NAME_MK_STR1_PARAMETERS,
         result_type: generated::NAME_MK_STR1_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Name.hasMacroScopes",
+        name: "Lean.Name.hasMacroScopes",
+        borrowed: generated::NAME_HAS_MACRO_SCOPES_BORROWED,
+        parameters: generated::NAME_HAS_MACRO_SCOPES_PARAMETERS,
+        result_type: generated::NAME_HAS_MACRO_SCOPES_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Name.eraseMacroScopes",
+        name: "Lean.Name.eraseMacroScopes",
+        borrowed: generated::NAME_ERASE_MACRO_SCOPES_BORROWED,
+        parameters: generated::NAME_ERASE_MACRO_SCOPES_PARAMETERS,
+        result_type: generated::NAME_ERASE_MACRO_SCOPES_RESULT,
     },
     MirrorRow {
         id: "mirror:Lean.addMacroScope",
@@ -180,6 +197,132 @@ pub const ROWS: &[MirrorRow] = &[
         result_type: generated::SYNTAX_GET_NUM_ARGS_RESULT,
     },
     MirrorRow {
+        id: "mirror:Lean.Syntax.isNodeOf",
+        name: "Lean.Syntax.isNodeOf",
+        borrowed: generated::SYNTAX_IS_NODE_OF_BORROWED,
+        parameters: generated::SYNTAX_IS_NODE_OF_PARAMETERS,
+        result_type: generated::SYNTAX_IS_NODE_OF_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.matchesNull",
+        name: "Lean.Syntax.matchesNull",
+        borrowed: generated::SYNTAX_MATCHES_NULL_BORROWED,
+        parameters: generated::SYNTAX_MATCHES_NULL_PARAMETERS,
+        result_type: generated::SYNTAX_MATCHES_NULL_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.matchesIdent",
+        name: "Lean.Syntax.matchesIdent",
+        borrowed: generated::SYNTAX_MATCHES_IDENT_BORROWED,
+        parameters: generated::SYNTAX_MATCHES_IDENT_PARAMETERS,
+        result_type: generated::SYNTAX_MATCHES_IDENT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.matchesLit",
+        name: "Lean.Syntax.matchesLit",
+        borrowed: generated::SYNTAX_MATCHES_LIT_BORROWED,
+        parameters: generated::SYNTAX_MATCHES_LIT_PARAMETERS,
+        result_type: generated::SYNTAX_MATCHES_LIT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.getOptional?",
+        name: "Lean.Syntax.getOptional?",
+        borrowed: generated::SYNTAX_GET_OPTIONAL_BORROWED,
+        parameters: generated::SYNTAX_GET_OPTIONAL_PARAMETERS,
+        result_type: generated::SYNTAX_GET_OPTIONAL_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.mkLit",
+        name: "Lean.Syntax.mkLit",
+        borrowed: generated::SYNTAX_MK_LIT_BORROWED,
+        parameters: generated::SYNTAX_MK_LIT_PARAMETERS,
+        result_type: generated::SYNTAX_MK_LIT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.mkStrLit",
+        name: "Lean.Syntax.mkStrLit",
+        borrowed: generated::SYNTAX_MK_STR_LIT_BORROWED,
+        parameters: generated::SYNTAX_MK_STR_LIT_PARAMETERS,
+        result_type: generated::SYNTAX_MK_STR_LIT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.isLit?",
+        name: "Lean.Syntax.isLit?",
+        borrowed: generated::SYNTAX_IS_LIT_BORROWED,
+        parameters: generated::SYNTAX_IS_LIT_PARAMETERS,
+        result_type: generated::SYNTAX_IS_LIT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.isStrLit?",
+        name: "Lean.Syntax.isStrLit?",
+        borrowed: generated::SYNTAX_IS_STR_LIT_BORROWED,
+        parameters: generated::SYNTAX_IS_STR_LIT_PARAMETERS,
+        result_type: generated::SYNTAX_IS_STR_LIT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.TSyntax.getString",
+        name: "Lean.TSyntax.getString",
+        borrowed: generated::TSYNTAX_GET_STRING_BORROWED,
+        parameters: generated::TSYNTAX_GET_STRING_PARAMETERS,
+        result_type: generated::TSYNTAX_GET_STRING_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.mkCharLit",
+        name: "Lean.Syntax.mkCharLit",
+        borrowed: generated::SYNTAX_MK_CHAR_LIT_BORROWED,
+        parameters: generated::SYNTAX_MK_CHAR_LIT_PARAMETERS,
+        result_type: generated::SYNTAX_MK_CHAR_LIT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.isCharLit?",
+        name: "Lean.Syntax.isCharLit?",
+        borrowed: generated::SYNTAX_IS_CHAR_LIT_BORROWED,
+        parameters: generated::SYNTAX_IS_CHAR_LIT_PARAMETERS,
+        result_type: generated::SYNTAX_IS_CHAR_LIT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.TSyntax.getChar",
+        name: "Lean.TSyntax.getChar",
+        borrowed: generated::TSYNTAX_GET_CHAR_BORROWED,
+        parameters: generated::TSYNTAX_GET_CHAR_PARAMETERS,
+        result_type: generated::TSYNTAX_GET_CHAR_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.mkNumLit",
+        name: "Lean.Syntax.mkNumLit",
+        borrowed: generated::SYNTAX_MK_NUM_LIT_BORROWED,
+        parameters: generated::SYNTAX_MK_NUM_LIT_PARAMETERS,
+        result_type: generated::SYNTAX_MK_NUM_LIT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.mkNatLit",
+        name: "Lean.Syntax.mkNatLit",
+        borrowed: generated::SYNTAX_MK_NAT_LIT_BORROWED,
+        parameters: generated::SYNTAX_MK_NAT_LIT_PARAMETERS,
+        result_type: generated::SYNTAX_MK_NAT_LIT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.isNatLit?",
+        name: "Lean.Syntax.isNatLit?",
+        borrowed: generated::SYNTAX_IS_NAT_LIT_BORROWED,
+        parameters: generated::SYNTAX_IS_NAT_LIT_PARAMETERS,
+        result_type: generated::SYNTAX_IS_NAT_LIT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.TSyntax.getNat",
+        name: "Lean.TSyntax.getNat",
+        borrowed: generated::TSYNTAX_GET_NAT_BORROWED,
+        parameters: generated::TSYNTAX_GET_NAT_PARAMETERS,
+        result_type: generated::TSYNTAX_GET_NAT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Nat.reprFast",
+        name: "Nat.reprFast",
+        borrowed: generated::NAT_REPR_FAST_BORROWED,
+        parameters: generated::NAT_REPR_FAST_PARAMETERS,
+        result_type: generated::NAT_REPR_FAST_RESULT,
+    },
+    MirrorRow {
         id: "mirror:Lean.Syntax.isOfKind",
         name: "Lean.Syntax.isOfKind",
         borrowed: generated::SYNTAX_IS_OF_KIND_BORROWED,
@@ -206,6 +349,55 @@ pub const ROWS: &[MirrorRow] = &[
         borrowed: generated::SYNTAX_GET_ARGS_BORROWED,
         parameters: generated::SYNTAX_GET_ARGS_PARAMETERS,
         result_type: generated::SYNTAX_GET_ARGS_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.getSepArgs",
+        name: "Lean.Syntax.getSepArgs",
+        borrowed: generated::SYNTAX_GET_SEP_ARGS_BORROWED,
+        parameters: generated::SYNTAX_GET_SEP_ARGS_PARAMETERS,
+        result_type: generated::SYNTAX_GET_SEP_ARGS_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.mkSepArray",
+        name: "Lean.mkSepArray",
+        borrowed: generated::MK_SEP_ARRAY_BORROWED,
+        parameters: generated::MK_SEP_ARRAY_PARAMETERS,
+        result_type: generated::MK_SEP_ARRAY_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.mkSep",
+        name: "Lean.Syntax.mkSep",
+        borrowed: generated::SYNTAX_MK_SEP_BORROWED,
+        parameters: generated::SYNTAX_MK_SEP_PARAMETERS,
+        result_type: generated::SYNTAX_MK_SEP_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.SepArray.getElems._redArg",
+        name: "Lean.Syntax.SepArray.getElems._redArg",
+        borrowed: generated::SEP_ARRAY_GET_ELEMS_BORROWED,
+        parameters: generated::SEP_ARRAY_GET_ELEMS_PARAMETERS,
+        result_type: generated::SEP_ARRAY_GET_ELEMS_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.TSepArray.getElems._redArg",
+        name: "Lean.Syntax.TSepArray.getElems._redArg",
+        borrowed: generated::TSEP_ARRAY_GET_ELEMS_BORROWED,
+        parameters: generated::TSEP_ARRAY_GET_ELEMS_PARAMETERS,
+        result_type: generated::TSEP_ARRAY_GET_ELEMS_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.SepArray.ofElems",
+        name: "Lean.Syntax.SepArray.ofElems",
+        borrowed: generated::SEP_ARRAY_OF_ELEMS_BORROWED,
+        parameters: generated::SEP_ARRAY_OF_ELEMS_PARAMETERS,
+        result_type: generated::SEP_ARRAY_OF_ELEMS_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.TSepArray.push._redArg",
+        name: "Lean.Syntax.TSepArray.push._redArg",
+        borrowed: generated::TSEP_ARRAY_PUSH_BORROWED,
+        parameters: generated::TSEP_ARRAY_PUSH_PARAMETERS,
+        result_type: generated::TSEP_ARRAY_PUSH_RESULT,
     },
     MirrorRow {
         id: "mirror:Lean.Syntax.setArgs",
@@ -248,6 +440,146 @@ pub const ROWS: &[MirrorRow] = &[
         borrowed: generated::SYNTAX_GET_HEAD_INFO_BORROWED,
         parameters: generated::SYNTAX_GET_HEAD_INFO_PARAMETERS,
         result_type: generated::SYNTAX_GET_HEAD_INFO_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.getInfo?",
+        name: "Lean.Syntax.getInfo?",
+        borrowed: generated::SYNTAX_GET_INFO_BORROWED,
+        parameters: generated::SYNTAX_GET_INFO_PARAMETERS,
+        result_type: generated::SYNTAX_GET_INFO_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.getHeadInfo?",
+        name: "Lean.Syntax.getHeadInfo?",
+        borrowed: generated::SYNTAX_GET_HEAD_INFO_OPTIONAL_BORROWED,
+        parameters: generated::SYNTAX_GET_HEAD_INFO_OPTIONAL_PARAMETERS,
+        result_type: generated::SYNTAX_GET_HEAD_INFO_OPTIONAL_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.getRange?",
+        name: "Lean.Syntax.getRange?",
+        borrowed: generated::SYNTAX_GET_RANGE_BORROWED,
+        parameters: generated::SYNTAX_GET_RANGE_PARAMETERS,
+        result_type: generated::SYNTAX_GET_RANGE_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.hasMissing",
+        name: "Lean.Syntax.hasMissing",
+        borrowed: generated::SYNTAX_HAS_MISSING_BORROWED,
+        parameters: generated::SYNTAX_HAS_MISSING_PARAMETERS,
+        result_type: generated::SYNTAX_HAS_MISSING_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.reprint",
+        name: "Lean.Syntax.reprint",
+        borrowed: generated::SYNTAX_REPRINT_BORROWED,
+        parameters: generated::SYNTAX_REPRINT_PARAMETERS,
+        result_type: generated::SYNTAX_REPRINT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.SourceInfo.getPos?",
+        name: "Lean.SourceInfo.getPos?",
+        borrowed: generated::SOURCE_INFO_GET_POS_BORROWED,
+        parameters: generated::SOURCE_INFO_GET_POS_PARAMETERS,
+        result_type: generated::SOURCE_INFO_GET_POS_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.SourceInfo.getTailPos?",
+        name: "Lean.SourceInfo.getTailPos?",
+        borrowed: generated::SOURCE_INFO_GET_TAIL_POS_BORROWED,
+        parameters: generated::SOURCE_INFO_GET_TAIL_POS_PARAMETERS,
+        result_type: generated::SOURCE_INFO_GET_TAIL_POS_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.getPos?",
+        name: "Lean.Syntax.getPos?",
+        borrowed: generated::SYNTAX_GET_POS_BORROWED,
+        parameters: generated::SYNTAX_GET_POS_PARAMETERS,
+        result_type: generated::SYNTAX_GET_POS_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.getTailPos?",
+        name: "Lean.Syntax.getTailPos?",
+        borrowed: generated::SYNTAX_GET_TAIL_POS_BORROWED,
+        parameters: generated::SYNTAX_GET_TAIL_POS_PARAMETERS,
+        result_type: generated::SYNTAX_GET_TAIL_POS_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.SourceInfo.fromRef",
+        name: "Lean.SourceInfo.fromRef",
+        borrowed: generated::SOURCE_INFO_FROM_REF_BORROWED,
+        parameters: generated::SOURCE_INFO_FROM_REF_PARAMETERS,
+        result_type: generated::SOURCE_INFO_FROM_REF_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.mkAtom",
+        name: "Lean.mkAtom",
+        borrowed: generated::MK_ATOM_BORROWED,
+        parameters: generated::MK_ATOM_PARAMETERS,
+        result_type: generated::MK_ATOM_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.mkAtomFrom",
+        name: "Lean.mkAtomFrom",
+        borrowed: generated::MK_ATOM_FROM_BORROWED,
+        parameters: generated::MK_ATOM_FROM_PARAMETERS,
+        result_type: generated::MK_ATOM_FROM_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.mkIdent",
+        name: "Lean.mkIdent",
+        borrowed: generated::MK_IDENT_BORROWED,
+        parameters: generated::MK_IDENT_PARAMETERS,
+        result_type: generated::MK_IDENT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.mkIdentFrom",
+        name: "Lean.mkIdentFrom",
+        borrowed: generated::MK_IDENT_FROM_BORROWED,
+        parameters: generated::MK_IDENT_FROM_PARAMETERS,
+        result_type: generated::MK_IDENT_FROM_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.mkCIdent",
+        name: "Lean.mkCIdent",
+        borrowed: generated::MK_CIDENT_BORROWED,
+        parameters: generated::MK_CIDENT_PARAMETERS,
+        result_type: generated::MK_CIDENT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.mkCIdentFrom",
+        name: "Lean.mkCIdentFrom",
+        borrowed: generated::MK_CIDENT_FROM_BORROWED,
+        parameters: generated::MK_CIDENT_FROM_PARAMETERS,
+        result_type: generated::MK_CIDENT_FROM_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.replaceRef",
+        name: "Lean.replaceRef",
+        borrowed: generated::REPLACE_REF_BORROWED,
+        parameters: generated::REPLACE_REF_PARAMETERS,
+        result_type: generated::REPLACE_REF_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Macro.throwError._redArg",
+        name: "Lean.Macro.throwError._redArg",
+        borrowed: generated::MACRO_THROW_ERROR_BORROWED,
+        parameters: generated::MACRO_THROW_ERROR_PARAMETERS,
+        result_type: generated::MACRO_THROW_ERROR_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Macro.throwErrorAt._redArg",
+        name: "Lean.Macro.throwErrorAt._redArg",
+        borrowed: generated::MACRO_THROW_ERROR_AT_BORROWED,
+        parameters: generated::MACRO_THROW_ERROR_AT_PARAMETERS,
+        result_type: generated::MACRO_THROW_ERROR_AT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Macro.throwUnsupported._redArg",
+        name: "Lean.Macro.throwUnsupported._redArg",
+        borrowed: generated::MACRO_THROW_UNSUPPORTED_BORROWED,
+        parameters: generated::MACRO_THROW_UNSUPPORTED_PARAMETERS,
+        result_type: generated::MACRO_THROW_UNSUPPORTED_RESULT,
     },
     MirrorRow {
         id: "mirror:Lean.Syntax.setInfo",
