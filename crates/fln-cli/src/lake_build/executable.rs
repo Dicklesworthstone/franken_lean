@@ -66,7 +66,11 @@ fn program(
         .ok_or_else(|| Failure::new("internal-fault", "executable root was not captured"))?;
     let mut sources = Vec::with_capacity(modules.len() + 1);
     sources.push((entry, first.source));
-    sources.extend(modules.into_iter().map(|(name, module)| (name, module.source)));
+    sources.extend(
+        modules
+            .into_iter()
+            .map(|(name, module)| (name, module.source)),
+    );
     Ok(source_check::PackageProgram {
         entry_path,
         root: root.to_path_buf(),
@@ -113,9 +117,9 @@ pub(crate) fn run(
             ))
         });
     let result = match worker {
-        Ok(worker) => worker.join().unwrap_or_else(|_| {
-            Err(Failure::new("internal-fault", "executable worker panicked"))
-        }),
+        Ok(worker) => worker
+            .join()
+            .unwrap_or_else(|_| Err(Failure::new("internal-fault", "executable worker panicked"))),
         Err(error) => Err(Failure::new(
             "resource",
             format!("could not start executable worker: {error}"),

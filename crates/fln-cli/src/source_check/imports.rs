@@ -515,7 +515,9 @@ fn load_package(
     max_bytes: usize,
 ) -> Result<Loaded, Failure> {
     if names.is_empty() || names.len() != sources.len() {
-        return Err(Failure::input("a package program needs one source per module"));
+        return Err(Failure::input(
+            "a package program needs one source per module",
+        ));
     }
     if names.len() > MAX_MODULES {
         return Err(Failure::resource("source module count exceeds 256"));

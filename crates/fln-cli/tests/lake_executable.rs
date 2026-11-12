@@ -16,7 +16,9 @@ static IMPORT_STORE: OnceLock<PathBuf> = OnceLock::new();
 static EXECUTION: Mutex<()> = Mutex::new(());
 
 fn serial_execution() -> MutexGuard<'static, ()> {
-    EXECUTION.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    EXECUTION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 struct Package(PathBuf);
@@ -58,7 +60,10 @@ impl Package {
             .arg(&self.0)
             .args(arguments)
             .current_dir(std::env::temp_dir())
-            .env("LEAN_PATH", reference.map_or_else(|| self.0.join("absent-imports"), |r| r.lib.clone()))
+            .env(
+                "LEAN_PATH",
+                reference.map_or_else(|| self.0.join("absent-imports"), |r| r.lib.clone()),
+            )
             .env("FLN_IMPORT_REUSE_DIR", store)
             .output()
             .unwrap()
@@ -78,51 +83,60 @@ struct Reference {
 
 fn reference() -> Option<&'static Reference> {
     static REFERENCE: OnceLock<Option<Reference>> = OnceLock::new();
-    REFERENCE.get_or_init(|| {
-        let row = include_str!("../../../SUITE.lock")
-            .lines()
-            .find(|line| line.starts_with("reference leanprover/lean4 "))
-            .unwrap();
-        let field = |key: &str| {
-            row.split_whitespace()
-                .find_map(|word| word.strip_prefix(key))
-                .unwrap()
-        };
-        let lean = std::env::var_os("FLN_REFERENCE_LEAN")
-            .or_else(|| std::env::var_os("FLN_REFERENCE_BIN"))
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("FLN_REFERENCE_LIB")
-                    .map(|path| PathBuf::from(path).join("../../bin/lean"))
-            })
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| {
-                    PathBuf::from(home)
-                        .join(".elan/toolchains")
-                        .join(format!("leanprover--lean4---{}", field("tag=")))
-                        .join("bin/lean")
+    REFERENCE
+        .get_or_init(|| {
+            let row = include_str!("../../../SUITE.lock")
+                .lines()
+                .find(|line| line.starts_with("reference leanprover/lean4 "))
+                .unwrap();
+            let field = |key: &str| {
+                row.split_whitespace()
+                    .find_map(|word| word.strip_prefix(key))
+                    .unwrap()
+            };
+            let lean = std::env::var_os("FLN_REFERENCE_LEAN")
+                .or_else(|| std::env::var_os("FLN_REFERENCE_BIN"))
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("FLN_REFERENCE_LIB")
+                        .map(|path| PathBuf::from(path).join("../../bin/lean"))
                 })
-            })
-            .filter(|binary| binary.is_file());
-        let Some(lean) = lean else {
-            assert!(
-                std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
-                "pinned Reference required for Lake executable tests",
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| {
+                        PathBuf::from(home)
+                            .join(".elan/toolchains")
+                            .join(format!("leanprover--lean4---{}", field("tag=")))
+                            .join("bin/lean")
+                    })
+                })
+                .filter(|binary| binary.is_file());
+            let Some(lean) = lean else {
+                assert!(
+                    std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+                    "pinned Reference required for Lake executable tests",
+                );
+                eprintln!("SKIP: pinned Reference absent; executable rejection controls still run");
+                return None;
+            };
+            let pin = Command::new(&lean).arg("--githash").output().unwrap();
+            assert!(pin.status.success(), "{pin:?}");
+            assert_eq!(
+                String::from_utf8(pin.stdout).unwrap().trim(),
+                field("commit=")
             );
-            eprintln!("SKIP: pinned Reference absent; executable rejection controls still run");
-            return None;
-        };
-        let pin = Command::new(&lean).arg("--githash").output().unwrap();
-        assert!(pin.status.success(), "{pin:?}");
-        assert_eq!(String::from_utf8(pin.stdout).unwrap().trim(), field("commit="));
-        let lib = std::env::var_os("FLN_REFERENCE_LIB")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| lean.parent().unwrap().join("../lib/lean"));
-        assert!(lib.join("Init/System/IO.olean").is_file(), "{}", lib.display());
-        let lake = lean.with_file_name("lake");
-        assert!(lake.is_file(), "{}", lake.display());
-        Some(Reference { lake, lib })
-    }).as_ref()
+            let lib = std::env::var_os("FLN_REFERENCE_LIB")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| lean.parent().unwrap().join("../lib/lean"));
+            assert!(
+                lib.join("Init/System/IO.olean").is_file(),
+                "{}",
+                lib.display()
+            );
+            let lake = lean.with_file_name("lake");
+            assert!(lake.is_file(), "{}", lake.display());
+            Some(Reference { lake, lib })
+        })
+        .as_ref()
 }
 
 fn text(bytes: &[u8]) -> &str {
@@ -385,13 +399,13 @@ fn checked_main_contract_and_vm_nonanswers_keep_their_dispositions() {
     assert!(output.stdout.is_empty(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
 
-    let stopped = package.run(
-        &["--fln-max-steps", "1", "exe", "runner"],
-        Some(reference),
-    );
+    let stopped = package.run(&["--fln-max-steps", "1", "exe", "runner"], Some(reference));
     assert_eq!(stopped.status.code(), Some(3), "{stopped:?}");
     assert!(stopped.stdout.is_empty(), "{stopped:?}");
-    assert!(text(&stopped.stderr).contains("inconclusive"), "{stopped:?}");
+    assert!(
+        text(&stopped.stderr).contains("inconclusive"),
+        "{stopped:?}"
+    );
 
     package.write(
         "src/application/App/Main.lean",
@@ -400,7 +414,10 @@ fn checked_main_contract_and_vm_nonanswers_keep_their_dispositions() {
     let invalid = package.run(&["exe", "runner"], Some(reference));
     assert_eq!(invalid.status.code(), Some(1), "{invalid:?}");
     assert!(invalid.stdout.is_empty(), "{invalid:?}");
-    assert!(text(&invalid.stderr).contains("main` function must have type"), "{invalid:?}");
+    assert!(
+        text(&invalid.stderr).contains("main` function must have type"),
+        "{invalid:?}"
+    );
 }
 
 #[test]
@@ -424,16 +441,23 @@ fn bad_dependency_cannot_run_main_and_repair_recovers() {
     assert_eq!(text(&recovered.stdout), "prefix:recovered\n");
 }
 
-const SIMPLE_CONFIG: &str = "name = \"isolated\"\n[[lean_exe]]\nname = \"runner\"\nroot = \"Main\"\n";
+const SIMPLE_CONFIG: &str =
+    "name = \"isolated\"\n[[lean_exe]]\nname = \"runner\"\nroot = \"Main\"\n";
 
 #[test]
 fn unknown_targets_and_undeclared_source_imports_are_refused() {
     let package = Package::new(SIMPLE_CONFIG);
     package.write("Main.lean", "prelude\nimport Loose\n");
-    package.write("Loose.lean", "prelude\ntheorem valid (P : Prop) (h : P) : P := h\n");
+    package.write(
+        "Loose.lean",
+        "prelude\ntheorem valid (P : Prop) (h : P) : P := h\n",
+    );
     let unknown = package.run(&["exe", "missing"], None);
     assert_eq!(unknown.status.code(), Some(1), "{unknown:?}");
-    assert!(text(&unknown.stderr).contains("unknown executable"), "{unknown:?}");
+    assert!(
+        text(&unknown.stderr).contains("unknown executable"),
+        "{unknown:?}"
+    );
     let loose = package.run(&["exe", "runner"], None);
     assert_eq!(loose.status.code(), Some(1), "{loose:?}");
     assert!(text(&loose.stderr).contains("import `Loose`"), "{loose:?}");
@@ -445,10 +469,16 @@ fn unknown_targets_and_undeclared_source_imports_are_refused() {
     );
     let declared = package.run(&["exe", "runner"], None);
     assert_eq!(declared.status.code(), Some(1), "{declared:?}");
-    assert!(text(&declared.stderr).contains("unknown executable declaration `main`"), "{declared:?}");
+    assert!(
+        text(&declared.stderr).contains("unknown executable declaration `main`"),
+        "{declared:?}"
+    );
     let library = package.run(&["exe", "Loose"], None);
     assert_eq!(library.status.code(), Some(1), "{library:?}");
-    assert!(text(&library.stderr).contains("unknown executable"), "{library:?}");
+    assert!(
+        text(&library.stderr).contains("unknown executable"),
+        "{library:?}"
+    );
 }
 
 #[test]
@@ -484,15 +514,16 @@ fn executable_targets_cannot_alias_the_same_root_module() {
 
 #[test]
 fn source_cycles_and_directory_escape_never_execute() {
-    let package = Package::new(&format!(
-        "{SIMPLE_CONFIG}[[lean_lib]]\nname = \"Lib\"\n",
-    ));
+    let package = Package::new(&format!("{SIMPLE_CONFIG}[[lean_lib]]\nname = \"Lib\"\n",));
     package.write("Main.lean", "prelude\nimport Lib.A\n");
     package.write("Lib/A.lean", "prelude\nimport Lib.B\n");
     package.write("Lib/B.lean", "prelude\nimport Lib.A\n");
     let cycle = package.run(&["exe", "runner"], None);
     assert_eq!(cycle.status.code(), Some(1), "{cycle:?}");
-    assert!(text(&cycle.stderr).to_lowercase().contains("cycl"), "{cycle:?}");
+    assert!(
+        text(&cycle.stderr).to_lowercase().contains("cycl"),
+        "{cycle:?}"
+    );
     assert!(cycle.stdout.is_empty(), "{cycle:?}");
 
     package.write(
@@ -501,7 +532,10 @@ fn source_cycles_and_directory_escape_never_execute() {
     );
     let escaped = package.run(&["exe", "runner"], None);
     assert_eq!(escaped.status.code(), Some(1), "{escaped:?}");
-    assert!(text(&escaped.stderr).contains("must stay within the package"), "{escaped:?}");
+    assert!(
+        text(&escaped.stderr).contains("must stay within the package"),
+        "{escaped:?}"
+    );
     assert!(escaped.stdout.is_empty(), "{escaped:?}");
 }
 
@@ -514,7 +548,10 @@ fn source_symlinks_are_refused_before_their_targets_are_read() {
     std::os::unix::fs::symlink(outside.0.join("Main.lean"), package.0.join("Main.lean")).unwrap();
     let output = package.run(&["exe", "runner"], None);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(text(&output.stderr).contains("refusing symlink"), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("refusing symlink"),
+        "{output:?}"
+    );
     assert!(output.stdout.is_empty(), "{output:?}");
 }
 
@@ -529,7 +566,10 @@ fn executable_arguments_are_bounded_before_configuration_is_loaded() {
         OsString::from("x".repeat(fln_cli::SOURCE_RUN_DEFAULT_MAX_BYTES)),
     ]);
     assert_eq!(output.exit_code, 3, "{output:?}");
-    assert!(output.stderr.contains("script arguments exceed"), "{output:?}");
+    assert!(
+        output.stderr.contains("script arguments exceed"),
+        "{output:?}"
+    );
     assert!(!output.stderr.contains("configuration"), "{output:?}");
 }
 
@@ -546,7 +586,12 @@ fn non_utf8_program_arguments_are_not_lossily_rewritten_or_parsed_as_lake_option
         OsString::from_vec(vec![0xff]),
     ]);
     assert_eq!(output.exit_code, 1, "{output:?}");
-    assert!(output.stderr.contains("script argument 0 is not valid UTF-8"), "{output:?}");
+    assert!(
+        output
+            .stderr
+            .contains("script argument 0 is not valid UTF-8"),
+        "{output:?}"
+    );
     assert!(!output.stderr.contains("configuration"), "{output:?}");
 }
 
@@ -555,7 +600,15 @@ fn leading_options_restart_after_the_command_and_end_before_program_arguments() 
     let package = Package::new(SIMPLE_CONFIG);
     package.write("Main.lean", "prelude\n");
     for args in [
-        vec!["--", "exe", "--import-posture", "recheck", "runner", "--import-posture", "invalid"],
+        vec![
+            "--",
+            "exe",
+            "--import-posture",
+            "recheck",
+            "runner",
+            "--import-posture",
+            "invalid",
+        ],
         vec!["exe", "--", "runner", "--jobs=0"],
         vec!["--", "exe", "--", "runner", "--help"],
     ] {
@@ -568,7 +621,12 @@ fn leading_options_restart_after_the_command_and_end_before_program_arguments() 
         assert!(output.stdout.is_empty(), "{output:?}");
     }
     let duplicate = package.run(
-        &["--import-posture=recheck", "exe", "--import-posture=recheck", "runner"],
+        &[
+            "--import-posture=recheck",
+            "exe",
+            "--import-posture=recheck",
+            "runner",
+        ],
         None,
     );
     assert_eq!(duplicate.status.code(), Some(1), "{duplicate:?}");
@@ -603,6 +661,12 @@ fn directory_option_values_are_never_commands_or_posture_options() {
 fn help_names_the_native_execution_contract_without_claiming_linked_artifacts() {
     let output = fln_cli::run_lake(["help", "exe"].map(OsString::from));
     assert_eq!(output.exit_code, 0, "{output:?}");
-    assert!(output.stdout.contains("runs main once on Golem"), "{output:?}");
-    assert!(output.stdout.contains("does not emit a native binary"), "{output:?}");
+    assert!(
+        output.stdout.contains("runs main once on Golem"),
+        "{output:?}"
+    );
+    assert!(
+        output.stdout.contains("does not emit a native binary"),
+        "{output:?}"
+    );
 }

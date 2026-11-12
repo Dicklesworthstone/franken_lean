@@ -482,20 +482,26 @@ fn opaque_module_ir_preserves_opacity_and_executes_in_the_pinned_reference() {
         );
     }
 
-    // A safe opaque body is compilable; unsafe bodies still need their own
-    // executable selection contract. Refusal must retain all last-good files.
-    package.write(
-        "Lib/Top.lean",
-        format!("{source}public unsafe opaque Lib.unsafeValue : Nat := 9\n"),
-    );
-    let refused = failure(&build());
-    assert!(
-        refused.contains("unsafe or partial source export"),
-        "{refused}"
-    );
-    assert_eq!(family_bytes(&package, "Lib.Top"), logical);
-    assert_eq!(std::fs::read(ir_path).unwrap(), executable);
-    assert_eq!(std::fs::read(snapshot).unwrap(), previous_snapshot);
+    // Unsafe opaque syntax is currently refused by the frontend. A supported
+    // unsafe definition reaches the separate IR safety boundary. Neither
+    // refusal may replace the last-good safe opaque artifact family.
+    for (declaration, diagnostic) in [
+        (
+            "public unsafe opaque Lib.unsafeValue : Nat := 9",
+            "expected unsafe def, abbrev, or data instance without partial",
+        ),
+        (
+            "public unsafe def Lib.unsafeValue : Nat := 9",
+            "unsafe or partial source export",
+        ),
+    ] {
+        package.write("Lib/Top.lean", format!("{source}{declaration}\n"));
+        let refused = failure(&build());
+        assert!(refused.contains(diagnostic), "{refused}");
+        assert_eq!(family_bytes(&package, "Lib.Top"), logical);
+        assert_eq!(std::fs::read(&ir_path).unwrap(), executable);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), previous_snapshot);
+    }
 }
 
 fn family_bytes(package: &Package, module: &str) -> Vec<Vec<u8>> {
