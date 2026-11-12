@@ -2,7 +2,10 @@
 use super::*;
 use fln_core::diag::ResourceReason;
 use fln_core::outcome::InconclusiveCause;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
 
 const REPLACEMENT: &str = "directoryReadReplacement";
 
@@ -281,11 +284,17 @@ fn directory_sources_preserve_logical_paths_names_and_native_order() {
     for filename in ["z-last", "a-first", "λ🙂"] {
         std::fs::write(directory.join(filename), b"retained").unwrap();
     }
-    std::fs::write(
-        directory.join(std::ffi::OsString::from_vec(b"raw-\xff-end".to_vec())),
-        b"retained",
-    )
-    .unwrap();
+    #[cfg(unix)]
+    let non_unicode_filename = std::ffi::OsString::from_vec(b"raw-\xff-end".to_vec());
+    #[cfg(windows)]
+    let non_unicode_filename = {
+        let mut units: Vec<u16> = "raw-".encode_utf16().collect();
+        units.push(0xd800); // An unpaired surrogate is a real non-Unicode Windows filename.
+        units.extend("-end".encode_utf16());
+        std::ffi::OsString::from_wide(&units)
+    };
+    assert!(non_unicode_filename.to_str().is_none());
+    std::fs::write(directory.join(non_unicode_filename), b"retained").unwrap();
     let supplied = directory.join(".");
     let batch = run(
         &engine,

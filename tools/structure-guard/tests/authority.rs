@@ -383,9 +383,24 @@ fn symlinked_source_cannot_escape_the_scanned_closure() {
     let ws = TempWs::new("authority-symlink");
     base(&ws);
     let root = ws.materialize().expect("materialize retained fixture");
+    let outside = TempWs::new("authority-symlink-target");
+    outside.write(
+        "unscanned.rs",
+        "#![forbid(unsafe_code)]\npub fn outside_authority() {}\n",
+    );
+    let target = outside
+        .materialize()
+        .expect("materialize external symlink target");
+    assert!(
+        !target.starts_with(&root),
+        "the target is outside the scanned authority"
+    );
     // A symlink is the one fixture the recipe cannot express as file content.
-    std::os::unix::fs::symlink("/etc", root.join("crates/fln-kernel/src/escape"))
-        .expect("plant symlink");
+    let escape = root.join("crates/fln-kernel/src/escape");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &escape).expect("plant directory symlink");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&target, &escape).expect("plant directory symlink");
     let out = structure_guard::checks::run(&root).expect("guard reports without following");
     assert!(
         out.findings
