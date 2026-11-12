@@ -164,7 +164,7 @@ fn computed_composition_callback_reaches_its_consumer_with_real_stages() {
 }
 
 #[test]
-fn a_computed_producer_is_shared_but_its_first_callback_stage_is_strict() {
+fn computed_producer_sharing_and_live_work_survive_dead_let_erasure() {
     let engine = checked(&format!(
         r#"{DECLARATIONS}
 def callbackSpend (n : Nat) : Nat :=
@@ -174,6 +174,8 @@ def callbackReuse (next : Nat -> Nat -> Nat) : Nat :=
 def callbackFirstOnly (next : Nat -> Nat -> Nat) : Nat :=
   let ignored : Nat -> Nat := next 3
   0
+def callbackApplyOnce (next : Nat -> Nat -> Nat) : Nat :=
+  next 3 5
 "#,
     ));
     let reference_idle = assert_nat(&engine, "#eval callbackSpend 0", "0");
@@ -201,10 +203,12 @@ def callbackFirstOnly (next : Nat -> Nat -> Nat) : Nat :=
     };
     let idle = assert_nat(&engine, &first_only(0), "0");
     let busy = assert_nat(&engine, &first_only(25), "0");
+    // The pin compiles callbackFirstOnly to a constant zero: the unused
+    // source let does not force its pure initializer. Source erasure agrees.
     assert_eq!(
         busy.checked_sub(idle).unwrap(),
-        once,
-        "discarding the returned world-stage closure cannot defer or erase the first stage",
+        0,
+        "a dead pure source call must not require callback-stage work",
     );
     let options = KVMap::new();
     let root = engine.logical_root(&options);
@@ -213,6 +217,27 @@ def callbackFirstOnly (next : Nat -> Nat -> Nat) : Nat :=
     assert!(matches!(
         engine
             .execute_source_commands_with_checks(first_only(25).as_bytes(), &options, bounded)
+            .unwrap(),
+        Outcome::Complete(_)
+    ));
+
+    let applied = |cost| {
+        format!(
+            "#eval callbackApplyOnce (callbackCompose callbackPure (fun (value : Nat) => callbackSpend {cost} + value))"
+        )
+    };
+    let idle = assert_nat(&engine, &applied(0), "8");
+    let busy = assert_nat(&engine, &applied(25), "33");
+    assert_eq!(
+        busy.checked_sub(idle).unwrap(),
+        once,
+        "a live callback must retain exactly one execution of its recursive work",
+    );
+    let mut bounded = limits();
+    bounded.vm.max_steps = idle;
+    assert!(matches!(
+        engine
+            .execute_source_commands_with_checks(applied(25).as_bytes(), &options, bounded)
             .unwrap(),
         Outcome::Inconclusive(_)
     ));
