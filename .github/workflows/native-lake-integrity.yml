@@ -70,7 +70,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo clippy --locked -p fln-parse -p fln --all-targets -- -D warnings
 
-  opaque-ir-candidate:
+  opaque-ir-regressions:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     env:
@@ -83,32 +83,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Apply the reviewed immutable opaque-body IR candidate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 -I - <<'PY'
-          import base64, hashlib, json, os, pathlib, urllib.request
-          rows = [{"path":"crates/fln/src/ir.rs","before":"6158f22bf3fc5338132b7697fc25891b46998176","after":"0724c519ba33ef8409416a7e608e7ec67b888913"},{"path":"crates/fln/src/source_check/modules/artifacts/ir.rs","before":"72e3fb9ce179c86f6cd2605a5b5e9250109b80a6","after":"a64ca50b0ce7c7da77504530220c146919a823f9"},{"path":"crates/fln-cli/tests/lake_module_build.rs","before":"4655c837350ef35ef629359b970fea60e5db1295","after":"6b5774acf8cd84e3935b795f38944ff2248704fa"}]
-          def blob(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          for row in rows:
-              path = pathlib.Path(row['path'])
-              assert blob(path.read_bytes()) == row['before'], row['path']
-              request = urllib.request.Request(
-                  'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + row['after'],
-                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                           'Accept': 'application/vnd.github+json',
-                           'User-Agent': 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  result = json.load(response)
-              assert result['encoding'] == 'base64'
-              data = base64.b64decode(result['content'])
-              assert blob(data) == row['after'], row['path']
-              path.write_bytes(data)
-              print(row['path'], row['before'], '->', row['after'])
-          PY
-          git diff --check
       - name: Install repository toolchain
         run: |
           set -euo pipefail

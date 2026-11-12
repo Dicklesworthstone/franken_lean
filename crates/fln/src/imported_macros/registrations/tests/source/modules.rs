@@ -666,7 +666,10 @@ fn imported_macro_queries_expand_reduction_and_instance_terms() {
     let crate::Declaration::Defn(synthesized) = &instance.declaration else {
         panic!("instance synthesis checks a scratch definition");
     };
-    assert_eq!(instance.checked_type, Expr::const_(name("QueryClass"), vec![]));
+    assert_eq!(
+        instance.checked_type,
+        Expr::const_(name("QueryClass"), vec![])
+    );
     assert_eq!(
         synthesized.value,
         Expr::const_(name("queryInstance"), vec![])
@@ -771,7 +774,13 @@ fn imported_macro_queries_do_not_bypass_atomic_macros_for_existing_globals() {
         None,
     );
     assert_eq!(
-        executed(&checked).modules.last().unwrap().commands.checks.len(),
+        executed(&checked)
+            .modules
+            .last()
+            .unwrap()
+            .commands
+            .checks
+            .len(),
         1
     );
     assert!(checked.attempts.is_empty());
@@ -806,7 +815,13 @@ fn imported_macro_queries_share_limits_and_withhold_partial_states() {
     let files = [("Main", source)];
     let complete = execute_program(&imported, &code, &files, MacroTreeLimits::default(), None);
     assert_eq!(
-        executed(&complete).modules.last().unwrap().commands.checks.len(),
+        executed(&complete)
+            .modules
+            .last()
+            .unwrap()
+            .commands
+            .checks
+            .len(),
         2
     );
     assert_eq!(complete.attempts.len(), 4);

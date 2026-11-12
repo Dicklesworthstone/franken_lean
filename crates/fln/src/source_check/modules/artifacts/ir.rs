@@ -152,8 +152,8 @@ impl SourceModuleArtifact {
     /// This currently supports module-system files and the native compiler's
     /// closed Nat/String/Bool signatures. Legacy files require IR embedded in
     /// their `.olean`, so a standalone companion is refused. Unsupported
-    /// executable definitions, including opaque bodies,
-    /// refuse the entire facet. Theorems and declaration-only constants need no
+    /// executable definitions refuse the entire facet. Safe opaque bodies use
+    /// their checked implementation without changing the logical declaration. Theorems and declaration-only constants need no
     /// executable bodies; explicit `noncomputable` definitions are omitted as at
     /// the pin. Ordinary `.olean` compilation does not require this facet.
     pub fn compile_ir(
@@ -207,13 +207,7 @@ impl SourceModuleArtifact {
                 continue;
             }
             match constant {
-                ConstantInfo::Defn(_) => {}
-                ConstantInfo::Opaque(_) => {
-                    return Err(refuse(
-                        constant.name(),
-                        "native IR export does not yet support opaque definitions",
-                    ));
-                }
+                ConstantInfo::Defn(_) | ConstantInfo::Opaque(_) => {}
                 ConstantInfo::Thm(_)
                 | ConstantInfo::Axiom(_)
                 | ConstantInfo::Quot(_)

@@ -648,12 +648,15 @@ impl<'a> FileSession<'a> {
                 return wrong_command(expected);
             };
             if registry.declarations(kind).next().is_some() {
-                return Outcome::Complete(Err(SourceMacroError::ScopeControl { kind: kind.clone() }));
+                return Outcome::Complete(Err(SourceMacroError::ScopeControl {
+                    kind: kind.clone(),
+                }));
             }
             term
         };
         let resolve = crate::source_check::grammar::resolver(engine.environment(), scope);
-        let existing_global = *kind == Name::from_components(["Lean", "Parser", "Command", "check"])
+        let existing_global = *kind
+            == Name::from_components(["Lean", "Parser", "Command", "check"])
             && parsed.query_is_identifier()
             && matches!(input, Syntax::Ident { val, .. }
                 if matches!(resolve(val),

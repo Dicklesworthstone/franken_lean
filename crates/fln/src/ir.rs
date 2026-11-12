@@ -1711,9 +1711,10 @@ pub fn compile_source_definition(
     compile_definition_impl(engine, declaration, None, options, engine_limits, limits)
 }
 
-/// Compile an exact definition from a module's privately retained checked
-/// environment. The temporary admission is confined to a fresh private alias:
-/// neither that alias nor a successor environment is a module product.
+/// Compile an exact definition or safe opaque body from a module's privately
+/// retained checked environment. The temporary admission is confined to a fresh
+/// private definition alias: neither that alias nor a successor environment is a
+/// module product, and an opaque source declaration stays logically opaque.
 ///
 /// The source signature still belongs to the original declaration. In
 /// particular, naming an existing definition cannot replace its exported ABI
@@ -1726,15 +1727,45 @@ pub(crate) fn compile_checked_source_definition(
     limits: CompileLimits,
 ) -> std::result::Result<fln_core::outcome::Outcome<IrModule>, DefinitionCompileError> {
     use fln_core::outcome::Outcome;
-    use fln_env::constants::{ConstantInfo, DefinitionSafety};
+    use fln_env::constants::{ConstantInfo, DefinitionSafety, DefinitionVal, ReducibilityHints};
+    use std::borrow::Cow;
 
-    let Some(ConstantInfo::Defn(definition)) = engine.environment().find(name) else {
-        return Err(DefinitionCompileError::Ir(unsupported(
-            "non-definition source export",
-        )));
-    };
     let mut meter = Budget(limits.max_work);
     meter.charge(1).map_err(DefinitionCompileError::Ir)?;
+    let definition = match engine.environment().find(name) {
+        Some(ConstantInfo::Defn(definition)) => Cow::Borrowed(definition),
+        Some(ConstantInfo::Opaque(opaque)) => {
+            if opaque.is_unsafe {
+                return Err(DefinitionCompileError::Ir(unsupported(
+                    "unsafe or partial source export",
+                )));
+            }
+            meter
+                .charge(
+                    opaque
+                        .base
+                        .level_params
+                        .len()
+                        .saturating_add(opaque.all.len()),
+                )
+                .map_err(DefinitionCompileError::Ir)?;
+            // The implementation was checked in the retained private world.
+            // Recheck its body under a fresh alias only for compilation; never
+            // replace the opaque constant or publish this transparent view.
+            Cow::Owned(DefinitionVal {
+                base: opaque.base.clone(),
+                value: opaque.value.clone(),
+                hints: ReducibilityHints::Opaque,
+                safety: DefinitionSafety::Safe,
+                all: opaque.all.clone(),
+            })
+        }
+        _ => {
+            return Err(DefinitionCompileError::Ir(unsupported(
+                "non-definition source export",
+            )));
+        }
+    };
     if definition.safety != DefinitionSafety::Safe {
         return Err(DefinitionCompileError::Ir(unsupported(
             "unsafe or partial source export",
@@ -1806,8 +1837,8 @@ pub(crate) fn compile_checked_source_definition(
         })?;
     meter.charge(work).map_err(DefinitionCompileError::Ir)?;
     let signature =
-        source_signature(definition, &erasures, &mut meter).map_err(DefinitionCompileError::Ir)?;
-    let mut alias = definition.clone();
+        source_signature(&definition, &erasures, &mut meter).map_err(DefinitionCompileError::Ir)?;
+    let mut alias = definition.into_owned();
     let alias_root = Name::str(name.clone(), "_fln_compile");
     let mut ordinal = 0_u64;
     loop {

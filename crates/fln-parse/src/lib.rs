@@ -867,11 +867,7 @@ impl ParsedSourceCommand {
             return None;
         };
         let index = match self.kind {
-            SourceCommandKind::Check
-                if *kind == Name::from_components(["Lean", "reduceCmd"]) =>
-            {
-                2
-            }
+            SourceCommandKind::Check if *kind == Name::from_components(["Lean", "reduceCmd"]) => 2,
             SourceCommandKind::Check
                 if *kind == parser_kind(&["Command", "check"])
                     || *kind == parser_kind(&["Command", "synth"]) =>
@@ -7417,7 +7413,10 @@ mod nat_definition_tests {
                 expanded.query_term_normalized(),
                 original.query_term_normalized()
             );
-            assert_eq!(expanded.query_is_identifier(), original.query_is_identifier());
+            assert_eq!(
+                expanded.query_is_identifier(),
+                original.query_is_identifier()
+            );
         }
     }
 

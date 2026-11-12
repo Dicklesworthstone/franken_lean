@@ -382,6 +382,122 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
     }
 }
 
+#[test]
+fn opaque_module_ir_preserves_opacity_and_executes_in_the_pinned_reference() {
+    let Some(reference) = pinned_family_reference() else {
+        return;
+    };
+    let lib = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| reference.parent().unwrap().join("../lib/lean"));
+    let package = Package::new(CONFIG);
+    let source = concat!(
+        "module\nprelude\npublic import Init.Notation\n",
+        "public opaque Lib.answer : Nat := 42\n",
+        "public opaque Lib.choose (b : Bool) (x y : Nat) : Nat := if b then x else y\n",
+    );
+    package.write("Lib/Top.lean", source);
+    let build = || {
+        Command::new(env!("CARGO_BIN_EXE_lake"))
+            .arg("--dir")
+            .arg(&package.0)
+            .args(["--json", "build", "+Lib.Top:ir"])
+            .env("LEAN_PATH", &lib)
+            .env("FLN_IMPORT_REUSE_DIR", package.0.join(".records"))
+            .output()
+            .unwrap()
+    };
+    let report = success(&build());
+    assert!(report.contains("\"executable_modules\":1"), "{report}");
+    let artifact = package.artifact("Lib.Top");
+    let ir_path = artifact.with_extension("ir");
+    let logical = family_bytes(&package, "Lib.Top");
+    let executable = std::fs::read(&ir_path).unwrap();
+    let snapshot = package.0.join(".lake/build/fln-build.snapshot");
+    success(&build());
+    assert_eq!(family_bytes(&package, "Lib.Top"), logical);
+    assert_eq!(std::fs::read(&ir_path).unwrap(), executable);
+    let previous_snapshot = std::fs::read(&snapshot).unwrap();
+
+    // An opaque declaration cannot be inlined from its logical public body.
+    // This consumer therefore needs the exact executable companion we emitted.
+    let consumer = Package::new("name = \"opaque_consumer\"\n");
+    consumer.write(
+        "Consumer.lean",
+        concat!(
+            "import Lib.Top\n",
+            "#eval Lib.answer\n",
+            "#eval Lib.choose true 17 23\n",
+            "#eval Lib.choose false 17 23\n",
+        ),
+    );
+    let import_paths = [package.0.join(".lake/build/lib/lean"), lib.clone()];
+    let search = std::env::join_paths(import_paths).unwrap();
+    let output = Command::new(&reference)
+        .arg(consumer.0.join("Consumer.lean"))
+        .current_dir(&consumer.0)
+        .env("LEAN_PATH", &search)
+        .output()
+        .unwrap();
+    assert_eq!(success(&output), "42\n17\n23\n");
+
+    // Both logical readers must still refuse unfolding the opaque body. The
+    // reflexive control separates opacity from a broken import or tactic path.
+    for (index, (body, accepted)) in [
+        ("example : Lib.answer = Lib.answer := by rfl", true),
+        ("example : Lib.answer = 42 := by rfl", false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let file = consumer.0.join(format!("Opacity{index}.lean"));
+        std::fs::write(
+            &file,
+            format!("prelude\nimport Init.Core\nimport Lib.Top\n{body}\n"),
+        )
+        .unwrap();
+        let native = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json", "--import-posture", "recheck"])
+            .arg(&file)
+            .current_dir(&consumer.0)
+            .env("LEAN_PATH", &search)
+            .env("FLN_IMPORT_REUSE_DIR", consumer.0.join(".records"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            native.status.code(),
+            Some(if accepted { 0 } else { 1 }),
+            "native opacity control: {native:?}"
+        );
+        let pinned = Command::new(&reference)
+            .arg(&file)
+            .current_dir(&consumer.0)
+            .env("LEAN_PATH", &search)
+            .output()
+            .unwrap();
+        assert_eq!(
+            pinned.status.success(),
+            accepted,
+            "pinned opacity control: {pinned:?}"
+        );
+    }
+
+    // A safe opaque body is compilable; unsafe bodies still need their own
+    // executable selection contract. Refusal must retain all last-good files.
+    package.write(
+        "Lib/Top.lean",
+        format!("{source}public unsafe opaque Lib.unsafeValue : Nat := 9\n"),
+    );
+    let refused = failure(&build());
+    assert!(
+        refused.contains("unsafe or partial source export"),
+        "{refused}"
+    );
+    assert_eq!(family_bytes(&package, "Lib.Top"), logical);
+    assert_eq!(std::fs::read(ir_path).unwrap(), executable);
+    assert_eq!(std::fs::read(snapshot).unwrap(), previous_snapshot);
+}
+
 fn family_bytes(package: &Package, module: &str) -> Vec<Vec<u8>> {
     FAMILY_PARTS
         .iter()
