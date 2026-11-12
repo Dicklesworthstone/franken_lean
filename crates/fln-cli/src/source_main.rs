@@ -17,7 +17,7 @@ pub(super) enum ArgumentsError {
 }
 
 impl ArgumentsError {
-    fn output(&self) -> MultiplexerOutput {
+    pub(super) fn output(&self) -> MultiplexerOutput {
         match self {
             Self::InvalidUtf8 { index } => failure(
                 "input",

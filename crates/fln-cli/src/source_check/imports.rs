@@ -505,6 +505,66 @@ fn load_with_implicit_init(
     })
 }
 
+/// Retain the package planner's exact module names and captured source bytes.
+/// This is the same ordinary Lean import world as `load_lean`; only filesystem
+/// discovery has already happened under the package's declared source roots.
+fn load_package(
+    names: Vec<Name>,
+    sources: Vec<Vec<u8>>,
+    root: &Path,
+    max_bytes: usize,
+) -> Result<Loaded, Failure> {
+    if names.is_empty() || names.len() != sources.len() {
+        return Err(Failure::input("a package program needs one source per module"));
+    }
+    if names.len() > MAX_MODULES {
+        return Err(Failure::resource("source module count exceeds 256"));
+    }
+    let mut total_bytes = 0usize;
+    let mut import_rows = 0usize;
+    let mut source_imports = BTreeMap::new();
+    for (name, source) in names.iter().zip(&sources) {
+        total_bytes = total_bytes
+            .checked_add(source.len())
+            .filter(|bytes| *bytes <= max_bytes)
+            .ok_or_else(|| Failure::resource("source import closure exceeds its byte limit"))?;
+        let mut header = parse_source_header(source).map_err(|error| {
+            Failure::input(format!("module `{}`: {error}", name.to_display_string()))
+        })?;
+        fln::source_check::modules::validate_source_header(name, &header).map_err(|error| {
+            let (class, authority, exit) = error.disposition();
+            Failure::new(class, &error.to_string(), authority, exit)
+        })?;
+        if !header.prelude {
+            header.imports.insert(0, Name::from_components(["Init"]));
+        }
+        import_rows = import_rows
+            .checked_add(header.imports.len())
+            .filter(|rows| *rows <= MAX_IMPORTS)
+            .ok_or_else(|| Failure::resource("source import count exceeds 4096"))?;
+        if source_imports
+            .insert(name.clone(), header.imports)
+            .is_some()
+        {
+            return Err(Failure::input(
+                "a package program contains a duplicate module",
+            ));
+        }
+    }
+    let olean_roots = metadata::ordered_roots(&source_imports, &names[..1]);
+    let oleans = if olean_roots.is_empty() {
+        Vec::new()
+    } else {
+        load_olean_closure(&olean_roots, root)?
+    };
+    Ok(Loaded {
+        inputs: Inputs::Modules { names, sources },
+        total_bytes,
+        oleans,
+        olean_roots,
+    })
+}
+
 /// Whether `name` resolves to a source file under `root`. A missing component
 /// anywhere means "not a local module"; a present one must pass the same
 /// symlink and file-kind checks as any source import.

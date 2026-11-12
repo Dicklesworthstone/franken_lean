@@ -14956,7 +14956,8 @@ const LAKE_USAGE: &str = concat!(
     "\nFrankenLean builds checked +Module:olean facets from declared libraries.\n",
     "TOML and native Lean package/lean_lib configurations are supported; Lean\n",
     "srcDir/buildDir terms are checked against real Init and evaluated by Golem.\n",
-    "Default library, executable and other facets remain unavailable.\n",
+    "Default library, native executable and other build facets remain unavailable.\n",
+    "lake exe runs configured executable roots and library imports on Golem.\n",
     "Builds recheck source. Imports default to --import-posture reuse-verified:\n",
     "a record of an earlier admission of the identical .olean bytes by the same\n",
     "admission authority is rebuilt and re-proved by logical root;\n",
@@ -15009,6 +15010,22 @@ const LAKE_HELP_QUERY: &str = concat!(
     "See `lake help build` for information on and examples of targets.\n",
 );
 
+const LAKE_HELP_EXE: &str = concat!(
+    "Execute a declared Lean program\n",
+    "\n",
+    "USAGE:\n",
+    "  lake [--dir DIR] [--fln-max-steps N] [--fln-max-frames N] exe TARGET [ARG...]\n",
+    "\n",
+    "FrankenLean checks the configured root and its declared library imports,\n",
+    "then runs main once on Golem. Every word after TARGET is a program argument,\n",
+    "including options and --. Program output and its exit status are preserved.\n",
+    "This executes checked source; it does not emit a native binary or satisfy\n",
+    "the executable build facet. Package dependencies and custom build settings\n",
+    "remain unavailable. Ordinary import admission and resource limits apply.\n",
+    "Golem inherits the caller's environment; Lake's augmented subprocess\n",
+    "environment is not installed by this source-execution route.\n",
+);
+
 const LAKE_HELP_ENV: &str = concat!(
     "Execute a command in Lake's environment\n",
     "\n",
@@ -15020,20 +15037,51 @@ const LAKE_HELP_ENV: &str = concat!(
     "the workspace configuration (if it exists).\n",
 );
 
+/// Separate the executable's argv before any Lake option pre-pass. The pin
+/// processes leading options before the command and before its target, then
+/// gives every remaining word to the executable unchanged.
+fn lake_executable_arguments(arguments: &mut Vec<OsString>) -> Vec<OsString> {
+    let mut executable = false;
+    let mut options = true;
+    let mut index = 0usize;
+    while index < arguments.len() {
+        let argument = arguments[index].to_string_lossy();
+        if options && argument == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options && argument.starts_with('-') && argument != "-" {
+            let takes_value = matches!(
+                argument.as_ref(),
+                "--import-posture" | "--jobs" | "--fln-max-steps" | "--fln-max-frames"
+            ) || lake_option_takes_next_argument(&argument);
+            index += 1 + usize::from(takes_value);
+            continue;
+        }
+        if executable {
+            return arguments.split_off(index + 1);
+        }
+        if !matches!(argument.as_ref(), "exe" | "exec") {
+            return Vec::new();
+        }
+        executable = true;
+        options = true;
+        index += 1;
+    }
+    Vec::new()
+}
+
 /// Run FrankenLean's bounded native `lake` personality (plan §17.1).
 pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
-    let arguments: Vec<OsString> = arguments.into_iter().collect();
+    let mut arguments: Vec<OsString> = arguments.into_iter().collect();
     if arguments.is_empty() {
         return MultiplexerOutput::success(LAKE_USAGE.to_owned());
     }
-    // `lake build --import-posture P` (bead `fln-uyuz`); `reuse-verified` by default.
-    let json_requested = arguments.iter().any(|arg| arg == "--json" || arg == "-J");
-    let (arguments, import_posture) = match source_check::take_import_posture_option(arguments) {
-        Ok(taken) => taken,
-        Err(UsageError(detail)) => {
-            return lake_operation_failure("fln.lake-build/2", &detail, false, json_requested);
-        }
-    };
+    let executable_arguments = lake_executable_arguments(&mut arguments);
+    // Parse posture only at actual Lake option positions. A pre-pass would
+    // steal option-like directory values and miss options after a global `--`.
+    let mut import_posture = None;
     let mut dir: Option<PathBuf> = None;
     let mut iter = arguments.into_iter();
     let mut command: Option<String> = None;
@@ -15042,9 +15090,73 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     let mut ignored_options = Vec::new();
     // `lake build --jobs N`: external `.olean` closure modules checked at once.
     let mut jobs: Option<std::num::NonZeroUsize> = None;
+    let mut vm_options = VmLimitOptions::default();
+    let mut options = true;
 
     while let Some(arg) = iter.next() {
-        let s = arg.to_string_lossy();
+        let Some(s) = arg.to_str() else {
+            return lake_operation_failure(
+                "fln.lake-exe/1",
+                "Lake options and target names must be valid UTF-8",
+                false,
+                is_json,
+            );
+        };
+        if options && s == "--" {
+            options = false;
+            continue;
+        }
+        if !options {
+            if command.is_none() {
+                command = Some(s.to_owned());
+                // Lake also processes leading options after its command.
+                options = true;
+            } else {
+                command_args.push(s.to_owned());
+            }
+            continue;
+        }
+        let posture_value = if s == "--import-posture" {
+            let Some(value) = iter.next() else {
+                return lake_operation_failure(
+                    "fln.lake-build/2",
+                    "--import-posture requires `recheck` or `reuse-verified`",
+                    false,
+                    is_json,
+                );
+            };
+            Some(value)
+        } else {
+            s.strip_prefix("--import-posture=").map(OsString::from)
+        };
+        if let Some(value) = posture_value {
+            if import_posture.is_some() {
+                return lake_operation_failure(
+                    "fln.lake-build/2",
+                    "--import-posture may be supplied at most once",
+                    false,
+                    is_json,
+                );
+            }
+            let parsed = value
+                .to_str()
+                .ok_or_else(|| "--import-posture is not UTF-8".to_owned())
+                .and_then(ImportPosture::parse);
+            match parsed {
+                Ok(posture) => import_posture = Some(posture),
+                Err(detail) => {
+                    return lake_operation_failure("fln.lake-build/2", &detail, false, is_json);
+                }
+            }
+            continue;
+        }
+        match vm_options.take(&arg, &mut iter) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(UsageError(detail)) => {
+                return lake_operation_failure("fln.lake-exe/1", &detail, false, is_json);
+            }
+        }
         let jobs_value = if s == "--jobs" {
             let Some(value) = iter.next() else {
                 return lake_operation_failure(
@@ -15073,7 +15185,12 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             continue;
         }
         if s == "--help" || s == "-h" {
-            return MultiplexerOutput::success(LAKE_USAGE.to_owned());
+            let help = if matches!(command.as_deref(), Some("exe" | "exec")) {
+                LAKE_HELP_EXE
+            } else {
+                LAKE_USAGE
+            };
+            return MultiplexerOutput::success(help.to_owned());
         }
         if s == "--version" {
             return MultiplexerOutput::success(format!(
@@ -15106,7 +15223,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             dir = Some(PathBuf::from(rest));
             continue;
         }
-        if let Some(refusal) = lake_unknown_option(&s) {
+        if let Some(refusal) = lake_unknown_option(s) {
             return MultiplexerOutput::failure(refusal, 1);
         }
         if s.starts_with('-') {
@@ -15120,16 +15237,16 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             }
             // An option the pin defines and this build does not act on. If
             // the pin gives it a value, that value is not a command.
-            if lake_option_takes_next_argument(&s) {
+            if lake_option_takes_next_argument(s) {
                 iter.next();
             }
-            ignored_options.push(s.into_owned());
+            ignored_options.push(s.to_owned());
             continue;
         }
         if command.is_none() {
-            command = Some(s.into_owned());
+            command = Some(s.to_owned());
         } else {
-            command_args.push(s.into_owned());
+            command_args.push(s.to_owned());
         }
     }
 
@@ -15148,6 +15265,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     let Some(cmd) = command else {
         return MultiplexerOutput::success(LAKE_USAGE.to_owned());
     };
+    let import_posture = import_posture.unwrap_or(ImportPosture::ReuseVerified);
 
     if cmd == "help" {
         if let Some(sub) = command_args.first() {
@@ -15155,10 +15273,20 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 "build" => return MultiplexerOutput::success(LAKE_HELP_BUILD.to_owned()),
                 "query" => return MultiplexerOutput::success(LAKE_HELP_QUERY.to_owned()),
                 "env" => return MultiplexerOutput::success(LAKE_HELP_ENV.to_owned()),
+                "exe" | "exec" => return MultiplexerOutput::success(LAKE_HELP_EXE.to_owned()),
                 _ => return MultiplexerOutput::success(format!("Help for lake {sub}\n")),
             }
         }
         return MultiplexerOutput::success(LAKE_USAGE.to_owned());
+    }
+
+    if vm_options.supplied() && !matches!(cmd.as_str(), "exe" | "exec") {
+        return lake_operation_failure(
+            "fln.lake-exe/1",
+            "Golem execution limits require lake exe",
+            false,
+            is_json,
+        );
     }
 
     match cmd.as_str() {
@@ -15333,30 +15461,30 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 }
             }
         }
-        "exe" => {
+        "exe" | "exec" => {
             let Some(target) = command_args.first() else {
                 return MultiplexerOutput::failure(
                     "error: missing executable target\n".to_owned(),
                     1,
                 );
             };
-            let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
-            match fln_lake::LakeConfig::discover(&target_dir) {
-                Ok(_cfg) => MultiplexerOutput::failure(
-                    format!(
-                        "lake exe {target}: executable execution requires Golem G2 execution pipeline (plan §13.3, §17.1)\n"
-                    ),
-                    1,
-                ),
-                Err(fln_lake::LakeDiscoveryError::NotFound(p)) => MultiplexerOutput::failure(
-                    format!(
-                        "error: no such file or directory (error code: 2)\n  file: {}\n",
-                        p.join("lakefile.lean").display()
-                    ),
-                    1,
-                ),
-                Err(err) => MultiplexerOutput::failure(format!("{err}\n"), 1),
+            if let Some(option) = ignored_options.first() {
+                return lake_operation_failure(
+                    "fln.lake-exe/1",
+                    &format!("executable option `{option}` is unavailable"),
+                    true,
+                    is_json,
+                );
             }
+            lake_build::run_executable(
+                dir.unwrap_or_else(|| PathBuf::from(".")),
+                target.clone(),
+                executable_arguments,
+                is_json,
+                jobs.unwrap_or(std::num::NonZeroUsize::MIN),
+                import_posture,
+                vm_options.limits,
+            )
         }
         "env" => {
             // The sysroot is a fact about where this binary is installed. A

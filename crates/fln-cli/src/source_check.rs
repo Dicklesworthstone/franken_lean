@@ -248,6 +248,27 @@ pub(super) fn run_imported_lean_main(
     })
 }
 
+/// A package's captured source closure, with its configured module identities.
+/// The entry module is first. Paths are used for diagnostics and external-import
+/// lookup only; execution never changes the process directory or rereads sources.
+pub(super) struct PackageProgram {
+    pub(super) entry_path: PathBuf,
+    pub(super) root: PathBuf,
+    pub(super) modules: Vec<(fln::Name, Vec<u8>)>,
+}
+
+/// Run a Lake executable through the same checked module and main pipeline as
+/// `lean --run`, preserving the package's source-root and module boundaries.
+pub(super) fn run_package_main(
+    program: PackageProgram,
+    arguments: Vec<String>,
+    jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
+    vm_limits: fln::VmExecutionLimits,
+) -> MultiplexerOutput {
+    imports::execution::run_package(program, arguments, jobs, posture, vm_limits)
+}
+
 /// Standard input has the same import and admission semantics as a Lean file.
 pub(super) fn run_imported_lean_stdin(
     source: Vec<u8>,

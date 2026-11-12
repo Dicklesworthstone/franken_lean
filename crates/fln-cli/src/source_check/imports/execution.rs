@@ -227,6 +227,7 @@ pub(in crate::source_check) fn run(
         paths,
         sources,
         EntryOrigin::File,
+        None,
         max_bytes,
         presentation,
         publication,
@@ -247,6 +248,7 @@ pub(in crate::source_check) fn run_stdin(
         vec![PathBuf::from("_stdin.lean")],
         vec![source],
         EntryOrigin::StandardInput,
+        None,
         max_bytes,
         Presentation::Lean,
         SourcePublication::None,
@@ -257,11 +259,46 @@ pub(in crate::source_check) fn run_stdin(
     )
 }
 
+pub(in crate::source_check) fn run_package(
+    program: PackageProgram,
+    arguments: Vec<String>,
+    jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
+    vm_limits: fln::VmExecutionLimits,
+) -> MultiplexerOutput {
+    let PackageProgram {
+        entry_path,
+        root,
+        modules,
+    } = program;
+    let (names, sources) = modules.into_iter().unzip();
+    run_loaded(
+        vec![entry_path],
+        sources,
+        EntryOrigin::File,
+        Some((root, names)),
+        SOURCE_RUN_DEFAULT_MAX_BYTES,
+        Presentation::Lean,
+        SourcePublication::None,
+        jobs,
+        posture,
+        vm_limits,
+        Some(arguments),
+    )
+    .unwrap_or_else(|| {
+        failure(
+            internal("the package source route lost its import context"),
+            Presentation::Lean,
+        )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_loaded(
     paths: Vec<PathBuf>,
     mut sources: Vec<Vec<u8>>,
     origin: EntryOrigin,
+    package: Option<(PathBuf, Vec<Name>)>,
     max_bytes: usize,
     presentation: Presentation,
     publication: SourcePublication,
@@ -325,7 +362,9 @@ fn run_loaded(
                 _ => {}
             }
             let total = sources.iter().map(Vec::len).sum();
-            let loaded = match if matches!(origin, EntryOrigin::StandardInput) {
+            let loaded = match if let Some((root, names)) = package {
+                load_package(names, sources, &root, max_bytes)
+            } else if matches!(origin, EntryOrigin::StandardInput) {
                 load_lean_stdin(sources.remove(0), max_bytes)
             } else if ordinary_lean {
                 load_lean(&paths, sources, total, max_bytes)

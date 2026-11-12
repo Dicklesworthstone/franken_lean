@@ -8,7 +8,9 @@ use fln::{Name, Outcome};
 use fln_lake::{LakeConfig, TargetKind};
 use std::path::Component;
 
+mod executable;
 mod explain;
+pub(super) use executable::run as run_executable;
 #[path = "lake_config.rs"]
 mod lean_config;
 mod snapshot;
@@ -219,11 +221,7 @@ fn config(root: &Path) -> Result<LakeConfig, Failure> {
     })
 }
 
-fn plan(
-    root: &Path,
-    config: &LakeConfig,
-    targets: &[String],
-) -> Result<(Vec<Library>, Vec<Name>), Failure> {
+fn library_sources(root: &Path, config: &LakeConfig) -> Result<Vec<Library>, Failure> {
     relative_directory(&config.src_dir)?;
     relative_directory(&config.build_dir)?;
     let mut libraries = Vec::new();
@@ -242,6 +240,15 @@ fn plan(
             directory: root.join(&config.src_dir).join(directory),
         });
     }
+    Ok(libraries)
+}
+
+fn plan(
+    root: &Path,
+    config: &LakeConfig,
+    targets: &[String],
+) -> Result<(Vec<Library>, Vec<Name>), Failure> {
+    let libraries = library_sources(root, config)?;
     if targets.is_empty() {
         return Err(Failure::unsupported(
             "default library and executable facets are unavailable; request +Module:olean for a declared lean_lib module",
@@ -286,6 +293,14 @@ fn load_sources(
     libraries: &[Library],
     entries: &[Name],
 ) -> Result<BTreeMap<Name, Module>, Failure> {
+    load_sources_with(root, entries, |module| source_path(module, libraries))
+}
+
+fn load_sources_with(
+    root: &Path,
+    entries: &[Name],
+    mut resolve: impl FnMut(&Name) -> Result<Option<PathBuf>, Failure>,
+) -> Result<BTreeMap<Name, Module>, Failure> {
     let mut pending: BTreeSet<_> = entries.iter().cloned().collect();
     let mut modules = BTreeMap::new();
     let mut source_bytes = 0usize;
@@ -297,8 +312,8 @@ fn load_sources(
         if modules.len() >= MAX_MODULES {
             return Err(Failure::new("resource", "source module count exceeds 256"));
         }
-        let path = source_path(&module, libraries)?
-            .ok_or_else(|| Failure::input("source module lost its library owner"))?;
+        let path = resolve(&module)?
+            .ok_or_else(|| Failure::input("source module lost its package owner"))?;
         check_path(root, &path, false)?;
         if !source_import_candidate_is_file(&path)? {
             return Err(Failure::input(format!(
@@ -327,7 +342,7 @@ fn load_sources(
             .filter(|n| *n <= MAX_IMPORTS)
             .ok_or_else(|| Failure::new("resource", "source import count exceeds 4096"))?;
         for imported in &imports {
-            if source_path(imported, libraries)?.is_some() {
+            if resolve(imported)?.is_some() {
                 pending.insert(imported.clone());
             }
         }
@@ -746,6 +761,32 @@ fn publish_with(
     Ok(outputs.into_iter().map(|(path, _, _)| path).collect())
 }
 
+fn load_configuration(
+    root: &Path,
+    jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
+) -> Result<(LakeConfig, Option<ImportPostureReport>), Failure> {
+    if root.join("lakefile.toml").is_file() {
+        return Ok((config(root)?, None));
+    }
+    let lean = root.join("lakefile.lean");
+    let toml = root.join("lakefile.toml");
+    if !lean
+        .try_exists()
+        .map_err(|error| Failure::io(&lean, error))?
+        && !toml
+            .try_exists()
+            .map_err(|error| Failure::io(&toml, error))?
+    {
+        return Err(Failure::new(
+            "missing-configuration",
+            format!("{}\n{}", lean.display(), toml.display()),
+        ));
+    }
+    let loaded = lean_config::load(root, jobs, posture)?;
+    Ok((loaded.config, Some(loaded.imports)))
+}
+
 fn build(
     directory: PathBuf,
     targets: Vec<String>,
@@ -762,26 +803,7 @@ fn build(
             detail,
             authority,
         })?;
-    let (config, configuration_imports) = if root.join("lakefile.toml").is_file() {
-        (config(&root)?, None)
-    } else {
-        let lean = root.join("lakefile.lean");
-        let toml = root.join("lakefile.toml");
-        if !lean
-            .try_exists()
-            .map_err(|error| Failure::io(&lean, error))?
-            && !toml
-                .try_exists()
-                .map_err(|error| Failure::io(&toml, error))?
-        {
-            return Err(Failure::new(
-                "missing-configuration",
-                format!("{}\n{}", lean.display(), toml.display()),
-            ));
-        }
-        let loaded = lean_config::load(&root, jobs, posture)?;
-        (loaded.config, Some(loaded.imports))
-    };
+    let (config, configuration_imports) = load_configuration(&root, jobs, posture)?;
     let (libraries, entries) = plan(&root, &config, &targets)?;
     let modules = load_sources(&root, &libraries, &entries)?;
     let executable = executable_modules(&targets, &modules)?;
