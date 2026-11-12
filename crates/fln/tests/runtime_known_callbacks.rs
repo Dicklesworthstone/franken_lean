@@ -210,15 +210,25 @@ def middleRun (offset : Nat) : Nat :=
 }
 
 #[test]
-fn discarded_nested_callback_results_still_execute_the_second_prefix() {
-    let source = |cost| {
+fn discarded_nested_callback_results_are_cheap_and_used_prefixes_execute() {
+    let source = |cost, used| {
+        let (consumer, body) = if used {
+            (
+                "useNested",
+                "let action := first second\n  let value := action 0\n  if n == 0 then value else Nat.add value (useNested f (Nat.pred n) second)",
+            )
+        } else {
+            (
+                "ignoreNested",
+                "let unused := first second\n  if n == 0 then 42 else ignoreNested f (Nat.pred n) second",
+            )
+        };
         format!(
             "{SPEND}\
-partial def ignoreNested (f : Nat -> Nat -> Nat -> Nat) (n second : Nat) : Nat :=
+partial def {consumer} (f : Nat -> Nat -> Nat -> Nat) (n second : Nat) : Nat :=
   let first := f n
-  let unused := first second
-  if n == 0 then 42 else ignoreNested f (Nat.pred n) second
-#eval ignoreNested
+  {body}
+#eval {consumer}
   (fun n =>
     let outer := Nat.add n 1
     fun acc =>
@@ -226,8 +236,13 @@ partial def ignoreNested (f : Nat -> Nat -> Nat -> Nat) (n second : Nat) : Nat :
       fun state => Nat.add (Nat.add outer paid) state) 3 {cost}"
         )
     };
-    let idle = execute(&source(0), "42");
-    let busy = execute(&source(30), "42");
+    assert_eq!(
+        execute(&source(0, false), "42"),
+        execute(&source(30, false), "42"),
+        "the original discarded callback result must not execute its prefixes"
+    );
+    let idle = execute(&source(0, true), "10");
+    let busy = execute(&source(30, true), "130");
     assert!(
         busy > idle + 30,
         "the second strict prefix disappeared: {idle} vs {busy}"
@@ -238,7 +253,7 @@ partial def ignoreNested (f : Nat -> Nat -> Nat -> Nat) (n second : Nat) : Nat :
     let mut bounded = limits();
     bounded.vm.max_steps = idle;
     assert!(matches!(
-        base.execute_source_definitions(&[source(30).as_bytes()], &options, bounded)
+        base.execute_source_definitions(&[source(30, true).as_bytes()], &options, bounded)
             .unwrap(),
         Outcome::Inconclusive(_)
     ));
@@ -349,17 +364,28 @@ fn partially_applied_consumers_and_interleaved_templates_keep_concrete_types() {
 }
 
 #[test]
-fn an_unused_partial_result_still_performs_the_callback_first_stage() {
+fn unused_partial_results_are_cheap_and_used_results_keep_the_first_stage() {
     let definitions = format!(
-        "{SPEND}def ignorePartial (f : Nat -> Nat -> Nat) (n : Nat) : Nat := let unused : Nat -> Nat := f n; 42\n"
+        "{SPEND}def ignorePartial (f : Nat -> Nat -> Nat) (n : Nat) : Nat := let unused : Nat -> Nat := f n; 42\n\
+         def usePartial (f : Nat -> Nat -> Nat) (n : Nat) : Nat := let action : Nat -> Nat := f n; action 42\n"
     );
-    let program = |cost| {
+    let program = |cost, used| {
+        let (body, consumer) = if used {
+            ("paid + y", "usePartial")
+        } else {
+            ("y", "ignorePartial")
+        };
         format!(
-            "{definitions}#eval ignorePartial (fun (n : Nat) => let paid : Nat := spend n; fun (y : Nat) => y) {cost}"
+            "{definitions}#eval {consumer} (fun (n : Nat) => let paid : Nat := spend n; fun (y : Nat) => {body}) {cost}"
         )
     };
-    let idle = execute(&program(0), "42");
-    let busy = execute(&program(30), "42");
+    assert_eq!(
+        execute(&program(0, false), "42"),
+        execute(&program(30, false), "42"),
+        "the original unused callback result must not execute its first stage"
+    );
+    let idle = execute(&program(0, true), "42");
+    let busy = execute(&program(30, true), "72");
     assert!(
         busy > idle + 30,
         "required stage was dropped: {idle} vs {busy}"
@@ -370,7 +396,7 @@ fn an_unused_partial_result_still_performs_the_callback_first_stage() {
     let mut bounded = limits();
     bounded.vm.max_steps = idle;
     assert!(matches!(
-        base.execute_source_definitions(&[program(30).as_bytes()], &options, bounded)
+        base.execute_source_definitions(&[program(30, true).as_bytes()], &options, bounded)
             .unwrap(),
         Outcome::Inconclusive(_)
     ));

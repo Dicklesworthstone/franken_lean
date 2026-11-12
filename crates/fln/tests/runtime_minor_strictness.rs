@@ -49,26 +49,45 @@ fn branch_local_owned_values_are_shared_and_remain_in_scope() {
 }
 
 #[test]
-fn an_unused_initializer_still_runs_and_exhaustion_is_not_success() {
+fn unused_initializers_are_cheap_and_used_initializer_exhaustion_is_not_success() {
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
-    let program = |cost| {
+    let program = |cost, used| {
+        let body = if used { "paid + x" } else { "x" };
         format!(
-            "{SPEND}def run (cost : Nat) : Nat := @Nat.rec (fun _ => Nat -> Nat) (let paid : Nat := spend cost; fun (x : Nat) => x) (fun (k : Nat) (ih : Nat -> Nat) (x : Nat) => ih x) 0 42\n#eval run {cost}"
+            "{SPEND}def run (cost : Nat) : Nat := @Nat.rec (fun _ => Nat -> Nat) (let paid : Nat := spend cost; fun (x : Nat) => {body}) (fun (k : Nat) (ih : Nat -> Nat) (x : Nat) => ih x) 0 42\n#eval run {cost}"
         )
     };
     let mut bounded = limits();
     bounded.vm.max_steps = 2000;
     bounded.vm.max_stack_depth = 256;
-    let expensive = program(100000);
+    // The original pure initializer is dead and must remain cheap even with
+    // a large input. Fuel checks below use a value captured by the result.
+    let unused = program(100000, false);
+    let unused_run = base
+        .execute_source_definitions(&[unused.as_bytes()], &options, bounded)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(value) = &unused_run.executions.last().unwrap().exit else {
+        panic!("unused initializer did not return");
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("42")
+    );
+    assert_eq!(base.logical_root(&options), root);
+    execute(&program(30, true), "72");
+
+    let expensive = program(100000, true);
     assert!(matches!(
         base.execute_source_definitions(&[expensive.as_bytes()], &options, bounded)
             .unwrap(),
         Outcome::Inconclusive(_)
     ));
     assert_eq!(base.logical_root(&options), root);
-    let cheap = program(0);
+    let cheap = program(0, true);
     let run = || {
         base.execute_source_definitions(&[cheap.as_bytes()], &options, bounded)
             .unwrap()

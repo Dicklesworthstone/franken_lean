@@ -100,15 +100,29 @@ def build (n : Nat) : Nat -> Nat -> Nat := let base : Nat := n + 1; fun (x : Nat
 }
 
 #[test]
-fn unused_partial_lifts_do_not_defer_the_supplied_function_initializer() {
-    let source = r#"
+fn unused_partial_lifts_are_cheap_and_used_initializers_keep_their_cost() {
+    let source = |cost, used| {
+        let (body, result) = if used {
+            ("forced + 42", "saved (Quot.mk (fun (a b : Nat) => True) 0)")
+        } else {
+            ("42", "42")
+        };
+        format!(
+            r#"
 def count (n : Nat) : Nat := match n with | .zero => 0 | .succ k => count k + 1
-def factory (n : Nat) : Nat -> Nat := let forced : Nat := count n; fun (x : Nat) => 42
+def factory (n : Nat) : Nat -> Nat := let forced : Nat := count n; fun (x : Nat) => {body}
 def Q : Type := Quot (fun (a b : Nat) => True)
-#eval let saved : Q -> Nat := Quot.lift (factory 30) (fun (a b : Nat) (h : True) => rfl); 42
-"#;
-    let idle = execute(&source.replace("factory 30", "factory 0"), "42");
-    let busy = execute(source, "42");
+#eval let saved : Q -> Nat := Quot.lift (factory {cost}) (fun (a b : Nat) (h : True) => rfl); {result}
+"#
+        )
+    };
+    assert_eq!(
+        execute(&source(0, false), "42"),
+        execute(&source(30, false), "42"),
+        "the original unused partial lift must not execute its initializer"
+    );
+    let idle = execute(&source(0, true), "42");
+    let busy = execute(&source(30, true), "72");
     assert!(busy > idle + 30, "partial lift delayed f: {idle} vs {busy}");
 }
 
