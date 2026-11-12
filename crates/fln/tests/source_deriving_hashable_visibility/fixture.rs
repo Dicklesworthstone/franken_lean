@@ -1,6 +1,7 @@
 //! Actual Hashable/UInt64 declarations, independently admitted from an empty Engine.
 //! This is a selected-declaration fixture, not complete library admission.
 //! No raw decoded constant or manufactured scalar declaration enters the Engine.
+#![forbid(unsafe_code)]
 use super::*;
 use fln::source_check::modules::imported::SourceOleanImportLimits;
 use fln::{IndependentReading, OleanCheckLimits, OleanDecodeLimits};

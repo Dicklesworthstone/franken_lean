@@ -6,6 +6,7 @@
 //! The original Prelude import remains in the decoded header. These tests check
 //! every Provider declaration against their already admitted selected foundation;
 //! they do not claim admission of the entire named Prelude module closure.
+#![forbid(unsafe_code)]
 
 fn bytes(text: &str) -> Vec<u8> {
     let text: String = text.split_whitespace().collect();

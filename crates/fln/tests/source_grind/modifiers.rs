@@ -1,5 +1,6 @@
 //! Selected theorem directions must change matching, preserve their original
 //! proofs, and reject directions that cannot cover the theorem's parameters.
+#![forbid(unsafe_code)]
 use super::*;
 
 const LOGICAL_ROOTS: &[&str] = &["Init.Grind.Tactics", "Init.Classical"];

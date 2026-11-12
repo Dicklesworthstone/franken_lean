@@ -1,6 +1,7 @@
 //! A small real Prelude slice, independently read and checked over SourceSeed.
 //! This is not complete module admission. No raw decoded declaration enters
 //! the returned Engine, and the choice axiom is the original pinned artifact.
+#![forbid(unsafe_code)]
 use super::*;
 use fln::source_check::modules::imported::SourceOleanImportLimits;
 use fln::{IndependentReading, OleanCheckLimits, OleanDecodeLimits};
