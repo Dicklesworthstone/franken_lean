@@ -60,6 +60,8 @@ pub enum LakeConfigFormat {
 pub struct LakeRequire {
     /// Package name.
     pub name: String,
+    /// Local package directory, relative to the declaring package.
+    pub path: Option<PathBuf>,
     /// Git URL (fetched via the D2 `git` subprocess protocol).
     pub url: Option<String>,
     /// Git revision or tag.
@@ -566,6 +568,16 @@ impl LakeConfig {
     /// custom globs, dependency jobs or native facets. Other configuration-only
     /// commands retain their existing permissive discovery surface.
     pub fn parse_toml_for_build(content: &str) -> Result<Self, LakeParseError> {
+        Self::parse_toml_strict(content, false)
+    }
+
+    /// The checked source executable route additionally resolves local path
+    /// requirements. Artifact builds retain their stricter dependency boundary.
+    pub fn parse_toml_for_execution(content: &str) -> Result<Self, LakeParseError> {
+        Self::parse_toml_strict(content, true)
+    }
+
+    fn parse_toml_strict(content: &str, local_requirements: bool) -> Result<Self, LakeParseError> {
         let mut section = "package";
         let mut keys = std::collections::BTreeSet::new();
         for (index, raw) in content.lines().enumerate() {
@@ -578,6 +590,7 @@ impl LakeConfig {
                     "[package]" => "package",
                     "[[lean_lib]]" => "lean_lib",
                     "[[lean_exe]]" => "lean_exe",
+                    "[[require]]" if local_requirements => "require",
                     _ => {
                         return Err(LakeParseError::UnsupportedBuildSetting(format!(
                             "line {}: {line}",
@@ -607,7 +620,8 @@ impl LakeConfig {
                     | "buildDir",
                 )
                 | ("lean_lib" | "lean_exe", "name" | "srcDir")
-                | ("lean_exe", "root") => false,
+                | ("lean_exe", "root")
+                | ("require", "name" | "path") => false,
                 _ => {
                     return Err(LakeParseError::UnsupportedBuildSetting(format!(
                         "line {}: {section}.{key}",
@@ -630,6 +644,17 @@ impl LakeConfig {
             }
         }
         let config = Self::parse_toml(content)?;
+        for requirement in &config.requires {
+            if requirement.name.is_empty() {
+                return Err(LakeParseError::MissingField("require name"));
+            }
+            if requirement.path.is_none() {
+                return Err(LakeParseError::UnsupportedBuildSetting(format!(
+                    "require {} has no local path",
+                    requirement.name
+                )));
+            }
+        }
         let mut names = std::collections::BTreeSet::new();
         for target in &config.targets {
             if !names.insert(&target.name) {
@@ -674,6 +699,7 @@ impl LakeConfig {
                     current_section = Section::Require;
                     requires.push(LakeRequire {
                         name: String::new(),
+                        path: None,
                         url: None,
                         rev: None,
                         subdir: None,
@@ -753,6 +779,9 @@ impl LakeConfig {
                                     if let Some(s) = parse_string_val(val) {
                                         req.name = s;
                                     }
+                                }
+                                "path" => {
+                                    req.path = parse_string_val(val).map(PathBuf::from);
                                 }
                                 "url" | "git" => {
                                     req.url = parse_string_val(val);

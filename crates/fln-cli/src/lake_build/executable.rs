@@ -11,7 +11,7 @@ fn program(
     config: &LakeConfig,
     target: &str,
 ) -> Result<source_check::PackageProgram, Failure> {
-    let libraries = library_sources(root, config)?;
+    let sources = local_dependencies::load(root, config)?;
     let executable = config
         .targets
         .iter()
@@ -34,20 +34,24 @@ fn program(
     // findModule? / findTargetModule? distinction. A loose file or another
     // executable cannot silently become an ambient library.
     let mut paths = BTreeMap::<PathBuf, Name>::new();
-    let mut modules = load_sources_with(root, std::slice::from_ref(&entry), |module| {
-        let path = if module == &entry {
-            Some(entry_path.clone())
+    let mut modules = load_sources_with(std::slice::from_ref(&entry), |module| {
+        let location = if module == &entry {
+            Some(SourceLocation {
+                package: root.to_path_buf(),
+                path: entry_path.clone(),
+            })
         } else {
-            source_path(module, &libraries)?
+            sources.resolve(module)?
         };
-        let Some(path) = path else {
+        let Some(location) = location else {
             return Ok(None);
         };
-        check_path(root, &path, false)?;
+        let path = &location.path;
+        check_path(&location.package, path, false)?;
         let canonical = path
             .canonicalize()
-            .map_err(|error| Failure::io(&path, error))?;
-        if !canonical.starts_with(root) {
+            .map_err(|error| Failure::io(path, error))?;
+        if !canonical.starts_with(&location.package) {
             return Err(Failure::input("executable source escaped its package"));
         }
         if let Some(previous) = paths.insert(canonical, module.clone())
@@ -59,7 +63,7 @@ fn program(
                 module.to_display_string(),
             )));
         }
-        Ok(Some(path))
+        Ok(Some(location))
     })?;
     let first = modules
         .remove(&entry)
@@ -99,7 +103,12 @@ pub(crate) fn run(
             let root = directory
                 .canonicalize()
                 .map_err(|error| Failure::io(&directory, error))?;
-            let (config, _) = match load_configuration(&root, jobs, posture) {
+            let loaded = if root.join("lakefile.toml").is_file() {
+                executable_config(&root).map(|config| (config, None))
+            } else {
+                load_configuration(&root, jobs, posture)
+            };
+            let (config, _) = match loaded {
                 Err(error) if error.class == "missing-configuration" && !json => {
                     return Ok(MultiplexerOutput::failure(
                         format!(

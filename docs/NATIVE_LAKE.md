@@ -254,6 +254,37 @@ Implicit `Init` is loaded for ordinary files. Changes to local dependencies
 are checked on the next invocation. A failed dependency prevents `main` from
 running; completed frontend output precedes the single `main` invocation.
 
+TOML executables can also use libraries from local packages. For example, the
+root package can declare a sibling whose own `lakefile.toml` declares a
+`Shared` library:
+
+```toml
+[[require]]
+name = "shared"
+path = "../shared"
+```
+
+An executable can then `import Shared` through the dependency's configured
+package and library source directories. Local requirements are resolved
+transitively before source checking. The resolver matches the pin's reverse
+breadth-first selection: a package name selected earlier keeps its chosen path
+when another requirement names it. Diamonds share that selection. The
+requirement name determines package identity; a different `name` in the
+dependency's own TOML does not rename it. Package dependency cycles and modules
+claimed by distinct source owners are refused before `main` runs.
+
+Each source path remains confined to its owning package; explicitly naming a
+sibling dependency does not permit a package's `srcDir` to escape its root.
+Resolution is bounded to 64 packages and 4096 declared requirement edges, in
+addition to the executable source-closure limits. This initial local-package
+path requires TOML configurations without existing `lake-manifest.json` or
+`.lake/package-overrides.json` files. These files, Lean dependency
+configurations, and non-path requirements are explicitly refused rather than
+silently ignored. Resolution writes no manifest or build artifacts.
+
+Local package requirements currently apply to `exe` and `exec`; artifact
+builds and `build explain` retain their explicit dependency-resolution refusal.
+
 Supported entry types are `IO Unit`, `IO UInt32`, and either of those with
 one `List String` argument. Existing compiler, runtime-capability, and resource
 limits still apply. VM exhaustion remains an inconclusive result.

@@ -10,6 +10,7 @@ use std::path::Component;
 
 mod executable;
 mod explain;
+mod local_dependencies;
 pub(super) use executable::run as run_executable;
 #[path = "lake_config.rs"]
 mod lean_config;
@@ -93,6 +94,11 @@ struct Library {
 struct Module {
     source: Vec<u8>,
     imports: Vec<Name>,
+}
+
+struct SourceLocation {
+    package: PathBuf,
+    path: PathBuf,
 }
 
 fn name(text: &str) -> Result<Name, Failure> {
@@ -195,6 +201,14 @@ fn source_path(module: &Name, libraries: &[Library]) -> Result<Option<PathBuf>, 
 }
 
 fn config(root: &Path) -> Result<LakeConfig, Failure> {
+    toml_config(root, false)
+}
+
+fn executable_config(root: &Path) -> Result<LakeConfig, Failure> {
+    toml_config(root, true)
+}
+
+fn toml_config(root: &Path, local_requirements: bool) -> Result<LakeConfig, Failure> {
     let path = root.join("lakefile.toml");
     if !path.is_file() {
         if !root.join("lakefile.lean").exists() {
@@ -202,6 +216,11 @@ fn config(root: &Path) -> Result<LakeConfig, Failure> {
                 "error: no such file or directory (error code: 2)\n  file: {}",
                 root.join("lakefile.lean").display()
             )));
+        }
+        if local_requirements {
+            return Err(Failure::unsupported(
+                "local-path executable dependencies require lakefile.toml configurations",
+            ));
         }
         return Err(Failure::unsupported(
             "build explain requires lakefile.toml because it does not elaborate or execute lakefile.lean configuration",
@@ -211,7 +230,12 @@ fn config(root: &Path) -> Result<LakeConfig, Failure> {
     let bytes = read_bounded(&path, 64 * 1024, "Lake configuration")?;
     let text =
         std::str::from_utf8(&bytes).map_err(|_| Failure::input("lakefile.toml is not UTF-8"))?;
-    let config = LakeConfig::parse_toml_for_build(text).map_err(|error| {
+    let parsed = if local_requirements {
+        LakeConfig::parse_toml_for_execution(text)
+    } else {
+        LakeConfig::parse_toml_for_build(text)
+    };
+    let config = parsed.map_err(|error| {
         let class = if matches!(error, fln_lake::LakeParseError::UnsupportedBuildSetting(_)) {
             "unsupported"
         } else {
@@ -319,13 +343,17 @@ fn load_sources(
     libraries: &[Library],
     entries: &[Name],
 ) -> Result<BTreeMap<Name, Module>, Failure> {
-    load_sources_with(root, entries, |module| source_path(module, libraries))
+    load_sources_with(entries, |module| {
+        Ok(source_path(module, libraries)?.map(|path| SourceLocation {
+            package: root.to_path_buf(),
+            path,
+        }))
+    })
 }
 
 fn load_sources_with(
-    root: &Path,
     entries: &[Name],
-    mut resolve: impl FnMut(&Name) -> Result<Option<PathBuf>, Failure>,
+    mut resolve: impl FnMut(&Name) -> Result<Option<SourceLocation>, Failure>,
 ) -> Result<BTreeMap<Name, Module>, Failure> {
     let mut pending: BTreeSet<_> = entries.iter().cloned().collect();
     let mut modules = BTreeMap::new();
@@ -338,9 +366,10 @@ fn load_sources_with(
         if modules.len() >= MAX_MODULES {
             return Err(Failure::new("resource", "source module count exceeds 256"));
         }
-        let path = resolve(&module)?
+        let location = resolve(&module)?
             .ok_or_else(|| Failure::input("source module lost its package owner"))?;
-        check_path(root, &path, false)?;
+        let path = location.path;
+        check_path(&location.package, &path, false)?;
         if !source_import_candidate_is_file(&path)? {
             return Err(Failure::input(format!(
                 "missing source module {}",

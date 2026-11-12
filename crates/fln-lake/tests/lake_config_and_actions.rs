@@ -87,6 +87,68 @@ defaultTargets = ["foo"]
 }
 
 #[test]
+fn local_requirements_are_retained_for_execution_and_refused_for_artifact_builds() {
+    let source = concat!(
+        "name = \"program\"\n",
+        "[[require]]\nname = \"shared\"\npath = \"../first\"\n",
+        "[[require]]\nname = \"shared\"\npath = \"../second\"\n",
+        "[[lean_exe]]\nname = \"runner\"\nroot = \"Main\"\n",
+    );
+    let executable = LakeConfig::parse_toml_for_execution(source).unwrap();
+    assert_eq!(executable.requires.len(), 2);
+    assert_eq!(executable.requires[0].name, "shared");
+    assert_eq!(executable.requires[1].name, "shared");
+    assert_eq!(
+        executable.requires[0].path.as_deref(),
+        Some(std::path::Path::new("../first")),
+    );
+    assert_eq!(
+        executable.requires[1].path.as_deref(),
+        Some(std::path::Path::new("../second")),
+    );
+    assert_eq!(
+        LakeConfig::parse_toml(source).unwrap().requires,
+        executable.requires,
+    );
+    assert!(matches!(
+        LakeConfig::parse_toml_for_build(source),
+        Err(LakeParseError::UnsupportedBuildSetting(_)),
+    ));
+}
+
+#[test]
+fn executable_requirements_do_not_ignore_remote_or_custom_settings() {
+    for fields in [
+        "name = \"dep\"\n",
+        "name = \"dep\"\ngit = \"https://example.invalid/dep\"\n",
+        "name = \"dep\"\npath = \"../dep\"\nrev = \"branch\"\n",
+        "name = \"dep\"\npath = \"../dep\"\nscope = \"owner\"\n",
+        "name = \"dep\"\npath = \"../dep\"\noptions = []\n",
+    ] {
+        let source = format!("name = \"program\"\n[[require]]\n{fields}");
+        assert!(
+            matches!(
+                LakeConfig::parse_toml_for_execution(&source),
+                Err(LakeParseError::UnsupportedBuildSetting(_)),
+            ),
+            "{source}"
+        );
+    }
+    assert!(matches!(
+        LakeConfig::parse_toml_for_execution(
+            "name = \"program\"\n[[require]]\npath = \"../dep\"\n",
+        ),
+        Err(LakeParseError::MissingField("require name")),
+    ));
+    assert!(matches!(
+        LakeConfig::parse_toml_for_execution(
+            "name = \"program\"\n[[require]]\nname = \"dep\"\npath = 1\n",
+        ),
+        Err(LakeParseError::InvalidSyntax(_)),
+    ));
+}
+
+#[test]
 fn test_validate_package_names() {
     assert!(validate_package_name("my_project").is_ok());
     assert!(validate_package_name("MyProject").is_ok());

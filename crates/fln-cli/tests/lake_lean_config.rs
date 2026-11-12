@@ -105,6 +105,24 @@ fn failure(output: Output) -> String {
     String::from_utf8(output.stderr).unwrap()
 }
 
+fn resource_failure(output: Output) -> String {
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(
+        output.stdout.is_empty(),
+        "partial output escaped: {output:?}"
+    );
+    let report = String::from_utf8(output.stderr).unwrap();
+    for field in [
+        "\"schema\":\"fln.lake-build/2\"",
+        "\"status\":\"inconclusive\"",
+        "\"class\":\"resource\"",
+        "\"authority\":false",
+    ] {
+        assert!(report.contains(field), "{report}");
+    }
+    report
+}
+
 fn assert_reused_configuration(report: &str) {
     assert!(
         report.contains(
@@ -145,6 +163,45 @@ package native where
   srcDir := FilePath.mk ("pro" ++ "ofs")
   roots := rootNames "mo"
 "#;
+
+#[test]
+fn configuration_byte_limit_is_inconclusive_and_preserves_previous_outputs() {
+    let package = Package::new(std::env::temp_dir().join("absent-reference-imports"));
+    let prior = [
+        ("Demo.Base", b"previous base artifact".as_slice()),
+        ("Demo", b"previous root artifact".as_slice()),
+        ("Support", b"previous support artifact".as_slice()),
+    ];
+    for (module, bytes) in prior {
+        let path = package.artifact(module);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    let mut source = format!("?{}", " ".repeat(64 * 1024 - 1));
+    for oversized in [false, true] {
+        if oversized {
+            source.push(' ');
+        }
+        package.write("lakefile.lean", &source);
+        let output = package.lake(&["build", "+Demo:olean"]);
+        let report = if oversized {
+            resource_failure(output)
+        } else {
+            failure(output)
+        };
+        assert_eq!(
+            report.contains("65536-byte input limit"),
+            oversized,
+            "{report}"
+        );
+        for (module, bytes) in prior {
+            assert_eq!(std::fs::read(package.artifact(module)).unwrap(), bytes);
+        }
+        assert!(!package.root.join(".lake/build/lib/lean").exists());
+        assert!(!package.root.join(".records").exists());
+    }
+}
 
 #[test]
 fn checked_lean_configuration_builds_real_modules_and_refuses_atomically() {
@@ -269,7 +326,6 @@ fn checked_lean_configuration_builds_real_modules_and_refuses_atomically() {
                 "@[extern \"foreign\"] def unavailable : FilePath := FilePath.mk \"sources/second\"\npackage native where",
             )
             .replace("srcDir := ◆ \"second\"", "srcDir := unavailable"),
-        format!("{changed_config}{}", " ".repeat(65 * 1024)),
     ].into_iter().enumerate() {
         eprintln!("[lake-lean-config] atomic refusal case {case}");
         package.write("lakefile.lean", invalid);
@@ -279,6 +335,17 @@ fn checked_lean_configuration_builds_real_modules_and_refuses_atomically() {
         assert_eq!(std::fs::read(package.artifact("Support")).unwrap(), support);
         assert!(!package.root.join(".lake/build/lib/lean").exists());
     }
+
+    package.write(
+        "lakefile.lean",
+        format!("{changed_config}{}", " ".repeat(65 * 1024)),
+    );
+    let exhausted = resource_failure(package.lake(&["build", "+Demo:olean"]));
+    assert!(exhausted.contains("65536-byte input limit"), "{exhausted}");
+    assert_eq!(std::fs::read(package.artifact("Demo.Base")).unwrap(), base);
+    assert_eq!(std::fs::read(package.artifact("Demo")).unwrap(), top);
+    assert_eq!(std::fs::read(package.artifact("Support")).unwrap(), support);
+    assert!(!package.root.join(".lake/build/lib/lean").exists());
 
     package.write(
         "lakefile.lean",
