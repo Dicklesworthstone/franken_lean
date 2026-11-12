@@ -113,6 +113,12 @@ pub enum ConvertError {
         visited: usize,
         budget: usize,
     },
+    /// The aggregate variable-sized payload would exceed the copy allowance.
+    ByteBudgetExhausted {
+        family: &'static str,
+        visited: usize,
+        budget: usize,
+    },
 }
 
 /// Recursion ceiling kept by `enter` if a walk family grows a frame again.
@@ -124,6 +130,8 @@ const MAX_WALK_DEPTH: u32 = 256;
 /// Node visits in one conversion scope, covering iterative lists as well
 /// as the recursive families.
 const MAX_WALK_NODES: usize = 1_000_000;
+/// Aggregate string and numeral payload copied by one conversion scope.
+const MAX_WALK_BYTES: usize = 16 * 1024 * 1024;
 
 impl std::fmt::Display for ConvertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -145,6 +153,14 @@ impl std::fmt::Display for ConvertError {
             } => write!(
                 f,
                 "{family} conversion exhausted {budget} nodes after {visited} visits"
+            ),
+            Self::ByteBudgetExhausted {
+                family,
+                visited,
+                budget,
+            } => write!(
+                f,
+                "{family} conversion exhausted {budget} bytes after {visited} payload bytes"
             ),
         }
     }
@@ -450,17 +466,46 @@ fn check_level_data(obj: &Obj, level: &Level) -> Result<(), ConvertError> {
 /// The dedup itself lives in the destination heap's interning, so the
 /// accounting is the whole region state — R10's short-lived conversion
 /// region, with nothing left behind when it ends.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Conversion {
     projected: usize,
     dedup_hits: usize,
     depth: u32,
     nodes: usize,
+    node_budget: usize,
+    bytes: usize,
+    byte_budget: usize,
+}
+
+impl Default for Conversion {
+    fn default() -> Self {
+        Self::with_node_budget(MAX_WALK_NODES)
+    }
 }
 
 impl Conversion {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Restrict the aggregate node visits across all projections in this
+    /// scope. A caller may lower, but cannot raise, the membrane's ceiling.
+    pub fn with_node_budget(node_budget: usize) -> Self {
+        Self::with_budgets(node_budget, MAX_WALK_BYTES)
+    }
+
+    /// Restrict aggregate node visits and copied payload bytes across all
+    /// projections. Neither allowance can exceed the membrane's ceiling.
+    pub fn with_budgets(node_budget: usize, byte_budget: usize) -> Self {
+        Self {
+            projected: 0,
+            dedup_hits: 0,
+            depth: 0,
+            nodes: 0,
+            node_budget: node_budget.min(MAX_WALK_NODES),
+            bytes: 0,
+            byte_budget: byte_budget.min(MAX_WALK_BYTES),
+        }
     }
 
     /// Terms projected in this scope (before interning dedup).
@@ -483,15 +528,27 @@ impl Conversion {
 
     fn enter(&mut self, family: &'static str) -> Result<(), ConvertError> {
         self.nodes = self.nodes.saturating_add(1);
-        if self.nodes > MAX_WALK_NODES {
+        if self.nodes > self.node_budget {
             return Err(ConvertError::NodeBudgetExhausted {
                 family,
                 visited: self.nodes,
-                budget: MAX_WALK_NODES,
+                budget: self.node_budget,
             });
         }
         if self.depth >= MAX_WALK_DEPTH {
             return Err(ConvertError::NativeOverflow { family });
+        }
+        Ok(())
+    }
+
+    fn copy_bytes(&mut self, family: &'static str, bytes: usize) -> Result<(), ConvertError> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.bytes > self.byte_budget {
+            return Err(ConvertError::ByteBudgetExhausted {
+                family,
+                visited: self.bytes,
+                budget: self.byte_budget,
+            });
         }
         Ok(())
     }
@@ -505,7 +562,7 @@ impl Conversion {
     }
 
     fn level(&mut self, obj: &Obj) -> Result<Level, ConvertError> {
-        self.project_level(obj)
+        self.project_level_graph(obj)
     }
 
     /// Project a Compat Expr graph into the NativeHeap, deduplicated by full
@@ -527,23 +584,48 @@ impl Conversion {
         Ok(handle)
     }
 
+    /// Project a Compat universe level with the same bounded, cached-data
+    /// validation as levels inside an Expr. Interning preserves structural
+    /// identity; it does not normalize levels or assert kernel equivalence.
+    pub fn project_level(
+        &mut self,
+        heap: &mut NativeHeap,
+        root: &Obj,
+    ) -> Result<NativeHandle<Level>, ConvertError> {
+        self.projected += 1;
+        let before = heap.live();
+        let handle = heap
+            .intern(self.level(root)?, Level::hash)
+            .map_err(ConvertError::NativeHeap)?;
+        if heap.live() == before {
+            self.dedup_hits += 1;
+        }
+        Ok(handle)
+    }
+
     fn project_expr_graph(&mut self, root: &Obj) -> Result<Expr, ConvertError> {
         // Iterative post-order: a 400-deep app nest is a legal native
         // value, and the recursive form overflowed at the host-stack
         // ceiling that still bounds inject (FL-INV-07).
         let mut done: HashMap<usize, Expr> = HashMap::new();
+        let mut active = HashSet::new();
         let mut stack = vec![root.clone_ref()];
         while let Some(current) = stack.last().map(Obj::clone_ref) {
+            let key = current.identity_token();
+            if done.contains_key(&key) {
+                stack.pop();
+                continue;
+            }
+            // Charge discovery, before inspecting descendants or allocating
+            // an unbounded pending path. Resuming a parent is not a new node.
+            if active.insert(key) {
+                self.enter("expr")?;
+            }
             if current.is_scalar() {
                 return Err(malformed(
                     "expr",
                     "a bare tagged scalar is not an expression object",
                 ));
-            }
-            let key = current.identity_token();
-            if done.contains_key(&key) {
-                stack.pop();
-                continue;
             }
             let tag = current.obj_tag() as u8;
             let child_slots: &[usize] = match tag {
@@ -583,10 +665,7 @@ impl Conversion {
                 if done.contains_key(&child_key) {
                     continue;
                 }
-                if stack
-                    .iter()
-                    .any(|frame| frame.identity_token() == child_key)
-                {
+                if active.contains(&child_key) {
                     return Err(malformed("expr", "expr graph is cyclic"));
                 }
                 pending = Some(child);
@@ -597,10 +676,10 @@ impl Conversion {
                 stack.push(child);
                 continue;
             }
-            self.enter("expr")?;
             let current = stack.pop().expect("the parent is still on the stack");
             let projected = self.project_expr_node(&current, &done)?;
             check_expr_data(&current, &projected)?;
+            active.remove(&key);
             done.insert(key, projected);
         }
         done.get(&root.identity_token())
@@ -770,22 +849,26 @@ impl Conversion {
         Ok(name)
     }
 
-    fn project_level(&mut self, root: &Obj) -> Result<Level, ConvertError> {
+    fn project_level_graph(&mut self, root: &Obj) -> Result<Level, ConvertError> {
         // Iterative post-order, keyed by identity_token: Level.depth is
         // 24-bit, so a succ tower can legally exceed the 256-frame host
         // stack that still bounds the recursive expr/name projectors.
         // A child already on the stack is a cycle in the Compat graph.
         let mut done: HashMap<usize, Level> = HashMap::new();
+        let mut active = HashSet::new();
         let mut stack = vec![root.clone_ref()];
         while let Some(current) = stack.last().map(Obj::clone_ref) {
             let key = current.identity_token();
-            if lean_box0(&current) {
-                self.enter("level")?;
-                done.insert(key, Level::zero());
+            if done.contains_key(&key) {
                 stack.pop();
                 continue;
             }
-            if done.contains_key(&key) {
+            if active.insert(key) {
+                self.enter("level")?;
+            }
+            if lean_box0(&current) {
+                done.insert(key, Level::zero());
+                active.remove(&key);
                 stack.pop();
                 continue;
             }
@@ -825,10 +908,7 @@ impl Conversion {
                 if done.contains_key(&child_key) {
                     continue;
                 }
-                if stack
-                    .iter()
-                    .any(|frame| frame.identity_token() == child_key)
-                {
+                if active.contains(&child_key) {
                     return Err(malformed("level", "level graph is cyclic"));
                 }
                 pending = Some(child);
@@ -837,7 +917,6 @@ impl Conversion {
                 stack.push(child);
                 continue;
             }
-            self.enter("level")?;
             let current = stack.pop().expect("the parent is still on the stack");
             let projected = match tag {
                 TAG_LEVEL_ZERO => Level::zero(),
@@ -886,6 +965,7 @@ impl Conversion {
                 _ => unreachable!("tag classified above"),
             };
             check_level_data(&current, &projected)?;
+            active.remove(&key);
             done.insert(key, projected);
         }
         done.get(&root.identity_token())
@@ -938,6 +1018,7 @@ impl Conversion {
                     if live > limbs.len() {
                         return Err(malformed("literal", "mpz size field exceeds the limb span"));
                     }
+                    self.copy_bytes("literal", live.saturating_mul(std::mem::size_of::<u64>()))?;
                     Ok(Literal::Nat(NatLit::from_limbs_le(limbs[..live].to_vec())))
                 }
             }
@@ -1097,22 +1178,22 @@ impl Conversion {
             ));
         }
         if obj.obj_tag() != usize::from(abi::TAG_STRING) {
-            // `try_string_view` refuses a non-string. Name.str's second
+            // The borrowed string view refuses a non-string. Name.str's second
             // child being a ctor is a malformed name, not a panic.
             return Err(malformed("string", "expected a string object"));
         }
-        // `try_string_view` is `(m_size, m_capacity, m_length, bytes-with-NUL)`.
+        // The view is `(m_size, m_capacity, m_length, bytes-with-NUL)`.
         // `m_length` is the UTF-8 scalar count, the same field
         // `lean_string_length` boxes. Slicing the buffer with it treats
         // "héllo" (5 scalars, 6 payload bytes) as a 5-byte string and
         // silently drops the last character — or splits a multi-byte
         // scalar and fails UTF-8. The payload is `m_size - 1` bytes.
-        // Header laws (`m_size == 0`, `m_size > m_capacity`, missing NUL)
-        // are refused before the copy; the checks below are the payload
-        // laws that still need the bytes in hand.
-        let Some((size, _, length, bytes)) = obj.try_string_view() else {
+        // Borrow first, then charge before copying or walking the UTF-8.
+        // A Name component and a literal share this aggregate allowance.
+        let Some((size, _, length, bytes)) = obj.try_borrow_string_view() else {
             return Err(malformed("string", "hostile or inconsistent string header"));
         };
+        self.copy_bytes("string", size - 1)?;
         let content = std::str::from_utf8(&bytes[..size - 1])
             .map_err(|_| malformed("string", "invalid UTF-8"))?;
         if content.chars().count() != length {
@@ -1130,6 +1211,13 @@ impl Conversion {
 pub fn inject_expr(heap: &NativeHeap, handle: NativeHandle<Expr>) -> Result<Obj, ConvertError> {
     let expr = heap.get(handle).map_err(ConvertError::NativeHeap)?;
     inject_expr_value(expr)
+}
+
+/// Inject a native universe level into owned Compat objects, retaining its
+/// constructor structure and the pin's computed data words.
+pub fn inject_level(heap: &NativeHeap, handle: NativeHandle<Level>) -> Result<Obj, ConvertError> {
+    let level = heap.get(handle).map_err(ConvertError::NativeHeap)?;
+    inject_level_value(level)
 }
 
 fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
@@ -1189,7 +1277,7 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
                 Obj::mk_ctor(TAG_EXPR_FVAR, vec![inject_name(&id.0)], &data_bytes)
             }
             ExprNode::Sort { level } => {
-                Obj::mk_ctor(TAG_EXPR_SORT, vec![inject_level(level)?], &data_bytes)
+                Obj::mk_ctor(TAG_EXPR_SORT, vec![inject_level_value(level)?], &data_bytes)
             }
             ExprNode::Const { name, levels } => Obj::mk_ctor(
                 TAG_EXPR_CONST,
@@ -1353,7 +1441,7 @@ pub fn inject_name(name: &Name) -> Obj {
     current
 }
 
-fn inject_level(level: &Level) -> Result<Obj, ConvertError> {
+fn inject_level_value(level: &Level) -> Result<Obj, ConvertError> {
     // Iterative post-order: Level.depth is 24-bit, so a succ tower can
     // legally exceed the 256-frame host-stack ceiling that used to bound
     // every convert walk.
@@ -1457,7 +1545,7 @@ fn inject_literal(literal: &Literal) -> Obj {
 fn inject_level_list(levels: &[Level]) -> Result<Obj, ConvertError> {
     let mut out = Obj::mk_nat(0);
     for level in levels.iter().rev() {
-        out = Obj::mk_ctor(TAG_LIST_CONS, vec![inject_level(level)?, out], &[]);
+        out = Obj::mk_ctor(TAG_LIST_CONS, vec![inject_level_value(level)?, out], &[]);
     }
     Ok(out)
 }

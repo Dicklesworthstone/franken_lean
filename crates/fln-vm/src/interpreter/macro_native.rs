@@ -1282,7 +1282,7 @@ fn limit(resource: &'static str, allowed: u64, observed: u64) -> Result<(), Intr
     Ok(())
 }
 
-fn name(value: &Obj) -> Result<Name, IntrinsicFailure> {
+pub(super) fn name(value: &Obj) -> Result<Name, IntrinsicFailure> {
     // Bound the complete borrowed carrier before the converter allocates its
     // Native Name. Its own checker also validates component shapes and hashes.
     let mut cursor = value.clone_ref();
@@ -1313,6 +1313,13 @@ fn name(value: &Obj) -> Result<Name, IntrinsicFailure> {
                 visited, budget, ..
             } => IntrinsicFailure::MirrorResource {
                 resource: "name nodes",
+                allowed: budget as u64,
+                observed: visited as u64,
+            },
+            ConvertError::ByteBudgetExhausted {
+                visited, budget, ..
+            } => IntrinsicFailure::MirrorResource {
+                resource: "name bytes",
                 allowed: budget as u64,
                 observed: visited as u64,
             },

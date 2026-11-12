@@ -268,6 +268,7 @@ impl DecodeError {
             self,
             Self::Limit { .. }
                 | Self::Conversion(ConvertError::NodeBudgetExhausted { .. })
+                | Self::Conversion(ConvertError::ByteBudgetExhausted { .. })
                 | Self::Conversion(ConvertError::NativeOverflow { .. })
         )
     }

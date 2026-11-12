@@ -19,7 +19,9 @@ use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
 use fln_core::options::{DataValue, KVMap, SyntaxHandle};
-use fln_rt::convert::{Conversion, ConvertError, INJECT_DECL, PROJECT_DECL, inject_expr};
+use fln_rt::convert::{
+    Conversion, ConvertError, INJECT_DECL, PROJECT_DECL, inject_expr, inject_level,
+};
 use fln_rt::native_heap::{HeapError, NativeHeap};
 use fln_unsafe_abi::handle::Obj;
 
@@ -85,6 +87,208 @@ fn projection_into_a_closed_heap_returns_a_typed_error_and_remains_reusable() {
     let recovered = conversion.project_expr(&mut fresh, &input).unwrap();
     assert_eq!(fresh.get(recovered).unwrap(), &Expr::bvar(0).unwrap());
     assert_eq!(fresh.live(), 1);
+}
+
+#[test]
+fn standalone_levels_round_trip_without_normalizing_and_share_the_scope_budget() {
+    let mut source = NativeHeap::new();
+    let level = Level::max(Level::zero(), Level::one()).unwrap();
+    let handle = source.alloc(level.clone());
+    let object = inject_level(&source, handle).unwrap();
+    let mut target = NativeHeap::new();
+    let mut conversion = Conversion::with_node_budget(6);
+    let first = conversion.project_level(&mut target, &object).unwrap();
+    let second = conversion.project_level(&mut target, &object).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(target.get(first).unwrap(), &level);
+    assert_ne!(target.get(first).unwrap(), &Level::one());
+    assert_eq!((conversion.projected(), conversion.dedup_hits()), (2, 1));
+    assert!(matches!(
+        conversion.project_level(&mut target, &Obj::mk_nat(0)),
+        Err(ConvertError::NodeBudgetExhausted {
+            family: "level",
+            visited: 7,
+            budget: 6,
+        })
+    ));
+    assert_eq!(target.live(), 1, "a resource stop publishes no new handle");
+
+    let mut closed = NativeHeap::new();
+    closed.close();
+    assert!(matches!(
+        Conversion::new().project_level(&mut closed, &object),
+        Err(ConvertError::NativeHeap(HeapError::Closed))
+    ));
+    assert!(matches!(
+        inject_level(&closed, first),
+        Err(ConvertError::NativeHeap(_))
+    ));
+}
+
+#[test]
+fn node_limits_stop_descent_before_unvisited_malformed_descendants() {
+    // A postorder-only budget reaches the unknown leaf before charging any
+    // ancestor. Charging first entry must instead stop at the ninth node.
+    let mut expression = Obj::mk_ctor(99, Vec::new(), &[]);
+    let mut level = Obj::mk_ctor(99, Vec::new(), &[]);
+    for _ in 0..400 {
+        expression = Obj::mk_ctor(
+            5,
+            vec![Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]), expression],
+            &[],
+        );
+        level = Obj::mk_ctor(1, vec![level], &[]);
+    }
+    let mut heap = NativeHeap::new();
+    assert!(matches!(
+        Conversion::with_node_budget(8).project_expr(&mut heap, &expression),
+        Err(ConvertError::NodeBudgetExhausted {
+            family: "expr",
+            visited: 9,
+            budget: 8,
+        })
+    ));
+    assert!(matches!(
+        Conversion::with_node_budget(8).project_level(&mut heap, &level),
+        Err(ConvertError::NodeBudgetExhausted {
+            family: "level",
+            visited: 9,
+            budget: 8,
+        })
+    ));
+    assert!(matches!(
+        Conversion::new().project_expr(&mut heap, &expression),
+        Err(ConvertError::UnsupportedConstructor {
+            family: "expr",
+            tag: 99
+        })
+    ));
+    assert!(matches!(
+        Conversion::new().project_level(&mut heap, &level),
+        Err(ConvertError::UnsupportedConstructor {
+            family: "level",
+            tag: 99
+        })
+    ));
+    assert_eq!(
+        heap.live(),
+        0,
+        "neither resource nor malformed stops publish handles"
+    );
+}
+
+#[test]
+fn first_entry_accounting_counts_shared_expr_nodes_once() {
+    let child = Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]);
+    let root = Obj::mk_ctor(5, vec![child.clone_ref(), child.clone_ref()], &[]);
+    let mut heap = NativeHeap::new();
+    let mut conversion = Conversion::with_node_budget(2);
+    let handle = conversion.project_expr(&mut heap, &root).unwrap();
+    assert_eq!(
+        heap.get(handle).unwrap(),
+        &Expr::app(Expr::bvar(0).unwrap(), Expr::bvar(0).unwrap())
+    );
+    assert!(matches!(
+        conversion.project_expr(&mut heap, &child),
+        Err(ConvertError::NodeBudgetExhausted {
+            family: "expr",
+            visited: 3,
+            budget: 2
+        })
+    ));
+    assert_eq!(heap.live(), 1);
+}
+
+#[test]
+fn string_payload_budget_is_aggregate_and_publishes_no_partial_handle() {
+    let text = "λ\0🙂";
+    let literal = Obj::mk_ctor(1, vec![Obj::mk_string(text)], &[]);
+    let expression = Obj::mk_ctor(9, vec![literal.clone_ref()], &[]);
+    let level = Obj::mk_ctor(4, vec![mk_name(&[text])], &[]);
+    let mut heap = NativeHeap::new();
+    let mut too_small = Conversion::with_budgets(100, text.len() - 1);
+    assert!(matches!(
+        too_small.project_expr(&mut heap, &expression),
+        Err(ConvertError::ByteBudgetExhausted {
+            family: "string",
+            visited: 7,
+            budget: 6
+        })
+    ));
+    assert_eq!(heap.live(), 0);
+    assert!(matches!(
+        Conversion::with_budgets(100, text.len() - 1).project_level(&mut heap, &level),
+        Err(ConvertError::ByteBudgetExhausted {
+            family: "string",
+            visited: 7,
+            budget: 6
+        })
+    ));
+    assert_eq!(heap.live(), 0);
+
+    let mut shared = Conversion::with_budgets(100, text.len());
+    let first = shared.project_expr(&mut heap, &expression).unwrap();
+    assert!(matches!(
+        shared.project_level(&mut heap, &level),
+        Err(ConvertError::ByteBudgetExhausted {
+            family: "string",
+            visited: 14,
+            budget: 7
+        })
+    ));
+    assert_eq!(
+        heap.live(),
+        1,
+        "a later exhausted projection preserves earlier handles"
+    );
+    assert_eq!(
+        heap.get(first).unwrap(),
+        &Expr::lit(Literal::Str(text.to_owned()))
+    );
+    let repaired = Conversion::with_budgets(100, text.len())
+        .project_level(&mut heap, &level)
+        .unwrap();
+    assert_eq!(
+        heap.get(repaired).unwrap(),
+        &Level::param(Name::str(Name::anonymous(), text))
+    );
+}
+
+#[test]
+fn natural_literal_limb_copies_share_the_string_byte_allowance() {
+    let literal = Obj::mk_ctor(0, vec![Obj::mk_mpz(&[7, 1], false)], &[]);
+    let expression = Obj::mk_ctor(9, vec![literal.clone_ref()], &[]);
+    let mut heap = NativeHeap::new();
+    assert!(matches!(
+        Conversion::with_budgets(100, 15).project_expr(&mut heap, &expression),
+        Err(ConvertError::ByteBudgetExhausted {
+            family: "literal",
+            visited: 16,
+            budget: 15
+        })
+    ));
+    assert_eq!(heap.live(), 0);
+    let string = Obj::mk_ctor(1, vec![Obj::mk_string("x")], &[]);
+    let mut shared = Conversion::with_budgets(100, 16);
+    assert_eq!(
+        shared.project_literal(&string).unwrap(),
+        Literal::Str("x".to_owned())
+    );
+    assert!(matches!(
+        shared.project_literal(&literal),
+        Err(ConvertError::ByteBudgetExhausted {
+            family: "literal",
+            visited: 17,
+            budget: 16
+        })
+    ));
+    let handle = Conversion::with_budgets(100, 16)
+        .project_expr(&mut heap, &expression)
+        .unwrap();
+    assert_eq!(
+        heap.get(handle).unwrap(),
+        &Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![7, 1])))
+    );
 }
 
 #[test]

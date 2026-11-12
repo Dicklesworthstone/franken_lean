@@ -346,6 +346,20 @@ fn conversion_outcome(
             })
             .with_progress("macro Name conversion"),
         ),
+        SyntaxConversionError::Name(fln_rt::convert::ConvertError::ByteBudgetExhausted {
+            visited,
+            budget,
+            ..
+        }) => Outcome::Inconclusive(
+            Inconclusive::resource(ResourceUsage {
+                reason: ResourceReason::Memory {
+                    limit_bytes: budget as u64,
+                },
+                allowed: budget as u64,
+                observed: visited as u64,
+            })
+            .with_progress("macro Name conversion bytes"),
+        ),
         SyntaxConversionError::Allocation => Outcome::Inconclusive(
             Inconclusive::dependency_unavailable("host allocation for macro value conversion"),
         ),
