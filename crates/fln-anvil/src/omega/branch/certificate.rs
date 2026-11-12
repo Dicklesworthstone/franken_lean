@@ -150,6 +150,7 @@ fn scoped_row(
     Ok(LinearConstraint { coeffs, bound })
 }
 
+// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: omega-branch-certificate-check
 fn check(
     expected: &[LinearConstraint],
     certificate: &OmegaBranchCertificate,
@@ -217,6 +218,7 @@ fn check(
 
 /// Validate exact input binding, strict tree shape, every ordered case context
 /// and every linear contradiction. This function grants no admission authority.
+// FLN-FL-INV-06-CERTIFICATE-ALIAS: omega-branch-certificate-check
 pub fn check_branch_certificate(
     expected: &[LinearConstraint],
     certificate: &OmegaBranchCertificate,
@@ -239,6 +241,7 @@ const MAGIC: &[u8; 8] = b"FLNOMBRN";
 
 /// Encode a strict postorder tree with canonical V1 linear certificates as
 /// length-delimited leaves. Arithmetic validity remains the checker's job.
+// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: omega-branch-certificate-encode
 pub fn encode_branch_certificate(
     certificate: &OmegaBranchCertificate,
     limits: OmegaLimits,
@@ -293,6 +296,7 @@ pub fn encode_branch_certificate(
 
 /// Decode one bounded canonical tree. Child references, tree ownership and
 /// cumulative leaf/node counts are validated; leaf arithmetic is not solved.
+// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: omega-branch-certificate-decode
 pub fn decode_branch_certificate(
     input: &[u8],
     limits: OmegaLimits,

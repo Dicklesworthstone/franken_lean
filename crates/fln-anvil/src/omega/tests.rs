@@ -1,3 +1,6 @@
+#![cfg(test)]
+#![forbid(unsafe_code)]
+
 use super::*;
 
 fn row(coeffs: &[i64], bound: i64) -> LinearConstraint {

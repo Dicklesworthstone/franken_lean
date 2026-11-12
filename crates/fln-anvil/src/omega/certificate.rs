@@ -44,6 +44,7 @@ fn parent(rows: &[LinearConstraint], step: usize, id: u32) -> Checked<&LinearCon
     })
 }
 
+// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: omega-linear-certificate-check
 pub(super) fn check(
     expected: &[LinearConstraint],
     certificate: &OmegaCertificate,
@@ -168,6 +169,7 @@ pub(super) fn check(
 
 /// Check exact input binding, all arithmetic steps, and the final contradiction.
 /// The resulting rows are useful for a proof replayer; this is not admission.
+// FLN-FL-INV-06-CERTIFICATE-ALIAS: omega-linear-certificate-check
 pub fn check_certificate(
     expected: &[LinearConstraint],
     certificate: &OmegaCertificate,
@@ -231,6 +233,7 @@ impl Encoder<'_, '_> {
 
 /// Encode the V1 tagged DAG with canonical signed-magnitude integers. Encoding
 /// preserves data and does not claim that the encoded certificate is valid.
+// FLN-FL-INV-06-CERTIFICATE-ALIAS: omega-linear-certificate-encode
 pub fn encode_certificate(certificate: &OmegaCertificate, limits: OmegaLimits) -> Checked<Vec<u8>> {
     let mut never_cancel = || false;
     let mut meter = Meter {
@@ -242,6 +245,7 @@ pub fn encode_certificate(certificate: &OmegaCertificate, limits: OmegaLimits) -
     encode(certificate, &mut meter)
 }
 
+// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: omega-linear-certificate-encode
 pub(super) fn encode(certificate: &OmegaCertificate, meter: &mut Meter<'_>) -> Checked<Vec<u8>> {
     if certificate.version != OMEGA_CERTIFICATE_VERSION {
         return Err(CertificateError::UnsupportedVersion(certificate.version));
@@ -373,6 +377,7 @@ impl<'a> Decoder<'a, '_, '_> {
 /// Decode one complete canonical V1 certificate. Unknown versions/tags, invalid
 /// integers, truncation and trailing bytes are errors. Arithmetic and exact input
 /// binding are checked separately by the certificate checker.
+// FLN-FL-INV-06-CERTIFICATE-ALIAS: omega-linear-certificate-decode
 pub fn decode_certificate(input: &[u8], limits: OmegaLimits) -> Checked<OmegaCertificate> {
     let mut never_cancel = || false;
     let mut meter = Meter {
@@ -384,12 +389,14 @@ pub fn decode_certificate(input: &[u8], limits: OmegaLimits) -> Checked<OmegaCer
     decode(input, &mut meter)
 }
 
+// FLN-FL-INV-06-CERTIFICATE-ALIAS: omega-linear-certificate-decode
 pub(super) fn decode(input: &[u8], meter: &mut Meter<'_>) -> Checked<OmegaCertificate> {
     decode_after_rows(input, meter, 0)
 }
 
 /// Branch decoding carries its earlier tree/leaf rows into this prefix check,
 /// so an otherwise permitted leaf cannot allocate past the cumulative cap.
+// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: omega-linear-certificate-decode
 pub(super) fn decode_after_rows(
     input: &[u8],
     meter: &mut Meter<'_>,

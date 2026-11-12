@@ -1494,12 +1494,48 @@ fn disclosed_cardinality(tree: &CensusTree, path: &str) -> Result<usize, String>
         .map_err(|error| format!("{path} has a non-numeric cardinality {encoded:?}: {error}"))
 }
 
-fn production_prefix(source: &str) -> &str {
-    ["\n#[cfg(test)]\nmod ", "\n#[cfg(test)]\npub mod "]
-        .iter()
-        .filter_map(|marker| source.find(marker))
-        .min()
-        .map_or(source, |at| &source[..at])
+fn production_prefix(source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    for line in &lines {
+        if line.split("//").next().unwrap_or_default().trim() == "#![cfg(test)]" {
+            return String::new();
+        }
+    }
+    let mut output = Vec::with_capacity(lines.len());
+    let mut index = 0usize;
+    while index < lines.len() {
+        let trimmed = lines[index].split("//").next().unwrap_or_default().trim();
+        if trimmed == "#[cfg(test)]" && index + 1 < lines.len() {
+            let next = lines[index + 1]
+                .split("//")
+                .next()
+                .unwrap_or_default()
+                .trim();
+            let module_tail = next
+                .strip_prefix("pub mod ")
+                .or_else(|| next.strip_prefix("mod "));
+            if let Some(rest) = module_tail {
+                let ident_trimmed = rest
+                    .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                    .trim_start();
+                if ident_trimmed.starts_with('{') {
+                    break;
+                }
+                if ident_trimmed.starts_with(';') {
+                    // Blank out out-of-line `#[cfg(test)] mod foo;` declarations while
+                    // preserving exact line numbers and continuing to scan production code
+                    // below them (fixes the `crates/fln/src/lib.rs:44` blindspot).
+                    output.push("");
+                    output.push("");
+                    index += 2;
+                    continue;
+                }
+            }
+        }
+        output.push(lines[index]);
+        index += 1;
+    }
+    output.join("\n")
 }
 
 fn manifest_facts(manifest: &str) -> (usize, usize) {
@@ -1596,7 +1632,10 @@ fn auto_target_kind(path: &str) -> Option<&'static str> {
 struct AnvilInventory {
     package_found: bool,
     implicit_lib_found: bool,
-    boundary_ids: BTreeSet<String>,
+    boundaries: BTreeMap<String, (String, String)>,
+    aliases: BTreeMap<String, (String, String)>,
+    unmarked_sensitive_functions: BTreeSet<String>,
+    marker_faults: Vec<String>,
     extra_rust_sources: BTreeSet<String>,
     rust_items: BTreeSet<String>,
     auto_targets: BTreeSet<String>,
@@ -1617,7 +1656,10 @@ fn anvil_inventory(tree: &CensusTree) -> AnvilInventory {
         .any(|line| line.trim() == "name = \"fln-anvil\"");
     let implicit_lib_found = tree.files.contains_key("crates/fln-anvil/src/lib.rs");
 
-    let mut boundary_ids = BTreeSet::new();
+    let mut boundaries = BTreeMap::new();
+    let mut aliases = BTreeMap::new();
+    let mut unmarked_sensitive_functions = BTreeSet::new();
+    let mut marker_faults = Vec::new();
     let mut extra_rust_sources = BTreeSet::new();
     let mut rust_items = BTreeSet::new();
     let mut auto_targets = BTreeSet::new();
@@ -1632,11 +1674,48 @@ fn anvil_inventory(tree: &CensusTree) -> AnvilInventory {
                 auto_targets.insert(format!("{kind}:{path}"));
             }
             for (line_number, line) in production_prefix(contents).lines().enumerate() {
-                if let Some((_, id)) = line.split_once(CERTIFICATE_BOUNDARY_MARKER) {
-                    boundary_ids.insert(id.trim().to_owned());
-                }
                 if rust_item_line(line) {
                     rust_items.insert(format!("{path}:{}", line_number + 1));
+                }
+            }
+            if path.starts_with("crates/fln-anvil/src/") {
+                for site in function_sites(path, contents) {
+                    match &site.marker {
+                        Some((true, id)) => {
+                            if boundaries
+                                .insert(id.clone(), (site.path.clone(), site.name.clone()))
+                                .is_some()
+                            {
+                                marker_faults.push(format!("duplicate-boundary:{id}"));
+                            }
+                        }
+                        Some((false, id)) => {
+                            let key = format!("{id}:{}", site.name);
+                            if aliases
+                                .insert(key.clone(), (site.path.clone(), site.name.clone()))
+                                .is_some()
+                            {
+                                marker_faults.push(format!("duplicate-alias:{key}"));
+                            }
+                        }
+                        None => {}
+                    }
+                    let sensitive = ["OmegaCertificate", "OmegaBranchCertificate"]
+                        .iter()
+                        .any(|needle| site.header.contains(needle));
+                    let allowed_producer = site.path == "crates/fln-anvil/src/omega.rs"
+                        && matches!(site.name.as_str(), "certificate" | "run");
+                    let allowed_shape_helper = site.path
+                        == "crates/fln-anvil/src/omega/branch/certificate.rs"
+                        && site.name == "shape";
+                    if sensitive
+                        && site.marker.is_none()
+                        && !allowed_producer
+                        && !allowed_shape_helper
+                    {
+                        unmarked_sensitive_functions
+                            .insert(format!("{}:{}:{}", site.path, site.line, site.name));
+                    }
                 }
             }
             continue;
@@ -1672,7 +1751,10 @@ fn anvil_inventory(tree: &CensusTree) -> AnvilInventory {
     AnvilInventory {
         package_found,
         implicit_lib_found,
-        boundary_ids,
+        boundaries,
+        aliases,
+        unmarked_sensitive_functions,
+        marker_faults,
         extra_rust_sources,
         rust_items,
         auto_targets,
@@ -1776,8 +1858,82 @@ struct ExpectedCall {
     count: usize,
 }
 
-const EXPECTED_ANVIL_RUST_ITEMS: usize = 46;
-const EXPECTED_ANVIL_DEPENDENCY_ROWS: usize = 2;
+const EXPECTED_ANVIL_RUST_ITEMS: usize = 154;
+const EXPECTED_ANVIL_DEPENDENCY_ROWS: usize = 4;
+
+const EXPECTED_ANVIL_EXTRA_RUST_SOURCES: [&str; 7] = [
+    "crates/fln-anvil/src/omega.rs",
+    "crates/fln-anvil/src/omega/branch.rs",
+    "crates/fln-anvil/src/omega/branch/certificate.rs",
+    "crates/fln-anvil/src/omega/branch/rational.rs",
+    "crates/fln-anvil/src/omega/branch/tests.rs",
+    "crates/fln-anvil/src/omega/certificate.rs",
+    "crates/fln-anvil/src/omega/tests.rs",
+];
+
+const EXPECTED_ANVIL_WORKSPACE_CONSUMERS: [&str; 2] =
+    ["crates/fln/Cargo.toml", "crates/fln/src/lib.rs"];
+
+const EXPECTED_ANVIL_BOUNDARIES: [ExpectedBoundary; 6] = [
+    ExpectedBoundary {
+        id: "omega-linear-certificate-check",
+        path: "crates/fln-anvil/src/omega/certificate.rs",
+        function: "check",
+    },
+    ExpectedBoundary {
+        id: "omega-linear-certificate-encode",
+        path: "crates/fln-anvil/src/omega/certificate.rs",
+        function: "encode",
+    },
+    ExpectedBoundary {
+        id: "omega-linear-certificate-decode",
+        path: "crates/fln-anvil/src/omega/certificate.rs",
+        function: "decode_after_rows",
+    },
+    ExpectedBoundary {
+        id: "omega-branch-certificate-check",
+        path: "crates/fln-anvil/src/omega/branch/certificate.rs",
+        function: "check",
+    },
+    ExpectedBoundary {
+        id: "omega-branch-certificate-encode",
+        path: "crates/fln-anvil/src/omega/branch/certificate.rs",
+        function: "encode_branch_certificate",
+    },
+    ExpectedBoundary {
+        id: "omega-branch-certificate-decode",
+        path: "crates/fln-anvil/src/omega/branch/certificate.rs",
+        function: "decode_branch_certificate",
+    },
+];
+
+const EXPECTED_ANVIL_ALIASES: [ExpectedBoundary; 5] = [
+    ExpectedBoundary {
+        id: "omega-linear-certificate-check",
+        path: "crates/fln-anvil/src/omega/certificate.rs",
+        function: "check_certificate",
+    },
+    ExpectedBoundary {
+        id: "omega-linear-certificate-encode",
+        path: "crates/fln-anvil/src/omega/certificate.rs",
+        function: "encode_certificate",
+    },
+    ExpectedBoundary {
+        id: "omega-linear-certificate-decode",
+        path: "crates/fln-anvil/src/omega/certificate.rs",
+        function: "decode_certificate",
+    },
+    ExpectedBoundary {
+        id: "omega-linear-certificate-decode",
+        path: "crates/fln-anvil/src/omega/certificate.rs",
+        function: "decode",
+    },
+    ExpectedBoundary {
+        id: "omega-branch-certificate-check",
+        path: "crates/fln-anvil/src/omega/branch/certificate.rs",
+        function: "check_branch_certificate",
+    },
+];
 
 const EXPECTED_VERDICT_BOUNDARIES: [ExpectedBoundary; 9] = [
     ExpectedBoundary {
@@ -2013,17 +2169,60 @@ fn census_findings(tree: &CensusTree) -> Vec<String> {
     if !anvil.implicit_lib_found {
         findings.push("anvil-sentinel: implicit library root was not resolved".to_owned());
     }
+    if !anvil.marker_faults.is_empty() {
+        findings.push(format!("anvil-markers: {:?}", anvil.marker_faults));
+    }
+    let expected_anvil_boundaries: BTreeMap<String, (String, String)> = EXPECTED_ANVIL_BOUNDARIES
+        .iter()
+        .map(|site| {
+            (
+                site.id.to_owned(),
+                (site.path.to_owned(), site.function.to_owned()),
+            )
+        })
+        .collect();
+    if anvil.boundaries != expected_anvil_boundaries {
+        findings.push(format!(
+            "anvil-boundaries: expected {expected_anvil_boundaries:?}, derived {:?}",
+            anvil.boundaries
+        ));
+    }
+    let expected_anvil_aliases: BTreeMap<String, (String, String)> = EXPECTED_ANVIL_ALIASES
+        .iter()
+        .map(|site| {
+            (
+                format!("{}:{}", site.id, site.function),
+                (site.path.to_owned(), site.function.to_owned()),
+            )
+        })
+        .collect();
+    if anvil.aliases != expected_anvil_aliases {
+        findings.push(format!(
+            "anvil-aliases: expected {expected_anvil_aliases:?}, derived {:?}",
+            anvil.aliases
+        ));
+    }
+    if !anvil.unmarked_sensitive_functions.is_empty() {
+        findings.push(format!(
+            "anvil-unmarked: certificate-sensitive functions {:?}",
+            anvil.unmarked_sensitive_functions
+        ));
+    }
     match disclosed_cardinality(tree, ANVIL_CENSUS) {
-        Ok(disclosed) if disclosed != anvil.boundary_ids.len() => findings.push(format!(
+        Ok(disclosed) if disclosed != anvil.boundaries.len() => findings.push(format!(
             "anvil-cardinality: census discloses {disclosed}, production markers derive {}",
-            anvil.boundary_ids.len()
+            anvil.boundaries.len()
         )),
         Err(error) => findings.push(format!("anvil-cardinality: {error}")),
         Ok(_) => {}
     }
-    if !anvil.extra_rust_sources.is_empty() {
+    let expected_anvil_sources: BTreeSet<String> = EXPECTED_ANVIL_EXTRA_RUST_SOURCES
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if anvil.extra_rust_sources != expected_anvil_sources {
         findings.push(format!(
-            "anvil-footprint: extra Rust sources {:?}",
+            "anvil-footprint: extra Rust sources expected {expected_anvil_sources:?}, found {:?}",
             anvil.extra_rust_sources
         ));
     }
@@ -2051,9 +2250,13 @@ fn census_findings(tree: &CensusTree) -> Vec<String> {
             anvil.manifest_target_rows
         ));
     }
-    if !anvil.workspace_consumers.is_empty() {
+    let expected_anvil_consumers: BTreeSet<String> = EXPECTED_ANVIL_WORKSPACE_CONSUMERS
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if anvil.workspace_consumers != expected_anvil_consumers {
         findings.push(format!(
-            "anvil-footprint: workspace consumers {:?}",
+            "anvil-footprint: workspace consumers expected {expected_anvil_consumers:?}, found {:?}",
             anvil.workspace_consumers
         ));
     }
@@ -2286,11 +2489,55 @@ fn fl_inv_06_census_mutants_change_the_referent_and_die() {
         "non-production decoys must not perturb the census referent"
     );
 
+    let mut anvil_unmarked = baseline.clone();
+    anvil_unmarked.edit("crates/fln-anvil/src/omega/certificate.rs", |source| {
+        format!("{source}\npub fn accept_unreviewed_omega(_: &OmegaCertificate) {{}}\n")
+    });
+    assert_eq!(
+        anvil_inventory(&anvil_unmarked)
+            .unmarked_sensitive_functions
+            .len(),
+        base_anvil.unmarked_sensitive_functions.len() + 1,
+        "unmarked Anvil certificate consumer did not enter unmarked_sensitive_functions"
+    );
+    assert_mutant_finding(&anvil_unmarked, "anvil-unmarked");
+
+    let mut anvil_boundary_removed = baseline.clone();
+    anvil_boundary_removed.edit("crates/fln-anvil/src/omega/certificate.rs", |source| {
+        source.replacen(
+            "// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: omega-linear-certificate-check\n",
+            "",
+            1,
+        )
+    });
+    assert_eq!(
+        anvil_inventory(&anvil_boundary_removed).boundaries.len() + 1,
+        base_anvil.boundaries.len(),
+        "removed Anvil join mutant did not leave the derived referent"
+    );
+    assert_mutant_finding(&anvil_boundary_removed, "anvil-boundaries");
+    assert_mutant_finding(&anvil_boundary_removed, "anvil-cardinality");
+
+    let mut early_cfg_test_consumer = baseline.clone();
+    early_cfg_test_consumer.edit("crates/fln-core/src/lib.rs", |source| {
+        format!(
+            "#[cfg(test)]\nmod early_decoy;\n{source}\npub fn hidden_anvil(_: fln_anvil::Probe) {{}}\n"
+        )
+    });
+    assert_eq!(
+        anvil_inventory(&early_cfg_test_consumer)
+            .workspace_consumers
+            .len(),
+        base_anvil.workspace_consumers.len() + 1,
+        "consumer placed after an out-of-line #[cfg(test)] mod; escaped workspace_consumers"
+    );
+    assert_mutant_finding(&early_cfg_test_consumer, "workspace consumers");
+
     let mut anvil_count = baseline.clone();
     anvil_count.edit(ANVIL_CENSUS, |document| {
         document.replacen(
-            "Certificate-accepting path cardinality: `0`.",
-            "Certificate-accepting path cardinality: `1`.",
+            "Certificate-accepting path cardinality: `6`.",
+            "Certificate-accepting path cardinality: `5`.",
             1,
         )
     });

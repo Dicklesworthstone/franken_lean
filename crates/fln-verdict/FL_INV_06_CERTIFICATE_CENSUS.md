@@ -180,13 +180,16 @@ Not established:
 
 - a universal proof that checker work is lower than recomputation for every
   input;
-- FL-INV-06 enforcement for the stub `fln-anvil` crate or its future simp,
-  arithmetic, grind, e-graph, index, or portfolio implementations;
+- FL-INV-06 enforcement for future `fln-anvil` `simp`, e-graph, `norm_num`,
+  `grind`, index, or portfolio implementations beyond the 6 `omega` linear and
+  branch certificate boundaries audited in
+  `crates/fln-anvil/FL_INV_06_CERTIFICATE_CENSUS.md`;
 - that the self-matching publication source guard detects removal of the
   production capability join.
 
-The separate `fln-anvil` zero-path census must remain retained while empty.
-This nonempty Verdict census does not replace or “tidy away” that evidence.
+The separate `fln-anvil` census (`crates/fln-anvil/FL_INV_06_CERTIFICATE_CENSUS.md`,
+cardinality `6`) tracks `fln-anvil`'s own certificate boundaries and `fln`
+consumer path independently of Verdict's 9 boundaries.
 
 ## Upgrade triggers
 
