@@ -61,9 +61,12 @@ use std::fmt;
 mod array_construction;
 mod arrays;
 mod diagnostics;
+mod expr_native;
 mod float_arrays;
 mod floats;
+mod level_native;
 mod macro_native;
+mod name_native;
 mod packed_constructors;
 mod string_fold;
 mod strings;
@@ -584,6 +587,9 @@ struct IntrinsicPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntrinsicImplementation {
     MacroNative(macro_native::Intrinsic),
+    ExprNative(expr_native::Intrinsic),
+    LevelNative(level_native::Intrinsic),
+    NameNative(name_native::Intrinsic),
     PanicCore,
     DbgTrace,
     Float(floats::Intrinsic),
@@ -935,6 +941,15 @@ impl IntrinsicImplementation {
     fn for_row(row: &str) -> Self {
         if let Some(intrinsic) = macro_native::Intrinsic::for_row(row) {
             return Self::MacroNative(intrinsic);
+        }
+        if let Some(intrinsic) = expr_native::Intrinsic::for_row(row) {
+            return Self::ExprNative(intrinsic);
+        }
+        if let Some(intrinsic) = level_native::Intrinsic::for_row(row) {
+            return Self::LevelNative(intrinsic);
+        }
+        if let Some(intrinsic) = name_native::Intrinsic::for_row(row) {
+            return Self::NameNative(intrinsic);
         }
         match row {
             "extern:panicCore" => Self::PanicCore,
@@ -4723,7 +4738,10 @@ fn finish_intrinsic_result(
             .is_some_and(float_arrays::Intrinsic::has_wide_result)
         || matches!(
             row,
-            "extern:ByteArray.hash" | "extern:ByteArray.usize" | "extern:Array.usize"
+            "extern:ByteArray.hash"
+                | "extern:ByteArray.usize"
+                | "extern:Array.usize"
+                | "extern:Lean.Expr.data"
         );
     let scalar_kind_matches = if let Some(intrinsic) = floats::Intrinsic::for_row(row) {
         intrinsic.result_kind_matches(&value)
@@ -5168,6 +5186,9 @@ fn dispatch_intrinsic(
         IntrinsicImplementation::MacroNative(intrinsic) => {
             intrinsic.invoke_with_lookup(row, args, None, max_nat_magnitude_bytes)
         }
+        IntrinsicImplementation::ExprNative(intrinsic) => intrinsic.invoke(row, args),
+        IntrinsicImplementation::LevelNative(intrinsic) => intrinsic.invoke(row, args),
+        IntrinsicImplementation::NameNative(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::PanicCore => diagnostics::panic(row, args),
         IntrinsicImplementation::ArrayConstruction(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::ArrayExtra(_)
@@ -8269,6 +8290,9 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::Float(_)
         | IntrinsicImplementation::StringInternal(_)
         | IntrinsicImplementation::MacroNative(_)
+        | IntrinsicImplementation::ExprNative(_)
+        | IntrinsicImplementation::LevelNative(_)
+        | IntrinsicImplementation::NameNative(_)
         | IntrinsicImplementation::PanicCore
         | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),

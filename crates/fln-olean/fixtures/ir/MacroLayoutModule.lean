@@ -1,6 +1,7 @@
 prelude
 import Init
 import Lean.Syntax
+import Lean.Expr
 
 set_option trace.compiler.ir.result true
 
@@ -126,6 +127,21 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
 
 @[noinline] def nameStr (parent : Lean.Name) (value : String) : Lean.Name :=
   .str parent value
+
+@[noinline] def levelSucc (value : Lean.Level) : Lean.Level := .succ value
+@[noinline] def levelMax (left right : Lean.Level) : Lean.Level := .max left right
+@[noinline] def levelIMax (left right : Lean.Level) : Lean.Level := .imax left right
+@[noinline] def levelParam (name : Lean.Name) : Lean.Level := .param name
+@[noinline] def levelMVar (id : Lean.LMVarId) : Lean.Level := .mvar id
+
+@[noinline] def exprBVar (index : Nat) : Lean.Expr := .bvar index
+@[noinline] def exprApp (fn arg : Lean.Expr) : Lean.Expr := .app fn arg
+@[noinline] def exprLam (name : Lean.Name) (type body : Lean.Expr)
+    (info : Lean.BinderInfo) : Lean.Expr := .lam name type body info
+@[noinline] def exprForall (name : Lean.Name) (type body : Lean.Expr)
+    (info : Lean.BinderInfo) : Lean.Expr := .forallE name type body info
+@[noinline] def exprLet (name : Lean.Name) (type value body : Lean.Expr)
+    (nondep : Bool) : Lean.Expr := .letE name type value body nondep
 
 @[noinline] def nameHasMacroScopes (value : Lean.Name) : Bool := value.hasMacroScopes
 

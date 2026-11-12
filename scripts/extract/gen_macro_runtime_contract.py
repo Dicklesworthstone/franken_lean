@@ -43,6 +43,16 @@ SCALARS = {
 FUNCTIONS = {
     "NAME_MK_STR1": "nameMkStr1",
     "NAME_STR": "nameStr",
+    "LEVEL_SUCC": "levelSucc",
+    "LEVEL_MAX": "levelMax",
+    "LEVEL_IMAX": "levelIMax",
+    "LEVEL_PARAM": "levelParam",
+    "LEVEL_MVAR": "levelMVar",
+    "EXPR_BVAR": "exprBVar",
+    "EXPR_APP": "exprApp",
+    "EXPR_LAM": "exprLam",
+    "EXPR_FORALL": "exprForall",
+    "EXPR_LET": "exprLet",
     "NAME_HAS_MACRO_SCOPES": "nameHasMacroScopes",
     "NAME_ERASE_MACRO_SCOPES": "nameEraseMacroScopes",
     "ADD_MACRO_SCOPE": "addMacroScope",
@@ -115,6 +125,16 @@ FUNCTIONS = {
 }
 
 FORWARDED_FUNCTIONS = {
+    "levelSucc": "Lean.Level.succ._override",
+    "levelMax": "Lean.Level.max._override",
+    "levelIMax": "Lean.Level.imax._override",
+    "levelParam": "Lean.Level.param._override",
+    "levelMVar": "Lean.Level.mvar._override",
+    "exprBVar": "Lean.Expr.bvar._override",
+    "exprApp": "Lean.Expr.app._override",
+    "exprLam": "Lean.Expr.lam._override",
+    "exprForall": "Lean.Expr.forallE._override",
+    "exprLet": "Lean.Expr.letE._override",
     "nameHasMacroScopes": "Lean.Name.hasMacroScopes",
     "nameEraseMacroScopes": "Lean.Name.eraseMacroScopes",
     "syntaxIsNodeOf": "Lean.Syntax.isNodeOf",

@@ -177,7 +177,7 @@ impl ExprData {
     /// `lean_expr_mk_data` with the range panic replaced by a typed refusal. The hash
     /// argument is the full 64-bit mix; only its low 32 bits are stored. approxDepth
     /// saturates at 255.
-    fn pack(
+    pub fn pack(
         hash: u64,
         loose_bvar_range: u32,
         approx_depth: u32,
@@ -205,7 +205,7 @@ impl ExprData {
 
     /// `lean_expr_mk_app_data` (expr.cpp:120-126): note the hash mixes the two FULL
     /// 64-bit data words, not the extracted 32-bit hashes.
-    fn pack_app(f: ExprData, a: ExprData) -> ExprData {
+    pub fn pack_app(f: ExprData, a: ExprData) -> ExprData {
         let depth = (f.approx_depth_u32().max(a.approx_depth_u32()) + 1).min(255);
         let range = f.loose_bvar_range().max(a.loose_bvar_range());
         let hash = mix_hash(f.0, a.0) as u32;

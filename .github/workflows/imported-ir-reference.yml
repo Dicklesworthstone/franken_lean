@@ -24,7 +24,10 @@ on:
       - 'crates/fln/src/source_records/equation_theorems.rs'
       - 'crates/fln-elab/src/**'
       - 'crates/fln-rt/src/**'
+      - 'crates/fln-rt/tests/native_convert.rs'
       - 'crates/fln-vm/src/**'
+      - 'crates/fln-vm/tests/name_native.rs'
+      - 'crates/fln-vm/tests/level_native.rs'
       - 'scripts/extract/gen_macro_runtime_contract.py'
       - 'crates/fln-olean/fixtures/ir/**'
       - 'SUITE.lock'
@@ -64,12 +67,14 @@ jobs:
           set -euo pipefail
           cargo test --locked -p fln-admission --lib reuse -- --nocapture \
             2>&1 | tee target/imported-ir-reference/import-cancellation.log
-      - name: Check native Syntax runtime
+      - name: Check native metaprogram primitives and conversion
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p fln-vm --lib macro_native -- --nocapture \
+          cargo test --locked -p fln-vm --lib _native --no-fail-fast -- --nocapture \
             2>&1 | tee target/imported-ir-reference/macro-vm.log
+          cargo test --locked -p fln-vm --test name_native --test level_native --no-fail-fast
+          cargo test --locked -p fln-rt --test native_convert --no-fail-fast
       - name: Install the SUITE.lock Reference for test-only code generation
         shell: bash
         run: |

@@ -44,7 +44,7 @@ pub struct LevelData(pub u64);
 
 impl LevelData {
     /// `lean_level_mk_data` with the panic replaced by a typed refusal.
-    fn pack(
+    pub fn pack(
         hash: u64,
         depth: u32,
         has_mvar: bool,
@@ -380,6 +380,17 @@ impl Level {
     /// The packed data word itself.
     pub fn data(&self) -> LevelData {
         self.data
+    }
+
+    /// Process-local identity of this immutable node allocation.
+    ///
+    /// Only bounded in-process graph walks may use this identity. It is not a
+    /// semantic hash, must not enter artifacts or deterministic ordering, and
+    /// remains unique only while the compared allocations are alive. Clones
+    /// retain the same identity; independently allocated equal levels need not.
+    #[doc(hidden)]
+    pub fn allocation_identity(&self) -> usize {
+        Arc::as_ptr(self.node_arc()) as usize
     }
 
     /// `Level.depth`.
