@@ -47,6 +47,15 @@ impl Package {
     }
 
     fn run(&self, arguments: &[&str], reference: Option<&Reference>) -> Output {
+        self.run_with_jobs(arguments, reference, 2)
+    }
+
+    fn run_with_jobs(
+        &self,
+        arguments: &[&str],
+        reference: Option<&Reference>,
+        jobs: usize,
+    ) -> Output {
         let store = IMPORT_STORE.get_or_init(|| {
             let path = std::env::temp_dir().join(format!(
                 "fln-lake-executable-imports-{}",
@@ -58,6 +67,8 @@ impl Package {
         Command::new(env!("CARGO_BIN_EXE_lake"))
             .arg("--dir")
             .arg(&self.0)
+            .arg("--jobs")
+            .arg(jobs.to_string())
             .args(arguments)
             .current_dir(std::env::temp_dir())
             .env(
@@ -216,7 +227,7 @@ fn configured_root_library_directory_and_raw_argv_match_the_reference() {
     ];
     let mut command = vec!["exe", "runner"];
     command.extend(args);
-    let output = native.run(&command, Some(reference));
+    let output = native.run_with_jobs(&command, Some(reference), 1);
     let expected = args.map(|arg| format!("prefix:{arg}\n")).join("");
     assert_eq!(output.status.code(), Some(7), "{output:?}");
     assert_eq!(text(&output.stdout), expected, "{output:?}");
