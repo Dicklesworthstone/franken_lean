@@ -34,6 +34,7 @@ use fln_hash::domain::{Digest, Domain, DomainHasher};
 use std::sync::Arc;
 
 const RECORD_MAGIC: &[u8] = b"fln.source-module-record/1\0";
+const RECORD_MODULE_TAG: &[u8] = b"module/1\0";
 const RECORD_SEAL_PREFIX: &[u8] = b"fln.source-module-record-seal/1\0";
 /// A bound on supported artifact journals, not a model of their current count.
 const MAX_RECORDED_EXTENSIONS: usize = 64;
@@ -47,8 +48,8 @@ pub struct SourceModuleKey(Digest);
 pub(super) enum KeyStep {
     /// An external module's metadata, from the session's checked import closure.
     External(Name),
-    /// A local dependency, identified by the result root of its checked environment.
-    Source(Name, LogicalRoot),
+    /// A local dependency, identified by the result root(s) of its checked environment(s).
+    Source(Name, LogicalRoot, Option<LogicalRoot>),
 }
 
 fn field(hasher: &mut DomainHasher, bytes: &[u8]) {
@@ -86,10 +87,28 @@ impl SourceModuleKey {
                     hasher.update(&[0]);
                     field(&mut hasher, &name.to_canonical_bytes());
                 }
-                KeyStep::Source(name, root) => {
+                KeyStep::Source(name, root, _) => {
                     hasher.update(&[1]);
                     field(&mut hasher, &name.to_canonical_bytes());
                     hasher.update(&root.0.0);
+                }
+            }
+        }
+        let public_count = steps
+            .iter()
+            .filter(|step| matches!(step, KeyStep::Source(_, _, Some(_))))
+            .count();
+        if public_count > 0 {
+            hasher.update(b"public\0");
+            hasher.update(
+                &u64::try_from(public_count)
+                    .unwrap_or(u64::MAX)
+                    .to_le_bytes(),
+            );
+            for step in steps {
+                if let KeyStep::Source(name, _, Some(public_root)) = step {
+                    field(&mut hasher, &name.to_canonical_bytes());
+                    hasher.update(&public_root.0.0);
                 }
             }
         }
@@ -192,6 +211,17 @@ struct RecordedExtension {
     entries: Vec<Vec<u8>>,
 }
 
+/// Companion roots, private journals, and `.olean.server`/`.olean.private` regions for a
+/// module-system file (`module` header). Absent for legacy source modules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedModuleWorlds {
+    public_base_root: Digest,
+    public_result_root: Digest,
+    private_extensions: Vec<RecordedExtension>,
+    server_artifact: Vec<u8>,
+    private_artifact: Vec<u8>,
+}
+
 /// What a successful elaboration leaves for a later invocation: the artifact, the
 /// journal rows the module appended, its roots, and the counts a hit must charge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +237,7 @@ pub struct SourceModuleRecord {
     bytes: u64,
     extensions: Vec<RecordedExtension>,
     artifact: Vec<u8>,
+    module_worlds: Option<RecordedModuleWorlds>,
 }
 
 fn seal(body: &[u8]) -> Digest {
@@ -279,6 +310,99 @@ fn put32(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend(bytes);
 }
 
+fn put64(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    out.extend(bytes);
+}
+
+fn write_extensions(out: &mut Vec<u8>, extensions: &[RecordedExtension]) {
+    out.extend(
+        u32::try_from(extensions.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    for extension in extensions {
+        put32(out, &extension.descriptor.name.to_canonical_bytes());
+        out.push(merge_code(extension.descriptor.merge));
+        out.push(checkpoint_code(extension.descriptor.checkpoint));
+        out.push(provenance_code(extension.descriptor.provenance));
+        out.extend(
+            u32::try_from(extension.entries.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        for entry in &extension.entries {
+            put32(out, entry);
+        }
+    }
+}
+
+fn read_extensions(
+    reader: &mut Reader<'_>,
+    journals: &[(Name, Vec<u8>)],
+) -> std::result::Result<Vec<RecordedExtension>, ModuleRecordRefusal> {
+    let count = usize::try_from(reader.u32()?)
+        .map_err(|_| ModuleRecordRefusal::Malformed("extension count"))?;
+    if count > MAX_RECORDED_EXTENSIONS {
+        return Err(ModuleRecordRefusal::Malformed("extension count"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut extensions = Vec::with_capacity(count);
+    for _ in 0..count {
+        // An artifact-mode module can append only the journals its writer can
+        // serialize; the name is checked here and the descriptor below.
+        let encoded = reader.bytes32()?;
+        let journal = journals
+            .iter()
+            .find(|(_, bytes)| bytes.as_slice() == encoded)
+            .map(|(name, _)| name.clone())
+            .ok_or(ModuleRecordRefusal::Extension)?;
+        if !seen.insert(journal.clone()) {
+            return Err(ModuleRecordRefusal::Extension);
+        }
+        let merge = match reader.u8()? {
+            0 => MergeSemantics::AppendOrdered,
+            1 => MergeSemantics::SetUnion,
+            2 => MergeSemantics::ConflictsRequireReview,
+            _ => return Err(ModuleRecordRefusal::Malformed("merge")),
+        };
+        let checkpoint = match reader.u8()? {
+            0 => CheckpointSemantics::JournalSuffix,
+            1 => CheckpointSemantics::FullJournal,
+            _ => return Err(ModuleRecordRefusal::Malformed("checkpoint")),
+        };
+        let provenance = match reader.u8()? {
+            0 => PayloadProvenance::Understood,
+            1 => PayloadProvenance::Opaque,
+            _ => return Err(ModuleRecordRefusal::Malformed("provenance")),
+        };
+        let descriptor = ExtensionDescriptor {
+            name: journal,
+            merge,
+            checkpoint,
+            provenance,
+        };
+        if !super::replay::supports_artifact_extension(&descriptor) {
+            return Err(ModuleRecordRefusal::Extension);
+        }
+        let rows = usize::try_from(reader.u32()?)
+            .map_err(|_| ModuleRecordRefusal::Malformed("row count"))?;
+        // Every row costs at least its four length bytes.
+        if rows > reader.0.len() / 4 {
+            return Err(ModuleRecordRefusal::Malformed("row count"));
+        }
+        let mut entries = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            entries.push(reader.bytes32()?.to_vec());
+        }
+        extensions.push(RecordedExtension {
+            descriptor,
+            entries,
+        });
+    }
+    Ok(extensions)
+}
+
 impl SourceModuleRecord {
     pub fn key(&self) -> SourceModuleKey {
         self.key
@@ -296,31 +420,16 @@ impl SourceModuleRecord {
         for count in [self.commands, self.theorems, self.work, self.bytes] {
             out.extend(count.to_le_bytes());
         }
-        out.extend(
-            u32::try_from(self.extensions.len())
-                .unwrap_or(u32::MAX)
-                .to_le_bytes(),
-        );
-        for extension in &self.extensions {
-            put32(&mut out, &extension.descriptor.name.to_canonical_bytes());
-            out.push(merge_code(extension.descriptor.merge));
-            out.push(checkpoint_code(extension.descriptor.checkpoint));
-            out.push(provenance_code(extension.descriptor.provenance));
-            out.extend(
-                u32::try_from(extension.entries.len())
-                    .unwrap_or(u32::MAX)
-                    .to_le_bytes(),
-            );
-            for entry in &extension.entries {
-                put32(&mut out, entry);
-            }
+        write_extensions(&mut out, &self.extensions);
+        put64(&mut out, &self.artifact);
+        if let Some(worlds) = &self.module_worlds {
+            out.extend(RECORD_MODULE_TAG);
+            out.extend(worlds.public_base_root.0);
+            out.extend(worlds.public_result_root.0);
+            write_extensions(&mut out, &worlds.private_extensions);
+            put64(&mut out, &worlds.server_artifact);
+            put64(&mut out, &worlds.private_artifact);
         }
-        out.extend(
-            u64::try_from(self.artifact.len())
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        out.extend(&self.artifact);
         let sealed = seal(&out);
         out.extend(sealed.0);
         out
@@ -354,11 +463,6 @@ impl SourceModuleRecord {
         let theorems = reader.u64()?;
         let work = reader.u64()?;
         let recorded_bytes = reader.u64()?;
-        let count = usize::try_from(reader.u32()?)
-            .map_err(|_| ModuleRecordRefusal::Malformed("extension count"))?;
-        if count > MAX_RECORDED_EXTENSIONS {
-            return Err(ModuleRecordRefusal::Malformed("extension count"));
-        }
         let journals = [
             fln_elab::instances::export::journal_name(),
             fln_elab::instances::defaults::journal_name(),
@@ -381,64 +485,31 @@ impl SourceModuleRecord {
             let bytes = name.to_canonical_bytes();
             (name, bytes)
         });
-        let mut seen = std::collections::BTreeSet::new();
-        let mut extensions = Vec::with_capacity(count);
-        for _ in 0..count {
-            // An artifact-mode module can append only the journals its writer can
-            // serialize; the name is checked here and the descriptor below.
-            let encoded = reader.bytes32()?;
-            let journal = journals
-                .iter()
-                .find(|(_, bytes)| bytes.as_slice() == encoded)
-                .map(|(name, _)| name.clone())
-                .ok_or(ModuleRecordRefusal::Extension)?;
-            if !seen.insert(journal.clone()) {
-                return Err(ModuleRecordRefusal::Extension);
-            }
-            let merge = match reader.u8()? {
-                0 => MergeSemantics::AppendOrdered,
-                1 => MergeSemantics::SetUnion,
-                2 => MergeSemantics::ConflictsRequireReview,
-                _ => return Err(ModuleRecordRefusal::Malformed("merge")),
-            };
-            let checkpoint = match reader.u8()? {
-                0 => CheckpointSemantics::JournalSuffix,
-                1 => CheckpointSemantics::FullJournal,
-                _ => return Err(ModuleRecordRefusal::Malformed("checkpoint")),
-            };
-            let provenance = match reader.u8()? {
-                0 => PayloadProvenance::Understood,
-                1 => PayloadProvenance::Opaque,
-                _ => return Err(ModuleRecordRefusal::Malformed("provenance")),
-            };
-            let descriptor = ExtensionDescriptor {
-                name: journal,
-                merge,
-                checkpoint,
-                provenance,
-            };
-            if !super::replay::supports_artifact_extension(&descriptor) {
-                return Err(ModuleRecordRefusal::Extension);
-            }
-            let rows = usize::try_from(reader.u32()?)
-                .map_err(|_| ModuleRecordRefusal::Malformed("row count"))?;
-            // Every row costs at least its four length bytes.
-            if rows > reader.0.len() / 4 {
-                return Err(ModuleRecordRefusal::Malformed("row count"));
-            }
-            let mut entries = Vec::with_capacity(rows);
-            for _ in 0..rows {
-                entries.push(reader.bytes32()?.to_vec());
-            }
-            extensions.push(RecordedExtension {
-                descriptor,
-                entries,
-            });
-        }
+        let extensions = read_extensions(&mut reader, &journals)?;
         let artifact = reader.bytes64()?.to_vec();
-        if !reader.0.is_empty() {
-            return Err(ModuleRecordRefusal::Malformed("trailing bytes"));
-        }
+        let module_worlds = if reader.0.is_empty() {
+            None
+        } else {
+            if !reader.0.starts_with(RECORD_MODULE_TAG) {
+                return Err(ModuleRecordRefusal::Malformed("trailing bytes"));
+            }
+            let _ = reader.take(RECORD_MODULE_TAG.len())?;
+            let public_base_root = reader.digest()?;
+            let public_result_root = reader.digest()?;
+            let private_extensions = read_extensions(&mut reader, &journals)?;
+            let server_artifact = reader.bytes64()?.to_vec();
+            let private_artifact = reader.bytes64()?.to_vec();
+            if !reader.0.is_empty() {
+                return Err(ModuleRecordRefusal::Malformed("trailing bytes"));
+            }
+            Some(RecordedModuleWorlds {
+                public_base_root,
+                public_result_root,
+                private_extensions,
+                server_artifact,
+                private_artifact,
+            })
+        };
         if recorded_key != key {
             return Err(ModuleRecordRefusal::Key);
         }
@@ -460,6 +531,7 @@ impl SourceModuleRecord {
             bytes: recorded_bytes,
             extensions,
             artifact,
+            module_worlds,
         })
     }
 }
@@ -472,6 +544,7 @@ pub(super) struct PendingRecord {
     pub(super) export: Arc<replay::Export>,
     pub(super) base_root: LogicalRoot,
     pub(super) result_root: LogicalRoot,
+    pub(super) public_roots: Option<(LogicalRoot, LogicalRoot)>,
     pub(super) commands: usize,
     pub(super) theorems: usize,
     pub(super) work: usize,
@@ -479,9 +552,42 @@ pub(super) struct PendingRecord {
 }
 
 impl PendingRecord {
-    pub(super) fn record(&self, checker: CheckerIdentity, artifact: &[u8]) -> SourceModuleRecord {
+    pub(super) fn record(
+        &self,
+        checker: CheckerIdentity,
+        artifact: &artifacts::SourceModuleArtifact,
+    ) -> std::result::Result<SourceModuleRecord, &'static str> {
         let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
-        SourceModuleRecord {
+        let collect_extensions =
+            |suffixes: &mut dyn Iterator<Item = (&ExtensionDescriptor, &[Arc<[u8]>])>| {
+                suffixes
+                    .map(|(descriptor, entries)| RecordedExtension {
+                        descriptor: descriptor.clone(),
+                        entries: entries.iter().map(|entry| entry.to_vec()).collect(),
+                    })
+                    .collect::<Vec<_>>()
+            };
+        let module_worlds = match (
+            &self.public_roots,
+            &artifact.companions,
+            self.export.private_journal_suffixes(),
+        ) {
+            (None, None, None) => None,
+            (
+                Some((public_base_root, public_result_root)),
+                Some(companions),
+                Some(mut private_suffixes),
+            ) => Some(RecordedModuleWorlds {
+                public_base_root: public_base_root.0,
+                public_result_root: public_result_root.0,
+                private_extensions: collect_extensions(&mut private_suffixes),
+                server_artifact: companions.server.clone(),
+                private_artifact: companions.private.clone(),
+            }),
+            _ => return Err("module record companions do not match its checked worlds"),
+        };
+        let mut public_suffixes = self.export.journal_suffixes();
+        Ok(SourceModuleRecord {
             key: self.key,
             checker: checker.digest(),
             name: self.name.to_canonical_bytes(),
@@ -491,22 +597,17 @@ impl PendingRecord {
             theorems: count(self.theorems),
             work: count(self.work),
             bytes: count(self.bytes),
-            extensions: self
-                .export
-                .journal_suffixes()
-                .map(|(descriptor, entries)| RecordedExtension {
-                    descriptor: descriptor.clone(),
-                    entries: entries.iter().map(|entry| entry.to_vec()).collect(),
-                })
-                .collect(),
-            artifact: artifact.to_vec(),
-        }
+            extensions: collect_extensions(&mut public_suffixes),
+            artifact: artifact.bytes.clone(),
+            module_worlds,
+        })
     }
 }
 
 /// A record re-admitted over its module's imported environment.
 pub(super) struct RecordHit {
     pub(super) engine: Engine,
+    pub(super) public_environment: Option<Environment>,
     pub(super) export: Arc<replay::Export>,
     pub(super) artifact: Arc<artifacts::PendingArtifact>,
     pub(super) base_root: LogicalRoot,
@@ -518,29 +619,29 @@ pub(super) struct RecordHit {
 }
 
 type Verdict = std::result::Result<RecordHit, ModuleRecordRefusal>;
+type WorldVerdict =
+    std::result::Result<(Engine, LogicalRoot, LogicalRoot, replay::Export), ModuleRecordRefusal>;
 
-/// Re-admit `record` for `module` over `imported`, the environment its own steps just
-/// built. `Ok(Complete(Err(_)))` is a refused record; cancellation and internal faults
-/// keep their typed forms, and a resource stop in the meter is the caller's error.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn readmit(
-    record: &SourceModuleRecord,
+fn readmit_world(
+    artifact_bytes: &[u8],
+    extensions: &[RecordedExtension],
+    expected_base_root: Digest,
+    expected_result_root: Digest,
     module: &Name,
-    header: &SourceHeader,
     imported: &Engine,
     options: &KVMap,
-    write_budget: OleanWriteBudget,
     meter: &mut Meter,
     cancellation: Option<&dyn CancellationProbe>,
-) -> std::result::Result<Outcome<Verdict>, SourceModuleCheckError> {
+) -> std::result::Result<Outcome<WorldVerdict>, SourceModuleCheckError> {
     let refuse = |refusal| Ok(Outcome::Complete(Err(refusal)));
     let base_root = imported.logical_root(options);
-    if base_root.0 != record.base_root {
+    if base_root.0 != expected_base_root {
         return refuse(ModuleRecordRefusal::BaseRoot);
     }
-    let max_bytes = record.artifact.len().max(1);
+    let max_bytes = artifact_bytes.len().max(1);
     let limits = OleanCheckLimits::new(max_bytes, meter.limits.source.admission.kernel);
-    let Ok(decoded) = decode_olean_artifact(&record.artifact, OleanDecodeLimits::new(max_bytes))
+    let Ok(decoded) = decode_olean_artifact(artifact_bytes, OleanDecodeLimits::new(max_bytes))
     else {
         return refuse(ModuleRecordRefusal::Decode);
     };
@@ -590,7 +691,7 @@ pub(super) fn readmit(
             }
         }
     }
-    for extension in &record.extensions {
+    for extension in extensions {
         meter.work(1)?;
         let name = &extension.descriptor.name;
         let registered = match engine.environment.extension(name) {
@@ -616,7 +717,7 @@ pub(super) fn readmit(
         engine.environment = environment;
     }
     let result_root = engine.environment.logical_root(options);
-    if result_root.0 != record.result_root {
+    if result_root.0 != expected_result_root {
         return refuse(ModuleRecordRefusal::ResultRoot);
     }
     let Ok(export) = replay::Export::capture(
@@ -628,28 +729,167 @@ pub(super) fn readmit(
     ) else {
         return refuse(ModuleRecordRefusal::Extension);
     };
-    let export = export.for_source_imports();
-    if export.require_artifact_support(module).is_err() {
-        return refuse(ModuleRecordRefusal::Extension);
-    }
-    let Ok(artifact) = artifacts::PendingArtifact::capture(
-        module,
-        header,
-        imported.environment(),
-        &engine,
-        None,
-        options,
-        meter,
-    ) else {
-        return refuse(ModuleRecordRefusal::Artifact);
+    Ok(Outcome::Complete(Ok((
+        engine,
+        base_root,
+        result_root,
+        export,
+    ))))
+}
+
+/// Re-admit `record` for `module` over `imported`, the environment its own steps just
+/// built. `Ok(Complete(Err(_)))` is a refused record; cancellation and internal faults
+/// keep their typed forms, and a resource stop in the meter is the caller's error.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn readmit(
+    record: &SourceModuleRecord,
+    module: &Name,
+    header: &SourceHeader,
+    imported: &Engine,
+    public_imported: Option<&Engine>,
+    options: &KVMap,
+    write_budget: OleanWriteBudget,
+    meter: &mut Meter,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> std::result::Result<Outcome<Verdict>, SourceModuleCheckError> {
+    let refuse = |refusal| Ok(Outcome::Complete(Err(refusal)));
+    let (engine, public_environment, base_root, result_root, export, artifact) = if header
+        .module_system
+    {
+        let (Some(worlds), Some(public_imported)) = (&record.module_worlds, public_imported) else {
+            return refuse(ModuleRecordRefusal::Artifact);
+        };
+        let (public_engine, _, _, public_export) = match readmit_world(
+            &record.artifact,
+            &record.extensions,
+            worlds.public_base_root,
+            worlds.public_result_root,
+            module,
+            public_imported,
+            options,
+            meter,
+            cancellation,
+        )? {
+            Outcome::Complete(Ok(world)) => world,
+            Outcome::Complete(Err(refusal)) => return refuse(refusal),
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let (engine, base_root, result_root, private_export) = match readmit_world(
+            &worlds.private_artifact,
+            &worlds.private_extensions,
+            record.base_root,
+            record.result_root,
+            module,
+            imported,
+            options,
+            meter,
+            cancellation,
+        )? {
+            Outcome::Complete(Ok(world)) => world,
+            Outcome::Complete(Err(refusal)) => return refuse(refusal),
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        // Every exported interface constant must correspond to a checked declaration
+        // added by this module's private implementation world with identical signature.
+        for (cname, pub_info) in public_engine.environment().constants() {
+            meter.work(1)?;
+            if public_imported.environment().contains(cname) {
+                continue;
+            }
+            let Some(priv_info) = engine
+                .environment()
+                .find(cname)
+                .filter(|_| !imported.environment().contains(cname))
+            else {
+                return refuse(ModuleRecordRefusal::Artifact);
+            };
+            if pub_info.constant_val().level_params != priv_info.constant_val().level_params
+                || pub_info.constant_val().type_ != priv_info.constant_val().type_
+            {
+                return refuse(ModuleRecordRefusal::Artifact);
+            }
+        }
+        let export = public_export
+            .with_private(private_export)
+            .for_source_imports();
+        if export.require_artifact_support(module).is_err() {
+            return refuse(ModuleRecordRefusal::Extension);
+        }
+        let Ok(artifact) = artifacts::PendingArtifact::capture(
+            module,
+            header,
+            imported.environment(),
+            &engine,
+            Some((public_imported.environment(), public_engine.environment())),
+            options,
+            meter,
+        ) else {
+            return refuse(ModuleRecordRefusal::Artifact);
+        };
+        match artifact.encode(write_budget) {
+            Ok(encoded)
+                if encoded.bytes == record.artifact
+                    && encoded.companions.as_ref().is_some_and(|companions| {
+                        companions.server == worlds.server_artifact
+                            && companions.private == worlds.private_artifact
+                    }) => {}
+            _ => return refuse(ModuleRecordRefusal::Artifact),
+        }
+        (
+            engine,
+            Some(public_engine.environment().clone()),
+            base_root,
+            result_root,
+            export,
+            artifact,
+        )
+    } else {
+        if record.module_worlds.is_some() || public_imported.is_some() {
+            return refuse(ModuleRecordRefusal::Artifact);
+        }
+        let (engine, base_root, result_root, export) = match readmit_world(
+            &record.artifact,
+            &record.extensions,
+            record.base_root,
+            record.result_root,
+            module,
+            imported,
+            options,
+            meter,
+            cancellation,
+        )? {
+            Outcome::Complete(Ok(world)) => world,
+            Outcome::Complete(Err(refusal)) => return refuse(refusal),
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let export = export.for_source_imports();
+        if export.require_artifact_support(module).is_err() {
+            return refuse(ModuleRecordRefusal::Extension);
+        }
+        let Ok(artifact) = artifacts::PendingArtifact::capture(
+            module,
+            header,
+            imported.environment(),
+            &engine,
+            None,
+            options,
+            meter,
+        ) else {
+            return refuse(ModuleRecordRefusal::Artifact);
+        };
+        match artifact.encode(write_budget) {
+            Ok(encoded) if encoded.bytes == record.artifact && encoded.companions.is_none() => {}
+            _ => return refuse(ModuleRecordRefusal::Artifact),
+        }
+        (engine, None, base_root, result_root, export, artifact)
     };
-    match artifact.encode(write_budget) {
-        Ok(encoded) if encoded.bytes == record.artifact => {}
-        _ => return refuse(ModuleRecordRefusal::Artifact),
-    }
     let count = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
     Ok(Outcome::Complete(Ok(RecordHit {
         engine,
+        public_environment,
         export: Arc::new(export),
         artifact: Arc::new(artifact),
         base_root,
@@ -1426,6 +1666,220 @@ mod tests {
             assert!(
                 SourceModuleRecord::parse(&bytes[..length], key, identity, &n("Main")).is_err(),
                 "length {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_system_records_replay_both_worlds_and_refuse_companion_forgeries() {
+        let graph = [
+            (
+                "Base",
+                "module\nprelude\n\
+                 public inductive Token where | left | right\n\
+                 private def privateValue : Token := Token.left\n\
+                 public def hidden : Token := privateValue\n\
+                 @[expose] public def exposed (x : Token) : Token := x\n\
+                 private theorem localProof (P : Prop) (h : P) : P := h\n\
+                 public theorem exportedProof (P : Prop) (h : P) : P := localProof P h\n",
+            ),
+            (
+                "Left",
+                "module\nprelude\npublic import Base\n\
+                 @[expose] public def fromLeft (x : Token) : Token := exposed x\n\
+                 public theorem leftProof (P : Prop) (h : P) : P := exportedProof P h\n",
+            ),
+            (
+                "Right",
+                "module\nprelude\npublic import Base\nimport all Base\n\
+                 def witness (P : Token -> Type) (x : P Token.left) : P hidden := x\n\
+                 public def fromRight : Token := hidden\n",
+            ),
+            (
+                "Main",
+                "module\nprelude\npublic import Left\nimport Right\n\
+                 public def finalToken : Token := fromLeft Token.right\n\
+                 private def privateUse : Token := fromRight\n\
+                 public theorem mainTheorem (P : Prop) (h : P) : P := leftProof P h\n",
+            ),
+        ];
+        let store = Memory::default();
+        let identity = checker(b"module-system-persisted");
+        let run = || {
+            compile(&store, identity, fln_core::mode::Mode::DEFAULT, &graph)
+                .unwrap()
+                .into_complete()
+                .unwrap()
+        };
+        let families = |build: &SourceModuleBuild| -> Vec<(Name, Vec<u8>, Vec<u8>, Vec<u8>)> {
+            build
+                .artifacts
+                .iter()
+                .map(|artifact| {
+                    let companions = artifact
+                        .companions
+                        .as_ref()
+                        .expect("module-system artifact has companions");
+                    (
+                        artifact.name.clone(),
+                        artifact.bytes.clone(),
+                        companions.server.clone(),
+                        companions.private.clone(),
+                    )
+                })
+                .collect()
+        };
+        let cold = run();
+        assert_eq!((cold.elaborated_modules, cold.persisted_modules), (4, 0));
+        assert!(
+            cold.modules
+                .iter()
+                .all(|row| row.record_write == ModuleRecordWrite::Stored)
+        );
+        let warm = run();
+        assert_eq!(
+            (warm.elaborated_modules, warm.persisted_modules),
+            (0, 4),
+            "{:?}",
+            rows(&warm)
+        );
+        assert!(warm.modules.iter().all(|row| {
+            row.decision == ModuleDecision::Cached && row.record == ModuleRecordLookup::Hit
+        }));
+        assert_eq!(families(&warm), families(&cold));
+        assert_eq!(
+            warm.checked.checked.result_logical_root,
+            cold.checked.checked.result_logical_root
+        );
+        assert_eq!(
+            warm.checked
+                .public_environment
+                .as_ref()
+                .unwrap()
+                .logical_root(&KVMap::new()),
+            cold.checked
+                .public_environment
+                .as_ref()
+                .unwrap()
+                .logical_root(&KVMap::new())
+        );
+
+        let base_key = key_of(&cold, "Base");
+        let original_bytes = store.0.borrow()[&base_key].clone();
+        let original =
+            SourceModuleRecord::parse(&original_bytes, base_key, identity, &n("Base")).unwrap();
+        let worlds = original
+            .module_worlds
+            .clone()
+            .expect("module-system record carries companion worlds");
+        let flip = |digest: Digest| {
+            let mut bytes = digest.0;
+            bytes[0] ^= 1;
+            Digest(bytes)
+        };
+        let journal = ExtensionDescriptor {
+            name: fln_elab::instances::export::journal_name(),
+            merge: MergeSemantics::AppendOrdered,
+            checkpoint: CheckpointSemantics::FullJournal,
+            provenance: PayloadProvenance::Understood,
+        };
+        let forgeries: Vec<(&str, SourceModuleRecord)> = vec![
+            (
+                "artifact",
+                SourceModuleRecord {
+                    module_worlds: None,
+                    ..original.clone()
+                },
+            ),
+            (
+                "base-root",
+                SourceModuleRecord {
+                    module_worlds: Some(RecordedModuleWorlds {
+                        public_base_root: flip(worlds.public_base_root),
+                        ..worlds.clone()
+                    }),
+                    ..original.clone()
+                },
+            ),
+            (
+                "result-root",
+                SourceModuleRecord {
+                    module_worlds: Some(RecordedModuleWorlds {
+                        public_result_root: flip(worlds.public_result_root),
+                        ..worlds.clone()
+                    }),
+                    ..original.clone()
+                },
+            ),
+            (
+                "artifact",
+                SourceModuleRecord {
+                    module_worlds: Some(RecordedModuleWorlds {
+                        server_artifact: worlds.private_artifact.clone(),
+                        ..worlds.clone()
+                    }),
+                    ..original.clone()
+                },
+            ),
+            (
+                "result-root",
+                SourceModuleRecord {
+                    module_worlds: Some(RecordedModuleWorlds {
+                        private_artifact: original.artifact.clone(),
+                        ..worlds.clone()
+                    }),
+                    ..original.clone()
+                },
+            ),
+            (
+                "result-root",
+                SourceModuleRecord {
+                    module_worlds: Some(RecordedModuleWorlds {
+                        private_extensions: vec![RecordedExtension {
+                            descriptor: journal,
+                            entries: vec![b"forged private extension row".to_vec()],
+                        }],
+                        ..worlds
+                    }),
+                    ..original.clone()
+                },
+            ),
+        ];
+        for (code, forged) in forgeries {
+            store.save(base_key, &forged.to_bytes()).unwrap();
+            let rebuilt = run();
+            assert_eq!(
+                rows(&rebuilt)[0],
+                (
+                    "Base".to_owned(),
+                    ModuleDecision::Elaborated,
+                    Some(format!("refused:{code}"))
+                ),
+                "{code}"
+            );
+            assert_eq!(rebuilt.modules[0].record_write, ModuleRecordWrite::Stored);
+            assert_eq!(rebuilt.persisted_modules, 3, "{code}");
+            assert_eq!(families(&rebuilt), families(&cold), "{code}");
+            assert_eq!(store.0.borrow()[&base_key], original_bytes, "{code}");
+        }
+        for index in 0..original_bytes.len() {
+            let mut damaged = original_bytes.clone();
+            damaged[index] ^= 0x40;
+            assert!(
+                SourceModuleRecord::parse(&damaged, base_key, identity, &n("Base")).is_err(),
+                "module record byte {index}"
+            );
+        }
+        for length in 0..original_bytes.len() {
+            assert!(
+                SourceModuleRecord::parse(
+                    &original_bytes[..length],
+                    base_key,
+                    identity,
+                    &n("Base")
+                )
+                .is_err(),
+                "module record length {length}"
             );
         }
     }

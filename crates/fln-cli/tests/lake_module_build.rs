@@ -199,7 +199,15 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
     }
     // Re-encoding a checked cache hit must replace the entire family, including
     // executable code, without treating disk IR as checked compiler input.
-    success(&build());
+    let warm_report = success(&build());
+    assert!(
+        warm_report.contains("\"modules_cached\":2"),
+        "{warm_report}"
+    );
+    assert!(
+        warm_report.contains("\"module_elaborations\":0"),
+        "{warm_report}"
+    );
     for (name, original) in ["Lib.Base", "Lib.Top"].into_iter().zip(&originals) {
         assert_eq!(
             &std::fs::read(package.artifact(name).with_extension("ir")).unwrap(),
@@ -1246,4 +1254,84 @@ fn scoped_instance_libraries_build_and_keep_scope_activation_after_import() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     check_reference("Wrong.lean", false);
+}
+
+#[test]
+fn warm_module_system_builds_readmit_tripartite_records_and_recover_from_corruption() {
+    let package = module_library();
+    let cold = success(&package.build(&["+Lib.Top:olean"]));
+    assert!(cold.contains("\"modules_built\":2"), "{cold}");
+    assert!(cold.contains("\"modules_cached\":0"), "{cold}");
+    assert!(cold.contains("\"module_elaborations\":2"), "{cold}");
+    let cold_families: Vec<_> = ["Lib.Base", "Lib.Top"]
+        .into_iter()
+        .map(|name| family_bytes(&package, name))
+        .collect();
+
+    let warm = success(&package.build(&["+Lib.Top:olean"]));
+    assert!(warm.contains("\"modules_built\":2"), "{warm}");
+    assert!(warm.contains("\"modules_cached\":2"), "{warm}");
+    assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
+    assert!(warm.contains("\"decision\":\"cached\""), "{warm}");
+    assert!(warm.contains("\"record\":\"hit\""), "{warm}");
+    for (name, expected) in ["Lib.Base", "Lib.Top"].into_iter().zip(&cold_families) {
+        assert_eq!(&family_bytes(&package, name), expected);
+    }
+
+    let explain = success(
+        &Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["build", "explain", "--json", "--dir"])
+            .arg(&package.0)
+            .env("LEAN_PATH", package.0.join("no-imports"))
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        explain.contains("\"reference_decision\":\"up-to-date\""),
+        "{explain}"
+    );
+    assert!(explain.contains("\"module_records\":\"on\""), "{explain}");
+
+    // Corrupt every persisted module record byte-file; the next build must refuse
+    // the damaged records, re-elaborate cleanly, rewrite valid records, and emit
+    // identical `.olean`, `.olean.server`, and `.olean.private` families.
+    let mut record_files = Vec::new();
+    let mut dirs = vec![package.0.join(".records")];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.is_file() {
+                record_files.push(path);
+            }
+        }
+    }
+    assert!(
+        !record_files.is_empty(),
+        "expected persisted module records"
+    );
+    for file in &record_files {
+        let mut bytes = std::fs::read(file).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(file, bytes).unwrap();
+    }
+    let recovered = success(&package.build(&["+Lib.Top:olean"]));
+    assert!(recovered.contains("\"modules_cached\":0"), "{recovered}");
+    assert!(
+        recovered.contains("\"module_elaborations\":2"),
+        "{recovered}"
+    );
+    assert!(recovered.contains("refused:"), "{recovered}");
+    for (name, expected) in ["Lib.Base", "Lib.Top"].into_iter().zip(&cold_families) {
+        assert_eq!(&family_bytes(&package, name), expected);
+    }
+    let warm_after_recovery = success(&package.build(&["+Lib.Top:olean"]));
+    assert!(
+        warm_after_recovery.contains("\"modules_cached\":2"),
+        "{warm_after_recovery}"
+    );
 }

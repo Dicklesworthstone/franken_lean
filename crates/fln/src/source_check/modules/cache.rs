@@ -224,13 +224,13 @@ impl SourceModuleSession {
                     .iter()
                     .find(|artifact| artifact.name == pending.name)
                 {
-                    Some(artifact) => {
-                        let record = pending.record(records.checker, &artifact.bytes);
-                        match records.store.save(pending.key, &record.to_bytes()) {
+                    Some(artifact) => match pending.record(records.checker, artifact) {
+                        Ok(record) => match records.store.save(pending.key, &record.to_bytes()) {
                             Ok(()) => ModuleRecordWrite::Stored,
                             Err(reason) => ModuleRecordWrite::Failed(reason),
-                        }
-                    }
+                        },
+                        Err(reason) => ModuleRecordWrite::Failed((*reason).to_owned()),
+                    },
                     None => ModuleRecordWrite::Failed(
                         "no artifact was encoded for the module".to_owned(),
                     ),
@@ -428,6 +428,7 @@ pub(super) fn run_collecting(
     let mut provenance = Vec::new();
     let mut pending_records = Vec::new();
     let mut result_roots: BTreeMap<usize, LogicalRoot> = BTreeMap::new();
+    let mut public_result_roots: BTreeMap<usize, Option<LogicalRoot>> = BTreeMap::new();
     let mut entry_result = None;
     let mut entry_public_environment = None;
     let mut entry_public_scope = None;
@@ -509,7 +510,7 @@ pub(super) fn run_collecting(
                     .checked_add(module.source.len())
                     .is_some_and(|n| n <= view.limits.max_source_bytes)
         });
-        let mut public_environment = None;
+        let public_environment;
         let mut public_scope = None;
         let mut checked = if let Some(cached) = hit {
             meter.work(cached.work)?;
@@ -548,6 +549,9 @@ pub(super) fn run_collecting(
                             *result_roots
                                 .get(dependency)
                                 .expect("postorder predecessor root"),
+                            *public_result_roots
+                                .get(dependency)
+                                .expect("postorder predecessor public root"),
                         ),
                     })
                     .collect();
@@ -654,6 +658,28 @@ pub(super) fn run_collecting(
                     },
                 })?;
             }
+            let public_imports = if plan.headers[index].module_system {
+                match visibility::imports(
+                    base,
+                    contexts,
+                    index,
+                    &plan,
+                    modules,
+                    |dependency| exports[&dependency].as_ref(),
+                    options,
+                    &mut meter,
+                    cancellation,
+                )? {
+                    Outcome::Complete((engine, replayed)) => {
+                        replayed_declarations += replayed;
+                        Some(engine)
+                    }
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                }
+            } else {
+                None
+            };
             let after_steps_work = meter.work;
             let after_steps_bytes = meter.bytes;
             let mut lookup = ModuleRecordLookup::NotConsulted;
@@ -674,6 +700,7 @@ pub(super) fn run_collecting(
                             module.name,
                             &plan.headers[index],
                             &imported,
+                            public_imports.as_ref(),
                             options,
                             records.write_budget,
                             &mut meter,
@@ -702,6 +729,10 @@ pub(super) fn run_collecting(
             }
             if let Some(hit) = recorded {
                 artifacts.push(Arc::clone(&hit.artifact));
+                if plan.headers[index].module_system {
+                    replayed_declarations += hit.export.declarations.len();
+                }
+                public_environment = hit.public_environment.clone();
                 let scope = fln_elab::source::scope::SourceScope {
                     private_module: plan.headers[index]
                         .module_system
@@ -729,7 +760,7 @@ pub(super) fn run_collecting(
                                 stamp,
                                 dependencies: identities,
                                 engine: hit.engine,
-                                public_environment: None,
+                                public_environment: hit.public_environment,
                                 public_scope: None,
                                 export: Arc::clone(&hit.export),
                                 artifact: Some(Arc::clone(&hit.artifact)),
@@ -763,28 +794,6 @@ pub(super) fn run_collecting(
                 let elaboration_bytes = meter.bytes;
                 let mut declarations = Vec::new();
                 let header = &plan.headers[index];
-                let public_imports = if header.module_system {
-                    match visibility::imports(
-                        base,
-                        contexts,
-                        index,
-                        &plan,
-                        modules,
-                        |dependency| exports[&dependency].as_ref(),
-                        options,
-                        &mut meter,
-                        cancellation,
-                    )? {
-                        Outcome::Complete((engine, replayed)) => {
-                            replayed_declarations += replayed;
-                            Some(engine)
-                        }
-                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                    }
-                } else {
-                    None
-                };
                 let mut public = public_imports.map(|engine| {
                     visibility::PublicWorld::new(module.name, engine, &mut meter, cancellation)
                 });
@@ -943,12 +952,16 @@ pub(super) fn run_collecting(
                     }
                 }
                 if let Some(key) = key {
+                    let public_roots = public_base.as_ref().zip(public_environment.as_ref()).map(
+                        |(base, result)| (base.logical_root(options), result.logical_root(options)),
+                    );
                     pending_records.push(PendingRecord {
                         name: module.name.clone(),
                         key,
                         export: Arc::clone(&export),
                         base_root: checked.base_logical_root,
                         result_root: checked.result_logical_root,
+                        public_roots,
                         commands: checked.commands,
                         theorems: checked.theorems,
                         work: meter.work - elaboration_work,
@@ -969,6 +982,12 @@ pub(super) fn run_collecting(
             }
         };
         result_roots.insert(index, checked.result_logical_root);
+        public_result_roots.insert(
+            index,
+            public_environment
+                .as_ref()
+                .map(|environment| environment.logical_root(options)),
+        );
         // Semantic source limits apply to reused modules too, including when a
         // changed sibling consumes more of the same aggregate command budget.
         commands = commands

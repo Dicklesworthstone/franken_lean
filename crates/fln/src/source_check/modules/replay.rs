@@ -86,6 +86,13 @@ impl Export {
             .map(|suffix| (&suffix.descriptor, suffix.entries.as_slice()))
     }
 
+    /// Each journal this module's private world appended to, when separate from its public view.
+    pub(super) fn private_journal_suffixes(
+        &self,
+    ) -> Option<impl Iterator<Item = (&ExtensionDescriptor, &[Arc<[u8]>])>> {
+        self.private.as_deref().map(Self::journal_suffixes)
+    }
+
     pub(super) fn require_artifact_support(
         &self,
         module: &Name,
@@ -100,6 +107,9 @@ impl Export {
                 &suffix.descriptor.name,
                 "the pinned .olean writer cannot yet serialize this module's environment extension",
             ));
+        }
+        if let Some(private) = &self.private {
+            private.require_artifact_support(module)?;
         }
         Ok(())
     }
