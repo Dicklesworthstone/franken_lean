@@ -238,7 +238,11 @@ lean_lib Literals where
     let conflicting = "import Lake\nopen Lake DSL\ndef entry : Lean.Name := Lean.Name.str Lean.Name.anonymous (\"Ma\" ++ \"in\")\npackage invalid\nlean_exe Main\nlean_exe runner where\n  srcDir := \"other\"\n  root := entry\n";
     let error = configured(&engine, conflicting, limits).unwrap_err();
     assert_eq!(error.class, "input", "{}", error.detail);
-    assert!(error.detail.contains("share root module `Main`"), "{}", error.detail);
+    assert!(
+        error.detail.contains("share root module `Main`"),
+        "{}",
+        error.detail
+    );
     assert!(!error.authority);
     let distinct = conflicting.replace("(\"Ma\" ++ \"in\")", "(\"Ot\" ++ \"her\")");
     let config = configured(&engine, &distinct, limits)

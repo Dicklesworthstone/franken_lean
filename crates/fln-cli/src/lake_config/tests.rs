@@ -52,7 +52,10 @@ fn native_lake_config_keeps_executable_roots_typed_and_defaults_to_the_target_na
     assert_eq!(parsed.config.targets[1].roots, ["Other"]);
     assert_eq!(parsed.fields.len(), 2);
     assert!(matches!(parsed.fields[0].slot, ConfigSlot::TargetSource(0)));
-    assert!(matches!(parsed.fields[1].slot, ConfigSlot::ExecutableRoot(0)));
+    assert!(matches!(
+        parsed.fields[1].slot,
+        ConfigSlot::ExecutableRoot(0)
+    ));
     let program = parsed.program.split_whitespace().collect::<String>();
     assert!(program.contains(&format!(
         "def{}:_root_.Lean.Name:=(selected)",

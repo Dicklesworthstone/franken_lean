@@ -34,7 +34,7 @@ impl Package {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed),
         ));
-        std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
         let package = Self(path);
         package.write(file, config);
         package
@@ -300,7 +300,9 @@ fn checked_lean_configuration_computes_executable_roots_and_refuses_invalid_valu
             "root := entryName \"Main\"",
             "root := Lean.Name.num Lean.Name.anonymous 1",
         ),
-        format!("{LEAN_CONFIG}lean_exe other where\n  root := entryName \"Main\"\n  srcDir := \"other\"\n"),
+        format!(
+            "{LEAN_CONFIG}lean_exe other where\n  root := entryName \"Main\"\n  srcDir := \"other\"\n"
+        ),
         LEAN_CONFIG.replace(
             "srcDir := FilePath.mk (\"appli\" ++ \"cation\")",
             "srcDir := FilePath.mk (\"appli\" ++ \"cation\")\n  moreLinkArgs := #[\"-unexpected\"]",
@@ -321,7 +323,10 @@ fn checked_lean_configuration_computes_executable_roots_and_refuses_invalid_valu
         "lakefile.lean",
         "import Lake\nopen Lake DSL\npackage defaulted\nlean_exe Main\n",
     );
-    default.write("Main.lean", "def main : IO Unit := IO.println \"default-root\"\n");
+    default.write(
+        "Main.lean",
+        "def main : IO Unit := IO.println \"default-root\"\n",
+    );
     let output = default.run(&["exe", "Main"], Some(reference));
     assert!(output.status.success(), "{output:?}");
     assert_eq!(text(&output.stdout), "default-root\n", "{output:?}");
