@@ -24,6 +24,7 @@
 //! authority lifetimes.
 
 use super::lookup::EnvironmentMacroLookup;
+mod hygiene;
 use super::registrations::{
     MacroAttempt, MacroDispatchInvocation, MacroRegistrationError, MacroTreeLimits,
     MacroTreeResult, MacroTreeUsage, RegisteredMacros,
@@ -247,6 +248,7 @@ pub(crate) struct FileSession<'a> {
     registry: &'a RegisteredMacros,
     parsers: fln_parse::extensions::ImportedSyntaxModule,
     context: &'a MacroContext,
+    hygiene: Option<hygiene::CommandHygiene>,
     state: MacroState,
     lookup: Option<&'a dyn MacroLookup>,
     limits: MacroTreeLimits,
@@ -322,6 +324,7 @@ impl<'a> FileSession<'a> {
             registry: invocation.registry,
             parsers: fln_parse::extensions::ImportedSyntaxModule::default(),
             context: invocation.context,
+            hygiene: None,
             state: invocation.state,
             lookup: invocation.lookup,
             limits: invocation.limits,
@@ -341,8 +344,71 @@ impl<'a> FileSession<'a> {
         }
     }
 
+    pub(crate) fn enable_command_hygiene(&mut self, module: Name) {
+        self.hygiene = Some(hygiene::CommandHygiene::new(
+            module,
+            self.context,
+            &mut self.state,
+        ));
+    }
+
+    fn active_context(&self) -> &MacroContext {
+        self.hygiene
+            .as_ref()
+            .map_or(self.context, hygiene::CommandHygiene::active_context)
+    }
+
+    /// Stage 1 of the pin frontend's two-stage `withInitQuotContext`
+    /// (`Command.lean:605-642`). Call inside `grammar.enter(...)` on each
+    /// top-level source command (never on nested steps synthesized by `in`).
+    pub(crate) fn observe_top_level_command(&mut self, source: &[u8]) -> Outcome<()> {
+        match self.collect_tactics() {
+            Outcome::Complete(()) => {}
+            other => return other,
+        }
+        if let Some(hygiene) = &mut self.hygiene {
+            hygiene.finish_command(&mut self.state);
+            hygiene.enter_quot_context(hygiene::command_quot_hint(source), &mut self.state);
+        }
+        Outcome::Complete(())
+    }
+
+    fn enter_declaration_hygiene(&mut self, syntax: &Syntax) -> Outcome<()> {
+        match self.collect_tactics() {
+            Outcome::Complete(()) => {}
+            other => return other,
+        }
+        if let Some(hygiene) = &mut self.hygiene {
+            hygiene.enter_quot_context(hygiene::declaration_quot_hint(syntax), &mut self.state);
+        }
+        Outcome::Complete(())
+    }
+
+    fn enter_mutual_hygiene(&mut self, members: &[Syntax]) -> Outcome<()> {
+        match self.collect_tactics() {
+            Outcome::Complete(()) => {}
+            other => return other,
+        }
+        if let Some(hygiene) = &mut self.hygiene {
+            hygiene.enter_quot_context(hygiene::mutual_quot_hint(members), &mut self.state);
+        }
+        Outcome::Complete(())
+    }
+
+    fn has_root_macro(&self, registry: &RegisteredMacros, syntax: &Syntax) -> bool {
+        let Some(kind) = syntax.kind() else {
+            return false;
+        };
+        self.templates.rules.contains_key(kind) || registry.declarations(kind).next().is_some()
+    }
+
     pub(crate) fn finish(mut self) -> (Outcome<()>, FileSessionReport) {
         let outcome = self.collect_tactics();
+        if matches!(outcome, Outcome::Complete(()))
+            && let Some(hygiene) = &mut self.hygiene
+        {
+            hygiene.finish_command(&mut self.state);
+        }
         (
             outcome,
             FileSessionReport {
@@ -416,7 +482,7 @@ impl<'a> FileSession<'a> {
         let runtime = Arc::new(ImportedTactics::new(
             registry,
             view.normalized().clone(),
-            self.context.clone(),
+            self.active_context().clone(),
             self.state.clone(),
             self.remaining_limits(),
         ));
@@ -665,14 +731,60 @@ impl<'a> FileSession<'a> {
         if existing_global {
             return Outcome::Complete(Ok(ProgramCommandSyntax::Single(Box::new(parsed))));
         }
-        self.expand_syntax(
-            engine,
-            registry,
-            parsed.source_view().normalized(),
-            input,
-            scope,
-        )
-        .map_complete(|result| {
+        let mut parsed = parsed;
+        if declaration {
+            if self.hygiene.is_some() && self.has_root_macro(registry, parsed.syntax()) {
+                let root = match self.expand_syntax_mode(
+                    engine,
+                    registry,
+                    parsed.source_view().normalized(),
+                    parsed.syntax(),
+                    scope,
+                    true,
+                    true,
+                ) {
+                    Outcome::Complete(Ok(syntax)) => syntax,
+                    Outcome::Complete(Err(error)) => return Outcome::Complete(Err(error)),
+                    Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+                    Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                };
+                let rewritten = match expected {
+                    SourceCommandKind::Definition => parsed.with_expanded_declaration(root),
+                    SourceCommandKind::Example => parsed.with_expanded_example(root),
+                    _ => unreachable!("checked declaration kind"),
+                };
+                let Some(rewritten) = rewritten else {
+                    return wrong_command(expected);
+                };
+                parsed = rewritten;
+            }
+            match self.enter_declaration_hygiene(parsed.syntax()) {
+                Outcome::Complete(()) => {}
+                Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+            }
+        }
+        let expanded = if declaration {
+            self.expand_syntax(
+                engine,
+                registry,
+                parsed.source_view().normalized(),
+                parsed.syntax(),
+                scope,
+            )
+        } else {
+            let Some(term) = parsed.query_term_syntax() else {
+                return wrong_command(expected);
+            };
+            self.expand_syntax(
+                engine,
+                registry,
+                parsed.source_view().normalized(),
+                term,
+                scope,
+            )
+        };
+        expanded.map_complete(|result| {
             result.and_then(|syntax| {
                 let rewritten = match expected {
                     SourceCommandKind::Definition => parsed.with_expanded_declaration(syntax),
@@ -753,6 +865,11 @@ impl<'a> FileSession<'a> {
                     Ok(view) => view,
                     Err(error) => return Outcome::Complete(Err(error)),
                 };
+                match self.enter_mutual_hygiene(&members) {
+                    Outcome::Complete(()) => {}
+                    Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+                    Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                }
                 // Mutual members see the group's original predecessor, while
                 // macro state and budgets advance in their source order. The
                 // whole group is admitted only after all expansions succeed.
@@ -775,8 +892,33 @@ impl<'a> FileSession<'a> {
                 }
                 Outcome::Complete(Ok(ScopedCommandSyntax::Mutual(members)))
             }
-            ScopedCommandSyntax::Example(parsed) => self
-                .expand_syntax(
+            ScopedCommandSyntax::Example(mut parsed) => {
+                if self.hygiene.is_some() && self.has_root_macro(registry, parsed.syntax()) {
+                    let root = match self.expand_syntax_mode(
+                        engine,
+                        registry,
+                        parsed.source_view().normalized(),
+                        parsed.syntax(),
+                        scope,
+                        true,
+                        true,
+                    ) {
+                        Outcome::Complete(Ok(syntax)) => syntax,
+                        Outcome::Complete(Err(error)) => return Outcome::Complete(Err(error)),
+                        Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+                        Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                    };
+                    let Some(rewritten) = parsed.with_expanded_example(root) else {
+                        return Outcome::Complete(Err(SourceMacroError::ExampleRequired));
+                    };
+                    parsed = rewritten;
+                }
+                match self.enter_declaration_hygiene(parsed.syntax()) {
+                    Outcome::Complete(()) => {}
+                    Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+                    Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                }
+                self.expand_syntax(
                     engine,
                     registry,
                     parsed.source_view().normalized(),
@@ -790,9 +932,35 @@ impl<'a> FileSession<'a> {
                             .map(ScopedCommandSyntax::Example)
                             .ok_or(SourceMacroError::ExampleRequired)
                     })
-                }),
-            ScopedCommandSyntax::Definition(parsed) => self
-                .expand_syntax(
+                })
+            }
+            ScopedCommandSyntax::Definition(mut parsed) => {
+                if self.hygiene.is_some() && self.has_root_macro(registry, parsed.syntax()) {
+                    let root = match self.expand_syntax_mode(
+                        engine,
+                        registry,
+                        parsed.source_view().normalized(),
+                        parsed.syntax(),
+                        scope,
+                        true,
+                        true,
+                    ) {
+                        Outcome::Complete(Ok(syntax)) => syntax,
+                        Outcome::Complete(Err(error)) => return Outcome::Complete(Err(error)),
+                        Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+                        Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                    };
+                    let Some(rewritten) = parsed.with_expanded_syntax(root) else {
+                        return Outcome::Complete(Err(SourceMacroError::DeclarationRequired));
+                    };
+                    parsed = rewritten;
+                }
+                match self.enter_declaration_hygiene(parsed.syntax()) {
+                    Outcome::Complete(()) => {}
+                    Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+                    Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                }
+                self.expand_syntax(
                     engine,
                     registry,
                     parsed.source_view().normalized(),
@@ -806,7 +974,8 @@ impl<'a> FileSession<'a> {
                             .map(ScopedCommandSyntax::Definition)
                             .ok_or(SourceMacroError::DeclarationRequired)
                     })
-                }),
+                })
+            }
         }
     }
 
@@ -857,6 +1026,45 @@ impl<'a> FileSession<'a> {
         parsed: ParsedSourceCommand,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Outcome<Result<ParsedSourceCommand, SourceMacroError>> {
+        if self.hygiene.is_none() {
+            return self
+                .expand_syntax(
+                    engine,
+                    registry,
+                    parsed.source_view().normalized(),
+                    parsed.syntax(),
+                    scope,
+                )
+                .map_complete(|result| {
+                    result.and_then(|syntax| {
+                        parsed
+                            .with_expanded_command_declaration(syntax)
+                            .ok_or(SourceMacroError::DeclarationRequired)
+                    })
+                });
+        }
+        let root = match self.expand_syntax_mode(
+            engine,
+            registry,
+            parsed.source_view().normalized(),
+            parsed.syntax(),
+            scope,
+            true,
+            true,
+        ) {
+            Outcome::Complete(Ok(syntax)) => syntax,
+            Outcome::Complete(Err(error)) => return Outcome::Complete(Err(error)),
+            Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+        };
+        let Some(parsed) = parsed.with_expanded_command_declaration(root) else {
+            return Outcome::Complete(Err(SourceMacroError::DeclarationRequired));
+        };
+        match self.enter_declaration_hygiene(parsed.syntax()) {
+            Outcome::Complete(()) => {}
+            Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+        }
         self.expand_syntax(
             engine,
             registry,
@@ -867,7 +1075,7 @@ impl<'a> FileSession<'a> {
         .map_complete(|result| {
             result.and_then(|syntax| {
                 parsed
-                    .with_expanded_command_declaration(syntax)
+                    .with_expanded_declaration(syntax)
                     .ok_or(SourceMacroError::DeclarationRequired)
             })
         })
@@ -924,25 +1132,33 @@ impl<'a> FileSession<'a> {
         // Controls apply directly to the lexical scope; unlike a declaration,
         // they do not bind an owned runtime provider before elaborating their
         // terms. Preserve explicit deferred-dispatch refusals at this boundary.
-        self.expand_syntax_mode(engine, registry, view.normalized(), &syntax, scope, false)
-            .map_complete(|result| {
-                result.and_then(|mut syntax| {
-                    if variable {
-                        if let Syntax::Node { kind, args, .. } = &mut syntax
-                            && *kind == variable_kind
-                            && args.len() == 2
-                            && let Some(binders) = args.pop()
-                        {
-                            return Ok(ScopeCommand::Variable(binders));
-                        }
-                        Err(SourceMacroError::ScopeControl {
-                            kind: variable_kind,
-                        })
-                    } else {
-                        Ok(ScopeCommand::Executable(syntax))
+        self.expand_syntax_mode(
+            engine,
+            registry,
+            view.normalized(),
+            &syntax,
+            scope,
+            false,
+            false,
+        )
+        .map_complete(|result| {
+            result.and_then(|mut syntax| {
+                if variable {
+                    if let Syntax::Node { kind, args, .. } = &mut syntax
+                        && *kind == variable_kind
+                        && args.len() == 2
+                        && let Some(binders) = args.pop()
+                    {
+                        return Ok(ScopeCommand::Variable(binders));
                     }
-                })
+                    Err(SourceMacroError::ScopeControl {
+                        kind: variable_kind,
+                    })
+                } else {
+                    Ok(ScopeCommand::Executable(syntax))
+                }
             })
+        })
     }
 
     fn expand_syntax(
@@ -953,9 +1169,10 @@ impl<'a> FileSession<'a> {
         syntax: &Syntax,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Outcome<Result<Syntax, SourceMacroError>> {
-        self.expand_syntax_mode(engine, registry, source, syntax, scope, true)
+        self.expand_syntax_mode(engine, registry, source, syntax, scope, true, false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expand_syntax_mode(
         &mut self,
         engine: &Engine,
@@ -964,6 +1181,7 @@ impl<'a> FileSession<'a> {
         syntax: &Syntax,
         scope: &fln_elab::source::scope::SourceScope,
         runtime_macros: bool,
+        root_only: bool,
     ) -> Outcome<Result<Syntax, SourceMacroError>> {
         match self.collect_tactics() {
             Outcome::Complete(()) => {}
@@ -985,6 +1203,7 @@ impl<'a> FileSession<'a> {
             },
             tree_usage: MacroTreeUsage::default(),
         };
+        let context = self.active_context().clone();
         let expanded = expand_syntax_in_scope(
             engine,
             source,
@@ -992,7 +1211,7 @@ impl<'a> FileSession<'a> {
             scope,
             SourceMacroInvocation {
                 registry: &registry,
-                context: self.context,
+                context: &context,
                 state: std::mem::take(&mut self.state),
                 lookup: self.lookup,
                 limits: remaining,
@@ -1000,6 +1219,7 @@ impl<'a> FileSession<'a> {
             },
             &mut progress,
             runtime_macros && self.lookup.is_none() && self.cancellation.is_none(),
+            root_only,
         );
         if let Err(reason) = self.record(progress) {
             return Outcome::Inconclusive(reason);
@@ -1463,6 +1683,7 @@ fn expand_in_scope(
             invocation,
             progress,
             false,
+            false,
         );
         let (syntax, state) = match expanded {
             Outcome::Complete(Ok(result)) => result,
@@ -1527,6 +1748,7 @@ fn source_preflight(
 /// The one executable expansion pass for queries, declarations, mutual members
 /// and syntax-bearing controls. The caller has validated the source binding and
 /// byte ceiling before parsing; this pass neither prints nor reparses Syntax.
+#[allow(clippy::too_many_arguments)]
 fn expand_syntax_in_scope(
     engine: &Engine,
     source: &SourceText,
@@ -1535,6 +1757,7 @@ fn expand_syntax_in_scope(
     invocation: SourceMacroInvocation<'_>,
     progress: &mut Progress,
     runtime_macros: bool,
+    root_only: bool,
 ) -> Outcome<Result<(Syntax, MacroState), SourceMacroError>> {
     let SourceMacroInvocation {
         registry,
@@ -1560,17 +1783,17 @@ fn expand_syntax_in_scope(
         &scope.explicit_opens,
     );
     let lookup = lookup.or(Some(&engine_lookup as &dyn MacroLookup));
-    let expanded = registry.expand_source_tree_with_context(
-        input,
-        MacroDispatchInvocation {
-            source,
-            context,
-            state,
-            lookup,
-        },
-        limits,
-        cancellation,
-    );
+    let dispatch = MacroDispatchInvocation {
+        source,
+        context,
+        state,
+        lookup,
+    };
+    let expanded = if root_only {
+        registry.expand_command_root_with_context(input, dispatch, limits, cancellation)
+    } else {
+        registry.expand_source_tree_with_context(input, dispatch, limits, cancellation)
+    };
     progress.attempts = expanded.attempts;
     progress.usage = expanded.completed_vm_usage;
     progress.tree_usage = expanded.usage;
@@ -1598,10 +1821,12 @@ fn expand_syntax_in_scope(
     };
     // Atomic and tactic dispatch belongs to their elaborators. Do not silently
     // ignore a registration that this recursive expansion pass leaves behind.
-    match deferred_candidate(registry, &syntax, runtime_macros) {
-        Ok(Some(error)) => return Outcome::Complete(Err(error)),
-        Ok(None) => {}
-        Err(reason) => return Outcome::Inconclusive(reason),
+    if !root_only {
+        match deferred_candidate(registry, &syntax, runtime_macros) {
+            Ok(Some(error)) => return Outcome::Complete(Err(error)),
+            Ok(None) => {}
+            Err(reason) => return Outcome::Inconclusive(reason),
+        }
     }
     if cancellation.is_some_and(CancellationProbe::is_cancelled) {
         return Outcome::Inconclusive(Inconclusive::cancelled(

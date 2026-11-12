@@ -2230,3 +2230,321 @@ fn installed_lake_builds_imported_macro_expansions_and_reimports_the_checked_art
         "{explanation}"
     );
 }
+
+fn imported_hygiene_provider_source() -> String {
+    format!(
+        "{}\n{}",
+        include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
+        r#"public section
+
+mutual
+meta partial def replaceIdentSyntax (target : Name) (replacement : Syntax) : Syntax → Syntax
+  | .ident info raw val pre =>
+    match Name.beq val target with
+    | true =>
+      match replacement with
+      | .ident _ _ repVal repPre => .ident info raw repVal (List.append repPre pre)
+      | other => other
+    | false => .ident info raw val pre
+  | .node info kind args =>
+    .node info kind (Array.mk (replaceIdentSyntaxList target replacement args.toList))
+  | other => other
+
+meta partial def replaceIdentSyntaxList (target : Name) (replacement : Syntax) : List Syntax → List Syntax
+  | .nil => .nil
+  | .cons h t => .cons (replaceIdentSyntax target replacement h) (replaceIdentSyntaxList target replacement t)
+end
+
+syntax (name := hygTerm) "hygTerm%" ident ":" term : term
+
+@[macro hygTerm]
+public meta def hygTermMacro : Macro := fun stx context state =>
+  match stx.getArg 1 with
+  | .ident info raw id pre =>
+    match Lean.Macro.addMacroScope id context state with
+    | .ok hyg next => .ok (replaceIdentSyntax id (.ident info raw hyg pre) (stx.getArg 3)) next
+    | .error err next => .error err next
+  | _ => .error .unsupportedSyntax state
+
+syntax (name := hygSplice) "hygSplice%" ident ":" term "=>" term : term
+
+@[macro hygSplice]
+public meta def hygSpliceMacro : Macro := fun stx context state =>
+  match stx.getArg 1 with
+  | .ident info raw id pre =>
+    match Lean.Macro.addMacroScope id context state with
+    | .ok hyg next =>
+      let stamped := replaceIdentSyntax id (.ident info raw hyg pre) (stx.getArg 3)
+      .ok (replaceIdentSyntax `HOLE (stx.getArg 5) stamped) next
+    | .error err next => .error err next
+  | _ => .error .unsupportedSyntax state
+
+syntax (name := hygCmd) "hygCmd%" ident ":" "[" command "]" : command
+
+@[macro hygCmd]
+public meta def hygCmdMacro : Macro := fun stx context state =>
+  match stx.getArg 1 with
+  | .ident info raw id pre =>
+    match Lean.Macro.addMacroScope id context state with
+    | .ok hyg next => .ok (replaceIdentSyntax id (.ident info raw hyg pre) (stx.getArg 4)) next
+    | .error err next => .error err next
+  | _ => .error .unsupportedSyntax state
+"#,
+    )
+}
+
+fn collect_hygienic_binders(
+    expr: &fln_core::expr::Expr,
+    out: &mut Vec<(fln_core::name::Name, fln_core::name::Name)>,
+) {
+    use fln_core::expr::ExprNode;
+    use fln_core::name::Name;
+    use fln_core::name::hygiene::extract_macro_scopes;
+
+    let internal = Name::from_components(["_internal"]);
+    let mut record = |binder: &Name| {
+        if let Ok(view) = extract_macro_scopes(binder)
+            && !view.scopes.is_empty()
+            && view.context != internal
+        {
+            out.push((view.name, view.context));
+        }
+    };
+    match expr.node() {
+        ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body,
+            ..
+        }
+        | ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            ..
+        } => {
+            record(binder_name);
+            collect_hygienic_binders(binder_type, out);
+            collect_hygienic_binders(body, out);
+        }
+        ExprNode::LetE {
+            decl_name,
+            type_,
+            value,
+            body,
+            ..
+        } => {
+            record(decl_name);
+            collect_hygienic_binders(type_, out);
+            collect_hygienic_binders(value, out);
+            collect_hygienic_binders(body, out);
+        }
+        ExprNode::App { fun, arg } => {
+            collect_hygienic_binders(fun, out);
+            collect_hygienic_binders(arg, out);
+        }
+        ExprNode::MData { expr: inner, .. }
+        | ExprNode::Proj {
+            struct_expr: inner, ..
+        } => {
+            collect_hygienic_binders(inner, out);
+        }
+        _ => {}
+    }
+}
+
+fn decode_olean_hygienic_contexts(
+    path: &std::path::Path,
+) -> std::collections::BTreeMap<
+    fln_core::name::Name,
+    Vec<(fln_core::name::Name, fln_core::name::Name)>,
+> {
+    use fln::ConstantInfo;
+    use fln_olean::decl::DeclDecoder;
+    use fln_olean::region::{OleanView, WalkBudget};
+
+    let bytes = std::fs::read(path).unwrap();
+    let view = OleanView::parse(&bytes).unwrap();
+    let constants = DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap();
+    let mut by_decl = std::collections::BTreeMap::new();
+    for info in constants {
+        let target = match &info {
+            ConstantInfo::Defn(v) => &v.value,
+            ConstantInfo::Thm(v) => &v.value,
+            ConstantInfo::Opaque(v) => &v.value,
+            other => &other.constant_val().type_,
+        };
+        let mut binders = Vec::new();
+        collect_hygienic_binders(target, &mut binders);
+        by_decl.insert(info.name().clone(), binders);
+    }
+    by_decl
+}
+
+#[test]
+fn imported_macro_hygiene_matches_pinned_reference_quot_contexts_and_proves_collision_safety() {
+    use fln_core::name::Name;
+
+    let Some(project) =
+        ImportedMacroProject::prepare_with_source(&imported_hygiene_provider_source())
+    else {
+        return;
+    };
+    let client = project.root.join("client");
+    std::fs::write(
+        client.join("lakefile.toml"),
+        "name = \"macro_hygiene\"\n[[lean_lib]]\nname = \"Client\"\nroots = [\"Main\"]\n",
+    )
+    .unwrap();
+    let main_src = r#"prelude
+import AdmittedSourceMacro
+
+-- leading trivia
+def first : Nat := (hygTerm% z : (fun z : Nat => z)) 10 -- trailing
+
+namespace Sub
+def second : Nat := (hygTerm% z : (fun z : Nat => z)) 20
+end Sub
+
+def Sub.dottedDef : Nat := (hygTerm% z : (fun z : Nat => z)) 25
+
+private def privDef : Nat := (hygTerm% z : (fun z : Nat => z)) 35
+
+mutual
+  def mA : Nat := (hygTerm% z : (fun z : Nat => z)) mB
+  def mB : Nat := (hygTerm% z : (fun z : Nat => z)) 11
+end
+
+inductive MyInd : Type where
+  | mk : (x : Nat) → (h : Eq ((hygTerm% z : (fun z : Nat => z)) x) x) → MyInd
+
+mutual
+  inductive MutIndA : Type where
+    | mk : (x : Nat) → (h : Eq ((hygTerm% z : (fun z : Nat => z)) x) x) → MutIndA
+    | step : MutIndB → MutIndA
+  inductive MutIndB : Type where
+    | mk : (x : Nat) → (h : Eq ((hygTerm% z : (fun z : Nat => z)) x) x) → MutIndB
+end
+
+hygCmd% z : [def third : Nat := (fun z : Nat => z) 30]
+
+open Sub in
+hygCmd% z : [def fromOpenIn : Nat := (fun z : Nat => z) second]
+
+hygCmd% u : [def fourth : Nat := (fun u : Nat => (hygTerm% z : (fun z : Nat => u)) 0) 4]
+
+namespace DupA
+def dupName : Nat := (hygTerm% z : (fun z : Nat => z)) 5
+end DupA
+
+namespace DupB
+def dupName : Nat := (hygTerm% z : (fun z : Nat => z)) 6
+end DupB
+
+def nonCapture (z : Nat) : Nat := (hygSplice% z : (fun z : Nat => HOLE) => z) 99
+
+theorem fourth_eq : Eq fourth 4 := Eq.refl fourth
+theorem nonCapture_eq (z : Nat) : Eq (nonCapture z) z := Eq.refl z
+"#;
+    let main_path = project.source(main_src);
+    let ref_olean = project.root.join("ref_out/Main.olean");
+    std::fs::create_dir(project.root.join("ref_out")).unwrap();
+    let ref_build = Command::new(&project.reference)
+        .arg("-R")
+        .arg(&client)
+        .arg("-o")
+        .arg(&ref_olean)
+        .arg(&main_path)
+        .current_dir(&client)
+        .env("LEAN_PATH", project.search_path())
+        .output()
+        .unwrap();
+    assert!(ref_build.status.success(), "{ref_build:?}");
+    assert!(ref_build.stdout.is_empty(), "{ref_build:?}");
+    assert!(ref_build.stderr.is_empty(), "{ref_build:?}");
+
+    let selected = ["AdmittedSourceMacro"];
+    let built = project.lake(&["+Main:olean"], true, &selected);
+    assert!(built.status.success(), "{built:?}; {:?}", project.root);
+    assert!(built.stderr.is_empty(), "{built:?}");
+
+    let fln_olean = client.join(".lake/build/lib/lean/Main.olean");
+    let fln_map = decode_olean_hygienic_contexts(&fln_olean);
+    let ref_map = decode_olean_hygienic_contexts(&ref_olean);
+
+    let priv_name = Name::str(
+        Name::num(Name::from_components(["_private", "Main"]), 0),
+        "privDef",
+    );
+    let targets = [
+        Name::from_components(["first"]),
+        Name::from_components(["Sub", "second"]),
+        Name::from_components(["Sub", "dottedDef"]),
+        priv_name,
+        Name::from_components(["mA"]),
+        Name::from_components(["mB"]),
+        Name::from_components(["MyInd", "mk"]),
+        Name::from_components(["MutIndA", "mk"]),
+        Name::from_components(["MutIndB", "mk"]),
+        Name::from_components(["third"]),
+        Name::from_components(["fromOpenIn"]),
+        Name::from_components(["fourth"]),
+        Name::from_components(["DupA", "dupName"]),
+        Name::from_components(["DupB", "dupName"]),
+        Name::from_components(["nonCapture"]),
+    ];
+    for decl in &targets {
+        let fln_binders = fln_map
+            .get(decl)
+            .unwrap_or_else(|| panic!("missing {decl:?} in FrankenLean Main.olean"));
+        let ref_binders = ref_map
+            .get(decl)
+            .unwrap_or_else(|| panic!("missing {decl:?} in Reference Main.olean"));
+        assert!(
+            !ref_binders.is_empty(),
+            "expected hygienic binders in {decl:?}"
+        );
+        assert_eq!(
+            fln_binders,
+            ref_binders,
+            "quotation context mismatch for {}",
+            decl.to_display_string()
+        );
+    }
+
+    // Two-stage hygiene invariant: Stage 1 command macro `u` and Stage 2 term macro `z`
+    // in `fourth` carry distinct `Main.<idx>._hygCtx` quotation contexts.
+    let fourth = &fln_map[&Name::from_components(["fourth"])];
+    assert_eq!(fourth.len(), 2, "{fourth:?}");
+    assert_ne!(fourth[0].1, fourth[1].1, "{fourth:?}");
+
+    // Collision-probing invariant: `DupA.dupName` and `DupB.dupName` share the same short
+    // declaration name (`dupName`), so `DupB.dupName` probes `idx + 1` in `used_quot_ctxts`.
+    let dup_a = &fln_map[&Name::from_components(["DupA", "dupName"])][0].1;
+    let dup_b = &fln_map[&Name::from_components(["DupB", "dupName"])][0].1;
+    assert_eq!(
+        dup_a,
+        &Name::str(
+            Name::num(Name::from_components(["Main"]), 3_247_554_766),
+            "_hygCtx"
+        )
+    );
+    assert_eq!(
+        dup_b,
+        &Name::str(
+            Name::num(Name::from_components(["Main"]), 3_247_554_767),
+            "_hygCtx"
+        )
+    );
+
+    // Negative control: if `hygSplice%` failed to stamp `z` hygienically, `nonCapture 7`
+    // would evaluate to `99` instead of `7`. Both Reference and FrankenLean reject that claim.
+    let bad_capture =
+        format!("{main_src}\ntheorem captured_wrong : Eq (nonCapture 7) 99 := Eq.refl 99\n");
+    let oracle_bad = project.oracle(&bad_capture);
+    assert!(!oracle_bad.status.success(), "{oracle_bad:?}");
+    project.source(&bad_capture);
+    ImportedMacroProject::refused(project.lake(&["+Main:olean"], true, &selected));
+}

@@ -922,7 +922,7 @@ impl RegisteredMacros {
         limits: MacroTreeLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> MacroTreeDispatch {
-        self.expand_tree_mode(input, invocation, limits, cancellation, false)
+        self.expand_tree_mode(input, invocation, limits, cancellation, false, false)
     }
 
     /// Source commands contain literal data as well as terms: universe levels,
@@ -936,7 +936,21 @@ impl RegisteredMacros {
         limits: MacroTreeLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> MacroTreeDispatch {
-        self.expand_tree_mode(input, invocation, limits, cancellation, true)
+        self.expand_tree_mode(input, invocation, limits, cancellation, true, false)
+    }
+
+    /// Expand command-root macros iteratively (`Command.lean:507-565`) without
+    /// descending into the resulting declaration's children, so Stage 2
+    /// declaration hygiene (`withInitQuotContext` over declaration names) runs
+    /// before term/body macros inside the declaration expand.
+    pub(crate) fn expand_command_root_with_context(
+        &self,
+        input: &Syntax,
+        invocation: MacroDispatchInvocation<'_>,
+        limits: MacroTreeLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> MacroTreeDispatch {
+        self.expand_tree_mode(input, invocation, limits, cancellation, true, true)
     }
 
     fn expand_tree_mode(
@@ -946,6 +960,7 @@ impl RegisteredMacros {
         limits: MacroTreeLimits,
         cancellation: Option<&dyn CancellationProbe>,
         defer_atomic: bool,
+        root_only: bool,
     ) -> MacroTreeDispatch {
         let MacroDispatchInvocation {
             source,
@@ -968,6 +983,7 @@ impl RegisteredMacros {
             &mut report,
             &mut work,
             defer_atomic,
+            root_only,
         );
         MacroTreeDispatch {
             outcome,
@@ -985,6 +1001,7 @@ impl RegisteredMacros {
         report: &mut MacroDispatch,
         work: &mut ExpansionWork,
         defer_atomic: bool,
+        root_only: bool,
     ) -> Outcome<Result<MacroTreeResult, MacroExecutionError>> {
         let ExpansionContext {
             source,
@@ -1071,6 +1088,10 @@ impl RegisteredMacros {
                             state: successor,
                         })) => {
                             state = successor;
+                            if root_only {
+                                built.push(syntax);
+                                continue;
+                            }
                         }
                         Outcome::Complete(Ok(RegisteredExpansion::Error {
                             module,

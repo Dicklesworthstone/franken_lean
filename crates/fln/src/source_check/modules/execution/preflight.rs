@@ -169,7 +169,7 @@ pub(super) fn check_command(
     meter: &mut Meter,
 ) -> Result<(), SourceModuleCheckError> {
     use crate::source_check::{SourceStep, in_steps};
-    let mut queue = std::collections::VecDeque::from([SourceStep::Command((at, source))]);
+    let mut queue = std::collections::VecDeque::from([SourceStep::Command((at, source), true)]);
     while let Some(step) = queue.pop_front() {
         meter.work(1)?;
         let (at, source) = match step {
@@ -177,7 +177,7 @@ pub(super) fn check_command(
                 grammar.observe(&scope);
                 continue;
             }
-            SourceStep::Command(command) => command,
+            SourceStep::Command(command, _) => command,
         };
         let control = grammar
             .enter(|| fln_parse::command_scope::parse(source))
@@ -207,10 +207,10 @@ pub(super) fn check_command(
                 grammar
                     .enter(|| fln_parse::command_scope::guard_spec::parse(source, body))
                     .map_err(|error| parse_error(module, index, at, error))?;
-                queue.push_front(SourceStep::Command((
-                    fln_parse::BytePos(at.0 + body),
-                    &source[body..],
-                )));
+                queue.push_front(SourceStep::Command(
+                    (fln_parse::BytePos(at.0 + body), &source[body..]),
+                    false,
+                ));
                 continue;
             }
             Some(ScopeCommand::In { head, body }) => {

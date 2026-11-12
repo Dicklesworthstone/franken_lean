@@ -29,9 +29,11 @@ pub struct SourceModuleMacroInputs<'a> {
     pub partition: &'a VerifiedPartition,
     pub user_declarations: &'a BTreeSet<Name>,
     pub registry_limits: MacroRegistryLimits,
-    /// Initial recursion and hygiene coordinates. Each module replaces only
-    /// `quotation_context` with its own name. This bounded source adapter does
-    /// not implement the pin frontend's command-hash hygiene seed.
+    /// Initial recursion and hygiene coordinates. When `current_macro_scope == 0`
+    /// and `state.macro_scope == 0`, each module activates the pin frontend's
+    /// two-stage `withInitQuotContext` hygiene seed (`Command.lean:605-642`,
+    /// `Declaration.lean:172`, `MutualDef.lean:1566`); explicit non-zero caller
+    /// scope coordinates are preserved verbatim for low-level state harnesses.
     pub context: MacroContext,
     /// Independently cloned for each source module, never inherited from its
     /// imports or a previously checked sibling.
@@ -330,6 +332,9 @@ impl ModuleMacroSession {
                 .map(|probe| probe as &dyn CancellationProbe),
         });
         session.set_parsers(parsers);
+        if self.context.current_macro_scope == 0 && self.state.macro_scope == 0 {
+            session.enable_command_hygiene(module.clone());
+        }
         let result = check(&mut session);
         let (finished, report) = session.finish();
         let successful = matches!(&result, Ok(Outcome::Complete(_)))

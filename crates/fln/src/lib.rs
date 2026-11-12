@@ -2942,7 +2942,7 @@ impl Engine {
         // keeps them: they change name resolution and declaration names, never the
         // environment. `open A in c` is the pin's `section open A c end`.
         enum Step<'s> {
-            Command(usize, fln_parse::BytePos, &'s [u8]),
+            Command(usize, fln_parse::BytePos, &'s [u8], bool),
             Scope(usize, fln_parse::command_scope::ScopeCommand),
         }
         let mut file_base = engine.environment.clone();
@@ -2968,7 +2968,7 @@ impl Engine {
         let mut queue: std::collections::VecDeque<Step<'_>> = commands
             .into_iter()
             .enumerate()
-            .map(|(index, (offset, source))| Step::Command(index, offset, source))
+            .map(|(index, (offset, source))| Step::Command(index, offset, source, true))
             .collect();
         let scope_error = |index: usize, at: fln_parse::BytePos, message: String| {
             EngineExecutionError::BatchCommand {
@@ -3002,8 +3002,10 @@ impl Engine {
                     limits.kernel,
                 )?);
             }
-            let (command_index, original_offset, command_source) = match step {
-                Step::Command(index, offset, source) => (index, offset, source),
+            let (command_index, original_offset, command_source, top_level) = match step {
+                Step::Command(index, offset, source, top_level) => {
+                    (index, offset, source, top_level)
+                }
                 Step::Scope(index, transition) => {
                     if let Some(session) = macros.as_deref() {
                         session
@@ -3083,6 +3085,19 @@ impl Engine {
                     error: Box::new(EngineExecutionError::Frontend(error)),
                     at: Some(original_offset),
                 })?;
+            if top_level
+                && !matches!(
+                    control,
+                    Some(fln_parse::command_scope::ScopeCommand::Trivia)
+                )
+                && let Some(session) = macros.as_deref_mut()
+            {
+                match grammar.enter(|| session.observe_top_level_command(command_source)) {
+                    Outcome::Complete(()) => {}
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                }
+            }
             if let Some(control) = control {
                 use fln_parse::command_scope::ScopeCommand;
                 let control = if let Some(session) = macros.as_deref_mut() {
@@ -3152,6 +3167,7 @@ impl Engine {
                                 command_index,
                                 fln_parse::BytePos(original_offset.0 + body),
                                 &command_source[body..],
+                                false,
                             ),
                             Step::Scope(command_index, ScopeCommand::End(None)),
                         ]
@@ -3166,11 +3182,17 @@ impl Engine {
                     ScopeCommand::In { head, body } => {
                         for step in [
                             Step::Scope(command_index, ScopeCommand::Section(None)),
-                            Step::Command(command_index, original_offset, &command_source[..head]),
+                            Step::Command(
+                                command_index,
+                                original_offset,
+                                &command_source[..head],
+                                false,
+                            ),
                             Step::Command(
                                 command_index,
                                 fln_parse::BytePos(original_offset.0 + body),
                                 &command_source[body..],
+                                false,
                             ),
                             Step::Scope(command_index, ScopeCommand::End(None)),
                         ]
@@ -3189,6 +3211,7 @@ impl Engine {
                                 command_index,
                                 fln_parse::BytePos(original_offset.0 + body),
                                 &command_source[body..],
+                                false,
                             ),
                             Step::Scope(command_index, ScopeCommand::End(None)),
                         ]
@@ -3301,6 +3324,7 @@ impl Engine {
                             command_index,
                             fln_parse::BytePos(original_offset.0 + body),
                             &command_source[body..],
+                            false,
                         ));
                     }
                     ScopeCommand::Namespace(_)

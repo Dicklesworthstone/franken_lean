@@ -181,6 +181,30 @@ pub fn declaration_warning_offset(source: &[u8]) -> Option<usize> {
     Some(if named { at(keyword + 1) } else { at(keyword) })
 }
 
+/// The non-trivia command substring used by the pin's `elabCommandTopLevel`
+/// (`Command.lean:636-641`, `stx.getSubstring? (withLeading := false) (withTrailing := false)`
+/// followed by `trimAscii`) to seed `withInitQuotContext`. Call inside the active grammar
+/// (`grammar.enter(...)`) so imported command tokens participate in lexing.
+pub fn command_quot_hint_text(source: &[u8]) -> Result<Option<String>, DefinitionParseError> {
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
+    let (tokens, _) = partition_tokens(&view)?;
+    let (Some(first), Some(last)) = (tokens.first(), tokens.last()) else {
+        return Ok(None);
+    };
+    let slice = view
+        .normalized()
+        .as_str()
+        .get(first.extent.start().0..last.extent.end().0)
+        .unwrap_or_default()
+        .trim_ascii();
+    if slice.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(slice.to_owned()))
+    }
+}
+
 /// [`tokens`] for [`partition`], which goes past a refusal of one token: a symbol the table
 /// does not have (a notation this table lacks, such as a scoped one) or a character literal with
 /// no closing quote (`x#'lt` without the scoped `#'`). The pin's frontend reports such an error on
@@ -1923,5 +1947,27 @@ mod tests {
         ] {
             assert!(partition(bad.as_bytes()).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn command_quot_hint_text_strips_leading_and_trailing_trivia_with_normalized_newlines() {
+        assert_eq!(
+            command_quot_hint_text(b"  -- leading\r\n  /- block -/\r\n").unwrap(),
+            None
+        );
+        assert_eq!(
+            command_quot_hint_text(
+                b"-- head\r\n/- pre -/\r\nopen Sub in\r\nmk_def fromOpenIn  -- tail\r\n"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("open Sub in\nmk_def fromOpenIn")
+        );
+        assert_eq!(
+            command_quot_hint_text(b"/-- doc -/\r\ndef f : Nat := 1 -- comment\n")
+                .unwrap()
+                .as_deref(),
+            Some("/-- doc -/\ndef f : Nat := 1")
+        );
     }
 }

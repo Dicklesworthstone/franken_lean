@@ -201,13 +201,16 @@ impl SourceModuleSession {
         let mut queue: std::collections::VecDeque<_> = commands
             .into_iter()
             .map(|(start, command)| {
-                SourceStep::Command((fln_parse::BytePos(header.body_start.0 + start.0), command))
+                SourceStep::Command(
+                    (fln_parse::BytePos(header.body_start.0 + start.0), command),
+                    true,
+                )
             })
             .collect();
         let mut index = 0;
         while let Some(step) = queue.pop_front() {
             let (start, command) = match step {
-                SourceStep::Command(command) => {
+                SourceStep::Command(command, _) => {
                     budget.commands_left =
                         budget.commands_left.checked_sub(1).ok_or_else(|| {
                             limit("document symbol commands", budget.limits.max_commands)

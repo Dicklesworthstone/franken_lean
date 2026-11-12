@@ -894,14 +894,16 @@ impl Engine {
             // A work list rather than a plain loop: `open A in <command>` expands in place to
             // the pin's `section open A <command> end`, whose scope steps are not commands of
             // their own (they neither count nor run elaboration).
-            let mut queue: std::collections::VecDeque<SourceStep<'_>> =
-                commands.into_iter().map(SourceStep::Command).collect();
+            let mut queue: std::collections::VecDeque<SourceStep<'_>> = commands
+                .into_iter()
+                .map(|command| SourceStep::Command(command, true))
+                .collect();
             while let Some(step) = queue.pop_front() {
                 if let Some(reason) = macros.as_deref().and_then(|session| session.cancelled()) {
                     return Ok(Outcome::Inconclusive(reason));
                 }
-                let (start, command) = match step {
-                    SourceStep::Command(command) => command,
+                let ((start, command), top_level) = match step {
+                    SourceStep::Command(command, top_level) => (command, top_level),
                     SourceStep::Scope(start, transition) => {
                         if let Some(session) = macros.as_deref() {
                             session
@@ -944,10 +946,20 @@ impl Engine {
                 }
                 let control =
                     grammar.enter(|| parse_control_command(command, start, file, count))?;
-                if let Some(control) = control {
-                    if matches!(control, fln_parse::command_scope::ScopeCommand::Trivia) {
-                        continue;
+                if matches!(
+                    control,
+                    Some(fln_parse::command_scope::ScopeCommand::Trivia)
+                ) {
+                    continue;
+                }
+                if top_level && let Some(session) = macros.as_deref_mut() {
+                    match grammar.enter(|| session.observe_top_level_command(command)) {
+                        Outcome::Complete(()) => {}
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     }
+                }
+                if let Some(control) = control {
                     if let Some(session) = macros.as_deref() {
                         session
                             .check_native_control(
@@ -1435,7 +1447,7 @@ pub fn preflight_source_module(
 /// One unit of a source file's command loop: a command's own bytes at its offset, or a scope
 /// transition that an enclosing command implies.
 enum SourceStep<'source> {
-    Command((fln_parse::BytePos, &'source [u8])),
+    Command((fln_parse::BytePos, &'source [u8]), bool),
     Scope(fln_parse::BytePos, fln_parse::command_scope::ScopeCommand),
 }
 
@@ -1452,7 +1464,10 @@ fn in_steps<'source>(
     [
         SourceStep::Scope(start, ScopeCommand::Section(None)),
         SourceStep::Scope(start, scope),
-        SourceStep::Command((fln_parse::BytePos(start.0 + body), &command[body..])),
+        SourceStep::Command(
+            (fln_parse::BytePos(start.0 + body), &command[body..]),
+            false,
+        ),
         SourceStep::Scope(start, ScopeCommand::End(None)),
     ]
 }
@@ -1468,8 +1483,11 @@ fn in_command_steps<'source>(
     use fln_parse::command_scope::ScopeCommand;
     [
         SourceStep::Scope(start, ScopeCommand::Section(None)),
-        SourceStep::Command((start, &command[..head])),
-        SourceStep::Command((fln_parse::BytePos(start.0 + body), &command[body..])),
+        SourceStep::Command((start, &command[..head]), false),
+        SourceStep::Command(
+            (fln_parse::BytePos(start.0 + body), &command[body..]),
+            false,
+        ),
         SourceStep::Scope(start, ScopeCommand::End(None)),
     ]
 }
