@@ -862,30 +862,57 @@ impl ParsedSourceCommand {
         &self.syntax
     }
 
-    /// Replace only the term of a `#check`, `#eval` or `#eval!` after an external macro
-    /// expander has produced native Syntax. The command wrapper, source view,
-    /// query span and identifier-as-written flag remain the parser's originals.
+    fn query_term_index(&self) -> Option<usize> {
+        let Syntax::Node { kind, args, .. } = &self.syntax else {
+            return None;
+        };
+        let index = match self.kind {
+            SourceCommandKind::Check
+                if *kind == Name::from_components(["Lean", "reduceCmd"]) =>
+            {
+                2
+            }
+            SourceCommandKind::Check
+                if *kind == parser_kind(&["Command", "check"])
+                    || *kind == parser_kind(&["Command", "synth"]) =>
+            {
+                1
+            }
+            SourceCommandKind::Evaluation
+                if *kind == parser_kind(&["Command", "eval"])
+                    || *kind == parser_kind(&["Command", "evalBang"])
+                    || *kind == parser_kind(&["Command", "guardCmd"]) =>
+            {
+                1
+            }
+            _ => return None,
+        };
+        (args.len() == index + 1).then_some(index)
+    }
+
+    /// The term of a native query, excluding its keyword and any reduction
+    /// configuration. Commands without an expandable query term return `None`.
+    pub fn query_term_syntax(&self) -> Option<&Syntax> {
+        let index = self.query_term_index()?;
+        let Syntax::Node { args, .. } = &self.syntax else {
+            return None;
+        };
+        Some(&args[index])
+    }
+
+    /// Replace only the term of a `#check`, `#synth`, `#reduce`, `#eval`,
+    /// `#eval!` or `#guard` after an external macro expander has produced native
+    /// Syntax. The command wrapper, reduction configuration, source view, query
+    /// span and identifier-as-written flag remain the parser's originals.
     /// No source text is rendered or reparsed, so hygiene and source coordinates
     /// survive the boundary. Other commands return `None`.
     pub fn with_expanded_query_term(mut self, term: Syntax) -> Option<Self> {
-        let command = match self.kind {
-            SourceCommandKind::Check => "check",
-            SourceCommandKind::Evaluation
-                if self.syntax.kind() == Some(&parser_kind(&["Command", "evalBang"])) =>
-            {
-                "evalBang"
-            }
-            SourceCommandKind::Evaluation => "eval",
-            _ => return None,
+        let index = self.query_term_index()?;
+        let Syntax::Node { args, .. } = &mut self.syntax else {
+            return None;
         };
-        if let Syntax::Node { kind, args, .. } = &mut self.syntax
-            && *kind == parser_kind(&["Command", command])
-            && args.len() == 2
-        {
-            args[1] = term;
-            return Some(self);
-        }
-        None
+        args[index] = term;
+        Some(self)
     }
 
     /// Retain the original source metadata for an externally expanded named
@@ -7349,6 +7376,70 @@ mod nat_definition_tests {
         assert!(matches!(&args[0], Syntax::Atom { val, .. } if val == "#eval!"));
         assert_eq!(expanded.reconstruct_original(), source);
         assert_eq!(args[1], term);
+    }
+
+    #[test]
+    fn native_query_expansion_preserves_wrappers_configuration_and_source_metadata() {
+        let replacement = parse_source_command(b"#eval 42").unwrap();
+        let term = replacement.query_term_syntax().unwrap().clone();
+        for source in [
+            "-- leading trivia\r\n#check Nat\r\n",
+            "-- leading trivia\r\n#synth Inhabited Nat\r\n",
+            "-- leading trivia\r\n#reduce (types := false) (proofs := false) Nat\r\n",
+            "-- leading trivia\r\n#eval Nat.zero\r\n",
+            "-- leading trivia\r\n#eval! Nat.zero\r\n",
+            "-- leading trivia\r\n#guard true\r\n",
+        ] {
+            let parsed = parse_source_command(source.as_bytes()).unwrap();
+            let original = parsed.clone();
+            let Syntax::Node { kind, args, .. } = original.syntax() else {
+                panic!("canonical query node");
+            };
+            assert_eq!(parsed.query_term_syntax(), args.last());
+            let expanded = parsed.with_expanded_query_term(term.clone()).unwrap();
+            let Syntax::Node {
+                kind: expanded_kind,
+                args: expanded_args,
+                ..
+            } = expanded.syntax()
+            else {
+                panic!("canonical expanded query node");
+            };
+            assert_eq!(expanded.kind(), original.kind());
+            assert_eq!(expanded_kind, kind);
+            assert_eq!(expanded_args.len(), args.len());
+            assert_eq!(expanded_args[..args.len() - 1], args[..args.len() - 1]);
+            assert_eq!(expanded.query_term_syntax(), Some(&term));
+            assert_eq!(expanded.reconstruct_original(), source.as_bytes());
+            assert_eq!(expanded.source_view(), original.source_view());
+            assert_eq!(expanded.epilogue(), original.epilogue());
+            assert_eq!(
+                expanded.query_term_normalized(),
+                original.query_term_normalized()
+            );
+            assert_eq!(expanded.query_is_identifier(), original.query_is_identifier());
+        }
+    }
+
+    #[test]
+    fn native_query_expansion_rejects_nonqueries_and_incomplete_wrappers() {
+        let term = parse_source_command(b"#eval 42")
+            .unwrap()
+            .query_term_syntax()
+            .unwrap()
+            .clone();
+        let declaration = parse_source_command(b"def value : Nat := 42").unwrap();
+        assert!(declaration.query_term_syntax().is_none());
+        assert!(declaration.with_expanded_query_term(term.clone()).is_none());
+        for source in ["#check Nat", "#synth Nat", "#reduce Nat", "#guard true"] {
+            let mut parsed = parse_source_command(source.as_bytes()).unwrap();
+            let Syntax::Node { args, .. } = &mut parsed.syntax else {
+                panic!("canonical query node");
+            };
+            args.pop();
+            assert!(parsed.query_term_syntax().is_none());
+            assert!(parsed.with_expanded_query_term(term.clone()).is_none());
+        }
     }
 
     #[test]

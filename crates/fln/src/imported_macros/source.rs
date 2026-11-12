@@ -633,36 +633,27 @@ impl<'a> FileSession<'a> {
             expected,
             SourceCommandKind::Definition | SourceCommandKind::Example
         );
-        let command = match expected {
-            SourceCommandKind::Check => "check",
-            SourceCommandKind::Evaluation
-                if parsed.syntax().kind()
-                    == Some(&Name::from_components([
-                        "Lean", "Parser", "Command", "evalBang",
-                    ])) =>
-            {
-                "evalBang"
-            }
-            SourceCommandKind::Evaluation => "eval",
-            SourceCommandKind::Definition | SourceCommandKind::Example => "declaration",
-        };
         let Syntax::Node { kind, args, .. } = parsed.syntax() else {
             return wrong_command(expected);
         };
-        if *kind != Name::from_components(["Lean", "Parser", "Command", command]) || args.len() != 2
-        {
-            return wrong_command(expected);
-        }
-        if !declaration && registry.declarations(kind).next().is_some() {
-            return Outcome::Complete(Err(SourceMacroError::ScopeControl { kind: kind.clone() }));
-        }
         let input = if declaration {
+            if *kind != Name::from_components(["Lean", "Parser", "Command", "declaration"])
+                || args.len() != 2
+            {
+                return wrong_command(expected);
+            }
             parsed.syntax()
         } else {
-            &args[1]
+            let Some(term) = parsed.query_term_syntax() else {
+                return wrong_command(expected);
+            };
+            if registry.declarations(kind).next().is_some() {
+                return Outcome::Complete(Err(SourceMacroError::ScopeControl { kind: kind.clone() }));
+            }
+            term
         };
         let resolve = crate::source_check::grammar::resolver(engine.environment(), scope);
-        let existing_global = expected == SourceCommandKind::Check
+        let existing_global = *kind == Name::from_components(["Lean", "Parser", "Command", "check"])
             && parsed.query_is_identifier()
             && matches!(input, Syntax::Ident { val, .. }
                 if matches!(resolve(val),

@@ -6,6 +6,10 @@ on:
       - '.github/workflows/native-lake-integrity.yml'
       - 'crates/fln-lake/**'
       - 'crates/fln-cli/**'
+      - 'crates/fln-parse/**'
+      - 'crates/fln/src/imported_macros/**'
+      - 'crates/fln/src/ir.rs'
+      - 'crates/fln/src/source_check/modules/artifacts/ir.rs'
   workflow_dispatch:
 permissions:
   contents: read
@@ -33,11 +37,7 @@ jobs:
           cargo clippy --locked -p fln-lake -p fln-cli --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
 
-  imported-query-candidate:
-    # Stage this exact source candidate while the local execution workspace is
-    # unavailable. No source is published and no branch is changed by this job.
-    if: >-
-      startsWith(github.event.head_commit.message, 'test(toolchain): validate native integration candidates')
+  imported-query-regressions:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     env:
@@ -50,32 +50,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Apply the reviewed immutable query-expansion candidate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 -I - <<'PY'
-          import base64, hashlib, json, os, pathlib, urllib.request
-          rows = [{"path":"crates/fln-parse/src/lib.rs","before":"f2bba958b18271d77ee37a773950dee96c219d7e","after":"093e73bfbb499c00a6397142fa50ee8a7a5a10b6"},{"path":"crates/fln/src/imported_macros/source.rs","before":"a57a6e00f4c8584b6a7c7e1c78e5988fe45b0fb5","after":"db17a385a558b148eed0938d73a11f74adbd568e"},{"path":"crates/fln/src/imported_macros/registrations/tests/source/modules.rs","before":"f609a0a85ed9dac94fe68e25805948f327ab502c","after":"a8804f6078d415ae36602116c0521fbc63658766"}]
-          def blob(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          for row in rows:
-              path = pathlib.Path(row['path'])
-              assert blob(path.read_bytes()) == row['before'], row['path']
-              request = urllib.request.Request(
-                  'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + row['after'],
-                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                           'Accept': 'application/vnd.github+json',
-                           'User-Agent': 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  result = json.load(response)
-              assert result['encoding'] == 'base64'
-              data = base64.b64decode(result['content'])
-              assert blob(data) == row['after'], row['path']
-              path.write_bytes(data)
-              print(row['path'], row['before'], '->', row['after'])
-          PY
-          git diff --check
       - name: Install repository toolchain
         run: |
           set -euo pipefail
@@ -97,8 +71,6 @@ jobs:
         run: cargo clippy --locked -p fln-parse -p fln --all-targets -- -D warnings
 
   opaque-ir-candidate:
-    if: >-
-      startsWith(github.event.head_commit.message, 'test(toolchain): validate native integration candidates')
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     env:
@@ -183,8 +155,6 @@ jobs:
         run: cargo clippy --locked -p fln -p fln-cli --all-targets -- -D warnings
 
   lake-executable-candidate:
-    if: >-
-      startsWith(github.event.head_commit.message, 'test(toolchain): validate native integration candidates')
     runs-on: ubuntu-22.04
     timeout-minutes: 75
     env:
@@ -203,7 +173,7 @@ jobs:
         run: |
           python3 -I - <<'PY'
           import base64, hashlib, json, os, pathlib, urllib.request
-          rows = json.loads(r'''[{"path":"crates/fln-cli/src/source_main.rs","before":"5709723ab08a8ac4b44810d66d9fc773d06c2e4c","after":"263ddf9c52188e81ba10b2a3582c39206887fda7"},{"path":"crates/fln-cli/src/lib.rs","before":"88e9387f4316ff096c28c1f46ddf4ae1e356665e","after":"95b7b4dbb8cc9edf2f297b5f9a15e00bca5ca34a"},{"path":"crates/fln-cli/src/lake_build.rs","before":"f512607146b1751e4e7349eb45f9bc197b44373f","after":"60ab24b90368c449d1a4f7f2a3b1a0a944f6d984"},{"path":"crates/fln-cli/src/lake_build/executable.rs","before":null,"after":"e55cc8e51d3ef598940c209d00e2e8427d4fb5b6"},{"path":"crates/fln-cli/src/source_check.rs","before":"b84ea4b030162bf195f4d55a5c6eefe6adf71ae0","after":"1bae3c571644b978fd3afb0f48282537fa78822a"},{"path":"crates/fln-cli/src/source_check/imports.rs","before":"102099c9c31afee0bd96dbbd533b441a2694c1b6","after":"74192de9c63327465bf69af729711bffb25692c2"},{"path":"crates/fln-cli/src/source_check/imports/execution.rs","before":"d57a3710a50c3fe8fcdf4815a49289891b4a8f2d","after":"75b78699d6cc190ca3cd95530a7fb48f15853bdd"},{"path":"crates/fln-cli/tests/lake_executable.rs","before":null,"after":"e2e0d24f9b0e0bf3e5e879b049e58af8c27b9c95"}]''')
+          rows = json.loads(r'''[{"path":"crates/fln-cli/src/source_main.rs","before":"5709723ab08a8ac4b44810d66d9fc773d06c2e4c","after":"263ddf9c52188e81ba10b2a3582c39206887fda7"},{"path":"crates/fln-cli/src/lib.rs","before":"88e9387f4316ff096c28c1f46ddf4ae1e356665e","after":"95b7b4dbb8cc9edf2f297b5f9a15e00bca5ca34a"},{"path":"crates/fln-cli/src/lake_build.rs","before":"f512607146b1751e4e7349eb45f9bc197b44373f","after":"60ab24b90368c449d1a4f7f2a3b1a0a944f6d984"},{"path":"crates/fln-cli/src/lake_build/executable.rs","before":null,"after":"e55cc8e51d3ef598940c209d00e2e8427d4fb5b6"},{"path":"crates/fln-cli/src/source_check.rs","before":"b84ea4b030162bf195f4d55a5c6eefe6adf71ae0","after":"1bae3c571644b978fd3afb0f48282537fa78822a"},{"path":"crates/fln-cli/src/source_check/imports.rs","before":"102099c9c31afee0bd96dbbd533b441a2694c1b6","after":"74192de9c63327465bf69af729711bffb25692c2"},{"path":"crates/fln-cli/src/source_check/imports/execution.rs","before":"d57a3710a50c3fe8fcdf4815a49289891b4a8f2d","after":"75b78699d6cc190ca3cd95530a7fb48f15853bdd"},{"path":"crates/fln-cli/tests/lake_executable.rs","before":null,"after":"3615e8996cce9bcfd1e1f3fbf8d26f0da4e05f35"}]''')
           def blob(data):
               return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
           for row in rows:
@@ -273,7 +243,8 @@ jobs:
         run: cargo test --locked -p fln-cli --test lake_module_build --test lake_build_session --test cli_personalities_and_verbs --no-fail-fast -- --nocapture --test-threads=1
       - name: Preserve existing installed Lean main execution
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p fln-cli --test source_imported_execution main_run:: --no-fail-fast -- --nocapture --test-threads=1
+        run: |
+          cargo test --locked -p fln-cli --test source_imported_execution main_run:: --no-fail-fast -- --nocapture --test-threads=1
       - name: Check CLI and every test target
         if: ${{ !cancelled() }}
         run: cargo clippy --locked -p fln-cli --all-targets -- -D warnings

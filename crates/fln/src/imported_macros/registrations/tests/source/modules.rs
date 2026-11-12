@@ -468,6 +468,24 @@ fn execute_program(
     limits: MacroTreeLimits,
     cancellation: Option<&dyn CancellationProbe>,
 ) -> crate::source_check::modules::SourceMacroProgramExecution {
+    execute_program_with_presentation(
+        imported,
+        code,
+        files,
+        limits,
+        cancellation,
+        crate::EvaluationPresentation::Raw,
+    )
+}
+
+fn execute_program_with_presentation(
+    imported: &SourceOleanImport,
+    code: &[IrModule],
+    files: &[(&str, &str)],
+    limits: MacroTreeLimits,
+    cancellation: Option<&dyn CancellationProbe>,
+    presentation: crate::EvaluationPresentation,
+) -> crate::source_check::modules::SourceMacroProgramExecution {
     let names: Vec<_> = files.iter().map(|(label, _)| name(label)).collect();
     let inputs: Vec<_> = files
         .iter()
@@ -495,7 +513,7 @@ fn execute_program(
             limits,
         },
         cancellation,
-        crate::EvaluationPresentation::Raw,
+        presentation,
     )
 }
 
@@ -584,6 +602,226 @@ fn imported_macro_programs_execute_expansions_in_exact_module_and_scope_worlds()
     assert!(report.completed_vm_usage.steps > 0);
     assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
     assert!(!imported.engine.environment().contains(&name("fromA")));
+}
+
+#[test]
+fn imported_macro_queries_expand_reduction_and_instance_terms() {
+    let (imported, code) = batches::artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    let source = "prelude\nimport SourceLibrary\n\
+        class QueryClass where\n  value : Nat\n\
+        instance queryInstance : QueryClass := QueryClass.mk 42\n\
+        def available : Nat := 19\n\
+        #reduce (types := false) (proofs := false) 7 + 11\n\
+        open scoped SourceScoped in\n#reduce 7 + 11\n\
+        #reduce unavailable / 0\n\
+        #synth Missing + QueryClass\n";
+    let report = execute_program(
+        &imported,
+        &code,
+        &[("Main", source)],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let program = executed(&report);
+    let commands = &program.modules.last().unwrap().commands;
+    assert_eq!(commands.checks.len(), 4);
+    assert!(commands.batch.source_evaluation_indices.is_empty());
+    for (checked, expected) in commands.checks[..2].iter().zip([11, 7]) {
+        let crate::Declaration::Defn(declaration) = &checked.declaration else {
+            panic!("a reduction query checks a scratch definition");
+        };
+        assert_eq!(
+            declaration.value,
+            Expr::lit(Literal::Nat(NatLit::from_u64(expected)))
+        );
+        assert_eq!(
+            checked.parsed.syntax().kind(),
+            Some(&name("Lean.reduceCmd"))
+        );
+        assert_eq!(checked.parsed.query_term_normalized(), Some("7 + 11"));
+    }
+    let fln_syntax::tree::Syntax::Node { args, .. } = commands.checks[0].parsed.syntax() else {
+        panic!("canonical reduction command");
+    };
+    assert_eq!(args.len(), 3);
+    assert_eq!(args[1].kind(), Some(&name("Lean.reduceConfig")));
+    let crate::Declaration::Defn(hygienic) = &commands.checks[2].declaration else {
+        panic!("a reduction query checks a scratch definition");
+    };
+    assert_eq!(
+        hygienic.value,
+        Expr::lit(Literal::Nat(NatLit::from_u64(19)))
+    );
+    assert!(matches!(
+        commands.checks[2].parsed.query_term_syntax(),
+        Some(fln_syntax::tree::Syntax::Ident { val, preresolved, .. })
+            if val == &name("unavailable") && !preresolved.is_empty()
+    ));
+    assert_eq!(
+        commands.checks[2].parsed.query_term_normalized(),
+        Some("unavailable / 0")
+    );
+    let instance = &commands.checks[3];
+    let crate::Declaration::Defn(synthesized) = &instance.declaration else {
+        panic!("instance synthesis checks a scratch definition");
+    };
+    assert_eq!(instance.checked_type, Expr::const_(name("QueryClass"), vec![]));
+    assert_eq!(
+        synthesized.value,
+        Expr::const_(name("queryInstance"), vec![])
+    );
+    assert_eq!(
+        instance.parsed.syntax().kind(),
+        Some(&name("Lean.Parser.Command.synth"))
+    );
+    assert_eq!(
+        instance.parsed.query_term_normalized(),
+        Some("Missing + QueryClass")
+    );
+    let final_root = commands.batch.engine.logical_root(&KVMap::new());
+    assert!(
+        commands
+            .checks
+            .iter()
+            .all(|checked| checked.environment_root == final_root)
+    );
+    assert!(report.completed_vm_usage.steps > 0);
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    assert!(!imported.engine.environment().contains(&name("QueryClass")));
+}
+
+#[test]
+fn imported_macro_queries_preserve_guard_presentation_and_scoped_boolean_results() {
+    // The prelude-only library lacks Init.Guard. Admit its syntax-availability
+    // declaration through the same checked artifact path as the macro owners.
+    let guard = ConstantInfo::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: name("Lean.Parser.Command.guardCmd"),
+            level_params: vec![],
+            type_: Expr::const_(name("Nat"), vec![]),
+        },
+        value: Expr::lit(Literal::Nat(NatLit::from_u64(0))),
+        hints: ReducibilityHints::Abbrev,
+        safety: DefinitionSafety::Safe,
+        all: vec![name("Lean.Parser.Command.guardCmd")],
+    });
+    let (imported, code) =
+        batches::artifact_import_fixture_with_parser_metadata(&[], &[guard], &[], &[]);
+    let before = imported.engine.logical_root(&KVMap::new());
+    let source = "prelude\nimport SourceLibrary\n\
+        #guard false + true\n\
+        open scoped SourceScoped in\n#guard false + true\n\
+        #guard false + true\n";
+    let report = execute_program_with_presentation(
+        &imported,
+        &code,
+        &[("Main", source)],
+        MacroTreeLimits::default(),
+        None,
+        crate::EvaluationPresentation::Lean,
+    );
+    let program = executed(&report);
+    assert_eq!(
+        program_values(program, "Main"),
+        vec![
+            crate::ClosedVmValue::Scalar(1),
+            crate::ClosedVmValue::Scalar(0),
+            crate::ClosedVmValue::Scalar(1),
+        ]
+    );
+    let commands = &program.modules.last().unwrap().commands;
+    for &index in &commands.batch.source_evaluation_indices {
+        // The CLI uses this marker to require true and keep guards silent.
+        // A false guard must not become an ordinary successful #eval result.
+        assert_eq!(
+            commands.batch.executions[index].evaluation_presentation(),
+            Some(crate::EvaluationResultPresentation::Guard)
+        );
+    }
+    let rejected = execute_program_with_presentation(
+        &imported,
+        &code,
+        &[("Main", "prelude\nimport SourceLibrary\n#guard 7 + 11")],
+        MacroTreeLimits::default(),
+        None,
+        crate::EvaluationPresentation::Lean,
+    );
+    assert!(
+        matches!(rejected.outcome, Outcome::Complete(Err(_))),
+        "{rejected:?}"
+    );
+    assert!(!rejected.attempts.is_empty());
+    assert!(rejected.states.is_none());
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn imported_macro_queries_do_not_bypass_atomic_macros_for_existing_globals() {
+    let (imported, code) = batches::artifact_import_fixture_with_extra_rows(&[(
+        "ident",
+        "SourceLibrary.diagnostic",
+        None,
+    )]);
+    let checked = execute_program(
+        &imported,
+        &code,
+        &[("Main", "prelude\nimport SourceLibrary\n#check Nat")],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert_eq!(
+        executed(&checked).modules.last().unwrap().commands.checks.len(),
+        1
+    );
+    assert!(checked.attempts.is_empty());
+    for command in ["#reduce Nat", "#synth Nat"] {
+        let source = format!("prelude\nimport SourceLibrary\n{command}");
+        let rejected = execute_program(
+            &imported,
+            &code,
+            &[("Main", &source)],
+            MacroTreeLimits::default(),
+            None,
+        );
+        assert!(
+            matches!(rejected.outcome, Outcome::Complete(Err(_))),
+            "{command}: {rejected:?}"
+        );
+        assert!(rejected.states.is_none());
+        assert!(
+            rejected
+                .attempts
+                .iter()
+                .any(|attempt| attempt.declaration == name("SourceLibrary.diagnostic")),
+            "{command}: {rejected:?}"
+        );
+    }
+}
+
+#[test]
+fn imported_macro_queries_share_limits_and_withhold_partial_states() {
+    let (imported, code) = batches::artifact_import_fixture();
+    let source = "prelude\nimport SourceLibrary\n#reduce 7 + 11\n#reduce 13 + 17";
+    let files = [("Main", source)];
+    let complete = execute_program(&imported, &code, &files, MacroTreeLimits::default(), None);
+    assert_eq!(
+        executed(&complete).modules.last().unwrap().commands.checks.len(),
+        2
+    );
+    assert_eq!(complete.attempts.len(), 4);
+    let mut limits = MacroTreeLimits::default();
+    limits.dispatch.max_attempts = 3;
+    let stopped = execute_program(&imported, &code, &files, limits, None);
+    assert!(
+        matches!(stopped.outcome, Outcome::Inconclusive(_)),
+        "{stopped:?}"
+    );
+    assert_eq!(stopped.attempts.len(), 3);
+    assert!(stopped.states.is_none());
+    let recovered = execute_program(&imported, &code, &files, MacroTreeLimits::default(), None);
+    assert_eq!(recovered.states, complete.states);
+    assert_eq!(recovered.completed_vm_usage, complete.completed_vm_usage);
 }
 
 #[test]
@@ -1011,6 +1249,9 @@ fn mixed_macro_programs_preserve_control_dispatch_and_accept_source_templates() 
         ),
         ("num", "set_option maxRecDepth 1024 in\n#eval 7 + 11"),
         ("Lean.Parser.Command.check", "#check 7 + 11"),
+        ("Lean.Parser.Command.synth", "#synth Nat + Bool"),
+        ("Lean.reduceCmd", "#reduce (types := false) 7 + 11"),
+        ("Lean.Parser.Command.guardCmd", "#guard false + true"),
     ] {
         let (imported, code) = batches::artifact_import_fixture_with_extra_rows(&[(
             kind,
