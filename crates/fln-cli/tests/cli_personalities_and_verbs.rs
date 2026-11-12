@@ -692,11 +692,34 @@ fn lake_refuses_every_option_the_pin_does_not_define() {
 }
 
 /// A command the pin has and this build does not is the typed not-implemented
-/// exit. It used to exit 1 with "requires Lake workspace configuration", which
-/// reads as the user's mistake.
+/// exit. It used to exit 1 with "requires Lake workspace configuration", and
+/// eleven commands advertised in `LAKE_USAGE` plus six other pinned top-level
+/// Lake commands exited 1 with "error: unknown command".
 #[test]
 fn lake_commands_without_an_implementation_say_so() {
-    for command in ["test", "query", "lint", "lean"] {
+    for command in [
+        "test",
+        "query",
+        "lint",
+        "lean",
+        "cache",
+        "check-lint",
+        "check-test",
+        "pack",
+        "query-kind",
+        "reservoir-config",
+        "resolve-deps",
+        "run",
+        "script",
+        "scripts",
+        "self-check",
+        "setup-file",
+        "shake",
+        "translate-config",
+        "unpack",
+        "upload",
+        "version-tags",
+    ] {
         let output = Command::new(env!("CARGO_BIN_EXE_lake"))
             .arg(command)
             .output()
@@ -712,6 +735,41 @@ fn lake_commands_without_an_implementation_say_so() {
             "{command}: {stderr}"
         );
     }
+
+    // `upgrade` is the pin's alias for `update` (`Lake/CLI/Main.lean:1264`),
+    // never an unknown command, and names `lake upgrade` when dependency
+    // fetching is unavailable.
+    let temp = TempDir::new("lake-upgrade-alias");
+    std::fs::write(
+        temp.0.join("lakefile.toml"),
+        "name = \"probe\"\n\n[[require]]\nname = \"dep\"\ngit = \"https://example.invalid/dep\"\n",
+    )
+    .unwrap();
+    let upgrade = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args(["--dir"])
+        .arg(&temp.0)
+        .arg("upgrade")
+        .output()
+        .expect("run lake upgrade");
+    let upgrade_stderr = String::from_utf8(upgrade.stderr).expect("utf8 stderr");
+    assert_eq!(upgrade.status.code(), Some(5), "{upgrade_stderr}");
+    assert!(
+        upgrade_stderr.starts_with("lake upgrade: not implemented:"),
+        "{upgrade_stderr}"
+    );
+
+    // Negative control: a spelling absent from the pinned Lake census stays an
+    // unknown command at exit 1 rather than being swept into exit 5.
+    let unknown = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .arg("definitely-not-a-lake-command")
+        .output()
+        .expect("run lake unknown");
+    let unknown_stderr = String::from_utf8(unknown.stderr).expect("utf8 stderr");
+    assert_eq!(unknown.status.code(), Some(1), "{unknown_stderr}");
+    assert_eq!(
+        unknown_stderr,
+        "error: unknown command 'definitely-not-a-lake-command'\n"
+    );
 }
 
 /// `fln why-trusts` stops at `--max-nodes`. A stopped walk has not seen the

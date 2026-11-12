@@ -38,6 +38,7 @@ const EXPECTED_PROBES: &[&str] = &[
     "lean:print-prefix",
     "lean:print-libdir",
     "lean:unknown-option",
+    "lean:unknown-option-alt",
     "lean:malformed-timeout",
     "lean:stdin-success",
     "lean:json-error",
@@ -49,12 +50,14 @@ const EXPECTED_PROBES: &[&str] = &[
     "lake:version",
     "lake:unknown-command",
     "lake:unknown-option",
+    "lake:unknown-option-alt",
     "lake:missing-dir-value",
     "lake:missing-root",
     "lake:json-help",
     "leanc:help",
     "leanc:version",
     "leanc:unknown-option",
+    "leanc:unknown-option-alt",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]

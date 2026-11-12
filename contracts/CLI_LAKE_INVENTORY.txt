@@ -4,7 +4,7 @@ hash fnv1a64 framing=u64le-length-prefixed
 policy-join exact-surface-bijection
 platform linux-x86_64
 surface-count 291
-transcript-count 25
+transcript-count 28
 source-count 20
 command-count 46
 config-default-count 11
@@ -21,11 +21,11 @@ resource-outcome typed-inconclusive
 raw-begin
 reference repo=leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 tree=15bccb750e9d73cd2a40f488bec389504a87896c
 source path=SUITE.lock hash=fnv1a64:e840e057e4aa69ce
-source path=contracts/CLI_LAKE_TRANSCRIPTS.txt hash=fnv1a64:cc1b4ef17f5f5d8c
-source path=crates/fln-conformance/src/cli_lake_census.rs hash=fnv1a64:267aa9cece6ee516
-source path=crates/fln-conformance/tests/cli_lake_census.rs hash=fnv1a64:2a20af3e51910201
-source path=crates/fln-conformance/tests/cli_lake_census_no_mock_e2e.rs hash=fnv1a64:1caee33b380c8f9f
-source path=scripts/extract/gen_cli_lake_census.py hash=fnv1a64:745e8a4db99c062f
+source path=contracts/CLI_LAKE_TRANSCRIPTS.txt hash=fnv1a64:72fc67f09a5f2e9c
+source path=crates/fln-conformance/src/cli_lake_census.rs hash=fnv1a64:5e7fdc16dd0005fc
+source path=crates/fln-conformance/tests/cli_lake_census.rs hash=fnv1a64:0cbfdf562d341636
+source path=crates/fln-conformance/tests/cli_lake_census_no_mock_e2e.rs hash=fnv1a64:867ec093756edf07
+source path=scripts/extract/gen_cli_lake_census.py hash=fnv1a64:7a7bf8e15268c32e
 source path=tribunal/epochs/v4.32.0/MANIFEST.txt hash=fnv1a64:07535ed88e8ee924
 source path=vendor/lean4-src/src/Lean/Shell.lean hash=fnv1a64:d68e36ae146d83d6
 source path=vendor/lean4-src/src/bin/leanc.in hash=fnv1a64:55853375785b2e4d
@@ -339,6 +339,7 @@ transcript key=lean:features personality=lean argv=--features stdin=none exit=0 
 transcript key=lean:print-prefix personality=lean argv=--print-prefix stdin=none exit=0 stdout=fnv1a64:3a6bc51a826b4fe6 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=12 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
 transcript key=lean:print-libdir personality=lean argv=--print-libdir stdin=none exit=0 stdout=fnv1a64:2600cabf472239c9 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=21 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
 transcript key=lean:unknown-option personality=lean argv=--fln-census-unknown stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:c9aa4d51397dbd0c stdout-bytes=0 stderr-bytes=3087 channel=stderr normalizer=paths-crlf-ansi-v1
+transcript key=lean:unknown-option-alt personality=lean argv=--fln-other-unknown-option stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:e452449a3dec9aa5 stdout-bytes=0 stderr-bytes=3093 channel=stderr normalizer=paths-crlf-ansi-v1
 transcript key=lean:malformed-timeout personality=lean argv=--timeout%3Dnot-a-number stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:3fe67dc693fdccc0 stdout-bytes=0 stderr-bytes=49 channel=stderr normalizer=paths-crlf-ansi-v1
 transcript key=lean:stdin-success personality=lean argv=--stdin stdin=fnv1a64:20e69cf785adc705 exit=0 stdout=fnv1a64:cffade031a48fc6c stderr=fnv1a64:cbf29ce484222325 stdout-bytes=11 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
 transcript key=lean:json-error personality=lean argv=--json%1F--stdin stdin=fnv1a64:be31e3b8471a7832 exit=1 stdout=fnv1a64:0386c33020347a32 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=249 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
@@ -350,14 +351,16 @@ transcript key=lake:help-env personality=lake argv=help%1Fenv stdin=none exit=0 
 transcript key=lake:version personality=lake argv=--version stdin=none exit=0 stdout=fnv1a64:6020b3f4664e231d stderr=fnv1a64:cbf29ce484222325 stdout-bytes=53 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
 transcript key=lake:unknown-command personality=lake argv=fln-census-unknown stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:bfd9b9f64279927d stdout-bytes=0 stderr-bytes=44 channel=stderr normalizer=paths-crlf-ansi-v1
 transcript key=lake:unknown-option personality=lake argv=--fln-census-unknown%1Fhelp stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:29c39a3bf54c2791 stdout-bytes=0 stderr-bytes=50 channel=stderr normalizer=paths-crlf-ansi-v1
+transcript key=lake:unknown-option-alt personality=lake argv=--fln-other-unknown-option%1Fhelp stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:8d5dc64a62cf669c stdout-bytes=0 stderr-bytes=56 channel=stderr normalizer=paths-crlf-ansi-v1
 transcript key=lake:missing-dir-value personality=lake argv=--dir stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:516858335aeccc48 stdout-bytes=0 stderr-bytes=30 channel=stderr normalizer=paths-crlf-ansi-v1
 transcript key=lake:missing-root personality=lake argv=--dir%1F/fln-cli-census/absent%1Fbuild stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:4ea31563d5e9857e stdout-bytes=0 stderr-bytes=61 channel=stderr normalizer=paths-crlf-ansi-v1
 transcript key=lake:json-help personality=lake argv=--json%1Fhelp%1Fquery stdin=none exit=0 stdout=fnv1a64:0cac46a28894ba99 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=512 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
 transcript key=leanc:help personality=leanc argv=--help stdin=none exit=0 stdout=fnv1a64:062f7574691c742b stderr=fnv1a64:cbf29ce484222325 stdout-bytes=131382 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
 transcript key=leanc:version personality=leanc argv=--version stdin=none exit=0 stdout=fnv1a64:5752864827c78f0f stderr=fnv1a64:cbf29ce484222325 stdout-bytes=184 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
 transcript key=leanc:unknown-option personality=leanc argv=--fln-census-unknown stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:c2ea5af023beaf6c stdout-bytes=0 stderr-bytes=55 channel=stderr normalizer=paths-crlf-ansi-v1
+transcript key=leanc:unknown-option-alt personality=leanc argv=--fln-other-unknown-option stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:07cabaf1bdfe4d49 stdout-bytes=0 stderr-bytes=61 channel=stderr normalizer=paths-crlf-ansi-v1
 raw-end
-raw-root fnv1a64:1b23dda17b23b1e0
+raw-root fnv1a64:d0c8187412d5f18d
 policy-root fnv1a64:1c626200d46049e6
-transcript-root fnv1a64:a687b3f8f8ae3bdf
-inventory-root fnv1a64:c6bdf3c71491d0ab
+transcript-root fnv1a64:eb8d0df09ac7f78b
+inventory-root fnv1a64:7d32f24ee23a758d

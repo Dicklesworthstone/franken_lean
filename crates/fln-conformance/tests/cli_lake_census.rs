@@ -130,7 +130,7 @@ fn cli_surface_inventory() {
             .and_then(|surface| surface.attribute("value")),
         Some("lake-manifest.json")
     );
-    assert_eq!(inventory.transcripts.len(), 25);
+    assert_eq!(inventory.transcripts.len(), 28);
     assert_eq!(inventory.platform, "linux-x86_64");
     assert_eq!(
         inventory
@@ -193,7 +193,7 @@ fn cli_surface_inventory() {
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    let missing_probe = missing_probe.replace("transcript-count 25", "transcript-count 24");
+    let missing_probe = missing_probe.replace("transcript-count 28", "transcript-count 27");
     let missing_probe = reseal(&missing_probe, EMBEDDED_POLICY);
     assert!(
         CliLakeInventory::parse(&missing_probe, EMBEDDED_POLICY)
@@ -293,13 +293,16 @@ fn exit_channel_matrix() {
 
     for key in [
         "lean:unknown-option",
+        "lean:unknown-option-alt",
         "lean:malformed-timeout",
         "lean:json-error",
         "lake:unknown-command",
         "lake:unknown-option",
+        "lake:unknown-option-alt",
         "lake:missing-dir-value",
         "lake:missing-root",
         "leanc:unknown-option",
+        "leanc:unknown-option-alt",
     ] {
         let row = inventory
             .transcript(key)
@@ -312,6 +315,18 @@ fn exit_channel_matrix() {
             ),
             "{key} lost its diagnostic channel: {}",
             row.channel
+        );
+    }
+    for (first, second) in [
+        ("lean:unknown-option", "lean:unknown-option-alt"),
+        ("lake:unknown-option", "lake:unknown-option-alt"),
+        ("leanc:unknown-option", "leanc:unknown-option-alt"),
+    ] {
+        let left = inventory.transcript(first).expect(first);
+        let right = inventory.transcript(second).expect(second);
+        assert_ne!(
+            left.stderr_hash, right.stderr_hash,
+            "{first} and {second} must record distinct diagnostic transcripts"
         );
     }
     for key in [

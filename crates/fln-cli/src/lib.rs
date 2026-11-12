@@ -406,11 +406,12 @@ const USAGE: &str = concat!(
     "not admit declarations or prove how the artifact was compiled.\n",
     "\n",
     "`serve-lsp` starts a Language Server Protocol session over stdin/stdout.\n",
-    "The server handles the LSP lifecycle (initialize/shutdown/exit) and routes\n",
-    "textDocument/didOpen notifications through the bounded source runner,\n",
-    "projecting diagnostics via fln-server. This is a synchronous, single-file\n",
-    "server suitable for editor integration testing; it is not yet the full\n",
-    "asupersync-backed parallel elaboration server from the plan.\n",
+    "The server handles the LSP lifecycle (initialize/shutdown/exit), document\n",
+    "sync (didOpen/didChange/didSave/didClose), local and .olean import worlds,\n",
+    "hover/completion/definition/documentSymbol, $/lean/plainGoal, and bounded\n",
+    "$/lean/rpc session procedures via fln-server. This is a synchronous,\n",
+    "single-client stdio server; it is not yet the multi-client Lantern daemon\n",
+    "with a cross-process shared import heap from the plan.\n",
 );
 
 const LEAN_USAGE: &str = concat!(
@@ -484,9 +485,10 @@ const LEAN_USAGE: &str = concat!(
     "refused instead of reporting a false toolchain root.\n",
     "--server starts the LSP server over stdin/stdout, matching the Reference's\n",
     "`lean --server` entry point used by editor extensions. The server handles\n",
-    "the LSP lifecycle and textDocument/didOpen, running opened documents through\n",
-    "the bounded source pipeline and projecting diagnostics. This is the same\n",
-    "transport as `fln serve-lsp`.\n",
+    "the LSP lifecycle, incremental document sync, local and .olean import\n",
+    "worlds, diagnostics, navigation, plain goals, and bounded $/lean/rpc\n",
+    "procedures. This is the same synchronous single-client server as\n",
+    "`fln serve-lsp`.\n",
     "An import that is not a local source is loaded as a compiled module from\n",
     "LEAN_PATH, else from the pinned toolchain under ELAN_HOME or ~/.elan. Its\n",
     "closure is checked by the kernel before the file runs, or reused from a\n",
@@ -10216,7 +10218,7 @@ struct DoctorCheck {
 const DOCTOR_NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("native Mirror facade implementations", "franken_lean-epx"),
     (
-        "Lantern daemon with shared import heap and RPC sessions",
+        "Lantern multi-client daemon with cross-process shared import heap",
         "franken_lean-v2p",
     ),
     ("Ledger content-addressed build store", "franken_lean-xy6"),
@@ -14569,6 +14571,23 @@ fn lake_pinned_options() -> &'static BTreeMap<&'static str, bool> {
     })
 }
 
+/// Every top-level command spelling the pinned `lake` defines (`build`,
+/// `check-test`, `upgrade`, …), read directly from the mechanical census so
+/// unimplemented pinned commands never masquerade as unknown commands.
+fn lake_pinned_top_commands() -> &'static BTreeSet<&'static str> {
+    static COMMANDS: std::sync::OnceLock<BTreeSet<&'static str>> = std::sync::OnceLock::new();
+    COMMANDS.get_or_init(|| {
+        CLI_LAKE_CENSUS
+            .lines()
+            .filter(|line| line.starts_with("surface key=command:lake:"))
+            .filter_map(|line| {
+                let field = |name: &str| line.split(' ').find_map(|field| field.strip_prefix(name));
+                (field("namespace=")? == "top").then_some(field("spelling=")?)
+            })
+            .collect()
+    })
+}
+
 /// The pinned spelling an argument uses: a long option's name up to any `=`,
 /// or a short option's first flag letter. The flag says whether a value is
 /// already attached (`--dir=x`, `-Kk=v`).
@@ -15431,7 +15450,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 }
             }
         }
-        "update" => {
+        "update" | "upgrade" => {
             let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
             match fln_lake::update_manifest(&target_dir) {
                 Ok(manifest) => {
@@ -15449,7 +15468,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 // so nothing is written and the answer is "not implemented",
                 // never a manifest that claims a resolution.
                 Err(err @ fln_lake::LakeUpdateError::DependencyResolutionUnavailable { .. }) => {
-                    lake_not_implemented("update", &err.to_string(), is_json)
+                    lake_not_implemented(&cmd, &err.to_string(), is_json)
                 }
                 Err(err) => {
                     if is_json {
@@ -15641,6 +15660,11 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
         "query" | "test" | "lint" | "lean" => lake_not_implemented(
             &cmd,
             "this command needs Lake workspace evaluation (plan §13.3), which this build does not have",
+            is_json,
+        ),
+        other if lake_pinned_top_commands().contains(other) => lake_not_implemented(
+            other,
+            "this pinned Lake command is not implemented in this build (plan §13.3)",
             is_json,
         ),
         unknown => MultiplexerOutput::failure(format!("error: unknown command '{unknown}'\n"), 1),

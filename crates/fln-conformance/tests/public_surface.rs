@@ -110,7 +110,7 @@ fn public_surface_schema_join() {
         PublicSurfaceContract::load_embedded().expect("the canonical joined contract is valid");
     assert_eq!(contract.domains.len(), 3);
     assert_eq!(contract.surfaces.len(), 1_010);
-    assert_eq!(contract.fixtures.len(), 40);
+    assert_eq!(contract.fixtures.len(), 43);
     assert_eq!(
         contract
             .domains
@@ -125,7 +125,7 @@ fn public_surface_schema_join() {
             .iter()
             .filter(|fixture| fixture.domain == "cli-lake")
             .count(),
-        25
+        28
     );
     assert_eq!(
         contract

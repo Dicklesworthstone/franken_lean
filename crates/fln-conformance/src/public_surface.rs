@@ -250,7 +250,7 @@ impl PublicSurfaceContract {
                 fixtures.len()
             )));
         }
-        if expected_domains != 3 || expected_surfaces != 1_010 || expected_fixtures != 40 {
+        if expected_domains != 3 || expected_surfaces != 1_010 || expected_fixtures != 43 {
             return Err(ContractError::new(
                 "PublicSurface anti-vacuity population changed without a schema revision",
             ));

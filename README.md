@@ -54,11 +54,11 @@ lake build                   # defaults unavailable; +Module:olean checks module
 code .                       # vscode-lean4 connects to the daemon and cannot tell
 
 # The Independent Judge: re-check every mathlib olean on a foreign-blooded kernel
-fln check-olean ~/.elan/toolchains/*/lib/lean4/library --all --receipts
+fln check-olean --receipts receipts.jsonl ~/.elan/toolchains/leanprover--lean4---v4.32.0/lib/lean
 #   → minutes, with proof certificates and a transparency-logged receipt set
 
 # What does this theorem actually trust?
-fln why-trusts Mathlib.Analysis.SpecialFunctions.Log.Basic.log_pos
+fln why-trusts Mathlib.Analysis.SpecialFunctions.Log.Basic.log_pos .lake/build/lib/lean
 #   → axioms: propext, Classical.choice · native_decide: none · plugins: none
 
 # Why did that rebuild?
@@ -68,7 +68,7 @@ fln build explain Mathlib/Order/Basic.lean
 # The proof panel where your agents actually live (tmux/SSH)
 fln goals MyFile.lean:142
 
-# Semantic, not textual, diff of a change
+# Semantic, not textual, diff of a change (1.0 target; today: fln diff LEFT.olean RIGHT.olean)
 fln diff --level interface HEAD~1
 #   → "proof-only change" is a checkable claim, not a reviewer's guess
 
@@ -187,14 +187,14 @@ lake build && lake test
 lean --server                      # the daemon behind the standard wire dialect
 
 # The Independent Judge
-fln check-olean <path|project> --receipts    # re-check oleans on the foreign kernel
+fln check-olean --receipts receipts.jsonl <dir>    # re-check oleans on the foreign kernel
 fln seal-capsule --output proof.flnpack capsule-modules/  # check and pack a closed module set
 fln verify-capsule --require-semantic --json proof.flnpack # re-check its declarations offline
 
 # Trust & provenance
 fln audit --tcb                    # axioms, native_decide sites, plugins, façade classes
-fln why-trusts Mathlib.Data.Real.Basic.add_comm
-fln diff --level proof HEAD~1      # source/syntax/interface/proof/reduction/extension levels
+fln why-trusts Mathlib.Data.Real.Basic.add_comm .lake/build/lib/lean
+fln diff --level proof HEAD~1      # 1.0 target (today: fln diff A.olean B.olean)
 
 # Build forensics
 fln build explain Mathlib/Order/Basic.lean
@@ -206,9 +206,9 @@ fln cache get                      # community-cache muscle memory, native CAS u
 fln olean diff A.olean B.olean     # human-readable module diffs (un-opaqued at last)
 
 # Interactive & agent surfaces
-fln goals MyFile.lean:142          # terminal InfoView over the same RPC the editor uses
+fln goals MyFile.lean:142          # terminal goal inspection (1.0 target: over daemon RPC)
 fln serve-mcp                      # Envoy: snapshots, tactics, search, eval — budgeted
-fln identity --json                # implementation commit, epoch, profile, TCB hash
+fln identity --json                # version, productRoot, modes, reference/corpus pins, rustChannel
 ```
 
 > **Live today (bounded):** `fln check-olean [--receipts]`, `fln check-source`, `fln run`, `fln flbc run`, `fln olean inspect|diff|verify-rebuild`, `fln ilean inspect`, `fln ir inspect`, `fln audit --tcb`, `fln why-trusts`, `fln identity`, `fln goals`, `fln seal-capsule`, `fln verify-capsule`, `fln doctor` and `fln diff` (an alias of `fln olean diff LEFT RIGHT`; it has no `--level`) are implemented; see IMPLEMENTATION_STATUS for each command's evidence, exact scope and refusals. The `leanc` personality hands its arguments unchanged to the host C compiler (`LEAN_CC`, else `cc`); `--print-cflags` and `--print-ldflags` print the pin's flags, and those link flags name the Reference's runtime libraries (`-lleancpp -lLean -lInit -lleanrt -lgmp`), which FrankenLean does not build. Ordinary headerless files and standard input now use their implicit `Init` import, and each `prelude` source module suppresses its own implicit edge. The earlier bounded-seed probe accepted 15 of the 29 programs the pinned Reference accepted, all 15 with identical output, and none of the 8 it rejected (`cargo test -p fln-cli --release --test ordinary_lean_probe -- --nocapture`, 2026-10-07); that historical result is not a measurement of the new import route. Compiled imports, whether implicit or explicit, are read from `LEAN_PATH`, else from the pinned toolchain under `ELAN_HOME` or `~/.elan`, decoded and checked by both checkers. Ordinary import admission does not execute them; the explicit imported-macro checking mode below additionally runs selected user macros on the native VM. The first admission of a large closure is expensive, with cost depending on its size and the worker count; a later run reuses a verified record of it. The `lake` personality covers package `init`/`new`/`clean`, TOML discovery, `check-build`, and `lake build +Module:olean` for modules under declared TOML library roots. That module facet checks the local import closure through K1 and the independent checker and emits separate, importable pinned-format `.olean` files under `buildDir/lib/lean`. A module whose source and imported environment are unchanged since a build by the same binary is not elaborated again. Both checkers re-admit it from a per-user record, and it is reported in `modules_cached`; `--import-posture recheck` elaborates every module. By default an external `.olean` import closure admitted before by a build with the same admission authority (a build-time digest of the kernel, checker and decoder crates and the toolchain, so a rebuild that changes only the elaborator keeps it) is rebuilt from its bytes and matched against a per-user admission record instead of being admitted again; `--import-posture recheck` admits it again with both checkers. Default library `leanArts`, executables, executable `lakefile.lean` configuration and unsupported extension exports still refuse; see [the working example and exact boundaries](docs/NATIVE_LAKE.md). `fln seal-capsule` and `fln verify-capsule --require-semantic` now check a complete sealed `.olean` closure through the kernel and independent checker; legacy capsules retain explicitly labeled integrity verification. See the capsule workflow below for the exact boundary. The remaining verbs above are the 1.0 target this README describes, not shipped code: `serve-mcp`, `cache` and `replay` exit with status 5 and a typed "not implemented" notice naming their gate. `fln build explain` compares the snapshot each successful `lake build` writes with the current tree. It reports changed inputs with their old and new content hashes, and Lake's file-cone rebuild decision. The native decision is reported as unavailable, because no Ledger records exist (franken_lean-z8j.1.2).
@@ -565,7 +565,7 @@ lake build
 $EDITOR MyProject/Lemmas.lean && lake build
 
 # 4. Re-check everything independently and keep the receipts
-fln check-olean . --receipts
+fln check-olean --receipts receipts.jsonl .lake/build/lib/lean
 
 # 5. Open the editor (vscode-lean4, unmodified) or the terminal InfoView
 fln goals MyProject/Main.lean:37

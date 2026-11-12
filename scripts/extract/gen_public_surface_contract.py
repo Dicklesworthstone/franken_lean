@@ -807,7 +807,7 @@ def render_all() -> tuple[dict[Path, str], str, dict[str, int]]:
         (row for product in domain_products for row in product[2]),
         key=lambda row: (row["domain"], row["key"]),
     )
-    if len(domains) != 3 or len(surfaces) != 1010 or len(fixtures) != 40:
+    if len(domains) != 3 or len(surfaces) != 1010 or len(fixtures) != 43:
         die(
             "joined population changed: "
             f"domains={len(domains)} surfaces={len(surfaces)} fixtures={len(fixtures)}"

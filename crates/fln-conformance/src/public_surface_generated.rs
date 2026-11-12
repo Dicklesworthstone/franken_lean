@@ -3,12 +3,12 @@
 
 #![allow(clippy::too_many_lines)]
 
-pub const CONTRACT_ROOT: &str = "fnv1a64:772f969926bc26da";
+pub const CONTRACT_ROOT: &str = "fnv1a64:6f0d3d40f0a5a00e";
 pub const REFERENCE_TAG: &str = "v4.32.0";
 pub const REFERENCE_COMMIT: &str = "8c9756b28d64dab099da31a4c09229a9e6a2ef35";
 pub const REFERENCE_TREE: &str = "15bccb750e9d73cd2a40f488bec389504a87896c";
 pub const SURFACE_COUNT: usize = 1010;
-pub const FIXTURE_COUNT: usize = 40;
+pub const FIXTURE_COUNT: usize = 43;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GeneratedDomain {
@@ -28,10 +28,10 @@ pub const DOMAINS: &[GeneratedDomain] = &[
         schema: "fln-cli-lake-inventory/1",
         platform: "linux-x86_64",
         row_count: 291,
-        input_root: "fnv1a64:c6bdf3c71491d0ab",
-        raw_root: "fnv1a64:1b23dda17b23b1e0",
+        input_root: "fnv1a64:7d32f24ee23a758d",
+        raw_root: "fnv1a64:d0c8187412d5f18d",
         policy_root: "fnv1a64:1c626200d46049e6",
-        fixture_root: "fnv1a64:d208ce74673af341",
+        fixture_root: "fnv1a64:cfc992d9b7e3c900",
     },
     GeneratedDomain {
         name: "lsp",
@@ -1084,31 +1084,34 @@ pub struct GeneratedFixture {
 }
 
 pub const FIXTURES: &[GeneratedFixture] = &[
-    GeneratedFixture { domain: "cli-lake", key: "lake:help", fixture_root: "fnv1a64:a1ebbf7a4841d0c1" },
-    GeneratedFixture { domain: "cli-lake", key: "lake:help-build", fixture_root: "fnv1a64:a1a5ef5524711869" },
-    GeneratedFixture { domain: "cli-lake", key: "lake:help-env", fixture_root: "fnv1a64:f38ec5a6e53010ab" },
-    GeneratedFixture { domain: "cli-lake", key: "lake:help-query", fixture_root: "fnv1a64:2df1af829ddf2f0e" },
-    GeneratedFixture { domain: "cli-lake", key: "lake:json-help", fixture_root: "fnv1a64:b9c2cb1633af1d48" },
-    GeneratedFixture { domain: "cli-lake", key: "lake:missing-dir-value", fixture_root: "fnv1a64:bce685dc31cfe111" },
-    GeneratedFixture { domain: "cli-lake", key: "lake:missing-root", fixture_root: "fnv1a64:6b9c13a915605787" },
-    GeneratedFixture { domain: "cli-lake", key: "lake:unknown-command", fixture_root: "fnv1a64:9ca1557c4c856a3a" },
-    GeneratedFixture { domain: "cli-lake", key: "lake:unknown-option", fixture_root: "fnv1a64:1bcfe61d3f6f93ab" },
-    GeneratedFixture { domain: "cli-lake", key: "lake:usage", fixture_root: "fnv1a64:127a90dae254bea1" },
-    GeneratedFixture { domain: "cli-lake", key: "lake:version", fixture_root: "fnv1a64:7b4c2d45bc6238be" },
-    GeneratedFixture { domain: "cli-lake", key: "lean:features", fixture_root: "fnv1a64:f0437ac750cad95e" },
-    GeneratedFixture { domain: "cli-lake", key: "lean:githash", fixture_root: "fnv1a64:ad2d7d6912c6ebc4" },
-    GeneratedFixture { domain: "cli-lake", key: "lean:help", fixture_root: "fnv1a64:0406d2af9e4d2382" },
-    GeneratedFixture { domain: "cli-lake", key: "lean:json-error", fixture_root: "fnv1a64:5f2c338e2861db98" },
-    GeneratedFixture { domain: "cli-lake", key: "lean:malformed-timeout", fixture_root: "fnv1a64:b95e06eb1e97d75e" },
-    GeneratedFixture { domain: "cli-lake", key: "lean:print-libdir", fixture_root: "fnv1a64:8372721be1e54926" },
-    GeneratedFixture { domain: "cli-lake", key: "lean:print-prefix", fixture_root: "fnv1a64:5284fb5671746e68" },
-    GeneratedFixture { domain: "cli-lake", key: "lean:short-version", fixture_root: "fnv1a64:6909824bdcedc506" },
-    GeneratedFixture { domain: "cli-lake", key: "lean:stdin-success", fixture_root: "fnv1a64:e7f73432eb764921" },
-    GeneratedFixture { domain: "cli-lake", key: "lean:unknown-option", fixture_root: "fnv1a64:bfa135200482dd67" },
-    GeneratedFixture { domain: "cli-lake", key: "lean:version", fixture_root: "fnv1a64:c85e0c5e56bee15a" },
-    GeneratedFixture { domain: "cli-lake", key: "leanc:help", fixture_root: "fnv1a64:59c785966a009025" },
-    GeneratedFixture { domain: "cli-lake", key: "leanc:unknown-option", fixture_root: "fnv1a64:26de5dfcbcad0d5a" },
-    GeneratedFixture { domain: "cli-lake", key: "leanc:version", fixture_root: "fnv1a64:85e8752056a8dabc" },
+    GeneratedFixture { domain: "cli-lake", key: "lake:help", fixture_root: "fnv1a64:30d3899d45f5b2d5" },
+    GeneratedFixture { domain: "cli-lake", key: "lake:help-build", fixture_root: "fnv1a64:c3a6ad2622e852bd" },
+    GeneratedFixture { domain: "cli-lake", key: "lake:help-env", fixture_root: "fnv1a64:ac9a1450a4323607" },
+    GeneratedFixture { domain: "cli-lake", key: "lake:help-query", fixture_root: "fnv1a64:f6525698c5527f7e" },
+    GeneratedFixture { domain: "cli-lake", key: "lake:json-help", fixture_root: "fnv1a64:82491abe9844fa50" },
+    GeneratedFixture { domain: "cli-lake", key: "lake:missing-dir-value", fixture_root: "fnv1a64:1fcc0193821e73a5" },
+    GeneratedFixture { domain: "cli-lake", key: "lake:missing-root", fixture_root: "fnv1a64:dab46a1ec9cce15b" },
+    GeneratedFixture { domain: "cli-lake", key: "lake:unknown-command", fixture_root: "fnv1a64:60c4f8fbf32643e2" },
+    GeneratedFixture { domain: "cli-lake", key: "lake:unknown-option", fixture_root: "fnv1a64:d4db34c6fe71b907" },
+    GeneratedFixture { domain: "cli-lake", key: "lake:unknown-option-alt", fixture_root: "fnv1a64:16c40d8120afd9c5" },
+    GeneratedFixture { domain: "cli-lake", key: "lake:usage", fixture_root: "fnv1a64:37fce73bca3ab935" },
+    GeneratedFixture { domain: "cli-lake", key: "lake:version", fixture_root: "fnv1a64:85a4b9726083a76e" },
+    GeneratedFixture { domain: "cli-lake", key: "lean:features", fixture_root: "fnv1a64:fd0259fe8a08490e" },
+    GeneratedFixture { domain: "cli-lake", key: "lean:githash", fixture_root: "fnv1a64:a68b16f11fff3b54" },
+    GeneratedFixture { domain: "cli-lake", key: "lean:help", fixture_root: "fnv1a64:561b5b982f6d286a" },
+    GeneratedFixture { domain: "cli-lake", key: "lean:json-error", fixture_root: "fnv1a64:ecba61c4d4605f20" },
+    GeneratedFixture { domain: "cli-lake", key: "lean:malformed-timeout", fixture_root: "fnv1a64:c61ce62257d5470e" },
+    GeneratedFixture { domain: "cli-lake", key: "lean:print-libdir", fixture_root: "fnv1a64:f606c223348fb8d6" },
+    GeneratedFixture { domain: "cli-lake", key: "lean:print-prefix", fixture_root: "fnv1a64:7a7490e8fb9555f0" },
+    GeneratedFixture { domain: "cli-lake", key: "lean:short-version", fixture_root: "fnv1a64:fbcdfd9658e7e1b6" },
+    GeneratedFixture { domain: "cli-lake", key: "lean:stdin-success", fixture_root: "fnv1a64:0d798a93d35c43b5" },
+    GeneratedFixture { domain: "cli-lake", key: "lean:unknown-option", fixture_root: "fnv1a64:8842470dbb554e3b" },
+    GeneratedFixture { domain: "cli-lake", key: "lean:unknown-option-alt", fixture_root: "fnv1a64:602e65f3d69c79c2" },
+    GeneratedFixture { domain: "cli-lake", key: "lean:version", fixture_root: "fnv1a64:ef856fb383040702" },
+    GeneratedFixture { domain: "cli-lake", key: "leanc:help", fixture_root: "fnv1a64:49fd00622cf0d5d1" },
+    GeneratedFixture { domain: "cli-lake", key: "leanc:unknown-option", fixture_root: "fnv1a64:4e05c151e8f23302" },
+    GeneratedFixture { domain: "cli-lake", key: "leanc:unknown-option-alt", fixture_root: "fnv1a64:2bc16d8c99b31516" },
+    GeneratedFixture { domain: "cli-lake", key: "leanc:version", fixture_root: "fnv1a64:c1d7c8ef5c03b90c" },
     GeneratedFixture { domain: "lsp", key: "cancellation.lean", fixture_root: "fnv1a64:a8ff342465e33df3" },
     GeneratedFixture { domain: "lsp", key: "inlayHints.lean", fixture_root: "fnv1a64:96c6eff5d7d7702d" },
     GeneratedFixture { domain: "lsp", key: "interactiveDiagnostics.lean", fixture_root: "fnv1a64:e1e91bb02a33b79b" },

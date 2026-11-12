@@ -1,19 +1,15 @@
-//! **fln-wasm** — the WASM Judge: K1 + fln-checker + the sealed-capsule
-//! verifier compiled to a single WASM artifact (plan §16.4b).
+//! **fln-wasm** — data types for the planned §16.4b WASM Judge.
 //!
-//! The WASM Judge enables zero-install third-party verification: anyone with
-//! a browser can independently verify FrankenLean proof certificates without
-//! trusting the build machine. The artifact contains:
+//! Target architecture (plan §16.4b, not yet built): K1 + `fln-checker` + the
+//! sealed-capsule verifier compiled to a single `wasm32` artifact exposing a
+//! C-ABI surface (`verify_capsule`, `get_verdict`, `free_verdict`) with no
+//! JavaScript framework, network access, or persistent state.
 //!
-//! - The trusted K1 kernel (§9).
-//! - The independent checker (fln-checker).
-//! - The capsule verifier: opens a sealed `.flnproof` capsule, replays
-//!   declarations against K1, and produces a typed verdict.
-//!
-//! The WASM module exposes a small, stable C-ABI surface (`verify_capsule`,
-//! `get_verdict`, `free_verdict`) that the host page calls via the standard
-//! WebAssembly instantiation path. No JavaScript framework, no network
-//! requests, no persistent state.
+//! Today this crate defines only the `.flnproof` capsule header/record types,
+//! `VerifyError` taxonomy, `VerifyBudget`, and `CapsuleVerdict` data model over
+//! `fln-core`. It does not link `fln-kernel` or `fln-checker`, export WASM
+//! entry points, or produce a `.wasm` binary (native capsule sealing and
+//! offline re-checking live under `fln seal-capsule` / `fln verify-capsule`).
 
 #![forbid(unsafe_code)]
 

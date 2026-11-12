@@ -75,6 +75,12 @@ const PROBES: &[Probe] = &[
         stdin: b"",
     },
     Probe {
+        key: "lean:unknown-option-alt",
+        personality: "lean",
+        argv: &["--fln-other-unknown-option"],
+        stdin: b"",
+    },
+    Probe {
         key: "lean:malformed-timeout",
         personality: "lean",
         argv: &["--timeout=not-a-number"],
@@ -141,6 +147,12 @@ const PROBES: &[Probe] = &[
         stdin: b"",
     },
     Probe {
+        key: "lake:unknown-option-alt",
+        personality: "lake",
+        argv: &["--fln-other-unknown-option", "help"],
+        stdin: b"",
+    },
+    Probe {
         key: "lake:missing-dir-value",
         personality: "lake",
         argv: &["--dir"],
@@ -174,6 +186,12 @@ const PROBES: &[Probe] = &[
         key: "leanc:unknown-option",
         personality: "leanc",
         argv: &["--fln-census-unknown"],
+        stdin: b"",
+    },
+    Probe {
+        key: "leanc:unknown-option-alt",
+        personality: "leanc",
+        argv: &["--fln-other-unknown-option"],
         stdin: b"",
     },
 ];

@@ -140,9 +140,10 @@ const fn round_up_to_power_of_two(n: usize) -> usize {
 pub struct EngineId(&'static str);
 
 impl EngineId {
-    /// The certified small-step engine in this crate — the only engine that
-    /// exists today (`fln-checker` is an independence boundary and a schema,
-    /// not an implementation that decides verdicts).
+    /// The certified small-step engine in this crate — the only kernel engine
+    /// implemented here today (`fln-checker` is a separate independent
+    /// declaration-checker crate outside `fln-kernel`, not a second `fln-kernel`
+    /// engine).
     pub const K1: EngineId = EngineId("fln-kernel/k1");
 
     /// Every checking engine this crate implements. Status surfaces derive what they

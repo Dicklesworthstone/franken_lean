@@ -816,6 +816,7 @@ PROBES = (
     Probe("lean:print-prefix", "lean", ("--print-prefix",)),
     Probe("lean:print-libdir", "lean", ("--print-libdir",)),
     Probe("lean:unknown-option", "lean", ("--fln-census-unknown",)),
+    Probe("lean:unknown-option-alt", "lean", ("--fln-other-unknown-option",)),
     Probe("lean:malformed-timeout", "lean", ("--timeout=not-a-number",)),
     Probe("lean:stdin-success", "lean", ("--stdin",), b"#check Nat\n"),
     Probe(
@@ -832,6 +833,7 @@ PROBES = (
     Probe("lake:version", "lake", ("--version",)),
     Probe("lake:unknown-command", "lake", ("fln-census-unknown",)),
     Probe("lake:unknown-option", "lake", ("--fln-census-unknown", "help")),
+    Probe("lake:unknown-option-alt", "lake", ("--fln-other-unknown-option", "help")),
     Probe("lake:missing-dir-value", "lake", ("--dir",)),
     Probe(
         "lake:missing-root",
@@ -842,6 +844,7 @@ PROBES = (
     Probe("leanc:help", "leanc", ("--help",)),
     Probe("leanc:version", "leanc", ("--version",)),
     Probe("leanc:unknown-option", "leanc", ("--fln-census-unknown",)),
+    Probe("leanc:unknown-option-alt", "leanc", ("--fln-other-unknown-option",)),
 )
 
 
