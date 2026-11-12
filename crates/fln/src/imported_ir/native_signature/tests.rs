@@ -34,6 +34,15 @@ mod primitives_reference;
 #[path = "tests/integers.rs"]
 mod integers;
 
+#[path = "tests/levels_reference.rs"]
+mod levels_reference;
+
+#[path = "tests/expressions_reference.rs"]
+mod expressions_reference;
+
+#[path = "tests/names_reference.rs"]
+mod names_reference;
+
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }

@@ -34,6 +34,7 @@ pub(in crate::imported_ir) struct BoxedNative {
     world_suffix: bool,
     parameters: &'static [IrType],
     result: &'static IrType,
+    exact_borrowed: Option<&'static [bool]>,
 }
 
 impl BoxedNative {
@@ -47,6 +48,7 @@ impl BoxedNative {
                 world_suffix: false,
                 parameters: signature.parameters,
                 result: signature.result,
+                exact_borrowed: signature.exact_borrowed,
             }));
         }
         if let Some(runtime) = state_runtime_arity(row)? {
@@ -68,6 +70,7 @@ impl BoxedNative {
                 erased_suffix: 0,
                 world_suffix: true,
                 parameters,
+                exact_borrowed: None,
                 result: if row.id == "extern:ST.Prim.Ref.set" {
                     &IrType::Tagged
                 } else {
@@ -168,6 +171,7 @@ impl BoxedNative {
             world_suffix: false,
             parameters,
             result,
+            exact_borrowed: None,
         }))
     }
 
@@ -212,8 +216,18 @@ impl BoxedNative {
         if params.len() != self.arity()
             || result != self.result
             || params.iter().enumerate().any(|(index, parameter)| {
+                // Some default census ownership rules deliberately retain
+                // every VM argument. The pin's raw IR telescope separately
+                // records whether its compiler parameter is borrowed. Only
+                // a reviewed per-row prototype may supply that distinction.
                 let borrowed = runtime.contains(&index)
-                    && ownership[index - runtime.start] == extern_row::ArgumentOwnership::Borrowed;
+                    && self.exact_borrowed.map_or_else(
+                        || {
+                            ownership[index - runtime.start]
+                                == extern_row::ArgumentOwnership::Borrowed
+                        },
+                        |borrowed| borrowed[index - runtime.start],
+                    );
                 parameter.ty != *self.parameter_type(index) || parameter.borrow != borrowed
             })
         {

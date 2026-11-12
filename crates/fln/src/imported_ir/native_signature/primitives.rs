@@ -5,10 +5,17 @@
 
 use super::{GeneratedExternRow, IrExecutionError, IrType, Name, inferred_arity};
 
+mod expressions;
+mod levels;
+mod names;
+
 #[derive(Clone, Copy)]
 pub(super) struct PrimitiveSignature {
     pub(super) parameters: &'static [IrType],
     pub(super) result: &'static IrType,
+    /// Raw Reference IR borrowing, when the census has a generic VM ownership
+    /// rule rather than the native scalar/borrowed telescope.
+    pub(super) exact_borrowed: Option<&'static [bool]>,
 }
 
 struct Review {
@@ -29,6 +36,9 @@ pub(super) fn signature(
         .or_else(|| word(row))
         .or_else(|| floating(row))
         .or_else(|| float_array(row))
+        .or_else(|| expressions::review(row))
+        .or_else(|| levels::review(row))
+        .or_else(|| names::review(row))
     else {
         return Ok(None);
     };
@@ -39,6 +49,10 @@ pub(super) fn signature(
         || row.ownership != review.ownership
         || row.levels != 0
         || row.arity as usize != review.signature.parameters.len()
+        || review
+            .signature
+            .exact_borrowed
+            .is_some_and(|borrowed| borrowed.len() != review.signature.parameters.len())
         || row.effect != "pure"
         || row.safety != "safe"
         || row.entry_class != "standard"
@@ -140,7 +154,11 @@ fn float_array(row: &GeneratedExternRow) -> Option<Review> {
         module: "Init.Data.FloatArray.Basic",
         kind,
         ownership,
-        signature: PrimitiveSignature { parameters, result },
+        signature: PrimitiveSignature {
+            parameters,
+            result,
+            exact_borrowed: None,
+        },
     })
 }
 
@@ -171,6 +189,7 @@ fn floating(row: &GeneratedExternRow) -> Option<Review> {
                         signature: PrimitiveSignature {
                             parameters: $parameters,
                             result: $result,
+                            exact_borrowed: None,
                         },
                     })
                 };
@@ -286,6 +305,7 @@ fn natural(row: &GeneratedExternRow) -> Option<Review> {
             "abi((a1: borrowed_arg, a2: borrowed_arg) -> owned_res)"
         },
         signature: PrimitiveSignature {
+            exact_borrowed: None,
             parameters: if unary {
                 &[IrType::TObject]
             } else {
@@ -456,7 +476,11 @@ fn integer(row: &GeneratedExternRow) -> Option<Review> {
         module,
         kind,
         ownership,
-        signature: PrimitiveSignature { parameters, result },
+        signature: PrimitiveSignature {
+            parameters,
+            result,
+            exact_borrowed: None,
+        },
     })
 }
 
@@ -532,7 +556,11 @@ fn string(row: &GeneratedExternRow) -> Option<Review> {
         module,
         kind,
         ownership,
-        signature: PrimitiveSignature { parameters, result },
+        signature: PrimitiveSignature {
+            parameters,
+            result,
+            exact_borrowed: None,
+        },
     })
 }
 
@@ -565,6 +593,7 @@ fn word(row: &GeneratedExternRow) -> Option<Review> {
                         signature: PrimitiveSignature {
                             parameters: $parameters,
                             result: $result,
+                            exact_borrowed: None,
                         },
                     })
                 };

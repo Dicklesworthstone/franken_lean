@@ -421,7 +421,11 @@ fn live_float_array_ir_matches_pin_with_full_native_and_boxed_prototypes() {
         std::process::id()
     ));
     std::fs::create_dir_all(&root).unwrap();
-    let source = r#"import Init.Data.FloatArray.Basic
+    let source = r#"module
+prelude
+public import Init
+public import Init.Data.FloatArray.Basic
+public section
 @[noinline] def floatArrayAnswer (first second : Float) : UInt64 :=
   let initial := (FloatArray.emptyWithCapacity 8).push first
   let both := initial.push second
@@ -467,9 +471,12 @@ fn live_float_array_ir_matches_pin_with_full_native_and_boxed_prototypes() {
         32 * 1024 * 1024,
     )
     .unwrap();
-    let users: BTreeSet<_> = ["floatArrayAnswer", "floatArrayProofAnswer"]
-        .map(name)
-        .into_iter()
+    // The pin hoists closed values into helpers owned by this user module.
+    // Those helpers must be executable without admitting toolchain bodies.
+    let users: BTreeSet<_> = user
+        .decls
+        .iter()
+        .map(|declaration| declaration.name().clone())
         .collect();
     let partition = VerifiedPartition::user_fixture();
     for (entry, expected) in [
@@ -503,7 +510,7 @@ fn live_float_array_ir_matches_pin_with_full_native_and_boxed_prototypes() {
             compiled
                 .reference_functions()
                 .iter()
-                .all(|f| f.producer() == "reference")
+                .all(|f| f.producer() == "reference" && users.contains(&f.name))
         );
     }
 }
