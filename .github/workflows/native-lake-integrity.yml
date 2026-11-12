@@ -36,7 +36,8 @@ jobs:
   imported-query-candidate:
     # Stage this exact source candidate while the local execution workspace is
     # unavailable. No source is published and no branch is changed by this job.
-    if: startsWith(github.event.head_commit.message, 'test(macros): validate imported query expansion')
+    if: >-
+      startsWith(github.event.head_commit.message, 'test(toolchain): validate native integration candidates')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -94,3 +95,89 @@ jobs:
       - name: Check touched packages and every test target
         if: ${{ !cancelled() }}
         run: cargo clippy --locked -p fln-parse -p fln --all-targets -- -D warnings
+
+  opaque-ir-candidate:
+    if: >-
+      startsWith(github.event.head_commit.message, 'test(toolchain): validate native integration candidates')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+      RUST_MIN_STACK: '268435456'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Apply the reviewed immutable opaque-body IR candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PY'
+          import base64, hashlib, json, os, pathlib, urllib.request
+          rows = [{"path":"crates/fln/src/ir.rs","before":"6158f22bf3fc5338132b7697fc25891b46998176","after":"0724c519ba33ef8409416a7e608e7ec67b888913"},{"path":"crates/fln/src/source_check/modules/artifacts/ir.rs","before":"72e3fb9ce179c86f6cd2605a5b5e9250109b80a6","after":"a64ca50b0ce7c7da77504530220c146919a823f9"},{"path":"crates/fln-cli/tests/lake_module_build.rs","before":"4655c837350ef35ef629359b970fea60e5db1295","after":"6b5774acf8cd84e3935b795f38944ff2248704fa"}]
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          for row in rows:
+              path = pathlib.Path(row['path'])
+              assert blob(path.read_bytes()) == row['before'], row['path']
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + row['after'],
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json',
+                           'User-Agent': 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+              assert result['encoding'] == 'base64'
+              data = base64.b64decode(result['content'])
+              assert blob(data) == row['after'], row['path']
+              path.write_bytes(data)
+              print(row['path'], row['before'], '->', row['after'])
+          PY
+          git diff --check
+      - name: Install repository toolchain
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\([^" ]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+          rustc -Vv
+      - name: Install and verify the pinned Reference
+        run: |
+          set -euo pipefail
+          tool_root="$RUNNER_TEMP/integration-elan-bin"
+          archive="$RUNNER_TEMP/integration-elan.tar.gz"
+          mkdir "$tool_root"
+          curl --user-agent 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)' \
+            --fail --location --retry 3 --output "$archive" \
+            https://github.com/leanprover/elan/releases/download/v4.2.1/elan-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            4e717523217af592fa2d7b9c479410a31816c065d66ccbf0c2149337cfec0f5c \
+            "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$tool_root"
+          export ELAN_HOME="$HOME/.elan"
+          "$tool_root/elan-init" -y --no-modify-path --default-toolchain none
+          export PATH="$ELAN_HOME/bin:$PATH"
+          mapfile -t reference_rows < <(grep -E '^reference ' SUITE.lock)
+          test "${#reference_rows[@]}" -eq 1
+          pin_tag="$(sed -nE 's/.* tag=([^ ]+).*/\1/p' <<<"${reference_rows[0]}")"
+          pin_commit="$(sed -nE 's/.* commit=([0-9a-f]{40}).*/\1/p' <<<"${reference_rows[0]}")"
+          test -n "$pin_tag"
+          test -n "$pin_commit"
+          elan toolchain install "leanprover/lean4:$pin_tag"
+          elan default "leanprover/lean4:$pin_tag"
+          toolchain_root="$ELAN_HOME/toolchains/leanprover--lean4---$pin_tag"
+          test "$("$toolchain_root/bin/lean" --githash)" = "$pin_commit"
+          printf 'ELAN_HOME=%s\nFLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\nFLN_REQUIRE_REFERENCE=1\n' \
+            "$ELAN_HOME" "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
+          printf '%s\n' "$ELAN_HOME/bin" >> "$GITHUB_PATH"
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Execute emitted IR and verify opacity and publication rollback
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p fln-cli --test lake_module_build ir_ --no-fail-fast -- --nocapture
+      - name: Check compiler, CLI and every test target
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked -p fln -p fln-cli --all-targets -- -D warnings
