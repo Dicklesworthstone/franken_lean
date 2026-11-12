@@ -445,11 +445,14 @@ fn bad_dependency_cannot_run_main_and_repair_recovers() {
     let package = executable();
     package.write(
         "src/library/Shared.lean",
-        "prelude\nimport Init.System.IO\ntheorem impossible (P Q : Prop) (h : P) : Q := h\n",
+        &format!("{LIBRARY}theorem impossible (P Q : Prop) (h : P) : Q := h\n"),
     );
     let refused = package.run(&["exe", "runner", "must not print"], Some(reference));
-    assert!(!refused.status.success(), "{refused:?}");
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
     assert!(refused.stdout.is_empty(), "{refused:?}");
+    let diagnostic = text(&refused.stderr);
+    assert!(diagnostic.contains("module `Shared`"), "{refused:?}");
+    assert!(diagnostic.contains("NotDefEq"), "{refused:?}");
     assert!(!package.0.join("artifacts").exists());
     package.write("src/library/Shared.lean", LIBRARY);
     let recovered = package.run(&["exe", "runner", "recovered"], Some(reference));
