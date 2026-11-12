@@ -40,11 +40,27 @@ fn live_pinned_name_equality_preserves_captures_and_native_scalar_abi() {
     .unwrap();
     let equality = name("Lean.Name.beq");
     let boxed = Name::str(equality.clone(), "_boxed");
+    let numeric_constructor = name("Lean.Name.num._override");
     prototypes.decls.retain(|declaration| {
         declaration.name() == &equality
             || declaration.name() == &boxed
             || declaration.name() == &name("Lean.Name.str._override")
+            || declaration.name() == &numeric_constructor
     });
+    let Some(IrDecl::Function { params, result, .. }) = prototypes
+        .decls
+        .iter()
+        .find(|declaration| declaration.name() == &numeric_constructor)
+    else {
+        panic!("the exact pin must contain the computed numeric Name constructor");
+    };
+    assert_eq!(params.len(), 2);
+    assert!(
+        params
+            .iter()
+            .all(|param| !param.borrow && param.ty == IrType::TObject)
+    );
+    assert_eq!(*result, IrType::TObject);
     let Some(IrDecl::Extern { params, result, .. }) = prototypes
         .decls
         .iter()
@@ -174,6 +190,64 @@ fn live_pinned_name_equality_preserves_captures_and_native_scalar_abi() {
             vec![EntryArgument::Nat(IrNat::Small(value))],
         ));
     }
+    let natural = |value: u128| {
+        EntryArgument::Nat(if value <= u128::from(u64::MAX) {
+            IrNat::Small(value as u64)
+        } else {
+            IrNat::Big(vec![value as u64, (value >> 64) as u64])
+        })
+    };
+    let numeric_pairs = [
+        (0, 0),
+        (7, u128::from(u64::MAX)),
+        (7, 1_u128 << 64),
+        (7, (1_u128 << 64) + 17),
+        ((1_u128 << 64) + 5, (1_u128 << 100) + 17),
+        (u128::MAX, u128::MAX),
+    ];
+    for (parent, component) in numeric_pairs {
+        // The source-level hash observer is oracle-only. Native execution
+        // returns the actual constructed object; its pinned cached field is
+        // inspected below, without admitting a toolchain getter body.
+        oracle_source.push_str(&format!(
+            "\n#eval (nativeNameNumeric {parent} {component}).hash.toNat\n"
+        ));
+        cases.push((
+            "nativeNameNumeric",
+            vec![natural(parent), natural(component)],
+        ));
+        oracle_source.push_str(&format!(
+            "\n#eval nativeNameNumericFields {parent} {component}\n"
+        ));
+        cases.push((
+            "nativeNameNumericFields",
+            vec![natural(parent), natural(component)],
+        ));
+    }
+    for (parent, left, right) in [
+        (7, u128::from(u64::MAX), u128::from(u64::MAX)),
+        (7, 1_u128 << 64, 1_u128 << 64),
+        (7, 17, (1_u128 << 64) + 17),
+        (7, (1_u128 << 64) + 17, (2_u128 << 64) + 17),
+        (
+            (1_u128 << 100) + 5,
+            (1_u128 << 100) + 17,
+            (1_u128 << 100) + 17,
+        ),
+        (
+            (1_u128 << 100) + 5,
+            (1_u128 << 100) + 17,
+            (1_u128 << 100) + 19,
+        ),
+    ] {
+        oracle_source.push_str(&format!(
+            "\n#eval nativeNameNumericEqual {parent} {left} {right}\n"
+        ));
+        cases.push((
+            "nativeNameNumericEqual",
+            vec![natural(parent), natural(left), natural(right)],
+        ));
+    }
     std::fs::write(dir.join("Oracle.lean"), oracle_source).unwrap();
     let oracle = Command::new(&reference)
         .current_dir(&dir)
@@ -202,8 +276,20 @@ fn live_pinned_name_equality_preserves_captures_and_native_scalar_abi() {
             IrExecutionLimits::default(),
         )
         .unwrap_or_else(|error| panic!("{entry} {arguments:?}: {error:?}; {dir:?}"));
-        assert_nat_replay(&compiled, expected);
-        assert!(compiled.native_externs().iter().any(|id| id == row.id));
+        if entry == "nativeNameNumeric" {
+            assert_numeric_hash_replay(&compiled, expected);
+        } else {
+            assert_nat_replay(&compiled, expected);
+            assert!(compiled.native_externs().iter().any(|id| id == row.id));
+        }
+        if entry.starts_with("nativeNameNumeric") {
+            assert!(
+                compiled
+                    .native_externs()
+                    .iter()
+                    .any(|id| id == "mirror:Lean.Name.num._override")
+            );
+        }
         assert!(
             compiled
                 .reference_functions()
@@ -229,6 +315,40 @@ fn live_pinned_name_equality_preserves_captures_and_native_scalar_abi() {
                 .outcome,
             Outcome::Inconclusive(_)
         ));
-        assert_nat_replay(&compiled, expected);
+        if entry == "nativeNameNumeric" {
+            assert_numeric_hash_replay(&compiled, expected);
+        } else {
+            assert_nat_replay(&compiled, expected);
+        }
+    }
+}
+
+fn assert_numeric_hash_replay(compiled: &CompiledIr, expected: &str) {
+    let expected: u64 = expected.parse().unwrap();
+    let bytes =
+        flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
+    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+    assert_eq!(
+        flbc::encode_canonical(&replay, flbc::CodecLimits::default()).unwrap(),
+        bytes
+    );
+    let layout = fln_rt::syntax_abi_generated::NAME_NUM_CTOR;
+    for program in [compiled.program.program(), &replay] {
+        let outcome = execute(program, ExecutionLimits::default(), None);
+        let Outcome::Complete(VmExit::Returned(value)) = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert!(!value.value.is_scalar());
+        assert_eq!(value.value.obj_tag(), usize::from(layout.tag));
+        assert_eq!(
+            usize::from(value.value.header().other),
+            layout.object_fields
+        );
+        assert_eq!(
+            value
+                .value
+                .try_ctor_scalar_u64(layout.object_fields * std::mem::size_of::<usize>()),
+            Some(expected)
+        );
     }
 }

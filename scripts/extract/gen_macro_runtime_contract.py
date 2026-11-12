@@ -33,6 +33,7 @@ CONSTRUCTORS = {
     "EXCEPTION_ERROR": "Lean.Macro.Exception.error",
     "LIST_CONS": "List.cons",
     "PROD": "Prod.mk",
+    "NAME_NUM_CTOR": "Lean.Name.num._impl",
 }
 SCALARS = {
     "SOURCE_NONE_TAG": "Lean.SourceInfo.none",
@@ -43,16 +44,24 @@ SCALARS = {
 FUNCTIONS = {
     "NAME_MK_STR1": "nameMkStr1",
     "NAME_STR": "nameStr",
+    "NAME_NUM": "nameNum",
     "LEVEL_SUCC": "levelSucc",
     "LEVEL_MAX": "levelMax",
     "LEVEL_IMAX": "levelIMax",
     "LEVEL_PARAM": "levelParam",
     "LEVEL_MVAR": "levelMVar",
     "EXPR_BVAR": "exprBVar",
+    "EXPR_FVAR": "exprFVar",
+    "EXPR_MVAR": "exprMVar",
+    "EXPR_SORT": "exprSort",
+    "EXPR_CONST": "exprConst",
     "EXPR_APP": "exprApp",
     "EXPR_LAM": "exprLam",
     "EXPR_FORALL": "exprForall",
     "EXPR_LET": "exprLet",
+    "EXPR_LIT": "exprLit",
+    "EXPR_MDATA": "exprMData",
+    "EXPR_PROJ": "exprProj",
     "NAME_HAS_MACRO_SCOPES": "nameHasMacroScopes",
     "NAME_ERASE_MACRO_SCOPES": "nameEraseMacroScopes",
     "ADD_MACRO_SCOPE": "addMacroScope",
@@ -125,16 +134,24 @@ FUNCTIONS = {
 }
 
 FORWARDED_FUNCTIONS = {
+    "nameNum": "Lean.Name.num._override",
     "levelSucc": "Lean.Level.succ._override",
     "levelMax": "Lean.Level.max._override",
     "levelIMax": "Lean.Level.imax._override",
     "levelParam": "Lean.Level.param._override",
     "levelMVar": "Lean.Level.mvar._override",
     "exprBVar": "Lean.Expr.bvar._override",
+    "exprFVar": "Lean.Expr.fvar._override",
+    "exprMVar": "Lean.Expr.mvar._override",
+    "exprSort": "Lean.Expr.sort._override",
+    "exprConst": "Lean.Expr.const._override",
     "exprApp": "Lean.Expr.app._override",
     "exprLam": "Lean.Expr.lam._override",
     "exprForall": "Lean.Expr.forallE._override",
     "exprLet": "Lean.Expr.letE._override",
+    "exprLit": "Lean.Expr.lit._override",
+    "exprMData": "Lean.Expr.mdata._override",
+    "exprProj": "Lean.Expr.proj._override",
     "nameHasMacroScopes": "Lean.Name.hasMacroScopes",
     "nameEraseMacroScopes": "Lean.Name.eraseMacroScopes",
     "syntaxIsNodeOf": "Lean.Syntax.isNodeOf",
@@ -177,6 +194,43 @@ FORWARDED_FUNCTIONS = {
     "macroThrowErrorAt": "Lean.Macro.throwErrorAt._redArg",
     "macroThrowUnsupported": "Lean.Macro.throwUnsupported._redArg",
 }
+
+
+def name_num_layout(lean):
+    """Read the computed-field constructor from its pinned IR implementation.
+
+    The source witness forwards to this override, so its compiler trace does
+    not itself contain the constructor allocation or cached-hash store.
+    Read that metadata using the existing Reference IR oracle; no imported
+    implementation body is granted native execution.
+    """
+    prefix = subprocess.run([lean, "--print-prefix"], check=True, capture_output=True,
+                            text=True, timeout=30).stdout.strip()
+    prelude = pathlib.Path(prefix) / "lib/lean/Init/Prelude.ir"
+    dumped = subprocess.run(
+        [lean, "--run", str(ROOT / "scripts/tribunal/ir_dump.lean"), str(prelude)],
+        check=True, capture_output=True, text=True, timeout=120,
+    )
+    declarations = [line for line in dumped.stdout.splitlines()
+                    if line.startswith("(fdecl Lean.Name.num._override ")]
+    if len(declarations) != 1:
+        raise ValueError("missing or repeated pinned Name.num override")
+    declaration = declarations[0]
+    constructors = re.findall(
+        r"\(vdecl (x\d+) obj \(ctor \(ci Lean\.Name\.num\._impl "
+        r"(\d+) (\d+) (\d+) (\d+)\) ([^()]*)\)\)", declaration,
+    )
+    if len(constructors) != 1:
+        raise ValueError("Name.num override is not one reviewed constructor allocation")
+    variable, tag, fields, usize_fields, scalar_bytes, arguments = constructors[0]
+    if int(usize_fields) != 0 or len(re.findall(r"\bx\d+\b", arguments)) != int(fields):
+        raise ValueError("Name.num override has an unexpected object layout")
+    stores = re.findall(
+        rf"\(sset {re.escape(variable)} (\d+) (\d+) x\d+ (\w+)\)", declaration,
+    )
+    if stores != [(fields, "0", "u64")] or int(scalar_bytes) != 8:
+        raise ValueError("Name.num override does not store exactly one cached UInt64 hash")
+    return int(tag), int(fields), int(scalar_bytes)
 
 
 def generate(lean):
@@ -236,6 +290,7 @@ def generate(lean):
         previous = layouts.setdefault(name, layout)
         if previous != layout:
             raise ValueError(f"inconsistent layout for {name}: {previous} vs {layout}")
+    layouts[CONSTRUCTORS["NAME_NUM_CTOR"]] = name_num_layout(lean)
     missing = set(CONSTRUCTORS.values()) - layouts.keys()
     if missing:
         raise ValueError(f"missing constructor layouts: {sorted(missing)}")

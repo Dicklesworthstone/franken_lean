@@ -91,6 +91,61 @@ fn programs() -> [ValidatedProgram; 2] {
     [owned.into_program(), replay]
 }
 
+fn numeric_constructor_programs() -> [ValidatedProgram; 2] {
+    let source = flbc::validate(Program::new(
+        FunctionId::new(0),
+        vec![
+            Function {
+                id: FunctionId::new(0),
+                arity: 0,
+                parameter_ownership: Vec::new(),
+                result_ownership: C::Scalar,
+                register_count: 1,
+                code: vec![
+                    I::Nat {
+                        dst: r(0),
+                        value: 0,
+                    },
+                    I::Return { src: r(0) },
+                ],
+            },
+            Function {
+                id: FunctionId::new(1),
+                arity: 2,
+                parameter_ownership: vec![A::Owned; 2],
+                result_ownership: C::Owned,
+                register_count: 3,
+                code: vec![
+                    I::Intrinsic {
+                        dst: r(2),
+                        row: "mirror:Lean.Name.num._override".to_owned(),
+                        args: vec![r(0), r(1)],
+                        argument_ownership: vec![A::Owned; 2],
+                        result_ownership: R::RawObject,
+                    },
+                    I::Return { src: r(2) },
+                ],
+            },
+        ],
+    ))
+    .unwrap();
+    let owned = flbc::insert_ownership(&source, flbc::OwnershipLimits::default()).unwrap();
+    flbc::validate_ownership_candidate(
+        &source,
+        owned.program().clone(),
+        owned.witness().clone(),
+        flbc::OwnershipLimits::default(),
+    )
+    .unwrap();
+    let bytes = flbc::encode_canonical(owned.program(), flbc::CodecLimits::default()).unwrap();
+    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+    assert_eq!(
+        flbc::encode_canonical(&replay, flbc::CodecLimits::default()).unwrap(),
+        bytes
+    );
+    [owned.into_program(), replay]
+}
+
 fn assert_equal(program: &ValidatedProgram, left: &Obj, right: &Obj, expected: bool) {
     let outcome = execute_function(
         program,
@@ -192,6 +247,51 @@ fn numeric(limbs: &[u64]) -> Obj {
         vec![Obj::mk_nat(0), Obj::mk_mpz(limbs, false)],
         &mix_hash(1723, component_hash).to_ne_bytes(),
     )
+}
+
+#[test]
+fn numeric_constructor_preserves_owned_operands_hashes_and_full_naturals_on_replay() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    shadow::enable();
+    {
+        let equality = programs();
+        for program in numeric_constructor_programs() {
+            for limbs in [vec![], vec![u64::MAX], vec![7, 1], vec![8, 1, 3]] {
+                let parent = Obj::mk_nat(0);
+                let number = Obj::mk_mpz(&limbs, false);
+                let outcome = execute_function(
+                    &program,
+                    FunctionId::new(1),
+                    vec![parent.clone_ref(), number.clone_ref()],
+                    ExecutionLimits::default(),
+                    None,
+                );
+                let Outcome::Complete(VmExit::Returned(result)) = outcome else {
+                    panic!("{outcome:?}");
+                };
+                assert_eq!(
+                    result.value.try_ctor_child(0).unwrap().identity_token(),
+                    parent.identity_token()
+                );
+                assert_eq!(
+                    result.value.try_ctor_child(1).unwrap().identity_token(),
+                    number.identity_token()
+                );
+                let expected = numeric(&limbs);
+                for equal_program in &equality {
+                    assert_equal(equal_program, &result.value, &expected, true);
+                    assert_equal(equal_program, &result.value, &numeric(&[42, 3]), false);
+                }
+                assert_eq!(
+                    result
+                        .value
+                        .try_ctor_scalar_u64(2 * std::mem::size_of::<usize>()),
+                    expected.try_ctor_scalar_u64(2 * std::mem::size_of::<usize>())
+                );
+            }
+        }
+    }
+    clean_shadow();
 }
 
 #[test]

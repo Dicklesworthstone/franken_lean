@@ -62,6 +62,7 @@ mod array_construction;
 mod arrays;
 mod diagnostics;
 mod expr_native;
+mod expr_traversal;
 mod float_arrays;
 mod floats;
 mod level_native;
@@ -588,6 +589,7 @@ struct IntrinsicPlan {
 enum IntrinsicImplementation {
     MacroNative(macro_native::Intrinsic),
     ExprNative(expr_native::Intrinsic),
+    ExprTraversal(expr_traversal::Intrinsic),
     LevelNative(level_native::Intrinsic),
     NameNative(name_native::Intrinsic),
     PanicCore,
@@ -944,6 +946,9 @@ impl IntrinsicImplementation {
         }
         if let Some(intrinsic) = expr_native::Intrinsic::for_row(row) {
             return Self::ExprNative(intrinsic);
+        }
+        if let Some(intrinsic) = expr_traversal::Intrinsic::for_row(row) {
+            return Self::ExprTraversal(intrinsic);
         }
         if let Some(intrinsic) = level_native::Intrinsic::for_row(row) {
             return Self::LevelNative(intrinsic);
@@ -1977,6 +1982,12 @@ enum ReturnTo {
         row: &'static str,
         result_ownership: ResultOwnership,
     },
+    CompleteExprTraversal {
+        destination: Register,
+        state: Box<expr_traversal::State>,
+        row: &'static str,
+        result_ownership: ResultOwnership,
+    },
     CompleteIntrinsicApplication {
         destination: Register,
         completion: IntrinsicCompletion,
@@ -2984,6 +2995,63 @@ fn run(
                             }
                         }
                     }
+                } else if let IntrinsicImplementation::ExprTraversal(intrinsic) =
+                    plan.implementation
+                {
+                    match expr_traversal::start(program, intrinsic, plan.row, values) {
+                        Ok(expr_traversal::Step::Complete(value)) => {
+                            let value = match finish_intrinsic_result(
+                                plan.row,
+                                result_ownership,
+                                IntrinsicResult::owned(value),
+                            ) {
+                                Ok(value) => value,
+                                Err(refusal) => {
+                                    return Ok(VmExit::Refused {
+                                        refusal,
+                                        usage: usage(steps, peak_stack_depth),
+                                    });
+                                }
+                            };
+                            set_register(current_frame_mut(&mut stack)?, dst, value)?;
+                            advance(current_frame_mut(&mut stack)?)?;
+                        }
+                        Ok(expr_traversal::Step::Call {
+                            function,
+                            args,
+                            state,
+                        }) => {
+                            advance(current_frame_mut(&mut stack)?)?;
+                            let next_depth = push_call(
+                                program,
+                                &mut stack,
+                                function,
+                                args,
+                                ReturnTo::CompleteExprTraversal {
+                                    destination: dst,
+                                    state,
+                                    row: plan.row,
+                                    result_ownership,
+                                },
+                                limits.max_stack_depth,
+                                location,
+                            )?;
+                            peak_stack_depth = peak_stack_depth.max(next_depth);
+                        }
+                        Err(expr_traversal::Failure::Refused(refusal)) => {
+                            return Ok(VmExit::Refused {
+                                refusal,
+                                usage: usage(steps, peak_stack_depth),
+                            });
+                        }
+                        Err(expr_traversal::Failure::Resource {
+                            resource,
+                            allowed,
+                            observed,
+                        }) => {
+                            return Err(mirror_resource_exhausted(resource, allowed, observed));
+                        }
+                    }
                 } else if let IntrinsicImplementation::StringTraversal(intrinsic) =
                     plan.implementation
                 {
@@ -3281,22 +3349,7 @@ fn run(
                             allowed,
                             observed,
                         }) => {
-                            return Err(Stop::Inconclusive(
-                                Inconclusive::resource(ResourceUsage {
-                                    reason: if resource.ends_with("bytes") {
-                                        ResourceReason::Memory {
-                                            limit_bytes: allowed,
-                                        }
-                                    } else {
-                                        ResourceReason::StructuralBudget {
-                                            unit: fln_core::diag::StructuralUnit::ProducedNodes,
-                                        }
-                                    },
-                                    allowed,
-                                    observed,
-                                })
-                                .with_progress(format!("native Mirror {resource}")),
-                            ));
+                            return Err(mirror_resource_exhausted(resource, allowed, observed));
                         }
                         Err(IntrinsicFailure::FileReadResource(error)) => {
                             return Err(file_read_exhausted(error, &location.to_string()));
@@ -3774,6 +3827,69 @@ fn run(
                                 cache_thunk_value(&thunk, &value)?;
                                 set_register(current_frame_mut(&mut stack)?, destination, value)?;
                             }
+                            ReturnTo::CompleteExprTraversal {
+                                destination,
+                                state,
+                                row,
+                                result_ownership,
+                            } => match expr_traversal::resume(program, state, value) {
+                                Ok(expr_traversal::Step::Complete(value)) => {
+                                    let value = match finish_intrinsic_result(
+                                        row,
+                                        result_ownership,
+                                        IntrinsicResult::owned(value),
+                                    ) {
+                                        Ok(value) => value,
+                                        Err(refusal) => {
+                                            return Ok(VmExit::Refused {
+                                                refusal,
+                                                usage: usage(steps, peak_stack_depth),
+                                            });
+                                        }
+                                    };
+                                    set_register(
+                                        current_frame_mut(&mut stack)?,
+                                        destination,
+                                        value,
+                                    )?;
+                                }
+                                Ok(expr_traversal::Step::Call {
+                                    function,
+                                    args,
+                                    state,
+                                }) => {
+                                    let next_depth = push_call(
+                                        program,
+                                        &mut stack,
+                                        function,
+                                        args,
+                                        ReturnTo::CompleteExprTraversal {
+                                            destination,
+                                            state,
+                                            row,
+                                            result_ownership,
+                                        },
+                                        limits.max_stack_depth,
+                                        location,
+                                    )?;
+                                    peak_stack_depth = peak_stack_depth.max(next_depth);
+                                }
+                                Err(expr_traversal::Failure::Refused(refusal)) => {
+                                    return Ok(VmExit::Refused {
+                                        refusal,
+                                        usage: usage(steps, peak_stack_depth),
+                                    });
+                                }
+                                Err(expr_traversal::Failure::Resource {
+                                    resource,
+                                    allowed,
+                                    observed,
+                                }) => {
+                                    return Err(mirror_resource_exhausted(
+                                        resource, allowed, observed,
+                                    ));
+                                }
+                            },
                             ReturnTo::CompleteStringFold {
                                 destination,
                                 state,
@@ -4500,6 +4616,25 @@ fn nat_magnitude_exhausted(allowed: u64, observed: u64, location: &str) -> Stop 
             observed,
         })
         .with_progress(location),
+    )
+}
+
+fn mirror_resource_exhausted(resource: &'static str, allowed: u64, observed: u64) -> Stop {
+    Stop::Inconclusive(
+        Inconclusive::resource(ResourceUsage {
+            reason: if resource.ends_with("bytes") {
+                ResourceReason::Memory {
+                    limit_bytes: allowed,
+                }
+            } else {
+                ResourceReason::StructuralBudget {
+                    unit: fln_core::diag::StructuralUnit::ProducedNodes,
+                }
+            },
+            allowed,
+            observed,
+        })
+        .with_progress(format!("native Mirror {resource}")),
     )
 }
 
@@ -7744,6 +7879,7 @@ fn dispatch_intrinsic(
         | IntrinsicImplementation::TaskMap
         | IntrinsicImplementation::TaskBind
         | IntrinsicImplementation::StringTraversal(_)
+        | IntrinsicImplementation::ExprTraversal(_)
         | IntrinsicImplementation::DbgTrace
         | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),
@@ -8232,6 +8368,7 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::ByteArrayValidateUtf8
         | IntrinsicImplementation::StringNext
         | IntrinsicImplementation::StringTraversal(_)
+        | IntrinsicImplementation::ExprTraversal(_)
         | IntrinsicImplementation::StringPrev
         | IntrinsicImplementation::StringPush
         | IntrinsicImplementation::StringTrim

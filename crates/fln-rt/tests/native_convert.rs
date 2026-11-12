@@ -20,7 +20,7 @@ use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
 use fln_core::options::{DataValue, KVMap, SyntaxHandle};
 use fln_rt::convert::{
-    Conversion, ConvertError, INJECT_DECL, PROJECT_DECL, inject_expr, inject_level,
+    Conversion, ConvertError, ExprConstructor, INJECT_DECL, PROJECT_DECL, inject_expr, inject_level,
 };
 use fln_rt::native_heap::{HeapError, NativeHeap};
 use fln_unsafe_abi::handle::Obj;
@@ -1601,6 +1601,262 @@ fn inject_walks_a_long_app_nest_without_a_stack_fault() {
 // ---------------------------------------------------------------------------
 // The declarations and the membrane tripwire
 // ---------------------------------------------------------------------------
+
+#[test]
+fn checked_expression_rebuild_preserves_identity_fields_and_recomputes_data() {
+    let name = Name::num(Name::from_components(["binder"]), 19);
+    let leaf = Expr::bvar(0).unwrap();
+    let other = Expr::bvar(3).unwrap();
+    let replacement = Expr::bvar(8).unwrap();
+    let metadata = KVMap::from_entries(vec![
+        (name.clone(), DataValue::OfString("first".into())),
+        (name.clone(), DataValue::OfNat(7)),
+    ]);
+    let cases = vec![
+        (
+            Expr::app(leaf.clone(), other.clone()),
+            Expr::app(replacement.clone(), other.clone()),
+            vec![0, 1],
+        ),
+        (
+            Expr::lam(
+                name.clone(),
+                leaf.clone(),
+                other.clone(),
+                BinderInfo::InstImplicit,
+            ),
+            Expr::lam(
+                name.clone(),
+                replacement.clone(),
+                other.clone(),
+                BinderInfo::InstImplicit,
+            ),
+            vec![1, 2],
+        ),
+        (
+            Expr::forall_e(
+                name.clone(),
+                leaf.clone(),
+                other.clone(),
+                BinderInfo::StrictImplicit,
+            ),
+            Expr::forall_e(
+                name.clone(),
+                replacement.clone(),
+                other.clone(),
+                BinderInfo::StrictImplicit,
+            ),
+            vec![1, 2],
+        ),
+        (
+            Expr::let_e(
+                name.clone(),
+                leaf.clone(),
+                other.clone(),
+                leaf.clone(),
+                true,
+            ),
+            Expr::let_e(
+                name.clone(),
+                replacement.clone(),
+                other.clone(),
+                leaf.clone(),
+                true,
+            ),
+            vec![1, 2, 3],
+        ),
+        (
+            Expr::mdata(metadata.clone(), leaf.clone()),
+            Expr::mdata(metadata, replacement.clone()),
+            vec![1],
+        ),
+        (
+            Expr::proj(name, 987, leaf),
+            Expr::proj(
+                Name::num(Name::from_components(["binder"]), 19),
+                987,
+                replacement.clone(),
+            ),
+            vec![2],
+        ),
+    ];
+    let mut heap = NativeHeap::new();
+    let replacement_handle = heap.alloc(replacement);
+    let replacement_object = inject_expr(&heap, replacement_handle).unwrap();
+    for (original, expected, slots) in cases {
+        let handle = heap.alloc(original);
+        let original_object = inject_expr(&heap, handle).unwrap();
+        let mut scope = Conversion::new();
+        let checked = scope.check_expr(&original_object).unwrap();
+        let mut children = checked.children().unwrap();
+        assert_eq!(children.len(), slots.len());
+        for (child, &slot) in children.iter().zip(&slots) {
+            assert_eq!(
+                child.object().identity_token(),
+                original_object
+                    .try_ctor_child(slot)
+                    .unwrap()
+                    .identity_token()
+            );
+        }
+        let unchanged = scope.rebuild_expr(&checked, &children).unwrap();
+        assert_eq!(
+            unchanged.object().identity_token(),
+            original_object.identity_token()
+        );
+        children[0] = scope.check_expr(&replacement_object).unwrap();
+        let changed = scope.rebuild_expr(&checked, &children).unwrap();
+        assert_ne!(
+            changed.object().identity_token(),
+            original_object.identity_token()
+        );
+        assert_eq!(changed.expression(), &expected);
+        assert_eq!(
+            changed
+                .object()
+                .try_ctor_child(slots[0])
+                .unwrap()
+                .identity_token(),
+            replacement_object.identity_token()
+        );
+        for slot in 0..usize::from(original_object.header().other) {
+            if slot != slots[0] {
+                assert_eq!(
+                    changed
+                        .object()
+                        .try_ctor_child(slot)
+                        .unwrap()
+                        .identity_token(),
+                    original_object
+                        .try_ctor_child(slot)
+                        .unwrap()
+                        .identity_token(),
+                    "all untouched fields retain the original carrier"
+                );
+            }
+        }
+        let mut verification = NativeHeap::new();
+        let projected = Conversion::new()
+            .project_expr(&mut verification, changed.object())
+            .unwrap();
+        assert_eq!(verification.get(projected).unwrap(), &expected);
+        assert!(matches!(
+            scope.rebuild_expr(&checked, &[]),
+            Err(ConvertError::MalformedCompat { family: "expr", .. })
+        ));
+    }
+}
+
+#[test]
+fn checked_expression_rebuild_and_callback_projections_share_aggregate_limits() {
+    let leaf = Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]);
+    let original = Obj::mk_ctor(5, vec![leaf.clone_ref(), leaf.clone_ref()], &[]);
+    let replacement = Obj::mk_ctor(0, vec![Obj::mk_nat(1)], &[]);
+    let mut scope = Conversion::with_node_budget(3);
+    let checked = scope.check_expr(&original).unwrap();
+    let replacement = scope.check_expr(&replacement).unwrap();
+    assert!(matches!(
+        scope.rebuild_expr(&checked, &[replacement.clone(), replacement]),
+        Err(ConvertError::NodeBudgetExhausted {
+            visited: 4,
+            budget: 3,
+            ..
+        })
+    ));
+    let original_children = checked.children().unwrap();
+    assert_eq!(
+        scope
+            .rebuild_expr(&checked, &original_children)
+            .unwrap()
+            .object()
+            .identity_token(),
+        original.identity_token(),
+        "a no-op does not allocate or consume another reconstruction node"
+    );
+
+    let mut heap = NativeHeap::new();
+    let expr = Expr::mdata(
+        KVMap::from_entries(vec![(
+            Name::anonymous(),
+            DataValue::OfString("data".into()),
+        )]),
+        Expr::bvar(0).unwrap(),
+    );
+    let handle = heap.alloc(expr);
+    let object = inject_expr(&heap, handle).unwrap();
+    let mut scope = Conversion::with_budgets(100, 7);
+    let checked = scope.check_expr(&object).unwrap();
+    let replacement = scope
+        .check_expr(&Obj::mk_ctor(0, vec![Obj::mk_nat(1)], &[]))
+        .unwrap();
+    assert!(matches!(
+        scope.rebuild_expr(&checked, &[replacement]),
+        Err(ConvertError::ByteBudgetExhausted {
+            visited: 8,
+            budget: 7,
+            ..
+        })
+    ));
+    let forged = Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &u64::MAX.to_le_bytes());
+    assert!(matches!(
+        Conversion::new().check_expr(&forged),
+        Err(ConvertError::MalformedCompat { family: "expr", .. })
+    ));
+}
+
+#[test]
+fn checked_constructor_computes_only_fresh_root_data_and_checks_every_descendant() {
+    let leaf = Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]);
+    let forged = Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &u64::MAX.to_le_bytes());
+    for constructor in [
+        ExprConstructor::Lam(BinderInfo::Implicit),
+        ExprConstructor::Forall(BinderInfo::StrictImplicit),
+    ] {
+        assert!(matches!(
+            Conversion::new().construct_expr(
+                constructor,
+                vec![Obj::mk_nat(0), forged.clone_ref(), leaf.clone_ref()]
+            ),
+            Err(ConvertError::MalformedCompat { family: "expr", .. })
+        ));
+    }
+    assert!(matches!(
+        Conversion::new().construct_expr(
+            ExprConstructor::Let(true),
+            vec![Obj::mk_nat(0), leaf.clone_ref(), leaf.clone_ref(), forged]
+        ),
+        Err(ConvertError::MalformedCompat { family: "expr", .. })
+    ));
+    let mut scope = Conversion::with_node_budget(3);
+    let constructed = scope
+        .construct_expr(
+            ExprConstructor::App,
+            vec![leaf.clone_ref(), leaf.clone_ref()],
+        )
+        .unwrap();
+    for slot in 0..2 {
+        assert_eq!(
+            constructed
+                .object()
+                .try_ctor_child(slot)
+                .unwrap()
+                .identity_token(),
+            leaf.identity_token()
+        );
+    }
+    assert!(matches!(
+        scope.construct_expr(ExprConstructor::BVar, vec![Obj::mk_nat(0)]),
+        Err(ConvertError::NodeBudgetExhausted {
+            visited: 4,
+            budget: 3,
+            ..
+        })
+    ));
+    assert!(matches!(
+        Conversion::new().construct_expr(ExprConstructor::App, vec![leaf]),
+        Err(ConvertError::MalformedCompat { family: "expr", .. })
+    ));
+}
 
 #[test]
 fn the_five_declarations_are_present_and_non_blank() {

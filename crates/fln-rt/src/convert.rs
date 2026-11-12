@@ -461,6 +461,133 @@ fn check_level_data(obj: &Obj, level: &Level) -> Result<(), ConvertError> {
     Ok(())
 }
 
+/// A structurally checked expression together with its original Compat
+/// object. The fields are private: only bounded projection or checked
+/// reconstruction can establish this relationship. Unlike a full injection,
+/// child views and unchanged reconstruction preserve observable object sharing.
+pub struct CheckedExpr {
+    object: Obj,
+    expression: Expr,
+}
+
+impl std::fmt::Debug for CheckedExpr {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CheckedExpr")
+            .field("expression", &self.expression)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The expression constructors and their typed scalar annotations. This closed
+/// set cannot manufacture an unchecked tag, invalid flag, or caller-supplied
+/// cached data word.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExprConstructor {
+    BVar,
+    FVar,
+    MVar,
+    Sort,
+    Const,
+    App,
+    Lam(BinderInfo),
+    Forall(BinderInfo),
+    Let(bool),
+    Lit,
+    MData,
+    Proj,
+}
+
+impl ExprConstructor {
+    fn tag(self) -> u8 {
+        match self {
+            Self::BVar => TAG_EXPR_BVAR,
+            Self::FVar => TAG_EXPR_FVAR,
+            Self::MVar => TAG_EXPR_MVAR,
+            Self::Sort => TAG_EXPR_SORT,
+            Self::Const => TAG_EXPR_CONST,
+            Self::App => TAG_EXPR_APP,
+            Self::Lam(_) => TAG_EXPR_LAM,
+            Self::Forall(_) => TAG_EXPR_FORALL,
+            Self::Let(_) => TAG_EXPR_LET,
+            Self::Lit => TAG_EXPR_LIT,
+            Self::MData => TAG_EXPR_MDATA,
+            Self::Proj => TAG_EXPR_PROJ,
+        }
+    }
+
+    fn scalar_bytes(self, data: u64) -> Vec<u8> {
+        match self {
+            Self::Lam(info) | Self::Forall(info) => data_and_u8(data, info.to_u64() as u8),
+            Self::Let(non_dep) => data_and_u8(data, u8::from(non_dep)),
+            _ => data.to_le_bytes().to_vec(),
+        }
+    }
+}
+
+impl Clone for CheckedExpr {
+    fn clone(&self) -> Self {
+        Self {
+            object: self.object.clone_ref(),
+            expression: self.expression.clone(),
+        }
+    }
+}
+
+impl CheckedExpr {
+    /// Borrow the checked original carrier, without allocating a replacement.
+    pub fn object(&self) -> &Obj {
+        &self.object
+    }
+
+    /// The native structural view validated against this exact carrier.
+    pub fn expression(&self) -> &Expr {
+        &self.expression
+    }
+
+    fn child_slots(&self) -> &'static [usize] {
+        match self.expression.node() {
+            ExprNode::App { .. } => &[0, 1],
+            ExprNode::Lam { .. } | ExprNode::ForallE { .. } => &[1, 2],
+            ExprNode::LetE { .. } => &[1, 2, 3],
+            ExprNode::MData { .. } => &[1],
+            ExprNode::Proj { .. } => &[2],
+            _ => &[],
+        }
+    }
+
+    /// Expression children in function/argument, domain/body, or
+    /// type/value/body order. Names, universes, literals and metadata are not
+    /// expression children. The at-most-three returned views retain their
+    /// original objects and need no repeated graph projection.
+    pub fn children(&self) -> Result<Vec<Self>, ConvertError> {
+        let expressions: Vec<&Expr> = match self.expression.node() {
+            ExprNode::App { f, a } => vec![f, a],
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => vec![binder_type, body],
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => vec![type_, value, body],
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => vec![expr],
+            _ => vec![],
+        };
+        self.child_slots()
+            .iter()
+            .zip(expressions)
+            .map(|(&slot, expression)| {
+                Ok(Self {
+                    object: ctor_field(&self.object, slot, "expr")?,
+                    expression: expression.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
 /// A conversion scope: the accounting for one lazy boundary crossing.
 /// Creating one is free; dropping it without projecting allocates nothing.
 /// The dedup itself lives in the destination heap's interning, so the
@@ -554,7 +681,7 @@ impl Conversion {
     }
 
     fn expr(&mut self, obj: &Obj) -> Result<Expr, ConvertError> {
-        self.project_expr_graph(obj)
+        self.project_expr_graph(obj, true)
     }
 
     fn name(&mut self, obj: &Obj) -> Result<Name, ConvertError> {
@@ -584,6 +711,151 @@ impl Conversion {
         Ok(handle)
     }
 
+    /// Check an expression without replacing its Compat carrier or interning
+    /// it against another input. Native callback traversals use this view so
+    /// pointer identity and the original graph's sharing remain observable.
+    /// Projection and later reconstruction share this scope's allowances.
+    pub fn check_expr(&mut self, object: &Obj) -> Result<CheckedExpr, ConvertError> {
+        self.projected += 1;
+        Ok(CheckedExpr {
+            expression: self.expr(object)?,
+            object: object.clone_ref(),
+        })
+    }
+
+    /// Construct a fresh Expr through bounded validation of all its fields.
+    /// The original field carriers are retained, and the Data word is derived
+    /// from their checked native structure. Caller-supplied hashes never cross
+    /// this boundary. The temporary checked shape has at most four fields.
+    pub fn construct_expr(
+        &mut self,
+        constructor: ExprConstructor,
+        fields: Vec<Obj>,
+    ) -> Result<CheckedExpr, ConvertError> {
+        let tag = constructor.tag();
+        let count = expr_lean_slots(tag).ok_or(ConvertError::UnsupportedConstructor {
+            family: "expr",
+            tag,
+        })?;
+        if fields.len() != usize::from(count) {
+            return Err(malformed("expr", "constructor field count does not match"));
+        }
+        // Only this newly allocated private root has no authoritative Data
+        // yet. Its tag, field count, and annotations come from the closed
+        // constructor enum. Every caller-supplied descendant is fully checked,
+        // including its cached Data, before the root's Data is computed.
+        let shape = Obj::mk_ctor(tag, fields, &constructor.scalar_bytes(0));
+        self.projected += 1;
+        let expression = self.project_expr_graph(&shape, false)?;
+        self.enter("expr constructor")?;
+        let fields = (0..usize::from(count))
+            .map(|slot| ctor_field(&shape, slot, "expr"))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CheckedExpr {
+            object: Obj::mk_ctor(tag, fields, &constructor.scalar_bytes(expression.data().0)),
+            expression,
+        })
+    }
+
+    /// Rebuild one checked expression from checked expression children.
+    /// Unchanged child identities retain the original parent; a changed
+    /// parent retains every non-expression field and computes fresh Data.
+    /// Allocation, including copied metadata, is charged before construction.
+    pub fn rebuild_expr(
+        &mut self,
+        original: &CheckedExpr,
+        children: &[CheckedExpr],
+    ) -> Result<CheckedExpr, ConvertError> {
+        let slots = original.child_slots();
+        if slots.len() != children.len() {
+            return Err(malformed("expr", "replacement child count does not match"));
+        }
+        let mut changed = false;
+        for (&slot, child) in slots.iter().zip(children) {
+            changed |= ctor_field(&original.object, slot, "expr")?.identity_token()
+                != child.object.identity_token();
+        }
+        if !changed {
+            return Ok(original.clone());
+        }
+        self.enter("expr rebuild")?;
+        // Metadata owns its entry vector and String values in the native
+        // representation. Charge those repeated copies before cloning; its
+        // Compat list itself is retained, including duplicate keys and order.
+        if let ExprNode::MData { data, .. } = original.expression.node() {
+            for (_, value) in data.entries() {
+                self.enter("expr metadata rebuild")?;
+                if let DataValue::OfString(text) = value {
+                    self.copy_bytes("expr metadata rebuild", text.len())?;
+                }
+            }
+        }
+        let expression = match original.expression.node() {
+            ExprNode::App { .. } => Expr::app(
+                children[0].expression.clone(),
+                children[1].expression.clone(),
+            ),
+            ExprNode::Lam {
+                binder_name,
+                binder_info,
+                ..
+            } => Expr::lam(
+                binder_name.clone(),
+                children[0].expression.clone(),
+                children[1].expression.clone(),
+                *binder_info,
+            ),
+            ExprNode::ForallE {
+                binder_name,
+                binder_info,
+                ..
+            } => Expr::forall_e(
+                binder_name.clone(),
+                children[0].expression.clone(),
+                children[1].expression.clone(),
+                *binder_info,
+            ),
+            ExprNode::LetE {
+                decl_name, non_dep, ..
+            } => Expr::let_e(
+                decl_name.clone(),
+                children[0].expression.clone(),
+                children[1].expression.clone(),
+                children[2].expression.clone(),
+                *non_dep,
+            ),
+            ExprNode::MData { data, .. } => {
+                Expr::mdata(data.clone(), children[0].expression.clone())
+            }
+            ExprNode::Proj {
+                struct_name, idx, ..
+            } => Expr::proj(struct_name.clone(), *idx, children[0].expression.clone()),
+            _ => return Err(malformed("expr", "a leaf has no replaceable children")),
+        };
+        let tag = original.object.obj_tag() as u8;
+        let count = expr_lean_slots(tag).ok_or(ConvertError::UnsupportedConstructor {
+            family: "expr",
+            tag,
+        })?;
+        let mut fields = (0..usize::from(count))
+            .map(|slot| ctor_field(&original.object, slot, "expr"))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (&slot, child) in slots.iter().zip(children) {
+            fields[slot] = child.object.clone_ref();
+        }
+        let scalar_bytes = match expression.node() {
+            ExprNode::Lam { binder_info, .. } | ExprNode::ForallE { binder_info, .. } => {
+                data_and_u8(expression.data().0, binder_info.to_u64() as u8)
+            }
+            ExprNode::LetE { non_dep, .. } => data_and_u8(expression.data().0, u8::from(*non_dep)),
+            _ => expression.data().0.to_le_bytes().to_vec(),
+        };
+        Ok(CheckedExpr {
+            object: Obj::mk_ctor(tag, fields, &scalar_bytes),
+            expression,
+        })
+    }
+
     /// Project a Compat universe level with the same bounded, cached-data
     /// validation as levels inside an Expr. Interning preserves structural
     /// identity; it does not normalize levels or assert kernel equivalence.
@@ -603,7 +875,11 @@ impl Conversion {
         Ok(handle)
     }
 
-    fn project_expr_graph(&mut self, root: &Obj) -> Result<Expr, ConvertError> {
+    fn project_expr_graph(
+        &mut self,
+        root: &Obj,
+        check_root_data: bool,
+    ) -> Result<Expr, ConvertError> {
         // Iterative post-order: a 400-deep app nest is a legal native
         // value, and the recursive form overflowed at the host-stack
         // ceiling that still bounds inject (FL-INV-07).
@@ -678,7 +954,9 @@ impl Conversion {
             }
             let current = stack.pop().expect("the parent is still on the stack");
             let projected = self.project_expr_node(&current, &done)?;
-            check_expr_data(&current, &projected)?;
+            if check_root_data || key != root.identity_token() {
+                check_expr_data(&current, &projected)?;
+            }
             active.remove(&key);
             done.insert(key, projected);
         }

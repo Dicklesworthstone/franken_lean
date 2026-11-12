@@ -9,13 +9,13 @@ use std::collections::HashSet;
 
 use super::{
     IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, bool_value, expect_arity, floats,
-    level_native, macro_native, nat_as_usize, type_mismatch, uint32_argument,
+    level_native, nat_as_usize, type_mismatch, uint32_argument,
 };
 use fln_core::expr::{
     BinderInfo, Expr, ExprData, ExprNode, MAX_LOOSE_BVAR_RANGE, TooManyBoundVars,
 };
 use fln_core::level::{Level, MAX_LEVEL_DEPTH};
-use fln_rt::convert::{Conversion, ConvertError, inject_expr};
+use fln_rt::convert::{Conversion, ConvertError, ExprConstructor, inject_expr};
 use fln_rt::native_heap::NativeHeap;
 
 const MAX_EXPR_NODES: usize = 1_000_000;
@@ -36,6 +36,13 @@ pub(super) enum Intrinsic {
     Lam,
     Forall,
     Let,
+    FVar,
+    MVar,
+    Sort,
+    Const,
+    Lit,
+    MData,
+    Proj,
 }
 
 impl Intrinsic {
@@ -55,6 +62,13 @@ impl Intrinsic {
             "mirror:Lean.Expr.lam._override" => Self::Lam,
             "mirror:Lean.Expr.forallE._override" => Self::Forall,
             "mirror:Lean.Expr.letE._override" => Self::Let,
+            "mirror:Lean.Expr.fvar._override" => Self::FVar,
+            "mirror:Lean.Expr.mvar._override" => Self::MVar,
+            "mirror:Lean.Expr.sort._override" => Self::Sort,
+            "mirror:Lean.Expr.const._override" => Self::Const,
+            "mirror:Lean.Expr.lit._override" => Self::Lit,
+            "mirror:Lean.Expr.mdata._override" => Self::MData,
+            "mirror:Lean.Expr.proj._override" => Self::Proj,
             _ => return None,
         })
     }
@@ -74,9 +88,9 @@ impl Intrinsic {
         node_budget: usize,
     ) -> Result<IntrinsicResult, IntrinsicFailure> {
         let arity = match self {
-            Self::Data | Self::BVar => 1,
+            Self::Data | Self::BVar | Self::FVar | Self::MVar | Self::Sort | Self::Lit => 1,
             Self::MkData => 7,
-            Self::LiftLooseBVars => 3,
+            Self::LiftLooseBVars | Self::Proj => 3,
             Self::Lam | Self::Forall => 4,
             Self::Let => 5,
             _ => 2,
@@ -91,39 +105,52 @@ impl Intrinsic {
             visited: 0,
         };
         match self {
+            Self::FVar
+            | Self::MVar
+            | Self::Sort
+            | Self::Const
+            | Self::Lit
+            | Self::MData
+            | Self::Proj => {
+                let constructor = match self {
+                    Self::FVar => ExprConstructor::FVar,
+                    Self::MVar => ExprConstructor::MVar,
+                    Self::Sort => ExprConstructor::Sort,
+                    Self::Const => ExprConstructor::Const,
+                    Self::Lit => ExprConstructor::Lit,
+                    Self::MData => ExprConstructor::MData,
+                    Self::Proj => ExprConstructor::Proj,
+                    _ => unreachable!("only the selected native constructors enter this arm"),
+                };
+                operands.constructed(constructor, args)
+            }
             Self::BVar => {
                 let index = nat_as_usize(&args[0], "Expr.bvar", 0)?;
-                let Some(index) = index.filter(|index| *index < MAX_LOOSE_BVAR_RANGE as usize)
-                else {
+                if index
+                    .filter(|index| *index < MAX_LOOSE_BVAR_RANGE as usize)
+                    .is_none()
+                {
                     return Err(range_exhausted(
                         index.map_or(u64::MAX, |index| (index as u64).saturating_add(1)),
                     ));
-                };
-                operands.constructed(Expr::bvar(index as u32).map_err(bound_vars)?)
+                }
+                operands.constructed(ExprConstructor::BVar, args)
             }
-            Self::App => {
-                let function = operands.expr(&args[0])?;
-                let argument = operands.expr(&args[1])?;
-                operands.constructed(Expr::app(function, argument))
-            }
+            Self::App => operands.constructed(ExprConstructor::App, args),
             Self::Lam | Self::Forall => {
-                let name = macro_native::name(&args[0])?;
-                let domain = operands.expr(&args[1])?;
-                let body = operands.expr(&args[2])?;
                 let info = binder_info(&args[3])?;
-                operands.constructed(if self == Self::Lam {
-                    Expr::lam(name, domain, body, info)
-                } else {
-                    Expr::forall_e(name, domain, body, info)
-                })
+                operands.constructed(
+                    if self == Self::Lam {
+                        ExprConstructor::Lam(info)
+                    } else {
+                        ExprConstructor::Forall(info)
+                    },
+                    &args[..3],
+                )
             }
             Self::Let => {
-                let name = macro_native::name(&args[0])?;
-                let type_ = operands.expr(&args[1])?;
-                let value = operands.expr(&args[2])?;
-                let body = operands.expr(&args[3])?;
                 let non_dep = bool_value(&args[4], "Expr.letE", 4)?;
-                operands.constructed(Expr::let_e(name, type_, value, body, non_dep))
+                operands.constructed(ExprConstructor::Let(non_dep), &args[..4])
             }
             Self::MkData => {
                 let hash = floats::wide_argument(&args[0], "Expr.mkData", 0)?;
@@ -240,11 +267,16 @@ struct Operands {
 }
 
 impl Operands {
-    fn constructed(&mut self, expr: Expr) -> Result<IntrinsicResult, IntrinsicFailure> {
-        let handle = self.heap.alloc(expr);
-        inject_expr(&self.heap, handle)
-            .map(IntrinsicResult::raw_object)
-            .map_err(conversion_error)
+    fn constructed(
+        &mut self,
+        constructor: ExprConstructor,
+        fields: &[Obj],
+    ) -> Result<IntrinsicResult, IntrinsicFailure> {
+        let checked = self
+            .conversion
+            .construct_expr(constructor, fields.iter().map(Obj::clone_ref).collect())
+            .map_err(conversion_error)?;
+        Ok(IntrinsicResult::raw_object(checked.object().clone_ref()))
     }
 
     fn expr(&mut self, value: &Obj) -> Result<Expr, IntrinsicFailure> {

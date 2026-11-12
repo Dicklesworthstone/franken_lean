@@ -33,3 +33,18 @@ public section
   let left := if n == 0 then Lean.Name.str .anonymous "A.B"
     else .str (.str .anonymous "A") "B"
   if Lean.Name.beq left (.str .anonymous "A.B") then 11 else 29
+
+@[noinline] def nativeNameNumeric (parent component : Nat) : Lean.Name :=
+  .num (.num .anonymous parent) component
+
+@[noinline] def nativeNameNumericFields (parent component : Nat) : Nat :=
+  let value := nativeNameNumeric parent component
+  if Lean.Name.beq value (nativeNameNumeric parent component) then
+    match value with
+    | .num (.num .anonymous previous) last => 17 * previous + last
+    | _ => 9999999
+  else 9999999
+
+@[noinline] def nativeNameNumericEqual (parent left right : Nat) : Nat :=
+  if Lean.Name.beq (nativeNameNumeric parent left) (nativeNameNumeric parent right)
+  then 11 else 29

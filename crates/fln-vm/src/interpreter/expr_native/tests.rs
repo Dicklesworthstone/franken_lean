@@ -203,6 +203,206 @@ fn native_expr_constructors_compute_data_and_preserve_all_binder_fields() {
 }
 
 #[test]
+fn native_expr_all_composite_constructors_retain_shared_operand_identity() {
+    let name = fln_rt::convert::inject_name(&Name::from_components(["shared"]));
+    let operand = object(Expr::app(bvar(1), bvar(3)));
+    for (row, args, child_slots) in [
+        (
+            "mirror:Lean.Expr.app._override",
+            vec![operand.clone_ref(), operand.clone_ref()],
+            vec![0, 1],
+        ),
+        (
+            "mirror:Lean.Expr.lam._override",
+            vec![
+                name.clone_ref(),
+                operand.clone_ref(),
+                operand.clone_ref(),
+                Obj::mk_nat(3),
+            ],
+            vec![1, 2],
+        ),
+        (
+            "mirror:Lean.Expr.forallE._override",
+            vec![
+                name.clone_ref(),
+                operand.clone_ref(),
+                operand.clone_ref(),
+                Obj::mk_nat(2),
+            ],
+            vec![1, 2],
+        ),
+        (
+            "mirror:Lean.Expr.letE._override",
+            vec![
+                name.clone_ref(),
+                operand.clone_ref(),
+                operand.clone_ref(),
+                operand.clone_ref(),
+                Obj::mk_nat(1),
+            ],
+            vec![1, 2, 3],
+        ),
+    ] {
+        let constructed = call(row, &args);
+        for slot in child_slots {
+            assert_eq!(
+                constructed.try_ctor_child(slot).unwrap().identity_token(),
+                operand.identity_token(),
+                "{row} retains the shared operand at field {slot}"
+            );
+        }
+        if row != "mirror:Lean.Expr.app._override" {
+            assert_eq!(
+                constructed.try_ctor_child(0).unwrap().identity_token(),
+                name.identity_token()
+            );
+        }
+        // Projection independently validates each new cached Data word and
+        // the original annotations after identity-preserving construction.
+        expression(&constructed);
+    }
+    let equal_but_distinct = object(expression(&operand));
+    assert_ne!(
+        operand.identity_token(),
+        equal_but_distinct.identity_token()
+    );
+    let constructed = call(
+        "mirror:Lean.Expr.app._override",
+        &[operand.clone_ref(), equal_but_distinct.clone_ref()],
+    );
+    assert_eq!(
+        constructed.try_ctor_child(0).unwrap().identity_token(),
+        operand.identity_token()
+    );
+    assert_eq!(
+        constructed.try_ctor_child(1).unwrap().identity_token(),
+        equal_but_distinct.identity_token()
+    );
+    let maximum = MAX_LOOSE_BVAR_RANGE - 1;
+    assert_eq!(
+        expression(&call(
+            "mirror:Lean.Expr.bvar._override",
+            &[Obj::mk_nat(maximum as usize)]
+        )),
+        bvar(maximum)
+    );
+    assert!(matches!(
+        execute(
+            "mirror:Lean.Expr.bvar._override",
+            &[Obj::mk_nat(MAX_LOOSE_BVAR_RANGE as usize)]
+        ),
+        Outcome::Inconclusive(_)
+    ));
+}
+
+#[test]
+fn native_expr_remaining_constructors_preserve_fields_and_checked_cached_data() {
+    use fln_core::expr::{FVarId, MVarId};
+    use fln_core::options::{DataValue, KVMap};
+    let name = Name::num(Name::from_components(["Expr", "payload"]), 91);
+    let level = Level::succ(Level::param(name.clone())).unwrap();
+    for (row, expected) in [
+        (
+            "mirror:Lean.Expr.fvar._override",
+            Expr::fvar(FVarId(name.clone())),
+        ),
+        (
+            "mirror:Lean.Expr.mvar._override",
+            Expr::mvar(MVarId(name.clone())),
+        ),
+        ("mirror:Lean.Expr.sort._override", Expr::sort(level.clone())),
+        (
+            "mirror:Lean.Expr.const._override",
+            Expr::const_(name.clone(), vec![level]),
+        ),
+        (
+            "mirror:Lean.Expr.lit._override",
+            Expr::lit(Literal::Str("retained λ".into())),
+        ),
+        (
+            "mirror:Lean.Expr.mdata._override",
+            Expr::mdata(
+                KVMap::from_entries(vec![
+                    (name.clone(), DataValue::OfString("kept".into())),
+                    (name.clone(), DataValue::OfNat(7)),
+                ]),
+                bvar(2),
+            ),
+        ),
+        (
+            "mirror:Lean.Expr.proj._override",
+            Expr::proj(name, u64::MAX, bvar(3)),
+        ),
+    ] {
+        let source = object(expected.clone());
+        let fields = (0..usize::from(source.header().other))
+            .map(|slot| source.try_ctor_child(slot).unwrap())
+            .collect::<Vec<_>>();
+        let constructed = call(row, &fields);
+        assert_eq!(expression(&constructed), expected);
+        assert_eq!(constructed.obj_tag(), source.obj_tag());
+        for (slot, field) in fields.iter().enumerate() {
+            assert_eq!(
+                constructed.try_ctor_child(slot).unwrap().identity_token(),
+                field.identity_token(),
+                "{row} retains original field {slot}"
+            );
+        }
+        assert_eq!(
+            call("extern:Lean.Expr.data", &[constructed]).try_ctor_scalar_u64(0),
+            Some(expected.data().0)
+        );
+    }
+}
+
+#[test]
+fn native_expr_remaining_constructors_bound_validation_and_reject_malformed_fields() {
+    let level = object(Expr::sort(Level::succ(Level::one()).unwrap()))
+        .try_ctor_child(0)
+        .unwrap();
+    assert!(matches!(
+        Intrinsic::Sort.invoke_bounded("mirror:Lean.Expr.sort._override", &[level], 2),
+        Err(IntrinsicFailure::MirrorResource {
+            allowed: 2,
+            observed: 3,
+            ..
+        })
+    ));
+    for (row, fields) in [
+        (
+            "mirror:Lean.Expr.fvar._override",
+            vec![Obj::mk_string("not a Name")],
+        ),
+        (
+            "mirror:Lean.Expr.const._override",
+            vec![Obj::mk_nat(0), Obj::mk_nat(1)],
+        ),
+        ("mirror:Lean.Expr.lit._override", vec![Obj::mk_nat(0)]),
+        (
+            "mirror:Lean.Expr.mdata._override",
+            vec![Obj::mk_nat(1), object(bvar(0))],
+        ),
+        (
+            "mirror:Lean.Expr.proj._override",
+            vec![
+                Obj::mk_nat(0),
+                Obj::mk_nat(0),
+                Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &u64::MAX.to_le_bytes()),
+            ],
+        ),
+    ] {
+        assert!(
+            matches!(
+                execute(row, &fields),
+                Outcome::Complete(VmExit::Refused { .. })
+            ),
+            "{row}"
+        );
+    }
+}
+
+#[test]
 fn native_expr_substitution_orders_and_binder_depth_are_observable() {
     let body = Expr::app(bvar(0), Expr::app(bvar(1), bvar(2)));
     let args = [

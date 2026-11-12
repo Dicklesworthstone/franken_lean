@@ -1,10 +1,11 @@
-//! Native `Lean.Name.beq` (Init/Prelude.lean:4782), including arbitrary Nat
+//! Native Name equality and numeric construction, including arbitrary Nat
 //! components. Names are compared structurally, never by cached hash alone.
-//! Validate both complete borrowed carriers before comparing: even an alias
-//! cannot make a malformed cached field or an exhausted walk succeed.
+//! Validate complete carriers before comparing or using their hashes. Numeric
+//! construction retains the original Compat operands and every numeral limb.
 
 use super::{IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, expect_arity};
 use fln_core::lean_hash::{mix_hash, string_hash};
+use fln_rt::syntax_abi_generated as layout;
 use std::collections::HashSet;
 
 // Match the other native Name operations' bounded membrane. One allowance
@@ -17,11 +18,16 @@ const WORD_BYTES: usize = std::mem::size_of::<usize>();
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Intrinsic {
     Beq,
+    Num,
 }
 
 impl Intrinsic {
     pub(super) fn for_row(row: &str) -> Option<Self> {
-        (row == "extern:Lean.Name.beq").then_some(Self::Beq)
+        match row {
+            "extern:Lean.Name.beq" => Some(Self::Beq),
+            "mirror:Lean.Name.num._override" => Some(Self::Num),
+            _ => None,
+        }
     }
 
     pub(super) fn invoke(
@@ -30,9 +36,15 @@ impl Intrinsic {
         args: &[Obj],
     ) -> Result<IntrinsicResult, IntrinsicFailure> {
         expect_arity(row, args, 2)?;
-        let equal = equal(&args[0], &args[1], &mut Budget::default())?;
-        // lean_name_eq returns a uint8_t in the generated ABI contract.
-        Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(equal))))
+        match self {
+            Self::Beq => {
+                let equal = equal(&args[0], &args[1], &mut Budget::default())?;
+                // lean_name_eq returns a uint8_t in the generated ABI contract.
+                Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(equal))))
+            }
+            Self::Num => numeric(&args[0], &args[1], &mut Budget::constructor())
+                .map(IntrinsicResult::raw_object),
+        }
     }
 }
 
@@ -62,11 +74,18 @@ struct Part {
     stored_hash: Option<u64>,
 }
 
+struct CheckedName {
+    parts: Vec<Part>,
+    hash: u64,
+}
+
 struct Budget {
     nodes: u64,
     bytes: u64,
     max_nodes: u64,
     max_bytes: u64,
+    node_resource: &'static str,
+    byte_resource: &'static str,
 }
 
 impl Default for Budget {
@@ -76,19 +95,29 @@ impl Default for Budget {
             bytes: 0,
             max_nodes: MAX_NAME_NODES,
             max_bytes: MAX_NAME_BYTES,
+            node_resource: "name equality nodes",
+            byte_resource: "name equality bytes",
         }
     }
 }
 
 impl Budget {
+    fn constructor() -> Self {
+        Self {
+            node_resource: "name constructor nodes",
+            byte_resource: "name constructor bytes",
+            ..Self::default()
+        }
+    }
+
     fn node(&mut self) -> Result<(), IntrinsicFailure> {
         self.nodes = self.nodes.saturating_add(1);
-        limit("name equality nodes", self.max_nodes, self.nodes)
+        limit(self.node_resource, self.max_nodes, self.nodes)
     }
 
     fn bytes(&mut self, size: usize) -> Result<(), IntrinsicFailure> {
         self.bytes = self.bytes.saturating_add(size as u64);
-        limit("name equality bytes", self.max_bytes, self.bytes)
+        limit(self.byte_resource, self.max_bytes, self.bytes)
     }
 
     fn object(&mut self, value: &Obj) -> Result<(), IntrinsicFailure> {
@@ -114,12 +143,29 @@ fn equal(left: &Obj, right: &Obj, budget: &mut Budget) -> Result<bool, Intrinsic
     let left = checked_name(left, budget)?;
     let right = checked_name(right, budget)?;
     Ok(left
+        .parts
         .iter()
         .map(|part| &part.component)
-        .eq(right.iter().map(|part| &part.component)))
+        .eq(right.parts.iter().map(|part| &part.component)))
 }
 
-fn checked_name(value: &Obj, budget: &mut Budget) -> Result<Vec<Part>, IntrinsicFailure> {
+fn numeric(parent: &Obj, value: &Obj, budget: &mut Budget) -> Result<Obj, IntrinsicFailure> {
+    // Charge the new node before inspecting its inputs, and charge every
+    // retained input and copied magnitude before allocating the result.
+    budget.node()?;
+    let parent_hash = checked_name(parent, budget)?.hash;
+    budget.object(value)?;
+    let component = Component::Num(natural(value, budget)?);
+    let hash = mix_hash(parent_hash, component.hash());
+    budget.bytes(HEADER_BYTES + 2 * WORD_BYTES + 8)?;
+    Ok(Obj::mk_ctor(
+        layout::NAME_NUM_CTOR.tag,
+        vec![parent.clone_ref(), value.clone_ref()],
+        &hash.to_ne_bytes(),
+    ))
+}
+
+fn checked_name(value: &Obj, budget: &mut Budget) -> Result<CheckedName, IntrinsicFailure> {
     let mut cursor = value.clone_ref();
     let mut seen = HashSet::new();
     let mut parts = Vec::new();
@@ -194,7 +240,7 @@ fn checked_name(value: &Obj, budget: &mut Budget) -> Result<Vec<Part>, Intrinsic
             return Err(VmRefusal::InvalidCtorObject.into());
         }
     }
-    Ok(parts)
+    Ok(CheckedName { parts, hash })
 }
 
 fn natural(value: &Obj, budget: &mut Budget) -> Result<Vec<u64>, IntrinsicFailure> {
@@ -279,6 +325,97 @@ mod tests {
         assert!(matches!(
             equal(&value, &value, &mut Budget::default()),
             Ok(true)
+        ));
+    }
+
+    #[test]
+    fn numeric_construction_retains_arbitrary_naturals_and_parent_identity() {
+        let parent = inject_name(&Name::str(Name::anonymous(), "λ\0root"));
+        for limbs in [vec![], vec![u64::MAX], vec![7, 1], vec![8, 1, 3]] {
+            let number = Obj::mk_mpz(&limbs, false);
+            let Ok(name) = numeric(&parent, &number, &mut Budget::constructor()) else {
+                panic!("valid numeric Name construction must succeed");
+            };
+            assert_eq!(
+                name.try_ctor_child(0).unwrap().identity_token(),
+                parent.identity_token()
+            );
+            assert_eq!(
+                name.try_ctor_child(1).unwrap().identity_token(),
+                number.identity_token()
+            );
+            let component_hash = match limbs.as_slice() {
+                [] => 0,
+                [value] => *value,
+                _ => 17,
+            };
+            let expected = mix_hash(
+                Name::str(Name::anonymous(), "λ\0root").hash(),
+                component_hash,
+            );
+            assert_eq!(name.try_ctor_scalar_u64(2 * WORD_BYTES), Some(expected));
+            let Ok(checked) = checked_name(&name, &mut Budget::default()) else {
+                panic!("constructed numeric Name must validate");
+            };
+            assert_eq!(checked.hash, expected);
+            let Ok(child) = numeric(&name, &Obj::mk_nat(9), &mut Budget::constructor()) else {
+                panic!("a valid arbitrary-size numeric prefix must be accepted");
+            };
+            assert_eq!(
+                child.try_ctor_scalar_u64(2 * WORD_BYTES),
+                Some(mix_hash(expected, 9))
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_construction_refuses_malformed_inputs_and_charges_before_allocation() {
+        let zero = Obj::mk_nat(0);
+        for parent in [
+            Obj::mk_nat(1),
+            Obj::mk_string("not a name"),
+            Obj::mk_ctor(2, vec![Obj::mk_nat(0), Obj::mk_nat(1)], &0u64.to_ne_bytes()),
+        ] {
+            assert!(matches!(
+                numeric(&parent, &zero, &mut Budget::constructor()),
+                Err(IntrinsicFailure::Refused(VmRefusal::InvalidCtorObject))
+            ));
+        }
+        for number in [Obj::mk_mpz(&[1], true), Obj::mk_string("not a natural")] {
+            assert!(matches!(
+                numeric(&zero, &number, &mut Budget::constructor()),
+                Err(IntrinsicFailure::Refused(VmRefusal::InvalidCtorObject))
+            ));
+        }
+        assert!(matches!(
+            numeric(
+                &zero,
+                &zero,
+                &mut Budget {
+                    max_nodes: 1,
+                    ..Budget::constructor()
+                }
+            ),
+            Err(IntrinsicFailure::MirrorResource {
+                resource: "name constructor nodes",
+                allowed: 1,
+                observed: 2,
+            })
+        ));
+        assert!(matches!(
+            numeric(
+                &zero,
+                &zero,
+                &mut Budget {
+                    max_bytes: 0,
+                    ..Budget::constructor()
+                }
+            ),
+            Err(IntrinsicFailure::MirrorResource {
+                resource: "name constructor bytes",
+                allowed: 0,
+                ..
+            })
         ));
     }
 }

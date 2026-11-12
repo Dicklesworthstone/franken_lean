@@ -119,8 +119,11 @@ fn materialize_mirror(scratch: &ScratchRoot, real: &Path) -> PathBuf {
             .unwrap_or_else(|error| panic!("copy {relative}: {error}"));
     };
     let link = |relative: &str| {
-        std::os::unix::fs::symlink(real.join(relative), mirror.join(relative))
-            .unwrap_or_else(|error| panic!("link {relative}: {error}"));
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(real.join(relative), mirror.join(relative));
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(real.join(relative), mirror.join(relative));
+        linked.unwrap_or_else(|error| panic!("link {relative}: {error}"));
     };
     copy("scripts/extract/gen_extern_rows.py");
     copy("contracts/EXTERN_ROW_CONTRACT.txt");
@@ -133,11 +136,17 @@ fn materialize_mirror(scratch: &ScratchRoot, real: &Path) -> PathBuf {
     link("contracts/builtin_environment.002.tsv");
     link("contracts/builtin_partition.tsv");
     link("ABI_CONTRACT.md");
-    std::os::unix::fs::symlink(
+    #[cfg(unix)]
+    let linked_epoch = std::os::unix::fs::symlink(
         real.join("tribunal/epochs/v4.32.0"),
         mirror.join("tribunal/epochs/v4.32.0"),
-    )
-    .expect("link the epoch manifest directory");
+    );
+    #[cfg(windows)]
+    let linked_epoch = std::os::windows::fs::symlink_dir(
+        real.join("tribunal/epochs/v4.32.0"),
+        mirror.join("tribunal/epochs/v4.32.0"),
+    );
+    linked_epoch.expect("link the epoch manifest directory");
     mirror
 }
 

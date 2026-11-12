@@ -6,7 +6,7 @@ use crate::imported_ir::EntryArgument;
 use std::path::PathBuf;
 use std::process::Command;
 
-const TARGETS: [&str; 9] = [
+const TARGETS: [&str; 12] = [
     "Lean.Expr.data",
     "Lean.Expr.mkData",
     "Lean.Expr.mkAppData",
@@ -16,6 +16,9 @@ const TARGETS: [&str; 9] = [
     "Lean.Expr.instantiate1",
     "Lean.Expr.instantiate",
     "Lean.Expr.instantiateRev",
+    "Lean.Expr.replaceImpl",
+    "Lean.Expr.findImpl?",
+    "Lean.Expr.findExtImpl?",
 ];
 
 #[test]
@@ -91,9 +94,17 @@ fn live_pinned_expr_primitives_preserve_binders_arrays_data_and_boxed_calls() {
             .all(|declaration| declaration.to_display_string().starts_with("NativeExpr."))
     );
 
-    let bytes = std::fs::read(library.join("Lean/Expr.ir")).unwrap();
-    fln_olean::pin::check_pinned_header(&bytes).unwrap();
-    let prototypes = crate::decode_ir_artifact(&bytes, 32 * 1024 * 1024).unwrap();
+    let mut prototypes = IrModule::default();
+    for path in [
+        "Lean/Expr.ir",
+        "Lean/Util/ReplaceExpr.ir",
+        "Lean/Util/FindExpr.ir",
+    ] {
+        let bytes = std::fs::read(library.join(path)).unwrap();
+        fln_olean::pin::check_pinned_header(&bytes).unwrap();
+        let decoded = crate::decode_ir_artifact(&bytes, 32 * 1024 * 1024).unwrap();
+        prototypes.decls.extend(decoded.decls);
+    }
     let mut native = IrModule::default();
     for target in TARGETS {
         let row = crate::imported_ir::native_row(&name(target)).unwrap();
@@ -143,8 +154,29 @@ fn live_pinned_expr_primitives_preserve_binders_arrays_data_and_boxed_calls() {
             .validate_declaration(wrapper)
             .unwrap_or_else(|error| panic!("{target}: {error:?}; {wrapper:?}"));
         native.decls.push(wrapper.clone());
+        if matches!(
+            target,
+            "Lean.Expr.replaceImpl" | "Lean.Expr.findImpl?" | "Lean.Expr.findExtImpl?"
+        ) {
+            assert!(
+                module.decls.iter().any(|declaration| match declaration {
+                    IrDecl::Function { body, .. } => body.bodies().into_iter().any(|body| body
+                        .stmts
+                        .iter()
+                        .any(|statement| matches!(
+                            statement,
+                            IrStmt::VDecl {
+                                expr: IrExpr::Pap { function, args },
+                                ..
+                            } if function == &boxed && args.len() == 1
+                        ))),
+                    IrDecl::Extern { .. } => false,
+                }),
+                "{target} captured callback call was optimized away"
+            );
+        }
     }
-    let cases: Vec<(&str, Vec<u64>)> = vec![
+    let mut cases: Vec<(&str, Vec<u64>)> = vec![
         ("single", vec![0]),
         ("single", vec![3]),
         ("single", vec![42]),
@@ -178,6 +210,46 @@ fn live_pinned_expr_primitives_preserve_binders_arrays_data_and_boxed_calls() {
             vec![0x1234_5678_9abc_def0, 0xfedc_ba98_7654_3210],
         ),
     ];
+    for entry in ["replaceDirect", "replaceCaptured"] {
+        for (value, mode) in [(0, 0), (7, 0), (7, 1), (65_536, 0)] {
+            cases.push((entry, vec![value, mode]));
+        }
+    }
+    // Every Expr constructor is returned unchanged, replaced at the root,
+    // and rebuilt after replacing its Expr children. Non-expression fields
+    // remain visible in the user fingerprint, including nonempty metadata.
+    for kind in 0..12 {
+        for mode in 0..3 {
+            cases.push(("replaceKinds", vec![kind, 7, mode]));
+        }
+    }
+    for value in [0, 7, 65_536] {
+        cases.push(("replaceData", vec![value]));
+    }
+    for entry in ["findDirect", "findCaptured"] {
+        for (needle, mode) in [(7, 0), (7, 1), (8, 2), (9, 2)] {
+            cases.push((entry, vec![7, needle, mode]));
+        }
+    }
+    for entry in ["findExtDirect", "findExtCaptured"] {
+        for (needle, mode, tree) in [
+            (99, 2, 0), // Inner partial application is never inspected.
+            (99, 3, 0), // Function precedes application arguments.
+            (99, 4, 0), // Root match precedes its children.
+            (7, 0, 1),
+            (8, 0, 1),
+            (7, 1, 1), // A done lambda prunes both type and body.
+            (9, 1, 1), // Pruning preserves the outer argument search.
+            (99, 0, 0),
+            (7, 0, 0),
+            (8, 0, 0),
+            (9, 0, 0),
+        ] {
+            cases.push((entry, vec![7, needle, mode, tree]));
+        }
+    }
+    // Ordinary find still inspects the partial application skipped by findExt.
+    cases.push(("findPartialApplication", vec![7]));
     let mut oracle_source = source.to_owned();
     for (entry, args) in &cases {
         oracle_source.push_str(&format!("\n#eval NativeExpr.{entry}"));

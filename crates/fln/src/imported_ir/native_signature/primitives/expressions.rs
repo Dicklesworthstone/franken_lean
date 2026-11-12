@@ -67,12 +67,34 @@ pub(super) fn review(row: &GeneratedExternRow) -> Option<Review> {
                 &[IrType::Object, IrType::Object],
                 &IrType::Object,
             ),
+            "extern:Lean.Expr.replaceImpl" => (
+                "Lean.Expr.replaceImpl",
+                "lean_replace_expr",
+                &[IrType::Object, IrType::Object],
+                &IrType::Object,
+            ),
+            "extern:Lean.Expr.findImpl?" => (
+                "Lean.Expr.findImpl?",
+                "lean_find_expr",
+                &[IrType::Object, IrType::Object],
+                &IrType::TObject,
+            ),
+            "extern:Lean.Expr.findExtImpl?" => (
+                "Lean.Expr.findExtImpl?",
+                "lean_find_ext_expr",
+                &[IrType::Object, IrType::Object],
+                &IrType::TObject,
+            ),
             _ => return None,
         };
     Some(Review {
         name,
         symbol,
-        module: "Lean.Expr",
+        module: match row.id {
+            "extern:Lean.Expr.replaceImpl" => "Lean.Util.ReplaceExpr",
+            "extern:Lean.Expr.findImpl?" | "extern:Lean.Expr.findExtImpl?" => "Lean.Util.FindExpr",
+            _ => "Lean.Expr",
+        },
         kind: if row.id == "extern:Lean.Expr.data" {
             "defn"
         } else {
