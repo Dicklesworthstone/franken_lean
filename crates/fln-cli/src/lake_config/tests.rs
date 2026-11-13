@@ -74,6 +74,165 @@ fn native_lake_config_uses_prior_local_and_scoped_notation_tokens() {
 }
 
 #[test]
+fn native_lake_config_keeps_local_requirements_as_typed_terms_in_source_order() {
+    let source = r#"import Lake
+open System Lake DSL
+def sibling (name : String) : FilePath := FilePath.mk ("../" ++ name)
+namespace Config
+scoped notation "◆" s => sibling s
+end Config
+open scoped Config
+require shared from ◆ "shared library"
+def nextPath : FilePath := "../next"
+package application
+require "quoted-dependency" from nextPath
+@[default_target] lean_lib Application
+"#;
+    let parsed = parse(source.as_bytes()).unwrap_or_else(|error| panic!("{}", error.detail));
+    assert_eq!(parsed.config.requires.len(), 2);
+    assert_eq!(parsed.config.requires[0].name, "shared");
+    assert_eq!(parsed.config.requires[1].name, "«quoted-dependency»");
+    assert!(
+        parsed
+            .config
+            .requires
+            .iter()
+            .all(|item| item.path.is_none())
+    );
+    assert!(matches!(
+        parsed.fields[0].slot,
+        ConfigSlot::DependencyPath(0)
+    ));
+    assert!(matches!(
+        parsed.fields[1].slot,
+        ConfigSlot::DependencyPath(1)
+    ));
+    let first = parsed.program.find(&parsed.fields[0].declaration).unwrap();
+    let next = parsed.program.find("def nextPath").unwrap();
+    let second = parsed.program.find(&parsed.fields[1].declaration).unwrap();
+    assert!(first < next && next < second, "{}", parsed.program);
+    assert!(parsed.program.contains("open scoped Config"));
+    assert!(parsed.program.contains("◆ \"shared library\""));
+    for field in &parsed.fields {
+        assert!(parsed.program.contains(&format!(
+            "def {} : _root_.System.FilePath := (",
+            field.declaration
+        )));
+    }
+    let windows = parse(source.replace('\n', "\r\n").as_bytes())
+        .unwrap_or_else(|error| panic!("{}", error.detail));
+    assert_eq!(windows.config.requires, parsed.config.requires);
+    assert!(windows.program.contains("◆ \"shared library\""));
+}
+
+#[test]
+fn native_lake_config_distinguishes_term_with_from_dependency_options() {
+    for expression in [
+        "match true with | true => \"../yes\" | false => \"../no\"",
+        "(match true with | true => \"../yes\" | false => \"../no\")",
+        "System.FilePath.mk (let s := \"with from git\"; s)",
+    ] {
+        let source = format!(
+            "import Lake\nopen Lake DSL\npackage p\nrequire dep from {expression}\nlean_lib P\n"
+        );
+        let parsed = parse(source.as_bytes()).unwrap_or_else(|error| panic!("{}", error.detail));
+        assert!(parsed.program.contains(expression), "{}", parsed.program);
+    }
+    for expression in [
+        "\"../dep\" with {}",
+        "(match true with | true => \"../yes\" | false => \"../no\") with {}",
+    ] {
+        let source =
+            format!("import Lake\nopen Lake DSL\npackage p\nrequire dep from {expression}\n");
+        let error = parse(source.as_bytes()).unwrap_err();
+        assert_eq!(error.class, "unsupported", "{}", error.detail);
+        assert!(error.detail.contains("`with` options"), "{}", error.detail);
+    }
+}
+
+#[test]
+fn native_lake_config_requirements_keep_package_names_separate_from_binding_names() {
+    let source = "import Lake\nopen Lake DSL\npackage p\nrequire _root_.foo from \"../one\"\nrequire \"_root_.foo\" from \"../two\"\nrequire pkgConfig from \"../three\"\nrequire \"_package.name\" from \"../four\"\nrequire _package.other from \"../five\"\n";
+    let parsed = parse(source.as_bytes()).unwrap_or_else(|error| panic!("{}", error.detail));
+    assert_eq!(parsed.config.requires[0].name, "_root_.foo");
+    assert_eq!(parsed.config.requires[1].name, "«_root_.foo»");
+    assert_eq!(parsed.config.requires[2].name, "pkgConfig");
+    assert_eq!(parsed.config.requires[3].name, "«_package.name»");
+    assert_eq!(parsed.config.requires[4].name, "_package.other");
+    assert_eq!(parsed.requirement_names[0], Name::from_components(["foo"]));
+    assert_eq!(
+        parsed.requirement_names[1],
+        Name::from_components(["_root_.foo"])
+    );
+    assert_eq!(
+        parsed.requirement_names[3],
+        Name::from_components(["_package.name"])
+    );
+}
+
+#[test]
+fn native_lake_config_refuses_unsupported_or_ambiguous_requirements() {
+    for (body, diagnostic) in [
+        ("require dep", "explicit local `from` path"),
+        ("require dep @ \"1.0.0\" from \"../dep\"", "version"),
+        ("require dep from git \"../dep\"", "git dependency"),
+        (
+            "require \"owner\" / dep from \"../dep\"",
+            "scoped dependency",
+        ),
+        ("require dep from", "FilePath expression"),
+        (
+            "@[default_target] require dep from \"../dep\"",
+            "only @[default_target]",
+        ),
+        (
+            "namespace N\nrequire dep from \"../dep\"\nend N",
+            "top level",
+        ),
+        (
+            "require dep from \"../one\"\nrequire dep from \"../two\"",
+            "already declared",
+        ),
+        (
+            "lean_lib dep\nrequire dep from \"../dep\"",
+            "already declared",
+        ),
+        (
+            "require dep from \"../dep\"\nlean_lib dep",
+            "already declared",
+        ),
+        (
+            "require _root_.dep from \"../one\"\nrequire dep from \"../two\"",
+            "already declared",
+        ),
+        (
+            "require _root_.Dep from \"../dep\"\nlean_lib Dep",
+            "already declared",
+        ),
+        (
+            "lean_lib Dep\nrequire _root_.Dep from \"../dep\"",
+            "already declared",
+        ),
+        ("require _package from \"../dep\"", "already declared"),
+        ("require _package.name from \"../dep\"", "already declared"),
+        (
+            "require _root_._package from \"../dep\"",
+            "already declared",
+        ),
+        ("require _root_ from \"../dep\"", "not a declaration name"),
+    ] {
+        let source = format!("import Lake\nopen Lake DSL\npackage p\n{body}\n");
+        let error = parse(source.as_bytes()).unwrap_err();
+        assert!(
+            error.detail.contains(diagnostic),
+            "{body}: {}",
+            error.detail
+        );
+        assert!(!error.authority);
+    }
+}
+
+#[test]
 fn native_lake_config_comments_strings_and_nested_terms_are_not_commands() {
     let source = b"import Lake\nopen Lake DSL\n/- package counterfeit\nlean_lib Wrong -/\npackage actual where\n  srcDir := System.FilePath.mk (let s := \"lean_lib Wrong\"; if true then s else \"package bad\")\n/-- the real library -/\n@[default_target] lean_lib Actual\n";
     let parsed = parse(source).unwrap_or_else(|error| panic!("{}", error.detail));

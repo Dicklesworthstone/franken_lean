@@ -14,6 +14,7 @@ const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
 pub(super) struct Sources {
     pub(super) packages: Vec<Package>,
+    pub(super) configuration_imports: Vec<ImportPostureReport>,
     manifest: ManifestSelection,
     /// Files whose absence selected the supported configuration/resolution path.
     metadata_guards: Vec<(PathBuf, &'static str)>,
@@ -98,7 +99,7 @@ impl ManifestSelection {
         owner: &Path,
         requirement: &fln_lake::LakeRequire,
         metadata_guards: &mut Vec<(PathBuf, &'static str)>,
-    ) -> Result<PathBuf, Failure> {
+    ) -> Result<(PathBuf, ConfigurationSelection), Failure> {
         let Some(entries) = &self.entries else {
             let path = requirement.path.as_deref().ok_or_else(|| {
                 Failure::unsupported("only local path dependencies are supported")
@@ -106,14 +107,10 @@ impl ManifestSelection {
             let directory = dependency_root(owner, path)?;
             guard_metadata(
                 &directory,
-                &[
-                    "lake-manifest.json",
-                    ".lake/package-overrides.json",
-                    "lakefile.lean",
-                ],
+                &["lake-manifest.json", ".lake/package-overrides.json"],
                 metadata_guards,
             )?;
-            return Ok(directory);
+            return Ok((directory, ConfigurationSelection::Default));
         };
         let identity = fln_lake::canonical_package_name(&requirement.name);
         let entry = entries.get(&identity).ok_or_else(|| {
@@ -136,31 +133,29 @@ impl ManifestSelection {
             ))
         })?;
         let directory = dependency_root(&self.root, path)?;
-        match entry.config_file.as_str() {
-            "lakefile.toml" => {}
-            // At the pin, the extensionless default probes Lean before TOML.
-            // Never force TOML when that lookup would select executable Lean.
-            "lakefile" => {
-                guard_metadata(&directory, &["lakefile.lean"], metadata_guards)?;
-            }
+        let selection = match entry.config_file.as_str() {
+            "lakefile.toml" => ConfigurationSelection::Toml,
+            "lakefile.lean" => ConfigurationSelection::Lean,
+            "lakefile" => ConfigurationSelection::Default,
             file => {
                 return Err(Failure::unsupported(format!(
-                    "manifest dependency '{}' selects unsupported configuration '{file}'; local locked packages require lakefile.toml",
+                    "manifest dependency '{}' selects unsupported configuration '{file}'; local locked packages require lakefile.lean or lakefile.toml",
                     requirement.name,
                 )));
             }
-        }
+        };
         // In locked mode only the root manifest selects packages. Dependency
         // manifests and overrides do not replace entries in that root table.
-        Ok(directory)
+        Ok((directory, selection))
     }
 }
 
 pub(super) struct Package {
     pub(super) root: PathBuf,
     pub(super) config: LakeConfig,
-    /// Exact TOML input captured after semantic agreement with discovery.
-    configuration: Option<(PathBuf, String)>,
+    /// Exact input captured before parsing or checked evaluation.
+    configuration: (PathBuf, String),
+    default_toml: bool,
     libraries: Vec<Library>,
 }
 
@@ -170,12 +165,7 @@ impl Sources {
     pub(super) fn configuration_rows(&self, invocation_root: &Path) -> Vec<snapshot::ConfigRow> {
         self.packages
             .iter()
-            .filter_map(|package| {
-                package
-                    .configuration
-                    .as_ref()
-                    .map(|(path, digest)| (path, digest))
-            })
+            .map(|package| (&package.configuration.0, &package.configuration.1))
             .chain(
                 self.manifest
                     .digest
@@ -205,9 +195,20 @@ impl Sources {
             absent_metadata(root, relative)?;
         }
         for package in &self.packages {
-            let Some((path, expected)) = &package.configuration else {
-                continue;
-            };
+            let (path, expected) = &package.configuration;
+            if package.default_toml {
+                let lean = package.root.join("lakefile.lean");
+                check_path(&package.root, &lean, true)?;
+                if lean
+                    .try_exists()
+                    .map_err(|error| Failure::io(&lean, error))?
+                {
+                    return Err(Failure::input(format!(
+                        "Lake configuration selection changed during the build: {}",
+                        lean.display(),
+                    )));
+                }
+            }
             check_path(&package.root, path, false)?;
             let bytes = read_bounded(path, 64 * 1024, "Lake configuration")?;
             if snapshot::digest(&bytes) != *expected {
@@ -351,25 +352,30 @@ fn dependency_root(owner: &Path, path: &Path) -> Result<PathBuf, Failure> {
         .map_err(|error| Failure::io(&cursor, error))
 }
 
-pub(super) fn load(root: &Path, config: &LakeConfig) -> Result<Sources, Failure> {
+pub(super) fn load(
+    root: &Path,
+    configuration: Configuration,
+    evaluation: ConfigurationEvaluation,
+) -> Result<Sources, Failure> {
     let manifest = ManifestSelection::load(root)?;
     let mut metadata_guards = Vec::new();
-    let mut packages = vec![(root.to_path_buf(), config.clone())];
+    let config = &configuration.config;
     let mut selected = BTreeMap::from([(fln_lake::canonical_package_name(&config.name), 0)]);
     let mut edges = vec![Vec::new()];
     let mut requirements = 0usize;
     if !config.requires.is_empty() {
         guard_metadata(
             root,
-            &[".lake/package-overrides.json", "lakefile.lean"],
+            &[".lake/package-overrides.json"],
             &mut metadata_guards,
         )?;
     }
+    let mut packages = vec![(root.to_path_buf(), configuration)];
     let mut next = 0;
     while next < packages.len() {
-        let (owner, config) = &packages[next];
+        let (owner, configuration) = &packages[next];
         let owner = owner.clone();
-        let declared = config.requires.clone();
+        let declared = configuration.config.requires.clone();
         requirements = requirements
             .checked_add(declared.len())
             .filter(|count| *count <= MAX_REQUIREMENTS)
@@ -387,13 +393,14 @@ pub(super) fn load(root: &Path, config: &LakeConfig) -> Result<Sources, Failure>
             if packages.len() >= MAX_PACKAGES {
                 return Err(Failure::new("resource", "local package count exceeds 64"));
             }
-            let directory = manifest.dependency(&owner, requirement, &mut metadata_guards)?;
-            let config = executable_config(&directory)?;
-            // Lake's TOML loader uses the requirement name as package identity;
+            let (directory, selection) =
+                manifest.dependency(&owner, requirement, &mut metadata_guards)?;
+            let configuration = load_configuration(&directory, selection, evaluation)?;
+            // Lake's loader uses the requirement name as package identity;
             // the dependency's own name field does not override that selection.
             let index = packages.len();
             selected.insert(identity, index);
-            packages.push((directory, config));
+            packages.push((directory, configuration));
             edges.push(Vec::new());
             edges[next].push(index);
         }
@@ -416,56 +423,33 @@ pub(super) fn load(root: &Path, config: &LakeConfig) -> Result<Sources, Failure>
     if cyclic(0, &edges, &mut vec![0; packages.len()]) {
         return Err(Failure::input("local package dependency cycle"));
     }
+    let mut configuration_imports = Vec::new();
     let packages = packages
         .into_iter()
-        .map(|(root, config)| {
-            let configuration = capture_configuration(&root, &config)?;
+        .map(|(root, loaded)| {
+            let Configuration {
+                config,
+                input: configuration,
+                default_toml,
+                imports,
+            } = loaded;
+            configuration_imports.extend(imports);
             let libraries = library_sources(&root, &config)?;
             Ok(Package {
                 root,
                 config,
                 configuration,
+                default_toml,
                 libraries,
             })
         })
         .collect::<Result<_, Failure>>()?;
     let sources = Sources {
         packages,
+        configuration_imports,
         manifest,
         metadata_guards,
     };
     sources.verify_configurations()?;
     Ok(sources)
-}
-
-/// Bind the exact bytes after discovery, checking that they still select the
-/// same package graph and output routes as the configuration already parsed.
-/// Native Lean configurations remain outside read-only rebuild explanations.
-fn capture_configuration(
-    root: &Path,
-    expected: &LakeConfig,
-) -> Result<Option<(PathBuf, String)>, Failure> {
-    if expected.format != fln_lake::LakeConfigFormat::Toml {
-        return Ok(None);
-    }
-    let path = root.join("lakefile.toml");
-    check_path(root, &path, false)?;
-    let bytes = read_bounded(&path, 64 * 1024, "Lake configuration")?;
-    let text =
-        std::str::from_utf8(&bytes).map_err(|_| Failure::input("lakefile.toml is not UTF-8"))?;
-    let current = LakeConfig::parse_toml_for_build(text).map_err(|error| {
-        let class = if matches!(error, fln_lake::LakeParseError::UnsupportedBuildSetting(_)) {
-            "unsupported"
-        } else {
-            "input"
-        };
-        Failure::new(class, error.to_string())
-    })?;
-    if current != *expected {
-        return Err(Failure::input(format!(
-            "Lake configuration changed during local package discovery: {}",
-            path.display(),
-        )));
-    }
-    Ok(Some((path, snapshot::digest(&bytes))))
 }

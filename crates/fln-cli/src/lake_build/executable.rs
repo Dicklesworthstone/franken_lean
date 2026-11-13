@@ -9,9 +9,9 @@ use super::*;
 fn program(
     root: &Path,
     config: &LakeConfig,
+    sources: &local_dependencies::Sources,
     target: &str,
 ) -> Result<source_check::PackageProgram, Failure> {
-    let sources = local_dependencies::load(root, config)?;
     let executable = config
         .targets
         .iter()
@@ -104,24 +104,23 @@ pub(crate) fn run(
             let root = directory
                 .canonicalize()
                 .map_err(|error| Failure::io(&directory, error))?;
-            let loaded = if root.join("lakefile.toml").is_file() {
-                executable_config(&root).map(|config| (config, None))
-            } else {
-                load_configuration(&root, jobs, posture)
-            };
-            let (config, _) = match loaded {
-                Err(error) if error.class == "missing-configuration" && !json => {
-                    return Ok(MultiplexerOutput::failure(
-                        format!(
-                            "error: no such file or directory (error code: 2)\n  file: {}\n",
-                            root.join("lakefile.lean").display()
-                        ),
-                        1,
-                    ));
-                }
-                result => result?,
-            };
-            let program = program(&root, &config, &target)?;
+            let evaluation = Some((jobs, posture));
+            let loaded =
+                match load_configuration(&root, ConfigurationSelection::Default, evaluation) {
+                    Err(error) if error.class == "missing-configuration" && !json => {
+                        return Ok(MultiplexerOutput::failure(
+                            format!(
+                                "error: no such file or directory (error code: 2)\n  file: {}\n",
+                                root.join("lakefile.lean").display()
+                            ),
+                            1,
+                        ));
+                    }
+                    result => result?,
+                };
+            let config = loaded.config.clone();
+            let sources = local_dependencies::load(&root, loaded, evaluation)?;
+            let program = program(&root, &config, &sources, &target)?;
             Ok(source_check::run_package_main(
                 program, arguments, jobs, posture, vm_limits,
             ))

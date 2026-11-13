@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-struct Workspace(PathBuf);
+struct Workspace(PathBuf, Option<PathBuf>);
 
 impl Workspace {
     fn new() -> Self {
@@ -22,7 +22,7 @@ impl Workspace {
             NEXT.fetch_add(1, Ordering::Relaxed),
         ));
         std::fs::create_dir(&path).unwrap();
-        let workspace = Self(path);
+        let workspace = Self(path, None);
         workspace.write("root/lakefile.toml", ROOT);
         workspace.write("root/src/app/App/Main.lean", MAIN);
         workspace.write("left/lakefile.toml", LEFT);
@@ -44,19 +44,23 @@ impl Workspace {
     }
 
     fn run(&self, arguments: &[&str], reference: Option<&Path>) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_lake"))
-            .arg("--dir")
-            .arg(self.0.join("root"))
-            .args(["--jobs", "2"])
-            .args(arguments)
-            .current_dir(&self.0)
-            .env(
-                "LEAN_PATH",
-                reference.unwrap_or(&self.0.join("absent-imports")),
-            )
-            .env("FLN_IMPORT_REUSE_DIR", self.0.join("import-records"))
-            .output()
-            .unwrap()
+        Command::new(
+            self.1
+                .as_deref()
+                .unwrap_or(Path::new(env!("CARGO_BIN_EXE_lake"))),
+        )
+        .arg("--dir")
+        .arg(self.0.join("root"))
+        .args(["--jobs", "2"])
+        .args(arguments)
+        .current_dir(&self.0)
+        .env(
+            "LEAN_PATH",
+            reference.unwrap_or(&self.0.join("absent-imports")),
+        )
+        .env("FLN_IMPORT_REUSE_DIR", self.0.join("import-records"))
+        .output()
+        .unwrap()
     }
 
     fn no_products(&self) {
@@ -304,8 +308,6 @@ fn unlocked_dependency_metadata_and_root_overrides_are_never_ignored() {
         "right/lake-manifest.json",
         "root/.lake/package-overrides.json",
         "right/.lake/package-overrides.json",
-        "root/lakefile.lean",
-        "right/lakefile.lean",
     ] {
         let workspace = Workspace::new();
         workspace.write(relative, "pre-existing package selection\n");
@@ -317,6 +319,24 @@ fn unlocked_dependency_metadata_and_root_overrides_are_never_ignored() {
         assert_eq!(
             std::fs::read_to_string(workspace.0.join(relative)).unwrap(),
             "pre-existing package selection\n"
+        );
+        assert!(!workspace.0.join("import-records").exists());
+        workspace.no_products();
+    }
+    // Supported Lean configuration now takes precedence over TOML. A selected
+    // unsupported command must still refuse before any imports or products.
+    for relative in ["root/lakefile.lean", "right/lakefile.lean"] {
+        let workspace = Workspace::new();
+        let source = "import Lake\nopen Lake DSL\npackage selected\nscript unsupported := pure 0\n";
+        workspace.write(relative, source);
+        refusal(
+            workspace.run(&["--json", "exe", "runner"], None),
+            "unsupported",
+            "script",
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.0.join(relative)).unwrap(),
+            source
         );
         assert!(!workspace.0.join("import-records").exists());
         workspace.no_products();
@@ -869,7 +889,7 @@ fn extensionless_locked_configurations_keep_lean_before_toml_precedence() {
         .collect();
     workspace.write(
         "right/lakefile.lean",
-        "import Lake\nopen Lake DSL\npackage right\n",
+        "import Lake\nopen Lake DSL\npackage right\nscript unsupported := pure 0\n",
     );
     refusal(
         workspace.run(&["--json", "build", "+App.Top:olean"], None),
@@ -1130,16 +1150,12 @@ fn local_update_publishes_a_lock_for_checked_builds_and_preserves_it_on_refusal(
     workspace.write("root/lakefile.toml", &configuration);
     workspace.write(
         "root/lakefile.lean",
-        "import Lake\nopen Lake DSL\npackage program\n",
+        "import Lake\nopen Lake DSL\npackage program\nscript unsupported := pure 0\n",
     );
-    let unsupported = workspace.run(&["--json", "upgrade"], None);
-    assert_eq!(unsupported.status.code(), Some(5), "{unsupported:?}");
-    assert!(unsupported.stdout.is_empty(), "{unsupported:?}");
-    assert!(
-        std::str::from_utf8(&unsupported.stderr)
-            .unwrap()
-            .contains("\"status\":\"not_implemented\""),
-        "{unsupported:?}",
+    refusal(
+        workspace.run(&["--json", "upgrade"], None),
+        "unsupported",
+        "script",
     );
     unchanged();
 }
@@ -1162,5 +1178,247 @@ fn local_update_lock_drives_the_installed_native_executable() {
     );
     assert!(output.stderr.is_empty(), "{output:?}");
     assert_eq!(std::fs::read(manifest_path).unwrap(), manifest);
+    workspace.no_products();
+}
+
+const MIXED_ROOT: &str = r#"import Lake
+open System Lake DSL
+def sibling (suffix : String) : FilePath := FilePath.mk ("../" ++ suffix)
+package program where
+  srcDir := FilePath.mk "src"
+  buildDir := FilePath.mk "output"
+require left from sibling "left"
+lean_lib Bundle where
+  roots := #[Lean.Name.str Lean.Name.anonymous "App"]
+  srcDir := FilePath.mk "lib"
+lean_exe runner where
+  root := Lean.Name.str (Lean.Name.str Lean.Name.anonymous "App") "Main"
+  srcDir := FilePath.mk "app"
+"#;
+
+const MIXED_LEFT: &str = r#"import Lake
+open System Lake DSL
+def dependency (suffix : String) : FilePath := FilePath.mk ("../right/vendor/" ++ suffix)
+package declaredLeftName where
+  srcDir := FilePath.mk ("co" ++ "de")
+require shared from dependency "shared library"
+lean_lib Left where
+  roots := #[Lean.Name.str (Lean.Name.str Lean.Name.anonymous "Feature") "Left"]
+  srcDir := FilePath.mk "lib"
+"#;
+
+fn mixed_configuration_workspace() -> Workspace {
+    let mut workspace = artifact_workspace();
+    // Reuse records attest the running checker's exact bytes. Keep the
+    // installed executable fixed across this multi-command test even when a
+    // concurrent development build replaces Cargo's binary in between calls.
+    let binary = workspace.0.join("native-bin/lake");
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_lake"), &binary).unwrap();
+    workspace.1 = Some(binary);
+    // Both formats exist. The Lean files select a three-package graph; the
+    // TOML files deliberately describe the different original diamond.
+    workspace.write("root/lakefile.lean", MIXED_ROOT);
+    workspace.write("left/lakefile.lean", MIXED_LEFT);
+    workspace.write(
+        "root/src/lib/App/Top.lean",
+        "prelude\nimport Feature.Left\ndef App.combine (A : Type) (a : A) : A := Feature.left A a\n",
+    );
+    workspace
+}
+
+#[test]
+fn checked_lean_path_dependencies_build_update_and_match_the_pinned_resolver() {
+    let Some((lake, lib)) = reference() else {
+        return;
+    };
+    let workspace = mixed_configuration_workspace();
+    let report = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], Some(&lib)));
+    assert!(report.contains("\"modules_built\":3"), "{report}");
+    assert_eq!(
+        report.matches("\"trust\":\"reuse-verified\"").count(),
+        2,
+        "{report}"
+    );
+    let all_paths = artifact_paths(&workspace);
+    let paths = [&all_paths[0], &all_paths[1], &all_paths[3]];
+    let original: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let bytes = std::fs::read(path).unwrap();
+            fln_olean::region::OleanView::parse(&bytes).unwrap();
+            bytes
+        })
+        .collect();
+    assert!(!all_paths[2].exists());
+    workspace.no_manifests();
+    let snapshot = workspace.0.join("root/output/fln-build.snapshot");
+    let snapshot_text = std::fs::read_to_string(&snapshot).unwrap();
+    assert!(snapshot_text.contains("lakefile.lean"), "{snapshot_text}");
+    assert!(
+        snapshot_text.contains("left/lakefile.lean"),
+        "{snapshot_text}"
+    );
+    assert!(
+        snapshot_text.contains("shared library/lakefile.toml"),
+        "{snapshot_text}"
+    );
+    assert_eq!(
+        snapshot_text
+            .lines()
+            .filter(|line| line.starts_with("configuration\t"))
+            .count(),
+        3
+    );
+
+    let warm = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], Some(&lib)));
+    assert!(warm.contains("\"modules_cached\":3"), "{warm}");
+    assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
+
+    // No configuration is executed by build explain, including transitive
+    // Lean configuration. It must not pretend a recorded graph is current.
+    let explained = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["build", "explain", "--json", "--dir"])
+        .arg(workspace.0.join("root"))
+        .env("LEAN_PATH", workspace.0.join("absent-imports"))
+        .output()
+        .unwrap();
+    assert!(!explained.status.success(), "{explained:?}");
+    assert!(
+        String::from_utf8_lossy(&explained.stderr).contains("does not elaborate or execute"),
+        "{explained:?}"
+    );
+
+    let updated = build_success(workspace.run(&["--json", "update"], Some(&lib)));
+    assert!(updated.contains("\"packages_count\":2"), "{updated}");
+    assert_eq!(
+        updated.matches("\"admission\":\"reused\"").count(),
+        2,
+        "{updated}"
+    );
+    let manifest_path = workspace.0.join("root/lake-manifest.json");
+    let native_bytes = std::fs::read(&manifest_path).unwrap();
+    let native =
+        fln_lake::Manifest::parse_json(std::str::from_utf8(&native_bytes).unwrap()).unwrap();
+    assert_eq!(native.packages[0].name, "left");
+    assert_eq!(native.packages[0].config_file, "lakefile.lean");
+    assert_eq!(native.packages[1].name, "shared");
+    assert_eq!(native.packages[1].config_file, "lakefile.toml");
+
+    // The pin evaluates the same computed paths. Compare resolved identities
+    // and directories, allowing its textual relative-path normalization.
+    let pinned = Command::new(&lake)
+        .args(["--dir"])
+        .arg(workspace.0.join("root"))
+        .arg("update")
+        .env_remove("LEAN_PATH")
+        .output()
+        .unwrap();
+    assert!(pinned.status.success(), "{pinned:?}");
+    let pinned_manifest =
+        fln_lake::Manifest::parse_json(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert_eq!(native.name, pinned_manifest.name);
+    assert_eq!(native.packages.len(), pinned_manifest.packages.len());
+    for (actual, expected) in native.packages.iter().zip(&pinned_manifest.packages) {
+        assert_eq!(actual.name, expected.name);
+        assert_eq!(actual.entry_type, expected.entry_type);
+        assert_eq!(actual.config_file, expected.config_file);
+        assert_eq!(actual.inherited, expected.inherited);
+        let resolve = |entry: &fln_lake::ManifestPackageEntry| {
+            workspace
+                .0
+                .join("root")
+                .join(entry.dir.as_ref().unwrap())
+                .canonicalize()
+                .unwrap()
+        };
+        assert_eq!(resolve(actual), resolve(expected));
+    }
+    std::fs::write(&manifest_path, &native_bytes).unwrap();
+    let locked = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], Some(&lib)));
+    assert!(locked.contains("\"modules_cached\":3"), "{locked}");
+
+    // Consume the native logical artifacts in the actual pin.
+    workspace.write(
+        "UseMixed.lean",
+        "prelude\nimport App.Top\ndef useMixed (A : Type) (a : A) : A := App.combine A a\n",
+    );
+    let search = std::env::join_paths(paths.iter().map(|path| {
+        path.ancestors()
+            .find(|parent| parent.ends_with("lib/lean"))
+            .unwrap()
+    }))
+    .unwrap();
+    let consumer = Command::new(lake.with_file_name("lean"))
+        .arg(workspace.0.join("UseMixed.lean"))
+        .env("LEAN_PATH", search)
+        .output()
+        .unwrap();
+    assert!(consumer.status.success(), "{consumer:?}");
+
+    // Rejected dependency proofs and invalid computed paths cannot replace
+    // any previously published family or the last complete root manifest.
+    let good_snapshot = std::fs::read(&snapshot).unwrap();
+    workspace.write(
+        "right/vendor/shared library/sources/lib/Shared.lean",
+        "prelude\ntheorem invalid (p q : Prop) (hp : p) : q := hp\n",
+    );
+    let rejected = workspace.run(&["--json", "build", "+App.Top:olean"], Some(&lib));
+    assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+    assert!(rejected.stdout.is_empty(), "{rejected:?}");
+    for (path, bytes) in paths.iter().zip(&original) {
+        assert_eq!(std::fs::read(path).unwrap(), *bytes);
+    }
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), native_bytes);
+    assert_eq!(std::fs::read(&snapshot).unwrap(), good_snapshot);
+    workspace.write(
+        "right/vendor/shared library/sources/lib/Shared.lean",
+        CHECKED_SHARED,
+    );
+    workspace.write(
+        "root/lakefile.lean",
+        MIXED_ROOT.replace("sibling \"left\"", "sibling \"missing\""),
+    );
+    // A root lock continues to select its recorded directory for builds.
+    build_success(workspace.run(&["--json", "build", "+App.Top:olean"], Some(&lib)));
+    // An update resolves the new requirement and refuses its absent directory.
+    let missing = workspace.run(&["--json", "update"], Some(&lib));
+    assert_eq!(missing.status.code(), Some(1), "{missing:?}");
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), native_bytes);
+    for (path, bytes) in paths.iter().zip(&original) {
+        assert_eq!(std::fs::read(path).unwrap(), *bytes);
+    }
+}
+
+#[test]
+fn checked_lean_path_dependencies_execute_the_selected_program() {
+    let Some((_, lib)) = reference() else {
+        return;
+    };
+    let workspace = mixed_configuration_workspace();
+    workspace.write(
+        "right/vendor/shared library/sources/lib/Shared.lean",
+        SHARED_SOURCE,
+    );
+    workspace.write("left/code/lib/Feature/Left.lean", LEFT_SOURCE);
+    workspace.write(
+        "root/src/app/App/Main.lean",
+        concat!(
+            "prelude\nimport Feature.Left\n",
+            "def main (args : List String) : IO UInt32 := do\n",
+            "  for value in args do\n",
+            "    IO.println (Feature.left value)\n",
+            "  pure 17\n",
+        ),
+    );
+    let updated = build_success(workspace.run(&["--json", "update"], Some(&lib)));
+    assert!(updated.contains("\"packages_count\":2"), "{updated}");
+    let output = workspace.run(&["exe", "runner", "mixed"], Some(&lib));
+    assert_eq!(output.status.code(), Some(17), "{output:?}");
+    assert_eq!(
+        std::str::from_utf8(&output.stdout).unwrap(),
+        "left:chosen:mixed\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
     workspace.no_products();
 }

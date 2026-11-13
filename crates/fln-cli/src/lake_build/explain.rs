@@ -113,8 +113,9 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
     let root = directory
         .canonicalize()
         .map_err(|error| Failure::io(directory, error))?;
-    let config = config(&root)?;
-    let sources = local_dependencies::load(&root, &config)?;
+    let loaded = load_configuration(&root, ConfigurationSelection::Default, None)?;
+    let config = loaded.config.clone();
+    let sources = local_dependencies::load(&root, loaded, None)?;
     let path = root.join(&config.build_dir).join(snapshot::FILE);
     check_path(&root, &path, true)?;
     let relative = |path: &Path| {

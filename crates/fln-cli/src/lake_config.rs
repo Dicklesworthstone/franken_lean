@@ -1,4 +1,4 @@
-//! Native `package`, `lean_lib` and `lean_exe` configuration for checked builds and execution.
+//! Native `package`, local `require`, `lean_lib` and `lean_exe` configuration.
 //!
 //! Lake's commands elaborate field terms at their declared types, then its loader evaluates
 //! the resulting configurations (`Lake/DSL/DeclUtil.lean`, `Lake/Load/Lean/Eval.lean`). This
@@ -35,6 +35,7 @@ const LAKE_COMMANDS: [&str; 10] = [
 enum ConfigSlot {
     Source,
     Build,
+    DependencyPath(usize),
     TargetSource(usize),
     LibraryRoots(usize),
     ExecutableRoot(usize),
@@ -53,11 +54,15 @@ struct ParsedConfig {
     /// Ordinary source and generated, *typed* field definitions, in source order.
     program: String,
     fields: Vec<ConfigField>,
+    /// `require` itself declares these names in the pin's configuration world.
+    requirement_names: Vec<Name>,
 }
 
 pub(super) struct LoadedConfig {
     pub(super) config: LakeConfig,
     pub(super) imports: ImportPostureReport,
+    /// The exact input captured before checking and evaluating the configuration.
+    pub(super) source: Vec<u8>,
 }
 
 struct Tokens {
@@ -157,9 +162,9 @@ impl Tokens {
         Ok((at, attributes))
     }
 
-    fn name(&self, at: usize) -> Result<String, Failure> {
+    fn name(&self, at: usize) -> Result<Name, Failure> {
         match self.tokens.get(at).map(|token| &token.kind) {
-            Some(TokenKind::Ident(name)) if !name.is_anonymous() => Ok(name.to_display_string()),
+            Some(TokenKind::Ident(name)) if !name.is_anonymous() => Ok(name.clone()),
             Some(TokenKind::Literal(LiteralKind::Str)) => {
                 let value = self.spelling(at).and_then(decode_string).ok_or_else(|| {
                     Failure::input("lakefile.lean: malformed package or target name")
@@ -170,7 +175,7 @@ impl Tokens {
                     ));
                 }
                 // A string denotes one Name component, as expandIdentOrStrAsIdent does.
-                Ok(Name::str(Name::anonymous(), value).to_display_string())
+                Ok(Name::str(Name::anonymous(), value))
             }
             _ => Err(Failure::unsupported(
                 "lakefile.lean: package and targets currently require an explicit name",
@@ -206,6 +211,39 @@ fn fresh_name(source: &str, next: &mut usize) -> String {
             return name;
         }
     }
+}
+
+/// The supported Lake commands are top-level declarations. A leading structural
+/// `_root_` escapes the namespace when the pin elaborates their binding, but is
+/// retained in `Dependency.name` by Require.lean's separate quotation. A string
+/// name such as "_root_.foo" has one component and must not be split here.
+fn declaration_identity(name: &Name) -> Result<Name, Failure> {
+    let mut cursor = name.clone();
+    let mut suffix = Vec::new();
+    while !cursor.parent().is_anonymous() {
+        suffix.push(cursor.clone());
+        cursor = cursor.parent();
+    }
+    if cursor != Name::from_components(["_root_"]) {
+        return Ok(name.clone());
+    }
+    if suffix.is_empty() {
+        return Err(Failure::input(
+            "lakefile.lean: `_root_` alone is not a declaration name",
+        ));
+    }
+    let mut result = Name::anonymous();
+    for component in suffix.iter().rev() {
+        result = match component.leaf_view() {
+            fln_core::name::LeafView::Str(value) => Name::str(result, value),
+            fln_core::name::LeafView::Num(value) if component.component_overflowed() => {
+                Name::num_overflowing(result, value)
+            }
+            fln_core::name::LeafView::Num(value) => Name::num(result, value),
+            fln_core::name::LeafView::Anonymous => unreachable!("suffix contains named components"),
+        };
+    }
+    Ok(result)
 }
 
 /// Lake's supported `where` fields, retaining each expression's original bytes. Delimiters
@@ -353,26 +391,33 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
         },
         program: String::new(),
         fields: Vec::new(),
+        requirement_names: Vec::new(),
     };
     let mut scope_depth = 0usize;
     let mut lake_open = false;
     let mut dsl_open = false;
     let mut next = 0;
-    let mut target_names = BTreeSet::new();
+    // Package.lean emits these two unhygienic declarations regardless of the
+    // package's public name. Its `pkgConfig` definition is hygienic and does not
+    // reserve the user's ordinary `pkgConfig` identifier.
+    let mut declaration_names = BTreeSet::from([
+        Name::from_components(["_package"]),
+        Name::from_components(["_package", "name"]),
+    ]);
     for (_, command) in commands {
         let active = grammar.grammar();
         let tokens = Tokens::read(command, active.table())?;
         let (head, attributes) = tokens.head()?;
         let keyword = tokens.spelling(head).unwrap_or("");
         if LAKE_COMMANDS.contains(&keyword) {
-            if !matches!(keyword, "package" | "lean_lib" | "lean_exe") {
+            if !matches!(keyword, "package" | "require" | "lean_lib" | "lean_exe") {
                 return Err(Failure::unsupported(format!(
                     "lakefile.lean: `{keyword}` configuration is not implemented"
                 )));
             }
             if !dsl_open || scope_depth != 0 {
                 return Err(Failure::unsupported(
-                    "lakefile.lean: package and targets must be at top level after `open Lake DSL`",
+                    "lakefile.lean: package, requirements and targets must be at top level after `open Lake DSL`",
                 ));
             }
             let mut default_target = false;
@@ -387,7 +432,129 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                 }
                 default_target = true;
             }
-            let declaration = tokens.name(head + 1)?;
+            let declaration_name = tokens.name(head + 1)?;
+            // This is a package/target identity, not a diagnostic display. The
+            // unescaped display would merge the string "a.b" with identifier
+            // a.b before the dependency resolver ever sees either name.
+            let declaration = fln_core::name::identifier::to_identifier_string(
+                &declaration_name,
+                MAX_CONFIG_BYTES,
+            )
+            .map_err(|error| match error {
+                fln_core::name::identifier::NameRenderError::ByteBudgetExceeded { .. } => {
+                    Failure::new(
+                        "resource",
+                        "lakefile.lean: configuration name exceeds 64 KiB",
+                    )
+                }
+                fln_core::name::identifier::NameRenderError::OverflowedComponent => {
+                    Failure::unsupported(
+                        "lakefile.lean: configuration name has an overflowing numeric component",
+                    )
+                }
+            })?;
+            if keyword == "require" {
+                match tokens.spelling(head + 2) {
+                    Some("/") => {
+                        return Err(Failure::unsupported(
+                            "lakefile.lean: scoped dependency requirements are not implemented",
+                        ));
+                    }
+                    Some("@") => {
+                        return Err(Failure::unsupported(
+                            "lakefile.lean: dependency version requirements are not implemented",
+                        ));
+                    }
+                    Some("from") => {}
+                    _ => {
+                        return Err(Failure::unsupported(
+                            "lakefile.lean: requirements need an explicit local `from` path; registry dependencies are not implemented",
+                        ));
+                    }
+                }
+                if tokens.spelling(head + 3) == Some("git") {
+                    return Err(Failure::unsupported(
+                        "lakefile.lean: git dependency requirements are not implemented",
+                    ));
+                }
+                if head + 3 == tokens.tokens.len() {
+                    return Err(Failure::input(
+                        "lakefile.lean: a local requirement needs a FilePath expression after `from`",
+                    ));
+                }
+                let identity = declaration_identity(&declaration_name)?;
+                if !declaration_names.insert(identity.clone()) {
+                    return Err(Failure::input(format!(
+                        "lakefile.lean: configuration declaration `{declaration}` is already declared"
+                    )));
+                }
+                let generated = fresh_name(original, &mut next);
+                let expression_start = tokens.offset(head + 3);
+                let expression = std::str::from_utf8(&command[expression_start..])
+                    .map_err(|_| Failure::input("lakefile.lean: expression is not UTF-8"))?;
+                let definition =
+                    format!("\ndef {generated} : _root_.System.FilePath := (\n{expression}\n)\n");
+                // `with` may belong to a real term (for example a match), so
+                // never split an expression on the keyword alone. A complete
+                // term followed by `with` is the unimplemented options clause.
+                if tokens.tokens[head + 3..]
+                    .iter()
+                    .enumerate()
+                    .any(|(at, _)| tokens.spelling(head + 3 + at) == Some("with"))
+                    && with_grammar(&active, || {
+                        fln_parse::parse_source_command(definition.as_bytes())
+                    })
+                    .is_err()
+                {
+                    let mut parsed_bytes = definition.len();
+                    for at in head + 3..tokens.tokens.len() {
+                        if tokens.spelling(at) != Some("with") {
+                            continue;
+                        }
+                        let prefix =
+                            std::str::from_utf8(&command[expression_start..tokens.offset(at)])
+                                .map_err(|_| {
+                                    Failure::input("lakefile.lean: expression is not UTF-8")
+                                })?;
+                        let prefix =
+                            format!("def {generated} : _root_.System.FilePath := (\n{prefix}\n)");
+                        parsed_bytes = parsed_bytes
+                            .checked_add(prefix.len())
+                            .filter(|bytes| *bytes <= 4 * MAX_CONFIG_BYTES)
+                            .ok_or_else(|| {
+                                Failure::new(
+                                    "resource",
+                                    "lakefile.lean: requirement syntax exceeds the bounded options-clause parsing budget",
+                                )
+                            })?;
+                        if with_grammar(&active, || {
+                            fln_parse::parse_source_command(prefix.as_bytes())
+                        })
+                        .is_ok()
+                        {
+                            return Err(Failure::unsupported(
+                                "lakefile.lean: dependency `with` options are not implemented",
+                            ));
+                        }
+                    }
+                }
+                let index = parsed.config.requires.len();
+                parsed.requirement_names.push(identity);
+                parsed.config.requires.push(fln_lake::LakeRequire {
+                    name: declaration.clone(),
+                    path: None,
+                    url: None,
+                    rev: None,
+                    subdir: None,
+                });
+                parsed.program.push_str(&definition);
+                parsed.fields.push(ConfigField {
+                    slot: ConfigSlot::DependencyPath(index),
+                    declaration: generated,
+                    label: format!("require {declaration}.path"),
+                });
+                continue;
+            }
             let target = if keyword == "package" {
                 if !parsed.config.name.is_empty() {
                     return Err(Failure::input(
@@ -404,7 +571,7 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                 }
                 // The existing module planner accepts textual path components only.
                 name(&declaration)?;
-                if !target_names.insert(declaration.clone()) {
+                if !declaration_names.insert(declaration_identity(&declaration_name)?) {
                     return Err(Failure::input(format!(
                         "lakefile.lean: target `{declaration}` is already declared"
                     )));
@@ -660,6 +827,28 @@ fn evaluate(
             }
         })?;
     let checked = complete(checked, "checking configuration")?;
+    for name in &parsed.requirement_names {
+        // The adapter lowers a requirement's selected path, not Lake's
+        // Dependency structure. Keep the original declaration's collision
+        // semantics against ordinary source and imported declarations.
+        if checked.engine.environment().contains(name) {
+            return Err(Failure::input(format!(
+                "lakefile.lean: requirement `{}` is already declared",
+                name.to_display_string(),
+            )));
+        }
+        if !name.parent().is_anonymous() {
+            // The admitted FilePath world intentionally does not import Lake's
+            // implementation. It cannot certify that a new hierarchical
+            // binding avoids every name imported by the pin's `import Lake`.
+            // Keep this capability gap explicit; a quoted single-component
+            // package name and `_root_.simple` remain fully distinguishable.
+            return Err(Failure::unsupported(format!(
+                "lakefile.lean: hierarchical requirement declaration `{}` needs the full Lake imported-name inventory",
+                name.to_display_string(),
+            )));
+        }
+    }
     for field in parsed.fields {
         let mut next = 0;
         let projection = loop {
@@ -742,13 +931,22 @@ fn evaluate(
             }
         };
         let path = PathBuf::from(value);
+        if let ConfigSlot::DependencyPath(index) = field.slot {
+            // Local requirements may name sibling packages or absolute paths.
+            // Package discovery checks each filesystem component before any
+            // normalization, including `..`, and enforces its own bounds.
+            parsed.config.requires[index].path = Some(path);
+            continue;
+        }
         relative_directory(&path)?;
         match field.slot {
             ConfigSlot::Source => parsed.config.src_dir = path,
             ConfigSlot::Build => parsed.config.build_dir = path,
             ConfigSlot::TargetSource(index) => parsed.config.targets[index].src_dir = Some(path),
-            ConfigSlot::LibraryRoots(_) | ConfigSlot::ExecutableRoot(_) => {
-                unreachable!("module roots were read above")
+            ConfigSlot::DependencyPath(_)
+            | ConfigSlot::LibraryRoots(_)
+            | ConfigSlot::ExecutableRoot(_) => {
+                unreachable!("module roots and dependency paths were read above")
             }
         }
     }
@@ -764,7 +962,17 @@ pub(super) fn load(
     let path = root.join("lakefile.lean");
     check_path(root, &path, false)?;
     let bytes = read_bounded(&path, MAX_CONFIG_BYTES, "Lake configuration")?;
-    let parsed = parse(&bytes)?;
+    load_source(root, &bytes, jobs, posture)
+}
+
+pub(super) fn load_source(
+    root: &Path,
+    bytes: &[u8],
+    jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
+) -> Result<LoadedConfig, Failure> {
+    let parsed = parse(bytes)?;
+    let source = bytes.to_vec();
     // No Lake implementation is imported or executed. This is the actual logical FilePath
     // and its Init dependency closure, checked by the same two seats as module compilation.
     let base = source_check::load_build_base(
@@ -802,6 +1010,7 @@ pub(super) fn load(
     Ok(LoadedConfig {
         config,
         imports: base.1,
+        source,
     })
 }
 
