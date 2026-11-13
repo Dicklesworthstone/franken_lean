@@ -292,7 +292,7 @@ rev = "v4.32.0"
     .unwrap();
     let manifest = fln_lake::update_manifest(&bare).expect("update with no requirements");
     assert_eq!(manifest.name, "math_project");
-    assert_eq!(manifest.version, "1.1.0");
+    assert_eq!(manifest.version, "1.2.0");
     assert!(manifest.packages.is_empty());
     let loaded = fln_lake::Manifest::load_from_dir(&bare)
         .expect("load manifest")
@@ -307,12 +307,14 @@ rev = "v4.32.0"
         name: "mathlib".to_owned(),
         scope: String::new(),
         entry_type: "git".to_owned(),
+        dir: None,
         url: Some("https://github.com/leanprover-community/mathlib4.git".to_owned()),
         rev: Some("81a5d257c8e410db227a6665ed08f64fea08e997".to_owned()),
         input_rev: Some("v4.32.0".to_owned()),
         subdir: None,
         inherited: false,
         config_file: "lakefile.toml".to_owned(),
+        manifest_file: Some(PathBuf::from("lake-manifest.json")),
     });
     let round_trip = fresh_temp_dir("manifest-round-trip-test");
     resolved.save_to_dir(&round_trip).expect("save manifest");
@@ -578,4 +580,273 @@ fn clean_removes_the_configured_build_directory_and_nothing_else() {
     let err = clean(&lean_only).unwrap_err();
     assert!(matches!(err, LakeCleanError::BuildDirUnknown(_)) && err.is_unavailable());
     assert!(kept.exists());
+}
+
+#[test]
+fn manifests_preserve_local_paths_and_every_json_string_field() {
+    let input = r#"{
+        "packages": [
+            {"name":"local","type":"path","dir":"../quoted\"\\dir/\ud83e\udd80",
+             "scope":"owner\\name","inherited":false,
+             "configFile":"config\".toml","manifestFile":"locks\\manifest.json"},
+            {"name":"remote","type":"git","url":"https://example.invalid/\"repo\\name",
+             "rev":"actual\\revision","inputRev":"release\nbranch","subDir":"sub\tpath",
+             "inherited":true,"configFile":"lakefile.toml"}
+        ],
+        "name":"«workspace\"name»","version":"1.2.0",
+        "lakeDir":"build\\cache","packagesDir":null,"fixedToolchain":true
+    }"#;
+    let manifest = fln_lake::Manifest::parse_json(input).unwrap();
+    assert_eq!(manifest.name, "«workspace\"name»");
+    assert_eq!(manifest.packages_dir, None);
+    assert!(manifest.fixed_toolchain);
+    assert_eq!(
+        manifest.packages[0].dir,
+        Some(PathBuf::from("../quoted\"\\dir/🦀")),
+    );
+    assert_eq!(manifest.packages[1].input_rev.as_deref(), Some("release\nbranch"));
+    assert_eq!(manifest.packages[1].subdir.as_deref(), Some("sub\tpath"));
+    assert_eq!(
+        fln_lake::Manifest::parse_json(&manifest.to_json()).unwrap(),
+        manifest,
+    );
+}
+
+#[test]
+fn manifest_fields_are_scoped_and_duplicate_keys_follow_the_pin() {
+    let manifest = fln_lake::Manifest::parse_json(
+        r#"{"packages":[{"name":"dependency","type":"path","dir":"../dep","inherited":false}],
+            "metadata":{"name":"not-the-workspace","version":99},
+            "name":"first","na\u006de":"selected","version":7}"#,
+    )
+    .unwrap();
+    assert_eq!(manifest.name, "selected");
+    assert_eq!(manifest.packages[0].name, "dependency");
+    assert_eq!(manifest.version, "7");
+    assert_eq!(
+        fln_lake::Manifest::parse_json(&manifest.to_json()).unwrap(),
+        manifest,
+    );
+
+    let anonymous = fln_lake::Manifest::parse_json(
+        r#"{"version":7,"packages":[{"name":"dependency","type":"path","dir":".","inherited":false}]}"#,
+    )
+    .unwrap();
+    assert_eq!(anonymous.name, "[anonymous]");
+}
+
+#[test]
+fn manifest_defaults_match_the_pins_null_and_missing_fields() {
+    let manifest = fln_lake::Manifest::parse_json(
+        r#"{"schemaVersion":"1.2.0-custom","name":null,"lakeDir":null,
+            "fixedToolchain":null,"packagesDir":null,
+            "packages":[{"name":"dep","type":"path","dir":"../dep","inherited":false,
+                         "scope":null,"configFile":null,"manifestFile":null}]}"#,
+    )
+    .unwrap();
+    assert_eq!(manifest.name, "[anonymous]");
+    assert_eq!(manifest.lake_dir, PathBuf::from(".lake"));
+    assert!(!manifest.fixed_toolchain);
+    assert_eq!(manifest.packages_dir, None);
+    let package = &manifest.packages[0];
+    assert_eq!(package.scope, "");
+    assert_eq!(package.config_file, "lakefile");
+    assert_eq!(package.manifest_file, Some(PathBuf::from("lake-manifest.json")));
+    assert!(
+        fln_lake::Manifest::parse_json(r#"{"version":"1.99.0","packages":null}"#)
+            .unwrap()
+            .packages
+            .is_empty()
+    );
+    assert!(
+        fln_lake::Manifest::parse_json(r#"{"version":null,"schemaVersion":7}"#).is_err(),
+        "a present invalid version must not fall back to schemaVersion",
+    );
+}
+
+#[test]
+fn malformed_manifests_cannot_become_partial_or_empty_dependency_locks() {
+    for input in [
+        r#""name":"not-an-object""#,
+        r#"{"version":7,"name":"p"} trailing"#,
+        r#"{"version":7,"packages":[}"#,
+        r#"{"version":7,"packages":[{"name":"dep"}]}"#,
+        r#"{"version":7,"packages":[{"name":"dep","type":"path","inherited":false}]}"#,
+        r#"{"version":7,"packages":[{"name":"dep","type":"path","dir":4,"inherited":false}]}"#,
+        r#"{"version":7,"packages":[{"name":"dep","type":"path","dir":".","inherited":null}]}"#,
+        r#"{"version":7,"packages":[{"name":"dep","type":"path","dir":"."}]}"#,
+        r#"{"version":7,"packages":[{"name":"dep","type":"git","url":"remote","inherited":false}]}"#,
+        r#"{"version":7,"packages":[null]}"#,
+        r#"{"version":7,"packages":{}}"#,
+        r#"{"version":7,"fixedToolchain":"false"}"#,
+        r#"{"version":7,"name":"\ud800"}"#,
+        r#"{"version":7,"name":"\udc00"}"#,
+        r#"{"version":7,"name":"\ud800\u0041"}"#,
+        r#"{"version":7,"name":"\q"}"#,
+        r#"{"version":7,}"#,
+        r#"{"version":7,"extension":[1,]}"#,
+        r#"{"version":7,"extension":01}"#,
+        r#"{"version":7,"extension":1e}"#,
+        r#"{"version":7,"extension":true false}"#,
+    ] {
+        assert!(
+            matches!(
+                fln_lake::Manifest::parse_json(input),
+                Err(fln_lake::ManifestParseError::Invalid(_))
+            ),
+            "{input}",
+        );
+    }
+    for version in [
+        "true", "null", "-1", "7.5", "\"2.0.0\"", "\"1.2\"", "\"1.2.0-\"",
+        "\"1.2.0-bad suffix\"", "\"1.2.0+metadata\"", "4", "5", "6",
+    ] {
+        assert!(
+            fln_lake::Manifest::parse_json(&format!("{{\"version\":{version}}}")).is_err(),
+            "{version}",
+        );
+    }
+}
+
+#[test]
+fn manifest_budget_exhaustion_is_distinct_from_invalid_json() {
+    let deep = format!(
+        "{{\"version\":7,\"extension\":{}null{}}}",
+        "[".repeat(70),
+        "]".repeat(70),
+    );
+    let many = format!(
+        "{{\"version\":7,\"extension\":[{}]}}",
+        vec!["null"; 100_001].join(","),
+    );
+    for input in [deep, many, " ".repeat(1024 * 1024 + 1)] {
+        assert!(
+            matches!(
+                fln_lake::Manifest::parse_json(&input),
+                Err(fln_lake::ManifestParseError::Resource(_))
+            ),
+        );
+    }
+    let directory = fresh_temp_dir("manifest-budget");
+    std::fs::write(
+        directory.join("lake-manifest.json"),
+        " ".repeat(1024 * 1024 + 1),
+    )
+    .unwrap();
+    assert!(matches!(
+        fln_lake::Manifest::load_from_dir(&directory),
+        Err(fln_lake::LakeUpdateError::Resource(_)),
+    ));
+}
+
+#[test]
+fn manifest_publication_preserves_old_data_and_unowned_temporary_files() {
+    let directory = fresh_temp_dir("manifest-publication");
+    let mut manifest = fln_lake::Manifest::new("original");
+    manifest.save_to_dir(&directory).unwrap();
+    let destination = directory.join("lake-manifest.json");
+    let original = std::fs::read(&destination).unwrap();
+    let old_temporary = directory.join(".lake-manifest.json.tmp");
+    std::fs::write(&old_temporary, b"another writer's data").unwrap();
+
+    manifest.packages.push(fln_lake::ManifestPackageEntry {
+        name: "invalid".to_owned(),
+        scope: String::new(),
+        entry_type: "path".to_owned(),
+        dir: None,
+        url: None,
+        rev: None,
+        input_rev: None,
+        subdir: None,
+        inherited: false,
+        config_file: "lakefile.toml".to_owned(),
+        manifest_file: Some(PathBuf::from("lake-manifest.json")),
+    });
+    assert!(manifest.save_to_dir(&directory).is_err());
+    assert_eq!(std::fs::read(&destination).unwrap(), original);
+    assert_eq!(
+        std::fs::read(&old_temporary).unwrap(),
+        b"another writer's data",
+    );
+
+    manifest.packages.clear();
+    manifest.name = "replacement".to_owned();
+    manifest.save_to_dir(&directory).unwrap();
+    assert_eq!(
+        fln_lake::Manifest::load_from_dir(&directory).unwrap().unwrap().name,
+        "replacement",
+    );
+    assert_eq!(
+        std::fs::read(&old_temporary).unwrap(),
+        b"another writer's data",
+    );
+
+    let blocked = fresh_temp_dir("manifest-directory-destination");
+    std::fs::create_dir(blocked.join("lake-manifest.json")).unwrap();
+    std::fs::write(blocked.join("lake-manifest.json/retained"), b"keep").unwrap();
+    assert!(manifest.save_to_dir(&blocked).is_err());
+    assert_eq!(
+        std::fs::read(blocked.join("lake-manifest.json/retained")).unwrap(),
+        b"keep",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn manifest_publication_does_not_follow_old_temporary_or_destination_symlinks() {
+    let directory = fresh_temp_dir("manifest-symlinks");
+    let outside = fresh_temp_dir("manifest-outside").join("sentinel");
+    std::fs::write(&outside, b"outside data").unwrap();
+    std::os::unix::fs::symlink(&outside, directory.join(".lake-manifest.json.tmp")).unwrap();
+    fln_lake::Manifest::new("safe").save_to_dir(&directory).unwrap();
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside data");
+
+    let blocked = fresh_temp_dir("manifest-destination-symlink");
+    std::os::unix::fs::symlink(&outside, blocked.join("lake-manifest.json")).unwrap();
+    assert!(fln_lake::Manifest::new("refused").save_to_dir(&blocked).is_err());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside data");
+}
+
+#[test]
+fn manifest_package_names_follow_the_pinned_identifier_grammar() {
+    for (input, expected) in [
+        ("Pkg.Sub", "Pkg.Sub"),
+        ("«with spaces»", "«with spaces»"),
+        ("«a.b»", "«a.b»"),
+        ("Pkg.000", "Pkg.0"),
+        ("Pkg.«»", "Pkg.«»"),
+        ("«plain»", "plain"),
+        ("café", "café"),
+        ("α", "α"),
+        ("Pkg.184467440737095516160", "Pkg.184467440737095516160"),
+    ] {
+        let text = format!("{{\"version\":7,\"name\":\"{input}\"}}");
+        assert_eq!(fln_lake::Manifest::parse_json(&text).unwrap().name, expected);
+    }
+    for name in ["", ".", "a.", ".a", "a..b", "a-b", "123abc", "«unfinished", "λ"] {
+        let text = format!("{{\"version\":7,\"name\":\"{name}\"}}");
+        assert!(fln_lake::Manifest::parse_json(&text).is_err(), "{name}");
+    }
+}
+
+#[test]
+fn toml_package_identities_remain_distinct_from_json_name_spellings() {
+    for (source, expected) in [
+        ("plain", "plain"),
+        ("foo-bar", "«foo-bar»"),
+        ("with spaces", "«with spaces»"),
+        ("Pkg.000", "Pkg.0"),
+        ("Pkg.«»", "Pkg.«»"),
+        ("[anonymous]", "«[anonymous]»"),
+        ("", "«»"),
+        ("a..b", "«a..b»"),
+    ] {
+        assert_eq!(fln_lake::canonical_package_name(source), expected);
+        let manifest = fln_lake::Manifest::new(source);
+        assert_eq!(manifest.name, expected);
+        assert_eq!(
+            fln_lake::Manifest::parse_json(&manifest.to_json()).unwrap().name,
+            expected,
+        );
+    }
 }
