@@ -21379,6 +21379,91 @@ fn fln_4hol_units_accept_within_their_step_ceilings() {
     }
 }
 
+/// The three S26 K1 corpus regression units accept within their step ceilings
+/// at `Budget::DEFAULT` (`fln-frontier-k1-step-stops-since-s25-uvm6`).
+#[ignore = "cost: three ~2,600..2,905-module Mathlib closure decodes (~20 min release); on-demand regression lane for bead fln-frontier-k1-step-stops-since-s25-uvm6"]
+#[test]
+fn s26_k1_step_regression_units_accept_within_their_step_ceilings() {
+    let reference_lib =
+        reference_lib().expect("pinned toolchain required for the S26 K1 unit regression");
+    let roots = chosen_set_roots(&reference_lib);
+    assert!(
+        roots.len() > 1,
+        "FLN_MATHLIB_CORPUS is required to resolve Mathlib modules for the S26 K1 regression lane"
+    );
+    for (chosen, selector, ceiling) in [
+        (
+            "Mathlib.Algebra.Polynomial.Derivative",
+            "Polynomial.iterate_derivative_derivative_mul_X",
+            2_000_000u64,
+        ),
+        (
+            "Mathlib.RingTheory.Morita.Matrix",
+            "MatrixModCat.unitIso._proof_2",
+            2_000_000u64,
+        ),
+        (
+            "Mathlib.Algebra.Category.ModuleCat.Monoidal.Basic",
+            "ModuleCat.monoidalCategory._proof_4",
+            2_000_000u64,
+        ),
+    ] {
+        let inventory = closure_inventory(&roots, chosen)
+            .unwrap_or_else(|error| panic!("{chosen}: closure inventory failed: {error}"));
+        assert!(
+            inventory.missing_imports.is_empty(),
+            "{chosen}: closure has unresolved imports: {:?}",
+            inventory.missing_imports
+        );
+        let PreparedChosenModule {
+            prep,
+            collision_count,
+        } = prepare_chosen_module(&inventory, chosen)
+            .unwrap_or_else(|error| panic!("{chosen}: replay preparation failed: {error}"));
+        assert_eq!(
+            collision_count, 0,
+            "{chosen}: a colliding closure is not the measured fixture"
+        );
+        let matches = prep
+            .items
+            .iter()
+            .filter(|item| {
+                item.member_names
+                    .iter()
+                    .any(|name| name.to_display_string() == selector)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "{chosen}: selector `{selector}` matched {} admission units; expected exactly one",
+            matches.len()
+        );
+        let item = matches[0];
+        let verdict =
+            check_work_item_with_stack(item, Budget::DEFAULT, KERNEL_REPLAY_WORKER_STACK_BYTES);
+        let outcome = unit_outcome(item, &verdict);
+        eprintln!(
+            "s26_k1_regression_unit module={} declaration={} outcome={} steps_used={} max_depth={} ceiling={}",
+            chosen, selector, outcome.outcome, outcome.steps_used, outcome.max_depth, ceiling
+        );
+        assert_eq!(
+            outcome.outcome, "accepted",
+            "{chosen}: `{selector}` produced `{}` ({}); the S26 K1 unit must accept at Budget::DEFAULT",
+            outcome.outcome, outcome.message
+        );
+        assert!(
+            outcome.steps_used <= ceiling,
+            "{chosen}: `{selector}` consumed {} steps against a {ceiling}-step ceiling",
+            outcome.steps_used
+        );
+        assert!(
+            outcome.steps_used > 0,
+            "{chosen}: `{selector}` reported zero steps"
+        );
+    }
+}
+
 /// One judged mutant row on the FrankenLean side, ready for the verdict join.
 struct BemcJudgedRow {
     lead: String,
