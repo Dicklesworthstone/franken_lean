@@ -12350,6 +12350,7 @@ mod tests {
                     type_: Expr::const_(p_name.clone(), Vec::new()),
                 },
                 value: bomb_body,
+                all: vec![bomb_name.clone()],
             }))
             .expect("bomb_thm adds")
             .add_decl(ConstantInfo::Defn(DefinitionVal {
