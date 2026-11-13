@@ -11,6 +11,7 @@
 //! - `max_payload_bytes`: exact worst-case native journal payload bytes across
 //!   retained entries (`max(activated_payload, erase_payload)` in `fln-elab`'s
 //!   wire format), before adding `retained * size_of::<ExtensionEntry>()`.
+//!
 //! Module-system companions are cumulative, so only the final private part counts.
 #![forbid(unsafe_code)]
 
