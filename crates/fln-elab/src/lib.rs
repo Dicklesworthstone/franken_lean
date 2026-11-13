@@ -66,7 +66,10 @@ pub use mvar::{
 };
 pub use perturbation::{PerturbationKind, PerturbationResult, PerturbationValidator};
 pub use scheduler::{DeterministicScheduler, ExecutionConfig, SchedulerOutput};
-pub use txn::{ElabBudget, ElabTxn, TxnCheckpoint, TxnOutcome};
+pub use txn::{
+    ChildTaskDrain, ElabBudget, ElabTxn, TXN_DISPOSITION_SCHEMA, TXN_DISPOSITION_VERSION,
+    TxnCheckpoint, TxnDispositionV1, TxnOutcome, TxnResolution,
+};
 pub use universe::UniverseStore;
 
 use fln_bignum::interop::literal_from_bignat;

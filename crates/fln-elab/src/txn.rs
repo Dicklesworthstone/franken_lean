@@ -6,8 +6,13 @@
 //! Candidate exposure preserves the context needed to interpret its holes;
 //! an exposed candidate is untrusted elaboration output, not kernel admission.
 
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use fln_core::diag::ResourceReason;
 use fln_core::expr::{Expr, MVarId};
 use fln_core::options::KVMap;
+use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_env::environment::Environment;
 
 use crate::constraint::{Constraint, ConstraintId, ConstraintKind, ConstraintQueue};
@@ -90,6 +95,116 @@ pub enum TxnOutcome {
     },
     /// Record a fork point. `ElabTxn::fork` constructs the alternative states.
     Fork { alternatives_count: usize },
+}
+
+/// Canonical schema identifier for versioned nested transaction dispositions.
+pub const TXN_DISPOSITION_SCHEMA: &str = "fln.elab.txn_disposition/1";
+
+/// Schema version for [`TxnDispositionV1`] and [`TxnResolution`].
+pub const TXN_DISPOSITION_VERSION: u16 = 1;
+
+/// Audited child-task drain summary required before committing a child transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildTaskDrain {
+    pub spawned_tasks: usize,
+    pub joined_tasks: usize,
+    pub cancelled_tasks: usize,
+}
+
+impl ChildTaskDrain {
+    pub const NONE: Self = Self {
+        spawned_tasks: 0,
+        joined_tasks: 0,
+        cancelled_tasks: 0,
+    };
+
+    pub const fn new(spawned_tasks: usize, joined_tasks: usize, cancelled_tasks: usize) -> Self {
+        Self {
+            spawned_tasks,
+            joined_tasks,
+            cancelled_tasks,
+        }
+    }
+
+    pub const fn is_fully_drained(&self) -> bool {
+        match self.joined_tasks.checked_add(self.cancelled_tasks) {
+            Some(accounted) => accounted == self.spawned_tasks,
+            None => false,
+        }
+    }
+}
+
+/// Versioned five-way nested transaction disposition algebra (`fln.elab.txn_disposition/1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxnDispositionV1 {
+    CommitAll,
+    CommitDiagnosticsOnly,
+    Rollback {
+        reason: String,
+    },
+    ExposeCandidate {
+        candidate: Expr,
+        obligations: Vec<MVarId>,
+    },
+    Fork {
+        alternatives_count: usize,
+    },
+}
+
+impl TxnDispositionV1 {
+    pub fn rollback(reason: impl Into<String>) -> Self {
+        Self::Rollback {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn from_txn_outcome(outcome: TxnOutcome) -> Self {
+        match outcome {
+            TxnOutcome::CommitAll => Self::CommitAll,
+            TxnOutcome::CommitDiagnosticsOnly => Self::CommitDiagnosticsOnly,
+            TxnOutcome::Rollback => Self::Rollback {
+                reason: "explicit_rollback".to_string(),
+            },
+            TxnOutcome::ExposeCandidate {
+                candidate,
+                obligations,
+            } => Self::ExposeCandidate {
+                candidate,
+                obligations,
+            },
+            TxnOutcome::Fork { alternatives_count } => Self::Fork { alternatives_count },
+        }
+    }
+
+    pub const fn disposition_name(&self) -> &'static str {
+        match self {
+            Self::CommitAll => "commit_all",
+            Self::CommitDiagnosticsOnly => "commit_diagnostics_only",
+            Self::Rollback { .. } => "rollback",
+            Self::ExposeCandidate { .. } => "expose_candidate",
+            Self::Fork { .. } => "fork",
+        }
+    }
+}
+
+/// Structured audit receipt emitted when an authoritative [`TxnDispositionV1`] resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxnResolution {
+    pub schema_version: u16,
+    pub disposition_name: &'static str,
+    pub heartbeats_charged: u64,
+    pub parent_revision: u64,
+    pub exposed_candidate: Option<Expr>,
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(msg) = payload.downcast_ref::<&'static str>() {
+        (*msg).to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 /// An untrusted candidate together with the state in which its holes and free
@@ -367,6 +482,282 @@ impl ElabTxn {
         }
     }
 
+    /// Resolve a child transaction wrapped in the canonical three-way [`Outcome`]
+    /// envelope (FL-INV-07) with explicit child-task drain verification.
+    ///
+    /// Non-authoritative outcomes (`Inconclusive` and `InternalFault`), undrained
+    /// child tasks, and heartbeat budget overruns still charge spent child work
+    /// (unless the parent checkpoint itself was already corrupted), while
+    /// publishing zero semantic state, diagnostics, InfoTree nodes, or candidates.
+    #[allow(clippy::too_many_lines)]
+    pub fn resolve_child_outcome(
+        &mut self,
+        checkpoint: &TxnCheckpoint,
+        child: ElabTxn,
+        outcome: Outcome<TxnDispositionV1>,
+        drain: ChildTaskDrain,
+    ) -> Outcome<TxnResolution> {
+        if let Err(msg) = self.verify_no_state_leaks(checkpoint) {
+            return Outcome::InternalFault(InternalFault::new("FL-INV-07", msg));
+        }
+        let base = &checkpoint.snapshot;
+        if self.budget.heartbeats_consumed < base.budget.heartbeats_consumed {
+            return Outcome::InternalFault(InternalFault::new(
+                "FL-INV-07",
+                "parent heartbeat accounting moved backwards",
+            ));
+        }
+        let Some(spent) = child
+            .budget
+            .heartbeats_consumed
+            .checked_sub(base.budget.heartbeats_consumed)
+        else {
+            return Outcome::InternalFault(InternalFault::new(
+                "FL-INV-07",
+                "child heartbeat accounting moved backwards",
+            ));
+        };
+        let Some(total) = self.budget.heartbeats_consumed.checked_add(spent) else {
+            self.budget.heartbeats_consumed = u64::MAX;
+            return Outcome::InternalFault(InternalFault::new(
+                "FL-INV-07",
+                "heartbeat counter overflow",
+            ));
+        };
+        self.budget.heartbeats_consumed = total;
+        let overrun = self.budget.max_heartbeats > 0 && total > self.budget.max_heartbeats;
+
+        let disposition = match outcome {
+            Outcome::Complete(disp) => disp,
+            Outcome::Inconclusive(inc) => return Outcome::Inconclusive(inc),
+            Outcome::InternalFault(flt) => return Outcome::InternalFault(flt),
+        };
+
+        if !drain.is_fully_drained() {
+            return Outcome::InternalFault(InternalFault::new(
+                "FL-INV-07",
+                "undrained child tasks at transaction boundary",
+            ));
+        }
+
+        if overrun {
+            let usage = ResourceUsage {
+                reason: ResourceReason::Heartbeats {
+                    consumed: total,
+                    limit: self.budget.max_heartbeats,
+                },
+                allowed: self.budget.max_heartbeats,
+                observed: total,
+            };
+            return Outcome::Inconclusive(Inconclusive::resource(usage));
+        }
+
+        if matches!(&disposition, TxnDispositionV1::CommitAll)
+            && !child
+                .decisions
+                .records()
+                .starts_with(base.decisions.records())
+        {
+            return Outcome::InternalFault(InternalFault::new(
+                "FL-INV-07",
+                "child replaced the inherited decision journal",
+            ));
+        }
+        if child.budget.current_rec_depth != base.budget.current_rec_depth {
+            return Outcome::InternalFault(InternalFault::new(
+                "FL-INV-07",
+                "child left an unbalanced elaboration recursion depth",
+            ));
+        }
+
+        let disposition_name = disposition.disposition_name();
+        let exposed_candidate = match disposition {
+            TxnDispositionV1::CommitAll => {
+                for record in &child.decisions.records()[base.decisions.len()..] {
+                    self.decisions.record(record.clone());
+                }
+                self.env = child.env;
+                self.lctx = child.lctx;
+                self.mvars = child.mvars;
+                self.universes = child.universes;
+                self.constraints = child.constraints;
+                self.messages = child.messages;
+                self.info_tree = child.info_tree;
+                self.options = child.options;
+                self.seed = child.seed;
+                self.exposed_candidate = child.exposed_candidate;
+                self.nat_sub_model_cache = child.nat_sub_model_cache;
+                None
+            }
+            TxnDispositionV1::CommitDiagnosticsOnly => {
+                self.messages = child.messages;
+                self.info_tree = child.info_tree;
+                self.decisions.record(DecisionRecord::TransactionRollback {
+                    branch_id: 0,
+                    reason: "commit_diagnostics_only".to_string(),
+                });
+                None
+            }
+            TxnDispositionV1::Rollback { reason } => {
+                self.decisions.record(DecisionRecord::TransactionRollback {
+                    branch_id: 0,
+                    reason,
+                });
+                None
+            }
+            TxnDispositionV1::ExposeCandidate {
+                candidate,
+                obligations,
+            } => {
+                self.exposed_candidate = Some(ExposedCandidate {
+                    expression: candidate.clone(),
+                    obligations,
+                    env: child.env,
+                    lctx: child.lctx,
+                    mvars: child.mvars,
+                    universes: child.universes,
+                    constraints: child.constraints,
+                    options: child.options,
+                    seed: child.seed,
+                });
+                Some(candidate)
+            }
+            TxnDispositionV1::Fork { alternatives_count } => {
+                self.decisions.record(DecisionRecord::TransactionFork {
+                    branch_id: 0,
+                    num_alternatives: alternatives_count,
+                });
+                None
+            }
+        };
+
+        Outcome::complete(TxnResolution {
+            schema_version: TXN_DISPOSITION_VERSION,
+            disposition_name,
+            heartbeats_charged: spent,
+            parent_revision: self.mvars.assignment_revision(),
+            exposed_candidate,
+        })
+    }
+
+    /// Execute forked alternative branches with bounded worker concurrency,
+    /// deterministic branch-indexed output ordering, cooperative cancellation,
+    /// child-budget overrun conversion to [`Outcome::Inconclusive`], and panic
+    /// containment ([`Outcome::InternalFault`]) with audited task drain counts.
+    #[allow(clippy::too_many_lines)]
+    pub fn run_fork_tasks<F>(
+        &self,
+        max_workers: usize,
+        tasks: Vec<F>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> (Vec<Outcome<(ElabTxn, TxnDispositionV1)>>, ChildTaskDrain)
+    where
+        F: FnOnce(usize, ElabTxn) -> Outcome<(ElabTxn, TxnDispositionV1)> + Send,
+    {
+        let total = tasks.len();
+        if total == 0 {
+            return (Vec::new(), ChildTaskDrain::NONE);
+        }
+        let children = self.fork(total);
+        let slots: Vec<Mutex<Option<(usize, ElabTxn, F)>>> = children
+            .into_iter()
+            .zip(tasks)
+            .enumerate()
+            .map(|(branch_id, (child, task))| Mutex::new(Some((branch_id, child, task))))
+            .collect();
+        let next_idx = AtomicUsize::new(0);
+        let joined_tasks = AtomicUsize::new(0);
+        let cancelled_tasks = AtomicUsize::new(0);
+        let results: Mutex<Vec<(usize, Outcome<(ElabTxn, TxnDispositionV1)>)>> =
+            Mutex::new(Vec::with_capacity(total));
+        let worker_count = max_workers.max(1).min(total);
+
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                scope.spawn(|| {
+                    loop {
+                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= total {
+                            break;
+                        }
+                        let Some((branch_id, child, task)) = slots[idx]
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                        else {
+                            continue;
+                        };
+                        if cancelled() {
+                            cancelled_tasks.fetch_add(1, Ordering::Relaxed);
+                            results
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push((
+                                    branch_id,
+                                    Outcome::Inconclusive(Inconclusive::cancelled(format!(
+                                        "fork branch {branch_id} cancelled before execution"
+                                    ))),
+                                ));
+                            continue;
+                        }
+                        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            task(branch_id, child)
+                        }));
+                        joined_tasks.fetch_add(1, Ordering::Relaxed);
+                        let normalized = match caught {
+                            Ok(Outcome::Complete((done_child, disp))) => {
+                                if cancelled() {
+                                    Outcome::Inconclusive(Inconclusive::cancelled(format!(
+                                        "fork branch {branch_id} cancelled"
+                                    )))
+                                } else if done_child.budget.max_heartbeats > 0
+                                    && done_child.budget.heartbeats_consumed
+                                        > done_child.budget.max_heartbeats
+                                {
+                                    let usage = ResourceUsage {
+                                        reason: ResourceReason::Heartbeats {
+                                            consumed: done_child.budget.heartbeats_consumed,
+                                            limit: done_child.budget.max_heartbeats,
+                                        },
+                                        allowed: done_child.budget.max_heartbeats,
+                                        observed: done_child.budget.heartbeats_consumed,
+                                    };
+                                    Outcome::Inconclusive(Inconclusive::resource(usage))
+                                } else {
+                                    Outcome::Complete((done_child, disp))
+                                }
+                            }
+                            Ok(non_complete) => non_complete,
+                            Err(payload) => Outcome::InternalFault(InternalFault::new(
+                                "FL-INV-07",
+                                format!(
+                                    "fork branch {branch_id} panicked: {}",
+                                    panic_payload_message(payload)
+                                ),
+                            )),
+                        };
+                        results
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((branch_id, normalized));
+                    }
+                });
+            }
+        });
+
+        let mut ordered = results
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ordered.sort_by_key(|(branch_id, _)| *branch_id);
+        let outcomes = ordered.into_iter().map(|(_, out)| out).collect();
+        let drain = ChildTaskDrain::new(
+            total,
+            joined_tasks.load(Ordering::Relaxed),
+            cancelled_tasks.load(Ordering::Relaxed),
+        );
+        (outcomes, drain)
+    }
+
     fn charge_child_work(
         &mut self,
         base: &ElabBudget,
@@ -394,7 +785,9 @@ impl ElabTxn {
         if self.mvars.decls() != base.mvars.decls() {
             return Err("leak detected: mvar decls modified after rollback");
         }
-        if self.mvars.assignments() != base.mvars.assignments() {
+        if self.mvars.assignments() != base.mvars.assignments()
+            || self.mvars.assignment_revision() != base.mvars.assignment_revision()
+        {
             return Err("leak detected: mvar assignments modified after rollback");
         }
         if self.mvars != base.mvars {

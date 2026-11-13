@@ -72,6 +72,10 @@ pub struct Constraint {
     /// context; `ElabTxn::postpone` always captures it. Sharing the immutable
     /// snapshot keeps queue/transaction forks from copying its declarations.
     pub local_context: Option<Arc<LocalContext>>,
+    /// Conservative dynamic-read marker: when `true`, the obligation's dynamic
+    /// read set could not be bounded statically, so any metavariable assignment
+    /// wakes it and `take_ready` holds it until its reads are narrowed.
+    pub reads_unknown: bool,
 }
 
 impl Constraint {
@@ -94,6 +98,7 @@ pub struct ConstraintQueue {
     next_id: u64,
     constraints: HashMap<ConstraintId, Constraint>,
     mvar_to_constraints: HashMap<MVarId, HashSet<ConstraintId>>,
+    unknown_reader_constraints: BTreeSet<ConstraintId>,
 }
 
 impl ConstraintQueue {
@@ -109,6 +114,9 @@ impl ConstraintQueue {
     pub fn constraints(&self) -> &HashMap<ConstraintId, Constraint> {
         &self.constraints
     }
+    pub fn unknown_reader_count(&self) -> usize {
+        self.unknown_reader_constraints.len()
+    }
 
     /// Enqueue with an explicit observed-read signature. Use `enqueue_inferred`
     /// when the obligation's terms are the complete signature.
@@ -118,7 +126,18 @@ impl ConstraintQueue {
         reads_mvars: HashSet<MVarId>,
         depth: u32,
     ) -> ConstraintId {
-        self.enqueue_with_context(kind, reads_mvars, depth, None)
+        self.enqueue_with_context(kind, reads_mvars, depth, None, false)
+    }
+
+    /// Enqueue an obligation whose dynamic read set is conservatively unknown:
+    /// any subsequent metavariable assignment will wake it.
+    pub fn enqueue_conservative(
+        &mut self,
+        kind: ConstraintKind,
+        reads_mvars: HashSet<MVarId>,
+        depth: u32,
+    ) -> ConstraintId {
+        self.enqueue_with_context(kind, reads_mvars, depth, None, true)
     }
 
     fn enqueue_with_context(
@@ -127,6 +146,7 @@ impl ConstraintQueue {
         reads_mvars: HashSet<MVarId>,
         depth: u32,
         local_context: Option<Arc<LocalContext>>,
+        reads_unknown: bool,
     ) -> ConstraintId {
         let id = ConstraintId(self.next_id);
         self.next_id += 1;
@@ -136,6 +156,9 @@ impl ConstraintQueue {
                 .or_default()
                 .insert(id);
         }
+        if reads_unknown {
+            self.unknown_reader_constraints.insert(id);
+        }
         self.constraints.insert(
             id,
             Constraint {
@@ -144,6 +167,7 @@ impl ConstraintQueue {
                 reads_mvars,
                 depth,
                 local_context,
+                reads_unknown,
             },
         );
         id
@@ -175,13 +199,46 @@ impl ConstraintQueue {
             reads_mvars: HashSet::new(),
             depth,
             local_context,
+            reads_unknown: false,
         };
         let reads = row.dependencies(store);
-        self.enqueue_with_context(row.kind, reads, depth, row.local_context)
+        self.enqueue_with_context(row.kind, reads, depth, row.local_context, false)
     }
 
-    /// Update observed reads without changing identity or scheduling priority.
-    /// Missing IDs leave the queue unchanged.
+    /// Suspend under an immutable lexical snapshot while marking dynamic reads
+    /// conservatively unknown so any metavariable assignment wakes the row.
+    pub fn enqueue_conservative_scoped(
+        &mut self,
+        kind: ConstraintKind,
+        store: &MetavarStore,
+        locals: &LocalContext,
+        depth: u32,
+    ) -> ConstraintId {
+        let local_context = Some(Arc::new(locals.clone()));
+        let row = Constraint {
+            id: ConstraintId(self.next_id),
+            kind,
+            reads_mvars: HashSet::new(),
+            depth,
+            local_context,
+            reads_unknown: true,
+        };
+        let reads = row.dependencies(store);
+        self.enqueue_with_context(row.kind, reads, depth, row.local_context, true)
+    }
+
+    /// Mark an existing queued obligation as conservatively reading unknown metavariables.
+    pub fn mark_reads_unknown(&mut self, id: ConstraintId) -> bool {
+        let Some(row) = self.constraints.get_mut(&id) else {
+            return false;
+        };
+        row.reads_unknown = true;
+        self.unknown_reader_constraints.insert(id);
+        true
+    }
+
+    /// Update observed reads without changing identity or scheduling priority,
+    /// clearing any conservative `reads_unknown` marker. Missing IDs leave the queue unchanged.
     pub fn update_reads(&mut self, id: ConstraintId, reads: HashSet<MVarId>) -> bool {
         let Some(mut constraint) = self.remove(&id) else {
             return false;
@@ -193,6 +250,7 @@ impl ConstraintQueue {
                 .insert(id);
         }
         constraint.reads_mvars = reads;
+        constraint.reads_unknown = false;
         self.constraints.insert(id, constraint);
         true
     }
@@ -221,20 +279,25 @@ impl ConstraintQueue {
         mvars: impl IntoIterator<Item = &'a MVarId>,
     ) -> Vec<Constraint> {
         let mut ids = BTreeSet::new();
+        let mut any_mvar = false;
         for mvar in mvars {
+            any_mvar = true;
             if let Some(readers) = self.mvar_to_constraints.get(mvar) {
                 ids.extend(readers.iter().copied());
             }
         }
+        if any_mvar {
+            ids.extend(self.unknown_reader_constraints.iter().copied());
+        }
         ids.into_iter().filter_map(|id| self.remove(&id)).collect()
     }
 
-    /// Extract obligations with no unresolved inputs; this does not decide them.
+    /// Extract obligations with no unresolved inputs and known read sets; this does not decide them.
     pub fn take_ready(&mut self) -> Vec<Constraint> {
         let ids: BTreeSet<_> = self
             .constraints
             .values()
-            .filter(|row| row.reads_mvars.is_empty())
+            .filter(|row| row.reads_mvars.is_empty() && !row.reads_unknown)
             .map(|row| row.id)
             .collect();
         ids.into_iter().filter_map(|id| self.remove(&id)).collect()
@@ -242,6 +305,7 @@ impl ConstraintQueue {
 
     pub fn remove(&mut self, id: &ConstraintId) -> Option<Constraint> {
         let constraint = self.constraints.remove(id)?;
+        self.unknown_reader_constraints.remove(id);
         for mvar in &constraint.reads_mvars {
             let empty = self.mvar_to_constraints.get_mut(mvar).is_some_and(|set| {
                 set.remove(id);
@@ -371,6 +435,9 @@ impl ElabTxn {
                     .entry(mvar.clone())
                     .or_default()
                     .insert(row.id);
+            }
+            if row.reads_unknown {
+                trial.constraints.unknown_reader_constraints.insert(row.id);
             }
             trial.constraints.constraints.insert(row.id, row.clone());
         }

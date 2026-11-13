@@ -110,6 +110,8 @@ pub struct MetavarStore {
     readers: HashMap<MVarId, HashSet<MVarId>>,
     /// The next index the unifier may use for a fresh local (`_fln_unify_local.N`).
     unify_locals: FreshLocalCounter,
+    /// Monotone counter incremented on every accepted metavariable assignment.
+    revision: AssignmentRevision,
 }
 
 /// A name generator, like the pin's `ngen`: it only ever advances, and it travels
@@ -126,6 +128,19 @@ impl PartialEq for FreshLocalCounter {
 }
 
 impl Eq for FreshLocalCounter {}
+
+/// Operational monotone counter tracking assignment mutations across checkpoints.
+/// Semantic equality ignores the counter; transaction leak audits compare it explicitly.
+#[derive(Debug, Clone, Copy, Default)]
+struct AssignmentRevision(u64);
+
+impl PartialEq for AssignmentRevision {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for AssignmentRevision {}
 
 /// Expression children, including metadata. One inventory serves substitution
 /// and dependency discovery so a container cannot be transparent to only one.
@@ -223,6 +238,11 @@ impl MetavarStore {
 
     pub fn assignments(&self) -> &HashMap<MVarId, MetavarAssignment> {
         &self.assignments
+    }
+
+    /// Monotone revision counter incremented whenever an assignment commits into this store.
+    pub fn assignment_revision(&self) -> u64 {
+        self.revision.0
     }
 
     /// The first index the next unification batch may use for a fresh local.
@@ -357,6 +377,7 @@ impl MetavarStore {
                 justification,
             },
         );
+        self.revision.0 = self.revision.0.saturating_add(1);
         Ok(wake_ups)
     }
 
