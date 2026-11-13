@@ -165,16 +165,26 @@ fn native_signature(row: &str) -> Result<(&'static [fir::ValueType], fir::ValueT
         | "extern:Nat.shiftRight" => Ok((&[Nat, Nat], Nat)),
         "extern:Nat.pred" | "extern:Nat.log2" => Ok((&[Nat], Nat)),
         "extern:Nat.beq" | "extern:Nat.ble" => Ok((&[Nat, Nat], Bool)),
-        // These native ABIs have the same ownership as their checked FIR rows.
-        // Internal.isEmpty/isPrefixOf are deliberately absent: their native
-        // bodies consume strings, while their Golem rows borrow the operands.
+        // Most native ABIs share the checked FIR ownership. The two consuming
+        // Bootstrap predicates below use an explicit borrowed-to-owned bridge.
         "extern:String.append" | "extern:String.Internal.append" => Ok((&[Text, Text], Text)),
         "extern:String.length" | "extern:String.Internal.length" | "extern:String.utf8ByteSize" => {
             Ok((&[Text], Nat))
         }
-        "extern:String.decEq" => Ok((&[Text, Text], Bool)),
+        "extern:String.decEq" | "extern:String.Internal.isPrefixOf" => Ok((&[Text, Text], Bool)),
+        "extern:String.Internal.isEmpty" => Ok((&[Text], Bool)),
         _ => Err(unsupported("native intrinsic signature")),
     }
+}
+
+// Bootstrap.lean's raw declarations own their String arguments, unlike the
+// generated Golem rows. This exception is deliberately exact: other native
+// signatures continue to use their validated ownership contracts unchanged.
+fn native_consumes_borrowed_strings(row: &str) -> bool {
+    matches!(
+        row,
+        "extern:String.Internal.isEmpty" | "extern:String.Internal.isPrefixOf"
+    )
 }
 
 fn native_name(row: &str) -> Result<Name> {
@@ -787,7 +797,16 @@ fn compile_body(
                         fir::ValueType::Bool => IrType::UInt8,
                         _ => return Err(invariant("native result carrier")),
                     };
-                    let mut value = out.call_typed(function, args, argument_ownership, ty)?;
+                    let mut value = if native_consumes_borrowed_strings(row) {
+                        // Each borrowed occurrence donates its own retained
+                        // owner to the consuming native ABI, including aliases.
+                        // The callee releases those donations: a post-call Dec
+                        // here would invalidate the still-live FIR operands.
+                        let args = out.args(args, argument_ownership, true)?;
+                        out.bind(ty, IrExpr::Fap { function, args })?
+                    } else {
+                        out.call_typed(function, args, argument_ownership, ty)?
+                    };
                     if result == fir::ValueType::Bool {
                         value = out.bind(
                             IrType::Tagged,
@@ -2281,6 +2300,20 @@ mod tests {
                 Bool,
                 ResultOwnership::Scalar,
             ),
+            (
+                "extern:String.Internal.isEmpty",
+                vec![Text],
+                vec![Borrowed],
+                Bool,
+                ResultOwnership::Owned,
+            ),
+            (
+                "extern:String.Internal.isPrefixOf",
+                vec![Text, Text],
+                vec![Borrowed; 2],
+                Bool,
+                ResultOwnership::Owned,
+            ),
         ] {
             let valid = fir::IntrinsicDecl {
                 id: fir::IntrinsicId::new(0),
@@ -2323,10 +2356,7 @@ mod tests {
                 );
             }
         }
-        for row in [
-            "extern:String.Internal.isEmpty",
-            "extern:String.Internal.isPrefixOf",
-        ] {
+        for row in ["extern:String.hash", "extern:String.Internal.toArray"] {
             assert!(matches!(
                 native_signature(row),
                 Err(CompileError::Unsupported {

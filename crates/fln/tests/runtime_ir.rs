@@ -1230,14 +1230,14 @@ fn reference() -> Option<PathBuf> {
     lean.is_file().then_some(lean)
 }
 
-fn imported_strings(lib: &Path, stack: usize) -> Engine {
+fn imported_strings(lib: &Path, stack: usize, module_root: &str) -> Engine {
     use fln::source_check::modules::imported::SourceOleanImportLimits;
     use fln::{
         Environment, OleanCheckLimits, OleanDecodeLimits, OleanFrontierJobs, OleanModuleInput,
     };
 
     type Parts = (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
-    let root = name("Init.Data.String.Length");
+    let root = name(module_root);
     let mut pending = vec![root.clone()];
     let mut artifacts = BTreeMap::<Name, Parts>::new();
     while let Some(module) = pending.pop() {
@@ -1680,6 +1680,15 @@ fn the_pin_executes_native_compiler_output_and_observes_changed_bodies() {
 
 #[test]
 fn the_pin_executes_imported_string_source_exports() {
+    check_pin_string_exports(false);
+}
+
+#[test]
+fn the_pin_executes_consuming_string_predicate_exports() {
+    check_pin_string_exports(true);
+}
+
+fn check_pin_string_exports(consuming_predicates: bool) {
     let Some(lean) = reference() else {
         assert!(
             std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
@@ -1710,7 +1719,15 @@ fn the_pin_executes_imported_string_source_exports() {
     std::thread::Builder::new()
         .stack_size(stack)
         .spawn(move || {
-            let base = imported_strings(&lib, stack);
+            // Check each primitive against its actual producer world. The
+            // consuming predicates belong to Bootstrap and do not require
+            // Length's unrelated proof-library dependency closure.
+            let module_root = if consuming_predicates {
+                "Init.Data.String.Bootstrap"
+            } else {
+                "Init.Data.String.Length"
+            };
+            let base = imported_strings(&lib, stack, module_root);
             let options = KVMap::new();
             let original_root = base.logical_root(&options);
             let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
@@ -1773,7 +1790,44 @@ fn the_pin_executes_imported_string_source_exports() {
                     expected: "(false, true, false)",
                     heap_expected: "(true, \"fresh λ😀\")",
                 },
+                Case {
+                    native: "String.Internal.isEmpty",
+                    ty: "String -> Bool",
+                    expression: "fun s => String.Internal.isEmpty s",
+                    application: "(compiled \"\", compiled \"é😀a\", compiled \"é\")",
+                    expected: "(true, false, false)",
+                    heap_expected: "(false, \"fresh λ😀\")",
+                },
+                Case {
+                    native: "String.Internal.isPrefixOf",
+                    ty: "String -> Bool",
+                    expression: "fun s => String.Internal.isPrefixOf \"é\" s",
+                    application: "(compiled \"\", compiled \"é😀a\", compiled \"é\")",
+                    expected: "(false, true, false)",
+                    heap_expected: "(false, \"fresh λ😀\")",
+                },
+                Case {
+                    native: "String.Internal.isPrefixOf",
+                    ty: "String -> Bool",
+                    expression: "fun s => String.Internal.isPrefixOf s s",
+                    application: "(compiled \"\", compiled \"é😀a\", compiled \"é\")",
+                    expected: "(true, true, true)",
+                    heap_expected: "(true, \"fresh λ😀\")",
+                },
+                Case {
+                    native: "String.Internal.isPrefixOf",
+                    ty: "String -> Bool",
+                    expression: "fun s => String.Internal.isPrefixOf s \"fresh λ😀\"",
+                    application: "(compiled \"\", compiled \"fresh \" , compiled \"fresh λ😃\")",
+                    expected: "(true, true, false)",
+                    heap_expected: "(true, \"fresh λ😀\")",
+                },
             ] {
+                if consuming_predicates != matches!(case.native,
+                    "String.Internal.isEmpty" | "String.Internal.isPrefixOf")
+                {
+                    continue;
+                }
                 let source = format!("def compiled : {} := {}", case.ty, case.expression);
                 let (declaration, checked) = checked_definition(&base, &source);
                 let mut no_execution = EngineExecutionLimits::new(Budget::for_stack_bytes(stack));
@@ -1825,8 +1879,9 @@ fn the_pin_executes_imported_string_source_exports() {
                 let original = std::fs::read(dir.join("NativeIrCase.ir")).unwrap();
                 std::fs::write(dir.join("original.ir"), &original).unwrap();
                 // Heap input and the caller's retained alias exercise native
-                // ownership, including passing the same String to append's
-                // consuming first operand and borrowed second operand.
+                // ownership: append mixes consuming and borrowing arguments,
+                // while Bootstrap predicates consume both donated aliases.
+                // The fresh caller String must remain usable after either call.
                 std::fs::write(dir.join("heap-input.txt"), "fresh λ😀").unwrap();
                 let probe = RuntimeProbe {
                     ty: case.ty,
@@ -1875,6 +1930,15 @@ fn the_pin_executes_imported_string_source_exports() {
 
 #[test]
 fn the_pin_calls_native_source_exports_directly_and_as_functions() {
+    check_pin_source_exports(0..52);
+}
+
+#[test]
+fn the_pin_executes_private_source_records_and_retains_their_fields() {
+    check_pin_source_exports(52..export_cases().len());
+}
+
+fn check_pin_source_exports(case_indices: std::ops::Range<usize>) {
     let Some(lean) = reference() else {
         assert!(
             std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
@@ -1899,8 +1963,10 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
     let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    for (index, (ty, expression, application, result_type, expected, _)) in
-        export_cases().into_iter().enumerate()
+    for (index, (ty, expression, application, result_type, expected, _)) in export_cases()
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| case_indices.contains(index))
     {
         let source = format!("def compiled : {ty} := {expression}");
         let (declaration, checked) = checked_definition(&base, &source);

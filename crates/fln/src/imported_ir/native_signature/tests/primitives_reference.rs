@@ -1,6 +1,6 @@
 //! Actual higher-order primitive IR with every reviewed native prototype.
 use super::arrays_reference::assert_nat_replay;
-use super::boxed_primitives::{WORD_FAMILIES, names};
+use super::boxed_primitives::{STRING_PREDICATES, WORD_FAMILIES, names};
 use super::*;
 use crate::imported_ir::EntryArgument;
 use std::path::{Path, PathBuf};
@@ -346,7 +346,10 @@ fn pinned_native_primitive_prototypes_match_boxed_and_unboxed_contracts() {
 }
 
 fn native_prototypes_from_library(library: &Path) -> IrModule {
-    let wanted: BTreeSet<_> = names().into_iter().collect();
+    let wanted: BTreeSet<_> = names()
+        .into_iter()
+        .chain(STRING_PREDICATES.into_iter().map(str::to_owned))
+        .collect();
     let mut externs = BTreeSet::new();
     let mut wrappers = BTreeSet::new();
     let mut declarations = Vec::new();
@@ -414,5 +417,251 @@ fn native_prototypes_from_library(library: &Path) -> IrModule {
     IrModule {
         decls: declarations,
         ..IrModule::default()
+    }
+}
+
+#[test]
+fn live_pinned_string_predicates_preserve_owned_ir_and_borrowed_native_contracts() {
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let library = PathBuf::from(std::env::var_os("FLN_REFERENCE_LIB")?);
+            Some(library.parent()?.parent()?.join("bin/lean"))
+        });
+    let Some(reference) = reference else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "pinned Reference required for live String predicate closures"
+        );
+        eprintln!("SKIP: live String predicate closures require FLN_REFERENCE_LEAN");
+        return;
+    };
+    let pin = include_str!("../../../../../../SUITE.lock")
+        .lines()
+        .find(|line| line.starts_with("reference "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|part| part.strip_prefix("commit="))
+        })
+        .expect("SUITE.lock Reference commit");
+    let identity = Command::new(&reference).arg("--githash").output().unwrap();
+    assert!(identity.status.success());
+    assert_eq!(String::from_utf8(identity.stdout).unwrap().trim(), pin);
+    let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = root.join(format!(
+        "string-predicate-reference-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = r#"module
+prelude
+public import Init
+public section
+
+@[noinline, nospecialize] def useStringPredicate (f : String → Bool) (s : String) : Nat :=
+  (if f s then 1 else 0) + (if f (s ++ "!") then 2 else 0) + s.utf8ByteSize
+
+@[noinline] def stringDirectEmpty (s : String) : Nat :=
+  (if String.Internal.isEmpty s then 1 else 0) + s.utf8ByteSize
+
+@[noinline] def stringDirectPrefix (p s : String) : Nat :=
+  (if String.Internal.isPrefixOf p s then 1 else 0) + p.utf8ByteSize + s.utf8ByteSize
+
+@[noinline] def stringBoxedEmpty (s : String) : Nat :=
+  useStringPredicate String.Internal.isEmpty s
+
+@[noinline] def stringBoxedPrefix (p s : String) : Nat :=
+  useStringPredicate (String.Internal.isPrefixOf p) s + p.utf8ByteSize
+
+@[noinline] def stringAliasedPrefix (s : String) : Nat :=
+  (if String.Internal.isPrefixOf s s then 1 else 0) +
+  useStringPredicate (String.Internal.isPrefixOf s) s + s.utf8ByteSize
+"#;
+    std::fs::write(dir.join("StringPredicateModule.lean"), source).unwrap();
+    let generated = Command::new(&reference)
+        .current_dir(&dir)
+        .args([
+            "-j1",
+            "-o",
+            "StringPredicateModule.olean",
+            "StringPredicateModule.lean",
+        ])
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("compile.stdout"), &generated.stdout).unwrap();
+    std::fs::write(dir.join("compile.stderr"), &generated.stderr).unwrap();
+    assert!(
+        generated.status.success(),
+        "{dir:?}: {}{}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr),
+    );
+    let module = crate::decode_ir_artifact(
+        &std::fs::read(dir.join("StringPredicateModule.ir")).unwrap(),
+        32 * 1024 * 1024,
+    )
+    .unwrap();
+    std::fs::write(dir.join("decoded-ir.txt"), format!("{module:#?}")).unwrap();
+    let mut partials = BTreeSet::new();
+    let mut direct = BTreeSet::new();
+    let mut aliased_prefix = false;
+    for declaration in &module.decls {
+        let IrDecl::Function { body, .. } = declaration else {
+            continue;
+        };
+        for body in body.bodies() {
+            for statement in &body.stmts {
+                match statement {
+                    IrStmt::VDecl {
+                        expr: IrExpr::Pap { function, .. },
+                        ..
+                    } => {
+                        partials.insert(function.clone());
+                    }
+                    IrStmt::VDecl {
+                        expr: IrExpr::Fap { function, args },
+                        ..
+                    } => {
+                        direct.insert(function.clone());
+                        aliased_prefix |= function == &name("String.Internal.isPrefixOf")
+                            && args.len() == 2
+                            && args[0] == args[1];
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for target in STRING_PREDICATES {
+        assert!(
+            partials.contains(&Name::str(name(target), "_boxed")),
+            "{target} partial optimized away; {dir:?}"
+        );
+        assert!(
+            direct.contains(&name(target)),
+            "{target} direct call optimized away; {dir:?}"
+        );
+    }
+    assert!(
+        aliased_prefix,
+        "the same object must supply both owned prefix operands"
+    );
+    let mut cases = Vec::new();
+    for entry in [
+        "stringDirectEmpty",
+        "stringBoxedEmpty",
+        "stringAliasedPrefix",
+    ] {
+        for value in ["", "x", "é😀", "e\u{301}"] {
+            cases.push((entry, vec![value]));
+        }
+    }
+    for entry in ["stringDirectPrefix", "stringBoxedPrefix"] {
+        for (prefix, candidate) in [
+            ("", ""),
+            ("", "é😀"),
+            ("é", "é😀"),
+            ("😀", "é😀"),
+            ("é😀", "é"),
+            ("é", "e\u{301}"),
+            ("e", "e\u{301}"),
+            ("x", "x"),
+        ] {
+            cases.push((entry, vec![prefix, candidate]));
+        }
+    }
+    let mut oracle_source = source.to_owned();
+    for (entry, arguments) in &cases {
+        oracle_source.push_str(&format!("\n#eval {entry}"));
+        for argument in arguments {
+            // The fixture strings contain no escapes or control characters.
+            oracle_source.push_str(&format!(" \"{argument}\""));
+        }
+        oracle_source.push('\n');
+    }
+    std::fs::write(dir.join("Oracle.lean"), oracle_source).unwrap();
+    let oracle = Command::new(&reference)
+        .current_dir(&dir)
+        .args(["-j1", "Oracle.lean"])
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("oracle.stdout"), &oracle.stdout).unwrap();
+    std::fs::write(dir.join("oracle.stderr"), &oracle.stderr).unwrap();
+    assert!(
+        oracle.status.success(),
+        "{dir:?}: {}{}",
+        String::from_utf8_lossy(&oracle.stdout),
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+    let output = String::from_utf8(oracle.stdout).unwrap();
+    let expected: Vec<_> = output.lines().collect();
+    assert_eq!(
+        expected.len(),
+        cases.len(),
+        "unexpected oracle output: {output}"
+    );
+    let users: BTreeSet<_> = module
+        .decls
+        .iter()
+        .filter(|decl| matches!(decl, IrDecl::Function { .. }))
+        .map(|decl| decl.name().clone())
+        .collect();
+    let modules = [module, native_prototypes(&reference)];
+    let partition = VerifiedPartition::user_fixture();
+    let mut observed = BTreeSet::new();
+    for ((entry, strings), expected) in cases.into_iter().zip(expected) {
+        let arguments: Vec<_> = strings
+            .iter()
+            .map(|value| EntryArgument::String((*value).to_owned()))
+            .collect();
+        let compiled = compile(
+            &modules,
+            &name(entry),
+            &arguments,
+            &partition,
+            &users,
+            IrExecutionLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("{entry} {strings:?}: {error:?}; {dir:?}"));
+        assert_nat_replay(&compiled, expected);
+        assert!(
+            compiled
+                .reference_functions()
+                .iter()
+                .all(
+                    |function| function.producer() == "reference" && users.contains(&function.name)
+                )
+        );
+        assert!(matches!(
+            compiled
+                .execute(
+                    ExecutionLimits {
+                        max_steps: 0,
+                        ..ExecutionLimits::default()
+                    },
+                    None
+                )
+                .outcome,
+            Outcome::Inconclusive(_)
+        ));
+        assert!(matches!(
+            compiled
+                .execute(ExecutionLimits::default(), Some(&|| true))
+                .outcome,
+            Outcome::Inconclusive(_)
+        ));
+        observed.extend(compiled.native_externs().iter().cloned());
+    }
+    for target in STRING_PREDICATES {
+        assert!(
+            observed.contains(&format!("extern:{target}")),
+            "{target} was not linked"
+        );
     }
 }

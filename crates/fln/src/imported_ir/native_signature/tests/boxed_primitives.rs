@@ -22,6 +22,9 @@ pub(super) const NAMES: [&str; 18] = [
     "String.hash",
 ];
 
+pub(super) const STRING_PREDICATES: [&str; 2] =
+    ["String.Internal.isEmpty", "String.Internal.isPrefixOf"];
+
 pub(super) const WORD_FAMILIES: [&str; 5] = ["UInt8", "UInt16", "UInt32", "UInt64", "USize"];
 pub(super) const WORD_OPERATIONS: [&str; 18] = [
     "add",
@@ -62,7 +65,10 @@ fn row(target: &str) -> &'static GeneratedExternRow {
 
 #[test]
 fn reviewed_boxed_primitives_bind_the_generated_row_before_admitting_a_wrapper() {
-    for target in names() {
+    for target in names()
+        .into_iter()
+        .chain(STRING_PREDICATES.into_iter().map(str::to_owned))
+    {
         let original = row(&target);
         assert!(BoxedNative::from_row(original).unwrap().is_some());
         for changed in [
@@ -91,7 +97,11 @@ fn reviewed_boxed_primitives_bind_the_generated_row_before_admitting_a_wrapper()
                 ..*original
             },
             GeneratedExternRow {
-                ownership: "rule(borrowed-args,owned-result)",
+                ownership: if original.ownership == "rule(borrowed-args,owned-result)" {
+                    "abi((s: borrowed_arg) -> owned_res)"
+                } else {
+                    "rule(borrowed-args,owned-result)"
+                },
                 ..*original
             },
             GeneratedExternRow {
@@ -159,6 +169,20 @@ fn primitive_prototypes_distinguish_borrowing_and_boxed_scalar_representations()
             IrType::UInt64,
             vec![IrType::Object],
             IrType::Object,
+        ),
+        (
+            "String.Internal.isEmpty",
+            vec![(IrType::Object, false)],
+            IrType::UInt8,
+            vec![IrType::Object],
+            IrType::Tagged,
+        ),
+        (
+            "String.Internal.isPrefixOf",
+            vec![(IrType::Object, false), (IrType::Object, false)],
+            IrType::UInt8,
+            vec![IrType::Object, IrType::Object],
+            IrType::Tagged,
         ),
         (
             "UInt16.add",

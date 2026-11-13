@@ -539,6 +539,24 @@ fn string(row: &GeneratedExternRow) -> Option<Review> {
             &[IrType::Object, IrType::Object],
             &IrType::UInt8,
         ),
+        "extern:String.Internal.isEmpty" => (
+            "String.Internal.isEmpty",
+            "lean_string_isempty",
+            "Init.Data.String.Bootstrap",
+            "opaque",
+            "rule(borrowed-args,owned-result)",
+            &[IrType::Object],
+            &IrType::UInt8,
+        ),
+        "extern:String.Internal.isPrefixOf" => (
+            "String.Internal.isPrefixOf",
+            "lean_string_isprefixof",
+            "Init.Data.String.Bootstrap",
+            "opaque",
+            "rule(borrowed-args,owned-result)",
+            &[IrType::Object, IrType::Object],
+            &IrType::UInt8,
+        ),
         "extern:String.hash" => (
             "String.hash",
             "lean_string_hash",
@@ -559,7 +577,16 @@ fn string(row: &GeneratedExternRow) -> Option<Review> {
         signature: PrimitiveSignature {
             parameters,
             result,
-            exact_borrowed: None,
+            // Bootstrap's native declarations consume their String objects
+            // and return UInt8. The exported implementations in Defs.lean and
+            // TakeDrop.lean release those operands. Golem's generated rows
+            // instead borrow them and return a boxed Bool; keep that runtime
+            // contract while validating the pin's distinct raw IR telescope.
+            exact_borrowed: match row.id {
+                "extern:String.Internal.isEmpty" => Some(&[false]),
+                "extern:String.Internal.isPrefixOf" => Some(&[false, false]),
+                _ => None,
+            },
         },
     })
 }
