@@ -9941,26 +9941,28 @@ mod tests {
 
     #[test]
     fn lazy_delta_retains_non_projection_unfold_results() {
-        use fln_env::constants::{ConstantVal, DefinitionVal};
+        use fln_env::constants::{AxiomVal, ConstantVal, DefinitionVal};
 
         let sort_zero = Expr::sort(Level::zero());
+        let sort_one = Expr::sort(Level::one());
         let beta_sort_zero = Expr::app(
             Expr::lam(
                 Name::anonymous(),
-                Expr::sort(Level::one()),
+                sort_one.clone(),
                 Expr::bvar(0).expect("packs"),
                 BinderInfo::Default,
             ),
             sort_zero.clone(),
         );
         let name = Name::str(Name::anonymous(), "lazyDeltaCacheSource");
+        let stuck_name = Name::str(Name::anonymous(), "lazyDeltaStuckTarget");
         let env = publish_checked(
             &Environment::new(),
             Declaration::Defn(DefinitionVal {
                 base: ConstantVal {
                     name: name.clone(),
                     level_params: Vec::new(),
-                    type_: Expr::sort(Level::one()),
+                    type_: sort_one.clone(),
                 },
                 value: beta_sort_zero.clone(),
                 hints: ReducibilityHints::Regular(1),
@@ -9968,20 +9970,53 @@ mod tests {
                 all: vec![name.clone()],
             }),
         );
+        let env = publish_checked(
+            &env,
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: stuck_name.clone(),
+                    level_params: Vec::new(),
+                    type_: sort_one,
+                },
+                is_unsafe: false,
+            }),
+        );
         let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT.narrowed(1_000, 32));
 
         let outcome = tc
-            .lazy_delta(Expr::const_(name, Vec::new()), sort_zero.clone(), 0)
-            .expect("the regular definition unfolds and reaches the comparison term");
+            .lazy_delta(Expr::const_(name.clone(), Vec::new()), sort_zero.clone(), 0)
+            .expect("the regular definition unfolds and closes by pin quick_is_def_eq");
         assert!(
-            matches!(outcome, LazyDelta::Stuck(ref left, ref right) if left == &sort_zero && right == &sort_zero),
-            "delta unfolding must normalize the definition body to its comparison term"
+            matches!(outcome, LazyDelta::Decided(true)),
+            "pin lazy_delta_reduction_step runs quick_is_def_eq after unfolding"
         );
         assert_eq!(
             tc.whnf_core_cache
                 .get(&beta_sort_zero, &tc.locals, &tc.local_positions),
+            Some(sort_zero.clone()),
+            "lazy-delta unfolding must retain the ordinary WHNF result when quick_is_def_eq closes"
+        );
+
+        let stuck_rhs = Expr::const_(stuck_name, Vec::new());
+        let mut tc_stuck = TypeChecker::new(&env, &[], Budget::DEFAULT.narrowed(1_000, 32));
+        let stuck_outcome = tc_stuck
+            .lazy_delta(Expr::const_(name, Vec::new()), stuck_rhs.clone(), 0)
+            .expect("the regular definition unfolds and reaches the stuck comparison term");
+        assert!(
+            matches!(
+                stuck_outcome,
+                LazyDelta::Stuck(ref left, ref right) if left == &sort_zero && right == &stuck_rhs
+            ),
+            "delta unfolding must normalize the definition body to its comparison term when stuck"
+        );
+        assert_eq!(
+            tc_stuck.whnf_core_cache.get(
+                &beta_sort_zero,
+                &tc_stuck.locals,
+                &tc_stuck.local_positions
+            ),
             Some(sort_zero),
-            "lazy-delta unfolding must retain the ordinary WHNF result"
+            "lazy-delta unfolding must retain the ordinary WHNF result when stuck"
         );
     }
 
