@@ -21148,6 +21148,151 @@ fn selected_real_module_resource_probe() {
     );
 }
 
+/// Check every admission unit of one provisioned Reference module in a single
+/// closure decode and report per-unit governed kernel consumption.
+///
+/// Diagnostic-only companion to [`selected_real_module_resource_probe`] so
+/// identifying which declaration(s) inside a multi-hundred-declaration module
+/// cross a step threshold decodes the import closure once rather than `N`
+/// times. Results are collected in deterministic `unit_index` order regardless
+/// of `FLN_CORPUS_PROBE_JOBS` (1..=32, default 8).
+#[ignore = "cost: decodes one selected module's real import closure and checks all units; on-demand resource probe"]
+#[test]
+fn selected_real_module_units_resource_probe() {
+    let chosen = std::env::var("FLN_CORPUS_PROBE_MODULE")
+        .expect("FLN_CORPUS_PROBE_MODULE must name one provisioned Reference module");
+    assert!(
+        !chosen.trim().is_empty(),
+        "FLN_CORPUS_PROBE_MODULE must be non-empty"
+    );
+    let steps_override = match std::env::var("FLN_CORPUS_PROBE_STEPS") {
+        Ok(raw) => Some(
+            raw.parse::<u64>()
+                .expect("FLN_CORPUS_PROBE_STEPS must be a base-10 step count"),
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => panic!("read FLN_CORPUS_PROBE_STEPS: {error}"),
+    };
+    let min_report_steps = match std::env::var("FLN_CORPUS_PROBE_MIN_STEPS") {
+        Ok(raw) => raw
+            .parse::<u64>()
+            .expect("FLN_CORPUS_PROBE_MIN_STEPS must be a base-10 step count"),
+        Err(std::env::VarError::NotPresent) => 500_000,
+        Err(error) => panic!("read FLN_CORPUS_PROBE_MIN_STEPS: {error}"),
+    };
+    let jobs = match std::env::var("FLN_CORPUS_PROBE_JOBS") {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .expect("FLN_CORPUS_PROBE_JOBS must be a positive integer")
+            .clamp(1, 32),
+        Err(std::env::VarError::NotPresent) => 8,
+        Err(error) => panic!("read FLN_CORPUS_PROBE_JOBS: {error}"),
+    };
+    let stack_bytes = KERNEL_REPLAY_WORKER_STACK_BYTES;
+    let steps = steps_override.unwrap_or(Budget::DEFAULT_STEPS);
+    assert!(steps > 0, "resource-probe step budget must be nonzero");
+    let budget = if steps_override.is_none() {
+        Budget::DEFAULT
+    } else {
+        Budget::derive(
+            StackMeasurement::k1_here(),
+            ExecConfig::current(),
+            stack_bytes,
+            steps,
+        )
+    };
+
+    let reference_lib = reference_lib().expect("pinned toolchain required for the resource probe");
+    let roots = chosen_set_roots(&reference_lib);
+    let inventory = closure_inventory(&roots, &chosen)
+        .unwrap_or_else(|error| panic!("{chosen}: closure inventory failed: {error}"));
+    assert!(
+        inventory.missing_imports.is_empty(),
+        "{chosen}: closure has unresolved imports: {:?}",
+        inventory.missing_imports
+    );
+    let PreparedChosenModule {
+        prep,
+        collision_count,
+    } = prepare_chosen_module(&inventory, &chosen)
+        .unwrap_or_else(|error| panic!("{chosen}: replay preparation failed: {error}"));
+
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let total = prep.items.len();
+    let outcomes = std::sync::Mutex::new(Vec::with_capacity(total));
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.min(total.max(1)) {
+            scope.spawn(|| {
+                loop {
+                    let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= total {
+                        break;
+                    }
+                    let item = &prep.items[idx];
+                    let verdict = check_work_item_with_stack(item, budget, stack_bytes);
+                    let fault = matches!(verdict, Outcome::InternalFault(_));
+                    let outcome = unit_outcome(item, &verdict);
+                    outcomes
+                        .lock()
+                        .expect("probe outcomes mutex")
+                        .push((idx, outcome, fault));
+                }
+            });
+        }
+    });
+    let mut rows = outcomes.into_inner().expect("probe outcomes mutex");
+    rows.sort_by_key(|(idx, _, _)| *idx);
+    let mut accepted = 0usize;
+    let mut non_accepted = 0usize;
+    let mut max_steps = 0u64;
+    let mut max_lead = String::from("none");
+    let mut total_steps = 0u64;
+    for (unit_index, outcome, fault) in &rows {
+        assert!(
+            !*fault,
+            "{chosen}:{}: an internal fault is never a resource observation",
+            outcome.lead
+        );
+        total_steps = total_steps.saturating_add(outcome.steps_used);
+        if outcome.steps_used >= max_steps {
+            max_steps = outcome.steps_used;
+            max_lead = outcome.lead.clone();
+        }
+        if outcome.outcome == "accepted" {
+            accepted += 1;
+        } else {
+            non_accepted += 1;
+        }
+        if outcome.outcome != "accepted" || outcome.steps_used >= min_report_steps {
+            eprintln!(
+                "kernel_units_probe_row module={} unit_index={} unit_lead={} kind={} members={} outcome={} steps_used={} max_depth={} budget_steps={}",
+                chosen,
+                unit_index,
+                outcome.lead,
+                outcome.kind,
+                outcome.members,
+                outcome.outcome,
+                outcome.steps_used,
+                outcome.max_depth,
+                budget.steps,
+            );
+        }
+    }
+    eprintln!(
+        "kernel_units_probe_summary module={} total_units={} accepted={} non_accepted={} max_steps={} max_lead={} total_steps={} budget_steps={} closure_modules={} collision_count={}",
+        chosen,
+        total,
+        accepted,
+        non_accepted,
+        max_steps,
+        max_lead,
+        total_steps,
+        budget.steps,
+        inventory.modules.len(),
+        collision_count,
+    );
+}
+
 /// The two `fln-4hol` admission units stay within their measured step ceilings
 /// at `Budget::DEFAULT` (bead `franken_lean-z8j.1.13`, acceptance criterion 1).
 ///
