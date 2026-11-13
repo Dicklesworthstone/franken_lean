@@ -87,6 +87,7 @@ impl From<BoundedReadFailure> for Failure {
     }
 }
 
+#[derive(Clone)]
 struct Library {
     roots: Vec<Name>,
     directory: PathBuf,
@@ -299,6 +300,20 @@ fn plan(
     targets: &[String],
 ) -> Result<(Vec<Library>, Vec<Name>), Failure> {
     let libraries = library_sources(root, config)?;
+    let modules = plan_modules(
+        config.targets.iter().map(|target| target.name.as_str()),
+        &libraries,
+        targets,
+    )?;
+    Ok((libraries, modules))
+}
+
+fn plan_modules<'a>(
+    target_names: impl IntoIterator<Item = &'a str>,
+    libraries: &[Library],
+    targets: &[String],
+) -> Result<Vec<Name>, Failure> {
+    let target_names: BTreeSet<_> = target_names.into_iter().collect();
     if targets.is_empty() {
         return Err(Failure::unsupported(
             "default library and executable facets are unavailable; request +Module:olean for a declared lean_lib module",
@@ -319,13 +334,13 @@ fn plan(
                 "facet `{facet}` is unavailable; supported module facets: +Module:olean, +Module:ir"
             )));
         }
-        if !module.starts_with('+') && config.targets.iter().any(|target| target.name == module) {
+        if !module.starts_with('+') && target_names.contains(module) {
             return Err(Failure::unsupported(format!(
                 "target `{module}` has no library or executable olean facet; select the module explicitly as +{module}:olean"
             )));
         }
         let module = name(module.strip_prefix('+').unwrap_or(module))?;
-        if source_path(&module, &libraries)?.is_none() {
+        if source_path(&module, libraries)?.is_none() {
             return Err(Failure::input(format!(
                 "module `{}` does not belong to a declared lean_lib root",
                 module.to_display_string()
@@ -335,20 +350,7 @@ fn plan(
             modules.push(module);
         }
     }
-    Ok((libraries, modules))
-}
-
-fn load_sources(
-    root: &Path,
-    libraries: &[Library],
-    entries: &[Name],
-) -> Result<BTreeMap<Name, Module>, Failure> {
-    load_sources_with(entries, |module| {
-        Ok(source_path(module, libraries)?.map(|path| SourceLocation {
-            package: root.to_path_buf(),
-            path,
-        }))
-    })
+    Ok(modules)
 }
 
 fn load_sources_with(
@@ -675,9 +677,8 @@ fn compile(
     })
 }
 
-/// Replace conventional Lake paths under one publisher lock, rolling back all
-/// touched members on failure. Readers opening flat paths independently do not
-/// receive the immutable-generation guarantee of `fln::ArtifactStore`.
+/// Single-package adapter for the workspace publisher used by fault controls.
+#[cfg(test)]
 fn publish(
     root: &Path,
     directory: &Path,
@@ -686,23 +687,29 @@ fn publish(
     publish_with(root, directory, artifacts, fln::publish_file_atomic)
 }
 
+#[cfg(test)]
 fn publish_with(
     root: &Path,
     directory: &Path,
     artifacts: &BTreeMap<Name, ModuleArtifacts>,
+    write: impl FnMut(&[u8], &Path) -> std::io::Result<()>,
+) -> Result<Vec<PathBuf>, Failure> {
+    let destinations = artifacts
+        .keys()
+        .map(|name| (name.clone(), (root.to_path_buf(), directory.to_path_buf())))
+        .collect();
+    publish_locations_with(artifacts, &destinations, write)
+}
+
+/// Replace every affected package's conventional Lake paths as one rollback
+/// unit. All publisher locks and old-byte snapshots precede the first write.
+/// Readers opening flat paths independently do not receive the immutable-
+/// generation guarantee of `fln::ArtifactStore`.
+fn publish_locations_with(
+    artifacts: &BTreeMap<Name, ModuleArtifacts>,
+    destinations: &BTreeMap<Name, (PathBuf, PathBuf)>,
     mut write: impl FnMut(&[u8], &Path) -> std::io::Result<()>,
 ) -> Result<Vec<PathBuf>, Failure> {
-    check_path(root, directory, true)?;
-    std::fs::create_dir_all(directory).map_err(|error| Failure::io(directory, error))?;
-    // Serialize this publisher's replacements and rollback snapshots. A crash
-    // leaves a lock rather than allowing another build to assume completion.
-    let lock_path = directory.join(".fln-olean-build.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-        .map_err(|error| Failure::io(&lock_path, error))?;
-    drop(lock_file);
     struct BuildLock {
         path: PathBuf,
         release: bool,
@@ -714,14 +721,47 @@ fn publish_with(
             }
         }
     }
-    let mut lock = BuildLock {
-        path: lock_path,
-        release: true,
-    };
+    let mut directories = BTreeMap::new();
+    for name in artifacts.keys() {
+        let (root, directory) = destinations.get(name).ok_or_else(|| {
+            Failure::new("internal-fault", "built module has no output destination")
+        })?;
+        check_path(root, directory, true)?;
+        if let Some(previous) = directories.insert(directory, root)
+            && previous != root
+        {
+            return Err(Failure::input(format!(
+                "multiple packages share build directory {}",
+                directory.display(),
+            )));
+        }
+    }
+    // Deterministic lock order also covers separate invocations whose root and
+    // dependency roles are reversed. A failed acquisition releases prior locks
+    // before any artifact replacement; a crash during writes retains them all.
+    let mut locks = Vec::new();
+    for &directory in directories.keys() {
+        std::fs::create_dir_all(directory).map_err(|error| Failure::io(directory, error))?;
+        let path = directory.join(".fln-olean-build.lock");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| Failure::io(&path, error))?;
+        drop(file);
+        locks.push(BuildLock {
+            path,
+            release: true,
+        });
+    }
     let mut outputs = Vec::new();
+    let mut output_paths = BTreeSet::new();
     let mut previous_bytes = 0usize;
     // All source checks, encodings and output preflights precede publication.
     for (name, family) in artifacts {
+        let (root, directory) = destinations
+            .get(name)
+            .expect("every output destination was checked before locking");
         let mut relative = source_import_relative_path(name)?;
         relative.set_extension("olean");
         let path = directory.join(relative);
@@ -748,6 +788,12 @@ fn publish_with(
         }
         for (suffix, bytes) in family.parts() {
             let path = path.with_extension(suffix);
+            if !output_paths.insert(path.clone()) {
+                return Err(Failure::input(format!(
+                    "multiple modules publish the same artifact {}",
+                    path.display(),
+                )));
+            }
             check_path(root, &path, true)?;
             let previous = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.is_file() => {
@@ -773,7 +819,9 @@ fn publish_with(
     }
     // Once replacements begin, an unwind must leave the same incomplete-build
     // marker as a crash. Only completion or a complete rollback releases it.
-    lock.release = false;
+    for lock in &mut locks {
+        lock.release = false;
+    }
     for (index, (path, bytes, _)) in outputs.iter().enumerate() {
         let result = std::fs::create_dir_all(path.parent().expect("artifact parent"))
             .and_then(|()| write(bytes, path));
@@ -793,7 +841,9 @@ fn publish_with(
                     rollback.push(format!("{}: {error}", prior.display()));
                 }
             }
-            lock.release = rollback.is_empty();
+            for lock in &mut locks {
+                lock.release = rollback.is_empty();
+            }
             return Err(Failure::new(
                 "io",
                 format!(
@@ -805,14 +855,20 @@ fn publish_with(
                         format!(
                             "; rollback failed: {}; build lock retained at {}",
                             rollback.join("; "),
-                            lock.path.display()
+                            locks
+                                .iter()
+                                .map(|lock| lock.path.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         )
                     }
                 ),
             ));
         }
     }
-    lock.release = true;
+    for lock in &mut locks {
+        lock.release = true;
+    }
     Ok(outputs.into_iter().map(|(path, _, _)| path).collect())
 }
 
@@ -859,8 +915,17 @@ fn build(
             authority,
         })?;
     let (config, configuration_imports) = load_configuration(&root, jobs, posture)?;
-    let (libraries, entries) = plan(&root, &config, &targets)?;
-    let modules = load_sources(&root, &libraries, &entries)?;
+    let sources = local_dependencies::load(&root, &config)?;
+    let libraries = sources.libraries();
+    let entries = plan_modules(
+        sources
+            .packages
+            .iter()
+            .flat_map(|package| package.config.targets.iter().map(|target| target.name.as_str())),
+        &libraries,
+        &targets,
+    )?;
+    let modules = load_sources_with(&entries, |module| sources.resolve(module))?;
     let executable = executable_modules(&targets, &modules)?;
     let records = macro_config
         .is_none()
@@ -889,19 +954,24 @@ fn build(
         macro_config.as_ref(),
     )?;
     let output_dir = root.join(&config.build_dir).join("lib/lean");
-    let paths = publish(&root, &output_dir, &artifacts)?;
-    let snapshot = record_snapshot(
-        &root,
-        &config,
-        &libraries,
-        &targets,
-        &modules,
-        &artifacts,
-        &output_dir,
-        &provenance,
-        posture,
-        records_state,
-    );
+    let destinations = sources.destinations(&artifacts)?;
+    let paths = publish_locations_with(&artifacts, &destinations, fln::publish_file_atomic)?;
+    let snapshot = if config.requires.is_empty() {
+        record_snapshot(
+            &root,
+            &config,
+            &libraries,
+            &targets,
+            &modules,
+            &artifacts,
+            &output_dir,
+            &provenance,
+            posture,
+            records_state,
+        )
+    } else {
+        Err("build snapshots do not yet bind local dependency configurations and output directories".to_owned())
+    };
     let executable_count = artifacts
         .values()
         .filter(|family| family.ir.is_some())
@@ -1275,6 +1345,164 @@ mod publication_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn workspace_publication_rolls_back_every_package_and_holds_all_locks() {
+        let directory = Directory::new();
+        let first = directory.0.join("first");
+        let second = directory.0.join("second");
+        for root in [&first, &second] {
+            std::fs::create_dir(root).unwrap();
+        }
+        let old_a = family("old A");
+        let old_b = family("old B");
+        for (root, name, old) in [(&first, "A", &old_a), (&second, "B", &old_b)] {
+            for (part, bytes) in old.parts() {
+                std::fs::write(root.join(name).with_extension(part), bytes).unwrap();
+            }
+        }
+        let a = Name::from_components(["A"]);
+        let b = Name::from_components(["B"]);
+        let destinations = BTreeMap::from([
+            (a.clone(), (first.clone(), first.clone())),
+            (b.clone(), (second.clone(), second.clone())),
+        ]);
+        let artifacts = BTreeMap::from([(a, family("new A")), (b, family("new B"))]);
+        let mut failed = false;
+        let error = publish_locations_with(&artifacts, &destinations, |bytes, path| {
+            for root in [&first, &second] {
+                assert!(root.join(".fln-olean-build.lock").is_file());
+            }
+            fln::publish_file_atomic(bytes, path)?;
+            if path == second.join("B.olean") && !failed {
+                failed = true;
+                return Err(std::io::Error::other("failure after dependent publication"));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(failed);
+        assert!(
+            error.detail.contains("failure after dependent publication"),
+            "{}",
+            error.detail
+        );
+        assert!(!error.detail.contains("rollback failed"), "{}", error.detail);
+        for (root, name, old) in [(&first, "A", &old_a), (&second, "B", &old_b)] {
+            for (part, bytes) in old.parts() {
+                assert_eq!(
+                    std::fs::read(root.join(name).with_extension(part)).unwrap(),
+                    bytes,
+                );
+            }
+            assert!(!root.join(".fln-olean-build.lock").exists());
+        }
+    }
+
+    #[test]
+    fn workspace_output_preflight_runs_before_any_package_is_replaced() {
+        let directory = Directory::new();
+        let first = directory.0.join("first");
+        let second = directory.0.join("second");
+        for root in [&first, &second] {
+            std::fs::create_dir(root).unwrap();
+        }
+        std::fs::write(first.join("A.olean"), b"old A").unwrap();
+        std::fs::write(second.join("B.ir"), b"unmatched executable").unwrap();
+        let a = Name::from_components(["A"]);
+        let b = Name::from_components(["B"]);
+        let destinations = BTreeMap::from([
+            (a.clone(), (first.clone(), first.clone())),
+            (b.clone(), (second.clone(), second.clone())),
+        ]);
+        let artifacts = BTreeMap::from([(a, family("new A")), (b, family("new B"))]);
+        let mut writes = 0;
+        let error = publish_locations_with(&artifacts, &destinations, |bytes, path| {
+            writes += 1;
+            fln::publish_file_atomic(bytes, path)
+        })
+        .unwrap_err();
+        assert_eq!(error.class, "unsupported");
+        assert_eq!(writes, 0);
+        assert_eq!(std::fs::read(first.join("A.olean")).unwrap(), b"old A");
+        assert_eq!(
+            std::fs::read(second.join("B.ir")).unwrap(),
+            b"unmatched executable",
+        );
+        for root in [&first, &second] {
+            assert!(!root.join(".fln-olean-build.lock").exists());
+        }
+    }
+
+    #[test]
+    fn nested_output_directories_cannot_publish_colliding_module_paths() {
+        let directory = Directory::new();
+        let first = directory.0.join("output");
+        let second = first.join("Dep/lib/lean");
+        std::fs::create_dir_all(&second).unwrap();
+        let output = second.join("Foo.olean");
+        std::fs::write(&output, b"original").unwrap();
+        let a = Name::from_components(["Dep", "lib", "lean", "Foo"]);
+        let b = Name::from_components(["Foo"]);
+        let destinations = BTreeMap::from([
+            (a.clone(), (directory.0.clone(), first.clone())),
+            (b.clone(), (second.clone(), second.clone())),
+        ]);
+        let artifacts = BTreeMap::from([(a, family("new A")), (b, family("new B"))]);
+        let mut writes = 0;
+        let error = publish_locations_with(&artifacts, &destinations, |bytes, path| {
+            writes += 1;
+            fln::publish_file_atomic(bytes, path)
+        })
+        .unwrap_err();
+        assert_eq!(error.class, "input");
+        assert!(error.detail.contains("same artifact"), "{}", error.detail);
+        assert_eq!(writes, 0);
+        assert_eq!(std::fs::read(output).unwrap(), b"original");
+        for root in [&first, &second] {
+            assert!(!root.join(".fln-olean-build.lock").exists());
+        }
+    }
+
+    #[test]
+    fn incomplete_workspace_rollback_retains_every_package_lock() {
+        let directory = Directory::new();
+        let first = directory.0.join("first");
+        let second = directory.0.join("second");
+        for root in [&first, &second] {
+            std::fs::create_dir(root).unwrap();
+        }
+        std::fs::write(first.join("A.olean"), b"old A").unwrap();
+        std::fs::write(second.join("B.olean"), b"old B").unwrap();
+        let a = Name::from_components(["A"]);
+        let b = Name::from_components(["B"]);
+        let destinations = BTreeMap::from([
+            (a.clone(), (first.clone(), first.clone())),
+            (b.clone(), (second.clone(), second.clone())),
+        ]);
+        let artifacts = BTreeMap::from([(a, family("new A")), (b, family("new B"))]);
+        let mut failed = false;
+        let error = publish_locations_with(&artifacts, &destinations, |bytes, path| {
+            if failed && path == first.join("A.olean") {
+                return Err(std::io::Error::other("cannot restore first package"));
+            }
+            fln::publish_file_atomic(bytes, path)?;
+            if !failed && path == second.join("B.olean") {
+                failed = true;
+                return Err(std::io::Error::other("failure after second package"));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.detail.contains("rollback failed"), "{}", error.detail);
+        for root in [&first, &second] {
+            assert!(root.join(".fln-olean-build.lock").is_file());
+            assert!(error.detail.contains(&root.display().to_string()));
+        }
+        let next = publish_locations_with(&artifacts, &destinations, fln::publish_file_atomic)
+            .unwrap_err();
+        assert!(next.detail.contains(".fln-olean-build.lock"));
     }
 
     #[test]

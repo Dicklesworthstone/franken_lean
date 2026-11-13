@@ -2339,14 +2339,11 @@ fn collect_hygienic_binders(
             collect_hygienic_binders(value, out);
             collect_hygienic_binders(body, out);
         }
-        ExprNode::App { fun, arg } => {
-            collect_hygienic_binders(fun, out);
-            collect_hygienic_binders(arg, out);
+        ExprNode::App { f, a } => {
+            collect_hygienic_binders(f, out);
+            collect_hygienic_binders(a, out);
         }
-        ExprNode::MData { expr: inner, .. }
-        | ExprNode::Proj {
-            struct_expr: inner, ..
-        } => {
+        ExprNode::MData { expr: inner, .. } | ExprNode::Proj { expr: inner, .. } => {
             collect_hygienic_binders(inner, out);
         }
         _ => {}

@@ -1711,7 +1711,8 @@ mod tests {
                 .into_complete()
                 .unwrap()
         };
-        let families = |build: &SourceModuleBuild| -> Vec<(Name, Vec<u8>, Vec<u8>, Vec<u8>)> {
+        type ModuleFamilyBytes = (Name, Vec<u8>, Vec<u8>, Vec<u8>);
+        let families = |build: &SourceModuleBuild| -> Vec<ModuleFamilyBytes> {
             build
                 .artifacts
                 .iter()

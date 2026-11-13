@@ -309,6 +309,14 @@ struct ExpansionContext<'a> {
     cancellation: Option<&'a dyn CancellationProbe>,
 }
 
+/// The traversal policies used by term, source, and command expansion.
+#[derive(Clone, Copy)]
+enum MacroTreeTraversal {
+    Full,
+    Source,
+    CommandRoot,
+}
+
 impl RegisteredMacros {
     /// A registry with no imported macro registrations.
     ///
@@ -922,7 +930,13 @@ impl RegisteredMacros {
         limits: MacroTreeLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> MacroTreeDispatch {
-        self.expand_tree_mode(input, invocation, limits, cancellation, false, false)
+        self.expand_tree_mode(
+            input,
+            invocation,
+            limits,
+            cancellation,
+            MacroTreeTraversal::Full,
+        )
     }
 
     /// Source commands contain literal data as well as terms: universe levels,
@@ -936,7 +950,13 @@ impl RegisteredMacros {
         limits: MacroTreeLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> MacroTreeDispatch {
-        self.expand_tree_mode(input, invocation, limits, cancellation, true, false)
+        self.expand_tree_mode(
+            input,
+            invocation,
+            limits,
+            cancellation,
+            MacroTreeTraversal::Source,
+        )
     }
 
     /// Expand command-root macros iteratively (`Command.lean:507-565`) without
@@ -950,7 +970,13 @@ impl RegisteredMacros {
         limits: MacroTreeLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> MacroTreeDispatch {
-        self.expand_tree_mode(input, invocation, limits, cancellation, true, true)
+        self.expand_tree_mode(
+            input,
+            invocation,
+            limits,
+            cancellation,
+            MacroTreeTraversal::CommandRoot,
+        )
     }
 
     fn expand_tree_mode(
@@ -959,8 +985,7 @@ impl RegisteredMacros {
         invocation: MacroDispatchInvocation<'_>,
         limits: MacroTreeLimits,
         cancellation: Option<&dyn CancellationProbe>,
-        defer_atomic: bool,
-        root_only: bool,
+        traversal: MacroTreeTraversal,
     ) -> MacroTreeDispatch {
         let MacroDispatchInvocation {
             source,
@@ -982,8 +1007,7 @@ impl RegisteredMacros {
             state,
             &mut report,
             &mut work,
-            defer_atomic,
-            root_only,
+            traversal,
         );
         MacroTreeDispatch {
             outcome,
@@ -1000,8 +1024,7 @@ impl RegisteredMacros {
         mut state: MacroState,
         report: &mut MacroDispatch,
         work: &mut ExpansionWork,
-        defer_atomic: bool,
-        root_only: bool,
+        traversal: MacroTreeTraversal,
     ) -> Outcome<Result<MacroTreeResult, MacroExecutionError>> {
         let ExpansionContext {
             source,
@@ -1054,7 +1077,8 @@ impl RegisteredMacros {
                         continue;
                     };
                     if *kind == tactic
-                        || (defer_atomic && fln_parse::extensions::is_atomic_macro_kind(kind))
+                        || (!matches!(traversal, MacroTreeTraversal::Full)
+                            && fln_parse::extensions::is_atomic_macro_kind(kind))
                     {
                         built.push(syntax);
                         continue;
@@ -1088,7 +1112,7 @@ impl RegisteredMacros {
                             state: successor,
                         })) => {
                             state = successor;
-                            if root_only {
+                            if matches!(traversal, MacroTreeTraversal::CommandRoot) {
                                 built.push(syntax);
                                 continue;
                             }

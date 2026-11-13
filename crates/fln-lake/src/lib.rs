@@ -568,16 +568,16 @@ impl LakeConfig {
     /// custom globs, dependency jobs or native facets. Other configuration-only
     /// commands retain their existing permissive discovery surface.
     pub fn parse_toml_for_build(content: &str) -> Result<Self, LakeParseError> {
-        Self::parse_toml_strict(content, false)
+        Self::parse_toml_strict(content)
     }
 
-    /// The checked source executable route additionally resolves local path
-    /// requirements. Artifact builds retain their stricter dependency boundary.
+    /// Checked executables and artifact builds resolve the same bounded local
+    /// path requirements without silently accepting remote or custom settings.
     pub fn parse_toml_for_execution(content: &str) -> Result<Self, LakeParseError> {
-        Self::parse_toml_strict(content, true)
+        Self::parse_toml_strict(content)
     }
 
-    fn parse_toml_strict(content: &str, local_requirements: bool) -> Result<Self, LakeParseError> {
+    fn parse_toml_strict(content: &str) -> Result<Self, LakeParseError> {
         let mut section = "package";
         let mut keys = std::collections::BTreeSet::new();
         for (index, raw) in content.lines().enumerate() {
@@ -590,7 +590,7 @@ impl LakeConfig {
                     "[package]" => "package",
                     "[[lean_lib]]" => "lean_lib",
                     "[[lean_exe]]" => "lean_exe",
-                    "[[require]]" if local_requirements => "require",
+                    "[[require]]" => "require",
                     _ => {
                         return Err(LakeParseError::UnsupportedBuildSetting(format!(
                             "line {}: {line}",

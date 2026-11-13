@@ -87,7 +87,7 @@ defaultTargets = ["foo"]
 }
 
 #[test]
-fn local_requirements_are_retained_for_execution_and_refused_for_artifact_builds() {
+fn local_requirements_are_retained_for_checked_execution_and_artifact_builds() {
     let source = concat!(
         "name = \"program\"\n",
         "[[require]]\nname = \"shared\"\npath = \"../first\"\n",
@@ -110,14 +110,14 @@ fn local_requirements_are_retained_for_execution_and_refused_for_artifact_builds
         LakeConfig::parse_toml(source).unwrap().requires,
         executable.requires,
     );
-    assert!(matches!(
-        LakeConfig::parse_toml_for_build(source),
-        Err(LakeParseError::UnsupportedBuildSetting(_)),
-    ));
+    assert_eq!(
+        LakeConfig::parse_toml_for_build(source).unwrap().requires,
+        executable.requires,
+    );
 }
 
 #[test]
-fn executable_requirements_do_not_ignore_remote_or_custom_settings() {
+fn checked_requirements_do_not_ignore_remote_or_custom_settings() {
     for fields in [
         "name = \"dep\"\n",
         "name = \"dep\"\ngit = \"https://example.invalid/dep\"\n",
@@ -126,13 +126,15 @@ fn executable_requirements_do_not_ignore_remote_or_custom_settings() {
         "name = \"dep\"\npath = \"../dep\"\noptions = []\n",
     ] {
         let source = format!("name = \"program\"\n[[require]]\n{fields}");
-        assert!(
-            matches!(
-                LakeConfig::parse_toml_for_execution(&source),
-                Err(LakeParseError::UnsupportedBuildSetting(_)),
-            ),
-            "{source}"
-        );
+        for parse in [
+            LakeConfig::parse_toml_for_execution,
+            LakeConfig::parse_toml_for_build,
+        ] {
+            assert!(
+                matches!(parse(&source), Err(LakeParseError::UnsupportedBuildSetting(_))),
+                "{source}"
+            );
+        }
     }
     assert!(matches!(
         LakeConfig::parse_toml_for_execution(

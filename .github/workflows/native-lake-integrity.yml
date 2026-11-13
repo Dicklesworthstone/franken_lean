@@ -33,7 +33,7 @@ jobs:
       - name: Check real command outcomes and nonpublication
         run: |
           set -euo pipefail
-          cargo test --locked -p fln-lake -p fln-cli --lib --test lake_config_and_actions --test lake_integrity --test cli_personalities_and_verbs
+          cargo test --locked -p fln-lake -p fln-cli --lib --test lake_config_and_actions --test lake_integrity --test lake_local_dependencies --test lake_module_build --test lake_module_records --test build_explain --test cli_personalities_and_verbs --no-fail-fast
           cargo clippy --locked -p fln-lake -p fln-cli --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
 
@@ -137,7 +137,7 @@ jobs:
         run: cargo test --locked -p fln-cli --test lake_executable --test lake_local_dependencies --no-fail-fast -- --nocapture --test-threads=1
       - name: Verify artifact interchange, opacity, rollback and command compatibility
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p fln-cli --test lake_module_build --test lake_build_session --test lake_lean_config --test cli_personalities_and_verbs --no-fail-fast -- --nocapture --test-threads=1
+        run: cargo test --locked -p fln-cli --test lake_module_build --test lake_module_records --test build_explain --test lake_build_session --test lake_lean_config --test cli_personalities_and_verbs --no-fail-fast -- --nocapture --test-threads=1
       - name: Preserve existing installed Lean main execution
         if: ${{ !cancelled() }}
         run: |

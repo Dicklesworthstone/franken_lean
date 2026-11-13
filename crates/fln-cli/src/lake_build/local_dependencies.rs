@@ -1,4 +1,4 @@
-//! Read-only local package discovery for checked source executables.
+//! Read-only local package discovery for checked source builds and executables.
 //!
 //! Package identity follows Lake's reverse, breadth-first requirement order.
 //! Source containment is checked against each owning package; an explicit
@@ -10,28 +10,71 @@ const MAX_PACKAGES: usize = 64;
 const MAX_REQUIREMENTS: usize = 4096;
 
 pub(super) struct Sources {
-    packages: Vec<(PathBuf, Vec<Library>)>,
+    pub(super) packages: Vec<Package>,
+}
+
+pub(super) struct Package {
+    pub(super) root: PathBuf,
+    pub(super) config: LakeConfig,
+    libraries: Vec<Library>,
 }
 
 impl Sources {
+    pub(super) fn libraries(&self) -> Vec<Library> {
+        self.packages
+            .iter()
+            .flat_map(|package| package.libraries.iter().cloned())
+            .collect()
+    }
+
     pub(super) fn resolve(&self, module: &Name) -> Result<Option<SourceLocation>, Failure> {
         let mut found: Option<SourceLocation> = None;
-        for (package, libraries) in &self.packages {
-            let Some(path) = source_path(module, libraries)? else {
+        for package in &self.packages {
+            let Some(path) = source_path(module, &package.libraries)? else {
                 continue;
             };
-            if found.as_ref().is_some_and(|previous| previous.path != path) {
+            if found.as_ref().is_some_and(|previous| {
+                previous.path != path || previous.package != package.root
+            }) {
                 return Err(Failure::unsupported(format!(
                     "module `{}` belongs to multiple local packages",
                     module.to_display_string(),
                 )));
             }
             found = Some(SourceLocation {
-                package: package.clone(),
+                package: package.root.clone(),
                 path,
             });
         }
         Ok(found)
+    }
+
+    pub(super) fn destinations(
+        &self,
+        artifacts: &BTreeMap<Name, ModuleArtifacts>,
+    ) -> Result<BTreeMap<Name, (PathBuf, PathBuf)>, Failure> {
+        artifacts
+            .keys()
+            .map(|name| {
+                let source = self.resolve(name)?.ok_or_else(|| {
+                    Failure::new("internal-fault", "built module has no source owner")
+                })?;
+                let package = self
+                    .packages
+                    .iter()
+                    .find(|package| package.root == source.package)
+                    .ok_or_else(|| {
+                        Failure::new("internal-fault", "built module lost its package")
+                    })?;
+                Ok((
+                    name.clone(),
+                    (
+                        package.root.clone(),
+                        package.root.join(&package.config.build_dir).join("lib/lean"),
+                    ),
+                ))
+            })
+            .collect()
     }
 }
 
@@ -46,7 +89,7 @@ fn unsupported_metadata(root: &Path) -> Result<(), Failure> {
         match std::fs::symlink_metadata(&path) {
             Ok(_) => {
                 return Err(Failure::unsupported(format!(
-                    "local-path executable dependency resolution does not yet support {}",
+                    "local-path dependency resolution does not yet support {}",
                     path.display(),
                 )));
             }
@@ -131,7 +174,7 @@ pub(super) fn load(root: &Path, config: &LakeConfig) -> Result<Sources, Failure>
                 return Err(Failure::new("resource", "local package count exceeds 64"));
             }
             let path = requirement.path.as_deref().ok_or_else(|| {
-                Failure::unsupported("only local path executable dependencies are supported")
+                Failure::unsupported("only local path dependencies are supported")
             })?;
             let directory = dependency_root(&owner, path)?;
             unsupported_metadata(&directory)?;
@@ -167,7 +210,11 @@ pub(super) fn load(root: &Path, config: &LakeConfig) -> Result<Sources, Failure>
         .into_iter()
         .map(|(root, config)| {
             let libraries = library_sources(&root, &config)?;
-            Ok((root, libraries))
+            Ok(Package {
+                root,
+                config,
+                libraries,
+            })
         })
         .collect::<Result<_, Failure>>()?;
     Ok(Sources { packages })

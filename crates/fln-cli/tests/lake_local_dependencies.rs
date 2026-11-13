@@ -347,25 +347,8 @@ fn missing_dependency_and_unsupported_remote_sources_fail_before_execution() {
 }
 
 #[test]
-fn package_count_is_bounded_and_build_consumers_do_not_ignore_requirements() {
+fn package_count_is_bounded_before_build_or_execution() {
     let workspace = Workspace::new();
-    refusal(
-        workspace.run(&["--json", "build", "+Feature.Left:olean"], None),
-        "unsupported",
-        "[[require]]",
-    );
-    let explained = Command::new(env!("CARGO_BIN_EXE_fln"))
-        .args(["build", "explain", "--json", "--dir"])
-        .arg(workspace.0.join("root"))
-        .output()
-        .unwrap();
-    assert_eq!(explained.status.code(), Some(1), "{explained:?}");
-    assert!(explained.stdout.is_empty(), "{explained:?}");
-    let error = std::str::from_utf8(&explained.stderr).unwrap();
-    assert!(
-        error.contains("\"class\":\"unsupported\"") && error.contains("[[require]]"),
-        "{error}"
-    );
     let mut config = String::from("name = \"program\"\n");
     for index in 0..64 {
         config.push_str(&format!(
@@ -378,11 +361,16 @@ fn package_count_is_bounded_and_build_consumers_do_not_ignore_requirements() {
     }
     config.push_str("[[lean_exe]]\nname = \"runner\"\nroot = \"Main\"\n");
     workspace.write("root/lakefile.toml", config);
-    refusal(
-        workspace.run(&["--json", "exe", "runner"], None),
-        "resource",
-        "package count exceeds 64",
-    );
+    for arguments in [
+        ["--json", "exe", "runner"],
+        ["--json", "build", "+Feature.Left:olean"],
+    ] {
+        refusal(
+            workspace.run(&arguments, None),
+            "resource",
+            "package count exceeds 64",
+        );
+    }
     assert!(!workspace.0.join("import-records").exists());
     workspace.no_products();
     workspace.no_manifests();
@@ -405,4 +393,264 @@ fn explicit_dependency_paths_do_not_hide_symlinks_before_parent_components() {
     assert!(!workspace.0.join("import-records").exists());
     workspace.no_products();
     workspace.no_manifests();
+}
+
+const CHECKED_SHARED: &str =
+    "prelude\ndef Shared.identity (A : Type) (a : A) : A := a\n";
+
+fn artifact_workspace() -> Workspace {
+    let workspace = Workspace::new();
+    workspace.write(
+        "root/lakefile.toml",
+        format!(
+            "{ROOT}[[lean_lib]]\nname = \"Bundle\"\nroots = [\"App\"]\nsrcDir = \"lib\"\n"
+        ),
+    );
+    workspace.write(
+        "right/lakefile.toml",
+        format!("buildDir = \"products\"\n{RIGHT}"),
+    );
+    workspace.write(
+        "root/src/lib/App/Top.lean",
+        concat!(
+            "prelude\nimport Feature.Left\nimport Feature.Right\n",
+            "def App.combine (A : Type) (a : A) : A := Feature.left A (Feature.right A a)\n",
+        ),
+    );
+    workspace.write(
+        "left/code/lib/Feature/Left.lean",
+        "prelude\nimport Shared\ndef Feature.left (A : Type) (a : A) : A := Shared.identity A a\n",
+    );
+    workspace.write(
+        "right/Feature/Right.lean",
+        "prelude\nimport Shared\ndef Feature.right (A : Type) (a : A) : A := Shared.identity A a\n",
+    );
+    workspace.write(
+        "right/vendor/shared library/sources/lib/Shared.lean",
+        CHECKED_SHARED,
+    );
+    workspace
+}
+
+fn artifact_paths(workspace: &Workspace) -> [PathBuf; 4] {
+    [
+        "root/output/lib/lean/App/Top.olean",
+        "left/.lake/build/lib/lean/Feature/Left.olean",
+        "right/products/lib/lean/Feature/Right.olean",
+        "right/vendor/shared library/.lake/build/lib/lean/Shared.olean",
+    ]
+    .map(|path| workspace.0.join(path))
+}
+
+fn build_success(output: Output) -> String {
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn artifact_builds_follow_transitive_package_ownership_and_reuse_checked_records() {
+    let workspace = artifact_workspace();
+    let report = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(report.contains("\"modules_built\":4"), "{report}");
+    let paths = artifact_paths(&workspace);
+    let previous: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            assert!(report.contains(&path.display().to_string()), "{report}");
+            let bytes = std::fs::read(path).unwrap();
+            fln_olean::region::OleanView::parse(&bytes).unwrap();
+            bytes
+        })
+        .collect();
+    // The shared dependency belongs only to the reverse-BFS-selected package.
+    assert!(!workspace.0.join("ignored-direct").exists());
+    assert!(!workspace.0.join("ignored-transitive").exists());
+    assert!(!workspace.0.join("root/output/lib/lean/Shared.olean").exists());
+    assert!(
+        !workspace
+            .0
+            .join("root/output/lib/lean/Feature/Left.olean")
+            .exists()
+    );
+    let warm = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(warm.contains("\"modules_cached\":4"), "{warm}");
+    assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
+    for (path, before) in paths.iter().zip(previous) {
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+    // A dependency module is also an explicit workspace target.
+    let selected = build_success(workspace.run(
+        &["--json", "build", "+Feature.Left:olean"],
+        None,
+    ));
+    assert!(selected.contains("\"modules_built\":2"), "{selected}");
+    workspace.no_manifests();
+}
+
+#[test]
+fn rejected_dependency_source_cannot_replace_any_previous_package_artifact() {
+    let workspace = artifact_workspace();
+    build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    let paths = artifact_paths(&workspace);
+    let previous: Vec<_> = paths.iter().map(|path| std::fs::read(path).unwrap()).collect();
+    workspace.write(
+        "right/vendor/shared library/sources/lib/Shared.lean",
+        "prelude\ndef Shared.identity (A : Type) (a : A) : A := A\n",
+    );
+    let rejected = workspace.run(&["--json", "build", "+App.Top:olean"], None);
+    assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+    assert!(rejected.stdout.is_empty(), "{rejected:?}");
+    for (path, before) in paths.iter().zip(&previous) {
+        assert_eq!(&std::fs::read(path).unwrap(), before);
+        assert!(
+            !path
+                .ancestors()
+                .find(|ancestor| ancestor.ends_with("lib/lean"))
+                .unwrap()
+                .join(".fln-olean-build.lock")
+                .exists()
+        );
+    }
+    workspace.write(
+        "right/vendor/shared library/sources/lib/Shared.lean",
+        CHECKED_SHARED,
+    );
+    build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    for (path, before) in paths.iter().zip(previous) {
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+}
+
+#[test]
+fn missing_declared_dependency_source_never_falls_back_to_stale_olean() {
+    let workspace = artifact_workspace();
+    build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    let paths = artifact_paths(&workspace);
+    let previous: Vec<_> = paths.iter().map(|path| std::fs::read(path).unwrap()).collect();
+    workspace.write(
+        "right/vendor/shared library/lakefile.toml",
+        SHARED.replace("srcDir = \"sources\"", "srcDir = \"missing\""),
+    );
+    let external_shadow = workspace
+        .0
+        .join("right/vendor/shared library/.lake/build/lib/lean");
+    let rejected = workspace.run(
+        &["--json", "build", "+App.Top:olean"],
+        Some(&external_shadow),
+    );
+    assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+    assert!(rejected.stdout.is_empty(), "{rejected:?}");
+    assert!(
+        std::str::from_utf8(&rejected.stderr)
+            .unwrap()
+            .contains("missing"),
+        "{rejected:?}",
+    );
+    for (path, before) in paths.iter().zip(previous) {
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+}
+
+#[test]
+fn same_source_path_cannot_silently_choose_between_two_package_owners() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "root/lakefile.toml",
+        concat!(
+            "name = \"root\"\nsrcDir = \"dep\"\n",
+            "[[require]]\nname = \"dependency\"\npath = \"dep\"\n",
+            "[[lean_lib]]\nname = \"Shared\"\n",
+        ),
+    );
+    workspace.write(
+        "root/dep/lakefile.toml",
+        "name = \"dependency\"\n[[lean_lib]]\nname = \"Shared\"\n",
+    );
+    workspace.write("root/dep/Shared.lean", CHECKED_SHARED);
+    refusal(
+        workspace.run(&["--json", "build", "+Shared:olean"], None),
+        "unsupported",
+        "multiple local packages",
+    );
+    assert!(!workspace.0.join("root/.lake/build").exists());
+    assert!(!workspace.0.join("root/dep/.lake/build").exists());
+    assert!(!workspace.0.join("import-records").exists());
+}
+
+#[test]
+fn ir_facets_publish_complete_module_families_across_local_packages() {
+    let workspace = artifact_workspace();
+    for (path, source) in [
+        (
+            "right/vendor/shared library/sources/lib/Shared.lean",
+            "module\nprelude\npublic theorem Shared.keep (P : Prop) (h : P) : P := h\n",
+        ),
+        (
+            "left/code/lib/Feature/Left.lean",
+            "module\nprelude\npublic import Shared\npublic theorem Feature.left (P : Prop) (h : P) : P := Shared.keep P h\n",
+        ),
+        (
+            "right/Feature/Right.lean",
+            "module\nprelude\npublic import Shared\npublic theorem Feature.right (P : Prop) (h : P) : P := Shared.keep P h\n",
+        ),
+        (
+            "root/src/lib/App/Top.lean",
+            "module\nprelude\npublic import Feature.Left\npublic import Feature.Right\npublic theorem App.keep (P : Prop) (h : P) : P := Feature.left P (Feature.right P h)\n",
+        ),
+    ] {
+        workspace.write(path, source);
+    }
+    let report = build_success(workspace.run(&["--json", "build", "+App.Top:ir"], None));
+    assert!(report.contains("\"modules_built\":4"), "{report}");
+    assert!(report.contains("\"executable_modules\":4"), "{report}");
+    let paths = artifact_paths(&workspace);
+    for path in &paths {
+        for extension in ["olean", "olean.server", "olean.private", "ir"] {
+            let part = path.with_extension(extension);
+            assert!(report.contains(&part.display().to_string()), "{report}");
+            let bytes = std::fs::read(&part).unwrap();
+            fln_olean::region::OleanView::parse(&bytes).unwrap();
+        }
+    }
+    workspace.write(
+        "Consumer.lean",
+        "prelude\nimport App.Top\ntheorem consumer (P : Prop) (h : P) : P := App.keep P h\n",
+    );
+    let lean_path = std::env::join_paths([
+        workspace.0.join("root/output/lib/lean"),
+        workspace.0.join("left/.lake/build/lib/lean"),
+        workspace.0.join("right/products/lib/lean"),
+        workspace
+            .0
+            .join("right/vendor/shared library/.lake/build/lib/lean"),
+    ])
+    .unwrap();
+    let checked = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(workspace.0.join("Consumer.lean"))
+        .env("LEAN_PATH", lean_path)
+        .env("FLN_IMPORT_REUSE_DIR", workspace.0.join("consumer-records"))
+        .output()
+        .unwrap();
+    assert!(checked.status.success(), "{checked:?}");
+    assert!(checked.stderr.is_empty(), "{checked:?}");
+    workspace.no_manifests();
+}
+
+#[test]
+fn dependency_library_targets_require_explicit_module_selection_for_olean() {
+    let workspace = artifact_workspace();
+    workspace.write(
+        "right/vendor/shared library/lakefile.toml",
+        SHARED.replace("name = \"Common\"", "name = \"Shared\""),
+    );
+    refusal(
+        workspace.run(&["--json", "build", "Shared:olean"], None),
+        "unsupported",
+        "has no library or executable olean facet",
+    );
+    workspace.no_products();
+    let report = build_success(workspace.run(&["--json", "build", "+Shared:olean"], None));
+    assert!(report.contains("\"modules_built\":1"), "{report}");
+    assert!(artifact_paths(&workspace)[3].is_file());
 }

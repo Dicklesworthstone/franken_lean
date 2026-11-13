@@ -108,6 +108,12 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
         .canonicalize()
         .map_err(|error| Failure::io(directory, error))?;
     let config = config(&root)?;
+    if !config.requires.is_empty() {
+        return Err(Refusal::Unavailable(
+            "build explanations do not yet bind local dependency configurations and output directories"
+                .to_owned(),
+        ));
+    }
     let path = root.join(&config.build_dir).join(snapshot::FILE);
     let relative = |path: &Path| {
         path.strip_prefix(&root)
