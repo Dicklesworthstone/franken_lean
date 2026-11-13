@@ -31,6 +31,28 @@ impl ImportedSimpRule {
         self.payload(env).map(|_| ())
     }
 
+    /// Exact native wire payload byte length of this operation without consulting
+    /// an environment, using the same encoders as [`Self::payload`].
+    pub fn encoded_payload_len(&self) -> Result<usize, SimpSetError> {
+        match self {
+            ImportedSimpRule::Proof {
+                origin,
+                proof,
+                priority,
+            } => proof_payload(origin, proof, *priority).map(|bytes| bytes.len()),
+            ImportedSimpRule::Unfold { declaration } => {
+                source_payload(declaration, Some((1000, false))).map(|bytes| bytes.len())
+            }
+            ImportedSimpRule::UnfoldTheorems {
+                declaration,
+                theorems,
+            } => unfold_theorems_payload(declaration, theorems).map(|bytes| bytes.len()),
+            ImportedSimpRule::Erase { declaration } => {
+                source_payload(declaration, None).map(|bytes| bytes.len())
+            }
+        }
+    }
+
     fn payload(&self, env: &Environment) -> Result<Vec<u8>, SimpSetError> {
         let origin = match self {
             ImportedSimpRule::Proof { origin, .. } => origin,

@@ -341,15 +341,26 @@ fn missing_or_data_valued_proofs_fail_atomically() {
 fn imported_population_is_not_limited_by_one_proofs_traversal_fuel() {
     let env = environment();
     let population = 4_097;
-    let full = import_rules(&env, &vec![proof("first", 1); population]).unwrap();
+    let mut batch = vec![proof("first", 1); population];
+    batch[population - 1] = proof("first", 2);
+    let full = import_rules(&env, &batch).unwrap();
+    assert_eq!(
+        full.extension(&descriptor().name).unwrap().len(),
+        population
+    );
     let rows = read(&full).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].order, population - 1);
+    assert_eq!(rows[0].priority, 2);
+    assert_eq!(rows[0].order, 0);
     let next = import_rules(&full, &[proof("second", 2)]).unwrap();
     let next_rows = read(&next).unwrap();
     assert_eq!(next_rows.len(), 2);
     assert_eq!(next_rows[0].proof, Some(name("second")));
+    assert_eq!(next_rows[0].priority, 2);
     assert_eq!(next_rows[0].order, population);
+    assert_eq!(next_rows[1].proof, Some(name("first")));
+    assert_eq!(next_rows[1].priority, 2);
+    assert_eq!(next_rows[1].order, 0);
     let journal = next.extension(&descriptor().name).unwrap();
     assert_eq!(
         journal.payload_bytes(),
@@ -364,6 +375,33 @@ fn imported_population_is_not_limited_by_one_proofs_traversal_fuel() {
 
 #[test]
 fn journal_bytes_and_entry_handles_share_a_checked_aggregate_bound() {
+    for (retained, payload_bytes) in [
+        (
+            PINNED_INIT_SIMP_RETAINED_EVENTS,
+            PINNED_INIT_SIMP_MAX_PAYLOAD_BYTES,
+        ),
+        (
+            PINNED_STD_SIMP_RETAINED_EVENTS,
+            PINNED_STD_SIMP_MAX_PAYLOAD_BYTES,
+        ),
+        (
+            PINNED_LEAN_SIMP_RETAINED_EVENTS,
+            PINNED_LEAN_SIMP_MAX_PAYLOAD_BYTES,
+        ),
+    ] {
+        let accounted = accounted_journal_bytes(retained, payload_bytes).unwrap();
+        assert!(accounted <= MAX_JOURNAL_BYTES);
+        assert_eq!(
+            check_journal_capacity(retained as usize, payload_bytes),
+            Ok(())
+        );
+    }
+    let lean_accounted = accounted_journal_bytes(
+        PINNED_LEAN_SIMP_RETAINED_EVENTS,
+        PINNED_LEAN_SIMP_MAX_PAYLOAD_BYTES,
+    )
+    .unwrap();
+    assert_eq!(MAX_JOURNAL_BYTES, JOURNAL_HEADROOM_FACTOR * lean_accounted);
     let remaining = MAX_JOURNAL_BYTES - ENTRY_ACCOUNTING_BYTES;
     assert_eq!(check_journal_capacity(1, remaining), Ok(()));
     assert_eq!(
@@ -378,6 +416,35 @@ fn journal_bytes_and_entry_handles_share_a_checked_aggregate_bound() {
         check_journal_capacity(1, u128::MAX),
         Err(SimpSetError::Limit)
     );
+
+    let env = environment();
+    let numeric = Name::str(Name::num(name("private"), 7), "proof");
+    for rule in [
+        proof("first", 900),
+        ImportedSimpRule::Proof {
+            origin: numeric.clone(),
+            proof: numeric.clone(),
+            priority: 1000,
+        },
+        ImportedSimpRule::Unfold {
+            declaration: name("data"),
+        },
+        ImportedSimpRule::UnfoldTheorems {
+            declaration: name("origin"),
+            theorems: vec![name("first"), name("second")],
+        },
+        ImportedSimpRule::Erase {
+            declaration: name("origin"),
+        },
+        ImportedSimpRule::Erase {
+            declaration: numeric,
+        },
+    ] {
+        assert_eq!(
+            rule.encoded_payload_len().unwrap(),
+            rule.payload(&env).unwrap().len()
+        );
+    }
 }
 
 #[test]

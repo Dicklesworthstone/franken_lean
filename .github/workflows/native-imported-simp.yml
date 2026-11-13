@@ -71,4 +71,6 @@ jobs:
         run: cargo test --locked --release -p fln --lib source_check::modules::imported::simp::tests::pinned_init_restores_the_reported_list_and_nat_default_simp_goals -- --exact --nocapture --test-threads=1
       - name: Derive the pinned Std and Lean simp populations natively
         if: ${{ !cancelled() && steps.pinned.outcome == 'success' }}
-        run: cargo run --locked --release -p fln-olean --example simp_journal_population -- "$FLN_REFERENCE_LIB" Std Lean
+        run: |
+          cargo run --locked --release -p fln-olean --example simp_journal_population -- "$FLN_REFERENCE_LIB" Std Lean
+          cargo test --locked --release -p fln --lib source_check::modules::imported::simp::tests::pinned_init_std_and_lean_populations_match_derived_journal_bounds_and_oversize_refuses_typed -- --exact --nocapture --test-threads=1

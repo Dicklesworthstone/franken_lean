@@ -713,11 +713,22 @@ fn pinned_init_restores_the_reported_list_and_nat_default_simp_goals() {
             .environment()
             .extension(&n("FrankenLean.sourceSimp.v1"))
             .expect("Init must retain its native default-simp journal");
-        // This is the historical failing population boundary, not a new
-        // capacity setting. Exercise it with the pin's real admitted rules.
+        // Exercise the pin's real admitted Init simp population and verify its
+        // retained count and payload bytes match the mechanically derived bounds.
+        assert_eq!(
+            journal.len(),
+            native::PINNED_INIT_SIMP_RETAINED_EVENTS as usize,
+            "Init must retain every global simp event"
+        );
         assert!(
-            journal.len() > 4096,
-            "Init must exercise the old row ceiling"
+            journal.payload_bytes() <= native::PINNED_INIT_SIMP_MAX_PAYLOAD_BYTES,
+            "Init payload bytes {} exceeded derived ceiling {}",
+            journal.payload_bytes(),
+            native::PINNED_INIT_SIMP_MAX_PAYLOAD_BYTES
+        );
+        assert_eq!(
+            native::check_journal_capacity(journal.len(), journal.payload_bytes()),
+            Ok(())
         );
         eprintln!(
             "Init native simp journal: {} events, {} retained payload bytes",
@@ -744,4 +755,217 @@ fn pinned_init_restores_the_reported_list_and_nat_default_simp_goals() {
             .unwrap();
         assert_eq!(result.checked.theorems, 2);
     });
+}
+
+#[test]
+fn pinned_init_std_and_lean_populations_match_derived_journal_bounds_and_oversize_refuses_typed() {
+    use fln_olean::pin::check_pinned_header;
+    use fln_olean::region::{OleanView, OpaqueExtensionBlock, WalkBudget};
+    use fln_olean::source_extensions::{DecodeLimits, SIMP_EXTENSION, SimpKind, decode};
+
+    // Always verify typed oversize refusal even when the pinned Reference
+    // toolchain is absent on a unit-only worker.
+    let before = model();
+    let max_rule_origin = Name::str(n("origin"), "x".repeat(8_192));
+    let mut oversized_env = before
+        .add_decl(ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: max_rule_origin.clone(),
+                level_params: vec![],
+                type_: Expr::const_(n("Nat"), vec![]),
+            },
+            value: Expr::const_(n("Nat.zero"), vec![]),
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![max_rule_origin.clone()],
+        }))
+        .unwrap();
+    let before_root = Engine::from_environment(oversized_env.clone()).logical_root(&KVMap::new());
+    let rule = ImportedSimpRule::Unfold {
+        declaration: max_rule_origin,
+    };
+    let per_rule_charge =
+        native::ENTRY_ACCOUNTING_BYTES + (rule.encoded_payload_len().unwrap() as u128);
+    let fitting_count = (native::MAX_JOURNAL_BYTES / per_rule_charge) as usize;
+    let overflowing = vec![rule; fitting_count + 1];
+    let error = native::import_rules(&oversized_env, &overflowing)
+        .map_err(|err| registry_error(&extension_name(), err))
+        .unwrap_err();
+    assert!(
+        matches!(error, SourceOleanImportError::Limit("native simp journal")),
+        "expected typed native simp journal Limit, got {error:?}"
+    );
+    assert!(error.metadata_resource_exhausted());
+    assert_eq!(
+        Engine::from_environment(oversized_env.clone()).logical_root(&KVMap::new()),
+        before_root
+    );
+    oversized_env = native::import_rules(&oversized_env, &overflowing[..1]).unwrap();
+    assert_eq!(
+        oversized_env
+            .extension(&n("FrankenLean.sourceSimp.v1"))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent");
+        return;
+    };
+
+    let simp_ext = Name::from_components(SIMP_EXTENSION.split('.'));
+    let mut cached = BTreeMap::<Name, (Vec<Name>, u64, u64, u128)>::new();
+    let inspect_module = |module: &Name| -> (Vec<Name>, u64, u64, u128) {
+        let base = lib.join(module.to_display_string().replace('.', "/"));
+        let public = std::fs::read(base.with_extension("olean")).unwrap();
+        check_pinned_header(&public).unwrap();
+        let budget = WalkBudget::default();
+        let public_view = OleanView::parse(&public).unwrap();
+        public_view.walk(budget).unwrap();
+        let mod_data = public_view.module_data(budget).unwrap();
+        let imports: Vec<Name> = mod_data.imports.into_iter().map(|i| i.module).collect();
+        let count_of = |exts: &[fln_olean::region::ExtensionBlock]| -> u64 {
+            exts.iter()
+                .find(|block| block.name == SIMP_EXTENSION)
+                .map_or(0, |block| block.entries)
+        };
+        let decode_from = |view: &OleanView, expected: u64| -> (u64, u64, u128) {
+            if expected == 0 {
+                return (0, 0, 0);
+            }
+            let selected = view
+                .selected_extension_payloads(budget, 64 << 20, |name| *name == simp_ext)
+                .unwrap();
+            let blocks: Vec<OpaqueExtensionBlock> = selected
+                .into_iter()
+                .filter_map(|block| {
+                    block.entries.map(|entries| OpaqueExtensionBlock {
+                        name: block.name,
+                        entries,
+                    })
+                })
+                .collect();
+            let decoded = decode(&blocks, DecodeLimits::default()).unwrap();
+            assert_eq!(decoded.simps.len() as u64, expected);
+            let mut retained = 0u64;
+            let mut max_payload_bytes = 0u128;
+            for entry in &decoded.simps {
+                if entry.scope.is_some() {
+                    continue;
+                }
+                retained += 1;
+                let erase = ImportedSimpRule::Erase {
+                    declaration: origin_of(entry).clone(),
+                };
+                let erase_len = erase.encoded_payload_len().unwrap();
+                let active_len = match &entry.kind {
+                    SimpKind::Theorem(theorem)
+                        if theorem.post && !theorem.origin_reverse && !theorem.permutation =>
+                    {
+                        if let ExprNode::Const { name, .. } = theorem.proof.node() {
+                            ImportedSimpRule::Proof {
+                                origin: theorem.origin.clone(),
+                                proof: name.clone(),
+                                priority: theorem.priority,
+                            }
+                            .encoded_payload_len()
+                            .unwrap()
+                        } else {
+                            0
+                        }
+                    }
+                    SimpKind::Unfold(declaration) => ImportedSimpRule::Unfold {
+                        declaration: declaration.clone(),
+                    }
+                    .encoded_payload_len()
+                    .unwrap(),
+                    SimpKind::UnfoldTheorems {
+                        declaration,
+                        theorems,
+                    } => ImportedSimpRule::UnfoldTheorems {
+                        declaration: declaration.clone(),
+                        theorems: theorems.clone(),
+                    }
+                    .encoded_payload_len()
+                    .unwrap(),
+                    _ => 0,
+                };
+                max_payload_bytes += erase_len.max(active_len) as u128;
+            }
+            (expected, retained, max_payload_bytes)
+        };
+        let (events, retained, max_payload_bytes) = if mod_data.is_module {
+            let server = std::fs::read(base.with_extension("olean.server")).unwrap();
+            let private = std::fs::read(base.with_extension("olean.private")).unwrap();
+            check_pinned_header(&server).unwrap();
+            check_pinned_header(&private).unwrap();
+            let private_view =
+                OleanView::parse_with_dependencies(&private, &[&public, &server]).unwrap();
+            private_view.walk(budget).unwrap();
+            let private_mod = private_view.module_data(budget).unwrap();
+            decode_from(&private_view, count_of(&private_mod.extensions))
+        } else {
+            decode_from(&public_view, count_of(&mod_data.extensions))
+        };
+        (imports, events, retained, max_payload_bytes)
+    };
+
+    for (root, expected_modules, expected_events, expected_retained, expected_payload_bytes) in [
+        (
+            "Init",
+            native::PINNED_INIT_SIMP_MODULES,
+            native::PINNED_INIT_SIMP_EVENTS,
+            native::PINNED_INIT_SIMP_RETAINED_EVENTS,
+            native::PINNED_INIT_SIMP_MAX_PAYLOAD_BYTES,
+        ),
+        (
+            "Std",
+            native::PINNED_STD_SIMP_MODULES,
+            native::PINNED_STD_SIMP_EVENTS,
+            native::PINNED_STD_SIMP_RETAINED_EVENTS,
+            native::PINNED_STD_SIMP_MAX_PAYLOAD_BYTES,
+        ),
+        (
+            "Lean",
+            native::PINNED_LEAN_SIMP_MODULES,
+            native::PINNED_LEAN_SIMP_EVENTS,
+            native::PINNED_LEAN_SIMP_RETAINED_EVENTS,
+            native::PINNED_LEAN_SIMP_MAX_PAYLOAD_BYTES,
+        ),
+    ] {
+        let mut pending = vec![n(root)];
+        let mut seen = BTreeSet::new();
+        let mut events = 0u64;
+        let mut retained = 0u64;
+        let mut max_payload_bytes = 0u128;
+        while let Some(module) = pending.pop() {
+            if !seen.insert(module.clone()) {
+                continue;
+            }
+            let (imports, mod_events, mod_retained, mod_payload_bytes) = cached
+                .entry(module.clone())
+                .or_insert_with(|| inspect_module(&module))
+                .clone();
+            events += mod_events;
+            retained += mod_retained;
+            max_payload_bytes += mod_payload_bytes;
+            pending.extend(imports);
+        }
+        assert_eq!(seen.len(), expected_modules, "{root} module count drifted");
+        assert_eq!(events, expected_events, "{root} simp event count drifted");
+        assert_eq!(
+            retained, expected_retained,
+            "{root} retained simp event count drifted"
+        );
+        assert_eq!(
+            max_payload_bytes, expected_payload_bytes,
+            "{root} worst-case native simp payload bytes drifted"
+        );
+        assert_eq!(
+            native::check_journal_capacity(retained as usize, max_payload_bytes),
+            Ok(()),
+            "{root} closure must fit MAX_JOURNAL_BYTES"
+        );
+    }
 }

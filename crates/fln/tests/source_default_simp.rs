@@ -501,7 +501,25 @@ fn reverse_registration_and_priorities_are_retained_deterministically() {
             .collect::<Vec<_>>()
     };
     assert_eq!(selected(&again_rows), selected(&rows));
-    assert_eq!(again_rows[0].order, rows[0].order + 1);
+    // Re-registering an already active rule updates its priority/orientation in
+    // place while preserving its initial discrimination slot (`869584b04`), and
+    // still advances the underlying journal index by +1 for subsequent rules.
+    assert_eq!(again_rows[0].order, rows[0].order);
+    let fresh_decl =
+        "@[simp 900] theorem freshUnwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl";
+    let after_newer = checked(&newer.engine, &[fresh_decl]);
+    let after_again = checked(&again.engine, &[fresh_decl]);
+    let after_newer_rows = simp::read(after_newer.engine.environment()).unwrap();
+    let after_again_rows = simp::read(after_again.engine.environment()).unwrap();
+    assert_eq!(
+        after_newer_rows[0].declaration,
+        Name::from_components(["freshUnwrap"])
+    );
+    assert_eq!(
+        after_again_rows[0].declaration,
+        Name::from_components(["freshUnwrap"])
+    );
+    assert_eq!(after_again_rows[0].order, after_newer_rows[0].order + 1);
     let same_predecessor = checked(&newer.engine, &["attribute [simp 900] unwrap"]);
     assert_eq!(
         again.result_logical_root,

@@ -477,20 +477,62 @@ const SNAPSHOT_MAGIC: &[u8] = b"FLNSIMP\x04";
 // The association records only the pin's recursive attribute-erasure relation.
 const UNFOLD_THEOREMS_MAGIC: &[u8] = b"FLNSIMP\x05";
 // A proof's type traversal and an imported library's journal are independent
-// resources. Init alone carries more than 4,096 simp events.
+// resources. Init alone carries 10,335 simp events.
 const MAX_TYPE_STEPS: usize = 4096;
 const MAX_BYTES: usize = 16384;
-// Preserve the old 4,096 * 16,384-byte envelope while accounting for each
-// retained entry handle too. Small rules may share the available space;
-// admitting a larger library never grants more work to any proof classifier.
-const MAX_JOURNAL_BYTES: u128 = 4096 * MAX_BYTES as u128;
-const ENTRY_ACCOUNTING_BYTES: u128 =
+
+/// Per-entry handle charge (`std::mem::size_of::<ExtensionEntry>()`), accounted
+/// alongside each entry's wire payload bytes.
+pub const ENTRY_ACCOUNTING_BYTES: u128 =
     std::mem::size_of::<fln_env::extensions::ExtensionEntry>() as u128;
 
-fn check_journal_capacity(entries: usize, payload_bytes: u128) -> Result<(), SimpSetError> {
-    let bytes = (entries as u128)
-        .checked_mul(ENTRY_ACCOUNTING_BYTES)
-        .and_then(|overhead| overhead.checked_add(payload_bytes))
+/// Pin-extracted default-simp closure metrics (`cargo run -p fln-olean
+/// --example simp_journal_population -- LIB/lean Init Std Lean`, schema
+/// `fln-simp-journal-population/2`, pin `v4.32.0`
+/// `8c9756b28d64dab099da31a4c09229a9e6a2ef35`).
+/// Re-checked against the live pinned `.olean` files by
+/// `fln::source_check::modules::imported::simp::tests::pinned_init_std_and_lean_populations_match_derived_journal_bounds_and_oversize_refuses_typed`.
+pub const PINNED_INIT_SIMP_MODULES: usize = 601;
+pub const PINNED_INIT_SIMP_EVENTS: u64 = 10_335;
+pub const PINNED_INIT_SIMP_RETAINED_EVENTS: u64 = 10_335;
+pub const PINNED_INIT_SIMP_MAX_PAYLOAD_BYTES: u128 = 868_468;
+
+pub const PINNED_STD_SIMP_MODULES: usize = 965;
+pub const PINNED_STD_SIMP_EVENTS: u64 = 15_095;
+pub const PINNED_STD_SIMP_RETAINED_EVENTS: u64 = 15_095;
+pub const PINNED_STD_SIMP_MAX_PAYLOAD_BYTES: u128 = 1_488_071;
+
+pub const PINNED_LEAN_SIMP_MODULES: usize = 2_270;
+pub const PINNED_LEAN_SIMP_EVENTS: u64 = 20_548;
+pub const PINNED_LEAN_SIMP_RETAINED_EVENTS: u64 = 20_548;
+pub const PINNED_LEAN_SIMP_MAX_PAYLOAD_BYTES: u128 = 2_385_946;
+
+/// Exact aggregate journal charge (`retained_events * ENTRY_ACCOUNTING_BYTES + payload_bytes`).
+pub const fn accounted_journal_bytes(retained_events: u64, payload_bytes: u128) -> Option<u128> {
+    match (retained_events as u128).checked_mul(ENTRY_ACCOUNTING_BYTES) {
+        Some(overhead) => overhead.checked_add(payload_bytes),
+        None => None,
+    }
+}
+
+/// Headroom multiple over the pinned `Lean` closure (`2,270` modules, covering
+/// `Init` and `Std`) so user modules and downstream libraries on top of
+/// `import Lean` can register local `@[simp]` rules and snapshots without
+/// overflowing the native journal, while oversize imports fail closed with
+/// [`SimpSetError::Limit`].
+pub const JOURNAL_HEADROOM_FACTOR: u128 = 8;
+
+/// Mechanically derived native simp journal byte ceiling (`8×` the pinned
+/// `Lean` closure's worst-case native journal footprint; admitting a larger
+/// library never grants more work to any per-proof classifier).
+pub const MAX_JOURNAL_BYTES: u128 = JOURNAL_HEADROOM_FACTOR
+    * ((PINNED_LEAN_SIMP_RETAINED_EVENTS as u128) * ENTRY_ACCOUNTING_BYTES
+        + PINNED_LEAN_SIMP_MAX_PAYLOAD_BYTES);
+
+pub fn check_journal_capacity(entries: usize, payload_bytes: u128) -> Result<(), SimpSetError> {
+    let bytes = u64::try_from(entries)
+        .ok()
+        .and_then(|count| accounted_journal_bytes(count, payload_bytes))
         .ok_or(SimpSetError::Limit)?;
     if bytes > MAX_JOURNAL_BYTES {
         return Err(SimpSetError::Limit);

@@ -131,9 +131,11 @@ fn entry_native_metrics(entry: &SimpEntry) -> Result<(u64, u128), String> {
                 && !theorem.permutation
                 && let ExprNode::Const { name, .. } = theorem.proof.node()
             {
+                let origin_bytes = structural_name_bytes(&theorem.origin)?;
+                let proof_name_bytes = structural_name_bytes(name)?;
                 let proof_bytes = 14usize
-                    .checked_add(structural_name_bytes(&theorem.origin)?)
-                    .and_then(|n| n.checked_add(structural_name_bytes(name)?))
+                    .checked_add(origin_bytes)
+                    .and_then(|n| n.checked_add(proof_name_bytes))
                     .ok_or("simp proof payload overflow")?;
                 if proof_bytes > MAX_ROW_BYTES {
                     return Err(format!("simp proof payload exceeds {MAX_ROW_BYTES} bytes"));
