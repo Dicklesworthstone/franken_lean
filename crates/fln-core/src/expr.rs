@@ -510,6 +510,21 @@ impl std::fmt::Debug for Expr {
 
 impl PartialEq for Expr {
     fn eq(&self, other: &Expr) -> bool {
+        self.expr_eq_impl(other, true)
+    }
+}
+impl Eq for Expr {}
+
+impl Expr {
+    /// Pin `is_equal` / `expr_eq_fn<false>` (`expr_eq_fn.cpp:113-145`):
+    /// de Bruijn alpha-equivalence ignoring binder names and binder-info
+    /// annotations on `Lam`/`ForallE` and declaration names on `LetE`, while
+    /// preserving `Lam` vs `ForallE` distinction and `LetE.non_dep`.
+    pub fn is_alpha_equiv(&self, other: &Expr) -> bool {
+        self.expr_eq_impl(other, false)
+    }
+
+    fn expr_eq_impl(&self, other: &Expr, compare_binder_info: bool) -> bool {
         if self.data != other.data {
             return false;
         }
@@ -615,7 +630,7 @@ impl PartialEq for Expr {
                         binder_info: b_info,
                     },
                 ) => {
-                    if a_name != b_name || a_info != b_info {
+                    if compare_binder_info && (a_name != b_name || a_info != b_info) {
                         return false;
                     }
                     pending.push((a_body, b_body));
@@ -637,7 +652,7 @@ impl PartialEq for Expr {
                         non_dep: b_non_dep,
                     },
                 ) => {
-                    if a_name != b_name || a_non_dep != b_non_dep {
+                    if a_non_dep != b_non_dep || (compare_binder_info && a_name != b_name) {
                         return false;
                     }
                     pending.push((a_body, b_body));
@@ -687,7 +702,6 @@ impl PartialEq for Expr {
         true
     }
 }
-impl Eq for Expr {}
 
 impl std::hash::Hash for Expr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -2850,5 +2864,92 @@ mod tests {
             outcome.is_ok(),
             "deep Expr formatting exhausted the bounded worker stack"
         );
+    }
+
+    #[test]
+    fn alpha_equiv_matches_pin_expr_eq_fn_false_and_remains_stack_safe() {
+        let prop = Expr::sort(Level::zero());
+        let b0 = Expr::bvar(0).expect("small");
+        let lam_x = Expr::lam(
+            Name::str(Name::anonymous(), "x"),
+            prop.clone(),
+            b0.clone(),
+            BinderInfo::Default,
+        );
+        let lam_y = Expr::lam(
+            Name::str(Name::anonymous(), "y"),
+            prop.clone(),
+            b0.clone(),
+            BinderInfo::InstImplicit,
+        );
+        assert_ne!(lam_x, lam_y);
+        assert!(lam_x.is_alpha_equiv(&lam_y));
+
+        let pi_x = Expr::forall_e(
+            Name::str(Name::anonymous(), "x"),
+            prop.clone(),
+            b0.clone(),
+            BinderInfo::Default,
+        );
+        let pi_y = Expr::forall_e(
+            Name::str(Name::anonymous(), "y"),
+            prop.clone(),
+            b0.clone(),
+            BinderInfo::Implicit,
+        );
+        assert_ne!(pi_x, pi_y);
+        assert!(pi_x.is_alpha_equiv(&pi_y));
+        assert!(!lam_x.is_alpha_equiv(&pi_x));
+
+        let let_a = Expr::let_e(
+            Name::str(Name::anonymous(), "a"),
+            prop.clone(),
+            prop.clone(),
+            b0.clone(),
+            false,
+        );
+        let let_b = Expr::let_e(
+            Name::str(Name::anonymous(), "b"),
+            prop.clone(),
+            prop.clone(),
+            b0.clone(),
+            false,
+        );
+        let let_nondep = Expr::let_e(
+            Name::str(Name::anonymous(), "a"),
+            prop.clone(),
+            prop.clone(),
+            b0,
+            true,
+        );
+        assert_ne!(let_a, let_b);
+        assert!(let_a.is_alpha_equiv(&let_b));
+        assert!(!let_a.is_alpha_equiv(&let_nondep));
+
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut left = Expr::sort(Level::zero());
+                let mut right = Expr::sort(Level::zero());
+                for i in 0..10_000_u64 {
+                    left = Expr::lam(
+                        Name::num(Name::anonymous(), i),
+                        Expr::sort(Level::zero()),
+                        left,
+                        BinderInfo::Default,
+                    );
+                    right = Expr::lam(
+                        Name::num(Name::anonymous(), i + 100_000),
+                        Expr::sort(Level::zero()),
+                        right,
+                        BinderInfo::Implicit,
+                    );
+                }
+                assert!(left.is_alpha_equiv(&right));
+                assert_ne!(left, right);
+            })
+            .expect("spawn bounded-stack alpha_equiv worker")
+            .join();
+        assert!(outcome.is_ok(), "deep alpha_equiv exhausted bounded stack");
     }
 }
