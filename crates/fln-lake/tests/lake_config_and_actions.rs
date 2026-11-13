@@ -850,3 +850,368 @@ fn toml_package_identities_remain_distinct_from_json_name_spellings() {
         );
     }
 }
+
+
+fn update_write_package(base: &std::path::Path, relative: &str, source: &str) {
+    let dir = base.join(relative);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lakefile.toml"), source).unwrap();
+}
+
+fn update_path_entry(
+    name: &str,
+    directory: &str,
+    inherited: bool,
+) -> fln_lake::ManifestPackageEntry {
+    fln_lake::ManifestPackageEntry {
+        name: name.to_owned(),
+        scope: String::new(),
+        entry_type: "path".to_owned(),
+        dir: Some(PathBuf::from(directory)),
+        url: None,
+        rev: None,
+        input_rev: None,
+        subdir: None,
+        inherited,
+        config_file: "lakefile.toml".to_owned(),
+        manifest_file: Some(PathBuf::from("lake-manifest.json")),
+    }
+}
+
+#[test]
+fn local_update_resolves_the_reverse_breadth_first_diamond_without_child_writes() {
+    let base = fresh_temp_dir("update-diamond");
+    update_write_package(
+        &base,
+        "root",
+        concat!(
+            "name = \"root\"\n",
+            "[[require]]\nname = \"left\"\npath = \"../left\"\n",
+            "[[require]]\nname = \"right\"\npath = \"../missing-direct\"\n",
+            "[[require]]\nname = \"right\"\npath = \"../right\"\n",
+        ),
+    );
+    update_write_package(
+        &base,
+        "left",
+        concat!(
+            "name = \"left\"\n",
+            "[[require]]\nname = \"shared\"\npath = \"../missing-transitive\"\n",
+        ),
+    );
+    update_write_package(
+        &base,
+        "right",
+        concat!(
+            "name = \"different-from-required-identity\"\n",
+            "[[require]]\nname = \"shared\"\npath = \"vendor/shared library\"\n",
+        ),
+    );
+    update_write_package(&base, "right/vendor/shared library", "name = \"shared\"\n");
+    let root = base.join("root");
+    std::fs::write(root.join("lake-manifest.json"), "{stale malformed lock}").unwrap();
+    let before = tree(&base);
+    let manifest = fln_lake::update_manifest(&root).unwrap();
+    assert_eq!(manifest.name, "root");
+    assert_eq!(manifest.version, "1.2.0");
+    assert!(!manifest.fixed_toolchain);
+    assert_eq!(manifest.packages_dir, Some(PathBuf::from(".lake/packages")));
+    assert_eq!(
+        manifest.packages,
+        [
+            update_path_entry("right", "../right", false),
+            update_path_entry("left", "../left", false),
+            update_path_entry("shared", "../right/vendor/shared library", true),
+        ],
+    );
+    let bytes = std::fs::read_to_string(root.join("lake-manifest.json")).unwrap();
+    let loaded = fln_lake::Manifest::load_from_dir(&root).unwrap().unwrap();
+    assert_eq!(loaded, manifest);
+    let mut expected = before;
+    expected.insert(
+        std::path::Path::new("root/lake-manifest.json")
+            .display()
+            .to_string(),
+        bytes.clone(),
+    );
+    assert_eq!(tree(&base), expected);
+    assert_eq!(fln_lake::update_manifest(&root).unwrap(), manifest);
+    assert_eq!(
+        std::fs::read_to_string(root.join("lake-manifest.json")).unwrap(),
+        bytes,
+    );
+    assert_eq!(tree(&base), expected);
+}
+
+#[test]
+fn local_update_inherits_child_locks_after_reserving_every_direct_name() {
+    let base = fresh_temp_dir("update-inherited");
+    update_write_package(
+        &base,
+        "root",
+        concat!(
+            "name = \"root\"\n",
+            "[[require]]\nname = \"leaf\"\npath = \"../direct\"\n",
+            "[[require]]\nname = \"parent\"\npath = \"../parent\"\n",
+        ),
+    );
+    update_write_package(
+        &base,
+        "parent",
+        concat!(
+            "name = \"parent\"\n",
+            "[[require]]\nname = \"leaf\"\npath = \"missing-unlocked-leaf\"\n",
+            "[[require]]\nname = \"transitive\"\npath = \"missing-unlocked-transitive\"\n",
+        ),
+    );
+    update_write_package(&base, "direct", "name = \"leaf-own-name\"\n");
+    update_write_package(&base, "parent/vendor/locked", "name = \"transitive\"\n");
+    let mut child = fln_lake::Manifest::new("parent");
+    child.packages = vec![
+        update_path_entry("leaf", "missing-shadow", false),
+        update_path_entry("transitive", "vendor/locked", false),
+        // The first imported lock for a name wins, unlike reading a root lock.
+        update_path_entry("transitive", "missing-later-duplicate", false),
+    ];
+    child.save_to_dir(&base.join("parent")).unwrap();
+    let root = base.join("root");
+    let mut stale = fln_lake::Manifest::new("root");
+    stale.packages = vec![update_path_entry("leaf", "../missing-stale-root", false)];
+    stale.save_to_dir(&root).unwrap();
+    let before = tree(&base);
+    let manifest = fln_lake::update_manifest(&root).unwrap();
+    assert_eq!(
+        manifest.packages,
+        [
+            update_path_entry("parent", "../parent", false),
+            update_path_entry("leaf", "../direct", false),
+            update_path_entry("transitive", "../parent/vendor/locked", true),
+        ],
+    );
+    let mut expected = before;
+    expected.insert(
+        std::path::Path::new("root/lake-manifest.json")
+            .display()
+            .to_string(),
+        std::fs::read_to_string(root.join("lake-manifest.json")).unwrap(),
+    );
+    assert_eq!(tree(&base), expected);
+    assert_eq!(
+        fln_lake::Manifest::load_from_dir(&base.join("parent"))
+            .unwrap()
+            .unwrap(),
+        child,
+    );
+}
+
+#[test]
+fn local_update_discovery_failures_preserve_every_existing_file() {
+    for (label, root_source, child_source, detail) in [
+        (
+            "missing",
+            concat!(
+                "name = \"root\"\n",
+                "[[require]]\nname = \"absent\"\npath = \"../absent\"\n",
+                "[[require]]\nname = \"good\"\npath = \"../good\"\n",
+            ),
+            "name = \"good\"\n",
+            "absent",
+        ),
+        (
+            "remote",
+            concat!(
+                "name = \"root\"\n",
+                "[[require]]\nname = \"remote\"\ngit = \"https://example.invalid/repo\"\n",
+                "[[require]]\nname = \"good\"\npath = \"../good\"\n",
+            ),
+            "name = \"good\"\n",
+            "remote",
+        ),
+        (
+            "cycle",
+            "name = \"root\"\n[[require]]\nname = \"good\"\npath = \"../good\"\n",
+            "name = \"good\"\n[[require]]\nname = \"root\"\npath = \"../root\"\n",
+            "cycle",
+        ),
+        (
+            "options",
+            "name = \"root\"\n[[require]]\nname = \"good\"\npath = \"../good\"\n",
+            "name = \"good\"\n[[require]]\nname = \"leaf\"\npath = \"../leaf\"\noptions = []\n",
+            "options",
+        ),
+    ] {
+        let base = fresh_temp_dir(&format!("update-{label}"));
+        update_write_package(&base, "root", root_source);
+        update_write_package(&base, "good", child_source);
+        let root = base.join("root");
+        fln_lake::Manifest::new("old-selection")
+            .save_to_dir(&root)
+            .unwrap();
+        let before = tree(&base);
+        let error = fln_lake::update_manifest(&root).unwrap_err();
+        assert!(error.to_string().contains(detail), "{label}: {error}");
+        assert_eq!(tree(&base), before, "{label}");
+    }
+}
+
+#[test]
+fn local_update_does_not_ignore_child_manifests_or_toolchain_changes() {
+    for (label, extra_path, contents, expected) in [
+        (
+            "child-manifest",
+            "good/lake-manifest.json",
+            "{not valid json}",
+            "manifest",
+        ),
+        (
+            "toolchain",
+            "good/lean-toolchain",
+            "leanprover/lean4:v4.33.0\n",
+            "toolchain",
+        ),
+        (
+            "overrides",
+            "good/.lake/package-overrides.json",
+            "{}",
+            "package-overrides.json",
+        ),
+        (
+            "lean-config",
+            "good/lakefile.lean",
+            "import Lake\n",
+            "lakefile.lean",
+        ),
+    ] {
+        let base = fresh_temp_dir(&format!("update-{label}"));
+        update_write_package(
+            &base,
+            "root",
+            "name = \"root\"\n[[require]]\nname = \"good\"\npath = \"../good\"\n",
+        );
+        update_write_package(&base, "good", "name = \"good\"\n");
+        let root = base.join("root");
+        std::fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.32.0\n").unwrap();
+        let extra = base.join(extra_path);
+        std::fs::create_dir_all(extra.parent().unwrap()).unwrap();
+        std::fs::write(extra, contents).unwrap();
+        fln_lake::Manifest::new("old-selection")
+            .save_to_dir(&root)
+            .unwrap();
+        let before = tree(&base);
+        let error = fln_lake::update_manifest(&root).unwrap_err();
+        assert!(error.to_string().contains(expected), "{label}: {error}");
+        assert_eq!(tree(&base), before, "{label}");
+    }
+}
+
+#[test]
+fn local_update_budget_stops_do_not_publish_partial_dependency_sets() {
+    let base = fresh_temp_dir("update-package-bound");
+    let mut source = String::from("name = \"root\"\n");
+    for index in 0..64 {
+        let name = format!("dep{index}");
+        source.push_str(&format!(
+            "[[require]]\nname = \"{name}\"\npath = \"../{name}\"\n",
+        ));
+        update_write_package(&base, &name, &format!("name = \"{name}\"\n"));
+    }
+    update_write_package(&base, "root", &source);
+    let root = base.join("root");
+    fln_lake::Manifest::new("previous")
+        .save_to_dir(&root)
+        .unwrap();
+    let before = tree(&base);
+    assert!(matches!(
+        fln_lake::update_manifest(&root),
+        Err(fln_lake::LakeUpdateError::Resource(detail))
+            if detail.contains("package count exceeds 64")
+    ));
+    assert_eq!(tree(&base), before);
+
+    std::fs::write(root.join("lakefile.toml"), " ".repeat(64 * 1024 + 1)).unwrap();
+    let before = tree(&base);
+    assert!(matches!(
+        fln_lake::update_manifest(&root),
+        Err(fln_lake::LakeUpdateError::Resource(detail))
+            if detail.contains("65536 bytes")
+    ));
+    assert_eq!(tree(&base), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn local_update_checks_symlinks_before_erasing_parent_components() {
+    let base = fresh_temp_dir("update-symlink-parent");
+    update_write_package(
+        &base,
+        "root",
+        "name = \"root\"\n[[require]]\nname = \"good\"\npath = \"../alias/../good\"\n",
+    );
+    update_write_package(&base, "good", "name = \"good\"\n");
+    std::os::unix::fs::symlink(base.join("good"), base.join("alias")).unwrap();
+    let root = base.join("root");
+    fln_lake::Manifest::new("previous")
+        .save_to_dir(&root)
+        .unwrap();
+    let before = std::fs::read(root.join("lake-manifest.json")).unwrap();
+    let error = fln_lake::update_manifest(&root).unwrap_err();
+    assert!(error.to_string().contains("symlink"), "{error}");
+    assert_eq!(std::fs::read(root.join("lake-manifest.json")).unwrap(), before);
+    assert_eq!(
+        std::fs::read_to_string(base.join("good/lakefile.toml")).unwrap(),
+        "name = \"good\"\n",
+    );
+    assert!(!base.join("good/lake-manifest.json").exists());
+}
+
+#[test]
+fn local_update_uses_canonical_names_and_an_inherited_explicit_toml_selector() {
+    let base = fresh_temp_dir("update-canonical-names");
+    update_write_package(
+        &base,
+        "root",
+        "name = \"root-project\"\n[[require]]\nname = \"parent-lib\"\npath = \"../parent\"\n",
+    );
+    update_write_package(
+        &base,
+        "parent",
+        concat!(
+            "name = \"parent-lib\"\n",
+            "[[require]]\nname = \"shared-lib\"\npath = \"missing-unlocked-shared\"\n",
+        ),
+    );
+    update_write_package(&base, "parent/vendor/shared", "name = \"shared-lib\"\n");
+    // The inherited entry explicitly selects TOML, so a sibling Lean file
+    // does not take precedence as it would for a fresh default selector.
+    std::fs::write(
+        base.join("parent/vendor/shared/lakefile.lean"),
+        "import Lake\npackage ignored\n",
+    )
+    .unwrap();
+    let mut inherited = fln_lake::Manifest::new("parent-lib");
+    inherited.packages = vec![update_path_entry("«shared-lib»", "vendor/shared", false)];
+    inherited.save_to_dir(&base.join("parent")).unwrap();
+    let before = tree(&base);
+    let root = base.join("root");
+    let manifest = fln_lake::update_manifest(&root).unwrap();
+    assert_eq!(manifest.name, "«root-project»");
+    assert_eq!(
+        manifest.packages,
+        [
+            update_path_entry("«parent-lib»", "../parent", false),
+            update_path_entry("«shared-lib»", "../parent/vendor/shared", true),
+        ],
+    );
+    assert_eq!(
+        fln_lake::Manifest::load_from_dir(&root).unwrap().unwrap(),
+        manifest,
+    );
+    let mut expected = before;
+    expected.insert(
+        std::path::Path::new("root/lake-manifest.json")
+            .display()
+            .to_string(),
+        std::fs::read_to_string(root.join("lake-manifest.json")).unwrap(),
+    );
+    assert_eq!(tree(&base), expected);
+}

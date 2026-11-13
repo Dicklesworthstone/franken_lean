@@ -1017,3 +1017,141 @@ fn quoted_self_requirements_share_the_roots_canonical_package_identity() {
     assert!(!workspace.0.join("import-records").exists());
     workspace.no_products();
 }
+
+#[test]
+fn local_update_publishes_a_lock_for_checked_builds_and_preserves_it_on_refusal() {
+    let workspace = artifact_workspace();
+    let configuration =
+        std::fs::read_to_string(workspace.0.join("root/lakefile.toml")).unwrap();
+    let report = build_success(workspace.run(&["--json", "update"], None));
+    assert!(report.contains("\"schema\":\"fln.lake-update/1\""), "{report}");
+    assert!(report.contains("\"packages_count\":3"), "{report}");
+    let manifest_path = workspace.0.join("root/lake-manifest.json");
+    let manifest = std::fs::read(&manifest_path).unwrap();
+    for package in ["left", "right", "right/vendor/shared library"] {
+        assert!(!workspace.0.join(package).join("lake-manifest.json").exists());
+    }
+    workspace.no_products();
+    let upgraded = build_success(workspace.run(&["--json", "upgrade"], None));
+    assert!(upgraded.contains("\"packages_count\":3"), "{upgraded}");
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest);
+
+    let built = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(built.contains("\"modules_built\":4"), "{built}");
+    let paths = artifact_paths(&workspace);
+    let original: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let bytes = std::fs::read(path).unwrap();
+            fln_olean::region::OleanView::parse(&bytes).unwrap();
+            bytes
+        })
+        .collect();
+    let warm = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(warm.contains("\"modules_cached\":4"), "{warm}");
+    assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
+    let snapshot = workspace.0.join("root/output/fln-build.snapshot");
+    let snapshot_bytes = std::fs::read(&snapshot).unwrap();
+    let unchanged = || {
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), snapshot_bytes);
+        for (path, before) in paths.iter().zip(&original) {
+            assert_eq!(&std::fs::read(path).unwrap(), before);
+        }
+        for package in ["left", "right", "right/vendor/shared library"] {
+            assert!(!workspace.0.join(package).join("lake-manifest.json").exists());
+        }
+    };
+
+    // Selective refreshes and unimplemented flags must fail before resolution.
+    for arguments in [
+        ["--json", "update", "right"],
+        ["--json", "upgrade", "--wfail"],
+    ] {
+        let output = workspace.run(&arguments, None);
+        assert_eq!(output.status.code(), Some(5), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let error = std::str::from_utf8(&output.stderr).unwrap();
+        assert!(error.contains("\"status\":\"not_implemented\""), "{error}");
+        unchanged();
+    }
+
+    workspace.write(
+        "root/lakefile.toml",
+        configuration.replace("path = \"../right\"", "path = \"../missing\\\"dependency\""),
+    );
+    let missing = workspace.run(&["--json", "update"], None);
+    assert_eq!(missing.status.code(), Some(1), "{missing:?}");
+    assert!(missing.stdout.is_empty(), "{missing:?}");
+    let error = std::str::from_utf8(&missing.stderr).unwrap();
+    assert!(error.contains("\"status\":\"error\""), "{error}");
+    assert!(error.contains("missing\\\"dependency"), "{error}");
+    assert_eq!(error.lines().count(), 1, "{error}");
+    unchanged();
+
+    workspace.write(
+        "root/lakefile.toml",
+        format!("{configuration}#{}\n", "x".repeat(1024 * 1024)),
+    );
+    refusal(
+        workspace.run(&["--json", "update"], None),
+        "resource",
+        "fln.lake-update/1",
+    );
+    unchanged();
+
+    workspace.write(
+        "root/lakefile.toml",
+        configuration.replace(
+            "path = \"../right\"",
+            "git = \"https://example.invalid/never-fetch.git\"",
+        ),
+    );
+    let remote = workspace.run(&["--json", "update"], None);
+    assert_eq!(remote.status.code(), Some(5), "{remote:?}");
+    assert!(remote.stdout.is_empty(), "{remote:?}");
+    assert!(
+        std::str::from_utf8(&remote.stderr)
+            .unwrap()
+            .contains("\"status\":\"not_implemented\""),
+        "{remote:?}",
+    );
+    unchanged();
+
+    workspace.write("root/lakefile.toml", &configuration);
+    workspace.write(
+        "root/lakefile.lean",
+        "import Lake\nopen Lake DSL\npackage program\n",
+    );
+    let unsupported = workspace.run(&["--json", "upgrade"], None);
+    assert_eq!(unsupported.status.code(), Some(5), "{unsupported:?}");
+    assert!(unsupported.stdout.is_empty(), "{unsupported:?}");
+    assert!(
+        std::str::from_utf8(&unsupported.stderr)
+            .unwrap()
+            .contains("\"status\":\"not_implemented\""),
+        "{unsupported:?}",
+    );
+    unchanged();
+}
+
+#[test]
+fn local_update_lock_drives_the_installed_native_executable() {
+    let Some((_, lib)) = reference() else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let report = build_success(workspace.run(&["--json", "update"], None));
+    assert!(report.contains("\"packages_count\":3"), "{report}");
+    let manifest_path = workspace.0.join("root/lake-manifest.json");
+    let manifest = std::fs::read(&manifest_path).unwrap();
+    let output = workspace.run(&["exe", "runner", "updated"], Some(&lib));
+    assert_eq!(output.status.code(), Some(17), "{output:?}");
+    assert_eq!(
+        std::str::from_utf8(&output.stdout).unwrap(),
+        "left:chosen:updated\nright:chosen:updated\n",
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(std::fs::read(manifest_path).unwrap(), manifest);
+    workspace.no_products();
+}

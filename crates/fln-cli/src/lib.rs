@@ -15451,30 +15451,54 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             }
         }
         "update" | "upgrade" => {
+            if let Some(option) = ignored_options.first() {
+                return lake_not_implemented(
+                    &cmd,
+                    &format!("update option `{option}` is unavailable"),
+                    is_json,
+                );
+            }
+            if !command_args.is_empty() {
+                return lake_not_implemented(
+                    &cmd,
+                    "selective dependency updates are unavailable; omit package names to refresh the whole local dependency graph",
+                    is_json,
+                );
+            }
             let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
             match fln_lake::update_manifest(&target_dir) {
                 Ok(manifest) => {
                     if is_json {
                         MultiplexerOutput::success(format!(
-                            "{{\"schema\":\"fln.lake-update/1\",\"status\":\"success\",\"package\":\"{}\",\"packages_count\":{}}}\n",
-                            manifest.name,
+                            "{{\"schema\":\"fln.lake-update/1\",\"status\":\"success\",\"package\":{},\"packages_count\":{}}}\n",
+                            json_string(&manifest.name),
                             manifest.packages.len()
                         ))
                     } else {
                         MultiplexerOutput::success(String::new())
                     }
                 }
-                // Resolving a requirement means fetching it. Nothing here does,
-                // so nothing is written and the answer is "not implemented",
-                // never a manifest that claims a resolution.
-                Err(err @ fln_lake::LakeUpdateError::DependencyResolutionUnavailable { .. }) => {
+                Err(err @ fln_lake::LakeUpdateError::DependencyResolutionUnavailable { .. })
+                | Err(err @ fln_lake::LakeUpdateError::Unsupported(_)) => {
                     lake_not_implemented(&cmd, &err.to_string(), is_json)
+                }
+                Err(err @ fln_lake::LakeUpdateError::Resource(_)) => {
+                    let detail = if is_json {
+                        format!(
+                            "{{\"schema\":\"fln.lake-update/1\",\"status\":\"inconclusive\",\"class\":\"resource\",\"authority\":false,\"error\":{}}}\n",
+                            json_string(&err.to_string()),
+                        )
+                    } else {
+                        format!("{err}\n")
+                    };
+                    MultiplexerOutput::failure(detail, 3)
                 }
                 Err(err) => {
                     if is_json {
                         MultiplexerOutput::failure(
                             format!(
-                                "{{\"schema\":\"fln.lake-update/1\",\"status\":\"error\",\"error\":\"{err}\"}}\n"
+                                "{{\"schema\":\"fln.lake-update/1\",\"status\":\"error\",\"error\":{}}}\n",
+                                json_string(&err.to_string()),
                             ),
                             1,
                         )
