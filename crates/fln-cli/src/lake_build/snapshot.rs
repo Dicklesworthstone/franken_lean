@@ -15,8 +15,8 @@ const COMPANION_SCHEMA: &str = "fln.lake-build-snapshot/2";
 const LEGACY_SCHEMA: &str = "fln.lake-build-snapshot/1";
 /// More than a build may hold (256 modules, 4,096 imports, Init's 601 external modules).
 const MAX_LINES: usize = 1 << 20;
-/// Local dependency discovery admits at most 64 selected packages.
-const MAX_CONFIGURATIONS: usize = 64;
+/// At most 64 selected package configurations and one root manifest.
+const MAX_CONFIGURATIONS: usize = 65;
 
 /// The digest a snapshot names file contents by.
 pub(crate) fn digest(bytes: &[u8]) -> String {
