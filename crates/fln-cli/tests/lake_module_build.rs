@@ -75,6 +75,53 @@ fn inspect(path: &Path) -> String {
             .unwrap(),
     )
 }
+
+fn emitted_ir_partition() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FLN_BUILTIN_PARTITION") {
+        let path = PathBuf::from(path);
+        assert!(
+            path.is_file(),
+            "explicit IR partition is absent: {}",
+            path.display()
+        );
+        return Some(path);
+    }
+    let path = fln_core::checked_workspace_root!().join("contracts/builtin_partition.tsv");
+    if path.is_file() {
+        Some(path)
+    } else {
+        eprintln!(
+            "SKIP: native execution of emitted IR requires the pinned partition at {}; pinned Reference consumers still run",
+            path.display(),
+        );
+        None
+    }
+}
+
+fn emitted_ir_name_key(name: &fln::Name) -> String {
+    let mut components = Vec::new();
+    let mut cursor = name.clone();
+    while !cursor.is_anonymous() {
+        components.push(match cursor.leaf_view() {
+            fln::LeafView::Str(part) => {
+                // These compiler-generated fixture names are printable ASCII;
+                // their debug strings therefore use JSON-compatible quoting.
+                assert!(part.is_ascii() && !part.bytes().any(|byte| byte.is_ascii_control()));
+                format!("/s{part:?}")
+            }
+            fln::LeafView::Num(part) => format!("/n{part}"),
+            fln::LeafView::Anonymous => unreachable!("the loop excludes anonymous names"),
+        });
+        cursor = cursor.parent();
+    }
+    let key = format!("a{}", components.into_iter().rev().collect::<String>());
+    assert_eq!(
+        fln::imported_ir::parse_name_key(&key, 16 * 1024, 128).unwrap(),
+        *name,
+    );
+    key
+}
+
 fn library() -> Package {
     let package = Package::new(CONFIG);
     package.write("Lib/Base.lean", BASE);
@@ -164,7 +211,7 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
         "Lib/Top.lean",
         concat!(
             "module\nprelude\npublic import Lib.Base\n",
-            "@[expose] public def Lib.increment (n : Nat) : Nat := Nat.add n 1\n",
+            "public def Lib.increment (n : Nat) : Nat := n + 1\n",
             "@[expose] public def Lib.selection : Nat := Lib.choose true 41 6\n",
         ),
     );
@@ -183,6 +230,7 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
     assert!(report.contains("\"facet\":\"ir\""), "{report}");
     assert!(report.contains("\"executable_modules\":2"), "{report}");
     let mut originals = Vec::new();
+    let mut users = std::collections::BTreeSet::new();
     for name in ["Lib.Base", "Lib.Top"] {
         let path = package.artifact(name).with_extension("ir");
         assert!(report.contains(&path.display().to_string()), "{report}");
@@ -195,6 +243,11 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
             fln_olean::ir::decode_ir(&blocks, fln_olean::ir::IrDecodeLimits::default()).unwrap();
         assert!(!ir.decls.is_empty());
         assert!(ir.initializers.is_empty());
+        for declaration in &ir.decls {
+            if matches!(declaration, fln_olean::ir::IrDecl::Function { .. }) {
+                users.insert(emitted_ir_name_key(declaration.name()));
+            }
+        }
         originals.push(bytes);
     }
     // Re-encoding a checked cache hit must replace the entire family, including
@@ -273,6 +326,55 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
     };
     assert_eq!(interpret(), "42\n41\n6\n42\n");
 
+    // Execute the same physical files on Golem through the installed IR door.
+    // Explicit user names preserve generated numeric components; native extern
+    // classification still comes only from the verified pinned partition.
+    let partition = emitted_ir_partition();
+    let native = |max_steps: Option<u64>| {
+        let partition = partition.as_ref()?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command
+            .args([
+                "ir",
+                "run",
+                "--json",
+                "--entry",
+                "Lib.increment",
+                "--partition",
+            ])
+            .arg(partition)
+            .args(["--nat", "41"])
+            .arg(package.artifact("Lib.Base").with_extension("ir"))
+            .arg(package.artifact("Lib.Top").with_extension("ir"));
+        for user in &users {
+            command.arg("--user-key").arg(user);
+        }
+        if let Some(max_steps) = max_steps {
+            command.arg("--fln-max-steps").arg(max_steps.to_string());
+        }
+        Some(command.output().unwrap())
+    };
+    let check_native = |expected: u64| {
+        if let Some(output) = native(None) {
+            let report = success(&output);
+            assert!(report.contains("\"outcome\":\"complete\""), "{report}");
+            assert!(
+                report.contains(&format!("\"value\":{expected},")),
+                "{report}"
+            );
+            assert!(report.contains("\"authority\":false"), "{report}");
+        }
+    };
+    check_native(42);
+    if let Some(exhausted) = native(Some(1)) {
+        assert_eq!(exhausted.status.code(), Some(3), "{exhausted:?}");
+        assert!(exhausted.stdout.is_empty(), "{exhausted:?}");
+        let report = String::from_utf8(exhausted.stderr).unwrap();
+        assert!(report.contains("\"outcome\":\"inconclusive\""), "{report}");
+        assert!(report.contains("\"value\":null"), "{report}");
+        assert!(report.contains("\"authority\":false"), "{report}");
+    }
+
     // Change only the source-facing entry, preserving its checked logical
     // companion and every internal helper. Direct lookup must observe 99.
     use fln_olean::ir::write::{IrWriteInput, IrWriteLimits, encode_ir};
@@ -348,19 +450,21 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
     let output_ir = package.artifact("Lib.Top").with_extension("ir");
     std::fs::write(&output_ir, &mutant.bytes).unwrap();
     assert_eq!(interpret(), "42\n41\n6\n99\n");
+    check_native(99);
     std::fs::write(output_ir, original).unwrap();
-    // Imported HAdd carries a runtime dictionary; explicit Nat.add has the
-    // supported primitive ABI. Refusing that still-unsupported dictionary and
-    // a later source error must preserve every last-good output and snapshot.
+    check_native(42);
+    // Internal dictionaries do not widen the exported source ABI. Refusing an
+    // unsupported source carrier and a later source error must preserve every
+    // last-good output and snapshot.
     let families: Vec<_> = ["Lib.Base", "Lib.Top"]
         .into_iter()
         .map(|name| family_bytes(&package, name))
         .collect();
     let snapshot = package.0.join(".lake/build/fln-build.snapshot");
     let previous_snapshot = std::fs::read(&snapshot).unwrap();
-    for (source, unsupported_dictionary) in [
+    for (source, unsupported_export) in [
         (
-            "module\nprelude\npublic import Lib.Base\npublic def Lib.increment (n : Nat) : Nat := n + 1\n",
+            "module\nprelude\npublic import Lib.Base\npublic inductive Token where | mk\npublic def Lib.identity (x : Token) : Token := x\n",
             true,
         ),
         (
@@ -370,13 +474,9 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
     ] {
         package.write("Lib/Top.lean", source);
         let failed = build();
-        assert!(!failed.status.success(), "{failed:?}");
-        if unsupported_dictionary {
-            let report = failure(&failed);
-            assert!(
-                report.contains("internal decision constructor layout"),
-                "{report}"
-            );
+        let report = failure(&failed);
+        if unsupported_export {
+            assert!(report.contains("source export carrier"), "{report}");
             assert!(report.contains("\"class\":\"unsupported\""), "{report}");
         }
         for (index, name) in ["Lib.Base", "Lib.Top"].into_iter().enumerate() {
@@ -388,6 +488,28 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
         }
         assert_eq!(std::fs::read(&snapshot).unwrap(), previous_snapshot);
     }
+    package.write("Lib/Top.lean", vec![b' '; 1024 * 1024 + 1]);
+    let exhausted = build();
+    assert_eq!(exhausted.status.code(), Some(3), "{exhausted:?}");
+    assert!(exhausted.stdout.is_empty(), "{exhausted:?}");
+    let report = String::from_utf8(exhausted.stderr).unwrap();
+    assert!(report.contains("\"status\":\"inconclusive\""), "{report}");
+    assert!(report.contains("\"class\":\"resource\""), "{report}");
+    assert!(report.contains("\"authority\":false"), "{report}");
+    for (index, name) in ["Lib.Base", "Lib.Top"].into_iter().enumerate() {
+        assert_eq!(family_bytes(&package, name), families[index]);
+        assert_eq!(
+            std::fs::read(package.artifact(name).with_extension("ir")).unwrap(),
+            originals[index]
+        );
+    }
+    assert_eq!(std::fs::read(&snapshot).unwrap(), previous_snapshot);
+    assert!(
+        !package
+            .0
+            .join(".lake/build/lib/lean/.fln-olean-build.lock")
+            .exists()
+    );
 }
 
 #[test]

@@ -16,6 +16,15 @@ use std::{
 
 const HELPERS: &str = "def keep (x : Nat) : Nat := x\ndef invoke (f : Nat -> Nat) (x : Nat) : Nat := f x\ndef invokeString (f : Nat -> String) (x : Nat) : String := f x\n";
 
+// Closed exported signatures keep these native boxed layouts private. The two
+// tag-zero shapes deliberately differ in size; no source-data ABI is promised.
+const INTERNAL_DATA_HELPERS: &str = concat!(
+    "structure IRTextPair where\n  left : String\n  right : String\n",
+    "structure IRNested where\n  pair : IRTextPair\n",
+    "structure IRFunctionBox where\n  run : Nat -> Nat\n",
+    "structure IRBoolBox where\n  value : Bool\n",
+);
+
 fn name(s: &str) -> Name {
     Name::from_components(s.split('.'))
 }
@@ -29,11 +38,15 @@ fn base() -> Engine {
         .unwrap()
         .into_complete()
         .unwrap();
-    seed.execute_source_definitions(&[HELPERS.as_bytes()], &options, limits)
-        .unwrap()
-        .into_complete()
-        .unwrap()
-        .engine
+    seed.execute_source_definitions(
+        &[HELPERS.as_bytes(), INTERNAL_DATA_HELPERS.as_bytes()],
+        &options,
+        limits,
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap()
+    .engine
 }
 
 fn cases() -> [(&'static str, &'static str, &'static str); 5] {
@@ -58,7 +71,7 @@ fn export_cases() -> [(
     &'static str,
     &'static str,
     usize,
-); 52] {
+); 58] {
     [
         ("Nat", "42", "compiled", "Nat", "42", 0),
         (
@@ -448,6 +461,54 @@ fn export_cases() -> [(
             "\"no\"",
             2,
         ),
+        (
+            "String -> String",
+            "fun s => (IRTextPair.mk s s).right",
+            "compiled \"kept field\"",
+            "String",
+            "\"kept field\"",
+            1,
+        ),
+        (
+            "String -> String",
+            "fun s => (IRTextPair.mk \"discarded field\" s).right",
+            "compiled \"second field\"",
+            "String",
+            "\"second field\"",
+            1,
+        ),
+        (
+            "(Nat -> Nat) -> Nat",
+            "fun f => (IRFunctionBox.mk f).run 184467440737095516160",
+            "compiled (fun n => n)",
+            "Nat",
+            "184467440737095516160",
+            1,
+        ),
+        (
+            "String -> String",
+            "fun s => (IRNested.mk (IRTextPair.mk s s)).pair.right",
+            "compiled \"nested field\"",
+            "String",
+            "\"nested field\"",
+            1,
+        ),
+        (
+            "Bool -> Bool",
+            "fun b => (IRBoolBox.mk b).value",
+            "compiled true",
+            "Bool",
+            "true",
+            1,
+        ),
+        (
+            "Bool -> Bool",
+            "fun b => (IRBoolBox.mk b).value",
+            "compiled false",
+            "Bool",
+            "false",
+            1,
+        ),
     ]
 }
 
@@ -462,7 +523,7 @@ fn erased_positions(index: usize) -> &'static [usize] {
 
 fn boolean_positions(index: usize) -> &'static [usize] {
     match index {
-        25..=28 | 32 | 33 | 36..=39 | 44 | 45 | 50 | 51 => &[0],
+        25..=28 | 32 | 33 | 36..=39 | 44 | 45 | 50 | 51 | 56 | 57 => &[0],
         29..=31 | 35 => &[1],
         34 => &[0, 1],
         _ => &[],
@@ -540,6 +601,48 @@ fn arbitrary_fir_cannot_claim_the_closed_source_constructor_boundary() {
     ));
 }
 
+fn private_data_operations(module: &fln_olean::ir::IrModule) -> (usize, usize) {
+    let mut constructors = 0;
+    let mut projections = 0;
+    let mut pending: Vec<_> = module
+        .decls
+        .iter()
+        .filter_map(|declaration| {
+            if let IrDecl::Function { body, .. } = declaration {
+                Some(body)
+            } else {
+                None
+            }
+        })
+        .collect();
+    while let Some(body) = pending.pop() {
+        for statement in &body.stmts {
+            match statement {
+                IrStmt::VDecl {
+                    expr: IrExpr::Ctor { .. },
+                    ..
+                } => constructors += 1,
+                IrStmt::VDecl {
+                    expr: IrExpr::Proj { .. },
+                    ..
+                } => projections += 1,
+                IrStmt::JDecl { value, .. } => pending.push(value),
+                _ => {}
+            }
+        }
+        if let IrTerminal::Case { alts, .. } = body.terminal.as_ref() {
+            for alternative in alts {
+                let body = match alternative {
+                    fln_olean::ir::IrAlt::Ctor { body, .. }
+                    | fln_olean::ir::IrAlt::Default { body } => body,
+                };
+                pending.push(body);
+            }
+        }
+    }
+    (constructors, projections)
+}
+
 #[test]
 fn source_exports_keep_source_arguments_and_compile_without_execution() {
     let base = base();
@@ -563,6 +666,13 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
         .into_complete()
         .unwrap();
         assert_eq!(compiled.entry, name("compiled"));
+        if index >= 52 {
+            let (constructors, projections) = private_data_operations(&compiled.module);
+            assert!(
+                constructors > 0 && projections > 0,
+                "the private-data case must construct and project at runtime: {source}"
+            );
+        }
         assert_eq!(
             compiled.admission.result_logical_root,
             checked.logical_root(&options)
@@ -699,6 +809,9 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
         "def compiled (x y : Nat) : Nat := keep x",
         "def compiled (x y : Nat) : Nat := let saved := x; saved",
         "def compiled (f : Nat -> Nat) (x : Nat) : Nat := x",
+        "def compiled (p : IRTextPair) : String := p.right",
+        "def compiled (s : String) : IRTextPair := IRTextPair.mk s s",
+        "def compiled (f : IRTextPair -> String) : String := f (IRTextPair.mk \"a\" \"b\")",
     ] {
         let (declaration, _) = checked_definition(&base, source);
         assert!(
@@ -1739,11 +1852,11 @@ fn the_pin_executes_imported_string_source_exports() {
                     for declaration in &mut mutant.decls {
                         let IrDecl::Function { body, .. } = declaration else { continue };
                         for stmt in &mut body.stmts {
-                            if let IrStmt::VDecl { expr: IrExpr::Fap { function, .. }, .. } = stmt {
-                                if function == &native {
-                                    *function = name("String.utf8ByteSize");
-                                    switched += 1;
-                                }
+                            if let IrStmt::VDecl { expr: IrExpr::Fap { function, .. }, .. } = stmt
+                                && function == &native
+                            {
+                                *function = name("String.utf8ByteSize");
+                                switched += 1;
                             }
                         }
                     }
@@ -1820,7 +1933,9 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
         // Its IR declarations are replaced, never supplied to this compiler.
         std::fs::write(
             dir.join("NativeIrCase.lean"),
-            format!("module\npublic opaque compiled : {ty} := {expression}\n"),
+            format!(
+                "module\n{INTERNAL_DATA_HELPERS}\npublic opaque compiled : {ty} := {expression}\n"
+            ),
         )
         .unwrap();
         let generated = Command::new(&lean)
@@ -1844,11 +1959,11 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
             "module\nmeta import NativeIrCase\n#eval ({application})\n#eval ({application})\n"
         );
         let mut expected_output = format!("{expected}\n{expected}");
-        if index == 4 || index == 12 || index == 19 || index == 32 {
+        if matches!(index, 4 | 12 | 19 | 32 | 52 | 55) {
             // Effectful input prevents closed-term lifting from making the
             // alias a persistent literal. The caller keeps it across the call.
             std::fs::write(dir.join("heap-input.txt"), "fresh heap string").unwrap();
-            let call = if index == 4 {
+            let call = if matches!(index, 4 | 52 | 55) {
                 "compiled saved"
             } else if index == 12 {
                 "compiled 7 saved"
@@ -1883,7 +1998,7 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
             check_meta: true,
             higher_universe: matches!(index, 15 | 17 | 19 | 20 | 21 | 22 | 31),
             heap_call: match index {
-                4 => Some("compiled saved"),
+                4 | 52 | 55 => Some("compiled saved"),
                 12 => Some("compiled 7 saved"),
                 19 => Some("compiled Nat saved"),
                 32 => Some("compiled false saved"),
@@ -1989,7 +2104,7 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
             "\"changed IR\""
         };
         let mut changed_output = format!("{changed}\n{changed}");
-        if index == 4 || index == 12 || index == 19 || index == 32 {
+        if matches!(index, 4 | 12 | 19 | 32 | 52 | 55) {
             changed_output.push_str("\n(\"changed IR\", \"fresh heap string\")");
         }
         // Ordinary compilation may inline the logical companion's original

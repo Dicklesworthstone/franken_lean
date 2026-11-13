@@ -12,9 +12,11 @@
 //! other scalar conventions remain unsupported. Acyclic control flow preserves
 //! reachable branches and their ownership cleanup; expansion is work/depth bounded.
 //! Type/proof slots retain their original source positions.
-//! Closed source exports may use private binary decision objects internally.
-//! Those objects cannot cross the source ABI, and arbitrary FIR cannot enable
-//! this profile or claim the pin's distinct Decidable representation.
+//! Closed source exports may use private boxed data and dictionaries internally.
+//! Their object layouts receive private tags, preserving both tag and field-count
+//! tests even when unrelated records share a source tag. These objects cannot
+//! cross the source ABI; arbitrary FIR cannot enable this profile or claim the
+//! pin's source data representation. Packed/scalar payloads remain unsupported.
 
 use fln_comp::{fir, flbc};
 use fln_core::name::Name;
@@ -78,14 +80,14 @@ impl Budget {
     }
 }
 
-fn carrier(ty: fir::ValueType, internal_decisions: bool) -> Result<()> {
+fn carrier(ty: fir::ValueType, internal_constructors: bool) -> Result<()> {
     match ty {
         fir::ValueType::Unit
         | fir::ValueType::Bool
         | fir::ValueType::Nat
         | fir::ValueType::String
         | fir::ValueType::Closure(_) => Ok(()),
-        fir::ValueType::Constructor if internal_decisions => Ok(()),
+        fir::ValueType::Constructor if internal_constructors => Ok(()),
         _ => Err(unsupported("non-pure boxed carrier")),
     }
 }
@@ -107,11 +109,11 @@ fn signature(
     ownership: &[flbc::ArgumentOwnership],
     result: fir::ValueType,
     result_ownership: flbc::CallableResultOwnership,
-    internal_decisions: bool,
+    internal_constructors: bool,
     meter: &mut Budget,
 ) -> Result<()> {
     meter.charge(types.len().saturating_add(1))?;
-    carrier(result, internal_decisions)?;
+    carrier(result, internal_constructors)?;
     let valid_result = match result {
         fir::ValueType::Unit | fir::ValueType::Bool => {
             result_ownership == flbc::CallableResultOwnership::Scalar
@@ -129,7 +131,7 @@ fn signature(
         return Err(invariant("parameter ownership arity"));
     }
     for (ty, ownership) in types.iter().zip(ownership) {
-        carrier(*ty, internal_decisions)?;
+        carrier(*ty, internal_constructors)?;
         match ownership {
             flbc::ArgumentOwnership::Unique => return Err(unsupported("uniqueness preconditions")),
             flbc::ArgumentOwnership::Scalar
@@ -220,12 +222,66 @@ fn validate_native(intrinsic: &fir::IntrinsicDecl, meter: &mut Budget) -> Result
     Ok(())
 }
 
+/// A fixed-size set covers the pin's complete byte-sized constructor tag space.
+/// Empty means that a register has not yet acquired a more precise shape fact.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct ConstructorTags([u64; 4]);
+
+impl ConstructorTags {
+    fn singleton(tag: u8) -> Self {
+        let mut result = Self::default();
+        result.0[usize::from(tag) / 64] = 1 << (tag % 64);
+        result
+    }
+    fn insert(&mut self, tag: u8) {
+        self.0[usize::from(tag) / 64] |= 1 << (tag % 64);
+    }
+    fn contains(self, tag: u8) -> bool {
+        self.0[usize::from(tag) / 64] & (1 << (tag % 64)) != 0
+    }
+    fn without(mut self, tag: u8) -> Self {
+        self.0[usize::from(tag) / 64] &= !(1 << (tag % 64));
+        self
+    }
+    fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+/// Native source data has an all-boxed representation, independent of the pin's
+/// source compiler. Only a closed source ABI lets us keep that representation
+/// private. Assigning tags by the *whole* layout preserves the VM's shape tests:
+/// two constructors with tag zero but different field counts must stay distinct.
+struct InternalConstructors {
+    type_name: Name,
+    layouts: std::collections::BTreeMap<(u8, u16), u8>,
+    tags: ConstructorTags,
+}
+
+impl InternalConstructors {
+    fn tag(&self, tag: u8, fields: u16) -> Result<u8> {
+        self.layouts
+            .get(&(tag, fields))
+            .copied()
+            .ok_or_else(|| unsupported("unproved internal constructor layout"))
+    }
+    fn info(&self, tag: u8, fields: u16) -> IrCtorInfo {
+        IrCtorInfo {
+            name: Name::num(self.type_name.clone(), u64::from(tag)),
+            cidx: u64::from(tag),
+            size: u64::from(fields),
+            usize: 0,
+            ssize: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Value {
     index: u64,
     owned: bool,
     natural: Option<u64>,
-    decision_tags: u8,
+    constructor_tags: ConstructorTags,
 }
 
 struct Function<'a> {
@@ -233,8 +289,7 @@ struct Function<'a> {
     registers: Vec<Option<Value>>,
     next: u64,
     stmts: Vec<IrStmt>,
-    decision_tags: u8,
-    decision_type: Name,
+    constructors: &'a InternalConstructors,
     meter: &'a mut Budget,
 }
 
@@ -302,7 +357,7 @@ impl Function<'_> {
             index,
             owned: true,
             natural,
-            decision_tags: 0,
+            constructor_tags: ConstructorTags::default(),
         })
     }
     fn name(&self, id: flbc::FunctionId) -> Result<Name> {
@@ -320,11 +375,11 @@ impl Function<'_> {
         saved.extend_from_slice(&self.registers);
         Ok(saved)
     }
-    fn refine_decision(&mut self, index: u64, tags: u8) -> Result<()> {
+    fn refine_constructor(&mut self, index: u64, tags: ConstructorTags) -> Result<()> {
         self.meter.charge(self.registers.len())?;
         for value in self.registers.iter_mut().flatten() {
             if value.index == index {
-                value.decision_tags = tags;
+                value.constructor_tags = tags;
             }
         }
         Ok(())
@@ -425,8 +480,7 @@ impl Function<'_> {
 fn compile_function(
     function: &flbc::Function,
     names: &[Name],
-    decision_tags: u8,
-    decision_type: &Name,
+    constructors: &InternalConstructors,
     meter: &mut Budget,
 ) -> Result<IrDecl> {
     meter.charge(usize::from(function.register_count))?;
@@ -442,7 +496,7 @@ fn compile_function(
             index: i as u64 + 1,
             owned: !borrow,
             natural: None,
-            decision_tags: 0,
+            constructor_tags: ConstructorTags::default(),
         });
         params.push(IrParam {
             x: i as u64 + 1,
@@ -459,8 +513,7 @@ fn compile_function(
         registers,
         next: u64::from(function.arity) + 1,
         stmts: Vec::new(),
-        decision_tags,
-        decision_type: decision_type.clone(),
+        constructors,
         meter,
     };
     let mut active = Vec::new();
@@ -483,18 +536,6 @@ fn compile_function(
 /// copies only the compile-time register map; each runtime path retains its
 /// original moves and drops. Global variable numbering is shared by all arms,
 /// matching the pin's declaration-wide uniqueness rule.
-fn decision_info(type_name: &Name, tag: u8) -> IrCtorInfo {
-    IrCtorInfo {
-        // This is the compiler's private heap representation, not the pin's
-        // immediate Decidable ABI. No source constructor uses this label.
-        name: Name::num(type_name.clone(), u64::from(tag)),
-        cidx: u64::from(tag),
-        size: 1,
-        usize: 0,
-        ssize: 0,
-    }
-}
-
 fn compile_body(
     function: &flbc::Function,
     out: &mut Function<'_>,
@@ -567,25 +608,36 @@ fn compile_body(
                     fields,
                     scalar_bytes,
                 } => {
-                    if out.decision_tags == 0
-                        || *tag > 1
-                        || fields.len() != 1
-                        || !scalar_bytes.is_empty()
-                    {
-                        return Err(unsupported("internal decision constructor layout"));
+                    if !scalar_bytes.is_empty() {
+                        return Err(unsupported("internal constructor scalar payload"));
                     }
-                    // FIR constructors borrow their fields. IR constructors
-                    // consume them, so the private object receives its own
-                    // references even while the original register stays live.
-                    let args = out.args(fields, &[flbc::ArgumentOwnership::Borrowed], true)?;
+                    let field_count =
+                        u16::try_from(fields.len()).map_err(|_| CompileError::Limit)?;
+                    let tag = out.constructors.tag(*tag, field_count)?;
+                    // FIR constructors borrow fields; IR constructors consume
+                    // them. Keep an independent owner for every stored slot,
+                    // including repeated aliases and captured closures.
+                    out.meter.charge(fields.len())?;
+                    let mut args = Vec::new();
+                    args.try_reserve_exact(fields.len())
+                        .map_err(|_| CompileError::Allocation)?;
+                    for field in fields {
+                        let value = out.get(*field)?;
+                        out.retain(value)?;
+                        args.push(IrArg::Var(value.index));
+                    }
                     let mut value = out.bind(
-                        IrType::Object,
+                        if fields.is_empty() {
+                            IrType::Tagged
+                        } else {
+                            IrType::Object
+                        },
                         IrExpr::Ctor {
-                            info: decision_info(&out.decision_type, *tag),
+                            info: out.constructors.info(tag, field_count),
                             args,
                         },
                     )?;
-                    value.decision_tags = 1 << tag;
+                    value.constructor_tags = ConstructorTags::singleton(tag);
                     out.set(*dst, value)?;
                 }
                 I::CtorTest {
@@ -594,35 +646,33 @@ fn compile_body(
                     expected_tag,
                     expected_fields,
                 } => {
-                    if out.decision_tags == 0 || *expected_tag > 1 || *expected_fields != 1 {
-                        return Err(unsupported("internal decision constructor test"));
-                    }
+                    let tag = out.constructors.tag(*expected_tag, *expected_fields)?;
                     let source = out.get(*src)?;
-                    let possible = if source.decision_tags == 0 {
-                        out.decision_tags
+                    let possible = if source.constructor_tags.is_empty() {
+                        out.constructors.tags
                     } else {
-                        source.decision_tags
+                        source.constructor_tags
                     };
-                    let matched = 1 << expected_tag;
-                    if possible & matched == 0 || possible == matched {
+                    let matched = ConstructorTags::singleton(tag);
+                    if !possible.contains(tag) || possible == matched {
                         let value = out.bind(
                             IrType::Tagged,
                             IrExpr::Lit(IrLit::Num(IrNat::Small(u64::from(possible == matched)))),
                         )?;
                         out.set(*dst, value)?;
                     } else {
-                        // Split at the TEST, while its borrowed constructor is
-                        // alive. The remaining FLBC may drop or overwrite it
-                        // before branching on the independently stored Bool.
+                        // Split while the borrowed source is alive. Its register
+                        // may be dropped or overwritten before the later branch
+                        // reads the independently stored Boolean result.
                         let saved = out.snapshot()?;
                         let prefix = std::mem::take(&mut out.stmts);
-                        out.refine_decision(source.index, matched)?;
+                        out.refine_constructor(source.index, matched)?;
                         let value =
                             out.bind(IrType::Tagged, IrExpr::Lit(IrLit::Num(IrNat::Small(1))))?;
                         out.set(*dst, value)?;
                         let yes = compile_body(function, out, pc + 1, active, depth + 1)?;
                         out.registers = saved;
-                        out.refine_decision(source.index, possible & !matched)?;
+                        out.refine_constructor(source.index, possible.without(tag))?;
                         let value =
                             out.bind(IrType::Tagged, IrExpr::Lit(IrLit::Num(IrNat::Small(0))))?;
                         out.set(*dst, value)?;
@@ -630,15 +680,82 @@ fn compile_body(
                         return Ok(IrBody {
                             stmts: prefix,
                             terminal: Box::new(IrTerminal::Case {
-                                type_name: out.decision_type.clone(),
+                                type_name: out.constructors.type_name.clone(),
                                 x: source.index,
-                                x_type: IrType::Object,
+                                x_type: IrType::TObject,
                                 alts: vec![
                                     IrAlt::Ctor {
-                                        info: decision_info(&out.decision_type, *expected_tag),
+                                        info: out.constructors.info(tag, *expected_fields),
                                         body: yes,
                                     },
                                     IrAlt::Default { body: no },
+                                ],
+                            }),
+                        });
+                    }
+                }
+                I::CtorField {
+                    dst,
+                    src,
+                    expected_tag,
+                    expected_fields,
+                    field,
+                } => {
+                    let tag = out.constructors.tag(*expected_tag, *expected_fields)?;
+                    if field >= expected_fields {
+                        return Err(invariant("constructor projection field"));
+                    }
+                    let source = out.get(*src)?;
+                    let possible = if source.constructor_tags.is_empty() {
+                        out.constructors.tags
+                    } else {
+                        source.constructor_tags
+                    };
+                    if !possible.contains(tag) {
+                        return Err(unsupported("internal constructor projection shape"));
+                    }
+                    let matched = ConstructorTags::singleton(tag);
+                    let prefix = if possible != matched {
+                        Some(std::mem::take(&mut out.stmts))
+                    } else {
+                        None
+                    };
+                    out.refine_constructor(source.index, matched)?;
+                    // IR projection borrows the field. The FLBC instruction
+                    // returns an owner, which must survive releasing its parent
+                    // or replacing the source register with the field itself.
+                    let value = out.bind(
+                        IrType::TObject,
+                        IrExpr::Proj {
+                            i: u64::from(*field),
+                            x: source.index,
+                        },
+                    )?;
+                    out.retain(value)?;
+                    out.set(*dst, value)?;
+                    if let Some(prefix) = prefix {
+                        let body = compile_body(function, out, pc + 1, active, depth + 1)?;
+                        // A checked source projection selects its constructor.
+                        // Retain a runtime tag guard before the unchecked pin
+                        // projection when calls have hidden the precise shape.
+                        // A wrong tag cannot reach an out-of-bounds field read.
+                        return Ok(IrBody {
+                            stmts: prefix,
+                            terminal: Box::new(IrTerminal::Case {
+                                type_name: out.constructors.type_name.clone(),
+                                x: source.index,
+                                x_type: IrType::TObject,
+                                alts: vec![
+                                    IrAlt::Ctor {
+                                        info: out.constructors.info(tag, *expected_fields),
+                                        body,
+                                    },
+                                    IrAlt::Default {
+                                        body: IrBody {
+                                            stmts: Vec::new(),
+                                            terminal: Box::new(IrTerminal::Unreachable),
+                                        },
+                                    },
                                 ],
                             }),
                         });
@@ -936,34 +1053,48 @@ fn compile_module(
     if entry.is_anonymous() {
         return Err(unsupported("anonymous entry name"));
     }
-    // A checked source signature has only Nat/String/Bool leaves, recursively
-    // through callbacks. Thus no constructor can enter or leave through that
-    // ABI. With ABI erasure/casts, projections and constructor externs still
-    // refused, every internal constructor comes from these exact layouts.
-    // This closure justifies replacing the VM's tag+shape test by an IR case,
-    // and exhausting {0,1} proves the generated failure arm unreachable.
-    // The arbitrary-FIR API deliberately receives no such source guarantee.
-    let mut decision_tags = 0;
+    // No constructor can enter or leave a closed Nat/String/Bool source ABI,
+    // recursively through callbacks. ABI casts and constructor externs remain
+    // refused. Every internal object therefore comes from these checked boxed
+    // layouts, including objects reached through a constructor's object fields.
+    // The arbitrary-FIR API has no such guarantee and keeps this table empty.
+    let mut constructors = InternalConstructors {
+        type_name: Name::str(entry.clone(), "_fln_data"),
+        layouts: std::collections::BTreeMap::new(),
+        tags: ConstructorTags::default(),
+    };
     if source_exports.is_some() {
         for constructor in program.constructors() {
             meter.charge(constructor.fields.len().saturating_add(1))?;
-            if constructor.tag > 1
-                || constructor.fields != [fir::ValueType::Bool]
-                || !constructor.static_scalar_bytes.is_empty()
-            {
-                return Err(unsupported("internal decision constructor layout"));
+            if !constructor.static_scalar_bytes.is_empty() {
+                return Err(unsupported("internal constructor scalar payload"));
             }
-            decision_tags |= 1 << constructor.tag;
+            for field in &constructor.fields {
+                carrier(*field, true)?;
+            }
+            let fields =
+                u16::try_from(constructor.fields.len()).map_err(|_| CompileError::Limit)?;
+            let next = constructors.layouts.len();
+            if let std::collections::btree_map::Entry::Vacant(layout) =
+                constructors.layouts.entry((constructor.tag, fields))
+            {
+                let tag = u8::try_from(next).map_err(|_| CompileError::Limit)?;
+                if tag > fln_rt::abi::TAG_MAX_CTOR_TAG {
+                    return Err(unsupported("private constructor tag capacity"));
+                }
+                layout.insert(tag);
+                constructors.tags.insert(tag);
+            }
         }
     }
-    let internal_decisions = decision_tags != 0;
+    let internal_constructors = !constructors.tags.is_empty();
     for function in program.functions() {
         signature(
             &function.parameters,
             &function.parameter_ownership,
             function.result,
             function.result_ownership,
-            internal_decisions,
+            internal_constructors,
             meter,
         )?;
         let mut types: std::collections::BTreeMap<_, _> = function
@@ -977,11 +1108,12 @@ fn compile_module(
         // up captures and application operands on any control-flow path.
         for binding in function.blocks.iter().flat_map(|block| &block.bindings) {
             meter.charge(1)?;
-            carrier(binding.ty, internal_decisions)?;
+            carrier(binding.ty, internal_constructors)?;
             if binding.ty == fir::ValueType::Constructor
                 && !matches!(
                     binding.operation,
                     fir::Operation::Ctor { .. }
+                        | fir::Operation::Project { .. }
                         | fir::Operation::Alias(_)
                         | fir::Operation::Call { .. }
                         | fir::Operation::Apply { .. }
@@ -1027,7 +1159,7 @@ fn compile_module(
             &closure.parameter_ownership,
             closure.result,
             closure.result_ownership,
-            internal_decisions,
+            internal_constructors,
             meter,
         )?;
     }
@@ -1046,9 +1178,8 @@ fn compile_module(
         });
     }
     let mut declarations = Vec::new();
-    let decision_type = Name::str(entry.clone(), "_fln_decision");
     for function in lowered.program().functions() {
-        let declaration = compile_function(function, &names, decision_tags, &decision_type, meter)?;
+        let declaration = compile_function(function, &names, &constructors, meter)?;
         // A boxed application always owns its operands. The wrapper releases
         // those whose base function borrows them, just as the pin's wrappers do.
         if !function.parameter_ownership.is_empty() {

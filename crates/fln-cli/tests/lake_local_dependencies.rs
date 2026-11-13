@@ -203,7 +203,7 @@ fn transitive_diamond_and_name_precedence_match_the_pin() {
     eprintln!("[lake-local] native executable passed; checking a false dependency theorem");
     native.write(
         "right/vendor/shared library/sources/lib/Shared.lean",
-        format!("{SHARED_SOURCE}theorem impossible : Bool.true = Bool.false := rfl\n",),
+        format!("{SHARED_SOURCE}theorem impossible (P Q : Prop) (h : P) : Q := h\n",),
     );
     let invalid = native.run(&args, Some(&lib));
     assert_eq!(invalid.status.code(), Some(1), "{invalid:?}");
