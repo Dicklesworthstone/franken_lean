@@ -1117,6 +1117,11 @@ mod tests {
                 r#"[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":1,"message":{"text":"unknown identifier"}}]"#,
             ),
             ("Lean.Widget.highlightMatches", r#"{"text":"P"}"#),
+            ("Lean.Widget.getWidgets", r#"{"widgets":[]}"#),
+            (
+                "Lean.Widget.getWidgets",
+                r#"{"widgets":[{"id":"Lean.Widget.convSelectionWidget","javascriptHash":"18446744073709551615","props":{},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"name":"Conv"}]}"#,
+            ),
         ] {
             let response = format!(r#"{{"jsonrpc":"2.0","id":"call","result":{value}}}"#);
             let (client, server) = rpc_pair(procedure, &response);
@@ -1163,10 +1168,31 @@ mod tests {
         for name in [
             "Lean.Widget.getInteractiveDiagnostics",
             "Lean.Widget.getInteractiveTermGoal",
+            "Lean.Widget.getWidgets",
             "Lean.Widget.unknown",
         ] {
             let (client, server) = rpc_pair(name, reply);
             assert!(correlate_transcripts(&client, &server).is_err(), "{name}");
+        }
+        for bad_widgets in [
+            "null",
+            "{}",
+            "[]",
+            r#"{"widgets":null}"#,
+            r#"{"widgets":[],"goals":[]}"#,
+            r#"{"widgets":[],"wid\u0067ets":[]}"#,
+            r#"{"widgets":[{}]}"#,
+            r#"{"widgets":[{"id":"","javascriptHash":"17","props":{}}]}"#,
+            r#"{"widgets":[{"id":"W","javascriptHash":17,"props":{}}]}"#,
+            r#"{"widgets":[{"id":"W","javascriptHash":"17","props":[]}]}"#,
+            r#"{"widgets":[{"id":"W","javascriptHash":"17","props":{},"range":{"start":{"line":2,"character":0},"end":{"line":1,"character":0}}}]}"#,
+        ] {
+            let response = format!(r#"{{"jsonrpc":"2.0","id":"call","result":{bad_widgets}}}"#);
+            let (client, server) = rpc_pair("Lean.Widget.getWidgets", &response);
+            assert!(
+                correlate_transcripts(&client, &server).is_err(),
+                "{bad_widgets}"
+            );
         }
     }
 

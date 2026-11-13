@@ -101,6 +101,18 @@ pub(in crate::dispatch) fn goal_position(
     }
     query_position(value)
 }
+pub(in crate::dispatch) fn widget_position(value: RawField<'_>) -> Result<Position, &'static str> {
+    object(value)?;
+    if !matches!(object_field(object(value)?, "position"), RawField::Missing)
+        || !matches!(
+            object_field(object(value)?, "textDocument"),
+            RawField::Missing
+        )
+    {
+        return Err("Lean.Widget.getWidgets expects a bare LSP Position object");
+    }
+    position(value)
+}
 pub(in crate::dispatch) fn wire_format(value: RawField<'_>) -> Result<WireFormat, &'static str> {
     let mut current = value;
     for key in ["capabilities", "lean", "rpcWireFormat"] {

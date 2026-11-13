@@ -278,6 +278,17 @@ impl Sessions {
             self.session(call.session, &call.uri, Instant::now())?;
             return Ok(result);
         }
+        if call.method == "Lean.Widget.getWidgets" {
+            // Pinned contract (`Lean/Widget/UserWidget.lean:283-315`): `getWidgets`
+            // decodes a bare `Lean.Lsp.Position` and returns `GetWidgetsResponse`
+            // (`{"widgets":[]}` when no panel widgets are registered at that
+            // position). Validate the UTF-16 position against the current source
+            // without fabricating widgets or expression references.
+            let position = params::widget_position(call.params).map_err(invalid)?;
+            json::byte_offset(text, position).map_err(invalid)?;
+            self.session(call.session, &call.uri, Instant::now())?;
+            return Ok("{\"widgets\":[]}".to_owned());
+        }
         let kind = match call.method.as_str() {
             "Lean.Widget.getInteractiveGoals" => QueryKind::InteractiveGoals,
             "Lean.Widget.getInteractiveTermGoal" => QueryKind::InteractiveTermGoal,

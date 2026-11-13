@@ -219,6 +219,7 @@ pub(super) enum RpcProcedure {
     TermGoal,
     Diagnostics,
     Highlight,
+    Widgets,
 }
 
 impl RpcProcedure {
@@ -228,6 +229,7 @@ impl RpcProcedure {
             "Lean.Widget.getInteractiveTermGoal" => Some(Self::TermGoal),
             "Lean.Widget.getInteractiveDiagnostics" => Some(Self::Diagnostics),
             "Lean.Widget.highlightMatches" => Some(Self::Highlight),
+            "Lean.Widget.getWidgets" => Some(Self::Widgets),
             _ => None,
         }
     }
@@ -273,8 +275,92 @@ impl RpcProcedure {
                 })
             }),
             Self::Highlight => rpc_tagged_text(root),
+            Self::Widgets => {
+                if !object_has_only_keys(root, &["widgets"]) {
+                    return false;
+                }
+                let RawField::Value(widgets) = object_member(root, "widgets") else {
+                    return false;
+                };
+                array_elements(widgets, 256)
+                    .is_some_and(|widgets| widgets.into_iter().all(rpc_panel_widget))
+            }
         }
     }
+}
+
+fn object_has_only_keys(raw: RawField<'_>, allowed: &[&str]) -> bool {
+    let RawField::Value(json) = object_value(raw) else {
+        return false;
+    };
+    let bytes = json.as_bytes();
+    let mut index = skip_ws(bytes, 0);
+    if bytes.get(index).copied() != Some(b'{') {
+        return false;
+    }
+    index = skip_ws(bytes, index + 1);
+    if bytes.get(index).copied() == Some(b'}') {
+        return skip_ws(bytes, index + 1) == bytes.len();
+    }
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let Some(key_end) = scan_string_end(bytes, index) else {
+            return false;
+        };
+        let Some(key) = json.get(index..key_end).and_then(decode_json_string_value) else {
+            return false;
+        };
+        if !allowed.contains(&key.as_str()) || seen.contains(&key) {
+            return false;
+        }
+        seen.push(key);
+        index = skip_ws(bytes, key_end);
+        if bytes.get(index).copied() != Some(b':') {
+            return false;
+        }
+        index = skip_ws(bytes, index + 1);
+        let Some(value_end) = parse_value_end(json, index, 0) else {
+            return false;
+        };
+        index = skip_ws(bytes, value_end);
+        match bytes.get(index).copied() {
+            Some(b',') => {
+                index = skip_ws(bytes, index + 1);
+                if bytes.get(index).copied() == Some(b'}') {
+                    return false;
+                }
+            }
+            Some(b'}') => return skip_ws(bytes, index + 1) == bytes.len(),
+            _ => return false,
+        }
+    }
+}
+
+fn rpc_panel_widget(raw: &str) -> bool {
+    let widget = RawField::Value(raw);
+    if !object_has_only_keys(widget, &["id", "javascriptHash", "props", "range", "name"]) {
+        return false;
+    }
+    let props_ok = match object_member(widget, "props") {
+        RawField::Value(props) => {
+            let trimmed = props.trim();
+            trimmed.starts_with('{') && parse_value_end(trimmed, 0, 0) == Some(trimmed.len())
+        }
+        _ => false,
+    };
+    let range_ok = match object_member(widget, "range") {
+        RawField::Missing | RawField::Value("null") => true,
+        range => matches!(range_points(range), Some((start, end)) if start <= end),
+    };
+    let name_ok = match object_member(widget, "name") {
+        RawField::Missing | RawField::Value("null") => true,
+        name => matches!(decoded_string(name), DecodedField::Valid(_)),
+    };
+    plain_string_member(widget, "id")
+        && rpc_uint64(object_string_member(widget, "javascriptHash"))
+        && props_ok
+        && range_ok
+        && name_ok
 }
 
 fn rpc_uint64(value: DecodedField) -> bool {

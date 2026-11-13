@@ -467,3 +467,62 @@ fn diagnostic_highlighting_uses_the_live_pinned_wire_shape_and_session_guards() 
         }
     }
 }
+
+#[test]
+fn get_widgets_returns_empty_panel_list_and_enforces_bare_position_and_session_guards() {
+    let widgets_call = |id: &str, session: &str, params: &str| {
+        request(
+            id,
+            "$/lean/rpc/call",
+            &format!(
+                r#"{{"sessionId":{},"method":"Lean.Widget.getWidgets","params":{params},"textDocument":{{"uri":"{URI}"}},"position":{{"line":0,"character":0}}}}"#,
+                quote(session),
+            ),
+        )
+    };
+    for (binary, args) in [
+        (env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        (env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        for format in ["v0", "v1"] {
+            let mut client = Client::start(binary, args, format);
+            client.open("-- 😀\r\nprelude\r\ndef x (P : Prop) (h : P) : P := h\r\n");
+            let session = client.connect("connect");
+            for (index, pos) in [
+                r#"{"line":2,"character":0}"#,
+                r#"{"line":99,"character":99}"#,
+            ]
+            .iter()
+            .enumerate()
+            {
+                let id = format!("widgets-{index}");
+                let reply = client.exchange(&id, &widgets_call(&id, &session, pos));
+                assert!(reply.contains(r#""result":{"widgets":[]}"#), "{reply}");
+            }
+            for (index, bad) in [
+                "null",
+                r#"{"line":-1,"character":0}"#,
+                r#"{"line":0,"character":4}"#,
+                r#"{"textDocument":{"uri":"file:///FlnRpc.lean"},"position":{"line":2,"character":0}}"#,
+            ]
+            .iter()
+            .enumerate()
+            {
+                let id = format!("bad-widgets-{index}");
+                let reply = client.exchange(&id, &widgets_call(&id, &session, bad));
+                assert!(reply.contains("\"code\":-32602"), "{bad}: {reply}");
+            }
+            client.send(&notification(
+                "textDocument/didClose",
+                &format!(r#"{{"textDocument":{{"uri":"{URI}"}}}}"#),
+            ));
+            client.open("prelude\n");
+            let stale = client.exchange(
+                "stale-widgets",
+                &widgets_call("stale-widgets", &session, r#"{"line":0,"character":0}"#),
+            );
+            assert!(stale.contains("\"code\":-32900"), "{stale}");
+            client.finish();
+        }
+    }
+}

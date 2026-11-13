@@ -556,3 +556,139 @@ fn message_search_cannot_hide_invalid_outer_utf16_positions() {
     assert_eq!(provider.calls, 0);
     assert!(sessions.sessions[&id].references.is_empty());
 }
+
+fn widgets_call(session: u64, uri: &str, outer_char: usize, params: &str) -> String {
+    format!(
+        r#"{{"textDocument":{{"uri":{}}},"position":{{"line":0,"character":{outer_char}}},"sessionId":"{session}","method":"Lean.Widget.getWidgets","params":{params}}}"#,
+        crate::json_string(uri)
+    )
+}
+
+#[test]
+fn widgets_query_validates_bare_positions_and_preserves_session_guards() {
+    for format in [WireFormat::V0, WireFormat::V1] {
+        let mut sessions = Sessions {
+            format,
+            ..Sessions::default()
+        };
+        let id = sessions.create(URI.into(), Instant::now()).unwrap();
+        let mut docs = DocumentSession::new();
+        docs.open(URI.into(), 1, "😀\ndef x := 1\n".into()).unwrap();
+        let mut provider = Provider::new();
+        execute(&mut sessions, id, &docs, &mut provider).unwrap();
+        let before = &sessions.sessions[&id];
+        let retained = (before.references.len(), before.bytes, before.next_reference);
+
+        for params in [
+            r#"{"line":0,"character":0}"#,
+            r#"{"line":1,"character":4}"#,
+            r#"{"line":99,"character":99}"#,
+        ] {
+            let input = widgets_call(id, URI, 0, params);
+            assert_eq!(
+                sessions
+                    .execute(
+                        "$/lean/rpc/call",
+                        RawField::Value(&input),
+                        &docs,
+                        &mut provider,
+                    )
+                    .unwrap(),
+                r#"{"widgets":[]}"#,
+                "{params}"
+            );
+        }
+        assert_eq!(
+            provider.calls, 1,
+            "getWidgets must not re-elaborate or invoke semantic query"
+        );
+        let after = &sessions.sessions[&id];
+        assert_eq!(
+            (after.references.len(), after.bytes, after.next_reference),
+            retained
+        );
+
+        for bad_params in [
+            "null",
+            "[]",
+            "1",
+            "{}",
+            r#"{"line":-1,"character":0}"#,
+            r#"{"line":"0","character":0}"#,
+            r#"{"line":0,"character":1}"#,
+            r#"{"line":0,"l\u0069ne":0,"character":0}"#,
+            r#"{"textDocument":{"uri":"file:///Rpc.lean"},"position":{"line":0,"character":0}}"#,
+        ] {
+            let input = widgets_call(id, URI, 0, bad_params);
+            assert!(
+                matches!(
+                    sessions.execute(
+                        "$/lean/rpc/call",
+                        RawField::Value(&input),
+                        &docs,
+                        &mut provider,
+                    ),
+                    Err((-32602, _))
+                ),
+                "{bad_params}"
+            );
+        }
+
+        let bad_outer_surrogate = widgets_call(id, URI, 1, r#"{"line":1,"character":0}"#);
+        assert!(matches!(
+            sessions.execute(
+                "$/lean/rpc/call",
+                RawField::Value(&bad_outer_surrogate),
+                &docs,
+                &mut provider,
+            ),
+            Err((-32602, _))
+        ));
+
+        let wrong_uri = widgets_call(id, "file:///Other.lean", 0, r#"{"line":0,"character":0}"#);
+        assert!(matches!(
+            sessions.execute(
+                "$/lean/rpc/call",
+                RawField::Value(&wrong_uri),
+                &docs,
+                &mut provider,
+            ),
+            Err((RECONNECT, _))
+        ));
+
+        docs.reject_change(URI, 2).unwrap();
+        let valid = widgets_call(id, URI, 0, r#"{"line":0,"character":0}"#);
+        assert!(matches!(
+            sessions.execute(
+                "$/lean/rpc/call",
+                RawField::Value(&valid),
+                &docs,
+                &mut provider,
+            ),
+            Err((REQUEST_FAILED_CODE, _))
+        ));
+        docs.change(URI, 3, "recovered".into()).unwrap();
+        assert_eq!(
+            sessions
+                .execute(
+                    "$/lean/rpc/call",
+                    RawField::Value(&valid),
+                    &docs,
+                    &mut provider,
+                )
+                .unwrap(),
+            r#"{"widgets":[]}"#
+        );
+
+        sessions.sessions.get_mut(&id).unwrap().expires = Instant::now();
+        assert!(matches!(
+            sessions.execute(
+                "$/lean/rpc/call",
+                RawField::Value(&valid),
+                &docs,
+                &mut provider,
+            ),
+            Err((RECONNECT, _))
+        ));
+    }
+}
