@@ -1275,6 +1275,11 @@ impl PositiveDefEqCache {
         (left, right, local_count)
     }
 
+    fn pair_matches(a_left: &Expr, a_right: &Expr, b_left: &Expr, b_right: &Expr) -> bool {
+        (a_left.is_alpha_equiv(b_left) && a_right.is_alpha_equiv(b_right))
+            || (a_left.is_alpha_equiv(b_right) && a_right.is_alpha_equiv(b_left))
+    }
+
     fn contains(
         &self,
         left: &Expr,
@@ -1284,8 +1289,7 @@ impl PositiveDefEqCache {
     ) -> bool {
         let matches = |bucket: &Vec<PositiveDefEqCacheEntry>| {
             bucket.iter().any(|entry| {
-                ((entry.left == *left && entry.right == *right)
-                    || (entry.left == *right && entry.right == *left))
+                Self::pair_matches(&entry.left, &entry.right, left, right)
                     && dependencies_are_live(&entry.dependencies, locals, local_positions)
             })
         };
@@ -1303,17 +1307,14 @@ impl PositiveDefEqCache {
         candidates
             .iter()
             .filter_map(|(cached_left, cached_right, scope)| {
-                ((cached_left == left && cached_right == right)
-                    || (cached_left == right && cached_right == left))
-                    .then_some(*scope)
+                Self::pair_matches(cached_left, cached_right, left, right).then_some(*scope)
             })
             .any(|alternate_scope| {
                 self.buckets
                     .get(&(packed.0, packed.1, alternate_scope))
                     .is_some_and(|bucket| {
                         bucket.iter().any(|entry| {
-                            ((entry.left == *left && entry.right == *right)
-                                || (entry.left == *right && entry.right == *left))
+                            Self::pair_matches(&entry.left, &entry.right, left, right)
                                 && dependencies_are_live(
                                     &entry.dependencies,
                                     locals,
@@ -1331,16 +1332,14 @@ impl PositiveDefEqCache {
             if bucket
                 .iter()
                 .any(|(cached_left, cached_right, existing_scope)| {
-                    ((cached_left == left && cached_right == right)
-                        || (cached_left == right && cached_right == left))
+                    Self::pair_matches(cached_left, cached_right, left, right)
                         && *existing_scope == scope
                 })
             {
                 return;
             }
             let oldest_same_pair = bucket.iter().position(|(cached_left, cached_right, _)| {
-                (cached_left == left && cached_right == right)
-                    || (cached_left == right && cached_right == left)
+                Self::pair_matches(cached_left, cached_right, left, right)
             });
             if has_capacity && bucket.len() < self.max_bucket_entries {
                 bucket.push((left.clone(), right.clone(), scope));
@@ -1393,8 +1392,7 @@ impl PositiveDefEqCache {
                 bucket
                     .iter()
                     .filter_map(|(cached_left, cached_right, scope)| {
-                        ((cached_left == &left && cached_right == &right)
-                            || (cached_left == &right && cached_right == &left))
+                        Self::pair_matches(cached_left, cached_right, &left, &right)
                             .then_some(*scope)
                     })
                     .collect::<Vec<_>>()
@@ -1443,8 +1441,7 @@ impl PositiveDefEqCache {
         // dependency slice.
         if self.buckets.get(&packed).is_some_and(|bucket| {
             bucket.iter().any(|entry| {
-                ((entry.left == left && entry.right == right)
-                    || (entry.left == right && entry.right == left))
+                Self::pair_matches(&entry.left, &entry.right, &left, &right)
                     && dependencies_are_live(&entry.dependencies, locals, local_positions)
             })
         }) {
@@ -1454,8 +1451,7 @@ impl PositiveDefEqCache {
             (bucket.len() >= self.max_bucket_entries)
                 .then(|| {
                     bucket.iter().position(|entry| {
-                        (entry.left == left && entry.right == right)
-                            || (entry.left == right && entry.right == left)
+                        Self::pair_matches(&entry.left, &entry.right, &left, &right)
                     })
                 })
                 .flatten()
@@ -1524,8 +1520,7 @@ impl PositiveDefEqCache {
         self.record_cross_scope(&left, &right, locals.len());
         if let Some(bucket) = self.buckets.get_mut(&packed) {
             if bucket.iter().any(|entry| {
-                ((entry.left == left && entry.right == right)
-                    || (entry.left == right && entry.right == left))
+                Self::pair_matches(&entry.left, &entry.right, &left, &right)
                     && entry.dependencies == dependencies
             }) {
                 return;
@@ -1564,6 +1559,601 @@ impl PositiveDefEqCache {
         );
         self.entries += 1;
         self.local_dependency_cells += dependency_count;
+    }
+}
+
+/// Pin `equiv_manager` (`equiv_manager.cpp:56-126`): congruence- and
+/// transitivity-closed positive equivalence table with local-dependency-guarded
+/// spanning-tree union-find edges.
+struct EquivNode {
+    deps: Vec<LocalDependency>,
+    parent: Option<(usize, Vec<LocalDependency>)>,
+    rank: u8,
+}
+
+struct EquivManager {
+    nodes: Vec<EquivNode>,
+    buckets: KMap<u64, Vec<(Expr, usize)>>,
+    entries: usize,
+    local_dependency_cells: usize,
+    local_dependency_scan_nodes: usize,
+    max_entries: usize,
+    max_bucket_entries: usize,
+    free_vars: FreeVars,
+}
+
+impl EquivManager {
+    fn new() -> Self {
+        Self::bounded(
+            TYPE_CHECKER_CACHE_MAX_ENTRIES,
+            TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES,
+        )
+    }
+
+    fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
+        Self {
+            nodes: Vec::new(),
+            buckets: KMap::default(),
+            entries: 0,
+            local_dependency_cells: 0,
+            local_dependency_scan_nodes: 0,
+            max_entries,
+            max_bucket_entries,
+            free_vars: FreeVars::default(),
+        }
+    }
+
+    fn merge_dep_slices(
+        left: &[LocalDependency],
+        right: &[LocalDependency],
+    ) -> Option<Vec<LocalDependency>> {
+        if left.is_empty() {
+            return Some(right.to_vec());
+        }
+        if right.is_empty() {
+            return Some(left.to_vec());
+        }
+        let mut merged = Vec::with_capacity(left.len() + right.len());
+        let (mut i, mut j) = (0, 0);
+        while i < left.len() && j < right.len() {
+            match left[i].id.0.cmp(&right[j].id.0) {
+                std::cmp::Ordering::Less => {
+                    merged.push(left[i].clone());
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    merged.push(right[j].clone());
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    if left[i].generation != right[j].generation
+                        || left[i].position != right[j].position
+                    {
+                        return None;
+                    }
+                    merged.push(left[i].clone());
+                    i += 1;
+                    j += 1;
+                }
+            }
+            if merged.len() > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
+                return None;
+            }
+        }
+        for rest in &left[i..] {
+            merged.push(rest.clone());
+            if merged.len() > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
+                return None;
+            }
+        }
+        for rest in &right[j..] {
+            merged.push(rest.clone());
+            if merged.len() > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
+                return None;
+            }
+        }
+        Some(merged)
+    }
+
+    fn find_existing_node(
+        &self,
+        expr: &Expr,
+        locals: &[LocalDecl],
+        local_positions: &KMap<FVarId, usize>,
+    ) -> Option<usize> {
+        let bucket = self.buckets.get(&expr.data().0)?;
+        bucket.iter().find_map(|(candidate, idx)| {
+            (candidate.is_alpha_equiv(expr)
+                && dependencies_are_live(&self.nodes[*idx].deps, locals, local_positions))
+            .then_some(*idx)
+        })
+    }
+
+    fn find_live_root(
+        &self,
+        mut idx: usize,
+        locals: &[LocalDecl],
+        local_positions: &KMap<FVarId, usize>,
+    ) -> Option<(usize, Vec<LocalDependency>)> {
+        let mut acc = self.nodes.get(idx)?.deps.clone();
+        while let Some((parent, ref edge_deps)) = self.nodes[idx].parent {
+            if !dependencies_are_live(edge_deps, locals, local_positions) {
+                break;
+            }
+            acc = Self::merge_dep_slices(&acc, edge_deps)?;
+            idx = parent;
+        }
+        Some((idx, acc))
+    }
+
+    fn are_known_equiv(
+        &self,
+        left: &Expr,
+        right: &Expr,
+        locals: &[LocalDecl],
+        local_positions: &KMap<FVarId, usize>,
+    ) -> Option<Vec<LocalDependency>> {
+        let n1 = self.find_existing_node(left, locals, local_positions)?;
+        let n2 = self.find_existing_node(right, locals, local_positions)?;
+        let (r1, d1) = self.find_live_root(n1, locals, local_positions)?;
+        let (r2, d2) = self.find_live_root(n2, locals, local_positions)?;
+        (r1 == r2).then(|| Self::merge_dep_slices(&d1, &d2))?
+    }
+
+    fn prune_dead_parent(&mut self, mut idx: usize, locals: &[LocalDecl]) {
+        while let Some((parent, ref edge_deps)) = self.nodes[idx].parent {
+            if !dependencies_are_present(edge_deps, locals) {
+                let reclaimed = edge_deps.len();
+                self.nodes[idx].parent = None;
+                self.local_dependency_cells = self.local_dependency_cells.saturating_sub(reclaimed);
+                break;
+            }
+            idx = parent;
+        }
+    }
+
+    fn ensure_node(
+        &mut self,
+        expr: &Expr,
+        locals: &[LocalDecl],
+        local_positions: &KMap<FVarId, usize>,
+    ) -> Option<usize> {
+        if expr.has_loose_bvars() || self.max_entries == 0 || self.max_bucket_entries == 0 {
+            return None;
+        }
+        if let Some(idx) = self.find_existing_node(expr, locals, local_positions) {
+            return Some(idx);
+        }
+        let key = expr.data().0;
+        if expr.has_fvar()
+            && let Some(bucket) = self.buckets.get_mut(&key)
+        {
+            let before = bucket.len();
+            let mut reclaimed = 0_usize;
+            let nodes = &self.nodes;
+            bucket.retain(|(_, idx)| {
+                let present = dependencies_are_present(&nodes[*idx].deps, locals);
+                if !present {
+                    reclaimed += nodes[*idx].deps.len();
+                }
+                present
+            });
+            self.entries -= before - bucket.len();
+            self.local_dependency_cells = self.local_dependency_cells.saturating_sub(reclaimed);
+        }
+        if self.entries >= self.max_entries
+            || self.nodes.len() >= self.max_entries.saturating_mul(2)
+            || self
+                .buckets
+                .get(&key)
+                .is_some_and(|bucket| bucket.len() >= self.max_bucket_entries)
+        {
+            return None;
+        }
+        let deps = if !expr.has_fvar() {
+            Vec::new()
+        } else {
+            if self.local_dependency_cells >= TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS {
+                return None;
+            }
+            let scan_limit = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES
+                .saturating_sub(self.local_dependency_scan_nodes)
+                .min(TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY);
+            if scan_limit == 0 {
+                return None;
+            }
+            let mut nodes_left = scan_limit;
+            let scanned = local_dependencies(
+                &[expr],
+                locals,
+                local_positions,
+                &mut self.free_vars,
+                &mut nodes_left,
+            );
+            self.local_dependency_scan_nodes += scan_limit - nodes_left;
+            scanned.ok()?
+        };
+        if self
+            .local_dependency_cells
+            .checked_add(deps.len())
+            .is_none_or(|cells| cells > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS)
+        {
+            return None;
+        }
+        let idx = self.nodes.len();
+        self.local_dependency_cells += deps.len();
+        self.nodes.push(EquivNode {
+            deps,
+            parent: None,
+            rank: 0,
+        });
+        self.buckets
+            .entry(key)
+            .or_default()
+            .push((expr.clone(), idx));
+        self.entries += 1;
+        Some(idx)
+    }
+
+    fn insert_equiv(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        extra_deps: &[LocalDependency],
+        locals: &[LocalDecl],
+        local_positions: &KMap<FVarId, usize>,
+    ) {
+        if left.has_loose_bvars() || right.has_loose_bvars() || left.is_alpha_equiv(right) {
+            return;
+        }
+        let Some(n1) = self.ensure_node(left, locals, local_positions) else {
+            return;
+        };
+        let Some(n2) = self.ensure_node(right, locals, local_positions) else {
+            return;
+        };
+        self.prune_dead_parent(n1, locals);
+        self.prune_dead_parent(n2, locals);
+        let Some((r1, d1)) = self.find_live_root(n1, locals, local_positions) else {
+            return;
+        };
+        let Some((r2, d2)) = self.find_live_root(n2, locals, local_positions) else {
+            return;
+        };
+        if r1 == r2 || self.nodes[r1].parent.is_some() || self.nodes[r2].parent.is_some() {
+            return;
+        }
+        let Some(root_deps) = Self::merge_dep_slices(&d1, &d2) else {
+            return;
+        };
+        let Some(edge_deps) = Self::merge_dep_slices(&root_deps, extra_deps) else {
+            return;
+        };
+        if self
+            .local_dependency_cells
+            .checked_add(edge_deps.len())
+            .is_none_or(|cells| cells > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS)
+        {
+            return;
+        }
+        let r1_closed = self.nodes[r1].deps.is_empty();
+        let r2_closed = self.nodes[r2].deps.is_empty();
+        let (parent, child, bump_rank) = match (r1_closed, r2_closed) {
+            (true, false) => (r1, r2, false),
+            (false, true) => (r2, r1, false),
+            _ => {
+                let rank1 = self.nodes[r1].rank;
+                let rank2 = self.nodes[r2].rank;
+                if rank1 < rank2 {
+                    (r2, r1, false)
+                } else if rank1 > rank2 {
+                    (r1, r2, false)
+                } else {
+                    (r1, r2, true)
+                }
+            }
+        };
+        self.local_dependency_cells += edge_deps.len();
+        self.nodes[child].parent = Some((parent, edge_deps));
+        if bump_rank {
+            self.nodes[parent].rank = self.nodes[parent].rank.saturating_add(1);
+        }
+    }
+
+    fn is_equiv(
+        &mut self,
+        t: &Expr,
+        s: &Expr,
+        use_hash: bool,
+        eager_reduction: bool,
+        locals: &[LocalDecl],
+        local_positions: &KMap<FVarId, usize>,
+    ) -> bool {
+        enum Op {
+            Enter(Expr, Expr),
+            Combine(Expr, Expr),
+        }
+
+        if t.allocation_identity() == s.allocation_identity() {
+            return true;
+        }
+        if !t.has_loose_bvars()
+            && !s.has_loose_bvars()
+            && self
+                .are_known_equiv(t, s, locals, local_positions)
+                .is_some()
+        {
+            return true;
+        }
+        if use_hash && t.data().hash() != s.data().hash() {
+            return false;
+        }
+        if t.is_alpha_equiv(s) {
+            return true;
+        }
+        if use_hash && self.entries == 0 {
+            return false;
+        }
+
+        let mut done: KMap<(usize, usize), (bool, bool, Vec<LocalDependency>)> = KMap::default();
+        let mut stack = vec![Op::Enter(t.clone(), s.clone())];
+        let mut visits = 0_usize;
+        while let Some(op) = stack.pop() {
+            match op {
+                Op::Enter(left, right) => {
+                    let pair = (left.allocation_identity(), right.allocation_identity());
+                    if pair.0 == pair.1 {
+                        done.insert(pair, (false, true, Vec::new()));
+                        continue;
+                    }
+                    if done.contains_key(&pair) {
+                        continue;
+                    }
+                    if !left.has_loose_bvars()
+                        && !right.has_loose_bvars()
+                        && let Some(deps) =
+                            self.are_known_equiv(&left, &right, locals, local_positions)
+                    {
+                        done.insert(pair, (true, true, deps));
+                        continue;
+                    }
+                    if use_hash && left.data().hash() != right.data().hash() {
+                        return false;
+                    }
+                    if left.is_alpha_equiv(&right) {
+                        done.insert(pair, (false, true, Vec::new()));
+                        continue;
+                    }
+                    if visits >= TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY {
+                        return false;
+                    }
+                    visits += 1;
+                    match (left.node(), right.node()) {
+                        (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) => {
+                            if a != b {
+                                return false;
+                            }
+                            done.insert(pair, (false, true, Vec::new()));
+                        }
+                        (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) => {
+                            if a != b {
+                                return false;
+                            }
+                            done.insert(pair, (false, true, Vec::new()));
+                        }
+                        (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) => {
+                            if a != b {
+                                return false;
+                            }
+                            done.insert(pair, (false, true, Vec::new()));
+                        }
+                        (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => {
+                            if a != b {
+                                return false;
+                            }
+                            done.insert(pair, (false, true, Vec::new()));
+                        }
+                        (ExprNode::Lit { literal: a }, ExprNode::Lit { literal: b }) => {
+                            if a != b {
+                                return false;
+                            }
+                            done.insert(pair, (false, true, Vec::new()));
+                        }
+                        (
+                            ExprNode::Const {
+                                name: a,
+                                levels: al,
+                            },
+                            ExprNode::Const {
+                                name: b,
+                                levels: bl,
+                            },
+                        ) => {
+                            if a != b || al != bl {
+                                return false;
+                            }
+                            done.insert(pair, (false, true, Vec::new()));
+                        }
+                        (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
+                            let (af, aa, bf, ba) = (af.clone(), aa.clone(), bf.clone(), ba.clone());
+                            stack.push(Op::Combine(left, right));
+                            stack.push(Op::Enter(aa, ba));
+                            stack.push(Op::Enter(af, bf));
+                        }
+                        (
+                            ExprNode::Lam {
+                                binder_type: at,
+                                body: ab,
+                                ..
+                            },
+                            ExprNode::Lam {
+                                binder_type: bt,
+                                body: bb,
+                                ..
+                            },
+                        )
+                        | (
+                            ExprNode::ForallE {
+                                binder_type: at,
+                                body: ab,
+                                ..
+                            },
+                            ExprNode::ForallE {
+                                binder_type: bt,
+                                body: bb,
+                                ..
+                            },
+                        ) => {
+                            let (at, ab, bt, bb) = (at.clone(), ab.clone(), bt.clone(), bb.clone());
+                            stack.push(Op::Combine(left, right));
+                            stack.push(Op::Enter(ab, bb));
+                            stack.push(Op::Enter(at, bt));
+                        }
+                        (
+                            ExprNode::LetE {
+                                type_: at,
+                                value: av,
+                                body: ab,
+                                non_dep: an,
+                                ..
+                            },
+                            ExprNode::LetE {
+                                type_: bt,
+                                value: bv,
+                                body: bb,
+                                non_dep: bn,
+                                ..
+                            },
+                        ) => {
+                            if an != bn {
+                                return false;
+                            }
+                            let (at, av, ab) = (at.clone(), av.clone(), ab.clone());
+                            let (bt, bv, bb) = (bt.clone(), bv.clone(), bb.clone());
+                            stack.push(Op::Combine(left, right));
+                            stack.push(Op::Enter(ab, bb));
+                            stack.push(Op::Enter(av, bv));
+                            stack.push(Op::Enter(at, bt));
+                        }
+                        (ExprNode::MData { expr: ae, .. }, ExprNode::MData { expr: be, .. }) => {
+                            let (ae, be) = (ae.clone(), be.clone());
+                            stack.push(Op::Combine(left, right));
+                            stack.push(Op::Enter(ae, be));
+                        }
+                        (
+                            ExprNode::Proj {
+                                struct_name: an,
+                                idx: ai,
+                                expr: ae,
+                            },
+                            ExprNode::Proj {
+                                struct_name: bn,
+                                idx: bi,
+                                expr: be,
+                            },
+                        ) => {
+                            if an != bn || ai != bi {
+                                return false;
+                            }
+                            let (ae, be) = (ae.clone(), be.clone());
+                            stack.push(Op::Combine(left, right));
+                            stack.push(Op::Enter(ae, be));
+                        }
+                        _ => return false,
+                    }
+                }
+                Op::Combine(left, right) => {
+                    let pair = (left.allocation_identity(), right.allocation_identity());
+                    if done.contains_key(&pair) {
+                        continue;
+                    }
+                    let mut nontrivial = false;
+                    let mut can_cache = true;
+                    let mut combined: Vec<LocalDependency> = Vec::new();
+                    let mut fold_child = |cl: &Expr, cr: &Expr| {
+                        let cp = (cl.allocation_identity(), cr.allocation_identity());
+                        if let Some((nt, child_cache, deps)) = done.get(&cp) {
+                            nontrivial |= *nt;
+                            can_cache &= *child_cache;
+                            if can_cache {
+                                match Self::merge_dep_slices(&combined, deps) {
+                                    Some(merged) => combined = merged,
+                                    None => can_cache = false,
+                                }
+                            }
+                        } else {
+                            can_cache = false;
+                        }
+                    };
+                    match (left.node(), right.node()) {
+                        (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
+                            fold_child(af, bf);
+                            fold_child(aa, ba);
+                        }
+                        (
+                            ExprNode::Lam {
+                                binder_type: at,
+                                body: ab,
+                                ..
+                            },
+                            ExprNode::Lam {
+                                binder_type: bt,
+                                body: bb,
+                                ..
+                            },
+                        )
+                        | (
+                            ExprNode::ForallE {
+                                binder_type: at,
+                                body: ab,
+                                ..
+                            },
+                            ExprNode::ForallE {
+                                binder_type: bt,
+                                body: bb,
+                                ..
+                            },
+                        ) => {
+                            fold_child(at, bt);
+                            fold_child(ab, bb);
+                        }
+                        (
+                            ExprNode::LetE {
+                                type_: at,
+                                value: av,
+                                body: ab,
+                                ..
+                            },
+                            ExprNode::LetE {
+                                type_: bt,
+                                value: bv,
+                                body: bb,
+                                ..
+                            },
+                        ) => {
+                            fold_child(at, bt);
+                            fold_child(av, bv);
+                            fold_child(ab, bb);
+                        }
+                        (ExprNode::MData { expr: ae, .. }, ExprNode::MData { expr: be, .. })
+                        | (ExprNode::Proj { expr: ae, .. }, ExprNode::Proj { expr: be, .. }) => {
+                            fold_child(ae, be);
+                        }
+                        _ => {}
+                    }
+                    if nontrivial
+                        && can_cache
+                        && (!eager_reduction || (!left.has_fvar() && !right.has_fvar()))
+                        && !left.has_loose_bvars()
+                        && !right.has_loose_bvars()
+                    {
+                        self.insert_equiv(&left, &right, &combined, locals, local_positions);
+                    }
+                    done.insert(pair, (nontrivial, can_cache, combined));
+                }
+            }
+        }
+        true
     }
 }
 
@@ -2050,6 +2640,7 @@ pub(crate) struct TypeChecker<'a> {
     cheap_proj_events: u64,
     whnf_cache: ExprResultCache,
     positive_def_eq_cache: PositiveDefEqCache,
+    equiv_manager: EquivManager,
     /// Landed lazy-delta outcome memo (bead `fln-4hol` item 2): bounded,
     /// refuse-not-evict, replay-gated by live dependencies; see consts.
     lazy_delta_outcomes: KMap<(u64, u64), Vec<LazyDeltaOutcomeEntry>>,
@@ -2120,6 +2711,7 @@ impl<'a> TypeChecker<'a> {
             major_coercion_replay_hits: 0,
             whnf_cache: ExprResultCache::new(),
             positive_def_eq_cache: PositiveDefEqCache::new(),
+            equiv_manager: EquivManager::new(),
             lazy_delta_outcomes: KMap::default(),
             lazy_delta_outcome_rows: 0,
             lazy_delta_outcome_scan_nodes: 0,
@@ -3438,7 +4030,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn definition_height(&self, e: &Expr) -> Option<u32> {
+    fn delta_info<'b>(&self, e: &'b Expr) -> Option<(&'b Name, DeltaPriority)> {
         let mut head = e;
         while let ExprNode::App { f, .. } = head.node() {
             head = f;
@@ -3453,20 +4045,20 @@ impl<'a> TypeChecker<'a> {
                         .unfolding
                         .is_some_and(|policy| policy.opaque_definitions.contains(name)) =>
             {
-                Some(match d.hints {
-                    ReducibilityHints::Regular(h) => h,
-                    // Abbrev unfolds eagerly (treated as tall); Opaque as height 0.
-                    ReducibilityHints::Abbrev => u32::MAX,
-                    ReducibilityHints::Opaque => 0,
-                })
+                let priority = match d.hints {
+                    ReducibilityHints::Opaque => DeltaPriority::Opaque,
+                    ReducibilityHints::Regular(h) => DeltaPriority::Regular(h),
+                    ReducibilityHints::Abbrev => DeltaPriority::Abbrev,
+                };
+                Some((name, priority))
             }
-            // Pin `constant_info::get_hints()` has no hints field to read for a
-            // theorem and returns `g_opaque`, which is height 0 — the shortest,
-            // so lazy delta unfolds the other side first, as at the pin.
+            // Pin `constant_info::get_hints()` returns `g_opaque` for theorems,
+            // which ranks strictly below every `Regular(h)` (including `h = 0`)
+            // in `reducibility_hints::compare` (`declaration.cpp:24-49`).
             ConstantInfo::Thm(_)
                 if !self.unfolding.is_some_and(|policy| !policy.unfold_theorems) =>
             {
-                Some(0)
+                Some((name, DeltaPriority::Opaque))
             }
             _ => None,
         }
@@ -4130,16 +4722,28 @@ impl<'a> TypeChecker<'a> {
     /// pair that only becomes Sort ≟ Sort or binder ≟ binder after reduction
     /// must not fall through to rules that cannot decide it). `None` = this
     /// pair's heads are not covered here — continue down the ladder.
-    fn quick_def_eq_rules(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<Option<bool>> {
-        // KR-301 positive equivalence cache, then quick structural equality
-        // (data-word fast path inside Expr::eq).
+    fn quick_def_eq_rules(
+        &mut self,
+        t: &Expr,
+        s: &Expr,
+        depth: u32,
+        use_hash: bool,
+    ) -> KResult<Option<bool>> {
+        // KR-301 positive equivalence cache + congruence-closed `equiv_manager`.
         if self
             .positive_def_eq_cache
             .contains(t, s, &self.locals, &self.local_positions)
         {
             return Ok(Some(true));
         }
-        if t == s {
+        if self.equiv_manager.is_equiv(
+            t,
+            s,
+            use_hash,
+            self.eager_reduction,
+            &self.locals,
+            &self.local_positions,
+        ) {
             return Ok(Some(true));
         }
         // KR-301's literal half (pin quick_is_def_eq, Lit case): a literal pair
@@ -4152,6 +4756,14 @@ impl<'a> TypeChecker<'a> {
         // KR-303 sorts by level equivalence.
         if let (ExprNode::Sort { level: lt }, ExprNode::Sort { level: ls }) = (t.node(), s.node()) {
             return Ok(Some(lt.is_equiv(ls)));
+        }
+        // Pin `quick_is_def_eq` (`type_checker.cpp:768-769`): peel matching
+        // `MData` wrappers immediately.
+        if let (ExprNode::MData { expr: e1, .. }, ExprNode::MData { expr: e2, .. }) =
+            (t.node(), s.node())
+        {
+            let (e1, e2) = (e1.clone(), e2.clone());
+            return Ok(Some(self.is_def_eq(&e1, &e2, depth + 1)?));
         }
         // KR-302 binder congruence. Matching Π/λ telescopes are a heap loop
         // (`is_def_eq_binding`); one recursive frame per binder used to abort
@@ -4179,12 +4791,7 @@ impl<'a> TypeChecker<'a> {
         let result = self.is_def_eq_core(t, s, depth);
         self.defer_recursor_major = deferral;
         if matches!(result, Ok(true)) {
-            self.positive_def_eq_cache.insert(
-                t.clone(),
-                s.clone(),
-                &self.locals,
-                &self.local_positions,
-            );
+            self.cache_positive_defeq(t, s);
         }
         result
     }
@@ -4254,12 +4861,17 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn cache_positive_defeq(&mut self, t: &Expr, s: &Expr) {
+        if self.eager_reduction && (t.has_fvar() || s.has_fvar()) {
+            return;
+        }
         self.positive_def_eq_cache.insert(
             t.clone(),
             s.clone(),
             &self.locals,
             &self.local_positions,
         );
+        self.equiv_manager
+            .insert_equiv(t, s, &[], &self.locals, &self.local_positions);
     }
 
     /// KR-300 through the cheap-proj full-WHNF restart. A changed pair
@@ -4269,15 +4881,15 @@ impl<'a> TypeChecker<'a> {
         let mut s = s.clone();
         loop {
             self.step(depth)?; // KR-300 resource hook
-            if let Some(decided) = self.quick_def_eq_rules(&t, &s, depth)? {
+            if let Some(decided) = self.quick_def_eq_rules(&t, &s, depth, true)? {
                 return Ok(DefeqReduced::Decided(decided));
             }
-            // KR-313's reflection fast path (pin type_checker.cpp:1062): `t`
-            // closed and `s` literally `Bool.true` — fully reduce `t` and
-            // compare. This is how `decide`-style proofs
+            // KR-313's reflection fast path (pin type_checker.cpp:1096): `t`
+            // closed (or under `eager_reduction`) and `s` literally `Bool.true`
+            // — fully reduce `t` and compare. This is how `decide`-style proofs
             // (`Eq.refl true : decide p = true`) close. One-sided at the pin;
             // the symmetric case still closes through delta.
-            if !t.has_fvar()
+            if (!t.has_fvar() || self.eager_reduction)
                 && matches!(s.node(), ExprNode::Const { name, .. } if is_name2(name, "Bool", "true"))
             {
                 let reduced = self.whnf(&t, depth + 1)?;
@@ -4295,8 +4907,8 @@ impl<'a> TypeChecker<'a> {
             // than opening the structure's definitions here.
             let tn = self.whnf_core_for_defeq(&t, depth + 1)?;
             let sn = self.whnf_core_for_defeq(&s, depth + 1)?;
-            if (tn != t || sn != s)
-                && let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth)?
+            if (!tn.is_alpha_equiv(&t) || !sn.is_alpha_equiv(&s))
+                && let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth, false)?
             {
                 return Ok(DefeqReduced::Decided(decided));
             }
@@ -4313,7 +4925,7 @@ impl<'a> TypeChecker<'a> {
                 LazyDelta::Decided(decided) => return Ok(DefeqReduced::Decided(decided)),
                 LazyDelta::Stuck(t, s) => (t, s),
             };
-            if let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth)? {
+            if let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth, false)? {
                 return Ok(DefeqReduced::Decided(decided));
             }
             // KR-310: same-name constants with equivalent levels.
@@ -4544,7 +5156,7 @@ impl<'a> TypeChecker<'a> {
                 // `instantiate_rev` they remain equal, so the skip is only
                 // an optimization. We still instantiate the right domain
                 // for the local's type.
-                let instantiated_s = if t_dom != s_dom {
+                let instantiated_s = if !t_dom.is_alpha_equiv(&s_dom) {
                     let var_t = self.instantiate_rev(&t_dom, &subst, 0, child_depth)?;
                     let var_s = self.instantiate_rev(&s_dom, &subst, 0, child_depth)?;
                     if !self.is_def_eq(&var_t, &var_s, child_depth)? {
@@ -4718,10 +5330,12 @@ impl<'a> TypeChecker<'a> {
             let (a, b) = (t.data().0, s.data().0);
             if a <= b { (a, b) } else { (b, a) }
         };
-        if let Some(bucket) = self.lazy_delta_outcomes.get(&key) {
+        if (!self.eager_reduction || (!t.has_fvar() && !s.has_fvar()))
+            && let Some(bucket) = self.lazy_delta_outcomes.get(&key)
+        {
             for entry in bucket {
-                if entry.t == t
-                    && entry.s == s
+                if entry.t.is_alpha_equiv(&t)
+                    && entry.s.is_alpha_equiv(&s)
                     && dependencies_are_live(&entry.deps, &self.locals, &self.local_positions)
                 {
                     let replay = entry.outcome.clone();
@@ -4732,7 +5346,8 @@ impl<'a> TypeChecker<'a> {
             }
         }
         let outcome = self.lazy_delta_uncached(t.clone(), s.clone(), depth)?;
-        if self.lazy_delta_outcome_rows < TYPE_CHECKER_LAZY_DELTA_OUTCOME_MAX_ROWS
+        if (!self.eager_reduction || (!t.has_fvar() && !s.has_fvar()))
+            && self.lazy_delta_outcome_rows < TYPE_CHECKER_LAZY_DELTA_OUTCOME_MAX_ROWS
             && self.lazy_delta_outcome_scan_nodes < TYPE_CHECKER_LAZY_DELTA_OUTCOME_SCAN_NODES
         {
             let per_entry = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY;
@@ -4751,7 +5366,10 @@ impl<'a> TypeChecker<'a> {
                         u64::try_from(per_entry.min(global_left) - nodes_left).unwrap_or(0);
                     let bucket = self.lazy_delta_outcomes.entry(key).or_default();
                     if bucket.len() < TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES {
-                        match bucket.iter_mut().find(|e| e.t == t && e.s == s) {
+                        match bucket
+                            .iter_mut()
+                            .find(|e| e.t.is_alpha_equiv(&t) && e.s.is_alpha_equiv(&s))
+                        {
                             // A dead row for this exact pair refreshes in place.
                             Some(slot) => {
                                 slot.outcome = outcome.clone();
@@ -4796,70 +5414,87 @@ impl<'a> TypeChecker<'a> {
             }
             // (`reduce_native` would run here at the pin — native_decide
             // surface, follow-up slice; omission only under-reduces.)
-            // Pin `lazy_delta_reduction_step`: before unfolding two
-            // applications of the SAME regular definition, compare their
-            // arguments. This is more than a micro-optimization. Class methods
-            // such as `HMod.hMod` can have proof-producing implementations;
-            // unfolding equal heads before noticing that only a closed numeric
-            // argument differs turns a tiny congruence query into evaluation of
-            // that proof program. A failed argument comparison is not
-            // decisive: exactly as at the pin, lazy delta then continues with
-            // the ordinary unfolding order.
-            if self.regular_same_head_apps_def_eq(&t, &s, depth + 1)? {
-                return Ok(LazyDelta::Decided(true));
-            }
-            let ht = self.definition_height(&t);
-            let hs = self.definition_height(&s);
-            // Pin `lazy_delta_reduction_step` continues every unfold with
-            // `whnf_core(.., false, true)`: a projection's structure is reduced
-            // without delta, so `(f a).i =?= (f b).i` reaches the projection-pair
-            // rule and compares `f a =?= f b` by their arguments instead of
-            // evaluating `f`. Continuing with the full `whnf_core` (06ff1e7a)
-            // made K1 evaluate concrete AIG array lookups the pin never unfolds,
-            // and left `goCache._mutual.eq_def` a no-answer even at 200M steps
-            // (bead fln-hvrk). What 06ff1e7a needed, reuse of these normal
-            // forms, is kept by the cheap mode's own caches (`whnf_core_mode`).
-            match (ht, hs) {
-                (None, None) => return Ok(LazyDelta::Stuck(t, s)),
-                // With one side a definition, the pin first tries to reduce the
-                // other side when it is a projection application
-                // (`try_unfold_proj_app`), so `expensive_term =?= instFoo.1 a`
-                // does not open `expensive_term`. Without it K1 walked
-                // `Nat.add`'s recursion on `Char.succ?_eq._proof_1_13`,
-                // 19.1M steps against the pin's 45 ms (bead fln-e44s).
-                (Some(_), None) => match self.try_unfold_proj_app(&s, depth)? {
-                    Some(next) => s = next,
-                    None => match self.unfold_definition(&t, depth)? {
-                        Some(next) => t = self.whnf_core_for_defeq(&next, depth)?,
-                        None => return Ok(LazyDelta::Stuck(t, s)),
-                    },
-                },
-                (None, Some(_)) => match self.try_unfold_proj_app(&t, depth)? {
-                    Some(next) => t = next,
-                    None => match self.unfold_definition(&s, depth)? {
-                        Some(next) => s = self.whnf_core_for_defeq(&next, depth)?,
-                        None => return Ok(LazyDelta::Stuck(t, s)),
-                    },
-                },
-                (Some(a), Some(b)) => {
-                    if a >= b {
-                        match self.unfold_definition(&t, depth)? {
-                            Some(next) => t = self.whnf_core_for_defeq(&next, depth)?,
-                            None => return Ok(LazyDelta::Stuck(t, s)),
-                        }
-                    }
-                    if b >= a {
-                        match self.unfold_definition(&s, depth)? {
-                            Some(next) => s = self.whnf_core_for_defeq(&next, depth)?,
-                            None => return Ok(LazyDelta::Stuck(t, s)),
-                        }
-                    }
-                    if t == s {
-                        return Ok(LazyDelta::Stuck(t, s));
-                    }
-                }
+            match self.lazy_delta_step(&mut t, &mut s, depth)? {
+                ReductionStatus::Continue => {}
+                ReductionStatus::DefUnknown => return Ok(LazyDelta::Stuck(t, s)),
+                ReductionStatus::DefEqual => return Ok(LazyDelta::Decided(true)),
+                ReductionStatus::DefDiff => return Ok(LazyDelta::Decided(false)),
             }
         }
+    }
+
+    /// Pin `type_checker::lazy_delta_reduction_step` (`type_checker.cpp:903-960`).
+    fn lazy_delta_step(
+        &mut self,
+        t: &mut Expr,
+        s: &mut Expr,
+        depth: u32,
+    ) -> KResult<ReductionStatus> {
+        let (same_regular_app, pt, ps) = match (self.delta_info(t), self.delta_info(s)) {
+            (None, None) => return Ok(ReductionStatus::DefUnknown),
+            (Some((_, pt)), None) => (false, Some(pt), None),
+            (None, Some((_, ps))) => (false, None, Some(ps)),
+            (Some((nt, pt)), Some((ns, ps))) => (
+                pt == ps
+                    && matches!(pt, DeltaPriority::Regular(_))
+                    && matches!(
+                        (t.node(), s.node()),
+                        (ExprNode::App { .. }, ExprNode::App { .. })
+                    )
+                    && nt == ns,
+                Some(pt),
+                Some(ps),
+            ),
+        };
+        // Pin `lazy_delta_reduction_step`: continues every unfold with
+        // `whnf_core(.., false, true)` (`whnf_core_for_defeq`), then runs
+        // `quick_is_def_eq(t_n, s_n, /* use_hash = */ false)` before any next
+        // unfold step (`type_checker.cpp:954`).
+        match (pt, ps) {
+            (None, None) => return Ok(ReductionStatus::DefUnknown),
+            (Some(_), None) => match self.try_unfold_proj_app(s, depth)? {
+                Some(next) => *s = next,
+                None => match self.unfold_definition(t, depth)? {
+                    Some(next) => *t = self.whnf_core_for_defeq(&next, depth)?,
+                    None => return Ok(ReductionStatus::DefUnknown),
+                },
+            },
+            (None, Some(_)) => match self.try_unfold_proj_app(t, depth)? {
+                Some(next) => *t = next,
+                None => match self.unfold_definition(s, depth)? {
+                    Some(next) => *s = self.whnf_core_for_defeq(&next, depth)?,
+                    None => return Ok(ReductionStatus::DefUnknown),
+                },
+            },
+            (Some(a), Some(b)) => match a.cmp_priority(b) {
+                std::cmp::Ordering::Greater => match self.unfold_definition(t, depth)? {
+                    Some(next) => *t = self.whnf_core_for_defeq(&next, depth)?,
+                    None => return Ok(ReductionStatus::DefUnknown),
+                },
+                std::cmp::Ordering::Less => match self.unfold_definition(s, depth)? {
+                    Some(next) => *s = self.whnf_core_for_defeq(&next, depth)?,
+                    None => return Ok(ReductionStatus::DefUnknown),
+                },
+                std::cmp::Ordering::Equal => {
+                    if same_regular_app && self.regular_same_head_apps_def_eq(t, s, depth + 1)? {
+                        return Ok(ReductionStatus::DefEqual);
+                    }
+                    match self.unfold_definition(t, depth)? {
+                        Some(next) => *t = self.whnf_core_for_defeq(&next, depth)?,
+                        None => return Ok(ReductionStatus::DefUnknown),
+                    }
+                    match self.unfold_definition(s, depth)? {
+                        Some(next) => *s = self.whnf_core_for_defeq(&next, depth)?,
+                        None => return Ok(ReductionStatus::DefUnknown),
+                    }
+                }
+            },
+        }
+        Ok(match self.quick_def_eq_rules(t, s, depth, false)? {
+            Some(true) => ReductionStatus::DefEqual,
+            Some(false) => ReductionStatus::DefDiff,
+            None => ReductionStatus::Continue,
+        })
     }
 
     /// Pinned `try_unfold_proj_app`: an application whose head is a projection
@@ -4878,22 +5513,25 @@ impl<'a> TypeChecker<'a> {
         Ok((reduced != *e).then_some(reduced))
     }
 
-    /// Pinned `lazy_delta_proj_reduction`: unfold the projection scrutinees
-    /// lazily. If that alone does not prove equality, reduce both constructor
-    /// fields at the requested index and compare the fields; only then compare
-    /// the residual scrutinees themselves.
+    /// Pinned `lazy_delta_proj_reduction` (`type_checker.cpp:1037-1054`):
+    /// step lazy-delta on the projection scrutinees (`DefUnknown` and `DefDiff`
+    /// both fall through to field projection, since unequal scrutinees can
+    /// still agree at field `idx`).
     fn lazy_delta_proj_reduction(
         &mut self,
-        t: Expr,
-        s: Expr,
+        mut t: Expr,
+        mut s: Expr,
         idx: u64,
         depth: u32,
     ) -> KResult<bool> {
-        let (t, s) = match self.lazy_delta(t, s, depth + 1)? {
-            LazyDelta::Decided(true) => return Ok(true),
-            LazyDelta::Decided(false) => return Ok(false),
-            LazyDelta::Stuck(t, s) => (t, s),
-        };
+        loop {
+            self.step(depth + 1)?;
+            match self.lazy_delta_step(&mut t, &mut s, depth + 1)? {
+                ReductionStatus::Continue => {}
+                ReductionStatus::DefEqual => return Ok(true),
+                ReductionStatus::DefUnknown | ReductionStatus::DefDiff => break,
+            }
+        }
         let placeholder = Name::anonymous();
         if let (Some(t_field), Some(s_field)) = (
             self.reduce_proj(&placeholder, idx, &t),
@@ -4906,50 +5544,50 @@ impl<'a> TypeChecker<'a> {
 
     /// The positive branch of the pin's equal-regular-definition shortcut.
     ///
-    /// The pin's `is_def_eq_args` walks last-to-first (type_checker.cpp:786).
-    /// A trailing mismatch must avoid forcing expensive earlier arguments.
-    /// Queries are strictly smaller (arguments only); structural identity,
-    /// never the packed expression hash, still decides cache hits elsewhere.
+    /// Caller (`lazy_delta_step`) has already verified both sides are `App`
+    /// spines headed by the same unfoldable `Regular` definition. The pin's
+    /// `is_def_eq_args` walks last-to-first (`type_checker.cpp:786`).
     fn regular_same_head_apps_def_eq(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<bool> {
+        if self
+            .regular_app_def_eq_failure_cache
+            .contains(t, s, &self.locals, &self.local_positions)
+        {
+            return Ok(false);
+        }
         let (t_head, t_args) = app_spine(t);
         let (s_head, s_args) = app_spine(s);
         if t_args.is_empty() || t_args.len() != s_args.len() {
+            self.regular_app_def_eq_failure_cache.insert(
+                t.clone(),
+                s.clone(),
+                &self.locals,
+                &self.local_positions,
+            );
             return Ok(false);
         }
         let (
             ExprNode::Const {
-                name: t_name,
-                levels: t_levels,
+                levels: t_levels, ..
             },
             ExprNode::Const {
-                name: s_name,
-                levels: s_levels,
+                levels: s_levels, ..
             },
         ) = (t_head.node(), s_head.node())
         else {
             return Ok(false);
         };
-        if t_name != s_name
-            || t_levels.len() != s_levels.len()
+        if t_levels.len() != s_levels.len()
             || !t_levels
                 .iter()
                 .zip(s_levels)
                 .all(|(t_level, s_level)| t_level.is_equiv(s_level))
         {
-            return Ok(false);
-        }
-        if !matches!(
-            self.env.find(t_name),
-            Some(ConstantInfo::Defn(defn))
-                if defn.safety == DefinitionSafety::Safe
-                    && matches!(defn.hints, ReducibilityHints::Regular(_))
-        ) {
-            return Ok(false);
-        }
-        if self
-            .regular_app_def_eq_failure_cache
-            .contains(t, s, &self.locals, &self.local_positions)
-        {
+            self.regular_app_def_eq_failure_cache.insert(
+                t.clone(),
+                s.clone(),
+                &self.locals,
+                &self.local_positions,
+            );
             return Ok(false);
         }
         for (t_arg, s_arg) in t_args.iter().zip(&s_args).rev() {
@@ -6871,6 +7509,37 @@ struct CheckedAppFrame {
     /// Original term this frame types, including any MData wrappers peeled
     /// to reach the application. Completed nested frames cache under this key.
     cache_key: Expr,
+}
+
+/// Pin `reducibility_hints::compare` (`declaration.cpp:24-49`): larger values
+/// unfold earlier (`Opaque < Regular(0) < Regular(1) < ... < Abbrev`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeltaPriority {
+    Opaque,
+    Regular(u32),
+    Abbrev,
+}
+
+impl DeltaPriority {
+    fn cmp_priority(self, other: Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Self::Opaque, Self::Opaque) | (Self::Abbrev, Self::Abbrev) => {
+                std::cmp::Ordering::Equal
+            }
+            (Self::Opaque, _) | (_, Self::Abbrev) => std::cmp::Ordering::Less,
+            (_, Self::Opaque) | (Self::Abbrev, _) => std::cmp::Ordering::Greater,
+            (Self::Regular(a), Self::Regular(b)) => a.cmp(&b),
+        }
+    }
+}
+
+/// Pin `type_checker::reduction_status` (`type_checker.h:72`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReductionStatus {
+    Continue,
+    DefUnknown,
+    DefEqual,
+    DefDiff,
 }
 
 /// Outcome of the lazy-delta loop: a decisive literal/offset verdict, or the
@@ -11620,6 +12289,187 @@ mod tests {
         assert!(
             first.allocation_identity() == second.allocation_identity(),
             "equal rebuilds from DIFFERENT sources and DIFFERENT substitute allocations must              share the interner's retained allocation; only the structural table can join them"
+        );
+    }
+
+    #[test]
+    fn delta_priority_ranks_regular_zero_strictly_above_theorems_and_opaque_hints() {
+        use fln_env::constants::{ConstantVal, DefinitionVal, TheoremVal};
+
+        assert_eq!(
+            DeltaPriority::Abbrev.cmp_priority(DeltaPriority::Regular(u32::MAX)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            DeltaPriority::Regular(0).cmp_priority(DeltaPriority::Opaque),
+            std::cmp::Ordering::Greater
+        );
+
+        let prop = Expr::sort(Level::zero());
+        let p_name = Name::str(Name::anonymous(), "P");
+        let bomb_name = Name::str(Name::anonymous(), "bomb_thm");
+        let alias_name = Name::str(Name::anonymous(), "alias_thm");
+
+        // Build an expensive theorem body (nested identity beta redexes) whose
+        // unfolding would consume dozens of steps if lazy delta ever touched it.
+        let id_prop = Expr::lam(
+            Name::str(Name::anonymous(), "h"),
+            Expr::const_(p_name.clone(), Vec::new()),
+            Expr::bvar(0).expect("small"),
+            BinderInfo::Default,
+        );
+        let ax_name = Name::str(Name::anonymous(), "ax_p");
+        let mut bomb_body = Expr::const_(ax_name.clone(), Vec::new());
+        for _ in 0..40 {
+            bomb_body = Expr::app(id_prop.clone(), bomb_body);
+        }
+
+        let env = Environment::new()
+            .add_decl(ConstantInfo::Axiom(fln_env::constants::AxiomVal {
+                base: ConstantVal {
+                    name: p_name.clone(),
+                    level_params: Vec::new(),
+                    type_: prop,
+                },
+                is_unsafe: false,
+            }))
+            .expect("P adds")
+            .add_decl(ConstantInfo::Axiom(fln_env::constants::AxiomVal {
+                base: ConstantVal {
+                    name: ax_name,
+                    level_params: Vec::new(),
+                    type_: Expr::const_(p_name.clone(), Vec::new()),
+                },
+                is_unsafe: false,
+            }))
+            .expect("ax_p adds")
+            .add_decl(ConstantInfo::Thm(TheoremVal {
+                base: ConstantVal {
+                    name: bomb_name.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::const_(p_name.clone(), Vec::new()),
+                },
+                value: bomb_body,
+            }))
+            .expect("bomb_thm adds")
+            .add_decl(ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: alias_name.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::const_(p_name, Vec::new()),
+                },
+                value: Expr::const_(bomb_name.clone(), Vec::new()),
+                hints: ReducibilityHints::Regular(0),
+                safety: DefinitionSafety::Safe,
+                all: vec![alias_name.clone()],
+            }))
+            .expect("alias_thm adds");
+
+        // Tight step budget (20 steps): unfolding `alias_thm` (Regular(0)) once
+        // yields `bomb_thm` immediately without opening `bomb_thm`'s 40-redex
+        // proof body. Under the old `definition_height` (`Regular(0) == Thm == 0`),
+        // both sides unfolded on step 1 and blew through a 20-step budget.
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT.narrowed(20, 256));
+        let alias_expr = Expr::const_(alias_name, Vec::new());
+        let bomb_expr = Expr::const_(bomb_name, Vec::new());
+        assert!(
+            tc.def_eq_public(&alias_expr, &bomb_expr, 0)
+                .expect("Regular(0) unfolds before Thm within 20 steps"),
+            "alias_thm must reduce to bomb_thm without unfolding bomb_thm's proof"
+        );
+    }
+
+    #[test]
+    fn equiv_manager_closes_transitivity_and_congruence_while_invalidating_stale_scopes() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let sort0 = Expr::sort(Level::zero());
+        let sort1 = Expr::sort(Level::one());
+        let f_id = FVarId(Name::str(Name::anonymous(), "f_head"));
+        tc.adopt_local(
+            f_id.clone(),
+            Expr::forall_e(
+                Name::str(Name::anonymous(), "x"),
+                sort1.clone(),
+                sort1.clone(),
+                BinderInfo::Default,
+            ),
+        );
+        let f = Expr::fvar(f_id);
+
+        // Two open let-bindings `a := Prop` and `b := Prop` with distinct hashes.
+        let saved = tc.locals.len();
+        let a_id = FVarId(Name::str(Name::anonymous(), "inst_a"));
+        let b_id = FVarId(Name::str(Name::anonymous(), "inst_b"));
+        tc.push_local(a_id.clone(), sort1.clone(), Some(sort0.clone()));
+        tc.push_local(b_id.clone(), sort1.clone(), Some(sort0.clone()));
+        let a = Expr::fvar(a_id.clone());
+        let b = Expr::fvar(b_id.clone());
+        assert_ne!(a.data().hash(), b.data().hash());
+
+        assert!(tc.def_eq_public(&a, &sort0, 0).expect("a == Prop"));
+        assert!(tc.def_eq_public(&b, &sort0, 0).expect("b == Prop"));
+
+        // Transitivity at the root: `a` and `b` were never compared directly,
+        // yet share the live closed root `Prop` in `equiv_manager`.
+        let before_trans = tc.consumption().steps_used;
+        assert!(tc.def_eq_public(&a, &b, 0).expect("transitive hit"));
+        assert_eq!(
+            tc.consumption().steps_used - before_trans,
+            1,
+            "transitive root hit must decide at the quick head check"
+        );
+
+        // Congruence under `f` after `whnf_core` (`use_hash = false` inside lazy delta / post-whnf):
+        let fa = Expr::app(f.clone(), a.clone());
+        let fb = Expr::app(f.clone(), b.clone());
+        assert!(
+            tc.equiv_manager
+                .is_equiv(&fa, &fb, false, false, &tc.locals, &tc.local_positions),
+            "congruence closure must equate `f a` and `f b` when `use_hash = false`"
+        );
+
+        // Soundness guard (D23): distinct projection struct names must NEVER be
+        // treated as congruent even at identical field index 0.
+        let proj_foo = Expr::proj(Name::str(Name::anonymous(), "Foo"), 0, a.clone());
+        let proj_bar = Expr::proj(Name::str(Name::anonymous(), "Bar"), 0, b.clone());
+        assert!(
+            !tc.equiv_manager.is_equiv(
+                &proj_foo,
+                &proj_bar,
+                false,
+                false,
+                &tc.locals,
+                &tc.local_positions
+            ),
+            "Proj congruence must check struct_name as well as field index"
+        );
+
+        // Scope truncation + rebinding `inst_b` without value (`Type` parameter):
+        // stale `a == b` and `f a == f b` facts must NOT survive!
+        tc.truncate_locals(saved);
+        tc.adopt_local(a_id.clone(), sort1.clone());
+        tc.adopt_local(b_id.clone(), sort1.clone());
+        assert!(
+            !tc.equiv_manager
+                .is_equiv(&fa, &fb, false, false, &tc.locals, &tc.local_positions),
+            "truncated/rebound locals must invalidate derived congruence edges"
+        );
+        assert!(
+            !tc.def_eq_public(&a, &b, 0)
+                .expect("distinct parameters do not equate"),
+            "rebinding inst_a/inst_b as distinct parameters must not replay stale equivalence"
+        );
+
+        // Direct `locals.clear()` + `local_positions.clear()` drift guard:
+        tc.locals.clear();
+        tc.local_positions.clear();
+        tc.adopt_local(a_id, sort1.clone());
+        tc.adopt_local(b_id, sort1);
+        assert!(
+            !tc.def_eq_public(&a, &b, 0)
+                .expect("post-clear parameters do not equate"),
+            "direct local-table clear must invalidate generation-bound edges"
         );
     }
 }
