@@ -390,7 +390,7 @@ fn check_exposure(
 fn normal_failure(error: &NatDefinitionElabError) -> bool {
     matches!(
         error,
-        NatDefinitionElabError::Inference(SourceInferenceError::InstanceSynthesisRequired)
+        NatDefinitionElabError::Inference(SourceInferenceError::InstanceSynthesisRequired(_))
     ) || instances::nonmatch(error)
 }
 

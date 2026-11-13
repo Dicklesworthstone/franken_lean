@@ -356,7 +356,7 @@ impl PreparedEvaluation {
             match attempted {
                 Ok(result) => return Ok(Some(result)),
                 Err(NatDefinitionElabError::Inference(
-                    SourceInferenceError::InstanceSynthesisRequired,
+                    SourceInferenceError::InstanceSynthesisRequired(_),
                 )) => {
                     let spent = self.context.txn.budget.heartbeats_consumed;
                     self.context = saved;

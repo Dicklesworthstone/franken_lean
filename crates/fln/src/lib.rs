@@ -2826,6 +2826,7 @@ impl Engine {
             guards: Vec::new(),
             warnings: Vec::new(),
             traces: Vec::new(),
+            final_file_base: self.environment.clone(),
         }
     }
 
@@ -3042,6 +3043,16 @@ impl Engine {
             // scope expansion revisits its original command index.
             if file_starts.peek() == Some(&command_index) {
                 file_starts.next();
+                if sites[source_file].1.is_some() {
+                    engine.environment =
+                        fln_elab::source::scope::simp::export::export_source_module(
+                            &file_base,
+                            &engine.environment,
+                        )
+                        .map_err(|error| {
+                            scope_error(command_index, original_offset, error.to_string())
+                        })?;
+                }
                 source_file += 1;
                 file_base = engine.environment.clone();
                 scopes = source_check::scopes::Scopes::new(&engine);
@@ -3698,10 +3709,14 @@ impl Engine {
                             &scopes.current,
                         ),
                     })
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
+                    .map_err(|error| {
+                        batch_command_error(
+                            command_index,
+                            original_offset,
+                            error,
+                            engine.environment(),
+                            &scope,
+                        )
                     })? {
                     Outcome::Complete(result) => result,
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -3761,10 +3776,14 @@ impl Engine {
                             &scope,
                         ),
                     })
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
+                    .map_err(|error| {
+                        batch_command_error(
+                            command_index,
+                            original_offset,
+                            error,
+                            engine.environment(),
+                            &scope,
+                        )
                     })? {
                     Outcome::Complete(admission) => admission,
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -3920,10 +3939,14 @@ impl Engine {
                             )
                         }
                     })
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
+                    .map_err(|error| {
+                        batch_command_error(
+                            command_index,
+                            original_offset,
+                            error,
+                            engine.environment(),
+                            &scope,
+                        )
                     })? {
                     Outcome::Complete(result) => result,
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -4026,11 +4049,13 @@ impl Engine {
                             });
                             continue;
                         }
-                        return Err(EngineExecutionError::BatchCommand {
-                            index: command_index,
-                            error: Box::new(error),
-                            at: Some(original_offset),
-                        });
+                        return Err(batch_command_error(
+                            command_index,
+                            original_offset,
+                            error,
+                            engine.environment(),
+                            &scope,
+                        ));
                     }
                 };
                 source_records::traces::append(
@@ -4156,10 +4181,14 @@ impl Engine {
                                 })
                         }
                     })
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
+                    .map_err(|error| {
+                        batch_command_error(
+                            command_index,
+                            original_offset,
+                            error,
+                            engine.environment(),
+                            &scope,
+                        )
                     })? {
                     Outcome::Complete(admission) => admission,
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -4294,10 +4323,14 @@ impl Engine {
                 })
                 .map(|outcome| outcome.map_complete(|declaration| (declaration, None)))
             }
-            .map_err(|error| EngineExecutionError::BatchCommand {
-                index: command_index,
-                error: Box::new(error),
-                at: Some(original_offset),
+            .map_err(|error| {
+                batch_command_error(
+                    command_index,
+                    original_offset,
+                    error,
+                    engine.environment(),
+                    &scope,
+                )
             })?;
             let (elaborated, evaluation_presentation) = match declaration {
                 Outcome::Complete(declaration) => declaration,
@@ -4429,10 +4462,14 @@ impl Engine {
                         &definition.base,
                         limits.kernel,
                     )
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
+                    .map_err(|error| {
+                        batch_command_error(
+                            command_index,
+                            original_offset,
+                            error,
+                            engine.environment(),
+                            &scope,
+                        )
                     })? {
                         Outcome::Complete(proof) => proof,
                         Outcome::Inconclusive(reason) => {
@@ -4707,10 +4744,14 @@ impl Engine {
                 equation_info.as_ref(),
                 scoped_options.as_ref().unwrap_or(options),
             )
-            .map_err(|error| EngineExecutionError::BatchCommand {
-                index: command_index,
-                error: Box::new(error),
-                at: Some(original_offset),
+            .map_err(|error| {
+                batch_command_error(
+                    command_index,
+                    original_offset,
+                    error,
+                    engine.environment(),
+                    &scope,
+                )
             })?;
             if !is_evaluation {
                 let equation_scope = scope
@@ -4730,10 +4771,14 @@ impl Engine {
                         options,
                         limits.kernel,
                     )
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
+                    .map_err(|error| {
+                        batch_command_error(
+                            command_index,
+                            original_offset,
+                            error,
+                            engine.environment(),
+                            &scope,
+                        )
                     })? {
                     Outcome::Complete(engine) => engine,
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -5150,6 +5195,7 @@ impl Engine {
             guards,
             warnings,
             traces: trace_messages,
+            final_file_base: file_base,
         }))
     }
 
@@ -6183,8 +6229,22 @@ impl Engine {
                 mut batch,
                 command_count,
                 execution_command_indices,
+                final_file_base,
                 ..
             } = mixed;
+            if parsed[entry_index].commands.is_empty() {
+                batch.engine.environment =
+                    fln_elab::source::scope::simp::export::export_source_module(
+                        &final_file_base,
+                        &batch.engine.environment,
+                    )
+                    .map_err(|error| {
+                        EngineExecutionError::ScopeTransition {
+                            message: error.to_string(),
+                        }
+                    })?;
+                batch.result_logical_root = batch.engine.logical_root(options);
+            }
             batch.source_module_order = module_order;
             Ok(Outcome::Complete(PlannedSourceModuleExecution {
                 batch,
@@ -7843,6 +7903,7 @@ pub struct SourceCommandBatchExecution {
     pub warnings: Vec<SourceWarning>,
     /// Raw tactic messages, captured in execution order (including backtracked branches).
     pub traces: Vec<SourceTraceMessage>,
+    pub(crate) final_file_base: Environment,
 }
 
 pub use source_records::traces::SourceTraceMessage;
@@ -7889,6 +7950,13 @@ fn guarded_elaboration_error(
     match error {
         EngineExecutionError::Frontend(NatDefinitionFrontendError::Elaborate(error)) => {
             if let fln_elab::NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::InstanceSynthesisRequired(Some(failure)),
+            ) = error
+                && let Some(message) = instance_synthesis_message(env, scope, failure)
+            {
+                return Some(message);
+            }
+            if let fln_elab::NatDefinitionElabError::Inference(
                 fln_elab::source::SourceInferenceError::InvalidFieldReceiver(refusal),
             ) = error
                 && let Some(message) = field_receiver_message(env, scope, refusal)
@@ -7916,6 +7984,73 @@ fn guarded_elaboration_error(
             Some(error.to_string())
         }
         _ => None,
+    }
+}
+
+/// The pin's `lean.synthInstanceFailed` message body (vendored
+/// `Lean/Elab/Term/TermElabM.lean:1248-1261` and `Lean/Elab/BuiltinTerm.lean:229-248`).
+fn instance_synthesis_message(
+    env: &Environment,
+    scope: &fln_elab::source::scope::SourceScope,
+    failure: &fln_elab::source::InstanceSynthesisFailure,
+) -> Option<String> {
+    if let Some(existing) = &failure.lean_message {
+        return Some(existing.clone());
+    }
+    let locals = failure.locals.decls();
+    let goal = pretty::goals::term_in_locals(env, scope, locals, &failure.goal).ok()?;
+    let mut message = format!(
+        "failed to synthesize instance of type class\n  {}",
+        goal.replace('\n', "\n  ")
+    );
+    if let Some((numeral, expected)) = &failure.numeral {
+        let expected = pretty::goals::term_in_locals(env, scope, locals, expected).ok()?;
+        let digits = pretty::nat_decimal(numeral);
+        message.push_str(&format!(
+            "\nnumerals are polymorphic in Lean, but the numeral `{digits}` cannot be used in a \
+             context where the expected type is\n  {}\ndue to the absence of the instance above",
+            expected.replace('\n', "\n  ")
+        ));
+    }
+    message.push_str(
+        "\n\nHint: Type class instance resolution failures can be inspected with the \
+         `set_option trace.Meta.synthInstance true` command.",
+    );
+    Some(message)
+}
+
+pub(crate) fn attach_lean_elaboration_diagnostics(
+    error: &mut EngineExecutionError,
+    env: &Environment,
+    scope: &fln_elab::source::scope::SourceScope,
+) {
+    match error {
+        EngineExecutionError::BatchCommand { error, .. } => {
+            attach_lean_elaboration_diagnostics(error, env, scope);
+        }
+        EngineExecutionError::Frontend(NatDefinitionFrontendError::Elaborate(
+            fln_elab::NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::InstanceSynthesisRequired(Some(failure)),
+            ),
+        )) if failure.lean_message.is_none() => {
+            failure.lean_message = instance_synthesis_message(env, scope, failure);
+        }
+        _ => {}
+    }
+}
+
+fn batch_command_error(
+    index: usize,
+    at: fln_parse::BytePos,
+    mut error: EngineExecutionError,
+    env: &Environment,
+    scope: &fln_elab::source::scope::SourceScope,
+) -> EngineExecutionError {
+    attach_lean_elaboration_diagnostics(&mut error, env, scope);
+    EngineExecutionError::BatchCommand {
+        index,
+        error: Box::new(error),
+        at: Some(at),
     }
 }
 
@@ -8895,6 +9030,25 @@ impl EngineExecutionError {
             // offer.
             Self::BatchCommand { error, at, .. } => error.primary_source_offset().or(*at),
             Self::Frontend(error) => error.primary_offset(),
+            _ => None,
+        }
+    }
+
+    /// The pin's named diagnostic header (`error(<name>)`) and delaborated body
+    /// when a frontend elaboration refusal carries a rendered Lean message.
+    pub fn lean_diagnostic(&self) -> Option<(&'static str, &str)> {
+        match self {
+            Self::BatchCommand { error, .. } => error.lean_diagnostic(),
+            Self::Frontend(NatDefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::InstanceSynthesisRequired(Some(
+                        failure,
+                    )),
+                ),
+            )) => failure
+                .lean_message
+                .as_deref()
+                .map(|msg| ("error(lean.synthInstanceFailed)", msg)),
             _ => None,
         }
     }

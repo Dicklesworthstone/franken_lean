@@ -355,7 +355,7 @@ fn flat(doc: &Format) -> String {
     doc.pretty(usize::MAX / 4)
 }
 
-fn nat_decimal(value: &NatLit) -> String {
+pub(crate) fn nat_decimal(value: &NatLit) -> String {
     if let Some(small) = value.to_u64() {
         return small.to_string();
     }

@@ -547,6 +547,138 @@ fn the_freeze_refuses_unledgered_or_newly_divergent_files_and_admits_a_repair() 
     assert!(freeze_problems(&files, &ledger, &[]).is_empty());
 }
 
+#[test]
+fn fln_5efd_semireducible_ofnat_diagnostics_match_reference_pin() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let root = fln_core::checked_workspace_root!();
+    let reference = match reference_lean(&root) {
+        Ok(reference) => reference,
+        Err(reason) => {
+            assert!(
+                std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+                "FLN_REQUIRE_REFERENCE is set but {reason}"
+            );
+            eprintln!(
+                "SKIP fln_5efd_semireducible_ofnat_diagnostics_match_reference_pin: {reason}"
+            );
+            return;
+        }
+    };
+
+    let control = "crates/fln-cli/tests/fixtures/source_ladder/ofnat_alias_control.lean";
+    let ref_control = Command::new(&reference)
+        .current_dir(&root)
+        .arg(control)
+        .output()
+        .expect("run pinned Reference lean on fln-5efd control");
+    assert_eq!(ref_control.status.code(), Some(0), "{ref_control:?}");
+    let fln_control = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .current_dir(&root)
+        .arg(control)
+        .output()
+        .expect("run FrankenLean lean on fln-5efd control");
+    assert_eq!(fln_control.status.code(), Some(0), "{fln_control:?}");
+    assert!(fln_control.stdout.is_empty(), "{fln_control:?}");
+    assert!(fln_control.stderr.is_empty(), "{fln_control:?}");
+
+    for rejected in [
+        "crates/fln-cli/tests/fixtures/source_ladder/ofnat_semireducible_carrier_projection.lean",
+        "crates/fln-cli/tests/fixtures/source_ladder/ofnat_semireducible_carrier_ascription.lean",
+    ] {
+        // Run the pinned Reference oracle FIRST (fln-5efd acceptance).
+        let ref_out = Command::new(&reference)
+            .current_dir(&root)
+            .arg(rejected)
+            .output()
+            .expect("run pinned Reference lean on fln-5efd rejected fixture");
+        assert_eq!(ref_out.status.code(), Some(1), "{rejected}: {ref_out:?}");
+        let ref_diag = String::from_utf8_lossy(&ref_out.stdout);
+        assert!(
+            ref_diag.contains("error(lean.synthInstanceFailed): failed to synthesize instance of type class\n  OfNat b.carrier 31\n"),
+            "{rejected}: unexpected Reference diagnostic:\n{ref_diag}"
+        );
+
+        let fln_out = Command::new(env!("CARGO_BIN_EXE_lean"))
+            .current_dir(&root)
+            .arg(rejected)
+            .output()
+            .expect("run FrankenLean lean on fln-5efd rejected fixture");
+        assert_eq!(fln_out.status.code(), Some(1), "{rejected}: {fln_out:?}");
+        assert!(fln_out.stdout.is_empty(), "{rejected}: {fln_out:?}");
+        let fln_diag = String::from_utf8_lossy(&fln_out.stderr);
+        assert_eq!(
+            fln_diag, ref_diag,
+            "{rejected}: FrankenLean diagnostic text diverged from pinned Reference lean"
+        );
+    }
+
+    let guarded = "\
+prelude
+import Init.Core
+structure Carrier where
+  carrier : Type
+structure Value (A : Type) where
+  value : A
+structure Both extends Carrier, Value carrier where
+  tag : Nat
+def b : Both := { carrier := Nat, value := 31, tag := 37 }
+def castV (b : Both) : Value b.carrier := b.toValue
+/--
+error: failed to synthesize instance of type class
+  OfNat b.carrier 31
+numerals are polymorphic in Lean, but the numeral `31` cannot be used in a context where the expected type is
+  b.carrier
+due to the absence of the instance above
+
+Hint: Type class instance resolution failures can be inspected with the `set_option trace.Meta.synthInstance true` command.
+-/
+#guard_msgs in
+example : (castV b).value = 31 := by rfl
+/--
+error: failed to synthesize instance of type class
+  OfNat b.carrier 31
+numerals are polymorphic in Lean, but the numeral `31` cannot be used in a context where the expected type is
+  b.carrier
+due to the absence of the instance above
+
+Hint: Type class instance resolution failures can be inspected with the `set_option trace.Meta.synthInstance true` command.
+-/
+#guard_msgs in
+example : (b.toValue.value : Nat) = 31 := by rfl
+";
+    for (label, use_reference) in [("reference", true), ("frankenlean", false)] {
+        let mut command = if use_reference {
+            Command::new(&reference)
+        } else {
+            Command::new(env!("CARGO_BIN_EXE_lean"))
+        };
+        let mut child = command
+            .current_dir(&root)
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn lean --stdin");
+        child
+            .stdin
+            .take()
+            .expect("stdin pipe")
+            .write_all(guarded.as_bytes())
+            .expect("write guarded fln-5efd source");
+        let output = child.wait_with_output().expect("wait lean --stdin");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{label} #guard_msgs failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 /// Rows that did not agree with the Reference when the freeze was enforced
 /// (fln-ew20, measured at 022c8ce3). One-way: delete an entry once its row
 /// agrees; never add one.

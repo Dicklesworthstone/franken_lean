@@ -130,7 +130,7 @@ fn bare_evaluations_synthesize_consecutive_instances_and_refuse_missing_dictiona
             limits().kernel,
         ),
         Err(fln_elab::NatDefinitionElabError::Inference(
-            fln_elab::source::SourceInferenceError::InstanceSynthesisRequired
+            fln_elab::source::SourceInferenceError::InstanceSynthesisRequired(_)
         ))
     ));
     let registered = checked(&missing, "attribute [instance] secondDictionary");

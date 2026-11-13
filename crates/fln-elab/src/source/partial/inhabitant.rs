@@ -66,7 +66,7 @@ impl Context {
                             || matches!(
                                 error,
                                 NatDefinitionElabError::Inference(
-                                    SourceInferenceError::InstanceSynthesisRequired
+                                    SourceInferenceError::InstanceSynthesisRequired(_)
                                         | SourceInferenceError::UnresolvedHoles { .. }
                                 )
                             ) =>

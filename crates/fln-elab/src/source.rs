@@ -82,6 +82,24 @@ pub struct FieldReceiverRefusal {
     pub locals: crate::lctx::LocalContext,
 }
 
+/// What the pin's `lean.synthInstanceFailed` diagnostic prints when native
+/// instance search at `.instances` transparency (vendored
+/// `Lean/Meta/SynthInstance.lean:356, 879`) cannot solve a synthetic instance
+/// metavariable: the instantiated goal in its local context (vendored
+/// `Lean/Elab/Term/TermElabM.lean:1248-1261`), the `(literal, expected_type)`
+/// pair when `elabNumLit` created an `OfNat` goal (vendored
+/// `Lean/Elab/BuiltinTerm.lean:229-248`), the relative byte offset inside the
+/// command, and the delaborated Lean message attached once an `Environment` and
+/// `SourceScope` printer are available.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceSynthesisFailure {
+    pub goal: Expr,
+    pub locals: crate::lctx::LocalContext,
+    pub offset: Option<BytePos>,
+    pub numeral: Option<(fln_core::expr::NatLit, Expr)>,
+    pub lean_message: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceInferenceError {
     NameScope(scope::ScopeError),
@@ -172,7 +190,7 @@ pub enum SourceInferenceError {
         count: usize,
     },
     UnresolvedUniverses,
-    InstanceSynthesisRequired,
+    InstanceSynthesisRequired(Option<Box<InstanceSynthesisFailure>>),
     /// The pin's eliminator elaboration (`elabAsElim`) could not finish; the
     /// text is the pin's own message after "failed to elaborate eliminator, ".
     Eliminator(&'static str),
@@ -449,7 +467,7 @@ impl std::fmt::Display for SourceInferenceError {
                 "source elaboration left {count} unresolved metavariables"
             ),
             Self::UnresolvedUniverses => write!(f, "source elaboration left unresolved universes"),
-            Self::InstanceSynthesisRequired => write!(
+            Self::InstanceSynthesisRequired(_) => write!(
                 f,
                 "native instance search could not resolve all instance arguments"
             ),
@@ -684,6 +702,7 @@ struct Context {
     equations: Vec<SourceEquation>,
     stalled_flush: Option<StalledFlush>,
     instance_goals: Vec<MVarId>,
+    instance_origins: std::collections::HashMap<MVarId, instances::InstanceGoalOrigin>,
     // Generated untyped binders can acquire a class type only after their
     // introduction, without becoming local instances. Ordinary typed locals
     // remain eligible; deriving marks just those late-inferred arguments.
@@ -911,6 +930,7 @@ impl Context {
             equations: Vec::new(),
             stalled_flush: None,
             instance_goals: Vec::new(),
+            instance_origins: std::collections::HashMap::new(),
             excluded_local_instances: Default::default(),
             bound_metavars: Vec::new(),
             synth_pending_depth: 0,
@@ -1729,11 +1749,13 @@ impl Context {
             budget.transparency = UnificationTransparency::Abbreviations;
             budget.offset_constraints = true;
         } else if !allow_delta {
-            // A selection query (an instance candidate against its goal) is one
-            // `isDefEq` at the pin's `instances` transparency (vendored
-            // Lean/Meta/SynthInstance.lean `tryResolve`, :356; configured at :879),
-            // which also unfolds `implicitReducible` definitions such as
-            // `instOfNatNat` (bead fln-gkhu).
+            // A selection query (an instance candidate against its goal, including
+            // `elabNumLit`'s `OfNat α n` goal from `Lean/Elab/BuiltinTerm.lean:229-248`)
+            // is one `isDefEq` at the pin's `instances` transparency (vendored
+            // `Lean/Meta/SynthInstance.lean` `tryResolve`, :356; configured at :879),
+            // unfolding `implicitReducible` definitions such as `instOfNatNat`
+            // (bead fln-gkhu) while keeping plain semireducible `def`s opaque
+            // (bead fln-5efd).
             budget.transparency = UnificationTransparency::Instances;
         } else {
             budget = self.ambient_budget(UnificationTransparency::Abbreviations);

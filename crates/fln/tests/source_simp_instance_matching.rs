@@ -44,7 +44,7 @@ fn check(tail: &str, expected: bool) {
                 panic!("not an elaborator refusal: {error:?}");
             };
             match reason {
-                SourceInferenceError::InstanceSynthesisRequired => {}
+                SourceInferenceError::InstanceSynthesisRequired(_) => {}
                 SourceInferenceError::Tactic(reason) => assert!(
                     matches!(
                         format!("{reason:?}").as_str(),

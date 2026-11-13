@@ -166,7 +166,7 @@ pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
             | SourceInferenceError::ExpectedType
             | SourceInferenceError::Match(_)
             | SourceInferenceError::Recursion(_)
-            | SourceInferenceError::InstanceSynthesisRequired
+            | SourceInferenceError::InstanceSynthesisRequired(_)
             | SourceInferenceError::UnresolvedHoles { .. }
             | SourceInferenceError::UnresolvedUniverses
             // The known row's wrong literal type is an ordinary `throwError`

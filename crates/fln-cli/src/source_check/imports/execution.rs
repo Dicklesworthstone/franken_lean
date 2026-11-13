@@ -156,17 +156,35 @@ fn module_failure(
         } = &error
         && module == entry
         && let fln::EngineExecutionError::Frontend(frontend) = cause.as_ref()
-        && let Some(relative) = frontend.primary_offset()
-        && let Some(offset) = command_start.checked_add(relative.0)
-        && let Some(position) = crate::source_position_at(source, offset)
     {
-        return MultiplexerOutput::failure(
-            format!(
-                "{display}:{}:{}: error: {cause}\n",
-                position.line, position.column
-            ),
-            exit,
-        );
+        if let Some((tag, message)) = cause.lean_diagnostic() {
+            let position = frontend
+                .primary_offset()
+                .and_then(|relative| command_start.checked_add(relative.0))
+                .and_then(|offset| crate::source_position_at(source, offset))
+                .or_else(|| crate::source_position_at(source, *command_start));
+            if let Some(position) = position {
+                return MultiplexerOutput::failure(
+                    format!(
+                        "{display}:{}:{}: {tag}: {message}\n",
+                        position.line, position.column
+                    ),
+                    exit,
+                );
+            }
+        }
+        if let Some(relative) = frontend.primary_offset()
+            && let Some(offset) = command_start.checked_add(relative.0)
+            && let Some(position) = crate::source_position_at(source, offset)
+        {
+            return MultiplexerOutput::failure(
+                format!(
+                    "{display}:{}:{}: error: {cause}\n",
+                    position.line, position.column
+                ),
+                exit,
+            );
+        }
     }
     failure(
         Failure::new(class, &error.to_string(), authority, exit),

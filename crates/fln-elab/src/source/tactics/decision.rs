@@ -668,11 +668,18 @@ impl Context {
         let domain = Expr::app(constant("Decidable", vec![]), proposition.clone());
         let dictionary = self.instance_hole(domain)?;
         self.resolve_instances(false)?;
+        let hole_id = match dictionary.node() {
+            ExprNode::MVar { id } => Some(id.clone()),
+            _ => None,
+        };
         let dictionary = self.instantiate(&dictionary)?;
         // Resolve this tactic's dictionary only. Unrelated outer instance goals
         // may still depend on later fields or explicitly unsolved proof holes.
         if dictionary.has_expr_mvar() || dictionary.has_level_mvar() {
-            return Err(failure(SourceInferenceError::InstanceSynthesisRequired));
+            return Err(match hole_id {
+                Some(id) => self.instance_synthesis_failure(&id)?,
+                None => failure(SourceInferenceError::InstanceSynthesisRequired(None)),
+            });
         }
         Ok(dictionary)
     }

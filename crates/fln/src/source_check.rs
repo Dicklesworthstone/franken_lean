@@ -1241,7 +1241,16 @@ impl Engine {
                                 outcome.map_complete(|admitted| (admitted.engine.clone(), admitted))
                             })
                     };
-                    match admitted.map_err(|error| command_error(file, count, start, error))? {
+                    match admitted.map_err(|error| {
+                        command_error_in_scope(
+                            file,
+                            count,
+                            start,
+                            error,
+                            engine.environment(),
+                            &scope,
+                        )
+                    })? {
                         Outcome::Complete(result) => result,
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -1261,8 +1270,16 @@ impl Engine {
                                     &scopes.current,
                                 )
                         })
-                        .map_err(|error| command_error(file, count, start, error))?
-                    {
+                        .map_err(|error| {
+                            command_error_in_scope(
+                                file,
+                                count,
+                                start,
+                                error,
+                                engine.environment(),
+                                &scope,
+                            )
+                        })? {
                         Outcome::Complete(result) => result,
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -1282,8 +1299,16 @@ impl Engine {
                                 None,
                             )
                         })
-                        .map_err(|error| command_error(file, count, start, error))?
-                    {
+                        .map_err(|error| {
+                            command_error_in_scope(
+                                file,
+                                count,
+                                start,
+                                error,
+                                engine.environment(),
+                                &scope,
+                            )
+                        })? {
                         Outcome::Complete(result) => (result.engine, result.admission),
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -1299,8 +1324,16 @@ impl Engine {
                                 Some(&file_base),
                             )
                         })
-                        .map_err(|error| command_error(file, count, start, error))?
-                    {
+                        .map_err(|error| {
+                            command_error_in_scope(
+                                file,
+                                count,
+                                start,
+                                error,
+                                engine.environment(),
+                                &scope,
+                            )
+                        })? {
                         Outcome::Complete(admitted) => (admitted.engine.clone(), admitted),
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -1523,6 +1556,18 @@ fn parse_control_command(
             DefinitionFrontendError::Parse(error),
         )),
     })
+}
+
+fn command_error_in_scope(
+    file: usize,
+    count: usize,
+    start: fln_parse::BytePos,
+    mut error: EngineExecutionError,
+    env: &Environment,
+    scope: &fln_elab::source::scope::SourceScope,
+) -> SourceCheckError {
+    crate::attach_lean_elaboration_diagnostics(&mut error, env, scope);
+    command_error(file, count, start, error)
 }
 
 fn command_error(

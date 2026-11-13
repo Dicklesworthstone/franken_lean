@@ -382,7 +382,7 @@ fn admitted_io_printing_refuses_before_effects_and_skips_printers_on_exceptions(
         assert!(matches!(reason(&missing), SourceInferenceError::EvaluationPrinting(PrintingError::MissingPrinter)), "{missing:?}");
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged\n");
         let unresolved = refused(&action("Nat", "ioNeeds"));
-        assert!(matches!(reason(&unresolved), SourceInferenceError::InstanceSynthesisRequired), "{unresolved:?}");
+        assert!(matches!(reason(&unresolved), SourceInferenceError::InstanceSynthesisRequired(_)), "{unresolved:?}");
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged\n");
         let guard_effect = directory.0.join("guard-effect.txt");
         std::fs::write(&guard_effect, b"").unwrap();

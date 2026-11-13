@@ -822,7 +822,7 @@ fn refusal(error: &SourceCheckError) -> Option<Refusal> {
         return None;
     };
     match reason {
-        SourceInferenceError::InstanceSynthesisRequired => Some(Refusal::InstanceSynthesis),
+        SourceInferenceError::InstanceSynthesisRequired(_) => Some(Refusal::InstanceSynthesis),
         SourceInferenceError::Unification(_) | SourceInferenceError::TypeMismatch { .. } => {
             Some(Refusal::TypeMismatch)
         }

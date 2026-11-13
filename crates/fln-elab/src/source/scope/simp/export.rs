@@ -35,6 +35,86 @@ pub fn persistent_source_entry(env: &Environment, payload: &[u8]) -> Result<bool
     }
 }
 
+/// Omit local `[-simp]` erasures from a completed source module's suffix before
+/// downstream source modules import `result`.
+pub fn export_source_module(
+    base: &Environment,
+    result: &Environment,
+) -> Result<Environment, SimpSetError> {
+    let expected = descriptor();
+    let Some(state) = result.extension(&expected.name) else {
+        return Ok(result.clone());
+    };
+    if state.descriptor != expected {
+        return Err(SimpSetError::Malformed);
+    }
+    let base_len = match base.extension(&expected.name) {
+        Some(prior) => {
+            if prior.descriptor != expected || state.len() < prior.len() {
+                return Err(SimpSetError::Malformed);
+            }
+            prior.len()
+        }
+        None => 0,
+    };
+    check_journal_capacity(state.len(), state.payload_bytes())?;
+    let mut has_local_erasure = false;
+    let mut kept = Vec::new();
+    for entry in state.entries().skip(base_len) {
+        if persistent_source_entry(result, &entry.payload)? {
+            kept.push(Arc::clone(&entry.payload));
+        } else {
+            has_local_erasure = true;
+        }
+    }
+    if !has_local_erasure {
+        return Ok(result.clone());
+    }
+    let limits = fln_env::extensions::CheckpointLimits::new(
+        (MAX_JOURNAL_BYTES / ENTRY_ACCOUNTING_BYTES) as usize,
+        MAX_JOURNAL_BYTES,
+    );
+    let epoch = fln_env::modules::ModuleEpoch::new(
+        "frankenlean-source-simp",
+        "0000000000000000000000000000000000000000",
+    );
+    let empty_base;
+    let checkpoint_source = if base.extension(&expected.name).is_some() {
+        base
+    } else {
+        empty_base = Environment::new()
+            .register_extension(expected.clone())
+            .map_err(|_| SimpSetError::Malformed)?;
+        &empty_base
+    };
+    let checkpoint = match checkpoint_source.checkpoint_extension(
+        &expected.name,
+        None,
+        limits,
+        fln_env::extensions::ProofBudget::UNBOUNDED,
+        &epoch,
+        None,
+    ) {
+        fln_core::outcome::Outcome::Complete(Ok(checkpoint)) => checkpoint,
+        _ => return Err(SimpSetError::Malformed),
+    };
+    let mut exported = match result.apply_extension_checkpoint(
+        &checkpoint,
+        limits,
+        fln_env::extensions::ProofBudget::UNBOUNDED,
+        None,
+    ) {
+        fln_core::outcome::Outcome::Complete(Ok(env)) => env,
+        _ => return Err(SimpSetError::Malformed),
+    };
+    for payload in kept {
+        exported = exported
+            .push_extension_entry(&expected.name, payload)
+            .map_err(|_| SimpSetError::Malformed)?;
+    }
+    Ok(exported)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theorem {
     pub proof: Expr,

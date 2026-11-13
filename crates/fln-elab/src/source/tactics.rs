@@ -1781,9 +1781,16 @@ impl Context {
             }
             let value = self.instance_hole(goal.target.clone())?;
             self.resolve_instances(true)?;
+            let hole_id = match value.node() {
+                ExprNode::MVar { id } => Some(id.clone()),
+                _ => None,
+            };
             let value = self.instantiate(&value)?;
             if value.has_expr_mvar() || value.has_level_mvar() {
-                return Err(failure(SourceInferenceError::InstanceSynthesisRequired));
+                return Err(match hole_id {
+                    Some(id) => self.instance_synthesis_failure(&id)?,
+                    None => failure(SourceInferenceError::InstanceSynthesisRequired(None)),
+                });
             }
             self.close_proof_goal(goal, value)?;
         } else if kind == &parser_kind(&["Tactic", "decide"])

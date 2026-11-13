@@ -299,7 +299,7 @@ impl Context {
         match self.decision_dictionary(proposition) {
             Ok(dictionary) => Ok((dictionary, false)),
             Err(NatDefinitionElabError::Inference(
-                SourceInferenceError::InstanceSynthesisRequired,
+                SourceInferenceError::InstanceSynthesisRequired(_),
             )) => {
                 let spent = self.txn.budget.heartbeats_consumed;
                 *self = saved;

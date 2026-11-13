@@ -37,7 +37,16 @@ fn checked(base: &Engine, source: &str) -> Engine {
         .engine
 }
 
-fn instance_refused(base: &Engine, source: &str) {
+const EXPECTED_FLN_5EFD_MESSAGE: &str = "\
+failed to synthesize instance of type class
+  OfNat b.carrier 31
+numerals are polymorphic in Lean, but the numeral `31` cannot be used in a context where the expected type is
+  b.carrier
+due to the absence of the instance above
+
+Hint: Type class instance resolution failures can be inspected with the `set_option trace.Meta.synthInstance true` command.";
+
+fn instance_refused(base: &Engine, source: &str) -> SourceCheckError {
     let before = base.logical_root(&KVMap::new());
     let result = base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits());
     let error = match result {
@@ -53,7 +62,7 @@ fn instance_refused(base: &Engine, source: &str) {
                     error.as_ref(),
                     EngineExecutionError::Frontend(NatDefinitionFrontendError::Elaborate(
                         NatDefinitionElabError::Inference(
-                            SourceInferenceError::InstanceSynthesisRequired
+                            SourceInferenceError::InstanceSynthesisRequired(_)
                         )
                     ))
                 )
@@ -62,6 +71,7 @@ fn instance_refused(base: &Engine, source: &str) {
     );
     assert_eq!(error.disposition(), ("elaboration", false, 1));
     assert_eq!(base.logical_root(&KVMap::new()), before);
+    error
 }
 
 #[test]
@@ -69,9 +79,15 @@ fn dependent_result_preserves_its_carrier_for_numeral_instance_search() {
     let base = checked(&engine(), PREFIX);
     // Explicit parent projection isolates numeral inference from automatic
     // parent coercions (fln-azxg).
-    instance_refused(
-        &base,
-        "def castV (b : Both) : Value b.carrier := b.toValue\ntheorem bad : (castV b).value = 31 := by rfl",
+    let source = "def castV (b : Both) : Value b.carrier := b.toValue\ntheorem bad : (castV b).value = 31 := by rfl";
+    let error = instance_refused(&base, source);
+    let SourceCheckError::Command { offset, error, .. } = &error else {
+        panic!("expected command refusal: {error:?}");
+    };
+    assert_eq!(*offset, source.rfind("31").unwrap());
+    assert_eq!(
+        error.lean_diagnostic(),
+        Some(("error(lean.synthInstanceFailed)", EXPECTED_FLN_5EFD_MESSAGE))
     );
 }
 
@@ -80,9 +96,15 @@ fn ascribed_projection_retains_its_actual_carrier_for_numeral_instance_search() 
     let base = checked(&engine(), PREFIX);
     // An ascription checks convertibility; it does not replace inferType's
     // result for the projected value with Nat.
-    instance_refused(
-        &base,
-        "theorem bad : (b.toValue.value : Nat) = 31 := by rfl",
+    let source = "theorem bad : (b.toValue.value : Nat) = 31 := by rfl";
+    let error = instance_refused(&base, source);
+    let SourceCheckError::Command { offset, error, .. } = &error else {
+        panic!("expected command refusal: {error:?}");
+    };
+    assert_eq!(*offset, source.rfind("31").unwrap());
+    assert_eq!(
+        error.lean_diagnostic(),
+        Some(("error(lean.synthInstanceFailed)", EXPECTED_FLN_5EFD_MESSAGE))
     );
 }
 
@@ -112,7 +134,7 @@ fn concrete_numeric_aliases_cannot_fall_back_to_default_instances() {
         "def bad : NumericAlias Nat := 7",
         "def bad : NumericAlias Float := 1.25",
     ] {
-        instance_refused(&base, source);
+        let _ = instance_refused(&base, source);
     }
     checked(
         &base,

@@ -1312,7 +1312,7 @@ def needs [Need] : Bool := true
         // The original query has an unsolved dictionary, even though its Bool
         // result has both valid printers. Printer fallback must not catch it.
         let unresolved = run(b"#eval needs", &KVMap::new()).unwrap_err();
-        assert!(matches!(reason(&unresolved), SourceInferenceError::InstanceSynthesisRequired));
+        assert!(matches!(reason(&unresolved), SourceInferenceError::InstanceSynthesisRequired(_)));
         let mut options = KVMap::new();
         options.insert(name("format.width"), fln_core::options::DataValue::OfNat(80));
         let width = run(b"#eval true", &options).unwrap_err();

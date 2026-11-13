@@ -151,6 +151,9 @@ impl NatDefinitionFrontendError {
             Self::Elaborate(NatDefinitionElabError::Inference(
                 source::SourceInferenceError::Tactic(source::TacticError::NoGoals { offset }),
             )) => *offset,
+            Self::Elaborate(NatDefinitionElabError::Inference(
+                source::SourceInferenceError::InstanceSynthesisRequired(Some(failure)),
+            )) => failure.offset,
             Self::Elaborate(_) => None,
         }
     }

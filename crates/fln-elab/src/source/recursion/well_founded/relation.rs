@@ -58,7 +58,7 @@ impl Context {
             .value;
         let dictionary = self
             .coercion_instance(target)?
-            .ok_or_else(|| failure(SourceInferenceError::InstanceSynthesisRequired))?;
+            .ok_or_else(|| failure(SourceInferenceError::InstanceSynthesisRequired(None)))?;
         self.require_resolved_terms(std::slice::from_ref(&dictionary))?;
 
         // `isNatLtWF` compares both the codomain and the actual dictionary at

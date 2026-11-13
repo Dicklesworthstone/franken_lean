@@ -75,12 +75,16 @@ impl Context {
         Ok(function)
     }
 
-    fn numeric_dictionary(&mut self, function: Typed) -> Result<Typed, NatDefinitionElabError> {
+    fn numeric_dictionary_with_origin(
+        &mut self,
+        function: Typed,
+        origin: instances::InstanceGoalOrigin,
+    ) -> Result<Typed, NatDefinitionElabError> {
         let signature = self.whnf(&function.type_)?;
         let ExprNode::ForallE { binder_type, .. } = signature.node() else {
             return Err(failure(SourceInferenceError::ExpectedFunction));
         };
-        let dictionary = self.instance_hole(binder_type.clone())?;
+        let dictionary = self.instance_hole_with_origin(binder_type.clone(), origin)?;
         self.numeric_argument(function, dictionary)
     }
 
@@ -89,7 +93,7 @@ impl Context {
         class: &str,
         method: &str,
         expected: Option<&Expr>,
-    ) -> Result<Typed, NatDefinitionElabError> {
+    ) -> Result<(Typed, Expr), NatDefinitionElabError> {
         let function = self.constant(&Name::from_components([class, method]))?;
         let signature = self.whnf(&function.type_)?;
         let ExprNode::ForallE { binder_type, .. } = signature.node() else {
@@ -99,7 +103,7 @@ impl Context {
         if let Some(expected) = expected {
             self.constrain(&type_, expected)?;
         }
-        self.numeric_argument(function, type_)
+        Ok((self.numeric_argument(function, type_.clone())?, type_))
     }
 
     pub(super) fn numeric_literal(
@@ -125,10 +129,17 @@ impl Context {
                 expected: "one numeric literal atom",
             });
         };
+        let offset = deprecated::syntax_span(syntax).map(|(start, _)| BytePos(start));
         if scientific {
             let (mantissa, negative, exponent) = decode_scientific(spelling)?;
-            let function = self.numeric_method("OfScientific", "ofScientific", expected)?;
-            let mut function = self.numeric_dictionary(function)?;
+            let (function, _) = self.numeric_method("OfScientific", "ofScientific", expected)?;
+            let mut function = self.numeric_dictionary_with_origin(
+                function,
+                instances::InstanceGoalOrigin {
+                    offset,
+                    numeral: None,
+                },
+            )?;
             for argument in [
                 mantissa,
                 Expr::const_(
@@ -141,10 +152,24 @@ impl Context {
             }
             Ok(Some(function))
         } else {
-            let number = Expr::lit(decode_natural(spelling)?);
-            let function = self.numeric_method("OfNat", "ofNat", expected)?;
+            // Pinned `elabNumLit` (`Lean/Elab/BuiltinTerm.lean:229-248`): synthesizes
+            // `OfNat ?typeMVar val` at `.instances` transparency (`Lean/Meta/SynthInstance.lean:356, 879`),
+            // keeping plain semireducible definitions opaque when matching `OfNat` (bead fln-5efd).
+            let literal = decode_natural(spelling)?;
+            let nat_lit = match &literal {
+                Literal::Nat(value) => value.clone(),
+                Literal::Str(_) => unreachable!("decode_natural produces Literal::Nat"),
+            };
+            let number = Expr::lit(literal);
+            let (function, carrier) = self.numeric_method("OfNat", "ofNat", expected)?;
             let function = self.numeric_argument(function, number)?;
-            Ok(Some(self.numeric_dictionary(function)?))
+            Ok(Some(self.numeric_dictionary_with_origin(
+                function,
+                instances::InstanceGoalOrigin {
+                    offset,
+                    numeral: Some((nat_lit, carrier)),
+                },
+            )?))
         }
     }
 }

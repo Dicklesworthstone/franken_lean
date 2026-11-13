@@ -135,7 +135,7 @@ fn ordinal(context: &mut Context, index: usize) -> Result<Typed, NatDefinitionEl
     );
     context
         .numeric_literal(&syntax, Some(&Expr::const_(named("UInt64"), Vec::new())))?
-        .ok_or_else(|| failure(SourceInferenceError::InstanceSynthesisRequired))
+        .ok_or_else(|| failure(SourceInferenceError::InstanceSynthesisRequired(None)))
 }
 
 fn family_indices(

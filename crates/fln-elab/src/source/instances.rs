@@ -23,6 +23,15 @@ const DEFAULT_MAX_RESULT_SIZE: u64 = 128;
 /// `synthPendingImp`, synthesis is refused only once the depth exceeds it.
 pub(super) const MAX_SYNTH_PENDING_DEPTH: u8 = 1;
 
+/// Source provenance for a synthetic instance metavariable: its command-relative
+/// byte offset and, when created by `elabNumLit` (`Lean/Elab/BuiltinTerm.lean:229-248`),
+/// the numeral literal and expected-type metavariable for the pin's extra message.
+#[derive(Clone, Debug, Default)]
+pub(in crate::source) struct InstanceGoalOrigin {
+    pub(in crate::source) offset: Option<BytePos>,
+    pub(in crate::source) numeral: Option<(fln_core::expr::NatLit, Expr)>,
+}
+
 /// A metavariable a `fun` or `∀` closed over before it was solved: `abstracted` stands in the
 /// closed term for the goal over `locals` ([`Context::capture_bound_metavars`]).
 #[derive(Clone, Debug)]
@@ -643,6 +652,14 @@ impl Context {
     }
 
     pub(super) fn instance_hole(&mut self, type_: Expr) -> Result<Expr, NatDefinitionElabError> {
+        self.instance_hole_with_origin(type_, InstanceGoalOrigin::default())
+    }
+
+    pub(super) fn instance_hole_with_origin(
+        &mut self,
+        type_: Expr,
+        origin: InstanceGoalOrigin,
+    ) -> Result<Expr, NatDefinitionElabError> {
         let name = self.fresh_name()?;
         let id = MVarId(name.clone());
         self.txn.mvars.declare(
@@ -655,7 +672,54 @@ impl Context {
             None,
         );
         self.instance_goals.push(id.clone());
+        if origin.offset.is_some() || origin.numeral.is_some() {
+            self.instance_origins.insert(id.clone(), origin);
+        }
         Ok(Expr::mvar(id))
+    }
+
+    /// Snapshot an unsolved synthetic instance goal as the pin's `synthesizeInstMVarCore`
+    /// (`Lean/Elab/Term/TermElabM.lean:1205-1261`) prepares `lean.synthInstanceFailed`.
+    pub(super) fn instance_synthesis_failure(
+        &mut self,
+        id: &MVarId,
+    ) -> Result<NatDefinitionElabError, NatDefinitionElabError> {
+        let Some(decl) = self.txn.mvars.get_decl(id).cloned() else {
+            return Ok(failure(SourceInferenceError::InstanceSynthesisRequired(
+                None,
+            )));
+        };
+        let goal = self.instantiate(&decl.type_)?;
+        let mut locals = crate::lctx::LocalContext::new();
+        for local in decl.lctx.decls() {
+            let type_ = self.instantiate(&local.type_)?;
+            if let Some(value) = &local.value {
+                let value = self.instantiate(value)?;
+                locals.add_let(local.id.clone(), local.user_name.clone(), type_, value);
+            } else {
+                locals.add_param(
+                    local.id.clone(),
+                    local.user_name.clone(),
+                    type_,
+                    local.binder_info,
+                );
+            }
+        }
+        let origin = self.instance_origins.get(id).cloned();
+        let offset = origin.as_ref().and_then(|o| o.offset);
+        let numeral = match origin.and_then(|o| o.numeral) {
+            Some((literal, expected)) => Some((literal, self.instantiate(&expected)?)),
+            None => None,
+        };
+        Ok(failure(SourceInferenceError::InstanceSynthesisRequired(
+            Some(Box::new(super::InstanceSynthesisFailure {
+                goal,
+                locals,
+                offset,
+                numeral,
+                lean_message: None,
+            })),
+        )))
     }
 
     /// Same annotation rule as the supported portion of Term.ElabBinders:
@@ -739,7 +803,7 @@ impl Context {
                 // demand the result of an as-yet unassigned dictionary. Retain
                 // all suspended obligations and retry them after publication.
                 let suspended = std::mem::take(&mut trial.equations);
-                let result = trial.search_instance(id, &registry);
+                let result = trial.search_instance(id.clone(), &registry);
                 self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
                 match result {
                     Ok(SearchResult::Solved) => {
@@ -759,7 +823,7 @@ impl Context {
                     }
                     Ok(SearchResult::Stuck) => {}
                     Ok(SearchResult::Failed) => {
-                        return Err(failure(SourceInferenceError::InstanceSynthesisRequired));
+                        return Err(self.instance_synthesis_failure(&id)?);
                     }
                     Err(error) => return Err(error),
                 }
@@ -801,12 +865,13 @@ impl Context {
             self.finish_postponed_fields()?;
         }
         if final_pass
-            && self
+            && let Some(id) = self
                 .instance_goals
                 .iter()
-                .any(|id| !self.txn.mvars.is_assigned(id))
+                .find(|id| !self.txn.mvars.is_assigned(id))
+                .cloned()
         {
-            return Err(failure(SourceInferenceError::InstanceSynthesisRequired));
+            return Err(self.instance_synthesis_failure(&id)?);
         }
         Ok(())
     }
