@@ -57,6 +57,248 @@ fn substituted_notation_arguments_cannot_be_captured_by_template_binders() {
     );
 }
 
+/// Run the same program through the native declaration door and, when
+/// supplied, the pinned executable. A capture's category does not determine
+/// whether its eventual syntax is a valid binder; use-site checking does.
+fn captured_binder_case(label: &str, source: &str, theorems: Option<usize>) {
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN")
+        .or_else(|| std::env::var_os("FLN_REFERENCE_BIN"))
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file());
+    if let Some(reference) = reference {
+        let path = std::env::temp_dir().join(format!(
+            "fln-captured-binder-{}-{label}.lean",
+            std::process::id()
+        ));
+        std::fs::write(&path, source).expect("reference source");
+        let output = std::process::Command::new(reference)
+            .arg("-j1")
+            .arg(&path)
+            .output()
+            .expect("run the pinned captured-binder probe");
+        assert_eq!(
+            output.status.code(),
+            Some(if theorems.is_some() { 0 } else { 1 }),
+            "pin {label}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    } else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "captured-binder source differential requires the pinned executable"
+        );
+        eprintln!("SKIP reference probe {label}: executable unavailable");
+    }
+
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let result = base.check_source_files(
+        &[source.as_bytes()],
+        &options,
+        SourceCheckLimits::new(limits()),
+    );
+    if let Some(theorems) = theorems {
+        let checked = result
+            .unwrap_or_else(|error| panic!("{label}: {source}\n{error:?}"))
+            .into_complete()
+            .expect("complete checked declarations");
+        assert_eq!(checked.theorems, theorems, "{label}");
+    } else {
+        let error = result.expect_err("invalid captured binder program must be refused");
+        assert!(
+            !matches!(
+                error.disposition().0,
+                "resource" | "inconclusive" | "internal-fault"
+            ),
+            "{label}: {error}"
+        );
+    }
+    assert_eq!(base.logical_root(&options), root, "{label}");
+}
+
+#[test]
+fn captured_binders_bind_caller_bodies_in_macros_and_notations() {
+    captured_binder_case(
+        "caller_bodies",
+        r#"
+macro "identityFn " x:ident : term => `(fun $x => $x)
+macro "bodyFn " x:ident " => " body:term : term => `(fun $x => $body)
+macro "termIdentity " x:term : term => `(fun $x => $x)
+notation "namedIdentity " x => fun x => x
+def identity : Nat → Nat := identityFn n
+def increment : Nat → Nat := bodyFn n => n + 1
+def termIdentityValue : Nat → Nat := termIdentity n
+def notationIdentity : Nat → Nat := namedIdentity n
+theorem direct : identity 7 = 7 := rfl
+theorem body : increment 7 = 8 := rfl
+theorem term_category : termIdentityValue 7 = 7 := rfl
+theorem notation_binder : notationIdentity 7 = 7 := rfl
+"#,
+        Some(4),
+    );
+}
+
+#[test]
+fn captured_binder_telescopes_preserve_dependencies_and_binder_kinds() {
+    captured_binder_case(
+        "dependent_telescopes",
+        r#"
+macro "polyIdentity " a:ident x:ident : term => `(fun ($a : Type) ($x : $a) => $x)
+macro "implicitIdentity " a:ident x:ident : term => `(fun {$a : Type} ($x : $a) => $x)
+macro "strictIdentity " a:ident x:ident : term => `(fun ⦃$a : Type⦄ ($x : $a) => $x)
+macro "identityType " a:ident x:ident : term => `(($a : Type) → ($x : $a) → $a)
+macro "allNamed " x:ident ":" t:term "," p:term : term => `(∀ ($x : $t), $p)
+def explicit : (A : Type) → A → A := polyIdentity A x
+def implicit : {A : Type} → A → A := implicitIdentity A x
+def strict : {A : Type} → A → A := strictIdentity A x
+def typed : identityType A x := fun A x => x
+theorem explicit_value : explicit Nat 7 = 7 := rfl
+theorem implicit_value : implicit 7 = 7 := rfl
+theorem strict_value : strict 7 = 7 := rfl
+theorem type_value : typed Nat 7 = 7 := rfl
+theorem named_proof : (allNamed n : Nat, n = n) := by intro n; rfl
+"#,
+        Some(5),
+    );
+    captured_binder_case(
+        "shared_domain",
+        r#"
+def T : Type 1 := Type
+macro "groupIdentity " a:ident x:ident : term => `(fun ($a $x : $a) => $x)
+def grouped : (A : Type) → A → A := groupIdentity T n
+theorem grouped_value : grouped Nat 7 = 7 := rfl
+"#,
+        Some(1),
+    );
+}
+
+#[test]
+fn captured_local_bindings_scope_after_the_initializer() {
+    captured_binder_case(
+        "local_bindings",
+        r#"
+def n : Nat := 5
+macro "bindLet " x:ident ":=" v:term ";" body:term : term => `(let $x := $v; $body)
+macro "bindHave " x:ident ":" t:term ":=" v:term ";" body:term : term => `(have $x : $t := $v; $body)
+theorem nonrecursive : (bindLet n := n + 1; n + 2) = 8 := rfl
+theorem nested : (bindLet n := 3; bindLet n := n + 1; n + 2) = 6 := rfl
+theorem sibling : (bindLet n := 3; n) + n = 8 := rfl
+theorem proof_binding (P : Prop) (proof : P) : P := bindHave h : P := proof; h
+"#,
+        Some(4),
+    );
+}
+
+#[test]
+fn captured_binders_keep_literal_names_and_repeated_scopes_hygienic() {
+    captured_binder_case(
+        "hygiene",
+        r#"
+namespace Definition
+def x : Nat := 99
+def x.succ : Nat := 101
+macro "globalFn " x:ident : term => `(fun $x : Nat => x)
+macro "literalFn " x:term : term => `(fun x : Nat => $x)
+macro "siblingValue " x:ident : term => `((fun $x : Nat => $x) x)
+macro "globalFieldFn " x:ident : term => `(fun $x : Nat => x.succ)
+macro "nestedFn " x:ident : term => `(fun $x : Nat => (fun $x : Nat => $x) $x)
+end Definition
+def x : Nat := 7
+theorem global_value : (globalFn x) 3 = 99 := rfl
+theorem caller_value (x : Nat) : (literalFn x) 3 = x := rfl
+theorem sibling_value : siblingValue x = 99 := rfl
+theorem global_field : (globalFieldFn x) 3 = 101 := rfl
+theorem repeated_binder : (nestedFn x) 3 = 3 := rfl
+theorem repeated_expansion : (nestedFn x) 3 + (nestedFn x) 4 = 7 := rfl
+"#,
+        Some(6),
+    );
+}
+
+#[test]
+fn captured_binders_do_not_bypass_syntax_type_or_proof_checking() {
+    for (label, source) in [
+        (
+            "non_binder_capture",
+            "macro \"identityFn \" x:term : term => `(fun $x => $x)\ndef invalid : Nat → Nat := identityFn (3 + 4)",
+        ),
+        (
+            "wrong_domain",
+            "macro \"typedFn \" x:ident : term => `(fun ($x : Bool) => $x)\ndef invalid : Nat → Nat := typedFn n",
+        ),
+        (
+            "escaped_capture",
+            "macro \"escapedFn \" x:ident : term => `((fun $x : Nat => $x) $x)\ndef invalid : Nat := escapedFn absent",
+        ),
+        (
+            "false_proof",
+            "macro \"allNamed \" x:ident \":\" t:term \",\" p:term : term => `(∀ ($x : $t), $p)\ntheorem invalid : (allNamed n : Nat, n = 0) := by intro n; rfl",
+        ),
+        (
+            "false_capture",
+            "def x : Nat := 99\nmacro \"globalFn \" x:ident : term => `(fun $x : Nat => x)\ntheorem invalid : (globalFn x) 3 = 3 := rfl",
+        ),
+    ] {
+        captured_binder_case(label, source, None);
+    }
+}
+
+#[test]
+fn captured_binder_macros_replay_from_modules_and_execute_on_golem() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let library_name = Name::from_components(["BinderLibrary"]);
+    let main_name = Name::from_components(["BinderMain"]);
+    let library = b"macro \"bodyFn \" x:ident \" => \" body:term : term => `(fun $x => $body)\n";
+    let main = b"import BinderLibrary\ndef answer : Nat := (bodyFn n => n + 1) 41\ntheorem checked : answer = 42 := rfl\n";
+    let checked = base
+        .check_source_modules(
+            &[
+                SourceModuleInput {
+                    name: &main_name,
+                    source: main,
+                },
+                SourceModuleInput {
+                    name: &library_name,
+                    source: library,
+                },
+            ],
+            &main_name,
+            &options,
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        )
+        .expect("captured binder macro survives native journal replay")
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked.checked.theorems, 1);
+    assert_eq!(checked.module_order, [library_name, main_name]);
+    let evaluated = checked
+        .checked
+        .engine
+        .execute_source_commands_with_checks(
+            b"#eval answer\n#eval (bodyFn n => n + 2) 40\n",
+            &options,
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(evaluated.batch.executions.len(), 2);
+    for execution in &evaluated.batch.executions {
+        let VmExit::Returned(value) = &execution.exit else {
+            panic!("the checked captured-binder program must return");
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+            Some("42")
+        );
+    }
+    assert_eq!(base.logical_root(&options), root);
+}
+
 /// A template's dotted name reading a field of a local the same template bound: `xs.succ`, with
 /// the template's scopes, is that `xs` and then `.succ` (the pin's `resolveLocalName`), also where
 /// the macro's argument is the caller's own `xs`.

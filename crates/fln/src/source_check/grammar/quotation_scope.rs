@@ -64,19 +64,21 @@ fn build(syntax: &Syntax) -> Result<Task<'_>, EngineExecutionError> {
     }
 }
 
-/// A literal identifier or `_`, not a pattern or an antiquoted binder. The
-/// latter needs quotation-pattern scope information, not a guessed local name.
+/// Literal identifiers enter the template's lexical scope. A captured binder
+/// is already caller syntax: substitution preserves its scopes along with any
+/// captured body, while the term elaborator checks the resulting binder shape.
+/// Do not make its placeholder a literal local; a template name with the same
+/// spelling must retain its own hygiene and declaration-site resolution.
 fn binder_name(
     syntax: &Syntax,
     rule: &NotationRule,
     names: &mut Vec<Name>,
 ) -> Result<(), EngineExecutionError> {
     match syntax {
-        Syntax::Ident { val, .. }
-            if !val.is_anonymous()
-                && !rule.variables.iter().any(|(_, variable)| variable == val) =>
-        {
-            names.push(val.clone());
+        Syntax::Ident { val, .. } if !val.is_anonymous() => {
+            if !rule.variables.iter().any(|(_, variable)| variable == val) {
+                names.push(val.clone());
+            }
             Ok(())
         }
         Syntax::Node { kind, args, .. }
@@ -1042,11 +1044,22 @@ mod tests {
     }
 
     #[test]
-    fn antiquoted_binder_names_are_not_guessed() {
+    fn captured_binders_are_preserved_without_becoming_literal_template_locals() {
         let rule = rule("notation \"bindFn\" x => fun x => x");
+        assert_eq!(
+            preresolve(&rule, &|_| panic!("captures need no global resolution")).unwrap(),
+            rule.rhs
+        );
+    }
+
+    #[test]
+    fn captured_binders_do_not_make_dotted_parameter_names_lexical() {
+        let rule = rule("notation \"bindFn\" x => fun x => x.succ");
         assert!(matches!(
             preresolve(&rule, &global),
-            Err(EngineExecutionError::NotImplemented { .. })
+            Err(EngineExecutionError::NotImplemented {
+                feature: "quotation field access through a bound name"
+            })
         ));
     }
 
