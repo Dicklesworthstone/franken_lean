@@ -22,8 +22,8 @@ fn module_macro_visibility_follows_public_and_private_import_forwarding() {
              def localOnly : Nat := 7 + 11"
         );
         let main = format!(
-            "prelude\nimport Lib\ndef observed : Nat := 7 + 11\n\
-             theorem checked : observed = {expected} := by rfl"
+            "module\nprelude\npublic import Lib\n@[expose] public def observed : Nat := 7 + 11\n\
+             public theorem checked : observed = {expected} := by rfl"
         );
         let report = check(
             &imported,
@@ -52,29 +52,52 @@ fn module_macro_visibility_follows_public_and_private_import_forwarding() {
         assert_eq!(states[&name("Lib")].macro_scope, 19);
         assert_eq!(states[&name("Main")].macro_scope, main_scope);
     }
+    let legacy_library = "module\nprelude\nimport SourceLibrary\ndef localOnly : Nat := 7 + 11";
+    let legacy_main = "prelude\nimport Lib\ndef observed : Nat := 7 + 11\ntheorem checked : observed = 11 := by rfl";
+    let legacy_report = check(
+        &imported,
+        &code,
+        &[("Main", legacy_main), ("Lib", legacy_library)],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let legacy_checked = succeeded(&legacy_report);
+    assert_declared_value(&legacy_checked.checked.engine, "observed", 11);
+    assert!(
+        !legacy_checked
+            .checked
+            .engine
+            .environment()
+            .contains(&name("localOnly"))
+    );
+    assert!(
+        legacy_checked
+            .checked
+            .engine
+            .environment()
+            .contains(&private("Lib", "localOnly"))
+    );
     assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
 }
 
 #[test]
 fn public_macro_definitions_export_expanded_values_and_only_checked_hidden_signatures() {
     let (imported, code) = batches::artifact_import_fixture();
+    let api = "module\nprelude\npublic import SourceLibrary\n\
+               def secret : Nat := 23\n\
+               @[expose] public def exposed : Nat := 7 + 11\n\
+               public def hiddenBody : Nat := False + secret";
     let report = check(
         &imported,
         &code,
         &[
             (
                 "Main",
-                "prelude\nimport Api\n\
-                 theorem exportedValue : exposed = 11 := by rfl\n\
-                 noncomputable def usesSignature : Nat := hiddenBody",
+                "module\nprelude\npublic import Api\n\
+                 public theorem exportedValue : exposed = 11 := by rfl\n\
+                 public noncomputable def usesSignature : Nat := hiddenBody",
             ),
-            (
-                "Api",
-                "module\nprelude\npublic import SourceLibrary\n\
-                 def secret : Nat := 23\n\
-                 @[expose] public def exposed : Nat := 7 + 11\n\
-                 public def hiddenBody : Nat := False + secret",
-            ),
+            ("Api", api),
         ],
         MacroTreeLimits::default(),
         None,
@@ -96,6 +119,27 @@ fn public_macro_definitions_export_expanded_values_and_only_checked_hidden_signa
         report.states.as_ref().unwrap()[&name("Api")].macro_scope,
         21
     );
+
+    let legacy = check(
+        &imported,
+        &code,
+        &[
+            (
+                "Main",
+                "prelude\nimport Api\ntheorem legacyHidden : hiddenBody = 23 := by rfl",
+            ),
+            ("Api", api),
+        ],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let legacy_env = succeeded(&legacy).checked.engine.environment();
+    assert!(matches!(
+        legacy_env.find(&name("hiddenBody")),
+        Some(ConstantInfo::Defn(_))
+    ));
+    assert!(legacy_env.contains(&private("Api", "secret")));
+    assert!(!legacy_env.contains(&name("secret")));
 }
 
 #[test]
@@ -163,22 +207,20 @@ fn expanded_public_bodies_signatures_and_false_proofs_cannot_publish_private_sta
 #[test]
 fn expanded_public_proof_instances_export_their_checked_interface_and_instance_journal() {
     let (imported, code) = batches::artifact_import_fixture();
+    let api = "module\nprelude\npublic import SourceLibrary\n\
+               public class Law (P : Prop) : Prop where\n  proof : P\n\
+               private theorem hidden : True := True.intro\n\
+               public instance lawful : Law (False + True) := Law.mk hidden";
     let report = check(
         &imported,
         &code,
         &[
             (
                 "Main",
-                "prelude\nimport Api\n\
-                 theorem proof : True := @Law.proof True (inferInstance : Law True)",
+                "module\nprelude\npublic import Api\n\
+                 public theorem proof : True := @Law.proof True (inferInstance : Law True)",
             ),
-            (
-                "Api",
-                "module\nprelude\npublic import SourceLibrary\n\
-                 public class Law (P : Prop) : Prop where\n  proof : P\n\
-                 private theorem hidden : True := True.intro\n\
-                 public instance lawful : Law (False + True) := Law.mk hidden",
-            ),
+            ("Api", api),
         ],
         MacroTreeLimits::default(),
         None,
@@ -199,6 +241,27 @@ fn expanded_public_proof_instances_export_their_checked_interface_and_instance_j
     };
     assert_eq!(instance.declaration, name("lawful"));
     assert_eq!(report.attempts.len(), 2);
+
+    let legacy = check(
+        &imported,
+        &code,
+        &[
+            (
+                "Main",
+                "prelude\nimport Api\n\
+                 theorem proof : True := @Law.proof True (inferInstance : Law True)",
+            ),
+            ("Api", api),
+        ],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let legacy_env = succeeded(&legacy).checked.engine.environment();
+    assert!(matches!(
+        legacy_env.find(&name("lawful")),
+        Some(ConstantInfo::Thm(_))
+    ));
+    assert!(legacy_env.contains(&private("Api", "hidden")));
 }
 
 fn equation_reference_function() -> IrDecl {
@@ -441,7 +504,10 @@ fn module_public_routing_uses_the_final_macro_generated_visibility_modifiers() {
         let report = check(
             &imported,
             &code,
-            &[("Main", "prelude\nimport Api"), ("Api", &source)],
+            &[
+                ("Main", "module\nprelude\npublic import Api"),
+                ("Api", &source),
+            ],
             MacroTreeLimits::default(),
             None,
         );
@@ -453,6 +519,16 @@ fn module_public_routing_uses_the_final_macro_generated_visibility_modifiers() {
             );
         } else {
             assert!(declaration.is_none());
+            let legacy = check(
+                &imported,
+                &code,
+                &[("Main", "prelude\nimport Api"), ("Api", &source)],
+                MacroTreeLimits::default(),
+                None,
+            );
+            let legacy_env = succeeded(&legacy).checked.engine.environment();
+            assert!(!legacy_env.contains(&name("shifted")));
+            assert!(legacy_env.contains(&private("Api", "shifted")));
         }
         assert!(
             !checked
@@ -510,7 +586,7 @@ end
         &[
             (
                 "Main",
-                "prelude\nimport Api\ntheorem publicWinner : shifted = 13 := by rfl",
+                "module\nprelude\npublic import Api\npublic theorem publicWinner : shifted = 13 := by rfl",
             ),
             ("Api", source),
         ],

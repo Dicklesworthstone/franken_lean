@@ -2255,7 +2255,7 @@ meta partial def replaceIdentSyntaxList (target : Name) (replacement : Syntax) :
   | .cons h t => .cons (replaceIdentSyntax target replacement h) (replaceIdentSyntaxList target replacement t)
 end
 
-syntax (name := hygTerm) "hygTerm%" ident ":" term : term
+syntax (name := hygTerm) "hygTerm%" ident ":" term "endHyg%" : term
 
 @[macro hygTerm]
 public meta def hygTermMacro : Macro := fun stx context state =>
@@ -2266,7 +2266,7 @@ public meta def hygTermMacro : Macro := fun stx context state =>
     | .error err next => .error err next
   | _ => .error .unsupportedSyntax state
 
-syntax (name := hygSplice) "hygSplice%" ident ":" term "=>" term : term
+syntax (name := hygSplice) "hygSplice%" ident ":" term "=>" term "endSplice%" : term
 
 @[macro hygSplice]
 public meta def hygSpliceMacro : Macro := fun stx context state =>
@@ -2301,13 +2301,14 @@ fn collect_hygienic_binders(
     use fln_core::name::Name;
     use fln_core::name::hygiene::extract_macro_scopes;
 
-    let internal = Name::from_components(["_internal"]);
+    let u_name = Name::from_components(["u"]);
+    let z_name = Name::from_components(["z"]);
     let mut record = |binder: &Name| {
         if let Ok(view) = extract_macro_scopes(binder)
             && !view.scopes.is_empty()
-            && view.context != internal
+            && (view.name == u_name || view.name == z_name)
         {
-            out.push((view.name, view.context));
+            out.push((view.name, view.imported.append_core(&view.context)));
         }
     };
     match expr.node() {
@@ -2399,30 +2400,30 @@ fn imported_macro_hygiene_matches_pinned_reference_quot_contexts_and_proves_coll
 import AdmittedSourceMacro
 
 -- leading trivia
-def first : Nat := (hygTerm% z : (fun z : Nat => z)) 10 -- trailing
+def first : Nat := (hygTerm% z : (fun z : Nat => z) endHyg%) 10 -- trailing
 
 namespace Sub
-def second : Nat := (hygTerm% z : (fun z : Nat => z)) 20
+def second : Nat := (hygTerm% z : (fun z : Nat => z) endHyg%) 20
 end Sub
 
-def Sub.dottedDef : Nat := (hygTerm% z : (fun z : Nat => z)) 25
+def Sub.dottedDef : Nat := (hygTerm% z : (fun z : Nat => z) endHyg%) 25
 
-private def privDef : Nat := (hygTerm% z : (fun z : Nat => z)) 35
+private def privDef : Nat := (hygTerm% z : (fun z : Nat => z) endHyg%) 35
 
 mutual
-  def mA : Nat := (hygTerm% z : (fun z : Nat => z)) mB
-  def mB : Nat := (hygTerm% z : (fun z : Nat => z)) 11
+  def mA : Nat := (hygTerm% z : (fun z : Nat => z) endHyg%) mB
+  def mB : Nat := (hygTerm% z : (fun z : Nat => z) endHyg%) 11
 end
 
 inductive MyInd : Type where
-  | mk : (x : Nat) → (h : Eq ((hygTerm% z : (fun z : Nat => z)) x) x) → MyInd
+  | mk : (x : Nat) → (h : Eq ((hygTerm% z : (fun z : Nat => z) endHyg%) x) x) → MyInd
 
 mutual
   inductive MutIndA : Type where
-    | mk : (x : Nat) → (h : Eq ((hygTerm% z : (fun z : Nat => z)) x) x) → MutIndA
+    | mk : (x : Nat) → (h : Eq ((hygTerm% z : (fun z : Nat => z) endHyg%) x) x) → MutIndA
     | step : MutIndB → MutIndA
   inductive MutIndB : Type where
-    | mk : (x : Nat) → (h : Eq ((hygTerm% z : (fun z : Nat => z)) x) x) → MutIndB
+    | mk : (x : Nat) → (h : Eq ((hygTerm% z : (fun z : Nat => z) endHyg%) x) x) → MutIndB
 end
 
 hygCmd% z : [def third : Nat := (fun z : Nat => z) 30]
@@ -2430,17 +2431,17 @@ hygCmd% z : [def third : Nat := (fun z : Nat => z) 30]
 open Sub in
 hygCmd% z : [def fromOpenIn : Nat := (fun z : Nat => z) second]
 
-hygCmd% u : [def fourth : Nat := (fun u : Nat => (hygTerm% z : (fun z : Nat => u)) 0) 4]
+hygCmd% u : [def fourth : Nat := (fun u : Nat => (hygTerm% z : (fun z : Nat => u) endHyg%) 0) 4]
 
 namespace DupA
-def dupName : Nat := (hygTerm% z : (fun z : Nat => z)) 5
+def dupName : Nat := (hygTerm% z : (fun z : Nat => z) endHyg%) 5
 end DupA
 
 namespace DupB
-def dupName : Nat := (hygTerm% z : (fun z : Nat => z)) 6
+def dupName : Nat := (hygTerm% z : (fun z : Nat => z) endHyg%) 6
 end DupB
 
-def nonCapture (z : Nat) : Nat := (hygSplice% z : (fun z : Nat => HOLE) => z) 99
+def nonCapture (z : Nat) : Nat := (hygSplice% z : (fun z : Nat => HOLE) => z endSplice%) 99
 
 theorem fourth_eq : Eq fourth 4 := Eq.refl fourth
 theorem nonCapture_eq (z : Nat) : Eq (nonCapture z) z := Eq.refl z

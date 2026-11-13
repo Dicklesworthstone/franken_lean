@@ -715,7 +715,7 @@ fn artifact_parser_follows_transitive_public_imports_and_private_forwarding_boun
         &[
             (
                 "Main",
-                "prelude\nimport Middle\ndef chosen : Nat := choose! 42\ntheorem inherited_ok : fromApi = 7 := by rfl",
+                "module\nprelude\npublic import Middle\n@[expose] public def chosen : Nat := choose! 42\npublic theorem inherited_ok : fromApi = 7 := by rfl",
             ),
             ("Middle", "module\nprelude\npublic import Api"),
             (
@@ -731,18 +731,17 @@ fn artifact_parser_follows_transitive_public_imports_and_private_forwarding_boun
     assert_declared_value(&checked.checked.engine, "fromApi", 7);
     assert_eq!(report.attempts.len(), 2);
 
+    let private_api =
+        "module\nprelude\nimport SourceLibrary\n@[expose] public def fromApi : Nat := choose! 7";
     let private = check(
         &imported,
         &code,
         &[
             (
                 "Main",
-                "prelude\nimport Api\ndef unavailable : Nat := choose! 42",
+                "module\nprelude\npublic import Api\npublic def unavailable : Nat := choose! 42",
             ),
-            (
-                "Api",
-                "module\nprelude\nimport SourceLibrary\n@[expose] public def fromApi : Nat := choose! 7",
-            ),
+            ("Api", private_api),
         ],
         MacroTreeLimits::default(),
         None,
@@ -757,6 +756,21 @@ fn artifact_parser_follows_transitive_public_imports_and_private_forwarding_boun
         "the private dependency remains usable inside Api"
     );
     assert!(private.states.is_none());
+
+    let legacy = check(
+        &imported,
+        &code,
+        &[
+            (
+                "Main",
+                "prelude\nimport Api\ndef legacyAvailable : Nat := choose! 42",
+            ),
+            ("Api", private_api),
+        ],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert_declared_value(&succeeded(&legacy).checked.engine, "legacyAvailable", 42);
     assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
 }
 
