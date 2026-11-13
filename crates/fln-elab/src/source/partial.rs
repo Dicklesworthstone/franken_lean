@@ -38,6 +38,12 @@ impl ElaboratedPartial {
         &self.irreducible
     }
 
+    /// Supported compilation failures suppressed by the enclosing section.
+    /// These remain candidate effects until the complete batch is admitted.
+    pub fn noncomputable(&self) -> &BTreeSet<Name> {
+        &self.noncomputable
+    }
+
     /// Record supported, section-suppressed compilation failures on the actual
     /// admitted executable declarations, never on a recursive logical witness.
     ///
@@ -236,9 +242,35 @@ pub fn elaborate(
 ) -> Result<ElaboratedPartial, NatDefinitionElabError> {
     validate(syntax)?;
     let scope = scope.for_declaration(syntax)?;
-    let mut context = Context::scoped(environment, kernel, &scope)?;
+    let context = Context::scoped(environment, kernel, &scope)?;
+    elaborate_in_context(syntax, context, environment, kernel)
+}
+
+/// Elaborate the public header before entering the private recursive body.
+/// The result still requires atomic admission of both the logical inhabitant
+/// and executable companion; it grants no public signature authority.
+pub fn elaborate_public(
+    syntax: &Syntax,
+    worlds: &TheoremWorlds<'_>,
+    kernel: Budget,
+) -> Result<ElaboratedPartial, NatDefinitionElabError> {
+    validate(syntax)?;
+    let context = Context::public_definition(syntax, worlds, kernel)?;
+    elaborate_in_context(syntax, context, worlds.private, kernel)
+}
+
+fn elaborate_in_context(
+    syntax: &Syntax,
+    mut context: Context,
+    inhabitant_environment: &Environment,
+    kernel: Budget,
+) -> Result<ElaboratedPartial, NatDefinitionElabError> {
     context.partial = Some(State::default());
     let candidate = definition_in_context(syntax, &mut context)?;
+    // A public header has now entered its private body world. Inhabitant
+    // synthesis must use that world's instance and reducibility history while
+    // retaining the declaration's already fixed public name and signature.
+    let scope = context.source_scope.clone();
     let Declaration::Mutual(ref definitions) = candidate else {
         // The pin uses its nonrecursive path when no self-reference survives.
         let mut noncomputable = BTreeSet::new();
@@ -271,7 +303,7 @@ pub fn elaborate(
         .and_then(|state| state.reference.as_ref())
         .ok_or_else(|| failure(SourceInferenceError::Scope))?;
     let name = reference.name.clone();
-    let mut inhabitant_context = Context::scoped(environment, kernel, &scope)?;
+    let mut inhabitant_context = Context::scoped(inhabitant_environment, kernel, &scope)?;
     inhabitant_context.level_params = implementation.base.level_params.clone();
     // Both phases consume the same declaration budget, not independent fresh
     // allowances. The companion's original body is checked at batch admission.
