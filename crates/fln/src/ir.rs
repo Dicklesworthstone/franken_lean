@@ -1344,7 +1344,7 @@ fn source_boolean_case<'a>(
     Ok(Some([condition, no, yes]))
 }
 
-fn source_parameter_uses(
+fn simple_source_parameter_uses(
     value: &fln_core::expr::Expr,
     arity: usize,
     meter: &mut Budget,
@@ -1497,6 +1497,519 @@ fn source_parameter_uses(
     Ok(used)
 }
 
+struct SourceUse {
+    parameters: Vec<bool>,
+    discardable: bool,
+}
+
+struct SourceUseBinding {
+    parameter: bool,
+    value: SourceUse,
+}
+
+/// The pin folds addition/append constants and neutral elements, but neither
+/// operation can erase a dynamic operand. This smaller analysis follows that
+/// exact dependency law through lets. Other named calls retain their refusal:
+/// e.g. `Nat.mul x 0` may erase x before the pin chooses its `_redArg` entry.
+struct SourceUses<'a, 'b> {
+    environment: &'a crate::Environment,
+    arity: usize,
+    ingress: fln_comp::ingress::IngressLimits,
+    meter: &'b mut Budget,
+    externs: Option<fln_elab::externs::ExternTable>,
+    replacements: Option<fln_elab::implemented_by::ImplementedByTable>,
+    natives: std::collections::BTreeSet<Name>,
+}
+
+impl SourceUses<'_, '_> {
+    fn empty(&mut self, discardable: bool) -> Result<SourceUse> {
+        self.meter.charge(self.arity)?;
+        let mut parameters = Vec::new();
+        parameters
+            .try_reserve_exact(self.arity)
+            .map_err(|_| CompileError::Allocation)?;
+        parameters.resize(self.arity, false);
+        Ok(SourceUse {
+            parameters,
+            discardable,
+        })
+    }
+
+    fn merge(&mut self, into: &mut SourceUse, other: &SourceUse) -> Result<()> {
+        self.meter.charge(self.arity)?;
+        for (left, right) in into.parameters.iter_mut().zip(&other.parameters) {
+            *left |= right;
+        }
+        into.discardable &= other.discardable;
+        Ok(())
+    }
+
+    fn expression_work(&mut self, expression: &fln_core::expr::Expr) -> Result<()> {
+        use fln_core::expr::ExprNode;
+        let mut pending = vec![expression];
+        while let Some(expression) = pending.pop() {
+            self.meter.charge(1)?;
+            pending
+                .try_reserve(3)
+                .map_err(|_| CompileError::Allocation)?;
+            match expression.node() {
+                ExprNode::App { f, a } => pending.extend([f, a]),
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => pending.extend([binder_type, body]),
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => pending.extend([type_, value, body]),
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => pending.push(expr),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn ingress_error(error: fln_comp::ingress::IngressError) -> CompileError {
+        if error.is_resource_exhaustion() {
+            CompileError::Limit
+        } else {
+            unsupported("unproved source operation contract")
+        }
+    }
+
+    fn metadata(&mut self) -> Result<()> {
+        if self.replacements.is_none() {
+            use fln_elab::implemented_by::{ImplementedByError, ImplementedByReadError};
+            self.replacements = Some(
+                fln_elab::implemented_by::ImplementedByTable::read_metered(
+                    self.environment,
+                    |work| self.meter.charge(work),
+                )
+                .map_err(|error| match error {
+                    ImplementedByReadError::Budget(error) => error,
+                    ImplementedByReadError::Registry(ImplementedByError::Limit) => {
+                        CompileError::Limit
+                    }
+                    _ => unsupported("invalid source executable replacement metadata"),
+                })?,
+            );
+        }
+        let mut visited = 0;
+        let mut limits = self.ingress;
+        limits.max_nodes = limits
+            .max_nodes
+            .min(usize::try_from(self.meter.0).unwrap_or(usize::MAX));
+        let result = crate::source_intrinsics::read_extern_attributes(
+            self.environment,
+            &mut self.externs,
+            &mut visited,
+            limits,
+        );
+        self.meter.charge(visited)?;
+        result.map_err(Self::ingress_error)
+    }
+
+    fn native(&mut self, name: &Name) -> Result<()> {
+        if self.natives.contains(name) {
+            return self.meter.charge(1);
+        }
+        self.metadata()?;
+        if self.replacements.as_ref().unwrap().get(name).is_some() {
+            return Err(unsupported(
+                "source operation with an executable replacement",
+            ));
+        }
+        let mut visited = 0;
+        let mut limits = self.ingress;
+        limits.max_nodes = limits
+            .max_nodes
+            .min(usize::try_from(self.meter.0).unwrap_or(usize::MAX));
+        let result = crate::executable_intrinsic_binding_cached(
+            self.environment,
+            name,
+            &mut visited,
+            limits,
+            &mut self.externs,
+        );
+        self.meter.charge(visited)?;
+        if result.map_err(Self::ingress_error)?.is_none() {
+            return Err(unsupported("unproved source operation contract"));
+        }
+        self.natives.insert(name.clone());
+        Ok(())
+    }
+
+    fn primitive(name: &Name) -> bool {
+        name == &Name::from_components(["Nat", "add"])
+            || name == &Name::from_components(["String", "append"])
+    }
+
+    fn dictionary_name(name: &Name) -> bool {
+        [
+            "HAdd.hAdd",
+            "Add.add",
+            "instHAdd",
+            "instAddNat",
+            "HAppend.hAppend",
+            "Append.append",
+            "instHAppendOfAppend",
+            "instAppendString",
+        ]
+        .iter()
+        .any(|label| name == &Name::from_components(label.split('.')))
+    }
+
+    /// Resolve only the closed dictionary spine, with symbolic runtime operands.
+    /// Actual checked bodies select the field; names alone authorize nothing.
+    /// Universes occur only in its erased type arguments and are not rewritten
+    /// into a source or runtime product. Externs/replacements on any unfolded
+    /// dictionary refuse, even when its logical body looks like the usual one.
+    fn dictionary(
+        &mut self,
+        mut expression: fln_core::expr::Expr,
+        depth: usize,
+    ) -> Result<fln_core::expr::Expr> {
+        use fln_core::expr::{Expr, ExprNode};
+        use fln_env::constants::{ConstantInfo, DefinitionSafety};
+        if depth >= 128 {
+            return Err(CompileError::Limit);
+        }
+        loop {
+            self.meter.charge(1)?;
+            let mut head = source_without_metadata(&expression, self.meter)?.clone();
+            let mut arguments = Vec::new();
+            while let ExprNode::App { f, a } = head.node() {
+                self.meter.charge(1)?;
+                arguments
+                    .try_reserve(1)
+                    .map_err(|_| CompileError::Allocation)?;
+                arguments.push(a.clone());
+                head = source_without_metadata(f, self.meter)?.clone();
+            }
+            arguments.reverse();
+            let next = match head.node() {
+                ExprNode::Const { name, .. } if Self::primitive(name) => return Ok(expression),
+                ExprNode::Const { name, .. }
+                    if matches!(self.environment.find(name), Some(ConstantInfo::Ctor(_))) =>
+                {
+                    self.metadata()?;
+                    if self.externs.as_ref().unwrap().get(name).is_some()
+                        || self.replacements.as_ref().unwrap().get(name).is_some()
+                    {
+                        return Err(unsupported("source operator dictionary replacement"));
+                    }
+                    return Ok(expression);
+                }
+                ExprNode::Const { name, levels } if Self::dictionary_name(name) => {
+                    self.metadata()?;
+                    if self.externs.as_ref().unwrap().get(name).is_some()
+                        || self.replacements.as_ref().unwrap().get(name).is_some()
+                    {
+                        return Err(unsupported("source operator dictionary replacement"));
+                    }
+                    let Some(ConstantInfo::Defn(definition)) = self.environment.find(name) else {
+                        return Err(unsupported("source operator dictionary definition"));
+                    };
+                    if definition.safety != DefinitionSafety::Safe
+                        || definition.base.level_params.len() != levels.len()
+                    {
+                        return Err(unsupported("source operator dictionary definition"));
+                    }
+                    self.expression_work(&definition.value)?;
+                    definition.value.clone()
+                }
+                ExprNode::Lam { body, .. } if !arguments.is_empty() => {
+                    self.expression_work(body)?;
+                    let argument = arguments.remove(0);
+                    body.subst_loose(0, &[argument])
+                        .map_err(|_| CompileError::Limit)?
+                }
+                ExprNode::LetE { value, body, .. } => {
+                    self.expression_work(body)?;
+                    self.expression_work(value)?;
+                    body.subst_loose(0, std::slice::from_ref(value))
+                        .map_err(|_| CompileError::Limit)?
+                }
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => {
+                    let constructor = self.dictionary(expr.clone(), depth + 1)?;
+                    let mut head = source_without_metadata(&constructor, self.meter)?;
+                    let mut fields = Vec::new();
+                    while let ExprNode::App { f, a } = head.node() {
+                        self.meter.charge(1)?;
+                        fields
+                            .try_reserve(1)
+                            .map_err(|_| CompileError::Allocation)?;
+                        fields.push(a);
+                        head = source_without_metadata(f, self.meter)?;
+                    }
+                    let ExprNode::Const { name, .. } = head.node() else {
+                        return Err(unsupported("source operator dictionary constructor"));
+                    };
+                    let Some(ConstantInfo::Ctor(info)) = self.environment.find(name) else {
+                        return Err(unsupported("source operator dictionary constructor"));
+                    };
+                    if &info.induct != struct_name
+                        || *idx >= u64::from(info.num_fields)
+                        || fields.len() as u64
+                            != u64::from(info.num_params) + u64::from(info.num_fields)
+                    {
+                        return Err(unsupported("source operator dictionary projection"));
+                    }
+                    fields[fields.len() - 1 - (u64::from(info.num_params) + idx) as usize].clone()
+                }
+                _ => return Err(unsupported("source operator dictionary")),
+            };
+            expression = arguments.into_iter().fold(next, Expr::app);
+        }
+    }
+
+    fn binary_arguments<'e>(
+        &mut self,
+        expression: &'e fln_core::expr::Expr,
+    ) -> Result<Option<[&'e fln_core::expr::Expr; 2]>> {
+        use fln_core::expr::{Expr, ExprNode, FVarId};
+        if let Some((head, arguments)) = source_spine::<2>(expression, self.meter)?
+            && let ExprNode::Const { name, levels } = head.node()
+            && levels.is_empty()
+            && Self::primitive(name)
+        {
+            self.native(name)?;
+            return Ok(Some(arguments));
+        }
+        let Some((head, [a, b, result, dictionary, left, right])) =
+            source_spine::<6>(expression, self.meter)?
+        else {
+            return Ok(None);
+        };
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let primitive = if name == &Name::from_components(["HAdd", "hAdd"]) {
+            Name::from_components(["Nat", "add"])
+        } else if name == &Name::from_components(["HAppend", "hAppend"]) {
+            Name::from_components(["String", "append"])
+        } else {
+            return Ok(None);
+        };
+        let carrier = if primitive == Name::from_components(["Nat", "add"]) {
+            Name::from_components(["Nat"])
+        } else {
+            Name::from_components(["String"])
+        };
+        if levels.len() != 3
+            || [a, b, result].iter().any(|ty| {
+                !matches!(ty.node(), ExprNode::Const { name, levels }
+                    if name == &carrier && levels.is_empty())
+            })
+            || dictionary.has_loose_bvars()
+            || dictionary.has_fvar()
+        {
+            return Err(unsupported("source operator dictionary arguments"));
+        }
+        let x = Expr::fvar(FVarId(Name::from_components(["_fln_ir_source_left"])));
+        let y = Expr::fvar(FVarId(Name::from_components(["_fln_ir_source_right"])));
+        let application = [a, b, result, dictionary]
+            .into_iter()
+            .cloned()
+            .chain([x.clone(), y.clone()])
+            .fold(head.clone(), Expr::app);
+        let resolved = self.dictionary(application, 0)?;
+        let Some((head, [actual_left, actual_right])) = source_spine::<2>(&resolved, self.meter)?
+        else {
+            return Err(unsupported("source operator dictionary result"));
+        };
+        if !matches!(head.node(), ExprNode::Const { name, levels }
+            if name == &primitive && levels.is_empty())
+            || actual_left != &x
+            || actual_right != &y
+        {
+            return Err(unsupported("source operator dictionary result"));
+        }
+        self.native(&primitive)?;
+        Ok(Some([left, right]))
+    }
+
+    fn value(
+        &mut self,
+        expression: &fln_core::expr::Expr,
+        locals: &mut Vec<SourceUseBinding>,
+        depth: usize,
+    ) -> Result<SourceUse> {
+        use fln_core::expr::ExprNode;
+        if depth >= 128 {
+            return Err(CompileError::Limit);
+        }
+        self.meter.charge(1)?;
+        if !expression.has_loose_bvars() {
+            self.expression_work(expression)?;
+            return self.empty(false);
+        }
+        let expression = source_without_metadata(expression, self.meter)?;
+        match expression.node() {
+            ExprNode::BVar { idx } => {
+                let index = locals
+                    .len()
+                    .checked_sub(*idx as usize + 1)
+                    .ok_or_else(|| unsupported("open source export"))?;
+                let mut used = self.empty(true)?;
+                self.merge(&mut used, &locals[index].value)?;
+                // Reading a let-bound value does not run its initializer again.
+                used.discardable = true;
+                Ok(used)
+            }
+            ExprNode::App { .. } => {
+                if let Some(arguments) = self.binary_arguments(expression)? {
+                    let mut used = self.empty(true)?;
+                    let mut discardable = true;
+                    for argument in arguments {
+                        let argument = self.value(argument, locals, depth + 1)?;
+                        discardable &=
+                            argument.discardable || !argument.parameters.iter().any(|used| *used);
+                        self.merge(&mut used, &argument)?;
+                    }
+                    // Closed subexpressions carry no parameter dependencies;
+                    // their effects cannot change which source slots are used.
+                    used.discardable = discardable;
+                    return Ok(used);
+                }
+                let mut head = expression;
+                let mut arguments = Vec::new();
+                while let ExprNode::App { f, a } = head.node() {
+                    self.meter.charge(1)?;
+                    arguments
+                        .try_reserve(1)
+                        .map_err(|_| CompileError::Allocation)?;
+                    arguments.push(a);
+                    head = source_without_metadata(f, self.meter)?;
+                }
+                let ExprNode::BVar { idx } = head.node() else {
+                    return Err(unsupported("specializable source call"));
+                };
+                let index = locals
+                    .len()
+                    .checked_sub(*idx as usize + 1)
+                    .ok_or_else(|| unsupported("open source call"))?;
+                if !locals[index].parameter {
+                    return Err(unsupported("local source call"));
+                }
+                let mut used = self.value(head, locals, depth + 1)?;
+                for argument in arguments {
+                    let argument = self.value(argument, locals, depth + 1)?;
+                    self.merge(&mut used, &argument)?;
+                }
+                used.discardable = false;
+                Ok(used)
+            }
+            ExprNode::LetE { value, body, .. } => {
+                self.push_let(value, locals, depth)?;
+                let result = self.value(body, locals, depth + 1);
+                locals.pop();
+                result
+            }
+            ExprNode::Lam { body, .. } => {
+                let value = self.empty(true)?;
+                locals
+                    .try_reserve(1)
+                    .map_err(|_| CompileError::Allocation)?;
+                locals.push(SourceUseBinding {
+                    parameter: false,
+                    value,
+                });
+                let result = self.value(body, locals, depth + 1);
+                locals.pop();
+                result.map(|mut used| {
+                    used.discardable = true;
+                    used
+                })
+            }
+            _ => Err(unsupported("source reduction expression")),
+        }
+    }
+
+    fn push_let(
+        &mut self,
+        value: &fln_core::expr::Expr,
+        locals: &mut Vec<SourceUseBinding>,
+        depth: usize,
+    ) -> Result<()> {
+        let value = self.value(value, locals, depth + 1)?;
+        if !value.discardable && value.parameters.iter().any(|used| *used) {
+            return Err(unsupported("parameter-dependent source initializer"));
+        }
+        locals
+            .try_reserve(1)
+            .map_err(|_| CompileError::Allocation)?;
+        locals.push(SourceUseBinding {
+            parameter: false,
+            value,
+        });
+        Ok(())
+    }
+
+    fn parameters(&mut self, value: &fln_core::expr::Expr) -> Result<Vec<bool>> {
+        use fln_core::expr::ExprNode;
+        let mut body = value;
+        let mut count = 0;
+        let mut locals = Vec::new();
+        while count < self.arity {
+            self.meter.charge(1)?;
+            match body.node() {
+                ExprNode::Lam { body: next, .. } => {
+                    let mut value = self.empty(true)?;
+                    value.parameters[count] = true;
+                    locals
+                        .try_reserve(1)
+                        .map_err(|_| CompileError::Allocation)?;
+                    locals.push(SourceUseBinding {
+                        parameter: true,
+                        value,
+                    });
+                    count += 1;
+                    body = next;
+                }
+                ExprNode::LetE {
+                    value, body: next, ..
+                } => {
+                    self.push_let(value, &mut locals, 0)?;
+                    body = next;
+                }
+                ExprNode::MData { expr, .. } => body = expr,
+                _ => return Err(unsupported("source export lambda telescope")),
+            }
+        }
+        Ok(self.value(body, &mut locals, 0)?.parameters)
+    }
+}
+
+fn source_parameter_uses(
+    value: &fln_core::expr::Expr,
+    arity: usize,
+    environment: &crate::Environment,
+    ingress: fln_comp::ingress::IngressLimits,
+    meter: &mut Budget,
+) -> Result<Vec<bool>> {
+    match simple_source_parameter_uses(value, arity, meter) {
+        Err(CompileError::Unsupported {
+            what: "specializable source call" | "parameter-dependent source initializer",
+        }) => SourceUses {
+            environment,
+            arity,
+            ingress,
+            meter,
+            externs: None,
+            replacements: None,
+            natives: std::collections::BTreeSet::new(),
+        }
+        .parameters(value),
+        result => result,
+    }
+}
+
 // Walk source types before erasure. In particular, a proof/type argument must
 // not disappear and silently change the exported source calling convention.
 fn source_carrier(ty: &fln_core::expr::Expr, meter: &mut Budget) -> Result<IrType> {
@@ -1542,6 +2055,8 @@ fn source_carrier(ty: &fln_core::expr::Expr, meter: &mut Budget) -> Result<IrTyp
 fn source_signature(
     definition: &fln_env::constants::DefinitionVal,
     erasures: &[bool],
+    environment: &crate::Environment,
+    ingress: fln_comp::ingress::IngressLimits,
     meter: &mut Budget,
 ) -> Result<SourceSignature> {
     use fln_core::expr::ExprNode;
@@ -1590,7 +2105,8 @@ fn source_signature(
         return Err(invariant("source erasure arity"));
     }
     let reduced = if !params.is_empty() {
-        let mut used = source_parameter_uses(&definition.value, params.len(), meter)?;
+        let mut used =
+            source_parameter_uses(&definition.value, params.len(), environment, ingress, meter)?;
         for (used, erased) in used.iter_mut().zip(erasures) {
             *used &= !erased;
         }
@@ -1851,8 +2367,10 @@ pub fn compile_definition(
 /// arguments), using owned object parameters. Source type/proof slots are
 /// classified in their original telescope and retained as erased parameters.
 /// A runtime carrier depending on a source type parameter remains unsupported.
-/// Source arrows require an explicit lambda telescope; multiple arguments also
-/// require closed let initializers and calls through source parameters. Ambiguous reductions and
+/// Source arrows require an explicit lambda telescope. Multiple arguments allow
+/// opaque calls through source parameters and checked Nat.add/String.append
+/// expressions, including their ordinary notation and dependency-preserving
+/// let bindings. Other specializable calls, ambiguous Boolean reductions and
 /// unused higher-order arguments refuse instead of guessing a `_redArg` ABI.
 /// The source signature is projected from the same declaration submitted
 /// unchanged to both checkers; success requires their admission and complete
@@ -1993,8 +2511,14 @@ pub(crate) fn compile_checked_source_definition(
             DefinitionCompileError::Engine(crate::EngineExecutionError::Ingress(error))
         })?;
     meter.charge(work).map_err(DefinitionCompileError::Ir)?;
-    let signature =
-        source_signature(&definition, &erasures, &mut meter).map_err(DefinitionCompileError::Ir)?;
+    let signature = source_signature(
+        &definition,
+        &erasures,
+        engine.environment(),
+        ingress,
+        &mut meter,
+    )
+    .map_err(DefinitionCompileError::Ir)?;
     let mut alias = definition.into_owned();
     let alias_root = Name::str(name.clone(), "_fln_compile");
     let mut ordinal = 0_u64;
@@ -2064,8 +2588,14 @@ fn compile_definition_impl(
                 })?;
             meter.charge(work).map_err(DefinitionCompileError::Ir)?;
             Some(
-                source_signature(definition, &erasures, &mut meter)
-                    .map_err(DefinitionCompileError::Ir)?,
+                source_signature(
+                    definition,
+                    &erasures,
+                    engine.environment(),
+                    ingress,
+                    &mut meter,
+                )
+                .map_err(DefinitionCompileError::Ir)?,
             )
         }
         _ => None,

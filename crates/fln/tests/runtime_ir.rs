@@ -807,7 +807,6 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
         "def compiled : Nat -> Type := fun _ => Nat",
         "def compiled : (Nat -> Nat) -> Nat -> Nat := invoke",
         "def compiled (x y : Nat) : Nat := keep x",
-        "def compiled (x y : Nat) : Nat := let saved := x; saved",
         "def compiled (f : Nat -> Nat) (x : Nat) : Nat := x",
         "def compiled (p : IRTextPair) : String := p.right",
         "def compiled (s : String) : IRTextPair := IRTextPair.mk s s",
@@ -875,6 +874,295 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
         Err(ir::DefinitionCompileError::Engine(_))
     ));
     assert_eq!(base.logical_root(&options), original);
+}
+
+struct NativeCallExportCase {
+    ty: &'static str,
+    expression: &'static str,
+    application: &'static str,
+    partial: &'static str,
+    result_type: &'static str,
+    expected: &'static str,
+    reduced: Option<(&'static str, &'static str)>,
+}
+
+fn native_call_export_cases() -> Vec<NativeCallExportCase> {
+    vec![
+        NativeCallExportCase {
+            ty: "Nat -> Nat -> Nat",
+            expression: "fun x y => Nat.add x y",
+            application: "compiled 17 25",
+            partial: "let f := compiled 17; f 25",
+            result_type: "Nat",
+            expected: "42",
+            reduced: None,
+        },
+        NativeCallExportCase {
+            ty: "Nat -> Nat -> Nat",
+            expression: "fun x y => x + y",
+            application: "compiled 184467440737095516160 25",
+            partial: "let f := compiled 184467440737095516160; f 25",
+            result_type: "Nat",
+            expected: "184467440737095516185",
+            reduced: None,
+        },
+        NativeCallExportCase {
+            ty: "Nat -> Nat -> Nat",
+            expression: "fun x y => let saved := x + 2; saved + y",
+            application: "compiled 19 21",
+            partial: "let f := compiled 19; f 21",
+            result_type: "Nat",
+            expected: "42",
+            reduced: None,
+        },
+        NativeCallExportCase {
+            ty: "Nat -> Nat -> Nat",
+            expression: "fun x y => let saved := x; saved",
+            application: "compiled 42 99",
+            partial: "let f := compiled 42; f 99",
+            result_type: "Nat",
+            expected: "42",
+            reduced: Some(("Nat -> Nat", "compiled 42")),
+        },
+        NativeCallExportCase {
+            ty: "Nat -> Nat -> Nat",
+            expression: "fun x => let saved := x + 2; fun _ => saved",
+            application: "compiled 40 99",
+            partial: "let f := compiled 40; f 99",
+            result_type: "Nat",
+            expected: "42",
+            reduced: Some(("Nat -> Nat", "compiled 40")),
+        },
+        NativeCallExportCase {
+            ty: "Nat -> Nat -> Nat",
+            expression: "fun x y => let unused := Nat.add x 5; y",
+            application: "compiled 99 42",
+            partial: "let f := compiled 99; f 42",
+            result_type: "Nat",
+            expected: "42",
+            reduced: Some(("Nat -> Nat", "compiled 42")),
+        },
+        NativeCallExportCase {
+            ty: "Nat -> Nat -> Nat",
+            expression: "fun x y => let unused := Nat.add x y; 42",
+            application: "compiled 99 7",
+            partial: "let f := compiled 99; f 7",
+            result_type: "Nat",
+            expected: "42",
+            reduced: None,
+        },
+        NativeCallExportCase {
+            ty: "Nat -> Nat -> Nat",
+            expression: "fun x y => let saved := x; let x := y; Nat.add saved x",
+            application: "compiled 17 25",
+            partial: "let f := compiled 17; f 25",
+            result_type: "Nat",
+            expected: "42",
+            reduced: None,
+        },
+        NativeCallExportCase {
+            ty: "Nat -> Nat -> Nat",
+            expression: "fun x _ => Nat.add (Nat.add x 0) (Nat.add 1 1)",
+            application: "compiled 40 99",
+            partial: "let f := compiled 40; f 99",
+            result_type: "Nat",
+            expected: "42",
+            reduced: Some(("Nat -> Nat", "compiled 40")),
+        },
+        NativeCallExportCase {
+            ty: "String -> String -> String",
+            expression: "fun x y => String.append x y",
+            application: "compiled \"left \" \"right\"",
+            partial: "let f := compiled \"left \"; f \"right\"",
+            result_type: "String",
+            expected: "\"left right\"",
+            reduced: None,
+        },
+        NativeCallExportCase {
+            ty: "String -> String -> String",
+            expression: "fun x y => let saved := x ++ \"λ\"; saved ++ y",
+            application: "compiled \"α\" \"β\"",
+            partial: "let f := compiled \"α\"; f \"β\"",
+            result_type: "String",
+            expected: "\"αλβ\"",
+            reduced: None,
+        },
+        NativeCallExportCase {
+            ty: "String -> String -> String",
+            expression: "fun x y => let unused := String.append x \"?\"; String.append y \"!\"",
+            application: "compiled \"unused\" \"answer\"",
+            partial: "let f := compiled \"unused\"; f \"answer\"",
+            result_type: "String",
+            expected: "\"answer!\"",
+            reduced: Some(("String -> String", "compiled \"answer\"")),
+        },
+    ]
+}
+
+#[test]
+fn source_exports_track_native_call_and_let_dependencies() {
+    let base = base();
+    let options = KVMap::new();
+    let original = base.logical_root(&options);
+    let mut no_execution = limits();
+    no_execution.vm.max_steps = 0;
+    for case in native_call_export_cases() {
+        let source = format!("def compiled : {} := {}", case.ty, case.expression);
+        let (declaration, checked) = checked_definition(&base, &source);
+        let compiled = ir::compile_source_definition(
+            &base,
+            declaration.clone(),
+            &options,
+            no_execution,
+            CompileLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+        .into_complete()
+        .unwrap();
+        assert_eq!(
+            compiled
+                .module
+                .decls
+                .iter()
+                .any(|decl| decl.name() == &name("compiled._redArg")),
+            case.reduced.is_some(),
+            "{source}",
+        );
+        for application in [case.application, case.partial] {
+            let source = format!("def result : {} := {application}", case.result_type);
+            let run = checked
+                .execute_source_definitions(&[source.as_bytes()], &options, limits())
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+                .into_complete()
+                .unwrap();
+            let VmExit::Returned(value) = &run.executions[0].exit else {
+                panic!("native source application")
+            };
+            if case.result_type == "Nat" {
+                assert_eq!(
+                    fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+                    Some(case.expected)
+                );
+            } else {
+                let string = value.value.try_string_view().unwrap();
+                assert_eq!(
+                    &string.3[..string.0 - 1],
+                    case.expected.trim_matches('"').as_bytes()
+                );
+            }
+        }
+        let bounded = ir::compile_source_definition(
+            &base,
+            declaration,
+            &options,
+            no_execution,
+            CompileLimits {
+                max_work: 100,
+                ..CompileLimits::default()
+            },
+        );
+        assert!(
+            match bounded {
+                Err(ir::DefinitionCompileError::Ir(ir::CompileError::Limit)) => true,
+                Err(ir::DefinitionCompileError::Engine(fln::EngineExecutionError::Ingress(
+                    error,
+                ))) => error.is_resource_exhaustion(),
+                _ => false,
+            },
+            "compiler exhaustion must stay a resource result: {source}"
+        );
+        assert_eq!(base.logical_root(&options), original);
+    }
+    for source in [
+        "def compiled (x y : Nat) : Nat := Nat.add (Nat.mul x 0) y",
+        "def compiled (x y : Nat) : Nat := let saved := Nat.sub 0 x; Nat.add saved y",
+        "def compiled (f : Nat -> Nat) (x y : Nat) : Nat := let unused := Nat.add (f x) y; y",
+        "def compiled (x y : Nat) : Nat := let f := fun _ : Nat => x; f y",
+    ] {
+        let (declaration, _) = checked_definition(&base, source);
+        assert!(
+            matches!(
+                ir::compile_source_definition(
+                    &base,
+                    declaration,
+                    &options,
+                    no_execution,
+                    CompileLimits::default()
+                ),
+                Err(ir::DefinitionCompileError::Ir(
+                    ir::CompileError::Unsupported { .. }
+                ))
+            ),
+            "unmodeled simplification must not choose an ABI: {source}"
+        );
+    }
+}
+
+#[test]
+fn source_call_dependencies_do_not_trust_replaced_primitives_or_dictionaries() {
+    use fln_elab::externs::{ExternEntry, register};
+    let base = base();
+    let options = KVMap::new();
+    for (target, body, ty) in [
+        ("Nat.add", "Nat.add x y", "Nat"),
+        ("HAdd.hAdd", "x + y", "Nat"),
+        ("instHAdd", "x + y", "Nat"),
+        ("instAddNat", "x + y", "Nat"),
+        ("HAdd.mk", "x + y", "Nat"),
+        ("Add.mk", "x + y", "Nat"),
+        ("String.append", "String.append x y", "String"),
+        ("HAppend.hAppend", "x ++ y", "String"),
+        ("instHAppendOfAppend", "x ++ y", "String"),
+        ("instAppendString", "x ++ y", "String"),
+        ("HAppend.mk", "x ++ y", "String"),
+        ("Append.mk", "x ++ y", "String"),
+    ] {
+        let environment = register(
+            base.environment(),
+            &name(target),
+            vec![ExternEntry::Standard {
+                backend: name("all"),
+                symbol: "unreviewed_source_operation".into(),
+            }],
+        )
+        .unwrap();
+        let changed = Engine::from_environment(environment);
+        let source = format!("def compiled (x y : {ty}) : {ty} := {body}");
+        let (declaration, _) = checked_definition(&changed, &source);
+        assert!(
+            matches!(
+                ir::compile_source_definition(
+                    &changed,
+                    declaration,
+                    &options,
+                    limits(),
+                    CompileLimits::default()
+                ),
+                Err(ir::DefinitionCompileError::Ir(
+                    ir::CompileError::Unsupported { .. }
+                ))
+            ),
+            "an explicit extern must invalidate dependency analysis for {target}"
+        );
+    }
+    let environment =
+        fln_elab::implemented_by::register(base.environment(), &name("Nat.add"), &name("Nat.sub"))
+            .unwrap();
+    let changed = Engine::from_environment(environment);
+    let (declaration, _) =
+        checked_definition(&changed, "def compiled (x y : Nat) : Nat := Nat.add x y");
+    assert!(matches!(
+        ir::compile_source_definition(
+            &changed,
+            declaration,
+            &options,
+            limits(),
+            CompileLimits::default()
+        ),
+        Err(ir::DefinitionCompileError::Ir(
+            ir::CompileError::Unsupported { .. }
+        ))
+    ));
 }
 
 // Valid FIR permits a borrowed argument to alias a consumed argument. Unlike
@@ -1681,6 +1969,197 @@ fn the_pin_executes_native_compiler_output_and_observes_changed_bodies() {
 #[test]
 fn the_pin_executes_imported_string_source_exports() {
     check_pin_string_exports(false);
+}
+
+#[test]
+fn the_pin_executes_multiargument_calls_and_reduced_let_exports() {
+    let Some(lean) = reference() else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "pinned Reference is required"
+        );
+        eprintln!("SKIP: multiargument source IR exports require the pin");
+        return;
+    };
+    let pin = include_str!("../../../SUITE.lock")
+        .lines()
+        .find(|line| line.starts_with("reference "))
+        .unwrap()
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("commit="))
+        .unwrap();
+    let identity = Command::new(&lean).arg("--githash").output().unwrap();
+    assert!(identity.status.success());
+    assert_eq!(String::from_utf8(identity.stdout).unwrap().trim(), pin);
+    let stack = 256 * 1024 * 1024;
+    std::thread::Builder::new()
+        .stack_size(stack)
+        .spawn(move || {
+            // This producer uses the checked native source seed, as the other
+            // source-export differential tests do. The pin supplies the real
+            // runtime/consumer and independent original/reduced signatures.
+            // Imported String model admission has its separate tests below.
+            let base = base();
+            let options = KVMap::new();
+            let original_root = base.logical_root(&options);
+            let mut no_execution = EngineExecutionLimits::new(Budget::for_stack_bytes(stack));
+            no_execution.vm.max_steps = 0;
+            let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            for (index, case) in native_call_export_cases().into_iter().enumerate() {
+                let source = format!("def compiled : {} := {}", case.ty, case.expression);
+                let (declaration, checked) = checked_definition(&base, &source);
+                let compiled = ir::compile_source_definition(
+                    &base,
+                    declaration,
+                    &options,
+                    no_execution,
+                    CompileLimits::default(),
+                )
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+                .into_complete()
+                .unwrap();
+                assert_eq!(
+                    compiled.admission.result_logical_root,
+                    checked.logical_root(&options)
+                );
+                assert_eq!(base.logical_root(&options), original_root);
+                let unique = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let dir = root.join(format!(
+                    "native-multiargument-export-{}-{unique}-{index}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("NativeIrCase.lean"),
+                    format!(
+                        "module\npublic opaque compiled : {} := {}\n",
+                        case.ty, case.expression
+                    ),
+                )
+                .unwrap();
+                let produced = Command::new(&lean)
+                    .current_dir(&dir)
+                    .args(["-j", "1", "-o", "NativeIrCase.olean", "NativeIrCase.lean"])
+                    .output()
+                    .unwrap();
+                std::fs::write(dir.join("compile.stdout"), &produced.stdout).unwrap();
+                std::fs::write(dir.join("compile.stderr"), &produced.stderr).unwrap();
+                assert!(
+                    produced.status.success(),
+                    "{source}: {} {}",
+                    String::from_utf8_lossy(&produced.stdout),
+                    String::from_utf8_lossy(&produced.stderr)
+                );
+                let original = std::fs::read(dir.join("NativeIrCase.ir")).unwrap();
+                std::fs::write(dir.join("original.ir"), &original).unwrap();
+                let bytes = encode(&compiled.module, &original);
+                let expected = format!("{}\n{}", case.expected, case.expected);
+                let mut probes = vec![
+                    RuntimeProbe {
+                        ty: case.ty,
+                        application: case.application,
+                        entry: "compiled",
+                        check_meta: true,
+                        higher_universe: false,
+                        heap_call: None,
+                    },
+                    RuntimeProbe {
+                        ty: case.ty,
+                        application: case.partial,
+                        entry: "compiled",
+                        check_meta: true,
+                        higher_universe: false,
+                        heap_call: None,
+                    },
+                ];
+                if let Some((ty, application)) = case.reduced {
+                    probes.push(RuntimeProbe {
+                        ty,
+                        application,
+                        entry: "compiled._redArg",
+                        check_meta: false,
+                        higher_universe: false,
+                        heap_call: None,
+                    });
+                }
+                for (producer, product) in [
+                    ("reference", original.as_slice()),
+                    ("native", bytes.as_slice()),
+                ] {
+                    std::fs::write(dir.join("NativeIrCase.ir"), product).unwrap();
+                    for (probe_index, probe) in probes.iter().enumerate() {
+                        let label = format!("{producer}-{probe_index}");
+                        assert_probe(
+                            consume_ir(&lean, &dir, &label, probe),
+                            &dir,
+                            &label,
+                            &expected,
+                        );
+                    }
+                    if index == 9 {
+                        std::fs::write(dir.join("heap-input.txt"), "fresh λ😀").unwrap();
+                        let probe = RuntimeProbe {
+                            ty: case.ty,
+                            application: case.application,
+                            entry: "compiled",
+                            check_meta: true,
+                            higher_universe: false,
+                            heap_call: Some("(let f := compiled saved; f saved)"),
+                        };
+                        let label = format!("{producer}-heap-alias");
+                        assert_probe(
+                            consume_ir(&lean, &dir, &label, &probe),
+                            &dir,
+                            &label,
+                            &format!("{expected}\n(\"fresh λ😀fresh λ😀\", \"fresh λ😀\")"),
+                        );
+                    }
+                }
+                std::fs::write(
+                    dir.join("Consumer.lean"),
+                    format!(
+                        "module\nmeta import NativeIrCase\n#eval ({})\n#eval ({})\n",
+                        case.application, case.partial,
+                    ),
+                )
+                .unwrap();
+                assert_probe(consume(&lean, &dir), &dir, "compiled-consumer", &expected);
+                if index == 0 {
+                    // Identical logical companions, changed physical source
+                    // entry: both full and partially applied runtime lookups
+                    // must observe native IR rather than an inlined oracle body.
+                    let mut mutant = compiled.module.clone();
+                    let IrDecl::Function { params, body, .. } = mutant
+                        .decls
+                        .iter_mut()
+                        .find(|decl| decl.name() == &name("compiled"))
+                        .unwrap()
+                    else {
+                        panic!("source entry")
+                    };
+                    replace_result(params, body, "Nat");
+                    std::fs::write(dir.join("NativeIrCase.ir"), encode(&mutant, &original))
+                        .unwrap();
+                    for (probe_index, probe) in probes.iter().enumerate() {
+                        let label = format!("changed-body-{probe_index}");
+                        assert_probe(
+                            consume_ir(&lean, &dir, &label, probe),
+                            &dir,
+                            &label,
+                            "99\n99",
+                        );
+                    }
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]

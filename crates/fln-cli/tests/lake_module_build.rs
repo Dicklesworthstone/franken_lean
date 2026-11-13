@@ -212,6 +212,8 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
         concat!(
             "module\nprelude\npublic import Lib.Base\n",
             "public def Lib.increment (n : Nat) : Nat := n + 1\n",
+            "public def Lib.sum (x y : Nat) : Nat := x + y\n",
+            "public def Lib.letSum (x ignored y : Nat) : Nat := let next := x + 2; next + y\n",
             "@[expose] public def Lib.selection : Nat := Lib.choose true 41 6\n",
         ),
     );
@@ -276,6 +278,9 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
             "#eval Lib.choose false 41 6\n",
             "#eval Lib.increment 41\n",
             "#eval Lib.selection\n",
+            "#eval Lib.sum 19 23\n",
+            "#eval (Lib.sum 40) 2\n",
+            "#eval Lib.letSum 30 999 10\n",
         ),
     );
     let output = Command::new(&reference)
@@ -288,7 +293,7 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
     assert!(output.stderr.is_empty(), "{output:?}");
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "42\n41\n6\n42\n41\n"
+        "42\n41\n6\n42\n41\n42\n42\n42\n"
     );
     // Runtime lookup prevents `[expose]` companion bodies from being inlined
     // into the consumer. The interpreter must load these exact emitted IR
@@ -311,6 +316,16 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
             "    IO.println (increment 41)\n",
             "  | .error message, _ => throw (IO.userError message)\n",
             "  | _, .error message => throw (IO.userError message)\n",
+            "  match env.evalConst (Nat → Nat → Nat) {} `Lib.sum (checkMeta := false),\n",
+            "        env.evalConst (Nat → Nat → Nat → Nat) {} `Lib.letSum (checkMeta := false),\n",
+            "        env.evalConst (Nat → Nat → Nat) {} `Lib.letSum._redArg (checkMeta := false) with\n",
+            "  | .ok sum, .ok letSum, .ok reduced =>\n",
+            "    IO.println (sum 19 23)\n",
+            "    IO.println (letSum 30 999 10)\n",
+            "    IO.println (reduced 30 10)\n",
+            "  | .error message, _, _ => throw (IO.userError message)\n",
+            "  | _, .error message, _ => throw (IO.userError message)\n",
+            "  | _, _, .error message => throw (IO.userError message)\n",
         ),
     );
     let interpret = || {
@@ -324,26 +339,19 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
         assert!(output.stderr.is_empty(), "{output:?}");
         String::from_utf8(output.stdout).unwrap()
     };
-    assert_eq!(interpret(), "42\n41\n6\n42\n");
+    assert_eq!(interpret(), "42\n41\n6\n42\n42\n42\n42\n");
 
     // Execute the same physical files on Golem through the installed IR door.
     // Explicit user names preserve generated numeric components; native extern
     // classification still comes only from the verified pinned partition.
     let partition = emitted_ir_partition();
-    let native = |max_steps: Option<u64>| {
+    let native_entry = |entry: &str, arguments: &[&str], max_steps: Option<u64>| {
         let partition = partition.as_ref()?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
         command
-            .args([
-                "ir",
-                "run",
-                "--json",
-                "--entry",
-                "Lib.increment",
-                "--partition",
-            ])
+            .args(["ir", "run", "--json", "--entry", entry, "--partition"])
             .arg(partition)
-            .args(["--nat", "41"])
+            .args(arguments)
             .arg(package.artifact("Lib.Base").with_extension("ir"))
             .arg(package.artifact("Lib.Top").with_extension("ir"));
         for user in &users {
@@ -354,6 +362,7 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
         }
         Some(command.output().unwrap())
     };
+    let native = |max_steps| native_entry("Lib.increment", &["--nat", "41"], max_steps);
     let check_native = |expected: u64| {
         if let Some(output) = native(None) {
             let report = success(&output);
@@ -366,6 +375,23 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
         }
     };
     check_native(42);
+    for (entry, arguments) in [
+        ("Lib.sum", vec!["--nat", "19", "--nat", "23"]),
+        (
+            "Lib.letSum",
+            vec!["--nat", "30", "--nat", "999", "--nat", "10"],
+        ),
+        ("Lib.letSum._redArg", vec!["--nat", "30", "--nat", "10"]),
+    ] {
+        if let Some(output) = native_entry(entry, &arguments, None) {
+            let report = success(&output);
+            assert!(
+                report.contains("\"outcome\":\"complete\""),
+                "{entry}: {report}"
+            );
+            assert!(report.contains("\"value\":42,"), "{entry}: {report}");
+        }
+    }
     if let Some(exhausted) = native(Some(1)) {
         assert_eq!(exhausted.status.code(), Some(3), "{exhausted:?}");
         assert!(exhausted.stdout.is_empty(), "{exhausted:?}");
@@ -449,7 +475,7 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
     .unwrap();
     let output_ir = package.artifact("Lib.Top").with_extension("ir");
     std::fs::write(&output_ir, &mutant.bytes).unwrap();
-    assert_eq!(interpret(), "42\n41\n6\n99\n");
+    assert_eq!(interpret(), "42\n41\n6\n99\n42\n42\n42\n");
     check_native(99);
     std::fs::write(output_ir, original).unwrap();
     check_native(42);
