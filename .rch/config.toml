@@ -1,0 +1,107 @@
+# Repo-scoped RCH configuration for franken_lean (bead fln-rch-rsync-excludes-proofs-artifacts-445z).
+#
+# Deep-merged over ~/.config/rch/config.toml:
+# 1. Anchors `/artifacts/` and `/proofs/` to the repository root (plus
+#    `/scripts/e2e/artifacts/`) instead of unanchored `artifacts/` and
+#    `proofs/`, which otherwise strip 28 tracked Rust modules under
+#    `crates/fln-parse/src/{extensions/artifacts,proofs}/` and
+#    `crates/fln/src/{runtime/proofs,source_check/modules/artifacts}/`
+#    during ordinary rsync source transfer. All build-output, cache,
+#    agent-state, and credential exclusions from the fleet baseline are
+#    retained verbatim.
+# 2. Sizes `build_slots` and `test_slots` to 2 so 2- and 3-slot fleet
+#    workers remain admissible instead of failing `slots.request_exceeds_capacity`.
+
+[compilation]
+build_slots = 2
+test_slots = 2
+check_slots = 2
+
+[transfer]
+exclude_patterns = [
+    "*.rlib",
+    "*.rmeta",
+    ".beads/*.db",
+    ".beads/*.db-*",
+    ".beads/*.db.*",
+    ".beads/*.db-wal*",
+    ".beads/*.orphan_*",
+    ".beads/*.corrupt_*",
+    ".beads/*.backup_*",
+    ".beads/recovery*/",
+    ".bun/",
+    ".git/objects/*",
+    ".next/",
+    ".npm/",
+    ".nuxt/",
+    ".nyc_output/",
+    ".parcel-cache/",
+    ".pnpm-store/",
+    ".rch_cargo_home*/",
+    ".rch_cargo_home*/**",
+    ".rch_cargo_home_*/",
+    ".rch_cargo_home_*/**",
+    ".rch-target-cp-*",
+    ".rch-target-cp-*/**",
+    ".rch-target-*",
+    ".rch-target-*/**",
+    ".rch_target*/",
+    ".rch_target*/**",
+    "target_rch_*",
+    "target_rch_*/**",
+    ".turbo/",
+    "build/",
+    "coverage/",
+    "dist/",
+    "false/",
+    "false/**",
+    "fuzz/corpus/",
+    "fuzz/corpus/**",
+    "node_modules/",
+    "remote_compilation_helper/perf.data",
+    "target_local/",
+    "target_local/**",
+    "target_check_cc/",
+    "target_check_cc/**",
+    "target_crimson/",
+    "/artifacts/",
+    "/artifacts/**",
+    "/scripts/e2e/artifacts/",
+    "/scripts/e2e/artifacts/**",
+    "/proofs/",
+    "/proofs/**",
+    "legacy_v8/",
+    "legacy_v8/**",
+    "legacy_quickjs/",
+    "legacy_quickjs/**",
+    ".doctor/",
+    ".doctor/**",
+    ".claude/",
+    ".claude/**",
+    "target/",
+    # rch #109 agent-state defaults; a custom list replaces them (added 2026-10-20, fleet sweep)
+    ".ntm/",
+    ".beads-recovery/",
+    # rch default credential excludes; a custom list replaces them (JE-approved 2026-10-20, fleet sweep)
+    ".env",
+    ".env.*",
+    "credentials.json",
+    "secrets.json",
+    "secrets.yaml",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    # rch newer default credential excludes (46027203); a custom list replaces them (fleet sweep 2026-10-21)
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
+    ".netrc",
+    "secrets.yml",
+    "secrets.toml",
+    "secrets.env",
+    "secrets.txt",
+    "secrets.conf",
+    "secrets.cfg",
+    "secrets.properties",
+    "secrets.xml",
+]
