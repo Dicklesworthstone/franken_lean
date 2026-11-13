@@ -1338,10 +1338,12 @@ fn checked_lean_path_dependencies_build_update_and_match_the_pinned_resolver() {
     let locked = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], Some(&lib)));
     assert!(locked.contains("\"modules_cached\":3"), "{locked}");
 
-    // Consume the native logical artifacts in the actual pin.
+    // Consume the native logical artifacts in the actual pin. This admission-
+    // only facet deliberately has no executable LCNF signatures; a noncomputable
+    // consumer checks the imported body without requesting the separate IR facet.
     workspace.write(
         "UseMixed.lean",
-        "prelude\nimport App.Top\ndef useMixed (A : Type) (a : A) : A := App.combine A a\n",
+        "prelude\nimport App.Top\nnoncomputable def useMixed (A : Type) (a : A) : A := App.combine A a\n",
     );
     let search = std::env::join_paths(paths.iter().map(|path| {
         path.ancestors()

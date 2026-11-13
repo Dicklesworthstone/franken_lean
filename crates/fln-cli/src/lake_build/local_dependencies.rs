@@ -228,27 +228,42 @@ impl Sources {
             .collect()
     }
 
-    pub(super) fn resolve(&self, module: &Name) -> Result<Option<SourceLocation>, Failure> {
-        let mut found: Option<SourceLocation> = None;
+    /// Keep the exact selected configuration as the module's owner. Different
+    /// package identities may share a directory while selecting different
+    /// configuration files, source libraries and build directories.
+    pub(super) fn resolve_package(
+        &self,
+        module: &Name,
+    ) -> Result<Option<(&Package, PathBuf)>, Failure> {
+        let mut found: Option<(&Package, PathBuf)> = None;
         for package in &self.packages {
             let Some(path) = source_path(module, &package.libraries)? else {
                 continue;
             };
-            if found
-                .as_ref()
-                .is_some_and(|previous| previous.path != path || previous.package != package.root)
-            {
+            if found.as_ref().is_some_and(|(previous, previous_path)| {
+                previous_path != &path || previous.root != package.root
+            }) {
                 return Err(Failure::unsupported(format!(
                     "module `{}` belongs to multiple local packages",
                     module.to_display_string(),
                 )));
             }
-            found = Some(SourceLocation {
-                package: package.root.clone(),
-                path,
-            });
+            // Lake's Workspace.findModule? selects the first package. Identical
+            // source aliases must retain that owner's configuration as well.
+            if found.is_none() {
+                found = Some((package, path));
+            }
         }
         Ok(found)
+    }
+
+    pub(super) fn resolve(&self, module: &Name) -> Result<Option<SourceLocation>, Failure> {
+        Ok(self
+            .resolve_package(module)?
+            .map(|(package, path)| SourceLocation {
+                package: package.root.clone(),
+                path,
+            }))
     }
 
     pub(super) fn destinations(
@@ -258,16 +273,9 @@ impl Sources {
         artifacts
             .keys()
             .map(|name| {
-                let source = self.resolve(name)?.ok_or_else(|| {
+                let (package, _) = self.resolve_package(name)?.ok_or_else(|| {
                     Failure::new("internal-fault", "built module has no source owner")
                 })?;
-                let package = self
-                    .packages
-                    .iter()
-                    .find(|package| package.root == source.package)
-                    .ok_or_else(|| {
-                        Failure::new("internal-fault", "built module lost its package")
-                    })?;
                 Ok((
                     name.clone(),
                     (
@@ -452,4 +460,144 @@ pub(super) fn load(
     };
     sources.verify_configurations()?;
     Ok(sources)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fln_lake::{LakeConfigFormat, LakeTarget};
+
+    fn package(format: LakeConfigFormat, root_module: &str) -> Package {
+        // These are already loaded configuration values. The regression is in
+        // source ownership and destination selection, not import admission.
+        let (name, filename, build_dir) = match format {
+            LakeConfigFormat::Lean => ("leanPart", "lakefile.lean", "lean-out"),
+            LakeConfigFormat::Toml => ("tomlPart", "lakefile.toml", "toml-out"),
+        };
+        let root = PathBuf::from("/workspace/shared");
+        let config = LakeConfig {
+            name: name.to_owned(),
+            default_targets: Vec::new(),
+            lean_toolchain: None,
+            src_dir: PathBuf::from("src"),
+            build_dir: PathBuf::from(build_dir),
+            requires: Vec::new(),
+            targets: vec![LakeTarget {
+                name: root_module.to_owned(),
+                kind: TargetKind::Library,
+                roots: vec![root_module.to_owned()],
+                src_dir: None,
+            }],
+            format,
+        };
+        let libraries = library_sources(&root, &config)
+            .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
+        Package {
+            configuration: (root.join(filename), filename.to_owned()),
+            root,
+            config,
+            default_toml: false,
+            libraries,
+        }
+    }
+
+    fn sources(packages: Vec<Package>) -> Sources {
+        Sources {
+            packages,
+            configuration_imports: Vec::new(),
+            manifest: ManifestSelection {
+                root: PathBuf::from("/workspace/root"),
+                path: PathBuf::from("/workspace/root/lake-manifest.json"),
+                digest: None,
+                entries: None,
+            },
+            metadata_guards: Vec::new(),
+        }
+    }
+
+    fn artifacts(names: &[&str]) -> BTreeMap<Name, ModuleArtifacts> {
+        names
+            .iter()
+            .map(|name| {
+                (
+                    Name::from_components(name.split('.')),
+                    ModuleArtifacts {
+                        exported: Vec::new(),
+                        companions: None,
+                        ir: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn configurations_in_one_directory_keep_their_own_artifact_destinations() {
+        for reverse in [false, true] {
+            let mut packages = vec![
+                package(LakeConfigFormat::Lean, "LeanPart"),
+                package(LakeConfigFormat::Toml, "TomlPart"),
+            ];
+            if reverse {
+                packages.reverse();
+            }
+            let sources = sources(packages);
+            let destinations = sources
+                .destinations(&artifacts(&["LeanPart.Child", "TomlPart.Child"]))
+                .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
+            for (module, build_dir) in [("LeanPart", "lean-out"), ("TomlPart", "toml-out")] {
+                let name = Name::from_components([module, "Child"]);
+                let location = sources
+                    .resolve(&name)
+                    .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail))
+                    .expect("declared library module");
+                let root = PathBuf::from("/workspace/shared");
+                assert_eq!(location.package, root);
+                assert_eq!(
+                    location.path,
+                    root.join("src").join(module).join("Child.lean")
+                );
+                assert_eq!(
+                    destinations[&name],
+                    (root.clone(), root.join(build_dir).join("lib/lean")),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_source_aliases_keep_the_first_selected_configuration() {
+        for (reverse, build_dir) in [(false, "lean-out"), (true, "toml-out")] {
+            let mut packages = vec![
+                package(LakeConfigFormat::Lean, "Shared"),
+                package(LakeConfigFormat::Toml, "Shared"),
+            ];
+            if reverse {
+                packages.reverse();
+            }
+            let destinations = sources(packages)
+                .destinations(&artifacts(&["Shared"]))
+                .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
+            let root = PathBuf::from("/workspace/shared");
+            assert_eq!(
+                destinations[&Name::from_components(["Shared"])],
+                (root.clone(), root.join(build_dir).join("lib/lean")),
+            );
+        }
+    }
+
+    #[test]
+    fn shared_directories_do_not_hide_conflicting_source_ownership() {
+        let lean = package(LakeConfigFormat::Lean, "Shared");
+        let mut toml = package(LakeConfigFormat::Toml, "Shared");
+        toml.config.src_dir = PathBuf::from("different-source");
+        toml.libraries = library_sources(&toml.root, &toml.config)
+            .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
+        let sources = sources(vec![lean, toml]);
+        let error = sources
+            .destinations(&artifacts(&["Shared"]))
+            .expect_err("different physical sources remain ambiguous");
+        assert_eq!(error.class, "unsupported");
+        assert!(error.detail.contains("belongs to multiple local packages"));
+    }
 }
