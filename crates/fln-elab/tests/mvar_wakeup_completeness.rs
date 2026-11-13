@@ -285,25 +285,15 @@ fn unknown_reader_conservatism_wakes_on_any_assignment_blocks_take_ready_and_nar
 #[test]
 fn planted_read_omission_mutants_are_caught_by_completeness_oracle() {
     let prop_const = Expr::const_(Name::from_components(["P"]), Vec::new());
-    let m_type_dep = mvar_id(10);
-    let m_term = mvar_id(11);
 
-    // Mutant 1: omitting transitive metavariable-type dependency (`?m_term : P ?m_type_dep`)
-    // by passing syntactic-only `{m_term}` instead of `enqueue_scoped`.
+    // Mutant 1: omitting lexical-context dependency (`x : P ?m_ctx_dep |- x : Sort 0`)
+    // by calling `enqueue_inferred` (no `LocalContext`) instead of `enqueue_scoped`.
+    let m_ctx_dep = mvar_id(10);
     let mut store_mutant = MetavarStore::new();
     store_mutant.declare(
-        m_type_dep.clone(),
-        m_type_dep.0.clone(),
+        m_ctx_dep.clone(),
+        m_ctx_dep.0.clone(),
         Expr::sort(Level::one()),
-        LocalContext::new(),
-        MetavarKind::Natural,
-        0,
-        None,
-    );
-    store_mutant.declare(
-        m_term.clone(),
-        m_term.0.clone(),
-        Expr::app(prop_const, Expr::mvar(m_type_dep.clone())),
         LocalContext::new(),
         MetavarKind::Natural,
         0,
@@ -311,37 +301,46 @@ fn planted_read_omission_mutants_are_caught_by_completeness_oracle() {
     );
     let mut store_prod = store_mutant.clone();
 
+    let mut lctx = LocalContext::new();
+    let x_id = FVarId(Name::from_components(["x"]));
+    lctx.add_param(
+        x_id.clone(),
+        Name::from_components(["x"]),
+        Expr::app(prop_const, Expr::mvar(m_ctx_dep.clone())),
+        BinderInfo::Default,
+    );
+
     let kind = ConstraintKind::HasType {
-        expr: Expr::mvar(m_term.clone()),
+        expr: Expr::fvar(x_id),
         expected_type: Expr::sort(Level::zero()),
     };
     let mut mutant_queue = ConstraintQueue::new();
-    // Planted read-omission mutant: syntactic-only `{m_term}`, omitting `m_type_dep`!
-    let mutant_cid = mutant_queue.enqueue(kind.clone(), HashSet::from([m_term]), 0);
+    let mutant_cid = mutant_queue.enqueue_inferred(kind.clone(), &store_mutant, 0);
 
     let mut prod_queue = ConstraintQueue::new();
-    let prod_cid = prod_queue.enqueue_scoped(kind, &store_prod, &LocalContext::new(), 0);
+    let prod_cid = prod_queue.enqueue_scoped(kind, &store_prod, &lctx, 0);
 
-    let before_rows: Vec<Constraint> = mutant_queue.constraints().values().cloned().collect();
+    let prod_rows_before: Vec<Constraint> = prod_queue.constraints().values().cloned().collect();
     let before_store = store_mutant.clone();
     let mutant_woke = mutant_queue
         .assign_mvar(
             &mut store_mutant,
-            m_type_dep.clone(),
+            m_ctx_dep.clone(),
             Expr::sort(Level::zero()),
             AssignmentJustification::DirectDefEq,
         )
         .unwrap();
-    let oracle_required = full_scan_oracle_affected(&before_rows, &before_store, &store_mutant);
+    let oracle_required =
+        full_scan_oracle_affected(&prod_rows_before, &before_store, &store_mutant);
     assert!(
-        oracle_required.contains(&mutant_cid) && mutant_woke.is_empty(),
-        "planted syntactic-only read-omission mutant must miss the oracle-required wakeup"
+        oracle_required.contains(&prod_cid) && mutant_woke.is_empty(),
+        "planted context-omission mutant (`enqueue_inferred` without `LocalContext`) must miss the oracle-required wakeup: mutant_cid={mutant_cid:?}"
     );
 
     let prod_woke = prod_queue
         .assign_mvar(
             &mut store_prod,
-            m_type_dep,
+            m_ctx_dep,
             Expr::sort(Level::zero()),
             AssignmentJustification::DirectDefEq,
         )
@@ -349,6 +348,54 @@ fn planted_read_omission_mutants_are_caught_by_completeness_oracle() {
     assert_eq!(
         prod_woke.iter().map(|c| c.id).collect::<Vec<_>>(),
         vec![prod_cid],
-        "production `enqueue_scoped` wakes on transitive metavariable-type dependency"
+        "production `enqueue_scoped` wakes on captured LocalContext metavariable dependency"
+    );
+
+    // Mutant 2: external assignment to a suspended `DelayedAssign` output (`m_out := ?m_residual`)
+    // introduces a new residual dependency (`?m_residual`) and requires consistency checking;
+    // indexing `kind.output_mvar()` in `mvar_to_constraints` wakes it without blocking `take_ready`.
+    let m_out = mvar_id(20);
+    let m_blocker = mvar_id(21);
+    let m_residual = mvar_id(22);
+    let mut store_delayed = MetavarStore::new();
+    for id in [&m_out, &m_blocker, &m_residual] {
+        store_delayed.declare(
+            id.clone(),
+            id.0.clone(),
+            Expr::sort(Level::one()),
+            LocalContext::new(),
+            MetavarKind::Natural,
+            0,
+            None,
+        );
+    }
+    let mut delayed_queue = ConstraintQueue::new();
+    let delayed_cid = delayed_queue.enqueue_scoped(
+        ConstraintKind::DelayedAssign {
+            mvar: m_out.clone(),
+            fvars: Vec::new(),
+            val: Expr::mvar(m_blocker),
+        },
+        &store_delayed,
+        &LocalContext::new(),
+        0,
+    );
+    let delayed_before: Vec<Constraint> = delayed_queue.constraints().values().cloned().collect();
+    let store_delayed_before = store_delayed.clone();
+    let delayed_woke = delayed_queue
+        .assign_mvar(
+            &mut store_delayed,
+            m_out,
+            Expr::mvar(m_residual),
+            AssignmentJustification::DirectDefEq,
+        )
+        .unwrap();
+    let delayed_oracle =
+        full_scan_oracle_affected(&delayed_before, &store_delayed_before, &store_delayed);
+    assert_eq!(delayed_oracle, BTreeSet::from([delayed_cid]));
+    assert_eq!(
+        delayed_woke.iter().map(|c| c.id).collect::<Vec<_>>(),
+        vec![delayed_cid],
+        "DelayedAssign output external assignment must wake the suspended obligation"
     );
 }
