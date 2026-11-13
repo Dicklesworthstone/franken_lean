@@ -3,7 +3,8 @@
 # Deep-merged over ~/.config/rch/config.toml:
 # 1. Anchors `/artifacts/` and `/proofs/` to the repository root (plus
 #    `/scripts/e2e/artifacts/`) instead of unanchored `artifacts/` and
-#    `proofs/`, which otherwise strip 28 tracked Rust modules under
+#    `proofs/`, which otherwise strip 23 tracked Rust modules (28 paths
+#    including subdirectories) under
 #    `crates/fln-parse/src/{extensions/artifacts,proofs}/` and
 #    `crates/fln/src/{runtime/proofs,source_check/modules/artifacts}/`
 #    during ordinary rsync source transfer. All build-output, cache,
