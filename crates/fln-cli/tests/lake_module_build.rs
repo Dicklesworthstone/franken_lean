@@ -56,6 +56,243 @@ const MODULE_BASE: &str = "module\nprelude\npublic inductive Token where\n | lef
 const MODULE_TOP: &str = "module\nprelude\npublic import Lib.Base\npublic theorem forwards (P : Prop) (h : P) : P := keep P h\n";
 const FAMILY_PARTS: [&str; 3] = ["olean", "olean.server", "olean.private"];
 
+#[test]
+fn native_ir_facets_export_checked_recursive_nat_definitions() {
+    let Some(reference) = pinned_family_reference() else {
+        return;
+    };
+    let lib = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| reference.parent().unwrap().join("../lib/lean"));
+    let package = Package::new(CONFIG);
+    let source = concat!(
+        "module\nprelude\npublic import Init.Notation\n",
+        "public def Lib.structuralCount : Nat → Nat\n",
+        "  | 0 => 42\n",
+        "  | Nat.succ n => Lib.structuralCount n\n",
+        "public def Lib.structuralAdd : Nat → Nat\n",
+        "  | 0 => 0\n",
+        "  | Nat.succ n => Lib.structuralAdd n + 2\n",
+        "public partial def Lib.partialCount (n : Nat) : Nat :=\n",
+        "  if n == 0 then 42 else Lib.partialCount (n - 1)\n",
+        "public partial def Lib.partialCountLt (n : Nat) : Nat :=\n",
+        "  if n < 1 then 7 else Lib.partialCountLt (n - 1)\n",
+        "public partial def Lib.partialCountLe (n : Nat) : Nat :=\n",
+        "  if n ≤ 0 then 9 else Lib.partialCountLe (n - 1)\n",
+        "public partial def Lib.spin (n : Nat) : Nat := Lib.spin (n + 1)\n",
+    );
+    package.write("Lib/Top.lean", source);
+    let binary = package.0.join("native-bin/lake");
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_lake"), &binary).unwrap();
+    let build = || {
+        Command::new(&binary)
+            .arg("--dir")
+            .arg(&package.0)
+            .args(["--json", "build", "+Lib.Top:ir"])
+            .env("LEAN_PATH", &lib)
+            .env("FLN_IMPORT_REUSE_DIR", package.0.join(".records"))
+            .output()
+            .unwrap()
+    };
+    let report = success(&build());
+    assert!(report.contains("\"executable_modules\":1"), "{report}");
+    let artifact = package.artifact("Lib.Top");
+    let ir_path = artifact.with_extension("ir");
+    let bytes = std::fs::read(&ir_path).unwrap();
+    let view = fln_olean::region::OleanView::parse(&bytes).unwrap();
+    let blocks = view
+        .extension_payloads(fln_olean::region::WalkBudget::default(), 16 << 20)
+        .unwrap();
+    let ir = fln_olean::ir::decode_ir(&blocks, Default::default()).unwrap();
+    let mut users = std::collections::BTreeSet::new();
+    for declaration in &ir.decls {
+        assert!(
+            !declaration
+                .name()
+                .to_display_string()
+                .contains("_unsafe_rec")
+        );
+        if matches!(declaration, fln_olean::ir::IrDecl::Function { .. }) {
+            users.insert(emitted_ir_name_key(declaration.name()));
+        }
+    }
+    for entry in [
+        "Lib.structuralCount",
+        "Lib.structuralAdd",
+        "Lib.partialCount",
+        "Lib.partialCountLt",
+        "Lib.partialCountLe",
+        "Lib.spin",
+    ] {
+        assert!(
+            ir.decls
+                .iter()
+                .any(|declaration| declaration.name().to_display_string() == entry)
+        );
+    }
+    assert!(ir.initializers.is_empty());
+    let warm = success(&build());
+    assert!(warm.contains("\"modules_cached\":1"), "{warm}");
+    assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
+    assert_eq!(std::fs::read(&ir_path).unwrap(), bytes);
+
+    // The pin compiles downstream calls against the native logical artifacts
+    // and executes their emitted IR, including a partial opaque interface.
+    package.write(
+        "UseRecursive.lean",
+        concat!(
+            "import Lib.Top\n",
+            "#eval Lib.structuralCount 0\n",
+            "#eval Lib.structuralCount 12\n",
+            "#eval Lib.structuralAdd 0\n",
+            "#eval Lib.structuralAdd 7\n",
+            "#eval Lib.structuralAdd 21\n",
+            "#eval Lib.partialCount 0\n",
+            "#eval Lib.partialCount 12\n",
+            "#eval Lib.partialCountLt 0\n",
+            "#eval Lib.partialCountLt 12\n",
+            "#eval Lib.partialCountLe 0\n",
+            "#eval Lib.partialCountLe 12\n",
+        ),
+    );
+    let search = package.0.join(".lake/build/lib/lean");
+    let consume = |path: &str| {
+        Command::new(&reference)
+            .arg(package.0.join(path))
+            .env("LEAN_PATH", &search)
+            .output()
+            .unwrap()
+    };
+    let pinned = consume("UseRecursive.lean");
+    assert!(pinned.status.success(), "{pinned:?}");
+    assert!(pinned.stderr.is_empty(), "{pinned:?}");
+    assert_eq!(
+        std::str::from_utf8(&pinned.stdout).unwrap(),
+        "42\n42\n0\n14\n42\n42\n42\n7\n7\n9\n9\n"
+    );
+
+    package.write("RuntimeRecursive.lean", concat!(
+        "import Lean\n",
+        "unsafe def main : IO Unit := do\n",
+        "  Lean.enableInitializersExecution\n",
+        "  let env ← Lean.importModules #[{ module := `Lib.Top, isMeta := true }] {} (loadExts := true)\n",
+        "  for entry in #[`Lib.structuralCount, `Lib.structuralAdd, `Lib.partialCount, `Lib.partialCountLt, `Lib.partialCountLe] do\n",
+        "    match env.evalConst (Nat → Nat) {} entry (checkMeta := false) with\n",
+        "    | .ok run => for n in [0, 7, 21] do IO.println (run n)\n",
+        "    | .error message => throw (IO.userError message)\n",
+    ));
+    let runtime = || {
+        Command::new(&reference)
+            .args(["--run", "RuntimeRecursive.lean"])
+            .current_dir(&package.0)
+            .env("LEAN_PATH", &search)
+            .output()
+            .unwrap()
+    };
+    let pinned = runtime();
+    assert!(pinned.status.success(), "{pinned:?}");
+    assert_eq!(
+        std::str::from_utf8(&pinned.stdout).unwrap(),
+        "42\n42\n42\n0\n14\n42\n42\n42\n42\n7\n7\n7\n9\n9\n9\n"
+    );
+
+    if let Some(partition) = emitted_ir_partition() {
+        let run = |entry: &str, argument: u64, fuel: Option<u64>| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+            command
+                .args(["ir", "run", "--json", "--entry", entry, "--partition"])
+                .arg(&partition)
+                .arg("--nat")
+                .arg(argument.to_string())
+                .arg(&ir_path);
+            for user in &users {
+                command.arg("--user-key").arg(user);
+            }
+            if let Some(fuel) = fuel {
+                command.arg("--fln-max-steps").arg(fuel.to_string());
+            }
+            command.output().unwrap()
+        };
+        for (entry, argument, expected) in [
+            ("Lib.structuralCount", 0, 42),
+            ("Lib.structuralCount", 12, 42),
+            ("Lib.structuralAdd", 0, 0),
+            ("Lib.structuralAdd", 7, 14),
+            ("Lib.structuralAdd", 21, 42),
+            ("Lib.partialCount", 0, 42),
+            ("Lib.partialCount", 12, 42),
+            ("Lib.partialCountLt", 0, 7),
+            ("Lib.partialCountLt", 12, 7),
+            ("Lib.partialCountLe", 0, 9),
+            ("Lib.partialCountLe", 12, 9),
+        ] {
+            let output = run(entry, argument, None);
+            let report = success(&output);
+            assert!(
+                report.contains(&format!("\"value\":{expected},")),
+                "{entry} {argument}: {report}"
+            );
+        }
+        let exhausted = run("Lib.spin", 21, Some(64));
+        assert_eq!(exhausted.status.code(), Some(3), "{exhausted:?}");
+        assert!(exhausted.stdout.is_empty(), "{exhausted:?}");
+        let report = String::from_utf8(exhausted.stderr).unwrap();
+        assert!(report.contains("\"outcome\":\"inconclusive\""), "{report}");
+        assert!(report.contains("\"value\":null"), "{report}");
+    }
+
+    // Exporting code must not expose the arbitrary inhabitant stored in a
+    // partial opaque or make its computation available to proof reduction.
+    package.write(
+        "OpaqueRecursive.lean",
+        "prelude\nimport Lib.Top\ntheorem opaqueValue : Lib.partialCount 0 = 42 := Eq.refl (Lib.partialCount 0)\n",
+    );
+    assert!(!consume("OpaqueRecursive.lean").status.success());
+    let check_proof = |path: &str| {
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(package.0.join(path))
+            .env(
+                "LEAN_PATH",
+                std::env::join_paths([search.as_path(), lib.as_path()]).unwrap(),
+            )
+            .env("FLN_IMPORT_REUSE_DIR", package.0.join(".records"))
+            .output()
+            .unwrap()
+    };
+    let rejected = check_proof("OpaqueRecursive.lean");
+    assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+    package.write("ReflexiveRecursive.lean", "prelude\nimport Lib.Top\ntheorem opaqueRefl : Lib.partialCount 0 = Lib.partialCount 0 := Eq.refl (Lib.partialCount 0)\n");
+    assert!(consume("ReflexiveRecursive.lean").status.success());
+    let accepted = check_proof("ReflexiveRecursive.lean");
+    assert!(accepted.status.success(), "{accepted:?}");
+
+    let previous = family_bytes(&package, "Lib.Top");
+    let snapshot = package.0.join(".lake/build/fln-build.snapshot");
+    let previous_snapshot = std::fs::read(&snapshot).unwrap();
+    for (unsupported, reason) in [
+        (
+            "public unsafe def Lib.unchecked (n : Nat) : Nat := n\n",
+            "unsafe or partial source export",
+        ),
+        (
+            "public partial def Lib.accumulate (n total : Nat) : Nat := if n == 0 then total else Lib.accumulate (n - 1) (total + 1)\n",
+            "recursive source exports require unary Nat -> Nat",
+        ),
+    ] {
+        package.write("Lib/Top.lean", format!("{source}{unsupported}"));
+        let refused = failure(&build());
+        assert!(refused.contains(reason), "{refused}");
+        assert_eq!(family_bytes(&package, "Lib.Top"), previous);
+        assert_eq!(std::fs::read(&ir_path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), previous_snapshot);
+    }
+    package.write("Lib/Top.lean", source);
+    success(&build());
+    assert_eq!(std::fs::read(&ir_path).unwrap(), bytes);
+}
+
 fn success(output: &Output) -> String {
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");

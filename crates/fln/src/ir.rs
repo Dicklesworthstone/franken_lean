@@ -164,7 +164,12 @@ fn native_signature(row: &str) -> Result<(&'static [fir::ValueType], fir::ValueT
         | "extern:Nat.shiftLeft"
         | "extern:Nat.shiftRight" => Ok((&[Nat, Nat], Nat)),
         "extern:Nat.pred" | "extern:Nat.log2" => Ok((&[Nat], Nat)),
-        "extern:Nat.beq" | "extern:Nat.ble" => Ok((&[Nat, Nat], Bool)),
+        // Preparation has already checked the decision models and adapts
+        // their scalar ABI tags to its private Decidable representation. At
+        // the pin all three raw decision entries return UInt8, just like beq
+        // and ble; no proof field crosses this native call or the source ABI.
+        "extern:Nat.beq" | "extern:Nat.ble" | "extern:Nat.decEq" | "extern:Nat.decLe"
+        | "extern:Nat.decLt" => Ok((&[Nat, Nat], Bool)),
         // Most native ABIs share the checked FIR ownership. The two consuming
         // Bootstrap predicates below use an explicit borrowed-to-owned bridge.
         "extern:String.append" | "extern:String.Internal.append" => Ok((&[Text, Text], Text)),
@@ -2386,6 +2391,108 @@ pub fn compile_source_definition(
     compile_definition_impl(engine, declaration, None, options, engine_limits, limits)
 }
 
+fn checked_recursive_companion(
+    engine: &crate::Engine,
+    logical: &Name,
+    engine_limits: crate::EngineExecutionLimits,
+    meter: &mut Budget,
+) -> std::result::Result<Option<fln_env::constants::DefinitionVal>, DefinitionCompileError> {
+    meter.charge(1).map_err(DefinitionCompileError::Ir)?;
+    let mut ingress = engine_limits.ingress;
+    ingress.max_nodes = ingress
+        .max_nodes
+        .min(usize::try_from(meter.0).unwrap_or(usize::MAX));
+    let runtime = engine.runtime_environment(ingress).map_err(|error| {
+        DefinitionCompileError::Engine(crate::EngineExecutionError::Ingress(error))
+    })?;
+    let (companion, work) = crate::runtime::Preparation::new(&runtime.environment, ingress)
+        .with_executable_opaques(&runtime.executable_opaques)
+        .with_runtime_initializers(&runtime.runtime_initializers)
+        .source_recursive_companion(logical)
+        .map_err(|error| {
+            DefinitionCompileError::Engine(crate::EngineExecutionError::Ingress(error))
+        })?;
+    meter.charge(work).map_err(DefinitionCompileError::Ir)?;
+    if companion
+        .as_ref()
+        .is_some_and(|definition| definition.all.len() != 1)
+    {
+        return Err(DefinitionCompileError::Ir(unsupported(
+            "mutual recursive source exports",
+        )));
+    }
+    Ok(companion)
+}
+
+/// A module may omit only the exact checked companion of a logical declaration
+/// it also owns and exports. The caller checks ownership; the runtime checks the
+/// admitted relationship, full group, type, universes and initializer posture.
+pub(crate) fn is_checked_recursive_companion(
+    engine: &crate::Engine,
+    companion: &Name,
+    engine_limits: crate::EngineExecutionLimits,
+    limits: CompileLimits,
+) -> std::result::Result<bool, DefinitionCompileError> {
+    if !matches!(
+        companion.leaf_view(),
+        fln_core::name::LeafView::Str("_unsafe_rec")
+    ) {
+        return Ok(false);
+    }
+    let mut meter = Budget(limits.max_work);
+    Ok(
+        checked_recursive_companion(engine, &companion.parent(), engine_limits, &mut meter)?
+            .is_some_and(|definition| &definition.base.name == companion),
+    )
+}
+
+/// Compile a safe reference to the logical interface, so normal preparation
+/// selects its checked executable companion. Never re-admit a Partial body as
+/// Safe or export a partial opaque's arbitrary inhabitant. A single Nat slot
+/// has no smaller nonempty reduced-argument ABI, regardless of body use.
+fn recursive_source_wrapper(
+    definition: &mut fln_env::constants::DefinitionVal,
+    meter: &mut Budget,
+) -> Result<()> {
+    use fln_core::expr::{Expr, ExprNode};
+    let natural = Name::from_components(["Nat"]);
+    let scalar = |expression: &Expr| {
+        matches!(expression.node(), ExprNode::Const { name, levels }
+            if name == &natural && levels.is_empty())
+    };
+    let ty = source_without_metadata(&definition.base.type_, meter)?;
+    let ExprNode::ForallE {
+        binder_name,
+        binder_type,
+        body,
+        binder_info,
+    } = ty.node()
+    else {
+        return Err(unsupported(
+            "recursive source exports require unary Nat -> Nat",
+        ));
+    };
+    if !definition.base.level_params.is_empty()
+        || !scalar(source_without_metadata(binder_type, meter)?)
+        || !scalar(source_without_metadata(body, meter)?)
+    {
+        return Err(unsupported(
+            "recursive source exports require unary Nat -> Nat",
+        ));
+    }
+    meter.charge(5)?;
+    definition.value = Expr::lam(
+        binder_name.clone(),
+        binder_type.clone(),
+        Expr::app(
+            Expr::const_(definition.base.name.clone(), Vec::new()),
+            Expr::bvar(0).expect("zero source parameter index"),
+        ),
+        *binder_info,
+    );
+    Ok(())
+}
+
 /// Compile an exact definition or safe opaque body from a module's privately
 /// retained checked environment. The temporary admission is confined to a fresh
 /// private definition alias: neither that alias nor a successor environment is a
@@ -2407,7 +2514,7 @@ pub(crate) fn compile_checked_source_definition(
 
     let mut meter = Budget(limits.max_work);
     meter.charge(1).map_err(DefinitionCompileError::Ir)?;
-    let definition = match engine.environment().find(name) {
+    let mut definition = match engine.environment().find(name) {
         Some(ConstantInfo::Defn(definition)) => Cow::Borrowed(definition),
         Some(ConstantInfo::Opaque(opaque)) => {
             if opaque.is_unsafe {
@@ -2500,6 +2607,22 @@ pub(crate) fn compile_checked_source_definition(
         return Err(DefinitionCompileError::Ir(unsupported(
             "source export with an executable replacement or extern",
         )));
+    }
+    if let Some(companion) = checked_recursive_companion(engine, name, engine_limits, &mut meter)? {
+        if noncomputable.contains(&companion.base.name) {
+            return Err(DefinitionCompileError::Ir(unsupported(
+                "noncomputable recursive source companion",
+            )));
+        }
+        if replacements.get(&companion.base.name).is_some()
+            || externs.get(&companion.base.name).is_some()
+        {
+            return Err(DefinitionCompileError::Ir(unsupported(
+                "recursive source companion with an executable replacement or extern",
+            )));
+        }
+        recursive_source_wrapper(definition.to_mut(), &mut meter)
+            .map_err(DefinitionCompileError::Ir)?;
     }
     let mut ingress = engine_limits.ingress;
     ingress.max_nodes = ingress
@@ -2654,6 +2777,9 @@ fn compile_definition_impl(
 }
 
 #[cfg(test)]
+mod recursion_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2787,6 +2913,27 @@ mod tests {
                 vec![Borrowed; 2],
                 Nat,
                 ResultOwnership::Owned,
+            ),
+            (
+                "extern:Nat.decEq",
+                vec![Nat, Nat],
+                vec![Borrowed; 2],
+                Bool,
+                ResultOwnership::Scalar,
+            ),
+            (
+                "extern:Nat.decLe",
+                vec![Nat, Nat],
+                vec![Borrowed; 2],
+                Bool,
+                ResultOwnership::Scalar,
+            ),
+            (
+                "extern:Nat.decLt",
+                vec![Nat, Nat],
+                vec![Borrowed; 2],
+                Bool,
+                ResultOwnership::Scalar,
             ),
             (
                 "extern:String.append",

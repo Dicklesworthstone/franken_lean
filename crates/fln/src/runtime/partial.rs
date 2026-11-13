@@ -23,6 +23,35 @@ fn logical_interface(info: &ConstantInfo) -> Option<(&ConstantVal, &[Name])> {
 }
 
 impl Preparation<'_> {
+    /// The source IR exporter needs to distinguish an authorized recursive
+    /// companion from an ordinary body. Reuse the runtime's complete linkage
+    /// check, with no suffix-only authorization and no opaque-value fallback
+    /// when a candidate exists but its relationship is invalid.
+    pub(crate) fn source_recursive_companion(
+        &mut self,
+        logical: &Name,
+    ) -> Result<(Option<DefinitionVal>, usize), IngressError> {
+        let before = self.visited;
+        self.tick()?;
+        let expected = Name::str(logical.clone(), "_unsafe_rec");
+        if self
+            .runtime_initializers
+            .is_some_and(|names| names.contains(logical) || names.contains(&expected))
+        {
+            return Err(unsupported("source export requires runtime initialization"));
+        }
+        if !self.environment.contains(&expected) {
+            return Ok((None, self.visited - before));
+        }
+        let Some(companion) = self.recursive_definition(logical)? else {
+            return Err(unsupported("unverified source recursive companion"));
+        };
+        if companion.base.name != expected || companion.safety != DefinitionSafety::Partial {
+            return Err(unsupported("unverified source recursive companion"));
+        }
+        Ok((Some(companion), self.visited - before))
+    }
+
     pub(crate) fn executable_definition(
         &mut self,
         requested: &Name,
