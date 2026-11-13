@@ -1117,6 +1117,62 @@ fn reference() -> Option<PathBuf> {
     lean.is_file().then_some(lean)
 }
 
+fn imported_strings(lib: &Path, stack: usize) -> Engine {
+    use fln::source_check::modules::imported::SourceOleanImportLimits;
+    use fln::{
+        Environment, OleanCheckLimits, OleanDecodeLimits, OleanFrontierJobs, OleanModuleInput,
+    };
+
+    type Parts = (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
+    let root = name("Init.Data.String.Length");
+    let mut pending = vec![root.clone()];
+    let mut artifacts = BTreeMap::<Name, Parts>::new();
+    while let Some(module) = pending.pop() {
+        if artifacts.contains_key(&module) {
+            continue;
+        }
+        let path = lib
+            .join(module.to_display_string().replace('.', "/"))
+            .with_extension("olean");
+        let public = std::fs::read(&path).unwrap();
+        pending.extend(fln::olean_module_imports(&public, OleanDecodeLimits::new(stack)).unwrap());
+        let optional = |path| match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("read companion: {error}"),
+        };
+        artifacts.insert(
+            module,
+            (
+                public,
+                optional(path.with_extension("olean.server")),
+                optional(path.with_extension("olean.private")),
+            ),
+        );
+    }
+    let inputs: Vec<_> = artifacts
+        .iter()
+        .map(|(name, (public, server, private))| OleanModuleInput {
+            name,
+            artifact: public,
+            server_artifact: server.as_deref(),
+            private_artifact: private.as_deref(),
+        })
+        .collect();
+    let mut admission =
+        SourceOleanImportLimits::new(OleanCheckLimits::new(stack, Budget::for_stack_bytes(stack)));
+    admission.jobs = OleanFrontierJobs {
+        threads: std::num::NonZeroUsize::new(1).unwrap(),
+        worker_stack_bytes: stack,
+    };
+    Engine::from_environment(Environment::new())
+        .import_olean_modules_for_source(&inputs, &[root], &KVMap::new(), admission)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine
+}
+
 fn encode(module: &fln_olean::ir::IrModule, original: &[u8]) -> Vec<u8> {
     let view = OleanView::parse(original).unwrap();
     let metadata = view.module_data(WalkBudget::default()).unwrap();
@@ -1236,7 +1292,7 @@ fn consume_ir(
     Command::new(lean)
         .current_dir(dir)
         .env("LEAN_PATH", dir)
-        .args(["--run", &filename])
+        .args(["-j", "1", "--run", &filename])
         .output()
         .unwrap()
 }
@@ -1507,6 +1563,201 @@ fn the_pin_executes_native_compiler_output_and_observes_changed_bodies() {
         }
         std::fs::write(dir.join("NativeIrCase.ir"), bytes).unwrap();
     }
+}
+
+#[test]
+fn the_pin_executes_imported_string_source_exports() {
+    let Some(lean) = reference() else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "pinned Reference is required"
+        );
+        eprintln!("SKIP: imported String IR exports require the pin");
+        return;
+    };
+    let lib = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| lean.parent().unwrap().parent().unwrap().join("lib/lean"));
+    assert!(lib.is_dir(), "the pinned Reference library is required");
+    let pin = include_str!("../../../SUITE.lock")
+        .lines()
+        .find(|s| s.starts_with("reference "))
+        .unwrap()
+        .split_whitespace()
+        .find_map(|s| s.strip_prefix("commit="))
+        .unwrap();
+    let identity = Command::new(&lean).arg("--githash").output().unwrap();
+    assert!(identity.status.success());
+    assert_eq!(String::from_utf8(identity.stdout).unwrap().trim(), pin);
+
+    // Import the real checked String declarations, including their extern
+    // journal and private/server companions. A name-shaped fixture is not
+    // sufficient authority for these source intrinsics.
+    let stack = 256 * 1024 * 1024;
+    std::thread::Builder::new()
+        .stack_size(stack)
+        .spawn(move || {
+            let base = imported_strings(&lib, stack);
+            let options = KVMap::new();
+            let original_root = base.logical_root(&options);
+            let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            struct Case {
+                native: &'static str,
+                ty: &'static str,
+                expression: &'static str,
+                application: &'static str,
+                expected: &'static str,
+                heap_expected: &'static str,
+            }
+            for case in [
+                Case {
+                    native: "String.length",
+                    ty: "String -> Nat",
+                    expression: "fun s => String.length s",
+                    application: "(compiled \"\", compiled \"é😀a\", compiled \"é\")",
+                    expected: "(0, 3, 2)",
+                    heap_expected: "(8, \"fresh λ😀\")",
+                },
+                Case {
+                    native: "String.Internal.length",
+                    ty: "String -> Nat",
+                    expression: "fun s => String.Internal.length s",
+                    application: "(compiled \"\", compiled \"é😀a\", compiled \"é\")",
+                    expected: "(0, 3, 2)",
+                    heap_expected: "(8, \"fresh λ😀\")",
+                },
+                Case {
+                    native: "String.utf8ByteSize",
+                    ty: "String -> Nat",
+                    expression: "fun s => String.utf8ByteSize s",
+                    application: "(compiled \"\", compiled \"é😀a\", compiled \"é\")",
+                    expected: "(0, 7, 3)",
+                    heap_expected: "(12, \"fresh λ😀\")",
+                },
+                Case {
+                    native: "String.Internal.append",
+                    ty: "String -> String",
+                    expression: "fun s => String.Internal.append s s",
+                    application: "(compiled \"\", compiled \"é😀a\", compiled \"é\")",
+                    expected: "(\"\", \"é😀aé😀a\", \"éé\")",
+                    heap_expected: "(\"fresh λ😀fresh λ😀\", \"fresh λ😀\")",
+                },
+                Case {
+                    native: "String.append",
+                    ty: "String -> String",
+                    expression: "fun s => String.append s s",
+                    application: "(compiled \"\", compiled \"é😀a\", compiled \"é\")",
+                    expected: "(\"\", \"é😀aé😀a\", \"éé\")",
+                    heap_expected: "(\"fresh λ😀fresh λ😀\", \"fresh λ😀\")",
+                },
+                Case {
+                    native: "String.decEq",
+                    ty: "String -> Bool",
+                    expression: "fun s => decide (s = \"fresh λ😀\")",
+                    application: "(compiled \"\", compiled \"fresh λ😀\", compiled \"fresh λ😃\")",
+                    expected: "(false, true, false)",
+                    heap_expected: "(true, \"fresh λ😀\")",
+                },
+            ] {
+                let source = format!("def compiled : {} := {}", case.ty, case.expression);
+                let (declaration, checked) = checked_definition(&base, &source);
+                let mut no_execution = EngineExecutionLimits::new(Budget::for_stack_bytes(stack));
+                no_execution.vm.max_steps = 0;
+                let compiled = ir::compile_source_definition(
+                    &base,
+                    declaration,
+                    &options,
+                    no_execution,
+                    CompileLimits::default(),
+                )
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+                .into_complete()
+                .unwrap();
+                assert_eq!(compiled.admission.result_logical_root, checked.logical_root(&options));
+                assert_eq!(base.logical_root(&options), original_root);
+                let native = name(case.native);
+                assert!(compiled.module.decls.iter().any(|declaration| {
+                    let IrDecl::Function { body, .. } = declaration else { return false };
+                    body.bodies().iter().any(|body| body.stmts.iter().any(|stmt| {
+                        matches!(stmt, IrStmt::VDecl { expr: IrExpr::Fap { function, .. }, .. } if function == &native)
+                    }))
+                }), "{} must actually call its native primitive", case.native);
+
+                let unique = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let dir = root.join(format!(
+                    "native-string-export-{}-{unique}-{}",
+                    std::process::id(),
+                    case.native,
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("NativeIrCase.lean"),
+                    format!("module\npublic opaque compiled : {} := {}\n", case.ty, case.expression),
+                ).unwrap();
+                let generated = Command::new(&lean)
+                    .current_dir(&dir)
+                    .args(["-j", "1", "-o", "NativeIrCase.olean", "NativeIrCase.lean"])
+                    .output()
+                    .unwrap();
+                std::fs::write(dir.join("compile.stdout"), &generated.stdout).unwrap();
+                std::fs::write(dir.join("compile.stderr"), &generated.stderr).unwrap();
+                assert!(generated.status.success(), "{source}: {} {}",
+                    String::from_utf8_lossy(&generated.stdout),
+                    String::from_utf8_lossy(&generated.stderr));
+                let original = std::fs::read(dir.join("NativeIrCase.ir")).unwrap();
+                std::fs::write(dir.join("original.ir"), &original).unwrap();
+                // Heap input and the caller's retained alias exercise native
+                // ownership, including passing the same String to append's
+                // consuming first operand and borrowed second operand.
+                std::fs::write(dir.join("heap-input.txt"), "fresh λ😀").unwrap();
+                let probe = RuntimeProbe {
+                    ty: case.ty,
+                    application: case.application,
+                    entry: "compiled",
+                    check_meta: true,
+                    higher_universe: false,
+                    heap_call: Some("compiled saved"),
+                };
+                let expected = format!("{}\n{}\n{}", case.expected, case.expected, case.heap_expected);
+                assert_probe(consume_ir(&lean, &dir, "string", &probe), &dir, "runtime-reference", &expected);
+                let bytes = encode(&compiled.module, &original);
+                std::fs::write(dir.join("native.ir"), &bytes).unwrap();
+                std::fs::write(dir.join("NativeIrCase.ir"), &bytes).unwrap();
+                assert_probe(consume_ir(&lean, &dir, "string", &probe), &dir, "runtime-native", &expected);
+
+                if case.native == "String.length" {
+                    // Change only the emitted call, retaining identical source
+                    // companions. A runtime lookup must observe byte length,
+                    // proving it consumed this physical native IR body.
+                    let mut mutant = compiled.module.clone();
+                    let mut switched = 0;
+                    for declaration in &mut mutant.decls {
+                        let IrDecl::Function { body, .. } = declaration else { continue };
+                        for stmt in &mut body.stmts {
+                            if let IrStmt::VDecl { expr: IrExpr::Fap { function, .. }, .. } = stmt {
+                                if function == &native {
+                                    *function = name("String.utf8ByteSize");
+                                    switched += 1;
+                                }
+                            }
+                        }
+                    }
+                    assert!(switched > 0, "the native-call mutation must not be vacuous");
+                    std::fs::write(dir.join("NativeIrCase.ir"), encode(&mutant, &original)).unwrap();
+                    assert_probe(consume_ir(&lean, &dir, "string", &probe), &dir,
+                        "runtime-byte-size-mutant", "(0, 7, 3)\n(0, 7, 3)\n(12, \"fresh λ😀\")");
+                    std::fs::write(dir.join("NativeIrCase.ir"), bytes).unwrap();
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]

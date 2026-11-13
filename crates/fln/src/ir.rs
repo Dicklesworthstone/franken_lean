@@ -163,7 +163,14 @@ fn native_signature(row: &str) -> Result<(&'static [fir::ValueType], fir::ValueT
         | "extern:Nat.shiftRight" => Ok((&[Nat, Nat], Nat)),
         "extern:Nat.pred" | "extern:Nat.log2" => Ok((&[Nat], Nat)),
         "extern:Nat.beq" | "extern:Nat.ble" => Ok((&[Nat, Nat], Bool)),
-        "extern:String.append" => Ok((&[Text, Text], Text)),
+        // These native ABIs have the same ownership as their checked FIR rows.
+        // Internal.isEmpty/isPrefixOf are deliberately absent: their native
+        // bodies consume strings, while their Golem rows borrow the operands.
+        "extern:String.append" | "extern:String.Internal.append" => Ok((&[Text, Text], Text)),
+        "extern:String.length" | "extern:String.Internal.length" | "extern:String.utf8ByteSize" => {
+            Ok((&[Text], Nat))
+        }
+        "extern:String.decEq" => Ok((&[Text, Text], Bool)),
         _ => Err(unsupported("native intrinsic signature")),
     }
 }
@@ -2090,28 +2097,110 @@ mod tests {
 
     #[test]
     fn compiler_refuses_forged_native_intrinsic_contracts() {
-        let valid = fir::IntrinsicDecl {
-            id: fir::IntrinsicId::new(0),
-            row: "extern:Nat.add".into(),
-            arguments: vec![fir::ValueType::Nat, fir::ValueType::Nat],
-            argument_ownership: vec![flbc::ArgumentOwnership::Borrowed; 2],
-            result: fir::ValueType::Nat,
-            result_ownership: flbc::ResultOwnership::Owned,
-            effect: fir::EffectClass::Pure,
-        };
-        validate_native(&valid, &mut Budget(1_000)).unwrap();
-        for changed in 0..4 {
-            let mut forged = valid.clone();
-            match changed {
-                0 => forged.arguments[0] = fir::ValueType::String,
-                1 => forged.result = fir::ValueType::Bool,
-                2 => forged.argument_ownership[0] = flbc::ArgumentOwnership::Owned,
-                3 => forged.effect = fir::EffectClass::Io,
-                _ => unreachable!(),
+        use fir::ValueType::{Bool, Nat, String as Text};
+        use flbc::ArgumentOwnership::{Borrowed, Owned};
+        use flbc::ResultOwnership;
+        for (row, arguments, argument_ownership, result, result_ownership) in [
+            (
+                "extern:Nat.add",
+                vec![Nat, Nat],
+                vec![Borrowed; 2],
+                Nat,
+                ResultOwnership::Owned,
+            ),
+            (
+                "extern:String.append",
+                vec![Text, Text],
+                vec![Owned, Borrowed],
+                Text,
+                ResultOwnership::Owned,
+            ),
+            (
+                "extern:String.Internal.append",
+                vec![Text, Text],
+                vec![Owned, Borrowed],
+                Text,
+                ResultOwnership::Owned,
+            ),
+            (
+                "extern:String.length",
+                vec![Text],
+                vec![Borrowed],
+                Nat,
+                ResultOwnership::Owned,
+            ),
+            (
+                "extern:String.Internal.length",
+                vec![Text],
+                vec![Borrowed],
+                Nat,
+                ResultOwnership::Owned,
+            ),
+            (
+                "extern:String.utf8ByteSize",
+                vec![Text],
+                vec![Borrowed],
+                Nat,
+                ResultOwnership::Owned,
+            ),
+            (
+                "extern:String.decEq",
+                vec![Text, Text],
+                vec![Borrowed; 2],
+                Bool,
+                ResultOwnership::Scalar,
+            ),
+        ] {
+            let valid = fir::IntrinsicDecl {
+                id: fir::IntrinsicId::new(0),
+                row: row.into(),
+                arguments,
+                argument_ownership,
+                result,
+                result_ownership,
+                effect: fir::EffectClass::Pure,
+            };
+            validate_native(&valid, &mut Budget(1_000)).unwrap();
+            for changed in 0..5 {
+                let mut forged = valid.clone();
+                match changed {
+                    0 => {
+                        forged.arguments[0] = if valid.arguments[0] == Text {
+                            Nat
+                        } else {
+                            Text
+                        }
+                    }
+                    1 => forged.result = if valid.result == Bool { Nat } else { Bool },
+                    2 => {
+                        forged.argument_ownership[0] = if valid.argument_ownership[0] == Borrowed {
+                            Owned
+                        } else {
+                            Borrowed
+                        }
+                    }
+                    3 => forged.effect = fir::EffectClass::Io,
+                    4 => forged.result_ownership = ResultOwnership::Borrowed,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    matches!(
+                        validate_native(&forged, &mut Budget(1_000)),
+                        Err(CompileError::Unsupported { .. })
+                    ),
+                    "{row}: mutation {changed}"
+                );
             }
+        }
+        for row in [
+            "extern:String.Internal.isEmpty",
+            "extern:String.Internal.isPrefixOf",
+        ] {
             assert!(matches!(
-                validate_native(&forged, &mut Budget(1_000)),
-                Err(CompileError::Unsupported { .. })
+                native_signature(row),
+                Err(CompileError::Unsupported {
+                    what: "native intrinsic signature"
+                })
             ));
         }
     }
