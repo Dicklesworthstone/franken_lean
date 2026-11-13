@@ -649,6 +649,26 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          `the_two_readings_stop_at_different_walls`. Nothing per commit re-derives the corpus \
          figures, and no coverage row may cite this function as a CI run",
     ),
+    (
+        "crates/fln-conformance/tests/kernel_replay.rs",
+        "selected_real_module_units_resource_probe",
+        "not evidence for any claim — the multi-unit companion to \
+         `selected_real_module_resource_probe` so localizing which declaration(s) in a \
+         provisioned module cross a step threshold decodes the import closure once rather than \
+         `N` times. NOTHING compensates per commit by design, and no coverage row may cite it",
+    ),
+    (
+        "crates/fln-conformance/tests/kernel_replay.rs",
+        "s26_k1_step_regression_units_accept_within_their_step_ceilings",
+        "an on-demand Mathlib three-closure step-band regression lane (~17 min release across \
+         ~2,635..2,905 modules, requires FLN_MATHLIB_CORPUS; bead \
+         fln-frontier-k1-step-stops-since-s25-uvm6 comments 12658 and 12659). Compensated per \
+         commit by `fln-core::lib::expr::tests::alpha_equiv_matches_pin_expr_eq_fn_false_and_remains_stack_safe` \
+         and `fln-kernel::lib::tc::tests::{equiv_manager_closes_transitivity_and_congruence_while_invalidating_stale_scopes, \
+         lazy_delta_compares_same_regular_head_arguments_before_unfolding, \
+         delta_priority_ranks_regular_zero_strictly_above_theorems_and_opaque_hints}`; no \
+         coverage row may cite this ignored function as CI-executed evidence",
+    ),
 ];
 
 /// The ratchet for [`IGNORED_PRODUCER_ALLOWANCE`], by equality, for the reason
@@ -757,7 +777,12 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// pin-gated unit tests that hold the native String rows per commit.
 /// 29 -> 32 on 2026-11-04: disclose two existing scheduled whole-Init regressions and the
 /// existing explicit String inventory generator. No test becomes ignored in this change.
-const IGNORED_PRODUCER_CEILING: usize = 32;
+/// 32 -> 34 on 2026-11-13: declare the two `kernel_replay` on-demand Mathlib lanes that landed
+/// `#[ignore]`d and undeclared during `fln-frontier-k1-step-stops-since-s25-uvm6` diagnosis
+/// (`selected_real_module_units_resource_probe` and
+/// `s26_k1_step_regression_units_accept_within_their_step_ceilings`), disclosed rather than
+/// smoothed, alongside removing the ignored citation from `uvm6`'s coverage row.
+const IGNORED_PRODUCER_CEILING: usize = 34;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
