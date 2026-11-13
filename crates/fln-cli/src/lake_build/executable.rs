@@ -65,6 +65,7 @@ fn program(
         }
         Ok(Some(location))
     })?;
+    sources.verify_configurations()?;
     let first = modules
         .remove(&entry)
         .ok_or_else(|| Failure::new("internal-fault", "executable root was not captured"))?;

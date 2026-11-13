@@ -1186,11 +1186,11 @@ pub enum LakeUpdateError {
     Discovery(LakeDiscoveryError),
     Io(String),
     Parse(String),
-    /// The configuration declares requirements, and resolving one means
-    /// fetching it and recording the commit it resolved to. No fetch exists
-    /// yet (the D2 subprocess protocol, bead `fln-7k0`), so no manifest is
-    /// written: an entry whose `rev` is a copy of the requested revision
-    /// would claim a resolution that never happened.
+    /// A selected remote requirement needs materialization and a resolved
+    /// commit. Fetching is not implemented (the D2 subprocess protocol, bead
+    /// `fln-7k0`), so no manifest is written. Local path requirements resolve
+    /// without fetching; a requested remote revision is never copied into a
+    /// resolved `rev` as a substitute for materialization.
     DependencyResolutionUnavailable {
         requirements: Vec<String>,
     },
@@ -1268,10 +1268,7 @@ struct ManifestParser<'a> {
 
 impl<'a> ManifestParser<'a> {
     fn error(&self, reason: &str) -> ManifestParseError {
-        ManifestParseError::Invalid(format!(
-            "manifest JSON at byte {}: {reason}",
-            self.offset,
-        ))
+        ManifestParseError::Invalid(format!("manifest JSON at byte {}: {reason}", self.offset,))
     }
 
     fn peek(&self) -> Option<u8> {
@@ -1505,9 +1502,7 @@ fn manifest_string(
 ) -> Result<String, String> {
     match fields.get(key) {
         Some(ManifestJson::String(value)) => Ok(value.clone()),
-        None | Some(ManifestJson::Null) if default.is_some() => {
-            Ok(default.unwrap().to_owned())
-        }
+        None | Some(ManifestJson::Null) if default.is_some() => Ok(default.unwrap().to_owned()),
         None => Err(format!("missing '{key}' field")),
         _ => Err(format!("'{key}' must be a string")),
     }
@@ -1598,7 +1593,11 @@ pub fn canonical_package_name(name: &str) -> String {
     }
 }
 
-fn manifest_bool(fields: &ManifestFields, key: &str, default: Option<bool>) -> Result<bool, String> {
+fn manifest_bool(
+    fields: &ManifestFields,
+    key: &str,
+    default: Option<bool>,
+) -> Result<bool, String> {
     match fields.get(key) {
         Some(ManifestJson::Bool(value)) => Ok(*value),
         None | Some(ManifestJson::Null) if default.is_some() => Ok(default.unwrap()),
@@ -1630,9 +1629,9 @@ fn manifest_version(fields: &ManifestFields) -> Result<String, String> {
             };
             let parts: Vec<_> = core.split('.').collect();
             if parts.len() != 3
-                || parts.iter().any(|part| {
-                    part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit())
-                })
+                || parts
+                    .iter()
+                    .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
             {
                 return Err("manifest version must have three numeric components".to_owned());
             }
@@ -1739,19 +1738,23 @@ impl Manifest {
     }
 
     pub fn to_json(&self) -> String {
-        let version = if !self.version.is_empty()
-            && self.version.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            self.version.clone()
-        } else {
-            manifest_quote(&self.version)
-        };
+        let version =
+            if !self.version.is_empty() && self.version.bytes().all(|byte| byte.is_ascii_digit()) {
+                self.version.clone()
+            } else {
+                manifest_quote(&self.version)
+            };
         let mut out = format!(
             "{{\n  \"name\": {},\n  \"version\": {version},\n  \"lakeDir\": {},\n  \"fixedToolchain\": {},\n  \"packagesDir\": {},\n  \"packages\": [\n",
             manifest_quote(&self.name),
             manifest_quote(&self.lake_dir.to_string_lossy()),
             self.fixed_toolchain,
-            manifest_optional_json(self.packages_dir.as_ref().map(|p| p.to_string_lossy()).as_deref()),
+            manifest_optional_json(
+                self.packages_dir
+                    .as_ref()
+                    .map(|p| p.to_string_lossy())
+                    .as_deref()
+            ),
         );
         for (index, package) in self.packages.iter().enumerate() {
             out.push_str(&format!(
@@ -1766,7 +1769,9 @@ impl Manifest {
             if package.entry_type == "path" {
                 out.push_str(&format!(
                     ",\n      \"dir\": {}",
-                    manifest_optional_json(package.dir.as_ref().map(|p| p.to_string_lossy()).as_deref()),
+                    manifest_optional_json(
+                        package.dir.as_ref().map(|p| p.to_string_lossy()).as_deref()
+                    ),
                 ));
             } else {
                 for (key, value) in [
@@ -1895,25 +1900,474 @@ impl Manifest {
     }
 }
 
-/// Write `lake-manifest.json` for a package with no requirements.
+/// Resolve the bounded local TOML dependency graph and publish its manifest.
 ///
-/// A package that declares requirements is refused with
-/// [`LakeUpdateError::DependencyResolutionUnavailable`] and nothing is written.
-/// Until 2026-10-07 this copied each requested `rev` into the manifest's
-/// resolved `rev`, fetched nothing, and returned `Ok` (bead
-/// `fln-front-door-residuals-0f6x`).
+/// This is a bare update: the root's previous selection is replaced from its
+/// current requirements. Direct requirements win before dependency manifests
+/// are inherited, and the remaining graph follows the pin's reverse
+/// breadth-first order (Lake/Load/Resolve.lean). No dependency is modified.
+/// Git fetching, executable configuration, custom selectors and toolchain
+/// changes remain explicit unavailable outcomes. Every input is rechecked
+/// before the one atomic root-manifest publication.
 pub fn update_manifest(dir: &Path) -> Result<Manifest, LakeUpdateError> {
-    let config = LakeConfig::discover(dir).map_err(LakeUpdateError::Discovery)?;
-    if !config.requires.is_empty() {
+    use std::collections::BTreeMap;
+
+    let root = fs::canonicalize(dir).map_err(|error| LakeUpdateError::Io(error.to_string()))?;
+    let mut inputs = Vec::new();
+    let mut input_bytes = 0usize;
+    let (config, toolchain) =
+        update_package_configuration(&root, false, &mut inputs, &mut input_bytes)?;
+    let previous = capture_update_input(
+        &root,
+        Path::new("lake-manifest.json"),
+        1024 * 1024,
+        &mut inputs,
+        &mut input_bytes,
+    )?;
+    if let Some(bytes) = &previous {
+        match parse_update_manifest(bytes) {
+            Ok(manifest) => {
+                if manifest.packages_dir.as_ref().is_some_and(|path| {
+                    path.components()
+                        .filter(|component| !matches!(component, std::path::Component::CurDir))
+                        .ne(Path::new(".lake/packages").components())
+                }) {
+                    return Err(LakeUpdateError::Unsupported(
+                        "updating a manifest with a custom packagesDir requires package-directory relocation"
+                            .to_owned(),
+                    ));
+                }
+            }
+            // The pin's bare update deliberately rebuilds a malformed root
+            // manifest. A resource stop is not a malformed-input judgment.
+            Err(LakeUpdateError::Parse(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if config.requires.len() > LOCAL_UPDATE_MAX_REQUIREMENTS {
+        return Err(LakeUpdateError::Resource(
+            "local requirement count exceeds 4096".to_owned(),
+        ));
+    }
+    let mut manifest = Manifest::new(&config.name);
+    let mut locked = BTreeMap::new();
+    // Reserve ALL direct names before importing any child's manifest. Without
+    // this phase a child's lock could override a later direct requirement.
+    for requirement in config.requires.iter().rev() {
+        let path = requirement.path.as_ref().ok_or_else(|| {
+            LakeUpdateError::DependencyResolutionUnavailable {
+                requirements: vec![requirement.name.clone()],
+            }
+        })?;
+        locked
+            .entry(requirement.name.clone())
+            .or_insert_with(|| local_update_entry(requirement.name.clone(), path.clone(), false));
+    }
+    let mut selected = BTreeMap::from([(config.name.clone(), 0usize)]);
+    let mut packages = vec![LocalUpdatePackage {
+        relative: PathBuf::from("."),
+        config,
+        entry: None,
+    }];
+    let mut edges = vec![Vec::new()];
+    let mut requirements = 0usize;
+    let mut next = 0usize;
+    while next < packages.len() {
+        let declared = packages[next].config.requires.clone();
+        requirements = requirements
+            .checked_add(declared.len())
+            .filter(|count| *count <= LOCAL_UPDATE_MAX_REQUIREMENTS)
+            .ok_or_else(|| {
+                LakeUpdateError::Resource("local requirement count exceeds 4096".to_owned())
+            })?;
+        for requirement in declared.iter().rev() {
+            if let Some(&index) = selected.get(&requirement.name) {
+                edges[next].push(index);
+                continue;
+            }
+            if packages.len() >= LOCAL_UPDATE_MAX_PACKAGES {
+                return Err(LakeUpdateError::Resource(
+                    "local package count exceeds 64".to_owned(),
+                ));
+            }
+            let mut entry = if let Some(entry) = locked.get(&requirement.name) {
+                entry.clone()
+            } else {
+                let path = requirement.path.as_ref().ok_or_else(|| {
+                    LakeUpdateError::DependencyResolutionUnavailable {
+                        requirements: vec![requirement.name.clone()],
+                    }
+                })?;
+                local_update_entry(
+                    requirement.name.clone(),
+                    packages[next].relative.join(path),
+                    true,
+                )
+            };
+            if entry.entry_type != "path" {
+                return Err(LakeUpdateError::DependencyResolutionUnavailable {
+                    requirements: vec![entry.name.clone()],
+                });
+            }
+            if !matches!(entry.config_file.as_str(), "lakefile" | "lakefile.toml")
+                || entry
+                    .manifest_file
+                    .as_deref()
+                    .is_some_and(|path| path != Path::new("lake-manifest.json"))
+            {
+                return Err(LakeUpdateError::Unsupported(format!(
+                    "dependency {} has a custom configuration or manifest selector",
+                    entry.name,
+                )));
+            }
+            let path = entry.dir.as_deref().ok_or_else(|| {
+                LakeUpdateError::Parse(format!("path dependency {} has no directory", entry.name))
+            })?;
+            let directory = update_dependency_directory(&root, path)?;
+            let relative = relative_update_directory(&root, &directory)?;
+            let (config, dependency_toolchain) = update_package_configuration(
+                &directory,
+                entry.config_file == "lakefile.toml",
+                &mut inputs,
+                &mut input_bytes,
+            )?;
+            if next == 0 && dependency_toolchain.is_some() && dependency_toolchain != toolchain {
+                return Err(LakeUpdateError::Unsupported(format!(
+                    "dependency {} requires toolchain selection; local manifest updates do not change lean-toolchain",
+                    entry.name,
+                )));
+            }
+            entry.dir = Some(relative.clone());
+            entry.config_file = "lakefile.toml".to_owned();
+            entry.manifest_file = Some(PathBuf::from("lake-manifest.json"));
+            locked.insert(entry.name.clone(), entry.clone());
+            if let Some(bytes) = capture_update_input(
+                &directory,
+                Path::new("lake-manifest.json"),
+                1024 * 1024,
+                &mut inputs,
+                &mut input_bytes,
+            )? {
+                let inherited = parse_update_manifest(&bytes)?;
+                for mut inherited_entry in inherited.packages {
+                    if locked.contains_key(&inherited_entry.name) {
+                        continue;
+                    }
+                    if locked.len() >= LOCAL_UPDATE_MAX_REQUIREMENTS {
+                        return Err(LakeUpdateError::Resource(
+                            "local manifest entry count exceeds 4096".to_owned(),
+                        ));
+                    }
+                    inherited_entry.inherited = true;
+                    if let Some(path) = inherited_entry.dir.take() {
+                        inherited_entry.dir = Some(relative.join(path));
+                    }
+                    locked.insert(inherited_entry.name.clone(), inherited_entry);
+                }
+            }
+            let index = packages.len();
+            selected.insert(requirement.name.clone(), index);
+            packages.push(LocalUpdatePackage {
+                relative,
+                config,
+                entry: Some(entry),
+            });
+            edges.push(Vec::new());
+            edges[next].push(index);
+        }
+        next += 1;
+    }
+    fn cyclic(index: usize, edges: &[Vec<usize>], states: &mut [u8]) -> bool {
+        if states[index] != 0 {
+            return states[index] == 1;
+        }
+        states[index] = 1;
+        if edges[index].iter().any(|&next| cyclic(next, edges, states)) {
+            return true;
+        }
+        states[index] = 2;
+        false
+    }
+    if cyclic(0, &edges, &mut vec![0; packages.len()]) {
+        return Err(LakeUpdateError::Parse(
+            "local package dependency cycle".to_owned(),
+        ));
+    }
+    for input in inputs {
+        if read_update_input(&input.root, &input.relative, input.max_bytes)? != input.bytes {
+            return Err(LakeUpdateError::Parse(format!(
+                "Lake configuration or manifest changed during dependency resolution: {}",
+                input.root.join(&input.relative).display(),
+            )));
+        }
+    }
+    manifest.packages = packages
+        .into_iter()
+        .filter_map(|package| package.entry)
+        .collect();
+    manifest
+        .save_to_dir(&root)
+        .map_err(|error| LakeUpdateError::Io(error.to_string()))?;
+    Ok(manifest)
+}
+
+const LOCAL_UPDATE_MAX_PACKAGES: usize = 64;
+const LOCAL_UPDATE_MAX_REQUIREMENTS: usize = 4096;
+const LOCAL_UPDATE_MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
+
+struct LocalUpdatePackage {
+    relative: PathBuf,
+    config: LakeConfig,
+    entry: Option<ManifestPackageEntry>,
+}
+
+struct LocalUpdateInput {
+    root: PathBuf,
+    relative: PathBuf,
+    max_bytes: usize,
+    bytes: Option<Vec<u8>>,
+}
+
+fn local_update_entry(name: String, dir: PathBuf, inherited: bool) -> ManifestPackageEntry {
+    ManifestPackageEntry {
+        name,
+        scope: String::new(),
+        entry_type: "path".to_owned(),
+        dir: Some(dir),
+        url: None,
+        rev: None,
+        input_rev: None,
+        subdir: None,
+        inherited,
+        config_file: "lakefile".to_owned(),
+        manifest_file: Some(PathBuf::from("lake-manifest.json")),
+    }
+}
+
+fn parse_update_manifest(bytes: &[u8]) -> Result<Manifest, LakeUpdateError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| LakeUpdateError::Parse("lake-manifest.json is not UTF-8".to_owned()))?;
+    Manifest::parse_json(text).map_err(|error| match error {
+        ManifestParseError::Invalid(detail) => LakeUpdateError::Parse(detail),
+        ManifestParseError::Resource(detail) => LakeUpdateError::Resource(detail.to_owned()),
+    })
+}
+
+fn capture_update_input(
+    root: &Path,
+    relative: &Path,
+    max_bytes: usize,
+    inputs: &mut Vec<LocalUpdateInput>,
+    input_bytes: &mut usize,
+) -> Result<Option<Vec<u8>>, LakeUpdateError> {
+    let bytes = read_update_input(root, relative, max_bytes)?;
+    *input_bytes = input_bytes
+        .checked_add(bytes.as_ref().map_or(0, Vec::len))
+        .filter(|count| *count <= LOCAL_UPDATE_MAX_INPUT_BYTES)
+        .ok_or_else(|| LakeUpdateError::Resource("local update inputs exceed 4 MiB".to_owned()))?;
+    inputs.push(LocalUpdateInput {
+        root: root.to_path_buf(),
+        relative: relative.to_path_buf(),
+        max_bytes,
+        bytes: bytes.clone(),
+    });
+    Ok(bytes)
+}
+
+fn read_update_input(
+    root: &Path,
+    relative: &Path,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, LakeUpdateError> {
+    use std::io::Read;
+
+    let mut path = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(LakeUpdateError::Unsupported(
+                "custom update input paths are unavailable".to_owned(),
+            ));
+        }
+        path.push(component.as_os_str());
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(LakeUpdateError::Io(format!("{}: {error}", path.display()))),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(LakeUpdateError::Parse(format!(
+                "refusing symlink {}",
+                path.display(),
+            )));
+        }
+        if components.peek().is_some() {
+            if !metadata.is_dir() {
+                return Err(LakeUpdateError::Parse(format!(
+                    "update input parent is not a directory: {}",
+                    path.display(),
+                )));
+            }
+        } else if !metadata.is_file() {
+            return Err(LakeUpdateError::Parse(format!(
+                "update input is not a regular file: {}",
+                path.display(),
+            )));
+        } else if metadata.len() > max_bytes as u64 {
+            return Err(LakeUpdateError::Resource(format!(
+                "update input exceeds {max_bytes} bytes: {}",
+                path.display(),
+            )));
+        }
+    }
+    let file = fs::File::open(&path)
+        .map_err(|error| LakeUpdateError::Io(format!("{}: {error}", path.display())))?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| LakeUpdateError::Io(format!("{}: {error}", path.display())))?;
+    if bytes.len() > max_bytes {
+        return Err(LakeUpdateError::Resource(format!(
+            "update input exceeds {max_bytes} bytes: {}",
+            path.display(),
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+fn update_package_configuration(
+    root: &Path,
+    explicit_toml: bool,
+    inputs: &mut Vec<LocalUpdateInput>,
+    input_bytes: &mut usize,
+) -> Result<(LakeConfig, Option<String>), LakeUpdateError> {
+    for relative in ["lakefile.lean", ".lake/package-overrides.json"] {
+        if relative == "lakefile.lean" && explicit_toml {
+            continue;
+        }
+        if capture_update_input(root, Path::new(relative), 64 * 1024, inputs, input_bytes)?
+            .is_some()
+        {
+            return Err(LakeUpdateError::Unsupported(format!(
+                "local manifest updates do not support {}",
+                root.join(relative).display(),
+            )));
+        }
+    }
+    let bytes = capture_update_input(
+        root,
+        Path::new("lakefile.toml"),
+        64 * 1024,
+        inputs,
+        input_bytes,
+    )?
+    .ok_or_else(|| LakeUpdateError::Discovery(LakeDiscoveryError::NotFound(root.to_path_buf())))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| LakeUpdateError::Parse("lakefile.toml is not UTF-8".to_owned()))?;
+    let unchecked = LakeConfig::parse_toml(text)
+        .map_err(|error| LakeUpdateError::Discovery(LakeDiscoveryError::Parse(error)))?;
+    let unavailable: Vec<_> = unchecked
+        .requires
+        .iter()
+        .filter(|requirement| {
+            requirement.path.is_none()
+                || requirement.url.is_some()
+                || requirement.rev.is_some()
+                || requirement.subdir.is_some()
+        })
+        .map(|requirement| requirement.name.clone())
+        .collect();
+    if !unavailable.is_empty() {
         return Err(LakeUpdateError::DependencyResolutionUnavailable {
-            requirements: config.requires.iter().map(|req| req.name.clone()).collect(),
+            requirements: unavailable,
         });
     }
-    let manifest = Manifest::new(&config.name);
-    manifest
-        .save_to_dir(dir)
-        .map_err(|e| LakeUpdateError::Io(e.to_string()))?;
-    Ok(manifest)
+    let mut config = LakeConfig::parse_toml_for_execution(text).map_err(|error| match error {
+        LakeParseError::UnsupportedBuildSetting(detail) => LakeUpdateError::Unsupported(detail),
+        error => LakeUpdateError::Discovery(LakeDiscoveryError::Parse(error)),
+    })?;
+    config.name = canonical_package_name(&config.name);
+    for requirement in &mut config.requires {
+        requirement.name = canonical_package_name(&requirement.name);
+    }
+    let toolchain =
+        capture_update_input(root, Path::new("lean-toolchain"), 4096, inputs, input_bytes)?
+            .map(|bytes| {
+                String::from_utf8(bytes)
+                    .map(|text| text.trim().to_owned())
+                    .map_err(|_| LakeUpdateError::Parse("lean-toolchain is not UTF-8".to_owned()))
+            })
+            .transpose()?
+            .filter(|text| !text.is_empty());
+    Ok((config, toolchain))
+}
+
+/// Inspect every component BEFORE normalizing away parent components.
+fn update_dependency_directory(root: &Path, path: &Path) -> Result<PathBuf, LakeUpdateError> {
+    use std::path::Component;
+
+    if path.components().count() > 128 {
+        return Err(LakeUpdateError::Resource(
+            "local dependency path exceeds 128 components".to_owned(),
+        ));
+    }
+    let mut cursor = root.to_path_buf();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => {
+                return Err(LakeUpdateError::Unsupported(
+                    "local dependency path has an unsupported platform prefix".to_owned(),
+                ));
+            }
+            Component::RootDir => cursor = PathBuf::from(component.as_os_str()),
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                cursor.pop();
+            }
+            Component::Normal(part) => cursor.push(part),
+        }
+        let metadata = fs::symlink_metadata(&cursor)
+            .map_err(|error| LakeUpdateError::Io(format!("{}: {error}", cursor.display())))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(LakeUpdateError::Parse(format!(
+                "local dependency is not a real directory (refusing symlink): {}",
+                cursor.display(),
+            )));
+        }
+    }
+    fs::canonicalize(&cursor)
+        .map_err(|error| LakeUpdateError::Io(format!("{}: {error}", cursor.display())))
+}
+
+fn relative_update_directory(root: &Path, directory: &Path) -> Result<PathBuf, LakeUpdateError> {
+    let root_components: Vec<_> = root.components().collect();
+    let components: Vec<_> = directory.components().collect();
+    let common = root_components
+        .iter()
+        .zip(&components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let path = if common == 0 {
+        directory.to_path_buf()
+    } else {
+        let mut relative = PathBuf::new();
+        for _ in &root_components[common..] {
+            relative.push("..");
+        }
+        for component in &components[common..] {
+            relative.push(component.as_os_str());
+        }
+        if relative.as_os_str().is_empty() {
+            relative.push(".");
+        }
+        relative
+    };
+    if path.to_str().is_none() {
+        return Err(LakeUpdateError::Unsupported(
+            "manifest dependency paths must be UTF-8".to_owned(),
+        ));
+    }
+    Ok(path)
 }
 
 // ---------------------------------------------------------------------------

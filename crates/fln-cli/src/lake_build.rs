@@ -943,6 +943,7 @@ fn build(
         macro_config.as_ref(),
     )?;
     let destinations = sources.destinations(&artifacts)?;
+    sources.verify_configurations()?;
     let paths = publish_locations_with(&artifacts, &destinations, fln::publish_file_atomic)?;
     let snapshot = record_snapshot(
         &root,

@@ -227,6 +227,42 @@ fn transitive_diamond_and_name_precedence_match_the_pin() {
     assert!(recovered.stderr.is_empty(), "{recovered:?}");
     native.no_products();
     native.no_manifests();
+
+    // Consume a real pin-written lock after the declared paths have changed.
+    // Both implementations must keep the lock's root-relative package choices.
+    let lock = std::fs::read(oracle.0.join("root/lake-manifest.json")).unwrap();
+    for workspace in [&native, &oracle] {
+        workspace.write(
+            "root/lakefile.toml",
+            ROOT.replace("path = \"../right\"", "path = \"../missing-after-lock\""),
+        );
+        workspace.write(
+            "right/lakefile.toml",
+            RIGHT.replace("vendor/shared library", "missing-after-lock"),
+        );
+    }
+    native.write("root/lake-manifest.json", &lock);
+    let pinned_locked = Command::new(&lake)
+        .arg("--dir")
+        .arg(oracle.0.join("root"))
+        .args(args)
+        .env("LEAN_PATH", &lib)
+        .output()
+        .unwrap();
+    assert_eq!(pinned_locked.status.code(), Some(17), "{pinned_locked:?}");
+    assert_eq!(pinned_locked.stdout, pinned.stdout, "{pinned_locked:?}");
+    let native_locked = native.run(&args, Some(&lib));
+    assert_eq!(native_locked.status.code(), Some(17), "{native_locked:?}");
+    assert_eq!(
+        native_locked.stdout, pinned_locked.stdout,
+        "{native_locked:?}"
+    );
+    assert!(native_locked.stderr.is_empty(), "{native_locked:?}");
+    assert_eq!(
+        std::fs::read(native.0.join("root/lake-manifest.json")).unwrap(),
+        lock,
+    );
+    native.no_products();
 }
 
 #[test]
@@ -263,9 +299,8 @@ fn package_cycles_are_refused_like_the_pinned_executable_build() {
 }
 
 #[test]
-fn manifests_overrides_and_lean_configurations_are_never_ignored() {
+fn unlocked_dependency_metadata_and_root_overrides_are_never_ignored() {
     for relative in [
-        "root/lake-manifest.json",
         "right/lake-manifest.json",
         "root/.lake/package-overrides.json",
         "right/.lake/package-overrides.json",
@@ -658,4 +693,474 @@ fn dependency_library_targets_require_explicit_module_selection_for_olean() {
     let report = build_success(workspace.run(&["--json", "build", "+Shared:olean"], None));
     assert!(report.contains("\"modules_built\":1"), "{report}");
     assert!(artifact_paths(&workspace)[3].is_file());
+}
+
+// Handwritten pin-schema data: it is intentionally not serialized by the
+// manifest implementation under test. The earlier duplicate and unused remote
+// row must not cause filesystem probes or network access.
+const LOCKED_MANIFEST: &str = r#"{
+  "version":"1.2.0",
+  "name":"program",
+  "lakeDir":".lake",
+  "packagesDir":".lake/packages",
+  "fixedToolchain":false,
+  "packages":[
+    {"type":"path","name":"right","dir":"../unselected-right","inherited":false,"configFile":"lakefile.toml"},
+    {"type":"git","name":"unused","url":"https://example.invalid/unused","rev":"deadbeef","inherited":true},
+    {"type":"path","name":"left","dir":"../left","inherited":false,"configFile":"lakefile.toml"},
+    {"type":"path","name":"right","dir":"../right","inherited":false,"configFile":"lakefile.toml"},
+    {"type":"path","name":"shared","dir":"../right/vendor/shared library","inherited":true,"configFile":"lakefile.toml"}
+  ]
+}
+"#;
+
+#[test]
+fn root_manifest_locks_transitive_builds_and_checked_record_reuse() {
+    let workspace = artifact_workspace();
+    workspace.write("root/lake-manifest.json", LOCKED_MANIFEST);
+    let configuration = std::fs::read_to_string(workspace.0.join("root/lakefile.toml")).unwrap();
+    workspace.write(
+        "root/lakefile.toml",
+        configuration.replace("path = \"../right\"", "path = \"../missing-config-path\""),
+    );
+    workspace.write(
+        "right/lakefile.toml",
+        format!(
+            "buildDir = \"products\"\n{}",
+            RIGHT.replace("vendor/shared library", "missing-config-path"),
+        ),
+    );
+    // Locked resolution follows the root table, not dependency-local locks or
+    // overrides. An explicit configFile also wins over a sibling Lean file.
+    for relative in [
+        "right/lake-manifest.json",
+        "right/.lake/package-overrides.json",
+        "right/lakefile.lean",
+    ] {
+        workspace.write(relative, "unselected metadata\n");
+    }
+    let report = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(report.contains("\"modules_built\":4"), "{report}");
+    let paths = artifact_paths(&workspace);
+    let original: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            assert!(report.contains(&path.display().to_string()), "{report}");
+            let bytes = std::fs::read(path).unwrap();
+            fln_olean::region::OleanView::parse(&bytes).unwrap();
+            bytes
+        })
+        .collect();
+    let snapshot =
+        std::fs::read_to_string(workspace.0.join("root/output/fln-build.snapshot")).unwrap();
+    assert!(
+        snapshot
+            .lines()
+            .any(|line| line.starts_with("configuration\tlake-manifest.json\t")),
+        "{snapshot}",
+    );
+    assert!(!snapshot.contains("right/lake-manifest.json"), "{snapshot}",);
+    let warm = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(warm.contains("\"modules_cached\":4"), "{warm}");
+    assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
+    for (path, bytes) in paths.iter().zip(original) {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+    assert_eq!(
+        std::fs::read_to_string(workspace.0.join("root/lake-manifest.json")).unwrap(),
+        LOCKED_MANIFEST,
+    );
+    assert!(!workspace.0.join("unselected-right").exists());
+    assert!(!workspace.0.join("missing-config-path").exists());
+}
+
+#[test]
+fn locked_resolution_failures_preserve_every_published_artifact() {
+    let workspace = artifact_workspace();
+    workspace.write("root/lake-manifest.json", LOCKED_MANIFEST);
+    build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    let paths = artifact_paths(&workspace);
+    let original: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let snapshot = workspace.0.join("root/output/fln-build.snapshot");
+    let snapshot_bytes = std::fs::read(&snapshot).unwrap();
+    for (manifest, class, detail) in [
+        ("{invalid".to_owned(), "input", "lake-manifest.json"),
+        (
+            LOCKED_MANIFEST.replace("\"name\":\"shared\"", "\"name\":\"unselected_shared\""),
+            "input",
+            "not in lake-manifest.json",
+        ),
+        (
+            LOCKED_MANIFEST.replace(
+                "\"dir\":\"../right/vendor/shared library\"",
+                "\"dir\":\"../absent-locked-package\"",
+            ),
+            "io",
+            "absent-locked-package",
+        ),
+        (
+            LOCKED_MANIFEST.replace(
+                "\"type\":\"path\",\"name\":\"shared\",\"dir\":\"../right/vendor/shared library\"",
+                "\"type\":\"git\",\"name\":\"shared\",\"url\":\"https://example.invalid/shared\",\"rev\":\"deadbeef\"",
+            ),
+            "unsupported",
+            "only local path dependencies",
+        ),
+        (
+            LOCKED_MANIFEST.replace(
+                "\"configFile\":\"lakefile.toml\"",
+                "\"configFile\":\"custom.toml\"",
+            ),
+            "unsupported",
+            "unsupported configuration",
+        ),
+    ] {
+        workspace.write("root/lake-manifest.json", &manifest);
+        refusal(
+            workspace.run(&["--json", "build", "+App.Top:olean"], None),
+            class,
+            detail,
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.0.join("root/lake-manifest.json")).unwrap(),
+            manifest,
+        );
+        assert_eq!(std::fs::read(&snapshot).unwrap(), snapshot_bytes);
+        for (path, bytes) in paths.iter().zip(&original) {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+            assert!(
+                !path
+                    .ancestors()
+                    .find(|ancestor| ancestor.ends_with("lib/lean"))
+                    .unwrap()
+                    .join(".fln-olean-build.lock")
+                    .exists()
+            );
+        }
+    }
+    workspace.write("root/lake-manifest.json", LOCKED_MANIFEST);
+    workspace.write(
+        "right/vendor/shared library/sources/lib/Shared.lean",
+        "prelude\ndef Shared.identity (A : Type) (a : A) : A := A\n",
+    );
+    let rejected = workspace.run(&["--json", "build", "+App.Top:olean"], None);
+    assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+    assert!(rejected.stdout.is_empty(), "{rejected:?}");
+    for (path, bytes) in paths.iter().zip(original) {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+    assert_eq!(std::fs::read(&snapshot).unwrap(), snapshot_bytes);
+}
+
+#[test]
+fn extensionless_locked_configurations_keep_lean_before_toml_precedence() {
+    let workspace = artifact_workspace();
+    let manifest = LOCKED_MANIFEST.replace(",\"configFile\":\"lakefile.toml\"", "");
+    workspace.write("root/lake-manifest.json", &manifest);
+    let report = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(report.contains("\"modules_built\":4"), "{report}");
+    let paths = artifact_paths(&workspace);
+    let original: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    workspace.write(
+        "right/lakefile.lean",
+        "import Lake\nopen Lake DSL\npackage right\n",
+    );
+    refusal(
+        workspace.run(&["--json", "build", "+App.Top:olean"], None),
+        "unsupported",
+        "lakefile.lean",
+    );
+    for (path, bytes) in paths.iter().zip(original) {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+    // Selecting TOML explicitly is different from choosing the default.
+    workspace.write("root/lake-manifest.json", LOCKED_MANIFEST);
+    build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+}
+
+#[test]
+fn locked_package_cycles_are_refused_before_source_admission() {
+    let workspace = artifact_workspace();
+    workspace.write("root/lake-manifest.json", LOCKED_MANIFEST);
+    workspace.write(
+        "right/lakefile.toml",
+        format!("{RIGHT}\n[[require]]\nname = \"program\"\npath = \"../ignored\"\n"),
+    );
+    refusal(
+        workspace.run(&["--json", "build", "+App.Top:olean"], None),
+        "input",
+        "dependency cycle",
+    );
+    assert!(!workspace.0.join("import-records").exists());
+    workspace.no_products();
+}
+
+#[cfg(unix)]
+#[test]
+fn manifest_selected_paths_cannot_hide_symlinks_before_parent_components() {
+    let workspace = artifact_workspace();
+    std::os::unix::fs::symlink(workspace.0.join("right"), workspace.0.join("alias")).unwrap();
+    workspace.write(
+        "root/lake-manifest.json",
+        LOCKED_MANIFEST.replace("\"dir\":\"../right\"", "\"dir\":\"../alias/../right\""),
+    );
+    refusal(
+        workspace.run(&["--json", "build", "+App.Top:olean"], None),
+        "input",
+        "refusing symlink",
+    );
+    assert!(!workspace.0.join("import-records").exists());
+    workspace.no_products();
+}
+
+#[test]
+fn root_manifest_changes_invalidate_build_explanations_without_publishing() {
+    let workspace = artifact_workspace();
+    workspace.write("root/lake-manifest.json", LOCKED_MANIFEST);
+    build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    let original = artifact_paths(&workspace).map(|path| std::fs::read(path).unwrap());
+    workspace.write("root/lake-manifest.json", format!("{LOCKED_MANIFEST}\n"));
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["build", "explain", "--json", "--dir"])
+        .arg(workspace.0.join("root"))
+        .env("LEAN_PATH", workspace.0.join("absent-imports"))
+        .env("FLN_IMPORT_REUSE_DIR", workspace.0.join("import-records"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        report.contains("\"reference_decision\":\"rebuild\""),
+        "{report}"
+    );
+    assert!(report.contains("lake-manifest.json"), "{report}");
+    assert!(report.contains("configuration"), "{report}");
+    for (path, bytes) in artifact_paths(&workspace).into_iter().zip(original) {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn malformed_root_manifest_is_rejected_even_without_requirements() {
+    let workspace = artifact_workspace();
+    workspace.write(
+        "root/lakefile.toml",
+        "name = \"root\"\n[[lean_lib]]\nname = \"App\"\n",
+    );
+    workspace.write("root/lake-manifest.json", "{\"packages\":[]");
+    refusal(
+        workspace.run(&["--json", "build", "+App.Top:olean"], None),
+        "input",
+        "lake-manifest.json",
+    );
+    assert!(!workspace.0.join("import-records").exists());
+    workspace.no_products();
+}
+
+#[test]
+fn manifest_identities_match_hyphenated_toml_names_and_quoted_duplicates() {
+    let workspace = artifact_workspace();
+    let configuration = std::fs::read_to_string(workspace.0.join("root/lakefile.toml")).unwrap();
+    workspace.write(
+        "root/lakefile.toml",
+        configuration.replace("name = \"left\"", "name = \"left-package\""),
+    );
+    let manifest = LOCKED_MANIFEST
+        .replace("\"name\":\"left\"", "\"name\":\"«left-package»\"")
+        .replace(
+            "\"name\":\"right\",\"dir\":\"../right\"",
+            "\"name\":\"«right»\",\"dir\":\"../right\"",
+        );
+    workspace.write("root/lake-manifest.json", &manifest);
+    let report = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(report.contains("\"modules_built\":4"), "{report}");
+    for path in artifact_paths(&workspace) {
+        fln_olean::region::OleanView::parse(&std::fs::read(path).unwrap()).unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(workspace.0.join("root/lake-manifest.json")).unwrap(),
+        manifest,
+    );
+    assert!(!workspace.0.join("unselected-right").exists());
+}
+
+#[test]
+fn quoted_self_requirements_share_the_roots_canonical_package_identity() {
+    let workspace = artifact_workspace();
+    let configuration = std::fs::read_to_string(workspace.0.join("root/lakefile.toml")).unwrap();
+    workspace.write(
+        "root/lakefile.toml",
+        configuration.replace("name = \"program\"", "name = \"root-package\""),
+    );
+    workspace.write("root/lake-manifest.json", LOCKED_MANIFEST);
+    workspace.write(
+        "right/lakefile.toml",
+        format!("{RIGHT}\n[[require]]\nname = \"«root-package»\"\npath = \"../ignored\"\n",),
+    );
+    refusal(
+        workspace.run(&["--json", "build", "+App.Top:olean"], None),
+        "input",
+        "dependency cycle",
+    );
+    assert!(!workspace.0.join("import-records").exists());
+    workspace.no_products();
+}
+
+#[test]
+fn local_update_publishes_a_lock_for_checked_builds_and_preserves_it_on_refusal() {
+    let workspace = artifact_workspace();
+    let configuration = std::fs::read_to_string(workspace.0.join("root/lakefile.toml")).unwrap();
+    let report = build_success(workspace.run(&["--json", "update"], None));
+    assert!(
+        report.contains("\"schema\":\"fln.lake-update/1\""),
+        "{report}"
+    );
+    assert!(report.contains("\"packages_count\":3"), "{report}");
+    let manifest_path = workspace.0.join("root/lake-manifest.json");
+    let manifest = std::fs::read(&manifest_path).unwrap();
+    for package in ["left", "right", "right/vendor/shared library"] {
+        assert!(
+            !workspace
+                .0
+                .join(package)
+                .join("lake-manifest.json")
+                .exists()
+        );
+    }
+    workspace.no_products();
+    let upgraded = build_success(workspace.run(&["--json", "upgrade"], None));
+    assert!(upgraded.contains("\"packages_count\":3"), "{upgraded}");
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest);
+
+    let built = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(built.contains("\"modules_built\":4"), "{built}");
+    let paths = artifact_paths(&workspace);
+    let original: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let bytes = std::fs::read(path).unwrap();
+            fln_olean::region::OleanView::parse(&bytes).unwrap();
+            bytes
+        })
+        .collect();
+    let warm = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(warm.contains("\"modules_cached\":4"), "{warm}");
+    assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
+    let snapshot = workspace.0.join("root/output/fln-build.snapshot");
+    let snapshot_bytes = std::fs::read(&snapshot).unwrap();
+    let unchanged = || {
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), snapshot_bytes);
+        for (path, before) in paths.iter().zip(&original) {
+            assert_eq!(&std::fs::read(path).unwrap(), before);
+        }
+        for package in ["left", "right", "right/vendor/shared library"] {
+            assert!(
+                !workspace
+                    .0
+                    .join(package)
+                    .join("lake-manifest.json")
+                    .exists()
+            );
+        }
+    };
+
+    // Selective refreshes and unimplemented flags must fail before resolution.
+    for arguments in [
+        ["--json", "update", "right"],
+        ["--json", "upgrade", "--wfail"],
+    ] {
+        let output = workspace.run(&arguments, None);
+        assert_eq!(output.status.code(), Some(5), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let error = std::str::from_utf8(&output.stderr).unwrap();
+        assert!(error.contains("\"status\":\"not_implemented\""), "{error}");
+        unchanged();
+    }
+
+    workspace.write(
+        "root/lakefile.toml",
+        configuration.replace("path = \"../right\"", "path = \"../missing\\\"dependency\""),
+    );
+    let missing = workspace.run(&["--json", "update"], None);
+    assert_eq!(missing.status.code(), Some(1), "{missing:?}");
+    assert!(missing.stdout.is_empty(), "{missing:?}");
+    let error = std::str::from_utf8(&missing.stderr).unwrap();
+    assert!(error.contains("\"status\":\"error\""), "{error}");
+    assert!(error.contains("missing\\\"dependency"), "{error}");
+    assert_eq!(error.lines().count(), 1, "{error}");
+    unchanged();
+
+    workspace.write(
+        "root/lakefile.toml",
+        format!("{configuration}#{}\n", "x".repeat(1024 * 1024)),
+    );
+    refusal(
+        workspace.run(&["--json", "update"], None),
+        "resource",
+        "fln.lake-update/1",
+    );
+    unchanged();
+
+    workspace.write(
+        "root/lakefile.toml",
+        configuration.replace(
+            "path = \"../right\"",
+            "git = \"https://example.invalid/never-fetch.git\"",
+        ),
+    );
+    let remote = workspace.run(&["--json", "update"], None);
+    assert_eq!(remote.status.code(), Some(5), "{remote:?}");
+    assert!(remote.stdout.is_empty(), "{remote:?}");
+    assert!(
+        std::str::from_utf8(&remote.stderr)
+            .unwrap()
+            .contains("\"status\":\"not_implemented\""),
+        "{remote:?}",
+    );
+    unchanged();
+
+    workspace.write("root/lakefile.toml", &configuration);
+    workspace.write(
+        "root/lakefile.lean",
+        "import Lake\nopen Lake DSL\npackage program\n",
+    );
+    let unsupported = workspace.run(&["--json", "upgrade"], None);
+    assert_eq!(unsupported.status.code(), Some(5), "{unsupported:?}");
+    assert!(unsupported.stdout.is_empty(), "{unsupported:?}");
+    assert!(
+        std::str::from_utf8(&unsupported.stderr)
+            .unwrap()
+            .contains("\"status\":\"not_implemented\""),
+        "{unsupported:?}",
+    );
+    unchanged();
+}
+
+#[test]
+fn local_update_lock_drives_the_installed_native_executable() {
+    let Some((_, lib)) = reference() else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let report = build_success(workspace.run(&["--json", "update"], None));
+    assert!(report.contains("\"packages_count\":3"), "{report}");
+    let manifest_path = workspace.0.join("root/lake-manifest.json");
+    let manifest = std::fs::read(&manifest_path).unwrap();
+    let output = workspace.run(&["exe", "runner", "updated"], Some(&lib));
+    assert_eq!(output.status.code(), Some(17), "{output:?}");
+    assert_eq!(
+        std::str::from_utf8(&output.stdout).unwrap(),
+        "left:chosen:updated\nright:chosen:updated\n",
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(std::fs::read(manifest_path).unwrap(), manifest);
+    workspace.no_products();
 }
