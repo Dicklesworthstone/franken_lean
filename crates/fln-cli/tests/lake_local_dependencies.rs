@@ -395,16 +395,13 @@ fn explicit_dependency_paths_do_not_hide_symlinks_before_parent_components() {
     workspace.no_manifests();
 }
 
-const CHECKED_SHARED: &str =
-    "prelude\ndef Shared.identity (A : Type) (a : A) : A := a\n";
+const CHECKED_SHARED: &str = "prelude\ndef Shared.identity (A : Type) (a : A) : A := a\n";
 
 fn artifact_workspace() -> Workspace {
     let workspace = Workspace::new();
     workspace.write(
         "root/lakefile.toml",
-        format!(
-            "{ROOT}[[lean_lib]]\nname = \"Bundle\"\nroots = [\"App\"]\nsrcDir = \"lib\"\n"
-        ),
+        format!("{ROOT}[[lean_lib]]\nname = \"Bundle\"\nroots = [\"App\"]\nsrcDir = \"lib\"\n"),
     );
     workspace.write(
         "right/lakefile.toml",
@@ -466,7 +463,12 @@ fn artifact_builds_follow_transitive_package_ownership_and_reuse_checked_records
     // The shared dependency belongs only to the reverse-BFS-selected package.
     assert!(!workspace.0.join("ignored-direct").exists());
     assert!(!workspace.0.join("ignored-transitive").exists());
-    assert!(!workspace.0.join("root/output/lib/lean/Shared.olean").exists());
+    assert!(
+        !workspace
+            .0
+            .join("root/output/lib/lean/Shared.olean")
+            .exists()
+    );
     assert!(
         !workspace
             .0
@@ -480,10 +482,7 @@ fn artifact_builds_follow_transitive_package_ownership_and_reuse_checked_records
         assert_eq!(std::fs::read(path).unwrap(), before);
     }
     // A dependency module is also an explicit workspace target.
-    let selected = build_success(workspace.run(
-        &["--json", "build", "+Feature.Left:olean"],
-        None,
-    ));
+    let selected = build_success(workspace.run(&["--json", "build", "+Feature.Left:olean"], None));
     assert!(selected.contains("\"modules_built\":2"), "{selected}");
     workspace.no_manifests();
 }
@@ -493,7 +492,10 @@ fn rejected_dependency_source_cannot_replace_any_previous_package_artifact() {
     let workspace = artifact_workspace();
     build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
     let paths = artifact_paths(&workspace);
-    let previous: Vec<_> = paths.iter().map(|path| std::fs::read(path).unwrap()).collect();
+    let previous: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
     workspace.write(
         "right/vendor/shared library/sources/lib/Shared.lean",
         "prelude\ndef Shared.identity (A : Type) (a : A) : A := A\n",
@@ -527,7 +529,10 @@ fn missing_declared_dependency_source_never_falls_back_to_stale_olean() {
     let workspace = artifact_workspace();
     build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
     let paths = artifact_paths(&workspace);
-    let previous: Vec<_> = paths.iter().map(|path| std::fs::read(path).unwrap()).collect();
+    let previous: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
     workspace.write(
         "right/vendor/shared library/lakefile.toml",
         SHARED.replace("srcDir = \"sources\"", "srcDir = \"missing\""),

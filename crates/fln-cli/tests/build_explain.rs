@@ -566,3 +566,287 @@ fn a_failed_build_leaves_the_last_successful_snapshot_and_unknown_targets_are_re
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stderr).contains("not part of the recorded build"));
 }
+
+const WORKSPACE_LEAF: &str =
+    "module\nprelude\npublic theorem Leaf.keep (P : Prop) (h : P) : P := h\n";
+const WORKSPACE_LEAF_CONFIG: &str = "name = \"leaf\"\nsrcDir = \"sources\"\nbuildDir = \"leaf-output\"\n[[lean_lib]]\nname = \"Leaf\"\n";
+
+fn toml_path(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+/// The mid package is nested; its leaf is a sibling of the invocation root.
+/// Other is a separately owned branch whose source does not depend on Leaf.
+fn local_workspace() -> (Package, Package) {
+    let mut root = Package::new("\"Lib\"");
+    let mut leaf = Package::new("\"Leaf\"");
+    root.0 = root.0.canonicalize().unwrap();
+    leaf.0 = leaf.0.canonicalize().unwrap();
+    root.write(
+        "lakefile.toml",
+        concat!(
+            "name = \"workspace\"\nsrcDir = \"src\"\nbuildDir = \"products\"\n",
+            "[[require]]\nname = \"mid\"\npath = \"vendor/mid\"\n",
+            "[[require]]\nname = \"other\"\npath = \"vendor/other\"\n",
+            "[[lean_lib]]\nname = \"Library\"\nroots = [\"Lib\"]\n",
+        ),
+    );
+    root.write(
+        "vendor/mid/lakefile.toml",
+        format!(
+            "name = \"mid\"\nsrcDir = \"code\"\nbuildDir = \"mid-output\"\n[[require]]\nname = \"leaf\"\npath = \"{}\"\n[[lean_lib]]\nname = \"Mid\"\n",
+            toml_path(&leaf.0),
+        ),
+    );
+    root.write(
+        "vendor/other/lakefile.toml",
+        "name = \"other\"\nbuildDir = \"other-output\"\n[[lean_lib]]\nname = \"Other\"\n",
+    );
+    leaf.write("lakefile.toml", WORKSPACE_LEAF_CONFIG);
+    leaf.write("sources/Leaf.lean", WORKSPACE_LEAF);
+    root.write(
+        "vendor/mid/code/Mid.lean",
+        "module\nprelude\npublic import Leaf\npublic theorem Mid.keep (P : Prop) (h : P) : P := Leaf.keep P h\n",
+    );
+    root.write(
+        "vendor/other/Other.lean",
+        "module\nprelude\npublic theorem Other.keep (P : Prop) (h : P) : P := h\n",
+    );
+    root.write(
+        "src/Lib/Top.lean",
+        "module\nprelude\npublic import Mid\npublic import Other\npublic theorem Lib.top (P : Prop) (h : P) : P := Mid.keep P (Other.keep P h)\n",
+    );
+    (root, leaf)
+}
+
+#[test]
+fn workspace_source_edits_rebuild_only_the_selected_import_cone() {
+    let (root, leaf) = local_workspace();
+    root.built("+Lib.Top:olean", None);
+    let snapshot = std::fs::read_to_string(root.0.join("products/fln-build.snapshot")).unwrap();
+    assert!(snapshot.starts_with("fln.lake-build-snapshot/4\n"));
+    assert_eq!(
+        snapshot
+            .lines()
+            .filter(|line| line.starts_with("configuration\t"))
+            .count(),
+        4,
+    );
+    assert!(snapshot.contains(&digest(WORKSPACE_LEAF_CONFIG.as_bytes())));
+    assert!(snapshot.contains(&digest(
+        &std::fs::read(root.0.join("lakefile.toml")).unwrap()
+    )));
+    assert_eq!(
+        root.explained(&[], None).field("reference_decision"),
+        "up-to-date"
+    );
+    let edited = format!("{WORKSPACE_LEAF}public theorem Leaf.more (P : Prop) (h : P) : P := h\n");
+    leaf.write("sources/Leaf.lean", &edited);
+    let report = root.explained(&["+Lib.Top:olean"], None);
+    let changed = report.changed("changed_inputs");
+    assert_eq!(changed.len(), 1, "{}", report.0);
+    assert_eq!(&changed[0][..2], &["Leaf", "source"]);
+    assert!(changed[0][2].ends_with("Leaf.lean"));
+    assert_eq!(changed[0][3], digest(WORKSPACE_LEAF.as_bytes()));
+    assert_eq!(changed[0][4], digest(edited.as_bytes()));
+    assert_eq!(
+        report.decisions(),
+        decisions(&[
+            ("Leaf", "rebuild"),
+            ("Mid", "rebuild"),
+            ("Other", "up-to-date"),
+            ("Lib.Top", "rebuild"),
+        ])
+    );
+    root.built("+Lib.Top:olean", None);
+    assert_eq!(
+        root.explained(&[], None).field("reference_decision"),
+        "up-to-date"
+    );
+}
+
+#[test]
+fn workspace_configuration_changes_track_output_routes_and_package_reselection() {
+    let (root, leaf) = local_workspace();
+    root.built("+Lib.Top:olean", None);
+    let original = leaf.0.join("leaf-output/lib/lean/Leaf.olean");
+    let bytes = std::fs::read(&original).unwrap();
+    let changed_config = WORKSPACE_LEAF_CONFIG.replace("leaf-output", "moved-output");
+    leaf.write("lakefile.toml", &changed_config);
+    let moved = root.explained(&[], None);
+    assert_eq!(moved.field("reference_decision"), "rebuild");
+    assert!(
+        moved
+            .decisions()
+            .iter()
+            .all(|(_, decision)| decision == "rebuild")
+    );
+    assert!(moved.changed("changed_inputs").iter().any(|row| {
+        row[1] == "configuration"
+            && row[2].ends_with("lakefile.toml")
+            && row[3] == digest(WORKSPACE_LEAF_CONFIG.as_bytes())
+            && row[4] == digest(changed_config.as_bytes())
+    }));
+    assert!(moved.changed("changed_outputs").iter().any(|row| {
+        row[0] == "Leaf"
+            && row[1] == "output-path"
+            && row[3].contains("leaf-output")
+            && row[4].contains("moved-output")
+    }));
+    assert_eq!(std::fs::read(&original).unwrap(), bytes);
+    assert!(!leaf.0.join("moved-output").exists());
+
+    leaf.write("lakefile.toml", WORKSPACE_LEAF_CONFIG);
+    let replacement = Package::new("\"Leaf\"");
+    replacement.write("lakefile.toml", WORKSPACE_LEAF_CONFIG);
+    replacement.write("sources/Leaf.lean", WORKSPACE_LEAF);
+    let mid_path = root.0.join("vendor/mid/lakefile.toml");
+    let mid_config = std::fs::read_to_string(&mid_path).unwrap();
+    root.write(
+        "vendor/mid/lakefile.toml",
+        mid_config.replace(&toml_path(&leaf.0), &toml_path(&replacement.0)),
+    );
+    let selected = root.explained(&[], None);
+    assert_eq!(selected.field("reference_decision"), "rebuild");
+    assert!(
+        selected
+            .changed("changed_inputs")
+            .iter()
+            .any(|row| { row[1] == "configuration" && row[3].is_empty() && !row[4].is_empty() })
+    );
+    assert!(
+        selected
+            .changed("changed_inputs")
+            .iter()
+            .any(|row| { row[1] == "configuration" && !row[3].is_empty() && row[4].is_empty() })
+    );
+    assert!(
+        selected
+            .changed("changed_outputs")
+            .iter()
+            .any(|row| { row[0] == "Leaf" && row[1] == "output-path" && row[3] != row[4] })
+    );
+
+    root.write(
+        "vendor/mid/lakefile.toml",
+        "name = \"mid\"\nsrcDir = \"code\"\nbuildDir = \"mid-output\"\n[[lean_lib]]\nname = \"Mid\"\n",
+    );
+    let unselected = root.explain(&["Leaf"], None);
+    assert_eq!(unselected.status.code(), Some(5), "{unselected:?}");
+    assert!(unselected.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&unselected.stderr)
+            .contains("no longer belongs to a selected local package"),
+        "{unselected:?}",
+    );
+}
+
+#[test]
+fn dependency_ir_outputs_are_checked_at_their_owner_without_invalidating_importers() {
+    let (root, leaf) = local_workspace();
+    root.built("+Lib.Top:ir", None);
+    let output = leaf.0.join("leaf-output/lib/lean/Leaf.ir");
+    let original = std::fs::read(&output).unwrap();
+    let clean = root.explained(&["+Lib.Top:ir"], None);
+    assert_eq!(clean.field("target"), "Lib.Top");
+    assert_eq!(clean.field("reference_decision"), "up-to-date");
+    std::fs::write(&output, b"changed dependency executable").unwrap();
+    let changed = root.explained(&["+Lib.Top:ir"], None);
+    assert_eq!(changed.field("reference_decision"), "up-to-date");
+    let outputs = changed.changed("changed_outputs");
+    assert_eq!(outputs.len(), 1, "{}", changed.0);
+    assert_eq!(&outputs[0][..2], &["Leaf", "output"]);
+    assert!(outputs[0][2].ends_with("Leaf.ir"));
+    assert_eq!(outputs[0][3], digest(&original));
+    assert_eq!(outputs[0][4], digest(b"changed dependency executable"));
+    std::fs::rename(&output, output.with_extension("ir.retained")).unwrap();
+    let missing = root.explained(&[], None);
+    assert_eq!(
+        missing.decisions(),
+        decisions(&[
+            ("Leaf", "rebuild"),
+            ("Mid", "up-to-date"),
+            ("Other", "up-to-date"),
+            ("Lib.Top", "up-to-date"),
+        ])
+    );
+    assert!(missing.changed("changed_inputs").is_empty());
+    assert_eq!(missing.changed("changed_outputs")[0][4], "");
+    root.built("+Lib.Top:ir", None);
+    assert_eq!(std::fs::read(output).unwrap(), original);
+}
+
+#[test]
+fn a_forged_absolute_snapshot_artifact_path_is_reported_but_never_followed() {
+    let (root, leaf) = local_workspace();
+    root.built("+Lib.Top:olean", None);
+    let snapshot_path = root.0.join("products/fln-build.snapshot");
+    let snapshot = std::fs::read_to_string(&snapshot_path).unwrap();
+    let sentinel = leaf.0.join("not-an-artifact");
+    std::fs::create_dir(&sentinel).unwrap();
+    let sentinel = sentinel.display().to_string().replace('\\', "\\\\");
+    let forged = snapshot
+        .lines()
+        .map(|line| {
+            if !line.starts_with("module\tLeaf\t") {
+                return line.to_owned();
+            }
+            let mut fields: Vec<_> = line.split('\t').collect();
+            fields[4] = &sentinel;
+            fields.join("\t")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_ne!(forged, snapshot);
+    root.write("products/fln-build.snapshot", forged);
+    let report = root.explained(&[], None);
+    assert_eq!(report.field("reference_decision"), "rebuild");
+    assert!(!report.0.contains("output unreadable"), "{}", report.0);
+    let outputs = report.changed("changed_outputs");
+    assert_eq!(outputs.len(), 1, "{}", report.0);
+    assert_eq!(&outputs[0][..2], &["Leaf", "output-path"]);
+    assert!(outputs[0][3].contains("not-an-artifact"));
+    assert!(outputs[0][4].ends_with("Leaf.olean"));
+    assert!(report.changed("changed_inputs").is_empty());
+}
+
+#[test]
+fn legacy_workspace_snapshots_without_configuration_identity_remain_unknown() {
+    let (root, _leaf) = local_workspace();
+    root.built("+Lib.Top:olean", None);
+    let snapshot = std::fs::read_to_string(root.0.join("products/fln-build.snapshot")).unwrap();
+    let legacy = snapshot
+        .replacen("fln.lake-build-snapshot/4", "fln.lake-build-snapshot/3", 1)
+        .lines()
+        .filter(|line| !line.starts_with("configuration\t"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    root.write("products/fln-build.snapshot", legacy);
+    let output = root.explain(&[], None);
+    assert_eq!(output.status.code(), Some(5), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let report = Explanation(String::from_utf8(output.stdout).unwrap());
+    assert_eq!(report.field("status"), "incomplete");
+    assert_eq!(report.field("reference_decision"), "unknown");
+    assert!(
+        report
+            .decisions()
+            .iter()
+            .all(|(_, decision)| decision == "unknown")
+    );
+    assert!(
+        report
+            .0
+            .contains("configuration identities were not recorded")
+    );
+    root.built("+Lib.Top:olean", None);
+    assert_eq!(
+        root.explained(&[], None).field("reference_decision"),
+        "up-to-date"
+    );
+}

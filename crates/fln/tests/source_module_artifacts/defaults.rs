@@ -6,11 +6,11 @@ const BASE: &str = "prelude\ninductive First where | mk\ninductive Second where 
 
 fn assert_choice(engine: &Engine, selected: &str) {
     let root = engine.logical_root(&KVMap::new());
-    // A bare polymorphic constant retains its implicit telescope. Supplying
-    // an unknown let type creates the pending application that defaults may
-    // resolve before the later proof fixes its carrier.
+    // Explicit `@` preserves the projection's implicit telescope, as in the
+    // pin. The ordinary projection below creates the pending application
+    // that defaults may resolve before the later proof fixes its carrier.
     let source = format!(
-        "def bare := Choice.value\ndef inferred := let value : _ := Choice.value; value\ndef selected (P : {selected} -> Prop) (h : P {selected}.mk) : P inferred := h"
+        "def bare := @Choice.value\ndef inferred := let value : _ := Choice.value; value\ndef selected (P : {selected} -> Prop) (h : P {selected}.mk) : P inferred := h"
     );
     let checked = engine
         .check_source_files(&[source.as_bytes()], &KVMap::new(), limits().source)

@@ -16,10 +16,52 @@ pub(super) struct Sources {
 pub(super) struct Package {
     pub(super) root: PathBuf,
     pub(super) config: LakeConfig,
+    /// Exact TOML input captured after semantic agreement with discovery.
+    configuration: Option<(PathBuf, String)>,
     libraries: Vec<Library>,
 }
 
 impl Sources {
+    /// These paths describe discovered inputs; a snapshot reader must resolve
+    /// the current package graph again before opening any configuration file.
+    pub(super) fn configuration_rows(&self, invocation_root: &Path) -> Vec<snapshot::ConfigRow> {
+        self.packages
+            .iter()
+            .filter_map(|package| package.configuration.as_ref())
+            .map(|(path, digest)| {
+                (
+                    path.strip_prefix(invocation_root)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string(),
+                    digest.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .map(|(path, digest)| snapshot::ConfigRow { path, digest })
+            .collect()
+    }
+
+    /// A successful build must not describe a package graph whose inputs
+    /// changed while source modules were being checked and published.
+    pub(super) fn verify_configurations(&self) -> Result<(), Failure> {
+        for package in &self.packages {
+            let Some((path, expected)) = &package.configuration else {
+                continue;
+            };
+            check_path(&package.root, path, false)?;
+            let bytes = read_bounded(path, 64 * 1024, "Lake configuration")?;
+            if snapshot::digest(&bytes) != *expected {
+                return Err(Failure::input(format!(
+                    "Lake configuration changed during the build: {}",
+                    path.display(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn libraries(&self) -> Vec<Library> {
         self.packages
             .iter()
@@ -33,9 +75,10 @@ impl Sources {
             let Some(path) = source_path(module, &package.libraries)? else {
                 continue;
             };
-            if found.as_ref().is_some_and(|previous| {
-                previous.path != path || previous.package != package.root
-            }) {
+            if found
+                .as_ref()
+                .is_some_and(|previous| previous.path != path || previous.package != package.root)
+            {
                 return Err(Failure::unsupported(format!(
                     "module `{}` belongs to multiple local packages",
                     module.to_display_string(),
@@ -70,7 +113,10 @@ impl Sources {
                     name.clone(),
                     (
                         package.root.clone(),
-                        package.root.join(&package.config.build_dir).join("lib/lean"),
+                        package
+                            .root
+                            .join(&package.config.build_dir)
+                            .join("lib/lean"),
                     ),
                 ))
             })
@@ -209,13 +255,47 @@ pub(super) fn load(root: &Path, config: &LakeConfig) -> Result<Sources, Failure>
     let packages = packages
         .into_iter()
         .map(|(root, config)| {
+            let configuration = capture_configuration(&root, &config)?;
             let libraries = library_sources(&root, &config)?;
             Ok(Package {
                 root,
                 config,
+                configuration,
                 libraries,
             })
         })
         .collect::<Result<_, Failure>>()?;
     Ok(Sources { packages })
+}
+
+/// Bind the exact bytes after discovery, checking that they still select the
+/// same package graph and output routes as the configuration already parsed.
+/// Native Lean configurations remain outside read-only rebuild explanations.
+fn capture_configuration(
+    root: &Path,
+    expected: &LakeConfig,
+) -> Result<Option<(PathBuf, String)>, Failure> {
+    if expected.format != fln_lake::LakeConfigFormat::Toml {
+        return Ok(None);
+    }
+    let path = root.join("lakefile.toml");
+    check_path(root, &path, false)?;
+    let bytes = read_bounded(&path, 64 * 1024, "Lake configuration")?;
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| Failure::input("lakefile.toml is not UTF-8"))?;
+    let current = LakeConfig::parse_toml_for_build(text).map_err(|error| {
+        let class = if matches!(error, fln_lake::LakeParseError::UnsupportedBuildSetting(_)) {
+            "unsupported"
+        } else {
+            "input"
+        };
+        Failure::new(class, error.to_string())
+    })?;
+    if current != *expected {
+        return Err(Failure::input(format!(
+            "Lake configuration changed during local package discovery: {}",
+            path.display(),
+        )));
+    }
+    Ok(Some((path, snapshot::digest(&bytes))))
 }

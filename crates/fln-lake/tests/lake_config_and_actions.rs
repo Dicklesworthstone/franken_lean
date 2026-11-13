@@ -131,7 +131,10 @@ fn checked_requirements_do_not_ignore_remote_or_custom_settings() {
             LakeConfig::parse_toml_for_build,
         ] {
             assert!(
-                matches!(parse(&source), Err(LakeParseError::UnsupportedBuildSetting(_))),
+                matches!(
+                    parse(&source),
+                    Err(LakeParseError::UnsupportedBuildSetting(_))
+                ),
                 "{source}"
             );
         }

@@ -5,14 +5,18 @@
 //! module reuse is decided by the record store alone. It is rewritten only by a
 //! successful build, so after a failed one it still describes the last success.
 use fln_hash::domain::{Domain, DomainHasher};
+use std::path::Path;
 
 /// Beside the outputs, under the package's build directory.
 pub(crate) const FILE: &str = "fln-build.snapshot";
-const SCHEMA: &str = "fln.lake-build-snapshot/3";
+const SCHEMA: &str = "fln.lake-build-snapshot/4";
+const IR_SCHEMA: &str = "fln.lake-build-snapshot/3";
 const COMPANION_SCHEMA: &str = "fln.lake-build-snapshot/2";
 const LEGACY_SCHEMA: &str = "fln.lake-build-snapshot/1";
 /// More than a build may hold (256 modules, 4,096 imports, Init's 601 external modules).
 const MAX_LINES: usize = 1 << 20;
+/// Local dependency discovery admits at most 64 selected packages.
+const MAX_CONFIGURATIONS: usize = 64;
 
 /// The digest a snapshot names file contents by.
 pub(crate) fn digest(bytes: &[u8]) -> String {
@@ -20,6 +24,14 @@ pub(crate) fn digest(bytes: &[u8]) -> String {
     hasher.update(b"fln.lake-file/1\0");
     hasher.update(bytes);
     hasher.finalize().to_hex()
+}
+
+/// Exact configuration contents selected by the current package resolver.
+/// Paths are provenance only; callers must rediscover and validate their inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigRow {
+    pub(crate) path: String,
+    pub(crate) digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,12 +43,12 @@ pub(crate) struct CompanionDigests {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModuleRow {
     pub(crate) name: String,
-    /// Relative to the package root.
+    /// Source identity recorded by the build; never file-reading authority.
     pub(crate) source: String,
     pub(crate) source_digest: String,
     /// In header order, the implicit `Init` included.
     pub(crate) imports: Vec<String>,
-    /// Relative to the package root.
+    /// Output identity recorded by the build; never file-reading authority.
     pub(crate) artifact: String,
     pub(crate) artifact_digest: String,
     pub(crate) ir_digest: Option<String>,
@@ -46,10 +58,14 @@ pub(crate) struct ModuleRow {
 }
 
 impl ModuleRow {
-    pub(crate) fn output_files(&self) -> Vec<(String, &str)> {
-        let mut files = vec![(self.artifact.clone(), self.artifact_digest.as_str())];
+    /// Derive all companion paths from the currently validated output location.
+    /// The recorded artifact string is only compared as provenance by callers.
+    pub(crate) fn output_files(&self, artifact: &Path) -> Vec<(String, &str)> {
+        let mut files = vec![(
+            artifact.display().to_string(),
+            self.artifact_digest.as_str(),
+        )];
         if let Some(parts) = &self.companions {
-            let artifact = std::path::Path::new(&self.artifact);
             files.extend([
                 (
                     artifact
@@ -68,13 +84,7 @@ impl ModuleRow {
             ]);
         }
         if let Some(digest) = &self.ir_digest {
-            files.push((
-                std::path::Path::new(&self.artifact)
-                    .with_extension("ir")
-                    .display()
-                    .to_string(),
-                digest,
-            ));
+            files.push((artifact.with_extension("ir").display().to_string(), digest));
         }
         files
     }
@@ -93,6 +103,7 @@ pub(crate) struct Snapshot {
     pub(crate) records: String,
     /// The exact module/facet targets requested by the build.
     pub(crate) targets: Vec<String>,
+    pub(crate) configurations: Vec<ConfigRow>,
     pub(crate) modules: Vec<ModuleRow>,
     pub(crate) externals: Vec<ExternalRow>,
 }
@@ -148,6 +159,13 @@ impl Snapshot {
         for target in &self.targets {
             text.push_str(&line(&["target", target]));
         }
+        for configuration in &self.configurations {
+            text.push_str(&line(&[
+                "configuration",
+                &configuration.path,
+                &configuration.digest,
+            ]));
+        }
         for module in &self.modules {
             text.push_str(&line(&[
                 "module",
@@ -180,22 +198,27 @@ impl Snapshot {
     }
 
     /// Strict: the schema line, `posture` and `records` once each, then targets,
-    /// modules and externals in that order, each `import` row belonging to the row
-    /// before it, and `end` as the last line.
+    /// configurations, modules and externals in that order, each `import` row
+    /// belonging to the row before it, and `end` as the last line.
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
         let mut lines = text.split('\n');
         let schema = lines.next();
-        if !matches!(schema, Some(SCHEMA | COMPANION_SCHEMA | LEGACY_SCHEMA)) {
+        if !matches!(
+            schema,
+            Some(SCHEMA | IR_SCHEMA | COMPANION_SCHEMA | LEGACY_SCHEMA)
+        ) {
             return Err(format!("not a {SCHEMA} snapshot"));
         }
         let mut snapshot = Snapshot {
             posture: String::new(),
             records: String::new(),
             targets: Vec::new(),
+            configurations: Vec::new(),
             modules: Vec::new(),
             externals: Vec::new(),
         };
-        // 0 header, 1 targets, 2 modules, 3 externals: rows never move backwards.
+        // 0 header, 1 targets, 2 configurations, 3 modules, 4 externals.
+        // Rows never move backwards.
         let mut stage = 0;
         let mut owner: Option<bool> = None;
         let mut ended = false;
@@ -226,8 +249,25 @@ impl Snapshot {
                     stage = 1;
                     snapshot.targets.push(fields[1].clone());
                 }
-                ("module", 8) if stage <= 2 && index >= 2 => {
+                ("configuration", 3) if schema == Some(SCHEMA) && stage <= 2 && index >= 2 => {
+                    if fields[1].is_empty()
+                        || fields[2].is_empty()
+                        || snapshot.configurations.len() >= MAX_CONFIGURATIONS
+                        || snapshot
+                            .configurations
+                            .iter()
+                            .any(|row| row.path == fields[1])
+                    {
+                        return Err(bad());
+                    }
                     stage = 2;
+                    snapshot.configurations.push(ConfigRow {
+                        path: fields[1].clone(),
+                        digest: fields[2].clone(),
+                    });
+                }
+                ("module", 8) if stage <= 3 && index >= 2 => {
+                    stage = 3;
                     owner = Some(true);
                     snapshot.modules.push(ModuleRow {
                         name: fields[1].clone(),
@@ -243,8 +283,8 @@ impl Snapshot {
                     });
                 }
                 ("companions", 3)
-                    if matches!(schema, Some(SCHEMA | COMPANION_SCHEMA))
-                        && stage == 2
+                    if matches!(schema, Some(SCHEMA | IR_SCHEMA | COMPANION_SCHEMA))
+                        && stage == 3
                         && owner == Some(true) =>
                 {
                     let module = snapshot.modules.last_mut().ok_or_else(bad)?;
@@ -261,7 +301,7 @@ impl Snapshot {
                     });
                 }
                 ("external", 3) if index >= 2 => {
-                    stage = 3;
+                    stage = 4;
                     owner = Some(false);
                     snapshot.externals.push(ExternalRow {
                         name: fields[1].clone(),
@@ -269,7 +309,11 @@ impl Snapshot {
                         imports: Vec::new(),
                     });
                 }
-                ("ir", 2) if schema == Some(SCHEMA) && stage == 2 && owner == Some(true) => {
+                ("ir", 2)
+                    if matches!(schema, Some(SCHEMA | IR_SCHEMA))
+                        && stage == 3
+                        && owner == Some(true) =>
+                {
                     let module = snapshot.modules.last_mut().ok_or_else(bad)?;
                     if module.ir_digest.is_some()
                         || !module.imports.is_empty()
@@ -317,6 +361,10 @@ mod tests {
             posture: "reuse-verified".to_owned(),
             records: "on".to_owned(),
             targets: vec!["+Lib.Top:olean".to_owned()],
+            configurations: vec![ConfigRow {
+                path: "lakefile.toml".to_owned(),
+                digest: digest(b"name = 'package'"),
+            }],
             modules: vec![ModuleRow {
                 name: "Lib.Top".to_owned(),
                 source: "Lib/Top.lean".to_owned(),
@@ -356,23 +404,66 @@ mod tests {
     }
 
     #[test]
+    fn configurations_are_unique_and_precede_module_provenance() {
+        let mut snapshot = sample();
+        snapshot.configurations.push(ConfigRow {
+            path: "../dependency/lakefile.toml".to_owned(),
+            digest: digest(b"name = 'dependency'"),
+        });
+        let text = snapshot.to_text();
+        assert_eq!(Snapshot::parse(&text).unwrap(), snapshot);
+        let row = text
+            .lines()
+            .find(|line| line.starts_with("configuration\t"))
+            .unwrap();
+        let without = text.replace(&format!("{row}\n"), "");
+        for broken in [
+            text.replace(SCHEMA, IR_SCHEMA),
+            text.replace(SCHEMA, COMPANION_SCHEMA),
+            text.replace(SCHEMA, LEGACY_SCHEMA),
+            text.replace(row, "configuration\t\tcontent"),
+            text.replace(row, "configuration\tlakefile.toml\t"),
+            text.replace(row, "configuration\tlakefile.toml"),
+            text.replace(row, &format!("{row}\n{row}")),
+            without.replace("end\n", &format!("{row}\nend\n")),
+            text.replace(row, &format!("{row}\ntarget\t+Late:olean")),
+        ] {
+            assert!(Snapshot::parse(&broken).is_err(), "{broken}");
+        }
+        let mut too_many = sample();
+        too_many.configurations = (0..=MAX_CONFIGURATIONS)
+            .map(|index| ConfigRow {
+                path: format!("package-{index}/lakefile.toml"),
+                digest: digest(b"config"),
+            })
+            .collect();
+        assert!(Snapshot::parse(&too_many.to_text()).is_err());
+    }
+
+    #[test]
     fn whole_families_round_trip_and_legacy_snapshots_remain_readable() {
         let mut snapshot = sample();
-        assert_eq!(
-            Snapshot::parse(&snapshot.to_text().replace(SCHEMA, LEGACY_SCHEMA)).unwrap(),
-            snapshot
-        );
+        snapshot.configurations.clear();
+        for schema in [LEGACY_SCHEMA, COMPANION_SCHEMA, IR_SCHEMA] {
+            assert_eq!(
+                Snapshot::parse(&snapshot.to_text().replace(SCHEMA, schema)).unwrap(),
+                snapshot
+            );
+        }
         snapshot.modules[0].companions = Some(CompanionDigests {
             server: digest(b"server"),
             private: digest(b"private"),
         });
         let text = snapshot.to_text();
         assert_eq!(Snapshot::parse(&text).unwrap(), snapshot);
-        assert_eq!(snapshot.modules[0].output_files().len(), 3);
-        assert_eq!(
-            Snapshot::parse(&text.replace(SCHEMA, COMPANION_SCHEMA)).unwrap(),
-            snapshot
-        );
+        let artifact = Path::new(&snapshot.modules[0].artifact);
+        assert_eq!(snapshot.modules[0].output_files(artifact).len(), 3);
+        for schema in [COMPANION_SCHEMA, IR_SCHEMA] {
+            assert_eq!(
+                Snapshot::parse(&text.replace(SCHEMA, schema)).unwrap(),
+                snapshot
+            );
+        }
         let row = text
             .lines()
             .find(|line| line.starts_with("companions\t"))
@@ -392,12 +483,18 @@ mod tests {
     #[test]
     fn executable_companions_participate_in_output_change_detection() {
         let mut snapshot = sample();
+        snapshot.configurations.clear();
         snapshot.targets = vec!["+Lib.Top:ir".to_owned()];
         let ir_digest = digest(b"native executable IR");
         snapshot.modules[0].ir_digest = Some(ir_digest.clone());
         let text = snapshot.to_text();
         assert_eq!(Snapshot::parse(&text).unwrap(), snapshot);
-        assert!(snapshot.modules[0].output_files().contains(&(
+        assert_eq!(
+            Snapshot::parse(&text.replace(SCHEMA, IR_SCHEMA)).unwrap(),
+            snapshot
+        );
+        let artifact = Path::new(&snapshot.modules[0].artifact);
+        assert!(snapshot.modules[0].output_files(artifact).contains(&(
             ".lake/build/lib/lean/Lib/Top.ir".to_owned(),
             ir_digest.as_str(),
         )));
@@ -410,5 +507,38 @@ mod tests {
         ] {
             assert!(Snapshot::parse(&broken).is_err(), "{broken}");
         }
+    }
+
+    #[test]
+    fn output_paths_come_only_from_the_current_validated_destination() {
+        let mut module = sample().modules.remove(0);
+        module.artifact = "../../untrusted/Elsewhere.olean".to_owned();
+        module.companions = Some(CompanionDigests {
+            server: digest(b"server"),
+            private: digest(b"private"),
+        });
+        module.ir_digest = Some(digest(b"ir"));
+        let artifact = Path::new("dependency/build/lib/lean/Lib/Top.olean");
+        let paths = module
+            .output_files(artifact)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                artifact.display().to_string(),
+                artifact
+                    .with_extension("olean.server")
+                    .display()
+                    .to_string(),
+                artifact
+                    .with_extension("olean.private")
+                    .display()
+                    .to_string(),
+                artifact.with_extension("ir").display().to_string(),
+            ],
+        );
+        assert!(paths.iter().all(|path| !path.contains("untrusted")));
     }
 }

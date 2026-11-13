@@ -1165,7 +1165,7 @@ mod tests {
             ("Right", "prelude\nimport Base"),
             (
                 "Main",
-                "prelude\nimport Left\nimport Right\ndef bare := Choice.value\ndef inferred := let value : _ := Choice.value; value\ndef selected (P : Second -> Prop) (h : P Second.mk) : P inferred := h",
+                "prelude\nimport Left\nimport Right\ndef bare := @Choice.value\ndef inferred := let value : _ := Choice.value; value\ndef selected (P : Second -> Prop) (h : P Second.mk) : P inferred := h",
             ),
         ];
         let store = Memory::default();

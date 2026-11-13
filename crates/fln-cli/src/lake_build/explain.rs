@@ -53,6 +53,9 @@ struct Explained {
 /// A module as the tree holds it now.
 struct Current {
     source: String,
+    /// Current, resolver-validated owner and output; recorded paths are never read.
+    package: PathBuf,
+    artifact: PathBuf,
     digest: std::result::Result<String, String>,
     /// `None` when the header cannot be read.
     imports: Option<Vec<Name>>,
@@ -88,7 +91,10 @@ fn target_name(text: &str) -> std::result::Result<Name, Failure> {
         return name(&path.trim_start_matches("./").replace(['/', '\\'], "."));
     }
     let bare = text.strip_prefix('+').unwrap_or(text);
-    let bare = bare.strip_suffix(":olean").unwrap_or(bare);
+    let bare = bare
+        .strip_suffix(":olean")
+        .or_else(|| bare.strip_suffix(":ir"))
+        .unwrap_or(bare);
     name(bare)
 }
 
@@ -108,13 +114,9 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
         .canonicalize()
         .map_err(|error| Failure::io(directory, error))?;
     let config = config(&root)?;
-    if !config.requires.is_empty() {
-        return Err(Refusal::Unavailable(
-            "build explanations do not yet bind local dependency configurations and output directories"
-                .to_owned(),
-        ));
-    }
+    let sources = local_dependencies::load(&root, &config)?;
     let path = root.join(&config.build_dir).join(snapshot::FILE);
+    check_path(&root, &path, true)?;
     let relative = |path: &Path| {
         path.strip_prefix(&root)
             .unwrap_or(path)
@@ -146,7 +148,39 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
             MACRO_EXPLANATION_UNAVAILABLE.to_owned(),
         ));
     }
-    let (libraries, recorded_entries) = plan(&root, &config, &recorded.targets)?;
+    let configurations = sources.configuration_rows(&root);
+    let recorded_configurations: BTreeMap<_, _> = recorded
+        .configurations
+        .iter()
+        .map(|row| (row.path.as_str(), row.digest.as_str()))
+        .collect();
+    let current_configurations: BTreeMap<_, _> = configurations
+        .iter()
+        .map(|row| (row.path.as_str(), row.digest.as_str()))
+        .collect();
+    let configuration_paths: BTreeSet<_> = recorded_configurations
+        .keys()
+        .chain(current_configurations.keys())
+        .copied()
+        .collect();
+    let configuration_changes: Vec<_> = configuration_paths
+        .into_iter()
+        .filter_map(|path| {
+            let old = recorded_configurations.get(path).copied();
+            let new = current_configurations.get(path).copied();
+            (old != new).then(|| (path, old.map(str::to_owned), new.map(str::to_owned)))
+        })
+        .collect();
+    let libraries = sources.libraries();
+    let recorded_entries = plan_modules(
+        sources
+            .packages
+            .iter()
+            .flat_map(|package| package.config.targets.iter())
+            .map(|target| target.name.as_str()),
+        &libraries,
+        &recorded.targets,
+    )?;
     let entries = match target {
         Some(text) => {
             let module = target_name(text)?;
@@ -158,6 +192,11 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
                 ))
                 .into());
             }
+            if sources.resolve(&module)?.is_none() {
+                return Err(Refusal::Unavailable(format!(
+                    "recorded module `{display}` no longer belongs to a selected local package"
+                )));
+            }
             vec![module]
         }
         None => recorded_entries,
@@ -165,21 +204,47 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
 
     // The current local import graph, from the entries, without elaborating.
     let mut current: BTreeMap<Name, Current> = BTreeMap::new();
+    let mut source_bytes = 0usize;
+    let mut import_count = 0usize;
     let mut external = BTreeSet::new();
     let mut pending: BTreeSet<Name> = entries.iter().cloned().collect();
     while let Some(module) = pending.pop_first() {
         if current.contains_key(&module) || external.contains(&module) {
             continue;
         }
-        let Some(source) = source_path(&module, &libraries)? else {
+        let Some(location) = sources.resolve(&module)? else {
             external.insert(module);
             continue;
         };
         if current.len() >= MAX_MODULES {
             return Err(Failure::new("resource", "source module count exceeds 256").into());
         }
-        let bytes = read_bounded(&source, SOURCE_RUN_DEFAULT_MAX_BYTES, "Lake module source")
-            .map_err(|error| error.to_string());
+        let source = location.path;
+        let package = sources
+            .packages
+            .iter()
+            .find(|package| package.root == location.package)
+            .ok_or_else(|| Failure::new("internal-fault", "source module lost its package"))?;
+        let mut artifact = source_import_relative_path(&module).map_err(Failure::from)?;
+        artifact.set_extension("olean");
+        let artifact = package
+            .root
+            .join(&package.config.build_dir)
+            .join("lib/lean")
+            .join(artifact);
+        let bytes = check_path(&location.package, &source, false)
+            .map_err(|failure| failure.detail)
+            .and_then(|()| {
+                read_bounded(
+                    &source,
+                    SOURCE_RUN_DEFAULT_MAX_BYTES - source_bytes,
+                    "Lake module source",
+                )
+                .map_err(|error| error.to_string())
+            });
+        if let Ok(bytes) = &bytes {
+            source_bytes += bytes.len();
+        }
         let imports = bytes.as_ref().ok().and_then(|bytes| {
             parse_source_header(bytes).ok().map(|header| {
                 let mut imports = header.imports;
@@ -189,6 +254,10 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
                 imports
             })
         });
+        import_count = import_count
+            .checked_add(imports.as_ref().map_or(0, Vec::len))
+            .filter(|count| *count <= MAX_IMPORTS)
+            .ok_or_else(|| Failure::new("resource", "source import count exceeds 4096"))?;
         for import in imports.iter().flatten() {
             pending.insert(import.clone());
         }
@@ -196,6 +265,8 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
             module,
             Current {
                 source: relative(&source),
+                package: location.package,
+                artifact,
                 digest: bytes.map(|bytes| snapshot::digest(&bytes)),
                 imports,
             },
@@ -268,6 +339,24 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
                     changed.push(entry);
                 }
             };
+        if recorded.configurations.is_empty() {
+            unknown.push("package configuration identities were not recorded".to_owned());
+        } else {
+            // Package selection and output routes depend on the complete
+            // selected configuration closure. Without declaration-level demand
+            // records, configuration changes conservatively invalidate this
+            // file-cone explanation rather than inventing a narrower hit.
+            for (path, old, new) in &configuration_changes {
+                rebuild.push(format!("configuration {path} changed"));
+                note(
+                    &display,
+                    "configuration",
+                    (*path).to_owned(),
+                    old.clone(),
+                    new.clone(),
+                );
+            }
+        }
         match (row, &now.digest) {
             (_, Err(reason)) => unknown.push(format!("source unreadable: {reason}")),
             (None, Ok(digest)) => {
@@ -364,9 +453,40 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
             }
         }
         if let Some(row) = row {
-            for (artifact, previous_digest) in row.output_files() {
-                match std::fs::read(root.join(&artifact)) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let destination = relative(&now.artifact);
+            if row.artifact != destination {
+                if rebuild.is_empty() {
+                    output_only = true;
+                }
+                rebuild.push("output location changed".to_owned());
+                outputs.push(Changed {
+                    module: display.clone(),
+                    kind: "output-path",
+                    subject: destination.clone(),
+                    old: Some(row.artifact.clone()),
+                    new: Some(destination),
+                });
+            }
+            // The snapshot is untrusted provenance. Resolve every output from
+            // the current package configuration rather than following a path
+            // supplied by the snapshot, including for sibling packages.
+            for (artifact, previous_digest) in row.output_files(&now.artifact) {
+                let artifact = Path::new(&artifact);
+                let subject = relative(artifact);
+                let bytes = check_path(&now.package, artifact, true)
+                    .map_err(|failure| failure.detail)
+                    .and_then(|()| match std::fs::symlink_metadata(artifact) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                        Err(error) => Err(error.to_string()),
+                        Ok(metadata) if !metadata.is_file() => {
+                            Err("output is not a regular file".to_owned())
+                        }
+                        Ok(_) => read_bounded(artifact, MAX_ARTIFACT_BYTES, "Lake module artifact")
+                            .map(Some)
+                            .map_err(|error| error.to_string()),
+                    });
+                match bytes {
+                    Ok(None) => {
                         if rebuild.is_empty() {
                             output_only = true;
                         }
@@ -374,19 +494,19 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
                         outputs.push(Changed {
                             module: display.clone(),
                             kind: "output",
-                            subject: artifact,
+                            subject,
                             old: Some(previous_digest.to_owned()),
                             new: None,
                         });
                     }
                     Err(error) => unknown.push(format!("output unreadable: {error}")),
-                    Ok(bytes) => {
+                    Ok(Some(bytes)) => {
                         let digest = snapshot::digest(&bytes);
                         if digest != previous_digest {
                             outputs.push(Changed {
                                 module: display.clone(),
                                 kind: "output",
-                                subject: artifact,
+                                subject,
                                 old: Some(previous_digest.to_owned()),
                                 new: Some(digest),
                             });
@@ -438,6 +558,7 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
             (decision, reasons)
         }
     };
+    sources.verify_configurations()?;
     Ok(Report {
         package: config.name.clone(),
         snapshot: relative(&path),

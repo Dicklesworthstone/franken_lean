@@ -7,10 +7,12 @@ checker, and emits one pinned-format artifact per module. Each artifact contains
 only that module's declarations and its actual imports. Source seeds and full
 environment snapshots are never substituted for module products.
 
-The output directory is `buildDir/lib/lean`, normally `.lake/build/lib/lean`.
-Package `srcDir`, library `srcDir`, and library `roots` determine source paths.
-Modules outside the requested import closure are not compiled. A module can be
-selected without `+` when its name does not also name a declared target.
+Each module's output directory is its owning package's `buildDir/lib/lean`,
+normally `.lake/build/lib/lean`. Package `srcDir`, library `srcDir`, and library
+`roots` determine source paths. TOML builds can follow transitive local path
+requirements, including sibling packages. Modules outside the requested import
+closure are not compiled. A module can be selected without `+` when its name
+does not also name a declared target in any selected package.
 
 Checked source simp registrations can accompany those artifacts. The supported
 slice includes forward equality theorems and unfolding for definitions marked
@@ -254,9 +256,9 @@ Implicit `Init` is loaded for ordinary files. Changes to local dependencies
 are checked on the next invocation. A failed dependency prevents `main` from
 running; completed frontend output precedes the single `main` invocation.
 
-TOML executables can also use libraries from local packages. For example, the
-root package can declare a sibling whose own `lakefile.toml` declares a
-`Shared` library:
+TOML artifact builds and executables can use libraries from local packages. For
+example, the root package can declare a sibling whose own `lakefile.toml`
+declares a `Shared` library:
 
 ```toml
 [[require]]
@@ -264,32 +266,43 @@ name = "shared"
 path = "../shared"
 ```
 
-An executable can then `import Shared` through the dependency's configured
-package and library source directories. Local requirements are resolved
+An executable or library module can then `import Shared` through the dependency's
+configured package and library source directories. Local requirements are resolved
 transitively before source checking. The resolver matches the pin's reverse
 breadth-first selection: a package name selected earlier keeps its chosen path
 when another requirement names it. Diamonds share that selection. The
 requirement name determines package identity; a different `name` in the
 dependency's own TOML does not rename it. Package dependency cycles and modules
-claimed by distinct source owners are refused before `main` runs.
+claimed by distinct source owners are refused before checking or publication.
 
 Each source path remains confined to its owning package; explicitly naming a
 sibling dependency does not permit a package's `srcDir` to escape its root.
 Resolution is bounded to 64 packages and 4096 declared requirement edges, in
-addition to the executable source-closure limits. This initial local-package
-path requires TOML configurations without existing `lake-manifest.json` or
+addition to the source-closure limits. This local-package path requires TOML
+configurations without existing `lake-manifest.json` or
 `.lake/package-overrides.json` files. These files, Lean dependency
 configurations, and non-path requirements are explicitly refused rather than
-silently ignored. Resolution writes no manifest or build artifacts.
+silently ignored. Package resolution writes no manifest.
 
-Local package requirements currently apply to `exe` and `exec`; artifact
-builds and `build explain` retain their explicit dependency-resolution refusal.
+The same selected package graph serves `exe`, `exec`, explicit module artifact
+builds, and `build explain`. A dependency module can be selected directly:
 
-Supported entry types are `IO Unit`, `IO UInt32`, and either of those with
+```sh
+lake build +Shared:olean
+fln build explain --json +Shared:olean
+```
+
+Root modules importing `Shared` build its source closure automatically, with
+each artifact published in its owning package's output directory. Explicit
+`:ir` targets also follow local requirements,
+subject to the module-system and compiler limits below. Configuration changes,
+package reselection, and output moves are included in rebuild explanations.
+
+Supported executable entry types are `IO Unit`, `IO UInt32`, and either of those with
 one `List String` argument. Existing compiler, runtime-capability, and resource
 limits still apply. VM exhaustion remains an inconclusive result.
 
-This route executes source and does not emit a linked binary or a Lake build
+The `exe`/`exec` route executes source and does not emit a linked binary or a Lake build
 snapshot. It inherits the caller's working directory and environment; Lake's
 augmented subprocess environment is not installed. Native executable build
 facets, linking, dependency fetching, and full Lake configuration remain
@@ -363,12 +376,15 @@ It also reports:
 
 All selected module closures must finish checking and encoding before output
 replacement starts. Parse, elaboration, kernel, import, and encoding failures
-leave prior artifacts unchanged. Output destinations are preflighted; successful
-file replacements use the existing atomic writer, with rollback on ordinary
-publication errors. This is not a crash-atomic multi-file generation protocol.
-A publication lock serializes native builders; an interrupted publication can
-leave that lock and requires inspection before retrying. A failed rollback is
-reported explicitly. Source and output symlinks are refused.
+leave prior artifacts unchanged. All package output destinations are preflighted
+together, including collisions between artifact paths. Native builders hold a
+publication lock for every affected output directory and save the previous
+artifact bytes before the first replacement. File replacements use the existing
+atomic writer; ordinary publication errors roll back the whole build across
+package directories. This is not a crash-atomic multi-file generation protocol.
+An interrupted publication can leave locks and requires inspection before
+retrying. A failed rollback is reported explicitly and retains the locks. Source
+and output symlinks are refused.
 
 The current limits are 64 KiB of configuration, 1 MiB of source, 256 source
 modules, 4,096 import rows, and 64 MiB of emitted artifacts. Compiler and checker
@@ -384,11 +400,15 @@ Unsupported TOML build settings are rejected rather than silently ignored.
 These boundaries are not full Lake compatibility, fresh-artifact byte identity
 with the Reference, or a claim that the Lake convergence bead is complete.
 
-Every successful build writes a snapshot, `buildDir/fln-build.snapshot` (bead
-`franken_lean-z8j.1.2`). For every module it records the source path and content
-hash, the ordered imports, the output path and content hash, the record key and
-the decision. It also records the content hash of every external `.olean` in the
-closure, with that module's imports. The report says `"snapshot":"written"`, or
+Every successful build writes a snapshot, `buildDir/fln-build.snapshot`, in the
+invoking package (bead `franken_lean-z8j.1.2`). Schema
+`fln.lake-build-snapshot/4` records the path and exact content hash of every
+selected TOML configuration. For every module it records the source path and
+content hash, the ordered imports, the output family paths and content hashes,
+the record key and the decision. It also records the content hash of every
+external `.olean` in the closure, with that module's imports. Paths within the
+invoking package are relative; sibling package paths are absolute. The report
+says `"snapshot":"written"`, or
 `"failed"` with `snapshot_reason`; a failed write does not fail a published
 build. A failed build leaves the last successful snapshot in place. No build
 reads the snapshot: module reuse is decided by the record store alone.
@@ -396,25 +416,38 @@ reads the snapshot: module reuse is decided by the record store alone.
 `fln build explain [--dir D] [--json] [MODULE]` compares that snapshot with the
 current tree and reports why each module of the recorded build (or of `MODULE`'s
 closure) would rebuild. It elaborates and admits nothing, so this command still
-requires a TOML configuration and explicitly refuses `lakefile.lean`.
+requires a TOML configuration and explicitly refuses `lakefile.lean`. It resolves
+the current selected packages and their source and output owners again; recorded
+paths never authorize reading arbitrary artifacts. It writes no artifacts,
+manifests, or snapshots. Both `+Module:olean` and `+Module:ir` can select the
+recorded module's closure.
+
 - The Reference decision follows Lake's file-cone model. A module rebuilds when
   its source bytes, its ordered imports, or the bytes of an external `.olean` in
   its import cone changed, or when a local import rebuilds.
+- A changed, added, or removed selected TOML configuration conservatively
+  rebuilds the entire recorded build. Source-only edits retain the narrower
+  import-cone behavior, leaving unrelated branches up to date.
 - A missing output rebuilds that module alone. A changed output is listed under
-  changed outputs and changes no decision.
+  changed outputs and changes no decision. An output route change is reported
+  separately as `output-path`; output bytes are read only from the current
+  owner's configured directory.
 - Each changed input is named with its old and new content hashes.
 - The native decision is reported as `unavailable (no Ledger records)`: it would
   need Ledger demand records, which do not exist.
 
-Source timestamps, output presence and the text of a file (comments,
-`axiom `, `-- fln-interface-change`) never decide anything: only which files'
-bytes changed. `--faithful-invalidation` is accepted and changes nothing,
+Source timestamps and special text markers such as `-- fln-interface-change`
+have no invalidation meaning: source edits are compared by content hash.
+`--faithful-invalidation` is accepted and changes nothing,
 because the Reference decision is already the file-cone model.
 
 Exit codes: 0 with a decision. 5 when no snapshot exists, or when the decision
 cannot be computed because an input cannot be read; the report then says which,
 with status `incomplete` and decision `unknown`. 1 for a malformed snapshot or a
-module outside the recorded build. JSON uses `fln.build-explain/2`.
+module outside the recorded build. Older snapshots without configuration
+identities also yield `unknown` with exit 5; a successful build refreshes them.
+A recorded module no longer owned by a selected package is explicitly
+unavailable. JSON uses `fln.build-explain/2`.
 
 `lake check-build` has the narrow meaning in the pinned Reference's
 `Lake/CLI/Help.lean` and `Lake/CLI/Main.lean`: load the configuration, then return

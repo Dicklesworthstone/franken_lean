@@ -26,7 +26,7 @@ use fln_core::name::Name;
 // ---------------------------------------------------------------------------
 
 /// A parsed `lakefile.lean` or `lakefile.toml` configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LakeConfig {
     /// Project name.
     pub name: String,

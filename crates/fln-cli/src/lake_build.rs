@@ -294,20 +294,6 @@ fn library_sources(root: &Path, config: &LakeConfig) -> Result<Vec<Library>, Fai
     Ok(libraries)
 }
 
-fn plan(
-    root: &Path,
-    config: &LakeConfig,
-    targets: &[String],
-) -> Result<(Vec<Library>, Vec<Name>), Failure> {
-    let libraries = library_sources(root, config)?;
-    let modules = plan_modules(
-        config.targets.iter().map(|target| target.name.as_str()),
-        &libraries,
-        targets,
-    )?;
-    Ok((libraries, modules))
-}
-
 fn plan_modules<'a>(
     target_names: impl IntoIterator<Item = &'a str>,
     libraries: &[Library],
@@ -918,10 +904,13 @@ fn build(
     let sources = local_dependencies::load(&root, &config)?;
     let libraries = sources.libraries();
     let entries = plan_modules(
-        sources
-            .packages
-            .iter()
-            .flat_map(|package| package.config.targets.iter().map(|target| target.name.as_str())),
+        sources.packages.iter().flat_map(|package| {
+            package
+                .config
+                .targets
+                .iter()
+                .map(|target| target.name.as_str())
+        }),
         &libraries,
         &targets,
     )?;
@@ -953,25 +942,20 @@ fn build(
         records.as_ref().and_then(|records| records.persisted()),
         macro_config.as_ref(),
     )?;
-    let output_dir = root.join(&config.build_dir).join("lib/lean");
     let destinations = sources.destinations(&artifacts)?;
     let paths = publish_locations_with(&artifacts, &destinations, fln::publish_file_atomic)?;
-    let snapshot = if config.requires.is_empty() {
-        record_snapshot(
-            &root,
-            &config,
-            &libraries,
-            &targets,
-            &modules,
-            &artifacts,
-            &output_dir,
-            &provenance,
-            posture,
-            records_state,
-        )
-    } else {
-        Err("build snapshots do not yet bind local dependency configurations and output directories".to_owned())
-    };
+    let snapshot = record_snapshot(
+        &root,
+        &config,
+        &sources,
+        &targets,
+        &modules,
+        &artifacts,
+        &destinations,
+        &provenance,
+        posture,
+        records_state,
+    );
     let executable_count = artifacts
         .values()
         .filter(|family| family.ir.is_some())
@@ -1097,11 +1081,11 @@ fn build(
 fn record_snapshot(
     root: &Path,
     config: &LakeConfig,
-    libraries: &[Library],
+    sources: &local_dependencies::Sources,
     targets: &[String],
     modules: &BTreeMap<Name, Module>,
     artifacts: &BTreeMap<Name, ModuleArtifacts>,
-    output_dir: &Path,
+    destinations: &BTreeMap<Name, (PathBuf, PathBuf)>,
     provenance: &[ModuleProvenance],
     posture: ImportPosture,
     records: &str,
@@ -1118,9 +1102,16 @@ fn record_snapshot(
         let module = modules
             .get(name)
             .ok_or("an artifact has no source module")?;
-        let source = source_path(name, libraries)
+        let source = sources
+            .resolve(name)
             .map_err(|failure| failure.detail)?
             .ok_or("a built module has no library owner")?;
+        let (owner, output_dir) = destinations
+            .get(name)
+            .ok_or("a built module has no output destination")?;
+        if &source.package != owner {
+            return Err("a built module changed its output owner".to_owned());
+        }
         let mut artifact =
             source_import_relative_path(name).map_err(|failure| failure.to_string())?;
         artifact.set_extension("olean");
@@ -1132,7 +1123,7 @@ fn record_snapshot(
         let row = provenance.iter().find(|row| &row.name == name);
         rows.push(snapshot::ModuleRow {
             name: name.to_display_string(),
-            source: relative(&source),
+            source: relative(&source.path),
             source_digest: snapshot::digest(&module.source),
             imports: module.imports.iter().map(Name::to_display_string).collect(),
             artifact: relative(&output_dir.join(artifact)),
@@ -1168,11 +1159,19 @@ fn record_snapshot(
         posture: posture.as_str().to_owned(),
         records: records.to_owned(),
         targets: targets.to_vec(),
+        configurations: sources.configuration_rows(root),
         modules: rows,
         externals,
     }
     .to_text();
-    let path = root.join(&config.build_dir).join(snapshot::FILE);
+    sources
+        .verify_configurations()
+        .map_err(|failure| failure.detail)?;
+    let directory = root.join(&config.build_dir);
+    let path = directory.join(snapshot::FILE);
+    check_path(root, &path, true).map_err(|failure| failure.detail)?;
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("{}: {error}", directory.display()))?;
     fln::publish_file_atomic(text.as_bytes(), &path)
         .map_err(|error| format!("{}: {error}", path.display()))
 }
@@ -1388,7 +1387,11 @@ mod publication_tests {
             "{}",
             error.detail
         );
-        assert!(!error.detail.contains("rollback failed"), "{}", error.detail);
+        assert!(
+            !error.detail.contains("rollback failed"),
+            "{}",
+            error.detail
+        );
         for (root, name, old) in [(&first, "A", &old_a), (&second, "B", &old_b)] {
             for (part, bytes) in old.parts() {
                 assert_eq!(
