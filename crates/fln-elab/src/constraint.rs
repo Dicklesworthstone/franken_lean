@@ -59,6 +59,17 @@ impl ConstraintKind {
     ) -> HashSet<MVarId> {
         dependencies::reads(self, store, Some(locals), &HashSet::new())
     }
+
+    /// Synthesis and delayed-assignment targets are outputs (so they never block
+    /// `take_ready`), yet an external assignment to an output turns a synthesis
+    /// or delayed obligation into a consistency check against the newly assigned
+    /// term (`dependencies.rs:58`) and must therefore wake the obligation.
+    pub(crate) fn output_mvar(&self) -> Option<&MVarId> {
+        match self {
+            Self::SynthInstance { mvar, .. } | Self::DelayedAssign { mvar, .. } => Some(mvar),
+            Self::DefEq { .. } | Self::HasType { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +161,7 @@ impl ConstraintQueue {
     ) -> ConstraintId {
         let id = ConstraintId(self.next_id);
         self.next_id += 1;
-        for mvar in &reads_mvars {
+        for mvar in reads_mvars.iter().chain(kind.output_mvar()) {
             self.mvar_to_constraints
                 .entry(mvar.clone())
                 .or_default()
@@ -243,7 +254,7 @@ impl ConstraintQueue {
         let Some(mut constraint) = self.remove(&id) else {
             return false;
         };
-        for mvar in &reads {
+        for mvar in reads.iter().chain(constraint.kind.output_mvar()) {
             self.mvar_to_constraints
                 .entry(mvar.clone())
                 .or_default()
@@ -306,7 +317,11 @@ impl ConstraintQueue {
     pub fn remove(&mut self, id: &ConstraintId) -> Option<Constraint> {
         let constraint = self.constraints.remove(id)?;
         self.unknown_reader_constraints.remove(id);
-        for mvar in &constraint.reads_mvars {
+        for mvar in constraint
+            .reads_mvars
+            .iter()
+            .chain(constraint.kind.output_mvar())
+        {
             let empty = self.mvar_to_constraints.get_mut(mvar).is_some_and(|set| {
                 set.remove(id);
                 set.is_empty()
@@ -425,7 +440,7 @@ impl ElabTxn {
         }
         let mut trial = self.clone();
         for row in rows {
-            for mvar in &row.reads_mvars {
+            for mvar in row.reads_mvars.iter().chain(row.kind.output_mvar()) {
                 if cancelled() {
                     return Err(cancelled_error());
                 }
