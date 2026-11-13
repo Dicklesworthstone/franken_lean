@@ -658,6 +658,7 @@ impl ElabTxn {
         if total == 0 {
             return (Vec::new(), ChildTaskDrain::NONE);
         }
+        type IndexedBranchOutcome = (usize, Outcome<(ElabTxn, TxnDispositionV1)>);
         let children = self.fork(total);
         let slots: Vec<Mutex<Option<(usize, ElabTxn, F)>>> = children
             .into_iter()
@@ -668,8 +669,7 @@ impl ElabTxn {
         let next_idx = AtomicUsize::new(0);
         let joined_tasks = AtomicUsize::new(0);
         let cancelled_tasks = AtomicUsize::new(0);
-        let results: Mutex<Vec<(usize, Outcome<(ElabTxn, TxnDispositionV1)>)>> =
-            Mutex::new(Vec::with_capacity(total));
+        let results: Mutex<Vec<IndexedBranchOutcome>> = Mutex::new(Vec::with_capacity(total));
         let worker_count = max_workers.max(1).min(total);
 
         std::thread::scope(|scope| {

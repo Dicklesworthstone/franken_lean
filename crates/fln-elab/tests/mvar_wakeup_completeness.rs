@@ -4,13 +4,13 @@
 
 #![forbid(unsafe_code)]
 
-use fln_core::expr::{BinderInfo, Expr, FVarId, MVarId};
+use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId, MVarId};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_elab::constraint::{Constraint, ConstraintId, ConstraintKind, ConstraintQueue};
 use fln_elab::lctx::LocalContext;
 use fln_elab::mvar::{AssignmentJustification, MetavarKind, MetavarStore};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 fn name1(s: impl AsRef<str>) -> Name {
     Name::from_components([s.as_ref()])
@@ -37,11 +37,103 @@ impl SplitMix64 {
     }
 }
 
+/// Independent full-tree walker computing the unresolved input metavariables of
+/// `row` from its input roots at `roots_store`, evaluated under `eval_store`.
+/// Deliberately calls neither `Constraint::dependencies` nor `MetavarStore::targeted_wake_up`.
+fn independent_input_mvars(
+    row: &Constraint,
+    roots_store: &MetavarStore,
+    eval_store: &MetavarStore,
+) -> HashSet<MVarId> {
+    let mut stack: Vec<&Expr> = Vec::new();
+    let target = match &row.kind {
+        ConstraintKind::DefEq { lhs, rhs } => {
+            stack.extend([lhs, rhs]);
+            None
+        }
+        ConstraintKind::HasType {
+            expr,
+            expected_type,
+        } => {
+            stack.extend([expr, expected_type]);
+            None
+        }
+        ConstraintKind::SynthInstance { class, mvar } => {
+            stack.push(class);
+            Some(mvar)
+        }
+        ConstraintKind::DelayedAssign { mvar, val, .. } => {
+            stack.push(val);
+            Some(mvar)
+        }
+    };
+    if let Some(locals) = row.local_context.as_deref() {
+        for decl in locals.decls() {
+            stack.push(&decl.type_);
+            stack.extend(decl.value.as_ref());
+        }
+    }
+    if let Some(out) = target {
+        if let Some(decl) = roots_store.get_decl(out) {
+            stack.push(&decl.type_);
+            for local in decl.lctx.decls() {
+                stack.push(&local.type_);
+                stack.extend(local.value.as_ref());
+            }
+        }
+        // Only a target already preassigned at queue-indexing time contributes
+        // residual input holes; an unassigned target is an output, not an input.
+        stack.extend(roots_store.get_assigned_expr(out));
+    }
+
+    let mut unresolved = HashSet::new();
+    let mut visited_decls = HashSet::new();
+    while let Some(expr) = stack.pop() {
+        match expr.node() {
+            ExprNode::MVar { id } => {
+                if let Some(assigned) = eval_store.get_assigned_expr(id) {
+                    stack.push(assigned);
+                } else {
+                    unresolved.insert(id.clone());
+                }
+                if visited_decls.insert(id.clone())
+                    && let Some(decl) = eval_store.get_decl(id)
+                {
+                    stack.push(&decl.type_);
+                    for local in decl.lctx.decls() {
+                        stack.push(&local.type_);
+                        stack.extend(local.value.as_ref());
+                    }
+                }
+            }
+            ExprNode::App { f, a } => stack.extend([f, a]),
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => stack.extend([binder_type, body]),
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => stack.extend([type_, value, body]),
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => stack.push(expr),
+            ExprNode::BVar { .. }
+            | ExprNode::FVar { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Const { .. }
+            | ExprNode::Lit { .. } => {}
+        }
+    }
+    unresolved
+}
+
 /// Independent full-scan oracle: inspects every remaining constraint before and
-/// after an assignment and reports every constraint whose live dependency set
-/// changed (or which carries an opaque `reads_unknown` marker).
-fn full_scan_oracle_affected(
+/// after an assignment, anchored to the `MetavarStore` snapshot at which each
+/// row entered the queue (`enqueue_stores`), and reports every constraint whose
+/// unresolved input dependency set changed (or which carries `reads_unknown`).
+fn full_scan_oracle_affected_with_roots(
     before_rows: &[Constraint],
+    enqueue_stores: &HashMap<ConstraintId, MetavarStore>,
     before_store: &MetavarStore,
     after_store: &MetavarStore,
 ) -> BTreeSet<ConstraintId> {
@@ -51,13 +143,22 @@ fn full_scan_oracle_affected(
             must_wake.insert(row.id);
             continue;
         }
-        let deps_before = row.dependencies(before_store);
-        let deps_after = row.dependencies(after_store);
+        let roots_store = enqueue_stores.get(&row.id).unwrap_or(before_store);
+        let deps_before = independent_input_mvars(row, roots_store, before_store);
+        let deps_after = independent_input_mvars(row, roots_store, after_store);
         if deps_before != deps_after {
             must_wake.insert(row.id);
         }
     }
     must_wake
+}
+
+fn full_scan_oracle_affected(
+    before_rows: &[Constraint],
+    before_store: &MetavarStore,
+    after_store: &MetavarStore,
+) -> BTreeSet<ConstraintId> {
+    full_scan_oracle_affected_with_roots(before_rows, &HashMap::new(), before_store, after_store)
 }
 
 #[test]
@@ -113,6 +214,8 @@ fn wakeup_matches_full_scan_oracle_across_generated_graphs_with_zero_missed_wake
             0
         };
 
+        let mut enqueue_stores: HashMap<ConstraintId, MetavarStore> = HashMap::new();
+
         // Enqueue 10 obligations mixing DefEq, HasType, SynthInstance, DelayedAssign, and conservative unknown readers.
         for c_idx in 0..10usize {
             let a = &ids[rng.pick(n)];
@@ -146,11 +249,12 @@ fn wakeup_matches_full_scan_oracle_across_generated_graphs_with_zero_missed_wake
                     val: Expr::mvar(a.clone()),
                 },
             };
-            if c_idx == 9 {
-                queue.enqueue_conservative_scoped(kind, &store, &lctx, 0);
+            let cid = if c_idx == 9 {
+                queue.enqueue_conservative_scoped(kind, &store, &lctx, 0)
             } else {
-                queue.enqueue_scoped(kind, &store, &lctx, 0);
-            }
+                queue.enqueue_scoped(kind, &store, &lctx, 0)
+            };
+            enqueue_stores.insert(cid, store.clone());
         }
 
         // Assign each remaining mvar either to an unassigned higher mvar (forming chains) or to Sort(0).
@@ -185,7 +289,12 @@ fn wakeup_matches_full_scan_oracle_across_generated_graphs_with_zero_missed_wake
                 "wake batch must be in canonical ID order"
             );
 
-            let oracle_must_wake = full_scan_oracle_affected(&before_rows, &before_store, &store);
+            let oracle_must_wake = full_scan_oracle_affected_with_roots(
+                &before_rows,
+                &enqueue_stores,
+                &before_store,
+                &store,
+            );
             for required in &oracle_must_wake {
                 assert!(
                     awakened_ids.contains(required),
@@ -197,13 +306,14 @@ fn wakeup_matches_full_scan_oracle_across_generated_graphs_with_zero_missed_wake
             for row in awakened {
                 let remaining = row.dependencies(&store);
                 if !remaining.is_empty() {
-                    if row.reads_unknown {
-                        queue.enqueue_conservative(row.kind, remaining, row.depth);
+                    let new_cid = if row.reads_unknown {
+                        queue.enqueue_conservative(row.kind, remaining, row.depth)
                     } else if let Some(locals) = row.local_context.as_deref() {
-                        queue.enqueue_scoped(row.kind, &store, locals, row.depth);
+                        queue.enqueue_scoped(row.kind, &store, locals, row.depth)
                     } else {
-                        queue.enqueue(row.kind, remaining, row.depth);
-                    }
+                        queue.enqueue(row.kind, remaining, row.depth)
+                    };
+                    enqueue_stores.insert(new_cid, store.clone());
                 }
             }
         }
@@ -351,15 +461,14 @@ fn planted_read_omission_mutants_are_caught_by_completeness_oracle() {
         "production `enqueue_scoped` wakes on captured LocalContext metavariable dependency"
     );
 
-    // Mutant 2: external assignment to a suspended `DelayedAssign` output (`m_out := ?m_residual`)
-    // introduces a new residual dependency (`?m_residual`) and requires consistency checking;
-    // indexing `kind.output_mvar()` in `mvar_to_constraints` wakes it without blocking `take_ready`.
+    // Mutant 2: omitting residual holes of a preassigned `DelayedAssign` output (`m_out := ?m_residual`)
+    // by passing syntactic-only `{m_blocker}` instead of `enqueue_scoped`.
     let m_out = mvar_id(20);
     let m_blocker = mvar_id(21);
     let m_residual = mvar_id(22);
-    let mut store_delayed = MetavarStore::new();
+    let mut store_delayed_mutant = MetavarStore::new();
     for id in [&m_out, &m_blocker, &m_residual] {
-        store_delayed.declare(
+        store_delayed_mutant.declare(
             id.clone(),
             id.0.clone(),
             Expr::sort(Level::one()),
@@ -369,33 +478,58 @@ fn planted_read_omission_mutants_are_caught_by_completeness_oracle() {
             None,
         );
     }
-    let mut delayed_queue = ConstraintQueue::new();
-    let delayed_cid = delayed_queue.enqueue_scoped(
-        ConstraintKind::DelayedAssign {
-            mvar: m_out.clone(),
-            fvars: Vec::new(),
-            val: Expr::mvar(m_blocker),
-        },
-        &store_delayed,
-        &LocalContext::new(),
-        0,
-    );
-    let delayed_before: Vec<Constraint> = delayed_queue.constraints().values().cloned().collect();
-    let store_delayed_before = store_delayed.clone();
-    let delayed_woke = delayed_queue
-        .assign_mvar(
-            &mut store_delayed,
-            m_out,
-            Expr::mvar(m_residual),
+    store_delayed_mutant
+        .assign(
+            m_out.clone(),
+            Expr::mvar(m_residual.clone()),
             AssignmentJustification::DirectDefEq,
         )
         .unwrap();
-    let delayed_oracle =
-        full_scan_oracle_affected(&delayed_before, &store_delayed_before, &store_delayed);
-    assert_eq!(delayed_oracle, BTreeSet::from([delayed_cid]));
+    let mut store_delayed_prod = store_delayed_mutant.clone();
+
+    let delayed_kind = ConstraintKind::DelayedAssign {
+        mvar: m_out,
+        fvars: Vec::new(),
+        val: Expr::mvar(m_blocker.clone()),
+    };
+    let mut delayed_mutant_q = ConstraintQueue::new();
+    let delayed_mutant_cid =
+        delayed_mutant_q.enqueue(delayed_kind.clone(), HashSet::from([m_blocker]), 0);
+
+    let mut delayed_prod_q = ConstraintQueue::new();
+    let delayed_prod_cid =
+        delayed_prod_q.enqueue_scoped(delayed_kind, &store_delayed_prod, &LocalContext::new(), 0);
+
+    let delayed_before: Vec<Constraint> = delayed_prod_q.constraints().values().cloned().collect();
+    let store_delayed_before = store_delayed_mutant.clone();
+    let delayed_mutant_woke = delayed_mutant_q
+        .assign_mvar(
+            &mut store_delayed_mutant,
+            m_residual.clone(),
+            Expr::sort(Level::zero()),
+            AssignmentJustification::DirectDefEq,
+        )
+        .unwrap();
+    let delayed_oracle = full_scan_oracle_affected(
+        &delayed_before,
+        &store_delayed_before,
+        &store_delayed_mutant,
+    );
+    assert!(
+        delayed_oracle.contains(&delayed_prod_cid) && delayed_mutant_woke.is_empty(),
+        "planted preassigned-target omission mutant must miss wakeup: cid={delayed_mutant_cid:?}"
+    );
+    let delayed_prod_woke = delayed_prod_q
+        .assign_mvar(
+            &mut store_delayed_prod,
+            m_residual,
+            Expr::sort(Level::zero()),
+            AssignmentJustification::DirectDefEq,
+        )
+        .unwrap();
     assert_eq!(
-        delayed_woke.iter().map(|c| c.id).collect::<Vec<_>>(),
-        vec![delayed_cid],
-        "DelayedAssign output external assignment must wake the suspended obligation"
+        delayed_prod_woke.iter().map(|c| c.id).collect::<Vec<_>>(),
+        vec![delayed_prod_cid],
+        "production `enqueue_scoped` wakes when a preassigned DelayedAssign target's residual hole assigns"
     );
 }
