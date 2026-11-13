@@ -1574,6 +1574,7 @@ struct EquivNode {
 struct EquivManager {
     nodes: Vec<EquivNode>,
     buckets: KMap<u64, Vec<(Expr, usize)>>,
+    done_scratch: KMap<(usize, usize), (bool, bool, Vec<LocalDependency>)>,
     entries: usize,
     local_dependency_cells: usize,
     local_dependency_scan_nodes: usize,
@@ -1594,6 +1595,7 @@ impl EquivManager {
         Self {
             nodes: Vec::new(),
             buckets: KMap::default(),
+            done_scratch: KMap::default(),
             entries: 0,
             local_dependency_cells: 0,
             local_dependency_scan_nodes: 0,
@@ -1860,24 +1862,63 @@ impl EquivManager {
         }
     }
 
-    fn is_equiv(
+    fn can_congruence_match(left: &Expr, right: &Expr) -> bool {
+        match (left.node(), right.node()) {
+            (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) => a == b,
+            (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) => a == b,
+            (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) => a == b,
+            (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => a == b,
+            (ExprNode::Lit { literal: a }, ExprNode::Lit { literal: b }) => a == b,
+            (
+                ExprNode::Const {
+                    name: a,
+                    levels: al,
+                },
+                ExprNode::Const {
+                    name: b,
+                    levels: bl,
+                },
+            ) => a == b && al == bl,
+            (ExprNode::App { .. }, ExprNode::App { .. })
+            | (ExprNode::Lam { .. }, ExprNode::Lam { .. })
+            | (ExprNode::ForallE { .. }, ExprNode::ForallE { .. })
+            | (ExprNode::MData { .. }, ExprNode::MData { .. }) => true,
+            (ExprNode::LetE { non_dep: a, .. }, ExprNode::LetE { non_dep: b, .. }) => a == b,
+            (
+                ExprNode::Proj {
+                    struct_name: an,
+                    idx: ai,
+                    ..
+                },
+                ExprNode::Proj {
+                    struct_name: bn,
+                    idx: bi,
+                    ..
+                },
+            ) => an == bn && ai == bi,
+            _ => false,
+        }
+    }
+
+    fn is_equiv<'a>(
         &mut self,
-        t: &Expr,
-        s: &Expr,
+        t: &'a Expr,
+        s: &'a Expr,
         use_hash: bool,
         eager_reduction: bool,
         locals: &[LocalDecl],
         local_positions: &KMap<FVarId, usize>,
     ) -> bool {
-        enum Op {
-            Enter(Expr, Expr),
-            Combine(Expr, Expr),
+        enum Op<'a> {
+            Enter(&'a Expr, &'a Expr),
+            Combine(&'a Expr, &'a Expr),
         }
 
-        if t.allocation_identity() == s.allocation_identity() {
+        if t.allocation_identity() == s.allocation_identity() || t.is_alpha_equiv(s) {
             return true;
         }
-        if !t.has_loose_bvars()
+        if self.entries > 0
+            && !t.has_loose_bvars()
             && !s.has_loose_bvars()
             && self
                 .are_known_equiv(t, s, locals, local_positions)
@@ -1885,97 +1926,123 @@ impl EquivManager {
         {
             return true;
         }
-        if use_hash && t.data().hash() != s.data().hash() {
-            return false;
-        }
-        if t.is_alpha_equiv(s) {
-            return true;
-        }
-        if use_hash && self.entries == 0 {
+        if (use_hash && t.data().hash() != s.data().hash()) || !Self::can_congruence_match(t, s) {
             return false;
         }
 
-        let mut done: KMap<(usize, usize), (bool, bool, Vec<LocalDependency>)> = KMap::default();
-        let mut stack = vec![Op::Enter(t.clone(), s.clone())];
+        self.done_scratch.clear();
+        if self.entries == 0 {
+            let mut pending = vec![(t, s)];
+            let mut visits = 0_usize;
+            while let Some((left, right)) = pending.pop() {
+                let pair = (left.allocation_identity(), right.allocation_identity());
+                if pair.0 == pair.1 || self.done_scratch.contains_key(&pair) {
+                    continue;
+                }
+                if use_hash && left.data().hash() != right.data().hash() {
+                    return false;
+                }
+                if left.is_alpha_equiv(right) {
+                    self.done_scratch.insert(pair, (false, true, Vec::new()));
+                    continue;
+                }
+                if !Self::can_congruence_match(left, right)
+                    || visits >= TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY
+                {
+                    return false;
+                }
+                visits += 1;
+                self.done_scratch.insert(pair, (false, true, Vec::new()));
+                match (left.node(), right.node()) {
+                    (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
+                        pending.push((aa, ba));
+                        pending.push((af, bf));
+                    }
+                    (
+                        ExprNode::Lam {
+                            binder_type: at,
+                            body: ab,
+                            ..
+                        },
+                        ExprNode::Lam {
+                            binder_type: bt,
+                            body: bb,
+                            ..
+                        },
+                    )
+                    | (
+                        ExprNode::ForallE {
+                            binder_type: at,
+                            body: ab,
+                            ..
+                        },
+                        ExprNode::ForallE {
+                            binder_type: bt,
+                            body: bb,
+                            ..
+                        },
+                    ) => {
+                        pending.push((ab, bb));
+                        pending.push((at, bt));
+                    }
+                    (
+                        ExprNode::LetE {
+                            type_: at,
+                            value: av,
+                            body: ab,
+                            ..
+                        },
+                        ExprNode::LetE {
+                            type_: bt,
+                            value: bv,
+                            body: bb,
+                            ..
+                        },
+                    ) => {
+                        pending.push((ab, bb));
+                        pending.push((av, bv));
+                        pending.push((at, bt));
+                    }
+                    (ExprNode::MData { expr: ae, .. }, ExprNode::MData { expr: be, .. })
+                    | (ExprNode::Proj { expr: ae, .. }, ExprNode::Proj { expr: be, .. }) => {
+                        pending.push((ae, be));
+                    }
+                    _ => {}
+                }
+            }
+            return true;
+        }
+
+        let mut stack = vec![Op::Enter(t, s)];
         let mut visits = 0_usize;
         while let Some(op) = stack.pop() {
             match op {
                 Op::Enter(left, right) => {
                     let pair = (left.allocation_identity(), right.allocation_identity());
-                    if pair.0 == pair.1 {
-                        done.insert(pair, (false, true, Vec::new()));
+                    if pair.0 == pair.1 || self.done_scratch.contains_key(&pair) {
                         continue;
                     }
-                    if done.contains_key(&pair) {
+                    if left.is_alpha_equiv(right) {
+                        self.done_scratch.insert(pair, (false, true, Vec::new()));
                         continue;
                     }
                     if !left.has_loose_bvars()
                         && !right.has_loose_bvars()
                         && let Some(deps) =
-                            self.are_known_equiv(&left, &right, locals, local_positions)
+                            self.are_known_equiv(left, right, locals, local_positions)
                     {
-                        done.insert(pair, (true, true, deps));
+                        self.done_scratch.insert(pair, (true, true, deps));
                         continue;
                     }
-                    if use_hash && left.data().hash() != right.data().hash() {
-                        return false;
-                    }
-                    if left.is_alpha_equiv(&right) {
-                        done.insert(pair, (false, true, Vec::new()));
-                        continue;
-                    }
-                    if visits >= TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY {
+                    if (use_hash && left.data().hash() != right.data().hash())
+                        || !Self::can_congruence_match(left, right)
+                        || visits >= TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY
+                    {
                         return false;
                     }
                     visits += 1;
                     match (left.node(), right.node()) {
-                        (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) => {
-                            if a != b {
-                                return false;
-                            }
-                            done.insert(pair, (false, true, Vec::new()));
-                        }
-                        (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) => {
-                            if a != b {
-                                return false;
-                            }
-                            done.insert(pair, (false, true, Vec::new()));
-                        }
-                        (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) => {
-                            if a != b {
-                                return false;
-                            }
-                            done.insert(pair, (false, true, Vec::new()));
-                        }
-                        (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => {
-                            if a != b {
-                                return false;
-                            }
-                            done.insert(pair, (false, true, Vec::new()));
-                        }
-                        (ExprNode::Lit { literal: a }, ExprNode::Lit { literal: b }) => {
-                            if a != b {
-                                return false;
-                            }
-                            done.insert(pair, (false, true, Vec::new()));
-                        }
-                        (
-                            ExprNode::Const {
-                                name: a,
-                                levels: al,
-                            },
-                            ExprNode::Const {
-                                name: b,
-                                levels: bl,
-                            },
-                        ) => {
-                            if a != b || al != bl {
-                                return false;
-                            }
-                            done.insert(pair, (false, true, Vec::new()));
-                        }
                         (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
-                            let (af, aa, bf, ba) = (af.clone(), aa.clone(), bf.clone(), ba.clone());
                             stack.push(Op::Combine(left, right));
                             stack.push(Op::Enter(aa, ba));
                             stack.push(Op::Enter(af, bf));
@@ -2004,7 +2071,6 @@ impl EquivManager {
                                 ..
                             },
                         ) => {
-                            let (at, ab, bt, bb) = (at.clone(), ab.clone(), bt.clone(), bb.clone());
                             stack.push(Op::Combine(left, right));
                             stack.push(Op::Enter(ab, bb));
                             stack.push(Op::Enter(at, bt));
@@ -2014,132 +2080,117 @@ impl EquivManager {
                                 type_: at,
                                 value: av,
                                 body: ab,
-                                non_dep: an,
                                 ..
                             },
                             ExprNode::LetE {
                                 type_: bt,
                                 value: bv,
                                 body: bb,
-                                non_dep: bn,
                                 ..
                             },
                         ) => {
-                            if an != bn {
-                                return false;
-                            }
-                            let (at, av, ab) = (at.clone(), av.clone(), ab.clone());
-                            let (bt, bv, bb) = (bt.clone(), bv.clone(), bb.clone());
                             stack.push(Op::Combine(left, right));
                             stack.push(Op::Enter(ab, bb));
                             stack.push(Op::Enter(av, bv));
                             stack.push(Op::Enter(at, bt));
                         }
-                        (ExprNode::MData { expr: ae, .. }, ExprNode::MData { expr: be, .. }) => {
-                            let (ae, be) = (ae.clone(), be.clone());
+                        (ExprNode::MData { expr: ae, .. }, ExprNode::MData { expr: be, .. })
+                        | (ExprNode::Proj { expr: ae, .. }, ExprNode::Proj { expr: be, .. }) => {
                             stack.push(Op::Combine(left, right));
                             stack.push(Op::Enter(ae, be));
                         }
-                        (
-                            ExprNode::Proj {
-                                struct_name: an,
-                                idx: ai,
-                                expr: ae,
-                            },
-                            ExprNode::Proj {
-                                struct_name: bn,
-                                idx: bi,
-                                expr: be,
-                            },
-                        ) => {
-                            if an != bn || ai != bi {
-                                return false;
-                            }
-                            let (ae, be) = (ae.clone(), be.clone());
-                            stack.push(Op::Combine(left, right));
-                            stack.push(Op::Enter(ae, be));
+                        _ => {
+                            self.done_scratch.insert(pair, (false, true, Vec::new()));
                         }
-                        _ => return false,
                     }
                 }
                 Op::Combine(left, right) => {
                     let pair = (left.allocation_identity(), right.allocation_identity());
-                    if done.contains_key(&pair) {
+                    if self.done_scratch.contains_key(&pair) {
                         continue;
                     }
                     let mut nontrivial = false;
                     let mut can_cache = true;
                     let mut combined: Vec<LocalDependency> = Vec::new();
-                    let mut fold_child = |cl: &Expr, cr: &Expr| {
-                        let cp = (cl.allocation_identity(), cr.allocation_identity());
-                        if let Some((nt, child_cache, deps)) = done.get(&cp) {
-                            nontrivial |= *nt;
-                            can_cache &= *child_cache;
-                            if can_cache {
-                                match Self::merge_dep_slices(&combined, deps) {
-                                    Some(merged) => combined = merged,
-                                    None => can_cache = false,
-                                }
+                    {
+                        let done = &self.done_scratch;
+                        let mut fold_child = |cl: &Expr, cr: &Expr| {
+                            let cp = (cl.allocation_identity(), cr.allocation_identity());
+                            if cp.0 == cp.1 {
+                                return;
                             }
-                        } else {
-                            can_cache = false;
+                            if let Some((nt, child_cache, deps)) = done.get(&cp) {
+                                nontrivial |= *nt;
+                                can_cache &= *child_cache;
+                                if can_cache && !deps.is_empty() {
+                                    match Self::merge_dep_slices(&combined, deps) {
+                                        Some(merged) => combined = merged,
+                                        None => can_cache = false,
+                                    }
+                                }
+                            } else {
+                                can_cache = false;
+                            }
+                        };
+                        match (left.node(), right.node()) {
+                            (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
+                                fold_child(af, bf);
+                                fold_child(aa, ba);
+                            }
+                            (
+                                ExprNode::Lam {
+                                    binder_type: at,
+                                    body: ab,
+                                    ..
+                                },
+                                ExprNode::Lam {
+                                    binder_type: bt,
+                                    body: bb,
+                                    ..
+                                },
+                            )
+                            | (
+                                ExprNode::ForallE {
+                                    binder_type: at,
+                                    body: ab,
+                                    ..
+                                },
+                                ExprNode::ForallE {
+                                    binder_type: bt,
+                                    body: bb,
+                                    ..
+                                },
+                            ) => {
+                                fold_child(at, bt);
+                                fold_child(ab, bb);
+                            }
+                            (
+                                ExprNode::LetE {
+                                    type_: at,
+                                    value: av,
+                                    body: ab,
+                                    ..
+                                },
+                                ExprNode::LetE {
+                                    type_: bt,
+                                    value: bv,
+                                    body: bb,
+                                    ..
+                                },
+                            ) => {
+                                fold_child(at, bt);
+                                fold_child(av, bv);
+                                fold_child(ab, bb);
+                            }
+                            (
+                                ExprNode::MData { expr: ae, .. },
+                                ExprNode::MData { expr: be, .. },
+                            )
+                            | (ExprNode::Proj { expr: ae, .. }, ExprNode::Proj { expr: be, .. }) => {
+                                fold_child(ae, be);
+                            }
+                            _ => {}
                         }
-                    };
-                    match (left.node(), right.node()) {
-                        (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
-                            fold_child(af, bf);
-                            fold_child(aa, ba);
-                        }
-                        (
-                            ExprNode::Lam {
-                                binder_type: at,
-                                body: ab,
-                                ..
-                            },
-                            ExprNode::Lam {
-                                binder_type: bt,
-                                body: bb,
-                                ..
-                            },
-                        )
-                        | (
-                            ExprNode::ForallE {
-                                binder_type: at,
-                                body: ab,
-                                ..
-                            },
-                            ExprNode::ForallE {
-                                binder_type: bt,
-                                body: bb,
-                                ..
-                            },
-                        ) => {
-                            fold_child(at, bt);
-                            fold_child(ab, bb);
-                        }
-                        (
-                            ExprNode::LetE {
-                                type_: at,
-                                value: av,
-                                body: ab,
-                                ..
-                            },
-                            ExprNode::LetE {
-                                type_: bt,
-                                value: bv,
-                                body: bb,
-                                ..
-                            },
-                        ) => {
-                            fold_child(at, bt);
-                            fold_child(av, bv);
-                            fold_child(ab, bb);
-                        }
-                        (ExprNode::MData { expr: ae, .. }, ExprNode::MData { expr: be, .. })
-                        | (ExprNode::Proj { expr: ae, .. }, ExprNode::Proj { expr: be, .. }) => {
-                            fold_child(ae, be);
-                        }
-                        _ => {}
                     }
                     if nontrivial
                         && can_cache
@@ -2147,9 +2198,10 @@ impl EquivManager {
                         && !left.has_loose_bvars()
                         && !right.has_loose_bvars()
                     {
-                        self.insert_equiv(&left, &right, &combined, locals, local_positions);
+                        self.insert_equiv(left, right, &combined, locals, local_positions);
                     }
-                    done.insert(pair, (nontrivial, can_cache, combined));
+                    self.done_scratch
+                        .insert(pair, (nontrivial, can_cache, combined));
                 }
             }
         }
@@ -2863,6 +2915,14 @@ impl<'a> TypeChecker<'a> {
                 .cloned()
                 .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
         };
+        if e.loose_bvar_range() <= k {
+            self.step(depth)?;
+            return Ok(e.clone());
+        }
+        if let Some(cached) = self.instantiate_cache.get(e, k, subst) {
+            self.step(depth)?;
+            return Ok(cached);
+        }
         let mut done: KMap<(usize, u32, usize), Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
@@ -2895,14 +2955,12 @@ impl<'a> TypeChecker<'a> {
                             } else {
                                 e.clone()
                             };
-                            if result != e {
-                                self.instantiate_cache.insert(
-                                    e.clone(),
-                                    k,
-                                    subst.clone(),
-                                    result.clone(),
-                                );
-                            }
+                            self.instantiate_cache.insert(
+                                e.clone(),
+                                k,
+                                subst.clone(),
+                                result.clone(),
+                            );
                             done.insert(key, result);
                         }
                         ExprNode::App { f, a } => {
@@ -3082,10 +3140,8 @@ impl<'a> TypeChecker<'a> {
                         _ => e.clone(),
                     };
                     let result = self.interner.intern(result);
-                    if result != e {
-                        self.instantiate_cache
-                            .insert(e.clone(), k, subst.clone(), result.clone());
-                    }
+                    self.instantiate_cache
+                        .insert(e.clone(), k, subst.clone(), result.clone());
                     done.insert(key, result);
                 }
             }
@@ -3135,6 +3191,18 @@ impl<'a> TypeChecker<'a> {
         };
         let count =
             u32::try_from(fvars.len()).map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
+        if e.loose_bvar_range() <= bound || fvars.is_empty() {
+            self.step(depth)?;
+            return Ok(e.clone());
+        }
+        let entry_cached = match context {
+            Some(context) => self.instantiate_rev_context_cache.get(context, e, bound),
+            None => cache.get(e, bound),
+        };
+        if let Some(cached) = entry_cached {
+            self.step(depth)?;
+            return Ok(cached);
+        }
         let mut done: KMap<(usize, u32), Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
@@ -3383,6 +3451,22 @@ impl<'a> TypeChecker<'a> {
                 .cloned()
                 .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
         };
+        use fln_core::level::LevelView;
+        if params.is_empty()
+            || !e.has_level_param()
+            || (params.len() == levels.len()
+                && params
+                    .iter()
+                    .zip(levels)
+                    .all(|(p, l)| matches!(l.view(), LevelView::Param(lp) if lp == p)))
+        {
+            self.step(depth)?;
+            return Ok(e.clone());
+        }
+        if let Some(cached) = self.instantiate_lparams_cache.get(e, params, levels) {
+            self.step(depth)?;
+            return Ok(cached);
+        }
         let mut done: KMap<usize, Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
@@ -3406,32 +3490,36 @@ impl<'a> TypeChecker<'a> {
                     }
                     match e.node() {
                         ExprNode::Sort { level } => {
-                            let result = Expr::sort(substitute_level(level, params, levels));
-                            if result != e {
-                                self.instantiate_lparams_cache.insert(
-                                    e.clone(),
-                                    params,
-                                    levels,
-                                    result.clone(),
-                                );
-                            }
+                            let new_level = substitute_level(level, params, levels);
+                            let result = if new_level == *level {
+                                e.clone()
+                            } else {
+                                Expr::sort(new_level)
+                            };
+                            self.instantiate_lparams_cache.insert(
+                                e,
+                                params,
+                                levels,
+                                result.clone(),
+                            );
                             done.insert(key, result);
                         }
                         ExprNode::Const { name, levels: ls } => {
-                            let result = Expr::const_(
-                                name.clone(),
-                                ls.iter()
-                                    .map(|level| substitute_level(level, params, levels))
-                                    .collect(),
+                            let new_levels: Vec<Level> = ls
+                                .iter()
+                                .map(|level| substitute_level(level, params, levels))
+                                .collect();
+                            let result = if new_levels == *ls {
+                                e.clone()
+                            } else {
+                                self.interner.intern(Expr::const_(name.clone(), new_levels))
+                            };
+                            self.instantiate_lparams_cache.insert(
+                                e,
+                                params,
+                                levels,
+                                result.clone(),
                             );
-                            if result != e {
-                                self.instantiate_lparams_cache.insert(
-                                    e.clone(),
-                                    params,
-                                    levels,
-                                    result.clone(),
-                                );
-                            }
                             done.insert(key, result);
                         }
                         ExprNode::App { f, a } => {
@@ -3547,14 +3635,8 @@ impl<'a> TypeChecker<'a> {
                         _ => e.clone(),
                     };
                     let result = self.interner.intern(result);
-                    if result != e {
-                        self.instantiate_lparams_cache.insert(
-                            e.clone(),
-                            params,
-                            levels,
-                            result.clone(),
-                        );
-                    }
+                    self.instantiate_lparams_cache
+                        .insert(e, params, levels, result.clone());
                     done.insert(key, result);
                 }
             }
@@ -4010,7 +4092,7 @@ impl<'a> TypeChecker<'a> {
         let levels = levels.clone();
         let mut unfolded = self.instantiate_lparams(&value, &params, &levels, depth + 1)?;
         for arg in args {
-            unfolded = Expr::app(unfolded, arg);
+            unfolded = self.interner.intern(Expr::app(unfolded, arg));
         }
         Ok(Some(unfolded))
     }
@@ -7742,6 +7824,14 @@ fn substitute_level(level: &Level, params: &[Name], levels: &[Level]) -> Level {
     use fln_core::level::LevelView;
     if !level.has_param() {
         return level.clone();
+    }
+    if let LevelView::Param(name) = level.view() {
+        return params
+            .iter()
+            .position(|p| p == name)
+            .and_then(|i| levels.get(i))
+            .cloned()
+            .unwrap_or_else(|| level.clone());
     }
     let mut done: KMap<Level, Level> = KMap::default();
     let mut stack = vec![(level.clone(), false)];

@@ -402,13 +402,13 @@
 //! that the prose reading the site is sound.
 //!
 //! ```text
-//! cite crates/fln-kernel/src/tc.rs:4758 :: lt.is_equiv(ls)
-//! cite crates/fln-kernel/src/tc.rs:4686 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
-//! cite crates/fln-kernel/src/tc.rs:5313 :: ExprNode::Sort { level } @@ fn is_prop
-//! cite crates/fln-kernel/src/tc.rs:6922 :: ExprNode::Sort { level } @@ fn finish_infer_proj
-//! cite crates/fln-kernel/src/tc.rs:2885 :: e.loose_bvar_range() <= k
-//! cite crates/fln-kernel/src/tc.rs:6454 :: !e.has_fvar() || active == 0
-//! cite crates/fln-kernel/src/tc.rs:6650 :: if !e.has_fvar() {
+//! cite crates/fln-kernel/src/tc.rs:4840 :: lt.is_equiv(ls)
+//! cite crates/fln-kernel/src/tc.rs:4768 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
+//! cite crates/fln-kernel/src/tc.rs:5395 :: ExprNode::Sort { level } @@ fn is_prop
+//! cite crates/fln-kernel/src/tc.rs:7004 :: ExprNode::Sort { level } @@ fn finish_infer_proj
+//! cite crates/fln-kernel/src/tc.rs:2945 :: e.loose_bvar_range() <= k
+//! cite crates/fln-kernel/src/tc.rs:6536 :: !e.has_fvar() || active == 0
+//! cite crates/fln-kernel/src/tc.rs:6732 :: if !e.has_fvar() {
 //! cite crates/fln-hash/src/canon.rs:1346 :: impl Canonical for Expr
 //! cite crates/fln-hash/src/canon.rs:835 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:511 :: impl PartialEq for Expr
