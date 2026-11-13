@@ -728,7 +728,20 @@ impl Budget {
     /// stack calibration and unchanged by it. They are also **engine-local**:
     /// see [`Bound::Steps`] for why a step count is never comparable across
     /// engines even when both engines are honest.
-    pub const DEFAULT_STEPS: u64 = 10_000_000;
+    ///
+    /// Calibrated to 500,000,000 from pinned Reference v4.32.0 measurements
+    /// (`fln-frontier-k1-step-stops-since-s25-uvm6`): upstream `.olean` replay
+    /// (`Lean/Replay.lean:60`, `Lean/Environment.lean:2553`) passes
+    /// `maxHeartbeats = 0` (unbounded) to `Kernel.Environment.addDeclCore`
+    /// because `.olean` files carry no `set_option maxHeartbeats` metadata,
+    /// while source elaboration defaults to 200,000,000 (`Lean/CoreM.lean:31`)
+    /// and Mathlib declarations routinely raise it further. On
+    /// `Mathlib.Algebra.Polynomial.Derivative::Polynomial.iterate_derivative_derivative_mul_X`,
+    /// pinned Reference `addDeclCore` spends `(134_201_344, 134_217_728]`
+    /// `g_heartbeat` and `348_896_102` `IO.getNumHeartbeats` (35.365 s), while
+    /// K1 in pin-faithful last-to-first argument order (`68429a1a`) consumes
+    /// `464_519_812` steps (1.331x Reference `IO.getNumHeartbeats`).
+    pub const DEFAULT_STEPS: u64 = 500_000_000;
 
     /// The traversal depth [`Budget::DEFAULT`] offers.
     ///

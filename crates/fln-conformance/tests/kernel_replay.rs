@@ -21379,9 +21379,15 @@ fn fln_4hol_units_accept_within_their_step_ceilings() {
     }
 }
 
-/// The three S26 K1 corpus regression units accept within their step ceilings
-/// at `Budget::DEFAULT` (`fln-frontier-k1-step-stops-since-s25-uvm6`).
-#[ignore = "cost: three ~2,600..2,905-module Mathlib closure decodes (~20 min release); on-demand regression lane for bead fln-frontier-k1-step-stops-since-s25-uvm6"]
+/// The three S26 K1 corpus regression units accept within their measured step
+/// ceilings at `Budget::DEFAULT` (`fln-frontier-k1-step-stops-since-s25-uvm6`):
+/// two stay strictly below the pre-calibration 10M step cap once pin-faithful
+/// `EquivManager` / `lazy_delta` parity is restored (`8,820,732` vs Reference
+/// `8,786,664` `IO.getNumHeartbeats`; `7,878,455` vs Reference `8,034,967`),
+/// while `Polynomial.iterate_derivative_derivative_mul_X` consumes `464,519,812`
+/// steps against Reference's `348,896,102` `IO.getNumHeartbeats` (`134.2M`
+/// `g_heartbeat`, 35.4 s in C++) under pin-faithful last-to-first argument order.
+#[ignore = "cost: three ~2,635..2,905-module Mathlib closure decodes (~17 min release); on-demand regression lane for bead fln-frontier-k1-step-stops-since-s25-uvm6"]
 #[test]
 fn s26_k1_step_regression_units_accept_within_their_step_ceilings() {
     let reference_lib =
@@ -21393,19 +21399,19 @@ fn s26_k1_step_regression_units_accept_within_their_step_ceilings() {
     );
     for (chosen, selector, ceiling) in [
         (
-            "Mathlib.Algebra.Polynomial.Derivative",
-            "Polynomial.iterate_derivative_derivative_mul_X",
-            2_000_000u64,
-        ),
-        (
             "Mathlib.RingTheory.Morita.Matrix",
             "MatrixModCat.unitIso._proof_2",
-            2_000_000u64,
+            9_500_000u64,
         ),
         (
             "Mathlib.Algebra.Category.ModuleCat.Monoidal.Basic",
             "ModuleCat.monoidalCategory._proof_4",
-            2_000_000u64,
+            9_000_000u64,
+        ),
+        (
+            "Mathlib.Algebra.Polynomial.Derivative",
+            "Polynomial.iterate_derivative_derivative_mul_X",
+            480_000_000u64,
         ),
     ] {
         let inventory = closure_inventory(&roots, chosen)

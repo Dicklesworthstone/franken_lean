@@ -2889,6 +2889,14 @@ impl<'a> TypeChecker<'a> {
         subst: &Expr,
         depth: u32,
     ) -> KResult<Expr> {
+        if e.loose_bvar_range() <= k {
+            self.step(depth)?;
+            return Ok(e.clone());
+        }
+        if let Some(cached) = self.instantiate_cache.get(e, k, subst) {
+            self.step(depth)?;
+            return Ok(cached);
+        }
         // Post-order heap walk. Recursing one frame per node would abort a
         // legal deep open term before `step` could turn it into Inconclusive
         // if the host stack is smaller than Budget::depth (FL-INV-07).
@@ -2915,14 +2923,6 @@ impl<'a> TypeChecker<'a> {
                 .cloned()
                 .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
         };
-        if e.loose_bvar_range() <= k {
-            self.step(depth)?;
-            return Ok(e.clone());
-        }
-        if let Some(cached) = self.instantiate_cache.get(e, k, subst) {
-            self.step(depth)?;
-            return Ok(cached);
-        }
         let mut done: KMap<(usize, u32, usize), Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),

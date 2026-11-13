@@ -61,8 +61,8 @@
 //! * **Universe judgments.** [`fln_core::level::Level::is_equiv`],
 //!   `normalize`, `normalize_fixpoint`, `is_zero`. These are not helpers; they
 //!   *are* judgments of the type theory, and `fln-kernel` returns their result
-//!   directly as its verdict — `tc.rs:4758` answers KR-303 sort definitional
-//!   equality with `lt.is_equiv(ls)`, and `tc.rs:4686`/`5313`/`6922` decide
+//!   directly as its verdict — `tc.rs:4840` answers KR-303 sort definitional
+//!   equality with `lt.is_equiv(ls)`, and `tc.rs:4768`/`5395`/`7004` decide
 //!   "is this a Prop?" (the KR-974 theorem check) with
 //!   `level.is_equiv(&Level::zero())`. A checker that calls `is_equiv` does not
 //!   check universe equivalence at all. `imax`/`max` fixpoint normalization is
@@ -72,9 +72,9 @@
 //!   `loose_bvar_range`, `has_fvar`, `has_expr_mvar`, `has_level_mvar`,
 //!   `has_level_param`, `approx_depth`. These are precomputed answers that the
 //!   kernel *skips work* on: `instantiate` returns early when
-//!   `loose_bvar_range() <= k` (`tc.rs:2885`), and the iterative
+//!   `loose_bvar_range() <= k` (`tc.rs:2892`), and the iterative
 //!   `abstract_fvar_set` and `replace_fvar` paths return early when
-//!   `!has_fvar()` (`tc.rs:6454`/`6650`). An under-reporting flag makes
+//!   `!has_fvar()` (`tc.rs:6536`/`6732`). An under-reporting flag makes
 //!   substitution silently skip a subterm that needed rewriting. Shared, both
 //!   engines skip the same subterm and agree for the same wrong reason.
 //! * **Hashing that feeds a decision.** [`fln_core::lean_hash`] and the
@@ -382,16 +382,16 @@
 //! line stops containing its construct, and if the prose cites a location this registry does
 //! not cover. **Fix the registry, not the test** — the registry is the source.
 //!
-//! **`@@ <item>` closes the tolerance that containment cannot see, and five rows carry it.**
+//! **`@@ <item>` closes the tolerance that containment cannot see, and four rows carry it.**
 //! Containment asks only whether line N holds construct C. Where C **recurs** in its file that
 //! is satisfied by *any* occurrence, so a shift can move a citation onto a different site and
 //! stay green — the tolerance is the distance between occurrences, and it is the reason
 //! `0f2ae0ba` shifted four of AGENTS.md's citations by 45 lines while only two reddened. A row
 //! whose construct recurs must therefore name the item the line sits inside, and that name is
-//! checked. `ExprNode::Sort { level }` occurs **9** times in `tc.rs` and `!e.has_fvar()` **2**,
-//! which is why exactly those five rows are sited and the other ten are not: where a construct
-//! occurs once, any shift already breaks containment, so a site check there could never fail
-//! and would be decoration reading as coverage.
+//! checked. `ExprNode::Sort { level }` occurs **9** times in `tc.rs` and
+//! `e.loose_bvar_range() <= k` **2**, which is why those four rows are sited and the other
+//! eleven are not: where a construct occurs once, any shift already breaks containment, so a
+//! site check there could never fail and would be decoration reading as coverage.
 //!
 //! **Measured before it was built, at `84f35ea6`, over all 15 rows:** every one was still on
 //! its original occurrence and inside its original item, so the tolerance was real and had
@@ -406,7 +406,7 @@
 //! cite crates/fln-kernel/src/tc.rs:4768 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
 //! cite crates/fln-kernel/src/tc.rs:5395 :: ExprNode::Sort { level } @@ fn is_prop
 //! cite crates/fln-kernel/src/tc.rs:7004 :: ExprNode::Sort { level } @@ fn finish_infer_proj
-//! cite crates/fln-kernel/src/tc.rs:2945 :: e.loose_bvar_range() <= k
+//! cite crates/fln-kernel/src/tc.rs:2892 :: e.loose_bvar_range() <= k @@ fn instantiate
 //! cite crates/fln-kernel/src/tc.rs:6536 :: !e.has_fvar() || active == 0
 //! cite crates/fln-kernel/src/tc.rs:6732 :: if !e.has_fvar() {
 //! cite crates/fln-hash/src/canon.rs:1346 :: impl Canonical for Expr

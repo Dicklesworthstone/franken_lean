@@ -1642,7 +1642,7 @@ KERNEL_ADMISSION_TESTS = (
 # What stays recorded is a FLOOR, so a silent loss of tests still fails. Lower it
 # only when tests are deliberately removed (franken_lean-ap6).
 KERNEL_ADMISSION_TARGET_PASS_FLOOR = 99
-KERNEL_ADMISSION_BUDGET_STEPS = 10_000_000
+KERNEL_ADMISSION_BUDGET_STEPS = 500_000_000  # Budget::DEFAULT_STEPS (uvm6)
 # The replay checks under `fln_kernel::verdict::Budget::DEFAULT`, whose depth is
 # `Budget::DEFAULT_DEPTH`: 4,160 since 62a5ff9a (2026-08-19), which raised it from
 # 4,096. Every matrix row of contract-drift run 37353599135 carries 4160.
