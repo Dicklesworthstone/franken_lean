@@ -67,6 +67,7 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
     let package = Package::new(CONFIG);
     let source = concat!(
         "module\nprelude\npublic import Init.Notation\n",
+        "public import Init.Data.String.Bootstrap\n",
         "public inductive Lib.Choice where | first | second | third\n",
         "public inductive Lib.Single where | only\n",
         "public def Lib.structuralCount : Nat → Nat\n",
@@ -210,12 +211,10 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
     // reduceArity, changed/permuted self arguments and the no-used-slot case.
     // Comparing emitted signatures catches a guessed mask even when a normal
     // source consumer could inline a logical body and conceal the discrepancy.
-    // The native seed supplies String's inhabitant; the pin needs its normal
-    // Init import to compile the existing partial String-returning examples.
-    package.write(
-        "ReferenceMasks.lean",
-        source.replace("public import Init.Notation\n", "public import Init\n"),
-    );
+    // Both compilers receive the exact same checked imports. Notation alone
+    // supplies no String inhabitant for these partial result types; the pinned
+    // Bootstrap module owns that instance.
+    package.write("ReferenceMasks.lean", source);
     let reference_output = Command::new(&reference)
         .args(["-o", "ReferenceMasks.olean", "ReferenceMasks.lean"])
         .current_dir(&package.0)

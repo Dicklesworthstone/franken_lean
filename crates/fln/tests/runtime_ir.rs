@@ -1128,6 +1128,65 @@ fn fieldless_enum_exports_preserve_scalar_signatures_and_private_layouts() {
 }
 
 #[test]
+fn recursive_enum_calls_keep_their_private_dispatch_domains_without_execution() {
+    let options = KVMap::new();
+    let base = enum_base()
+        .check_source_files(
+            &[
+                br#"partial def carryIRChoice (n : Nat) (value : IRChoice) : IRChoice :=
+  if n == 0 then value else carryIRChoice (n - 1) value
+partial def resetIRChoice (n : Nat) (value : IRChoice) : IRChoice :=
+  if n == 0 then value else resetIRChoice (n - 1) IRChoice.west
+"#,
+            ],
+            &options,
+            fln::SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let original = base.logical_root(&options);
+    let mut no_execution = limits();
+    no_execution.vm.max_steps = 0;
+    // IRChoice reserves three tags. The generated Decidable dispatcher must
+    // retain its actual two-constructor input domain across private calls.
+    for callee in ["carryIRChoice", "resetIRChoice"] {
+        let source = format!("def compiled (n : Nat) : IRChoice := {callee} n IRChoice.east");
+        let (declaration, checked) = checked_definition(&base, &source);
+        let compiled = ir::compile_source_definition(
+            &base,
+            declaration,
+            &options,
+            no_execution,
+            CompileLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+        .into_complete()
+        .unwrap();
+        let IrDecl::Function { params, result, .. } = compiled
+            .module
+            .decls
+            .iter()
+            .find(|declaration| declaration.name() == &name("compiled"))
+            .unwrap()
+        else {
+            panic!("recursive enum source entry")
+        };
+        assert_eq!(
+            params.iter().map(|p| p.ty.clone()).collect::<Vec<_>>(),
+            [IrType::TObject]
+        );
+        assert_eq!(*result, IrType::UInt8);
+        assert_eq!(
+            compiled.admission.result_logical_root,
+            checked.logical_root(&options)
+        );
+        assert_eq!(base.logical_root(&options), original);
+    }
+}
+
+#[test]
 fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
     let base = boxed_base();
     let options = KVMap::new();

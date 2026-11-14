@@ -27,6 +27,7 @@ use fln_olean::ir::{
 };
 use fln_olean::write::source::CompilerData;
 
+mod constructor_flow;
 mod recursive_signatures;
 
 #[derive(Debug, Clone, Copy)]
@@ -500,8 +501,15 @@ fn compile_function(
     function: &flbc::Function,
     names: &[Name],
     constructors: &InternalConstructors,
+    constructor_parameters: Option<&[ConstructorTags]>,
     meter: &mut Budget,
 ) -> Result<IrDecl> {
+    if function.parameter_ownership.len() != usize::from(function.arity)
+        || constructor_parameters
+            .is_some_and(|parameters| parameters.len() != function.parameter_ownership.len())
+    {
+        return Err(invariant("constructor parameter facts arity"));
+    }
     meter.charge(usize::from(function.register_count))?;
     let mut registers = Vec::new();
     registers
@@ -515,7 +523,8 @@ fn compile_function(
             index: i as u64 + 1,
             owned: !borrow,
             natural: None,
-            constructor_tags: ConstructorTags::default(),
+            constructor_tags: constructor_parameters
+                .map_or_else(ConstructorTags::default, |parameters| parameters[i]),
         });
         params.push(IrParam {
             x: i as u64 + 1,
@@ -1199,6 +1208,14 @@ fn compile_module(
             meter,
         )?;
     }
+    // Primitive-only programs need no constructor-flow tables. Source layouts
+    // can add unrelated tags, so a private case helper may need a tighter
+    // parameter domain proved from actual producers and call sites.
+    let constructor_parameters = if internal_constructors {
+        Some(constructor_flow::parameters(program, &constructors, meter)?)
+    } else {
+        None
+    };
     let lowered = fir::lower_to_flbc_with_ownership(program, limits.ownership)
         .map_err(CompileError::Lowering)?;
     let mut names = Vec::new();
@@ -1215,7 +1232,16 @@ fn compile_module(
     }
     let mut declarations = Vec::new();
     for function in lowered.program().functions() {
-        let declaration = compile_function(function, &names, &constructors, meter)?;
+        let parameters = match &constructor_parameters {
+            Some(parameters) => Some(
+                parameters
+                    .get(function.id.get() as usize)
+                    .ok_or_else(|| invariant("constructor parameter facts function"))?
+                    .as_slice(),
+            ),
+            None => None,
+        };
+        let declaration = compile_function(function, &names, &constructors, parameters, meter)?;
         // A boxed application always owns its operands. The wrapper releases
         // those whose base function borrows them, just as the pin's wrappers do.
         if !function.parameter_ownership.is_empty() {
