@@ -6415,15 +6415,52 @@ fn parse_definition_with_grammar(
         None
     };
     let name_index = cursor;
+    let quoted_name = if grammar == DefinitionGrammar::Scalar
+        && !is_example
+        && quotations::inside()
+        && matches!(tokens.get(cursor).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "$")
+    {
+        let leaves = Leaves::build(view.normalized(), &tokens)?;
+        // An unannotated capture occupies the entire leading-parser declId.
+        // :ident instead selects its inner identifier. The macro compiler
+        // applies Init.Meta's Ident-to-declId coercion when needed; parsing
+        // preserves the quotation tree before that elaboration.
+        match quotations::antiquotation(
+            &leaves,
+            &view,
+            &tokens,
+            cursor,
+            tokens.len(),
+            quotations::Position::Node {
+                label: "declId".to_owned(),
+                kind: parser_kind(&["Command", "declId"]),
+            },
+        ) {
+            Ok(capture) => capture.map(|(syntax, next)| (syntax, next, true)),
+            Err(_) => quotations::primitive(
+                &leaves,
+                &view,
+                &tokens,
+                cursor,
+                tokens.len(),
+                "ident",
+            )?
+            .map(|(syntax, next)| (syntax, next, false)),
+        }
+    } else {
+        None
+    };
     // `instance` takes an optional `declId` (`Lean.Parser.Command.instance`): without one the
     // elaborator generates the pin's name from the type.
     let named = !is_example
         && !(is_instance
+            && quoted_name.is_none()
             && !matches!(
                 tokens.get(cursor).map(|t| &t.kind),
                 Some(TokenKind::Ident(_))
             ));
     if named
+        && quoted_name.is_none()
         && !matches!(
             tokens.get(cursor).map(|t| &t.kind),
             Some(TokenKind::Ident(_))
@@ -6434,12 +6471,16 @@ fn parse_definition_with_grammar(
             expected: NatDefinitionExpectation::DeclarationIdentifier,
         });
     }
-    cursor += usize::from(named);
-    let (universe_suffix, after_levels) = if grammar == DefinitionGrammar::Scalar && named {
-        levels::declaration_suffix(&view, &tokens, cursor)?
-    } else {
-        (None, cursor)
-    };
+    cursor = quoted_name
+        .as_ref()
+        .map_or(cursor + usize::from(named), |(_, next, _)| *next);
+    let whole_decl_id = quoted_name.as_ref().is_some_and(|(_, _, whole)| *whole);
+    let (universe_suffix, after_levels) =
+        if grammar == DefinitionGrammar::Scalar && named && !whole_decl_id {
+            levels::declaration_suffix(&view, &tokens, cursor)?
+        } else {
+            (None, cursor)
+        };
     cursor = after_levels;
     let (parameter_groups, next) = signature_binders(&view, &tokens, cursor, grammar)?;
     cursor = next;
@@ -6551,11 +6592,16 @@ fn parse_definition_with_grammar(
     )?;
     let declaration_id = if !named {
         None
+    } else if let Some((syntax, _, true)) = &quoted_name {
+        Some(syntax.clone())
     } else {
         Some(Syntax::node(
             parser_kind(&["Command", "declId"]),
             vec![
-                leaves.leaf(name_index)?,
+                match quoted_name {
+                    Some((syntax, _, _)) => syntax,
+                    None => leaves.leaf(name_index)?,
+                },
                 levels::declaration_syntax(&leaves, universe_suffix)?,
             ],
         ))

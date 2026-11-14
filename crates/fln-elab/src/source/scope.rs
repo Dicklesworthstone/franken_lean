@@ -386,18 +386,25 @@ impl SourceScope {
     }
 
     fn user_declaration_name(&self, name: &Name) -> Result<Name, ScopeError> {
-        let parts = components(name)?;
+        // A literal name in a command quotation carries a fresh macro scope.
+        // Validate only its source-name portion, qualify that portion in the
+        // invocation namespace, and retain the complete hygiene identity.
+        // Arbitrary numeric/internal names still fail the source-name check.
+        let mut scoped = fln_syntax::hygiene::extract_macro_scopes(name)
+            .map_err(|_| ScopeError::InvalidName)?;
+        let parts = components(&scoped.name)?;
         if parts.is_empty() {
             return Err(ScopeError::InvalidName);
         }
-        if parts[0] == "_root_" {
+        scoped.name = if parts[0] == "_root_" {
             if parts.len() == 1 {
                 return Err(ScopeError::InvalidName);
             }
-            Ok(Name::from_components(parts[1..].iter().map(String::as_str)))
+            Name::from_components(parts[1..].iter().map(String::as_str))
         } else {
-            Ok(self.namespace.append_core(name))
-        }
+            self.namespace.append_core(&scoped.name)
+        };
+        Ok(scoped.review())
     }
 
     /// [`Self::resolve_with_aliases`] with no aliases and nothing protected.
@@ -830,6 +837,7 @@ impl Context {
         // before resolution), and `resolveGlobalName` reads it with the scopes erased: so a
         // template's `f` means the global `f` even where the use site binds a local `f`.
         let hygienic = name.has_macro_scopes();
+        let scoped_name = name;
         let erased;
         let name = if hygienic {
             erased = name.erase_macro_scopes();
@@ -892,10 +900,12 @@ impl Context {
         // (vendored `src/Lean/Elab/Term.lean`, `resolveName`), so a local, or the
         // declaration's own recursive reference, named at the current namespace or a
         // parent is never one candidate among globals. `_root_.x` names no local.
-        if !is_root_qualified(name) && !hygienic {
+        if !is_root_qualified(name) {
             let mut namespace = self.source_scope.namespace.clone();
             loop {
-                let candidate = namespace.append_core(name);
+                // Match generated recursive names before erasing scopes for
+                // global lookup. Unscoped caller locals remain excluded above.
+                let candidate = namespace.append_core(scoped_name);
                 if local(&candidate) {
                     return Ok(Ok(Some(candidate)));
                 }
@@ -934,7 +944,9 @@ impl Context {
         &self,
         name: &Name,
     ) -> Result<(), NatDefinitionElabError> {
-        let parts = components(name).map_err(error)?;
+        let scoped = fln_syntax::hygiene::extract_macro_scopes(name)
+            .map_err(|_| error(ScopeError::InvalidName))?;
+        let parts = components(&scoped.name).map_err(error)?;
         let (root_namespace, atomic) = if parts.first().is_some_and(|p| p == "_root_") {
             (parts.len() <= 2, true)
         } else {
@@ -975,7 +987,8 @@ impl Context {
         {
             return Err(error(ScopeError::ReservedName(name)));
         }
-        self.source_scope.namespace = user_name.parent();
+        // Hygiene is attached to the declaration name, not its lexical namespace.
+        self.source_scope.namespace = user_name.erase_macro_scopes().parent();
         Ok(name)
     }
 

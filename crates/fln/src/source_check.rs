@@ -1132,12 +1132,19 @@ impl Engine {
                     };
                     Some(parsed)
                 } else {
-                    grammar
+                    let deriving = grammar
                         .enter(|| source_records::parse_deriving_command(command))
                         .map_err(|error| command_error(file, count, start, error))?
                         .map(|parsed| {
                             source_records::ScopedCommandSyntax::Deriving(parsed.syntax().clone())
-                        })
+                        });
+                    if deriving.is_some() {
+                        deriving
+                    } else {
+                        grammar
+                            .enter(|| source_records::parse_native_command_macro(command))
+                            .map_err(|error| command_error(file, count, start, error))?
+                    }
                 };
                 let mut scope = if public.is_some() {
                     if let Some(parsed) = &expanded {

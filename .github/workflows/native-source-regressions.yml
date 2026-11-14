@@ -11,6 +11,12 @@ on:
       - 'crates/fln-elab/src/source/tactics.rs'
       - 'crates/fln/tests/source_goal_control.rs'
       - 'crates/fln/tests/source_backtracking.rs'
+      - 'crates/fln/src/source_check/**'
+      - 'crates/fln/src/source_check.rs'
+      - 'crates/fln/src/source_records.rs'
+      - 'crates/fln-elab/src/source/scope.rs'
+      - 'crates/fln/tests/source_command_macros.rs'
+      - 'crates/fln/tests/source_command_macro_hygiene.rs'
       - 'crates/fln/tests/source_quoted_capture_kinds.rs'
       - 'crates/fln/tests/source_quotation_repetitions.rs'
       - 'Cargo.toml'
@@ -47,6 +53,8 @@ jobs:
         run: cargo test --locked -p fln --test source_goal_control --test source_backtracking --no-fail-fast -- --test-threads=1
       - name: Preserve work accounting across failed goal attempts
         run: cargo test --locked -p fln-elab --lib source::tactics::backtrack::tests::nonprogressing_repetitions_and_backtracking_cannot_refund_work -- --exact
+      - name: Check native command macros, hygiene and journal replay
+        run: cargo test --locked -p fln --test source_command_macros --test source_command_macro_hygiene --no-fail-fast -- --test-threads=1
       - name: Check quotation expansion through the native elaborator and kernel
         run: cargo test --locked -p fln --test source_quoted_capture_kinds --test source_quotation_repetitions --no-fail-fast
       - name: Lint the native parser

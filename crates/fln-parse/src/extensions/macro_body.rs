@@ -71,6 +71,130 @@ fn compatible(actual: &Name, expected: &Name) -> bool {
                 .any(|kind| *expected == Name::from_components([kind])))
 }
 
+/// `Coe Ident (TSyntax Command.declId)` wraps the identifier and an empty universe
+/// suffix (`Init/Meta/Defs.lean`). Compile that coercion without changing the parsed
+/// quotation. An escaped antiquotation is literal syntax for a later stage, so only
+/// active captures are coerced; captures within its expression are still visited.
+fn coerce_declaration_names<'syntax>(
+    contents: &'syntax Syntax,
+    visited: &mut usize,
+    mut capture: impl FnMut(&Name, &mut usize) -> Result<(CaptureKind, Option<Name>), &'static str>,
+) -> Result<std::borrow::Cow<'syntax, Syntax>, &'static str> {
+    enum Step<'a> {
+        Visit(&'a Syntax, usize),
+        Build(SourceInfo, &'a Name, usize, bool),
+    }
+    let declaration = Name::from_components(["Lean", "Parser", "Command", "declId"]);
+    // Existing quotations do not acquire a depth limit or a recursive clone.
+    // Only the new declaration-name slots need the coercion traversal below.
+    let mut pending = vec![contents];
+    let mut scanned = 0;
+    let mut has_declaration_name = false;
+    while let Some(syntax) = pending.pop() {
+        quotation::templates::charge(&mut scanned)?;
+        if let Some(category) = antiquotation_category(syntax) {
+            if category == declaration {
+                has_declaration_name = true;
+                break;
+            }
+            continue;
+        }
+        let Syntax::Node { kind, args, .. } = syntax else {
+            continue;
+        };
+        match kind.leaf_view() {
+            // Literal framing is validated by templates::checked. Only the
+            // expression of an escaped capture can contain current captures.
+            LeafView::Str("antiquot") => {
+                if let Some(expression) = args.get(2) {
+                    pending.push(expression);
+                }
+                continue;
+            }
+            LeafView::Str("antiquot_suffix_splice") => continue,
+            LeafView::Str("antiquot_scope") => {
+                if let Some(body) = args.first() {
+                    let whole = null_args(body).is_some_and(|items| {
+                        matches!(items, [capture] if antiquotation_name(capture).is_some())
+                    });
+                    if !whole {
+                        pending.push(body);
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if args.len() > MAX_TEMPLATE_NODES.saturating_sub(scanned) {
+            return Err("a macro template past the node budget");
+        }
+        pending.extend(args.iter());
+    }
+    if !has_declaration_name {
+        return Ok(std::borrow::Cow::Borrowed(contents));
+    }
+    let identifier = Name::from_components(["ident"]);
+    let mut steps = vec![Step::Visit(contents, 0)];
+    let mut built = Vec::new();
+    while let Some(step) = steps.pop() {
+        match step {
+            Step::Visit(syntax, depth) => {
+                if depth > MAX_DESCR_DEPTH {
+                    return Err("a quoted macro pattern past the node or depth budget");
+                }
+                quotation::templates::charge(visited)?;
+                let coerce = if antiquotation_category(syntax).as_ref() == Some(&declaration) {
+                    let name = antiquotation_name(syntax).ok_or(TYPE_MISMATCH)?;
+                    let (family, category) = capture(&macro_variable(&name), visited)?;
+                    if family != CaptureKind::Scalar {
+                        return Err(TYPE_MISMATCH);
+                    }
+                    match category {
+                        Some(category) if category == identifier => true,
+                        Some(category) if category == declaration => false,
+                        _ => return Err(TYPE_MISMATCH),
+                    }
+                } else {
+                    false
+                };
+                if let Syntax::Node { info, kind, args } = syntax {
+                    if args.len() > MAX_TEMPLATE_NODES.saturating_sub(*visited) {
+                        return Err("a macro template past the node budget");
+                    }
+                    steps.push(Step::Build(*info, kind, args.len(), coerce));
+                    steps.extend(args.iter().rev().map(|child| Step::Visit(child, depth + 1)));
+                } else {
+                    built.push(syntax.clone());
+                }
+            }
+            Step::Build(info, kind, count, coerce) => {
+                let start = built.len().checked_sub(count).ok_or(TYPE_MISMATCH)?;
+                let args = built.split_off(start);
+                let syntax = Syntax::Node {
+                    info,
+                    kind: if coerce {
+                        Name::from_components(["ident", "antiquot"])
+                    } else {
+                        kind.clone()
+                    },
+                    args,
+                };
+                if coerce {
+                    quotation::templates::charge(visited)?;
+                    quotation::templates::charge(visited)?;
+                    built.push(Syntax::node(
+                        declaration.clone(),
+                        vec![syntax, null_node(Vec::new())],
+                    ));
+                } else {
+                    built.push(syntax);
+                }
+            }
+        }
+    }
+    built.pop().map(std::borrow::Cow::Owned).ok_or(TYPE_MISMATCH)
+}
+
 pub(super) fn direct(
     rhs: &Syntax,
     category: &Name,
@@ -78,12 +202,27 @@ pub(super) fn direct(
     items: &[StxItem],
     is_pure: &dyn Fn(&Name) -> bool,
 ) -> Result<Syntax, &'static str> {
-    // Preserve the established direct-quotation path and its exact budget.
+    // Direct quotations preserve their capture paths. Only declaration-name slots
+    // require a structural scalar coercion before ordinary template compilation.
     if let Some((actual, contents)) = quotation_contents(rhs) {
         if actual != *category {
             return Err("a macro whose right-hand side is not a quotation of its category");
         }
-        return quotation::templates::checked(contents, variables);
+        let contents = coerce_declaration_names(contents, &mut 0, |name, visited| {
+            let (path, _) = variables
+                .iter()
+                .find(|(_, variable)| variable == name)
+                .ok_or(TYPE_MISMATCH)?;
+            let [index] = path.as_slice() else {
+                return Err(TYPE_MISMATCH);
+            };
+            let item = items.get(*index).ok_or(TYPE_MISMATCH)?;
+            Ok((
+                capture_kinds::item_kind(item, visited, 0)?,
+                item_category(item),
+            ))
+        })?;
+        return quotation::templates::checked(&contents, variables);
     }
     let mut compiler = Compiler::new(is_pure);
     for (path, name) in variables {
@@ -106,7 +245,17 @@ pub(super) fn rule(
     is_pure: &dyn Fn(&Name) -> bool,
 ) -> Result<Syntax, &'static str> {
     if let Some((_, contents)) = quotation_contents(rhs) {
-        return quotation::templates::checked(contents, variables);
+        let contents = coerce_declaration_names(contents, &mut 0, |name, visited| {
+            let (path, _) = variables
+                .iter()
+                .find(|(_, variable)| variable == name)
+                .ok_or(TYPE_MISMATCH)?;
+            Ok((
+                capture_kinds::pattern_kind(children, path, visited)?,
+                pattern_category(children, path),
+            ))
+        })?;
+        return quotation::templates::checked(&contents, variables);
     }
     let mut compiler = Compiler::new(is_pure);
     for (path, name) in variables {
@@ -168,13 +317,21 @@ impl<'a> Compiler<'a> {
     }
 
     fn quote(&mut self, category: Name, contents: &Syntax) -> Result<Value, &'static str> {
-        self.validate_quotation(contents, 0)?;
+        let bound = &self.bound;
+        let contents = coerce_declaration_names(contents, &mut 0, |name, _| {
+            let value = bound.get(name).ok_or(UNSUPPORTED)?;
+            if value.monadic {
+                return Err(TYPE_MISMATCH);
+            }
+            Ok((value.family.clone(), value.category.clone()))
+        })?;
+        self.validate_quotation(&contents, 0)?;
         let variables: Vec<_> = self
             .bound
             .keys()
             .map(|name| (vec![], name.clone()))
             .collect();
-        let checked = quotation::templates::checked(contents, &variables)?;
+        let checked = quotation::templates::checked(&contents, &variables)?;
         let template = self.substitute(&checked, 0)?;
         Ok(Value {
             template,

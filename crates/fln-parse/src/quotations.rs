@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! Term.quot      := "`(" term ")"                          (Lean/Parser/Command.lean)
+//! Command.quot   := "`(" command ")"                       (lower priority than Term.quot)
 //! Tactic.quot    := "`(tactic| " tactic ")"                 (default+1, Lean/Parser/Term.lean)
 //! Tactic.quotSeq := "`(tactic| " Tactic.seq1 ")"            seq1 := sepBy1 tactic "; "
 //! conv.quot      := "`(conv| " conv ")"                     (inside a `Term.quot` node)
@@ -309,13 +310,21 @@ fn read_quotation(
     let syntax = if dynamic {
         dynamic_quotation(leaves, view, tokens, start, close)?
     } else if open == "`(" {
+        // The pin tries Term.quot before the lower-priority Command.quot.
+        // In particular `($x)` is a term quotation, whereas `($x:command)`
+        // selects a command. Reentry parses exactly the quoted interval and
+        // shares the descriptor budget; it never registers the quoted command.
+        let (category, body) = match nested_term(leaves, view, tokens, inner.clone()) {
+            Ok(term) => ("Term", term),
+            Err(error) => (
+                "Command",
+                crate::extensions::command_quotation(leaves, view, tokens, inner)
+                    .ok_or(error)?,
+            ),
+        };
         Syntax::node(
-            parser_kind(&["Term", "quot"]),
-            vec![
-                leaves.leaf(start)?,
-                nested_term(leaves, view, tokens, inner)?,
-                leaves.leaf(close)?,
-            ],
+            parser_kind(&[category, "quot"]),
+            vec![leaves.leaf(start)?, body, leaves.leaf(close)?],
         )
     } else if let Some(category) = crate::extensions::category_for_quotation(open) {
         let body =
@@ -365,6 +374,8 @@ fn dynamic_quotation(
     let inner = start + 3..close;
     let body = match category {
         "term" => nested_term(leaves, view, tokens, inner)?,
+        "command" => crate::extensions::command_quotation(leaves, view, tokens, inner)
+            .ok_or_else(|| refuse(view, tokens, start + 1))?,
         name @ ("ident" | "num" | "str" | "char" | "scientific" | "name") => {
             let Some((syntax, next)) =
                 primitive(leaves, view, tokens, inner.start, inner.end, name)?

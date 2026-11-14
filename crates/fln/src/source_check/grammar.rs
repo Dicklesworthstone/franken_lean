@@ -156,6 +156,7 @@ impl SourceGrammar {
             return Err(Self::module_phase_refusal());
         }
         journal::load(environment, &mut grammar.file)?;
+        reserve_admitted_macro_scopes(environment, &mut grammar.file)?;
         Ok(grammar)
     }
 
@@ -449,6 +450,79 @@ impl SourceGrammar {
         }
         parsed.expanded()
     }
+}
+
+/// A resumed grammar must not reuse the hygiene of an admitted declaration.
+/// Read only real constant names; imported templates do not fabricate a scope
+/// journal. Bound scanning and scope decoding before allocating parsed names.
+fn reserve_admitted_macro_scopes(
+    environment: &Environment,
+    file: &mut FileGrammar,
+) -> Result<(), EngineExecutionError> {
+    const MAX_WORK: usize = 64 * 1024 * 1024;
+    const MAX_COMPONENTS: usize = 4096;
+    let mut work = 0_usize;
+    let mut highest = 0_u64;
+    let limit = || EngineExecutionError::SourceScopeLimit {
+        resource: "admitted declaration macro-scope initialization",
+        limit: MAX_WORK,
+    };
+    let malformed = || EngineExecutionError::NotImplemented {
+        feature: "an admitted declaration with malformed macro scopes",
+    };
+    let depth_limit = || EngineExecutionError::SourceScopeLimit {
+        resource: "admitted declaration macro-scope name components",
+        limit: MAX_COMPONENTS,
+    };
+    for (name, _) in environment.constants() {
+        work = work
+            .checked_add(1)
+            .filter(|used| *used <= MAX_WORK)
+            .ok_or_else(limit)?;
+        let mut suffix = name.clone();
+        let mut suffix_depth = 0;
+        while matches!(suffix.leaf_view(), fln_core::name::LeafView::Num(_)) {
+            suffix_depth += 1;
+            if suffix_depth > MAX_COMPONENTS {
+                return Err(depth_limit());
+            }
+            work = work
+                .checked_add(1)
+                .filter(|used| *used <= MAX_WORK)
+                .ok_or_else(limit)?;
+            suffix = suffix.parent();
+        }
+        if suffix.leaf_view() != fln_core::name::LeafView::Str("_hyg") {
+            continue;
+        }
+        let mut cursor = name.clone();
+        let mut depth = 0;
+        while !cursor.is_anonymous() {
+            depth += 1;
+            if depth > MAX_COMPONENTS {
+                return Err(depth_limit());
+            }
+            if cursor.component_overflowed() {
+                return Err(malformed());
+            }
+            let weight = match cursor.leaf_view() {
+                fln_core::name::LeafView::Str(part) => part.len().saturating_add(1),
+                _ => 1,
+            };
+            work = work
+                .checked_add(weight)
+                .filter(|used| *used <= MAX_WORK)
+                .ok_or_else(limit)?;
+            cursor = cursor.parent();
+        }
+        let scopes = fln_syntax::hygiene::extract_macro_scopes(name).map_err(|_| malformed())?;
+        if scopes.review() != *name {
+            return Err(malformed());
+        }
+        highest = scopes.scopes.into_iter().fold(highest, u64::max);
+    }
+    file.reserve_macro_scopes_through(highest)
+        .map_err(|feature| EngineExecutionError::NotImplemented { feature })
 }
 
 /// What a template's identifier names where the notation is declared.

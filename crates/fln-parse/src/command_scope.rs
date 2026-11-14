@@ -217,11 +217,26 @@ pub fn command_quot_hint_text(source: &[u8]) -> Result<Option<String>, Definitio
 type PartitionTokens = (Vec<LexedToken>, Vec<(&'static str, BytePos)>);
 
 fn partition_tokens(view: &SourceView) -> Result<PartitionTokens, DefinitionParseError> {
+    partition_tokens_with_heads(view, &PartitionCommandHeads::new())
+}
+
+fn partition_tokens_with_heads(
+    view: &SourceView,
+    heads: &PartitionCommandHeads,
+) -> Result<PartitionTokens, DefinitionParseError> {
     // Partitioning precedes lexical scope transitions. A receipt-bound scoped
     // command must start its own slice even before `open scoped` is applied;
     // parsing that slice still uses only the actually active grammar.
     let run = crate::extensions::with_partition_token_table(|table| {
-        crate::lex_source_with_table(view, table)
+        if heads.is_empty() {
+            crate::lex_source_with_table(view, table)
+        } else {
+            let mut table = table.clone();
+            for head in heads.keys() {
+                table.insert(head);
+            }
+            crate::lex_source_with_table(view, &table)
+        }
     })?;
     let diagnostics: Vec<_> = run
         .events
@@ -249,6 +264,205 @@ fn partition_tokens(view: &SourceView) -> Result<PartitionTokens, DefinitionPars
     }
     Ok((tokens, refused))
 }
+
+/// Leading atoms declared by source command syntax. This is only a boundary hint:
+/// it never installs a parser or authorizes a macro. The actual command parser
+/// still checks the complete declaration and every later invocation.
+type PartitionCommandHeads = std::collections::BTreeMap<String, BytePos>;
+
+fn partition_column(view: &SourceView, token: &LexedToken) -> usize {
+    let source = view.normalized();
+    let start = token.extent.start();
+    start.0
+        - source
+            .line_start(source.line_of(start))
+            .expect("token line")
+            .0
+}
+
+/// Read the bounded header of an ordinary leading-atom syntax or macro declaration.
+/// Parentheses in named options and parser arguments are balanced, so strings in
+/// those positions cannot become the command's leading atom.
+fn partition_declared_command_head(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    keyword: usize,
+    base_column: usize,
+) -> Option<(String, BytePos)> {
+    const HEADER_TOKENS: usize = 4096;
+    let source = view.normalized();
+    let end = tokens.len().min(keyword.saturating_add(HEADER_TOKENS));
+    let symbol = |at: usize, expected: &str| {
+        at < end
+            && matches!(&tokens[at].kind, TokenKind::Symbol(found) if found == expected)
+    };
+    let word = |at: usize, expected: &str| {
+        at < end
+            && matches!(&tokens[at].kind, TokenKind::Symbol(_) | TokenKind::Ident(_))
+            && source.span_str(tokens[at].extent) == Some(expected)
+    };
+    let group_end = |start: usize| {
+        let mut depth = 0_usize;
+        for (at, token) in tokens.iter().enumerate().take(end).skip(start) {
+            if let TokenKind::Symbol(text) = &token.kind {
+                match bracket(text) {
+                    Some(true) => depth += 1,
+                    Some(false) => {
+                        depth = depth.checked_sub(1)?;
+                        if depth == 0 {
+                            return Some(at + 1);
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        None
+    };
+    let is_macro = symbol(keyword, "macro");
+    let mut first = keyword + 1;
+    if symbol(first, ":") {
+        first += 1;
+        if symbol(first, "(") {
+            first = group_end(first)?;
+        } else if first < end
+            && (matches!(&tokens[first].kind, TokenKind::Literal(LiteralKind::Nat))
+                || ["max", "arg", "lead", "min", "min1"]
+                    .iter()
+                    .any(|value| word(first, value)))
+        {
+            first += 1;
+        } else {
+            return None;
+        }
+    }
+    for option in ["name", "priority"] {
+        if symbol(first, "(") && word(first + 1, option) && symbol(first + 2, ":=") {
+            first = group_end(first)?;
+        }
+    }
+    // A macro may name even its first atom with the adjacent "name:" binder.
+    if is_macro
+        && first + 1 < end
+        && matches!(&tokens[first].kind, TokenKind::Ident(_))
+        && symbol(first + 1, ":")
+        && tokens[first].extent.end() == tokens[first + 1].extent.start()
+    {
+        first += 2;
+    }
+    if first >= end || !matches!(&tokens[first].kind, TokenKind::Literal(LiteralKind::Str)) {
+        return None;
+    }
+    let atom = fln_syntax::literal::decode_string(source.span_str(tokens[first].extent)?)?;
+    let atom = atom.trim_matches([' ', '\t', '\r', '\n']);
+    if atom.is_empty() || atom.chars().any(|c| matches!(c, ' ' | '\t' | '\r' | '\n')) {
+        return None;
+    }
+    let mut depth = 0_usize;
+    for at in first + 1..end {
+        let token = &tokens[at];
+        if depth == 0
+            && source.line_of(token.extent.start())
+                > source.line_of(tokens[at - 1].extent.end())
+            && partition_column(view, token) <= base_column
+        {
+            return None;
+        }
+        if depth == 0 && symbol(at, ":") && word(at + 1, "command") {
+            let tail = if is_macro {
+                symbol(at + 2, "=>")
+            } else {
+                tokens.get(at + 2).is_none_or(|next| {
+                    source.line_of(next.extent.start())
+                        > source.line_of(tokens[at + 1].extent.end())
+                })
+            };
+            if tail {
+                return Some((atom.to_owned(), tokens[at + 1].extent.end()));
+            }
+        }
+        if let TokenKind::Symbol(text) = &token.kind {
+            if depth == 0 && matches!(text.as_str(), ":=" | "=>") {
+                return None;
+            }
+            match bracket(text) {
+                Some(true) => depth += 1,
+                Some(false) => depth = depth.checked_sub(1)?,
+                None => {}
+            }
+        }
+    }
+    None
+}
+
+/// Find only top-level declaration headers. Quotations and bracketed operands
+/// stay nested; indented bodies cannot declare file-level command heads.
+fn partition_source_command_heads(
+    view: &SourceView,
+    tokens: &[LexedToken],
+) -> Result<PartitionCommandHeads, DefinitionParseError> {
+    let source = view.normalized();
+    let mut heads = PartitionCommandHeads::new();
+    let mut depth = 0_usize;
+    let mut owner_column = None;
+    let mut prefix_column = None;
+    let mut mutual_until = 0;
+    for (index, token) in tokens.iter().enumerate() {
+        if index < mutual_until {
+            continue;
+        }
+        let symbol = match &token.kind {
+            TokenKind::Symbol(symbol) => Some(symbol.as_str()),
+            _ => None,
+        };
+        if depth == 0 {
+            let column = partition_column(view, token);
+            let command_line = (index == 0
+                || source.line_of(token.extent.start())
+                    > source.line_of(tokens[index - 1].extent.end()))
+                && owner_column.is_none_or(|base| column <= base);
+            let prefix = symbol.is_some_and(|text| {
+                modifiers::is_modifier(text) || matches!(text, "local" | "scoped" | "@[" | "/--")
+            });
+            if prefix && (command_line || prefix_column.is_some()) {
+                prefix_column.get_or_insert(column);
+            } else if command_line || prefix_column.is_some() {
+                let base = prefix_column.take().unwrap_or(column);
+                if matches!(symbol, Some("syntax" | "macro")) {
+                    if let Some((head, after)) =
+                        partition_declared_command_head(view, tokens, index, base)
+                    {
+                        heads.entry(head).or_insert(after);
+                    }
+                }
+                if symbol == Some("#exit") {
+                    break;
+                }
+                if symbol == Some("mutual") {
+                    mutual_until = mutual::block_end(view, tokens, index)? + 1;
+                    owner_column = None;
+                    continue;
+                }
+                owner_column = if symbol.is_some_and(|text| {
+                    control(text) || matches!(text, "module" | "prelude" | "import" | "/-!")
+                }) {
+                    None
+                } else {
+                    Some(base)
+                };
+            }
+        }
+        if let Some(symbol) = symbol {
+            match bracket(symbol) {
+                Some(true) => depth = depth.saturating_add(1),
+                Some(false) => depth = depth.saturating_sub(1),
+                None => {}
+            }
+        }
+    }
+    Ok(heads)
+}
+
 /// A refusal of one token that [`partition`] goes past, leaving it to the command that holds it.
 pub(crate) fn refusal_of_one_token(error: &fln_syntax::run::RunError) -> bool {
     use fln_syntax::literal::LiteralError;
@@ -948,7 +1162,13 @@ fn guard_msgs(
 pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let (tokens, refused) = partition_tokens(&view)?;
+    let (initial_tokens, initial_refused) = partition_tokens(&view)?;
+    let source_heads = partition_source_command_heads(&view, &initial_tokens)?;
+    let (tokens, refused) = if source_heads.is_empty() {
+        (initial_tokens, initial_refused)
+    } else {
+        partition_tokens_with_heads(&view, &source_heads)?
+    };
     let mut starts = Vec::new();
     let mut depth = 0_usize;
     let source_view = view.normalized();
@@ -971,11 +1191,29 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
     let mut open_in = false;
     let mut mutual_until = 0;
     let mut exit_end = None;
+    // A custom command can consume another command, such as "pass_command def".
+    // Its operand belongs to it through the same line and indented continuations.
+    let mut custom_command = false;
     for (index, token) in tokens.iter().enumerate() {
         if index < mutual_until {
             continue;
         }
         if let TokenKind::Symbol(symbol) = &token.kind {
+            let command_line = (index == 0
+                || source_view.line_of(token.extent.start())
+                    > source_view.line_of(tokens[index - 1].extent.end()))
+                && declaration_column.is_none_or(|base| column(token) <= base);
+            if depth == 0 && custom_command && !command_line {
+                match bracket(symbol) {
+                    Some(true) => depth = depth.saturating_add(1),
+                    Some(false) => depth = depth.saturating_sub(1),
+                    None => {}
+                }
+                continue;
+            }
+            if depth == 0 && command_line {
+                custom_command = false;
+            }
             if depth == 0 && symbol == "mutual" {
                 // A mutual group is one admission unit. In particular its end
                 // cannot close the surrounding namespace or section, and no
@@ -990,10 +1228,6 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 attribute_prefix = false;
                 continue;
             }
-            let command_line = (index == 0
-                || source_view.line_of(token.extent.start())
-                    > source_view.line_of(tokens[index - 1].extent.end()))
-                && declaration_column.is_none_or(|base| column(token) <= base);
             // `#exit` is a terminal command: the pin's frontend parses nothing after it
             // (`Parser.isTerminalCommand`), so it is the last command, ending at its token.
             if depth == 0 && command_line && !open_in && symbol == "#exit" {
@@ -1025,8 +1259,13 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
             let deriving_command = symbol == "deriving"
                 && matches!(tokens.get(index + 1).map(|t| &t.kind),
                     Some(TokenKind::Symbol(next)) if next == "instance");
+            let custom_head = crate::extensions::is_partition_command_keyword(symbol)
+                || source_heads
+                    .get(symbol)
+                    .is_some_and(|after| token.extent.start() >= *after);
             let scope_start =
-                (control(symbol) || line_command(symbol) || deriving_command) && command_line;
+                (control(symbol) || line_command(symbol) || deriving_command || custom_head)
+                    && command_line;
             // Attributes and declaration modifiers (`private`, `protected`, `noncomputable`,
             // …) precede the declaration keyword in one command (`declModifiers`).
             // `local` and `scoped` (`attrKind`) lead `instance`, `notation`, `syntax`, … the same way.
@@ -1043,7 +1282,11 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
             // A command keyword after the prefix is its command's (`@[inherit_doc f]` then
             // `infixr:100 …` on the next line).
             let continues_prefix = (attribute_prefix
-                && (declaration(symbol) || prefix || line_command(symbol) || symbol == "section"))
+                && (declaration(symbol)
+                    || prefix
+                    || line_command(symbol)
+                    || custom_head
+                    || symbol == "section"))
                 || (after_class && declaration(symbol));
             if depth == 0 && current_open && symbol == "in" {
                 open_in = true;
@@ -1052,7 +1295,11 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
             }
             if depth == 0
                 && !after_deriving
-                && (scope_start || declaration(symbol) || inline_start || continues_prefix)
+                && (scope_start
+                    || declaration(symbol)
+                    || inline_start
+                    || continues_prefix
+                    || (custom_head && open_in))
             {
                 if !continues_prefix {
                     if !open_in {
@@ -1078,14 +1325,18 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                     || (continues_prefix
                         && !declaration(symbol)
                         && !line_command(symbol)
+                        && !custom_head
                         && symbol != "section");
                 // `[doc] #guard_msgs … in <command>`: the guarded command belongs to it, whether
                 // the guard starts its command or continues its doc comment's.
                 if symbol == "#guard_msgs" {
                     current_open = true;
                 }
-                declaration_column = declaration(symbol)
-                    .then(|| prefix_column.map_or(column(token), |base| base.min(column(token))));
+                custom_command = custom_head;
+                declaration_column = (declaration(symbol)
+                    || custom_head
+                    || matches!(symbol.as_str(), "syntax" | "macro" | "macro_rules"))
+                .then(|| prefix_column.map_or(column(token), |base| base.min(column(token))));
             } else if depth == 0 && attribute_prefix {
                 // Any other keyword ends the prefix: it carries the prefix (`abbrev`, `opaque`,
                 // `axiom`, …) and belongs to its command, and the next declaration starts anew.
@@ -1141,6 +1392,142 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_command_headers_partition_their_later_invocations() {
+        let source = r###"macro "generated " n:ident " := " v:term : command =>
+  `(def $n:ident : Nat := $v)
+generated answer := 4
+syntax "forward " command : command
+macro_rules
+  | `(forward $cmd:command) => pure cmd
+forward def forwarded : Nat := 5
+theorem checked : forwarded = 5 := rfl
+"###;
+        let commands = partition(source.as_bytes()).unwrap();
+        let heads: Vec<_> = commands
+            .iter()
+            .map(|(_, bytes)| std::str::from_utf8(bytes).unwrap().lines().next().unwrap())
+            .collect();
+        assert_eq!(
+            heads,
+            [
+                "macro \"generated \" n:ident \" := \" v:term : command =>",
+                "generated answer := 4",
+                "syntax \"forward \" command : command",
+                "macro_rules",
+                "forward def forwarded : Nat := 5",
+                "theorem checked : forwarded = 5 := rfl",
+            ]
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .flat_map(|(_, bytes)| *bytes)
+                .copied()
+                .collect::<Vec<_>>(),
+            source.as_bytes()
+        );
+    }
+
+    #[test]
+    fn custom_command_operands_keep_inline_and_indented_declarations() {
+        let source = r###"namespace Generated
+macro "pass_command " cmd:command : command => pure cmd
+pass_command
+  def first : Nat := 1
+pass_command def second : Nat := 2
+open Generated in pass_command theorem checked : second = 2 := rfl
+pass_command
+  mutual
+    def left : Nat := 0
+    def right : Nat := 0
+  end
+end Generated
+"###;
+        let commands = partition(source.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 7);
+        let text = |index: usize| std::str::from_utf8(commands[index].1).unwrap();
+        assert_eq!(text(0), "namespace Generated\n");
+        assert!(text(2).starts_with("pass_command\n  def first"));
+        assert!(text(3).starts_with("pass_command def second"));
+        assert!(text(4).starts_with("open Generated in pass_command theorem checked"));
+        assert!(text(5).starts_with("pass_command\n  mutual\n"));
+        assert!(text(5).ends_with("  end\n"));
+        assert_eq!(text(6), "end Generated\n");
+    }
+
+    #[test]
+    fn source_command_discovery_ignores_strings_quotes_and_nonleading_atoms() {
+        let source = r###"def text : String := "macro \"string_head\" : command => body"
+-- macro "comment_head" : command => body
+def quoted := `(command| macro "quoted_head" : command => `(def hidden : Nat := 0))
+def indented := by
+  macro "indented_head" : command => body
+macro "term_head " : term => `(0)
+macro value:term "later_atom" : command => pure value
+macro (name := realHead) "real_head " : command => `(def real : Nat := 0)
+"###;
+        let original = SourceText::from_utf8(source.as_bytes()).unwrap();
+        let view = SourceView::of(&original);
+        let (tokens, _) = partition_tokens(&view).unwrap();
+        let heads = partition_source_command_heads(&view, &tokens).unwrap();
+        assert_eq!(
+            heads.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["real_head"]
+        );
+    }
+
+    #[test]
+    fn source_command_heads_do_not_activate_earlier_or_escaped_spellings() {
+        let source = r###"def before : Nat := 0
+emit earlier
+syntax "emit " ident : command
+emit later
+def escaped : Nat := 1
+«emit» value
+emit_more value
+def after : Nat := 2
+"###;
+        let commands = partition(source.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 5);
+        let text = |index: usize| std::str::from_utf8(commands[index].1).unwrap();
+        assert!(text(0).contains("emit earlier\n"));
+        assert_eq!(text(2), "emit later\n");
+        assert!(text(3).contains("«emit» value\nemit_more value\n"));
+        assert_eq!(text(4), "def after : Nat := 2\n");
+    }
+
+    #[test]
+    fn fresh_punctuation_command_heads_preserve_original_offsets() {
+        let source = "-- 😀\r\nsyntax \"#generated \" ident : command\r\n#generated chosen\r\ndef after : Nat := 0\r\n";
+        let commands = partition(source.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[1].0.0, source.find("#generated chosen").unwrap());
+        let mut joined = Vec::new();
+        for (offset, bytes) in commands {
+            assert_eq!(offset, BytePos(joined.len()));
+            joined.extend_from_slice(bytes);
+        }
+        assert_eq!(joined, source.as_bytes());
+    }
+
+    #[test]
+    fn registered_command_operands_are_not_split_at_declaration_keywords() {
+        let mut grammar = crate::extensions::FileGrammar::new(false, &[], None).unwrap();
+        let declaration =
+            crate::parse_source_command(b"syntax \"already_registered \" command : command")
+                .unwrap();
+        assert!(grammar.declare(&declaration.syntax).unwrap().is_some());
+        let source = b"already_registered def first : Nat := 0\nalready_registered\n  theorem checked : first = 0 := rfl\ndef last : Nat := 1\n";
+        let active = grammar.grammar();
+        let commands = crate::extensions::with_grammar(&active, || partition(source)).unwrap();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0].1, b"already_registered def first : Nat := 0\n");
+        assert!(commands[1].1.starts_with(b"already_registered\n  theorem"));
+        assert_eq!(commands[2].1, b"def last : Nat := 1\n");
+    }
+
     #[test]
     fn wrapper_queries_parse_only_temporary_scope_headers() {
         for source in [

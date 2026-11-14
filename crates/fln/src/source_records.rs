@@ -1588,6 +1588,30 @@ pub(crate) fn parse_deriving_command(
     Ok(fln_elab::source::deriving::is_command(parsed.syntax()).then_some(parsed))
 }
 
+/// Expand native command macros before selecting a declaration's public or
+/// private checking scope. The result also takes the syntax-based equation
+/// discovery path, since generated references need not occur in source bytes.
+pub(crate) fn parse_native_command_macro(
+    source: &[u8],
+) -> Result<Option<ScopedCommandSyntax>, EngineExecutionError> {
+    let Ok(parsed) = fln_parse::parse_source_command(source) else {
+        return Ok(None);
+    };
+    if !fln_parse::extensions::is_active_command_macro(parsed.syntax()) {
+        return Ok(None);
+    }
+    let parsed = parsed
+        .expanded()
+        .map_err(DefinitionFrontendError::Parse)
+        .map_err(EngineExecutionError::Frontend)?;
+    let declaration = parsed
+        .into_definition()
+        .ok_or(EngineExecutionError::NotImplemented {
+            feature: "a command macro that does not expand to one named declaration",
+        })?;
+    Ok(Some(ScopedCommandSyntax::Definition(declaration)))
+}
+
 fn parse_scoped_command_with_expansion(
     source: &[u8],
     expand_templates: bool,
@@ -1603,16 +1627,28 @@ fn parse_scoped_command_with_expansion(
     }
     // Under an entered grammar (`source_check::grammar`), the file's notations are expanded
     // before the elaborator reads the tree.
-    let parsed = fln_parse::parse_definition(source)
-        .and_then(|parsed| {
+    let parsed = match fln_parse::parse_definition(source) {
+        Ok(parsed) => {
             if expand_templates {
                 parsed.expanded()
             } else {
                 Ok(parsed)
             }
-        })
-        .map_err(DefinitionFrontendError::Parse)
-        .map_err(EngineExecutionError::Frontend)?;
+        }
+        Err(original) if expand_templates => {
+            // A source-defined command macro has no declaration keyword until
+            // expansion. Keep its original source view, but admit only the same
+            // canonical named declaration accepted at the imported MacroM door.
+            // Syntax declarations, queries and command sequences cannot enter
+            // the kernel through this fallback.
+            fln_parse::parse_source_command(source)
+                .and_then(fln_parse::ParsedSourceCommand::expanded)
+                .and_then(|parsed| parsed.into_definition().ok_or(original))
+        }
+        Err(error) => Err(error),
+    }
+    .map_err(DefinitionFrontendError::Parse)
+    .map_err(EngineExecutionError::Frontend)?;
     if fln_elab::source::scope::is_example(parsed.syntax()) {
         let parsed = fln_parse::parse_source_command(source)
             .and_then(|parsed| {

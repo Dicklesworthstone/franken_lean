@@ -3,6 +3,22 @@
 //! normalized source before any macro receives the resulting tree.
 use super::*;
 
+/// A single command in a quotation. Parsing its syntax does not execute the
+/// command or mutate the active grammar. A command operand uses the same door.
+pub(crate) fn command_quotation(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+) -> Option<Syntax> {
+    Run {
+        leaves,
+        view,
+        tokens,
+    }
+    .command_operand(range.start, range.end)
+}
+
 impl Run<'_> {
     pub(super) fn command_operand(&self, at: usize, end: usize) -> Option<Syntax> {
         if at >= end {
@@ -15,6 +31,30 @@ impl Run<'_> {
                 if !categories::tick() {
                     return None;
                 }
+            }
+            if let Some((syntax, next)) = crate::quotations::antiquotation(
+                self.leaves,
+                self.view,
+                self.tokens,
+                at,
+                end,
+                crate::quotations::Position::Category(Name::from_components(["command"])),
+            )
+            .ok()?
+            {
+                if next != end {
+                    return None;
+                }
+                let mut pending = vec![&syntax];
+                while let Some(node) = pending.pop() {
+                    if !categories::tick() {
+                        return None;
+                    }
+                    if let Syntax::Node { args, .. } = node {
+                        pending.extend(args);
+                    }
+                }
+                return Some(syntax);
             }
             // Full leaf spans preserve exactly the trivia owned by this
             // operand. The wrapper's delimiters keep their own trivia.

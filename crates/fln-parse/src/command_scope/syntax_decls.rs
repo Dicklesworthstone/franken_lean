@@ -105,6 +105,17 @@ impl Reader<'_> {
     }
 
     fn string(&mut self) -> Result<Syntax, NatDefinitionParseError> {
+        if let Some((syntax, next)) = crate::quotations::primitive(
+            self.leaves,
+            self.view,
+            self.tokens,
+            self.at,
+            self.end,
+            "str",
+        )? {
+            self.at = next;
+            return Ok(syntax);
+        }
         if !self.literal(self.at, LiteralKind::Str) {
             return Err(self.bad());
         }
@@ -314,7 +325,9 @@ impl Reader<'_> {
 
     fn stx_leading(&mut self) -> Result<(Syntax, u32), NatDefinitionParseError> {
         let at = self.at;
-        if self.literal(at, LiteralKind::Str) {
+        if self.literal(at, LiteralKind::Str)
+            || (crate::quotations::inside() && self.symbol(at, "$"))
+        {
             let string = self.string()?;
             return Ok((
                 Syntax::node(parser_kind(&["Syntax", "atom"]), vec![string]),

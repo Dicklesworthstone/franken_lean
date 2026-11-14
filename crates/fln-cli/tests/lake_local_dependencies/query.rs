@@ -12,13 +12,20 @@ fn query_builds_ordered_results_and_reuses_checked_records() {
         "right/Feature.Right:olean",
     ];
     let paths = artifact_paths(&workspace);
+    let first = build_success(workspace.run(&arguments, None));
+    // The package resolver canonicalizes roots, including Windows' verbatim
+    // path prefix. Compare against the real produced files in that spelling.
+    let canonical: Vec<_> = paths
+        .iter()
+        .map(|path| path.canonicalize().unwrap())
+        .collect();
     let expected = format!(
         "{}\n{}\n{}\n",
-        paths[2].display(),
-        paths[0].display(),
-        paths[2].display(),
+        canonical[2].display(),
+        canonical[0].display(),
+        canonical[2].display(),
     );
-    assert_eq!(build_success(workspace.run(&arguments, None)), expected);
+    assert_eq!(first, expected);
     let previous: Vec<_> = paths
         .iter()
         .map(|path| {
@@ -174,6 +181,16 @@ fn query_empty_targets_and_unavailable_requests_never_invent_products() {
     workspace.no_manifests();
 }
 
+fn proof_build_directory() -> &'static str {
+    if cfg!(windows) {
+        // Quotes are not legal Windows filename characters. Backslashes in
+        // Windows paths still exercise JSON escaping, alongside Unicode.
+        "products Unicode λ"
+    } else {
+        "products \"quoted\" λ"
+    }
+}
+
 fn proof_workspace() -> Workspace {
     let workspace = artifact_workspace();
     for (path, source) in [
@@ -196,21 +213,27 @@ fn proof_workspace() -> Workspace {
     ] {
         workspace.write(path, source);
     }
+    let build_dir = proof_build_directory().replace('"', "\\\"");
     workspace.write(
         "right/lakefile.toml",
-        format!("buildDir = \"products \\\"quoted\\\" λ\"\n{RIGHT}"),
+        format!("buildDir = \"{build_dir}\"\n{RIGHT}"),
     );
     workspace
 }
 
-fn normalize_query_output(output: String, workspace: &Workspace, json: bool) -> String {
-    let prefix = workspace.0.display().to_string();
-    let prefix = if json {
-        prefix.replace('\\', "\\\\").replace('"', "\\\"")
-    } else {
-        prefix
-    };
-    output.replace(&prefix, "<workspace>")
+fn normalize_query_output(mut output: String, workspace: &Workspace, json: bool) -> String {
+    // Only the independent scratch root is normalized. Its canonical spelling
+    // can differ on Windows and on platforms with a symlinked temp directory.
+    for prefix in [workspace.0.canonicalize().unwrap(), workspace.0.clone()] {
+        let prefix = prefix.display().to_string();
+        let prefix = if json {
+            prefix.replace('\\', "\\\\").replace('"', "\\\"")
+        } else {
+            prefix
+        };
+        output = output.replace(&prefix, "<workspace>");
+    }
+    output
 }
 
 #[test]
@@ -256,13 +279,14 @@ fn query_module_facets_match_pinned_text_and_json_output() {
         assert!(lines[1].contains("Top.ir"), "{actual}");
         assert!(lines[3].contains("Top.olean"), "{actual}");
     }
-    for path in [
-        "root/output/lib/lean/App/Top.ir",
-        "left/.lake/build/lib/lean/Feature/Left.ir",
-        "right/products \"quoted\" λ/lib/lean/Feature/Right.ir",
-        "right/vendor/shared library/.lake/build/lib/lean/Shared.ir",
-    ] {
-        let bytes = std::fs::read(native.0.join(path)).unwrap();
+    let mut paths = artifact_paths(&native);
+    paths[2] = native
+        .0
+        .join("right")
+        .join(proof_build_directory())
+        .join("lib/lean/Feature/Right.olean");
+    for path in paths {
+        let bytes = std::fs::read(path.with_extension("ir")).unwrap();
         fln_olean::region::OleanView::parse(&bytes).unwrap();
     }
     native.no_manifests();

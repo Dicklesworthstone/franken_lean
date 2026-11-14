@@ -78,6 +78,7 @@ mod atoms;
 pub use atoms::is_kind as is_atomic_macro_kind;
 mod categories;
 pub(crate) use categories::{category_for_quotation, parse_category_quotation};
+pub(crate) use commands::command_quotation;
 mod commands;
 mod local_rules;
 mod macro_body;
@@ -2018,6 +2019,15 @@ impl FileGrammar {
         self.expander().expand(syntax)
     }
 
+    /// Keep subsequent expansions fresh relative to already admitted generated
+    /// declarations. Every active grammar shares this counter, and reserving
+    /// an older scope never rewinds it.
+    pub fn reserve_macro_scopes_through(&mut self, scope: u64) -> Result<(), &'static str> {
+        scope.checked_add(1).ok_or("macro scope limit")?;
+        self.expansions.set(self.expansions.get().max(scope));
+        Ok(())
+    }
+
     /// Replace the template of the rule for `kind`: the caller's pre-resolved copy, its
     /// identifiers naming what they named where the notation was declared. `false` when no rule
     /// expands `kind`.
@@ -2983,6 +2993,12 @@ fn quotation_contents(quotation: &Syntax) -> Option<(Name, &Syntax)> {
         };
         return Some((Name::from_components(["tactic"]), contents));
     }
+    if kind_is(quotation, &["Lean", "Parser", "Command", "quot"]) {
+        let [_, contents, _] = args else {
+            return None;
+        };
+        return Some((Name::from_components(["command"]), contents));
+    }
     if !kind_is(quotation, &["Lean", "Parser", "Term", "quot"]) {
         return None;
     }
@@ -3744,6 +3760,25 @@ pub fn expand_active(syntax: &Syntax) -> Result<Option<Syntax>, &'static str> {
     }
     .expand(syntax)
     .map(Some)
+}
+
+/// Whether a parsed source command has both an active command parser and a
+/// native quoted expansion. Parser or token metadata alone never grants one.
+pub fn is_active_command_macro(syntax: &Syntax) -> bool {
+    let Some(kind) = syntax.kind() else {
+        return false;
+    };
+    active().is_some_and(|grammar| {
+        grammar
+            .expander
+            .as_ref()
+            .is_some_and(|expander| expander.rules.contains_key(kind))
+            && grammar
+                .commands
+                .values()
+                .flatten()
+                .any(|index| grammar.decls[*index].decl == *kind)
+    })
 }
 
 /// The active infix declarations spelled `symbol`.

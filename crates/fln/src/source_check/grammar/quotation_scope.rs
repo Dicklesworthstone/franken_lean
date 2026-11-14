@@ -11,6 +11,7 @@ use fln_parse::extensions::NotationRule;
 use fln_syntax::source::SourceInfo;
 use fln_syntax::tree::{Preresolved, Syntax};
 
+mod command_declarations;
 mod do_notation;
 mod matches;
 
@@ -629,6 +630,9 @@ pub(super) fn preresolve(
     while let Some(task) = tasks.pop() {
         match task {
             Task::Visit(node @ Syntax::Node { kind, args, .. }) => {
+                if command_declarations::schedule(node, rule, &mut tasks, locals.len())? {
+                    continue;
+                }
                 if matches::conditional(node, rule, resolve, &mut tasks, &locals)? {
                     continue;
                 }
