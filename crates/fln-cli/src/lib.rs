@@ -15082,18 +15082,28 @@ const LAKE_HELP_ENV: &str = concat!(
     "Spawns a new process executing `cmd` with the given `args` and with\n",
     "the environment set based on the detected Lean/Lake installations and\n",
     "the workspace configuration (if it exists).\n",
+    "Checked local and materialized locked dependencies contribute their build\n",
+    "and library source directories in Lake's workspace order. Existing search\n",
+    "paths are retained. Every argument after cmd belongs to that command,\n",
+    "including options; its stdin, stdout, stderr and exit status are preserved.\n",
 );
 
-/// Separate the executable's argv before any Lake option pre-pass. The pin
+/// Separate a program's argv before any Lake option pre-pass. The pin
 /// processes leading options before the command and before its target, then
-/// gives every remaining word to the executable unchanged.
-fn lake_executable_arguments(arguments: &mut Vec<OsString>) -> Vec<OsString> {
-    let mut executable = false;
+/// gives every remaining word to the executable or explicit env command unchanged.
+fn lake_forwarded_arguments(arguments: &mut Vec<OsString>) -> (Vec<OsString>, Vec<OsString>) {
+    let mut command = None;
     let mut options = true;
     let mut index = 0usize;
     while index < arguments.len() {
         let argument = arguments[index].to_string_lossy();
         if options && argument == "--" {
+            if command == Some("env") {
+                // Lake stores these as subArgs. `env` has no command before
+                // this separator and does not consume subArgs, so it lists.
+                arguments.truncate(index);
+                return (Vec::new(), Vec::new());
+            }
             options = false;
             index += 1;
             continue;
@@ -15106,17 +15116,22 @@ fn lake_executable_arguments(arguments: &mut Vec<OsString>) -> Vec<OsString> {
             index += 1 + usize::from(takes_value);
             continue;
         }
-        if executable {
-            return arguments.split_off(index + 1);
+        if let Some(command) = command {
+            return if command == "env" {
+                (Vec::new(), arguments.split_off(index))
+            } else {
+                (arguments.split_off(index + 1), Vec::new())
+            };
         }
-        if !matches!(argument.as_ref(), "exe" | "exec") {
-            return Vec::new();
-        }
-        executable = true;
+        command = match argument.as_ref() {
+            "exe" | "exec" => Some("exe"),
+            "env" => Some("env"),
+            _ => return (Vec::new(), Vec::new()),
+        };
         options = true;
         index += 1;
     }
-    Vec::new()
+    (Vec::new(), Vec::new())
 }
 
 /// Run FrankenLean's bounded native `lake` personality (plan §17.1).
@@ -15125,7 +15140,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     if arguments.is_empty() {
         return MultiplexerOutput::success(LAKE_USAGE.to_owned());
     }
-    let executable_arguments = lake_executable_arguments(&mut arguments);
+    let (executable_arguments, environment_arguments) = lake_forwarded_arguments(&mut arguments);
     // Parse posture only at actual Lake option positions. A pre-pass would
     // steal option-like directory values and miss options after a global `--`.
     let mut import_posture = None;
@@ -15241,6 +15256,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 Some("exe" | "exec") => LAKE_HELP_EXE,
                 Some("lean") => LAKE_HELP_LEAN,
                 Some("query") => LAKE_HELP_QUERY,
+                Some("env") => LAKE_HELP_ENV,
                 _ => LAKE_USAGE,
             };
             return MultiplexerOutput::success(help.to_owned());
@@ -15607,65 +15623,21 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             }
         }
         "env" => {
-            // The sysroot is a fact about where this binary is installed. A
-            // development binary has none, and inventing one would hand every
-            // tool that reads this environment a directory that is not Lean.
-            let Some(prefix) = std::env::var_os("LEAN_SYSROOT")
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::current_exe()
-                        .ok()
-                        .and_then(|exe| derive_lean_installation_paths(&exe).ok().map(|p| p.prefix))
-                })
-            else {
-                return lake_not_implemented(
-                    "env",
-                    "this binary is not in a toolchain layout and LEAN_SYSROOT is not set, so \
-                     there is no sysroot to report",
+            if let Some(option) = ignored_options.first() {
+                return lake_operation_failure(
+                    "fln.lake-env/1",
+                    &format!("environment option `{option}` is unavailable"),
+                    true,
                     is_json,
                 );
-            };
-
-            if command_args.is_empty() {
-                let mut out = String::new();
-                out.push_str(&format!(
-                    "ELAN_TOOLCHAIN=leanprover/lean4:{}\n",
-                    fln::OLEAN_PIN_TAG
-                ));
-                out.push_str(&format!("LEAN_SYSROOT={}\n", prefix.display()));
-                out.push_str(&format!(
-                    "LEAN_PATH={}\n",
-                    prefix.join("lib").join("lean").display()
-                ));
-                out.push_str(&format!(
-                    "LEAN_SRC_PATH={}\n",
-                    prefix.join("src").join("lean").display()
-                ));
-                MultiplexerOutput::success(out)
-            } else {
-                let subcmd = &command_args[0];
-                let subargs = &command_args[1..];
-                let mut proc = std::process::Command::new(subcmd);
-                proc.args(subargs);
-                proc.env(
-                    "ELAN_TOOLCHAIN",
-                    format!("leanprover/lean4:{}", fln::OLEAN_PIN_TAG),
-                );
-                proc.env("LEAN_SYSROOT", &prefix);
-                proc.env("LEAN_PATH", prefix.join("lib").join("lean"));
-                proc.env("LEAN_SRC_PATH", prefix.join("src").join("lean"));
-                match proc.output() {
-                    Ok(output) => MultiplexerOutput {
-                        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                        exit_code: output.status.code().unwrap_or(1) as u8,
-                    },
-                    Err(_) => MultiplexerOutput::failure(
-                        format!("could not execute external process '{subcmd}'\n"),
-                        255,
-                    ),
-                }
             }
+            lake_build::run_environment(
+                dir.unwrap_or_else(|| PathBuf::from(".")),
+                environment_arguments,
+                is_json,
+                jobs.unwrap_or(std::num::NonZeroUsize::MIN),
+                import_posture,
+            )
         }
         "check-build" => {
             if !command_args.is_empty() {

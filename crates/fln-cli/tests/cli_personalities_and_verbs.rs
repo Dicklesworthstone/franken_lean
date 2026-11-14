@@ -1154,7 +1154,9 @@ rev = "v4.32.0"
     let sysroot = temp_parent.join("sysroot");
     let env_output = Command::new(env!("CARGO_BIN_EXE_lake"))
         .arg("env")
+        .current_dir(&temp_parent)
         .env("LEAN_SYSROOT", &sysroot)
+        .env_remove("LEAN_PATH")
         .output()
         .expect("run lake env");
     assert!(env_output.status.success());
@@ -1169,6 +1171,7 @@ rev = "v4.32.0"
     // 4. lake env echo hello
     let env_echo = Command::new(env!("CARGO_BIN_EXE_lake"))
         .args(["env", "echo", "testing_lake_env_propagation"])
+        .current_dir(&temp_parent)
         .env("LEAN_SYSROOT", &sysroot)
         .output()
         .expect("run lake env echo");
@@ -1179,6 +1182,7 @@ rev = "v4.32.0"
     // 5. lake env with nonexistent command exits 255
     let env_missing = Command::new(env!("CARGO_BIN_EXE_lake"))
         .args(["env", "nonexistent_command_12345_xyz"])
+        .current_dir(&temp_parent)
         .env("LEAN_SYSROOT", &sysroot)
         .output()
         .expect("run lake env missing");

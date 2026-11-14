@@ -6,6 +6,8 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "lake_local_dependencies/environment.rs"]
+mod environment;
 #[path = "lake_local_dependencies/query.rs"]
 mod query;
 
@@ -565,36 +567,42 @@ fn artifact_workspace() -> Workspace {
 
 #[test]
 fn lake_lean_checks_transitive_sources_without_running_main_or_publishing() {
+    let Some((_, lib)) = reference() else {
+        return;
+    };
     let workspace = artifact_workspace();
+    let checked_shared = CHECKED_SHARED.replace("prelude\n", "prelude\nimport Init.System.IO\n");
     workspace.write(
         "root/src/app/App/Main.lean",
         concat!(
             "prelude\nimport Feature.Left\nimport Feature.Right\n",
-            // This is an ordinary checked definition, deliberately not a
-            // runnable executable ABI. `lake lean` must not try to invoke it.
-            "def main (A : Type) (a : A) : A := Feature.left A (Feature.right A a)\n",
+            "def composed (A : Type) (a : A) : A := Feature.left A (Feature.right A a)\n",
+            // `main` must pass Lean's ordinary IO type check, but checking
+            // this file must not execute its observable action.
+            "def main : IO Unit := IO.println \"lake-lean-main-must-not-run\"\n",
             "#check main\n",
         ),
     );
     workspace.write(
         "right/vendor/shared library/sources/lib/Shared.lean",
-        format!("{CHECKED_SHARED}#check Shared.identity\n"),
+        format!("{checked_shared}#check Shared.identity\n"),
     );
     let args = ["lean", "root/src/app/App/Main.lean"];
-    let output = workspace.run(&args, None);
+    let output = workspace.run(&args, Some(&lib));
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
     let stdout = std::str::from_utf8(&output.stdout).unwrap();
     assert!(stdout.contains("main"), "{stdout}");
+    assert!(!stdout.contains("lake-lean-main-must-not-run"), "{stdout}");
     assert!(!stdout.contains("Shared.identity"), "{stdout}");
     workspace.no_products();
     workspace.no_manifests();
 
     workspace.write(
         "right/vendor/shared library/sources/lib/Shared.lean",
-        "prelude\ndef Shared.identity (A : Type) (a : A) : A := A\n",
+        "prelude\nimport Init.System.IO\ndef Shared.identity (A : Type) (a : A) : A := A\n",
     );
-    let invalid = workspace.run(&args, None);
+    let invalid = workspace.run(&args, Some(&lib));
     assert_eq!(invalid.status.code(), Some(1), "{invalid:?}");
     assert!(invalid.stdout.is_empty(), "{invalid:?}");
     let error = std::str::from_utf8(&invalid.stderr).unwrap();
@@ -604,9 +612,9 @@ fn lake_lean_checks_transitive_sources_without_running_main_or_publishing() {
     );
     workspace.write(
         "right/vendor/shared library/sources/lib/Shared.lean",
-        CHECKED_SHARED,
+        checked_shared,
     );
-    let repaired = workspace.run(&args, None);
+    let repaired = workspace.run(&args, Some(&lib));
     assert!(repaired.status.success(), "{repaired:?}");
     assert_eq!(repaired.stdout, output.stdout, "{repaired:?}");
     assert!(repaired.stderr.is_empty(), "{repaired:?}");

@@ -8,10 +8,12 @@ use fln::{Name, Outcome};
 use fln_lake::{LakeConfig, TargetKind};
 use std::path::Component;
 
+mod environment;
 mod executable;
 mod explain;
 mod local_dependencies;
 mod update;
+pub(super) use environment::run as run_environment;
 pub(super) use executable::run as run_executable;
 pub(super) use executable::run_source;
 pub(super) use update::run as update_manifest;
