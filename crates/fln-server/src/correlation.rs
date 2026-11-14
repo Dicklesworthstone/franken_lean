@@ -1315,6 +1315,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rpc_navigation_accepts_real_location_links_and_rejects_fabricated_shapes() {
+        use crate::json::RpcProcedure;
+        let range = r#"{"start":{"line":2,"character":0},"end":{"line":2,"character":26}}"#;
+        let selection = r#"{"start":{"line":2,"character":10},"end":{"line":2,"character":15}}"#;
+        let link = format!(
+            r#"{{"targetUri":"file:///Main.lean","targetRange":{range},"targetSelectionRange":{selection}}}"#
+        );
+        for value in ["[]".to_owned(), format!("[{link}]")] {
+            let response = format!(r#"{{"jsonrpc":"2.0","id":"call","result":{value}}}"#);
+            let (client, server) = rpc_pair("Lean.Widget.getGoToLocation", &response);
+            assert_eq!(
+                correlate_transcripts(&client, &server)
+                    .unwrap()
+                    .rpc_call_results,
+                1
+            );
+        }
+        for bad in [
+            "null".to_owned(),
+            link.clone(),
+            r#"[{}]"#.to_owned(),
+            format!("[{}]", link.replace("file:///Main.lean", "")),
+            format!(
+                "[{}]",
+                link.replace(
+                    selection,
+                    r#"{"start":{"line":1,"character":10},"end":{"line":2,"character":15}}"#
+                )
+            ),
+            format!(
+                "[{}]",
+                link.replace(
+                    selection,
+                    r#"{"start":{"line":2,"character":15},"end":{"line":2,"character":10}}"#
+                )
+            ),
+            format!(
+                "[{}]",
+                link.replace(
+                    "\"targetUri\":",
+                    "\"targetUri\":\"file:///Other.lean\",\"targetUri\":"
+                )
+            ),
+            format!(r#"[{{"targetUri":"file:///Main.lean","range":{range}}}]"#),
+        ] {
+            assert!(!RpcProcedure::GoToLocation.result(&bad), "{bad}");
+        }
+    }
+
     fn framed(bodies: &[&str]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for body in bodies {

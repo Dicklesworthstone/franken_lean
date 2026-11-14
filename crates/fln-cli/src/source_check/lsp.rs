@@ -557,9 +557,28 @@ fn inspect_sources(
             return completion::complete(session, sources, &inputs, offset);
         }
     };
-    let result = session
-        .inspect(&inputs, &sources.names[0], offset, wanted)
-        .map_err(|e| e.to_string())?;
+    let mut locations = None;
+    let result = if matches!(
+        kind,
+        QueryKind::InteractiveGoals | QueryKind::InteractiveTermGoal
+    ) {
+        session
+            .inspect_with_navigation(&inputs, &sources.names[0], offset, wanted)
+            .map_err(|error| error.to_string())?
+            .map_complete(|navigation| {
+                // Failure of the independent origin pass is represented by
+                // unavailable navigation, not an invented empty destination or
+                // the loss of an otherwise valid native goal/hover response.
+                if let Ok(fln::Outcome::Complete(origins)) = navigation.locations {
+                    locations = navigation::locations(sources, origins).ok();
+                }
+                navigation.inspection
+            })
+    } else {
+        session
+            .inspect(&inputs, &sources.names[0], offset, wanted)
+            .map_err(|error| error.to_string())?
+    };
     let inspected = match result {
         fln::Outcome::Complete(result) => result,
         fln::Outcome::Inconclusive(reason) => {
@@ -585,6 +604,7 @@ fn inspect_sources(
                 range,
                 kind,
                 fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
+                locations.as_ref(),
             )?)
         }
         Some(SourceObservation::Goals { range, goals }) => {

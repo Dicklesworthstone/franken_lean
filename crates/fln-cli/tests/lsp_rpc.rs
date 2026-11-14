@@ -71,6 +71,22 @@ fn info_call(id: &str, session: &str, key: &str, reference: &str) -> String {
         ),
     )
 }
+fn navigation_call(id: &str, session: &str, key: &str, reference: &str, kind: &str) -> String {
+    request(
+        id,
+        "$/lean/rpc/call",
+        &format!(
+            r#"{{"textDocument":{{"uri":"{URI}"}},"position":{{"line":0,"character":0}},"sessionId":"{session}","method":"Lean.Widget.getGoToLocation","params":{{"kind":"{kind}","info":{{"{key}":"{reference}"}}}}}}"#
+        ),
+    )
+}
+
+fn location_link(line: usize, end: usize, selection: std::ops::Range<usize>) -> String {
+    format!(
+        r#"{{"targetUri":"{URI}","targetRange":{{"start":{{"line":{line},"character":0}},"end":{{"line":{line},"character":{end}}}}},"targetSelectionRange":{{"start":{{"line":{line},"character":{}}},"end":{{"line":{line},"character":{}}}}}}}"#,
+        selection.start, selection.end,
+    )
+}
 struct Client {
     child: Child,
     input: ChildStdin,
@@ -304,6 +320,100 @@ fn both_doors_and_wire_formats_show_native_goals_terms_and_current_edits() {
         }
     }
 }
+#[test]
+fn both_doors_navigate_retained_native_goal_tags_to_checked_declarations_and_types() {
+    let source = "-- 😀\r\ninductive Token where | mk\r\ndef value : Token := Token.mk\r\ndef pending (P : Prop) (β : P) : Token :=\r\n  let item : Token := value\r\n  by exact item";
+    let expected_type = location_link(1, 26, 10..15);
+    let expected_definition = location_link(2, "def value : Token := Token.mk".len(), 4..9);
+    for (binary, args) in [
+        (env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        (env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        for (format, key) in [("v0", "p"), ("v1", "__rpcref")] {
+            let mut client = Client::start(binary, args, format);
+            client.open(source);
+            let session = client.connect("connect");
+            let goals = client.exchange(
+                "goals",
+                &call("goals", &session, "Lean.Widget.getInteractiveGoals", 5, 5),
+            );
+            let value = expression_reference(&goals, "value", key).to_owned();
+            let token = expression_reference(&goals, "Token", key).to_owned();
+            let local = expression_reference(&goals, "P", key).to_owned();
+            for (kind, expected) in [
+                ("declaration", &expected_definition),
+                ("definition", &expected_definition),
+                ("type", &expected_type),
+            ] {
+                let result =
+                    client.exchange(kind, &navigation_call(kind, &session, key, &value, kind));
+                assert!(
+                    result.contains(&format!(r#""result":[{expected}]"#)),
+                    "{result}"
+                );
+            }
+            let result = client.exchange(
+                "type-global",
+                &navigation_call("type-global", &session, key, &token, "definition"),
+            );
+            assert!(
+                result.contains(&format!(r#""result":[{expected_type}]"#)),
+                "{result}"
+            );
+            for (reference, kind) in [(&local, "definition"), (&local, "type"), (&token, "type")] {
+                let result = client.exchange(
+                    "empty",
+                    &navigation_call("empty", &session, key, reference, kind),
+                );
+                assert!(result.contains(r#""result":[]"#), "{result}");
+            }
+            client.change(2, &format!("\r\n{source}"));
+            let new_goals = client.exchange(
+                "new-goals",
+                &call(
+                    "new-goals",
+                    &session,
+                    "Lean.Widget.getInteractiveGoals",
+                    6,
+                    5,
+                ),
+            );
+            let new_value = expression_reference(&new_goals, "value", key);
+            let new_location = client.exchange(
+                "new-location",
+                &navigation_call("new-location", &session, key, new_value, "definition"),
+            );
+            assert!(
+                new_location.contains(&format!(
+                    r#""result":[{}]"#,
+                    location_link(3, "def value : Token := Token.mk".len(), 4..9)
+                )),
+                "{new_location}"
+            );
+            let old = client.exchange(
+                "old-location",
+                &navigation_call("old-location", &session, key, &value, "definition"),
+            );
+            assert!(
+                old.contains(&format!(r#""result":[{expected_definition}]"#)),
+                "{old}"
+            );
+            client.send(&notification(
+                "$/lean/rpc/release",
+                &format!(
+                    r#"{{"uri":"{URI}","sessionId":"{session}","refs":[{{"{key}":"{value}"}}]}}"#
+                ),
+            ));
+            let released = client.exchange(
+                "released",
+                &navigation_call("released", &session, key, &value, "definition"),
+            );
+            assert!(released.contains(r#""code":-32602"#), "{released}");
+            client.finish();
+        }
+    }
+}
+
 #[test]
 fn closed_sessions_reconnect_and_numeric_or_wrong_document_ids_refuse() {
     let mut client = Client::start(env!("CARGO_BIN_EXE_fln"), &["serve-lsp"], "v1");

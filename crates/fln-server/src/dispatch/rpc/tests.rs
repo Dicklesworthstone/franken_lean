@@ -1,6 +1,7 @@
 //! Deterministic state tests; installed-binary tests exercise native elaboration.
 use super::*;
 use semantic::{Goal, Hypothesis, TermGoal};
+mod navigation;
 const URI: &str = "file:///Rpc.lean";
 fn answer(target: &str) -> Answer {
     Answer::InteractiveGoals {
@@ -35,6 +36,7 @@ fn annotated_answer() -> Answer {
     };
     goals[0].target.info = Some(ExpressionInfo {
         type_: Some("P".into()),
+        ..ExpressionInfo::default()
     });
     goals[0].target.subexpressions = vec![
         semantic::SubexpressionInfo {
@@ -42,6 +44,7 @@ fn annotated_answer() -> Answer {
             position: 4,
             info: ExpressionInfo {
                 type_: Some("P → P".into()),
+                ..ExpressionInfo::default()
             },
         },
         semantic::SubexpressionInfo {
@@ -49,6 +52,7 @@ fn annotated_answer() -> Answer {
             position: 5,
             info: ExpressionInfo {
                 type_: Some("P".into()),
+                ..ExpressionInfo::default()
             },
         },
     ];

@@ -13,9 +13,95 @@ pub struct Code {
     pub subexpressions: Vec<SubexpressionInfo>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExpressionInfo {
     pub type_: Option<String>,
+    /// None means the origin pass was unavailable; Some([]) means the actual
+    /// expression has no supported source destination, as for a local binder.
+    pub definition: Option<Vec<NavigationLocation>>,
+    pub type_definition: Option<Vec<NavigationLocation>>,
+}
+
+/// A source-validated, immutable LSP LocationLink. Keep only coordinates and
+/// URI, not another copy of a potentially large imported source per tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavigationLocation {
+    uri: String,
+    range: [super::super::json::Position; 2],
+    selection: [super::super::json::Position; 2],
+}
+
+impl NavigationLocation {
+    /// Convert original byte ranges once, while their checked source snapshot
+    /// is available. Invalid UTF-8/CRLF boundaries cannot become wire locations.
+    pub fn new(
+        uri: String,
+        source: &str,
+        range: Range<usize>,
+        selection: Range<usize>,
+    ) -> Result<Self, &'static str> {
+        Self::from_symbols(
+            &uri,
+            source,
+            &[super::DocumentSymbol {
+                name: String::new(),
+                range,
+                selection_range: selection,
+            }],
+        )?
+        .pop()
+        .ok_or("navigation source did not produce its location")
+    }
+
+    /// Convert a source-ordered batch in one source traversal. This shares the
+    /// exact outline boundary validator instead of rescanning a module for each
+    /// declaration, which would make normal large files quadratic to present.
+    pub fn from_symbols(
+        uri: &str,
+        source: &str,
+        symbols: &[super::DocumentSymbol],
+    ) -> Result<Vec<Self>, &'static str> {
+        if uri.is_empty()
+            || uri.len() > 16 * 1024
+            || uri.chars().any(char::is_control)
+            || source.len() > 1024 * 1024
+            || symbols.len() > 4096
+            || symbols
+                .len()
+                .checked_mul(64 + uri.len())
+                .is_none_or(|bytes| bytes > 1024 * 1024)
+        {
+            return Err("navigation location exceeds its source bounds");
+        }
+        let coordinates = super::symbols::coordinates(source, symbols, 1024 * 1024)?;
+        Ok(coordinates
+            .into_iter()
+            .map(|[start, end, selection_start, selection_end]| Self {
+                uri: uri.to_owned(),
+                range: [start, end],
+                selection: [selection_start, selection_end],
+            })
+            .collect())
+    }
+
+    pub fn payload_bytes(&self) -> usize {
+        64 + self.uri.len()
+    }
+
+    pub(in crate::dispatch) fn wire(&self) -> String {
+        let range = |points: [super::super::json::Position; 2]| {
+            format!(
+                "{{\"start\":{{\"line\":{},\"character\":{}}},\"end\":{{\"line\":{},\"character\":{}}}}}",
+                points[0].line, points[0].character, points[1].line, points[1].character
+            )
+        };
+        format!(
+            "{{\"targetUri\":{},\"targetRange\":{},\"targetSelectionRange\":{}}}",
+            crate::json_string(&self.uri),
+            range(self.range),
+            range(self.selection),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,14 +161,25 @@ pub(in crate::dispatch) fn payload_bytes(answer: &Answer) -> Result<usize, &'sta
         Ok(())
     }
     fn info(total: &mut usize, info: &ExpressionInfo) -> Result<(), &'static str> {
-        add(total, 32)?;
+        add(total, 80)?;
         if let Some(type_) = &info.type_ {
             add(total, type_.len())?;
+        }
+        for locations in [&info.definition, &info.type_definition]
+            .into_iter()
+            .flatten()
+        {
+            if locations.len() > 256 {
+                return Err("interactive expression has too many navigation destinations");
+            }
+            for location in locations {
+                add(total, location.payload_bytes())?;
+            }
         }
         Ok(())
     }
     fn code(total: &mut usize, code: &Code) -> Result<(), &'static str> {
-        add(total, 96)?;
+        add(total, 160)?;
         add(total, code.text.len())?;
         if let Some(root) = &code.info {
             if code.text.is_empty() {
@@ -178,4 +275,65 @@ pub(in crate::dispatch) fn validate(
         }
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn navigation_links_preserve_unicode_crlf_and_contained_selection_ranges() {
+        let source = "-- 😀\r\ndef «😀» : Nat := 1\r\n";
+        let start = source.find("def").unwrap();
+        let selection = start + 4..source.find(" :").unwrap();
+        let location = NavigationLocation::new(
+            "file:///Unicode.lean".into(),
+            source,
+            start..source.len() - 2,
+            selection,
+        )
+        .unwrap();
+        assert!(location.wire().contains(r#""targetSelectionRange":{"start":{"line":1,"character":4},"end":{"line":1,"character":8}}"#));
+        for (range, selection) in [
+            (start..source.len() - 1, start + 4..start + 5), // CRLF interior.
+            (start..source.len() - 2, start + 5..start + 6), // UTF-8 interior.
+            (start..start + 3, start + 4..start + 5),
+            (start..start, start..start),
+        ] {
+            assert!(
+                NavigationLocation::new("file:///Invalid.lean".into(), source, range, selection)
+                    .is_err()
+            );
+        }
+        assert!(
+            NavigationLocation::new(
+                "file:///bad\n.lean".into(),
+                source,
+                start..source.len() - 2,
+                start..start + 3
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn navigation_batches_bound_uri_copies_before_allocating_them() {
+        let symbol = super::super::DocumentSymbol {
+            name: String::new(),
+            range: 0..1,
+            selection_range: 0..1,
+        };
+        assert!(
+            NavigationLocation::from_symbols(
+                &"x".repeat(16 * 1024),
+                "x",
+                &vec![symbol.clone(); 64]
+            )
+            .is_err()
+        );
+        let locations =
+            NavigationLocation::from_symbols("file:///Batch.lean", "x", &vec![symbol; 4096])
+                .unwrap();
+        assert_eq!(locations.len(), 4096);
+    }
 }

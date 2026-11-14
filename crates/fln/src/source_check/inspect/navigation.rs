@@ -36,7 +36,54 @@ pub struct SourceDefinition {
     pub range: Range<usize>,
 }
 
+/// An authored declaration's complete extent and identifier in the exact
+/// checked source closure. Both ranges address original UTF-8 source bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDeclarationLocation {
+    pub name: Name,
+    pub module: Name,
+    pub range: Range<usize>,
+    pub selection_range: Range<usize>,
+}
+
+/// Navigation has an independent bounded origin pass. Its failure must not
+/// discard a successfully observed goal or turn unavailable origins into an
+/// empty successful navigation result.
+#[derive(Debug)]
+pub struct SourceNavigationInspection {
+    pub inspection: SourceInspection,
+    pub locations: Result<Outcome<Vec<SourceDeclarationLocation>>, SourceModuleCheckError>,
+}
+
 impl SourceModuleSession {
+    /// Observe once, then index that observation's checked command/import
+    /// prefix once for all expressions presented by an InfoView response.
+    /// The current unfinished declaration never acquires a global origin.
+    pub fn inspect_with_navigation(
+        &mut self,
+        inputs: &[SourceModuleInput<'_>],
+        entry: &Name,
+        offset: usize,
+        kind: ObservationKind,
+    ) -> Result<Outcome<SourceNavigationInspection>, SourceModuleCheckError> {
+        let inspection = match self.inspect(inputs, entry, offset, kind)? {
+            Outcome::Complete(inspection) => inspection,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let locations = self.inspection_locations(
+            inputs,
+            entry,
+            offset,
+            &inspection,
+            DefinitionLookupLimits::default(),
+        );
+        Ok(Outcome::Complete(SourceNavigationInspection {
+            inspection,
+            locations,
+        }))
+    }
+
     /// Locate an elaborator-resolved global in the exact checked source closure.
     /// Locals, seed constants, generated helpers and unsupported source
     /// declaration shapes return `None`, never a same-spelled global substitute.
@@ -81,7 +128,44 @@ impl SourceModuleSession {
         if !environment.contains(target) {
             return Ok(Outcome::Complete(None));
         }
-        let mut found = None;
+        let locations =
+            match self.inspection_locations(inputs, entry, offset, &inspected, limits)? {
+                Outcome::Complete(locations) => locations,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+        Ok(Outcome::Complete(locations.into_iter().find_map(
+            |location| {
+                (&location.name == target).then_some(SourceDefinition {
+                    name: location.name,
+                    module: location.module,
+                    range: location.selection_range,
+                })
+            },
+        )))
+    }
+
+    fn inspection_locations(
+        &mut self,
+        inputs: &[SourceModuleInput<'_>],
+        entry: &Name,
+        offset: usize,
+        inspected: &SourceInspection,
+        limits: DefinitionLookupLimits,
+    ) -> Result<Outcome<Vec<SourceDeclarationLocation>>, SourceModuleCheckError> {
+        if inputs.len() > limits.max_modules {
+            return Err(limit("definition modules", limits.max_modules));
+        }
+        let mut bytes = 0usize;
+        for input in inputs {
+            bytes = bytes
+                .checked_add(input.source.len())
+                .filter(|n| *n <= limits.max_source_bytes)
+                .ok_or_else(|| limit("definition source bytes", limits.max_source_bytes))?;
+        }
+        let environment = inspected.prefix.checked.checked.engine.environment();
+        let mut found = Vec::new();
+        let mut names = std::collections::BTreeSet::new();
         let mut budget = symbols::SourceOriginBudget::new(DocumentSymbolLimits {
             max_source_bytes: limits.max_source_bytes,
             max_modules: limits.max_modules,
@@ -140,10 +224,8 @@ impl SourceModuleSession {
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
             for origin in origins {
-                if &origin.name != target {
-                    continue;
-                }
-                let range = origin.symbol.selection_range;
+                let range = origin.symbol.range;
+                let selection_range = origin.symbol.selection_range;
                 let text = std::str::from_utf8(input.source).map_err(|_| {
                     source_error(
                         module,
@@ -152,7 +234,14 @@ impl SourceModuleSession {
                         "definition source is not UTF-8".into(),
                     )
                 })?;
-                if range.is_empty() || text.get(range.clone()).is_none() || found.is_some() {
+                if range.is_empty()
+                    || text.get(range.clone()).is_none()
+                    || selection_range.is_empty()
+                    || text.get(selection_range.clone()).is_none()
+                    || selection_range.start < range.start
+                    || selection_range.end > range.end
+                    || !names.insert(origin.name.clone())
+                {
                     return Err(source_error(
                         module,
                         0,
@@ -160,10 +249,11 @@ impl SourceModuleSession {
                         "definition location is invalid or ambiguous".into(),
                     ));
                 }
-                found = Some(SourceDefinition {
+                found.push(SourceDeclarationLocation {
                     name: origin.name,
                     module: module.clone(),
                     range,
+                    selection_range,
                 });
             }
         }

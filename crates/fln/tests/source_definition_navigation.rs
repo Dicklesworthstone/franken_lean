@@ -1,6 +1,9 @@
 //! Real source-to-elaborator-to-origin joins, not a text-matching navigation mock.
 #![forbid(unsafe_code)]
-use fln::source_check::inspect::{DefinitionLookupLimits, DocumentSymbolLimits, SourceDefinition};
+use fln::source_check::inspect::{
+    DefinitionLookupLimits, DocumentSymbolLimits, ObservationKind, SourceDefinition,
+    SourceObservation,
+};
 use fln::source_check::modules::{
     SourceModuleCacheLimits, SourceModuleCheckError, SourceModuleCheckLimits, SourceModuleSession,
 };
@@ -48,6 +51,106 @@ fn same_module_reference_returns_the_explicit_definition_identifier() {
     assert_eq!(found.module, name("Main"));
     assert_eq!(found.range, 4..9);
     assert_eq!(&source[found.range], "value");
+}
+
+#[test]
+fn goal_navigation_indexes_checked_imports_and_full_ranges_without_admitting_the_cursor() {
+    let main = name("Main");
+    let lib = name("Lib");
+    let library = "-- 😀\r\nnamespace Outer\r\nprivate def secret : Nat := 3\r\ninductive Token where | mk\r\nend Outer";
+    let source = "import Lib\nopen Outer\ndef pending (x : Token) : Token := by\n  exact x\ndef future : Nat := unavailable";
+    let navigation = session()
+        .inspect_with_navigation(
+            &[
+                SourceModuleInput {
+                    name: &main,
+                    source: source.as_bytes(),
+                },
+                SourceModuleInput {
+                    name: &lib,
+                    source: library.as_bytes(),
+                },
+            ],
+            &main,
+            source.find("exact x").unwrap(),
+            ObservationKind::Goals,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(
+        matches!(navigation.inspection.observation, Some(SourceObservation::Goals { ref goals, .. }) if goals.len() == 1)
+    );
+    let environment = navigation
+        .inspection
+        .prefix
+        .checked
+        .checked
+        .engine
+        .environment();
+    assert!(!environment.contains(&name("pending")));
+    assert!(!environment.contains(&name("future")));
+    let locations = navigation.locations.unwrap().into_complete().unwrap();
+    assert!(locations.iter().all(|location| location.module == lib));
+    let token = locations
+        .iter()
+        .find(|location| location.name == name("Outer.Token"))
+        .unwrap();
+    assert_eq!(&library[token.range.clone()], "inductive Token where | mk");
+    assert_eq!(&library[token.selection_range.clone()], "Token");
+    let private = locations
+        .iter()
+        .find(|location| &library[location.selection_range.clone()] == "secret")
+        .unwrap();
+    assert_ne!(private.name, name("Outer.secret"));
+    assert!(environment.contains(&private.name));
+    assert!(
+        locations
+            .iter()
+            .any(|location| location.name == name("Outer.Token.mk"))
+    );
+}
+
+#[test]
+fn navigation_inspections_rebuild_imported_origins_after_unsaved_source_edits() {
+    let main = name("Main");
+    let lib = name("Lib");
+    let source = "import Lib\ndef pending (x : Token) : Token := by\n  exact x";
+    let mut checker = session();
+    for library in [
+        "inductive Token where | mk",
+        "-- 😀\r\n\r\ninductive Token where | mk",
+        "\r\n-- 😀\r\ninductive Token where | mk",
+        "\u{feff}\r\n-- 😀\r\ninductive Token where | mk",
+    ] {
+        let navigation = checker
+            .inspect_with_navigation(
+                &[
+                    SourceModuleInput {
+                        name: &main,
+                        source: source.as_bytes(),
+                    },
+                    SourceModuleInput {
+                        name: &lib,
+                        source: library.as_bytes(),
+                    },
+                ],
+                &main,
+                source.find("exact x").unwrap(),
+                ObservationKind::Goals,
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let locations = navigation.locations.unwrap().into_complete().unwrap();
+        let token = locations
+            .iter()
+            .find(|location| location.name == name("Token"))
+            .unwrap();
+        assert_eq!(token.module, lib);
+        assert_eq!(token.range.start, library.find("inductive").unwrap());
+        assert_eq!(&library[token.selection_range.clone()], "Token");
+    }
 }
 
 #[test]

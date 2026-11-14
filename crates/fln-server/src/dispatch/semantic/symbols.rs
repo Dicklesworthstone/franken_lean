@@ -27,7 +27,7 @@ pub(super) fn payload_bytes(symbols: &[DocumentSymbol]) -> Result<usize, &'stati
 /// Sort the bounded set of endpoints, then visit the source once. Declaration
 /// ranges may overlap, so their ends need not follow their source-ordered starts.
 /// Keep endpoint identities to restore the provider's original result order.
-fn coordinates(
+pub(super) fn coordinates(
     text: &str,
     symbols: &[DocumentSymbol],
     max_source_bytes: usize,

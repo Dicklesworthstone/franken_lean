@@ -24,7 +24,7 @@ struct Limits {
     work_bytes: usize,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::dispatch) struct Position {
     pub(in crate::dispatch) line: u32,
     pub(in crate::dispatch) character: u32,

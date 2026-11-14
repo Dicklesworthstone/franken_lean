@@ -266,7 +266,8 @@ fn parse_header(source: &[u8]) -> Result<ParsedHeader, DefinitionParseError> {
             module: module_token,
         });
     }
-    let body_position = if module.is_none() && prelude.is_none() && imports.is_empty() {
+    let empty_header = module.is_none() && prelude.is_none() && imports.is_empty();
+    let body_position = if empty_header {
         start
     } else {
         next.as_ref().map_or_else(
@@ -278,7 +279,15 @@ fn parse_header(source: &[u8]) -> Result<ParsedHeader, DefinitionParseError> {
         header: SourceHeader {
             imports,
             import_specs,
-            body_start: view.to_original(body_position),
+            // With no header tokens this is the original slice boundary after
+            // an optional BOM, not the position of a normalized source byte.
+            // Mapping the LF of a leading CRLF would split that pair and leave
+            // an isolated CR in the header-only prefix used by editor queries.
+            body_start: if empty_header {
+                header_start
+            } else {
+                view.to_original(body_position)
+            },
             prelude: prelude.is_some(),
             module_system: module.is_some(),
             module_at: module.map(|index| view.to_original(tokens[index].extent.start())),
@@ -363,6 +372,32 @@ fn boundary(view: &SourceView, tokens: &[LexedToken], start: BytePos) -> BytePos
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_header_boundary_never_splits_a_leading_crlf() {
+        for source in [
+            "\r\n",
+            "\r\n\r\n-- 😀\r\ndef value := 1",
+            "\u{feff}\r\n",
+            "\u{feff}\r\n-- 😀\r\ndef value := 1",
+        ] {
+            let source = source.as_bytes();
+            let header = parse_source_header(source).unwrap();
+            let expected = if source.starts_with(b"\xef\xbb\xbf") {
+                3
+            } else {
+                0
+            };
+            assert_eq!(header.body_start, BytePos(expected));
+            assert!(parse_source_header(&source[..header.body_start.0]).is_ok());
+            assert!(partition(&source[header.body_start.0..]).is_ok());
+            assert!(parse_source_header_syntax(source).is_ok());
+        }
+        assert!(
+            parse_source_header(b"\r").is_err(),
+            "a genuine isolated CR still refuses"
+        );
+    }
 
     /// The header is lexed with builtin tokens only, so a body that opens with notation an
     /// import declares (`#guard_msgs`, `#reduce`) starts where those bytes do, as the pin's

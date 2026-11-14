@@ -178,9 +178,61 @@ pub(in crate::dispatch) fn reference(
     integer(object_field(raw, format.key()))
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::dispatch) enum GoToKind {
+    Declaration,
+    Definition,
+    Type,
+}
+
+pub(in crate::dispatch) fn go_to(
+    value: RawField<'_>,
+    format: WireFormat,
+) -> Result<(GoToKind, u64), &'static str> {
+    let raw = object(value)?;
+    let kind = match string(value, "kind")?.as_str() {
+        "declaration" => GoToKind::Declaration,
+        "definition" => GoToKind::Definition,
+        "type" => GoToKind::Type,
+        _ => return Err("unknown RPC navigation kind"),
+    };
+    Ok((kind, reference(object_field(raw, "info"), format)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn navigation_requires_a_pinned_kind_and_one_typed_reference() {
+        for format in [WireFormat::V0, WireFormat::V1] {
+            for kind in ["declaration", "definition", "type"] {
+                let value = format!(
+                    r#"{{"kind":"{kind}","info":{}}}"#,
+                    format.reference(u64::MAX)
+                );
+                let (_, reference) = go_to(RawField::Value(&value), format).unwrap();
+                assert_eq!(reference, u64::MAX);
+            }
+            for value in [
+                r#"{"kind":"implementation","info":{}}"#.to_owned(),
+                format!(
+                    r#"{{"kind":"definition","k\u0069nd":"type","info":{}}}"#,
+                    format.reference(1)
+                ),
+                format!(
+                    r#"{{"kind":"definition","info":{},"in\u0066o":{}}}"#,
+                    format.reference(1),
+                    format.reference(2)
+                ),
+                format!(r#"{{"kind":null,"info":{}}}"#, format.reference(1)),
+                r#"{"kind":"definition","info":null}"#.to_owned(),
+                "null".to_owned(),
+            ] {
+                assert!(go_to(RawField::Value(&value), format).is_err(), "{value}");
+            }
+        }
+    }
+
     #[test]
     fn identifiers_preserve_all_bits_and_reject_numbers_or_ambiguous_fields() {
         let value = r#"{"uri":"x","sessionId":"18446744073709551615"}"#;

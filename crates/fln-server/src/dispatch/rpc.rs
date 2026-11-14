@@ -162,7 +162,7 @@ impl Session {
         }
     }
 
-    fn popup(&self, id: u64) -> Result<String> {
+    fn expression(&self, id: u64) -> Result<(&str, &ExpressionInfo)> {
         let reference = self
             .references
             .get(&id)
@@ -195,7 +195,30 @@ impl Session {
                 (expression, &subexpression.info)
             }
         };
+        Ok((expression, info))
+    }
+
+    fn popup(&self, id: u64) -> Result<String> {
+        let (expression, info) = self.expression(id)?;
         Ok(popup_json(expression, info))
+    }
+
+    fn go_to(&self, id: u64, kind: params::GoToKind) -> Result<String> {
+        let (_, info) = self.expression(id)?;
+        let locations = match kind {
+            params::GoToKind::Declaration | params::GoToKind::Definition => &info.definition,
+            params::GoToKind::Type => &info.type_definition,
+        }
+        .as_ref()
+        .ok_or_else(|| failed("source navigation is unavailable for this retained expression"))?;
+        Ok(format!(
+            "[{}]",
+            locations
+                .iter()
+                .map(semantic::NavigationLocation::wire)
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
     }
 }
 
@@ -359,6 +382,17 @@ impl Sessions {
                 .popup(reference)?;
             if result.len() > MAX_RESPONSE_BYTES {
                 return Err(failed("RPC popup exceeds its wire budget"));
+            }
+            self.session(call.session, &call.uri, Instant::now())?;
+            return Ok(result);
+        }
+        if call.method == "Lean.Widget.getGoToLocation" {
+            let (kind, reference) = params::go_to(call.params, self.format).map_err(invalid)?;
+            let result = self
+                .session(call.session, &call.uri, Instant::now())?
+                .go_to(reference, kind)?;
+            if result.len() > MAX_RESPONSE_BYTES {
+                return Err(failed("RPC navigation exceeds its wire budget"));
             }
             self.session(call.session, &call.uri, Instant::now())?;
             return Ok(result);

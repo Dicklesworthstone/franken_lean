@@ -15,7 +15,9 @@ pub use fln_elab::source::scope::SourceScope;
 use modules::{
     SourceModuleCheckError, SourceModuleCheckLimits, SourceModuleSession, SourceModuleSessionCheck,
 };
-pub use navigation::{DefinitionLookupLimits, SourceDefinition};
+pub use navigation::{
+    DefinitionLookupLimits, SourceDeclarationLocation, SourceDefinition, SourceNavigationInspection,
+};
 pub use symbols::{DocumentSymbolLimits, SourceDocumentSymbol};
 
 /// The prefix is checked; the observation is provisional elaboration state.

@@ -221,6 +221,7 @@ pub(super) enum RpcProcedure {
     Highlight,
     Widgets,
     InfoPopup,
+    GoToLocation,
 }
 
 impl RpcProcedure {
@@ -232,6 +233,7 @@ impl RpcProcedure {
             "Lean.Widget.highlightMatches" => Some(Self::Highlight),
             "Lean.Widget.getWidgets" => Some(Self::Widgets),
             "Lean.Widget.InteractiveDiagnostics.infoToInteractive" => Some(Self::InfoPopup),
+            "Lean.Widget.getGoToLocation" => Some(Self::GoToLocation),
             _ => None,
         }
     }
@@ -292,6 +294,27 @@ impl RpcProcedure {
                         value => matches!(decoded_string(value), DecodedField::Valid(_)),
                     }
             }
+            Self::GoToLocation => array_elements(value, 256).is_some_and(|locations| {
+                locations.into_iter().all(|location| {
+                    let location = RawField::Value(location);
+                    if !object_has_only_keys(location, &[
+                        "targetUri", "targetRange", "targetSelectionRange", "originSelectionRange"
+                    ]) || !plain_string_member(location, "targetUri") {
+                        return false;
+                    }
+                    let Some((start, end)) = range_points(object_member(location, "targetRange")) else {
+                        return false;
+                    };
+                    let Some((selection_start, selection_end)) = range_points(object_member(location, "targetSelectionRange")) else {
+                        return false;
+                    };
+                    start < end && start <= selection_start && selection_start < selection_end && selection_end <= end
+                        && match object_member(location, "originSelectionRange") {
+                            RawField::Missing | RawField::Value("null") => true,
+                            range => matches!(range_points(range), Some((start, end)) if start <= end),
+                        }
+                })
+            }),
             Self::Widgets => {
                 if !object_has_only_keys(root, &["widgets"]) {
                     return false;
