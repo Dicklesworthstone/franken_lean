@@ -25,6 +25,26 @@ pub(crate) enum ProofConversionOutcome {
     Complete { equal: bool, polls: u64 },
     Halted(Box<InferenceOutcome>),
 }
+#[derive(Default, Debug)]
+struct ProbeProfile {
+    runs: u64,
+    reserve_steps: u64,
+    work_pops: u64,
+    taken_skips: u64,
+    congruence_attempts: u64,
+    congruence_fails: u64,
+    proof_type_calls: u64,
+    proof_type_hits: u64,
+    equal_calls: u64,
+    equal_hits: u64,
+    whnf_calls: u64,
+    whnf_changed: u64,
+    apply_peels: u64,
+    k_checks: u64,
+    local_reuses: u64,
+    local_fresh: u64,
+}
+
 struct Probe<'a> {
     budget: InferenceBudget,
     steps: u64,
@@ -41,6 +61,7 @@ struct Probe<'a> {
     answers: PairAnswers,
     /// The local each binder and eta task opened (`OpenedLocals`).
     opened: OpenedLocals,
+    profile: ProbeProfile,
 }
 /// The local each binder and eta task of one run opened, by the task's key.
 ///
@@ -362,12 +383,14 @@ impl Probe<'_> {
         let fingerprint = PairSet::fingerprint(left, right);
         let (name, local) = match self.opened.get(fingerprint, kind, left, right) {
             Some(name) if context.local(name).is_none() => {
+                self.profile.local_reuses += 1;
                 let name = name.clone();
                 self.tick()?;
                 let local = self.free_local(&name)?;
                 (name, local)
             }
             _ => {
+                self.profile.local_fresh += 1;
                 let (name, local) = self.local()?;
                 self.opened
                     .insert(fingerprint, kind, left, right, name.clone());
@@ -409,6 +432,7 @@ impl Probe<'_> {
         term: &WireExpr,
         context: &InferenceContext,
     ) -> Result<Option<WireExpr>> {
+        self.profile.whnf_calls += 1;
         let budget = self.budget.whnf;
         let result =
             crate::whnf::whnf_comparand_with(term, context.reduction(), budget, &mut || {
@@ -439,8 +463,10 @@ impl Probe<'_> {
         right: &WireExpr,
         context: &InferenceContext,
     ) -> Result<Option<bool>> {
+        self.profile.equal_calls += 1;
         let fingerprint = PairSet::fingerprint(left, right);
         if let Some(answer) = self.answers.get(fingerprint, left, right) {
+            self.profile.equal_hits += 1;
             return Ok(answer);
         }
         let budget = self.budget.defeq;
@@ -520,6 +546,7 @@ impl Probe<'_> {
         term: &WireExpr,
         context: &InferenceContext,
     ) -> Result<Option<WireExpr>> {
+        self.profile.proof_type_calls += 1;
         // A type constructor cannot itself be a proof. Avoid expensive failed
         // queries while descending the declaration's outer function telescope.
         if matches!(
@@ -542,10 +569,14 @@ impl Probe<'_> {
         };
         self.tick()?;
         let normalized = normalize(&WireLevel::from_parts(sort.levels().to_vec(), *level));
-        Ok(normalized
+        let hit = normalized
             .ok()
             .filter(|n| matches!(n.nodes().get(n.root().index()), Some(NormalNode::Zero)))
-            .map(|_| type_))
+            .map(|_| type_);
+        if hit.is_some() {
+            self.profile.proof_type_hits += 1;
+        }
+        Ok(hit)
     }
     /// KR-315, the pin's `is_def_eq_unit_like` (type_checker.cpp:1073): when
     /// `left`'s type normalizes to a non-recursive, index-free, one-constructor
@@ -1173,6 +1204,8 @@ impl Probe<'_> {
                 context: InferenceContext,
             },
         }
+        self.profile.runs += 1;
+        let before_reserve = self.steps;
         self.reserve(left)?;
         self.reserve(right)?;
         for local in context.locals() {
@@ -1183,6 +1216,7 @@ impl Probe<'_> {
                 self.reserve(value)?;
             }
         }
+        self.profile.reserve_steps += self.steps.saturating_sub(before_reserve);
         let mut work = vec![Work::Pair(left.clone(), right.clone(), context.clone())];
         let mut skip_untyped = root_deferred;
         // Every task is an obligation of one conjunction: the run succeeds only
@@ -1224,6 +1258,7 @@ impl Probe<'_> {
                     }) = work.pop()
                     {
                         attempts -= 1;
+                        self.profile.congruence_fails += 1;
                         for entry in trail.drain(mark..) {
                             taken.remove(&entry);
                         }
@@ -1234,6 +1269,7 @@ impl Probe<'_> {
                 }};
             }
             self.tick()?;
+            self.profile.work_pops += 1;
             let key = match &task {
                 Work::Pair(left, right, _) => Some((Taken::Pair, left, right)),
                 Work::Binders(left, right, ..) => Some((Taken::Binders, left, right)),
@@ -1248,6 +1284,7 @@ impl Probe<'_> {
             if let Some((kind, a, b)) = key {
                 let entry = (kind, a.clone(), b.clone());
                 if taken.contains(&entry) {
+                    self.profile.taken_skips += 1;
                     continue;
                 }
                 if attempts > 0 {
@@ -1384,6 +1421,7 @@ impl Probe<'_> {
                     skip_untyped: skip,
                     trail: trail.len(),
                 });
+                self.profile.congruence_attempts += 1;
                 attempts += 1;
                 work.extend(obligations.into_iter().rev());
                 continue;
@@ -1421,6 +1459,7 @@ impl Probe<'_> {
             };
             // A changed head may expose ordinary conversion or proof evidence.
             if l != left || r != right {
+                self.profile.whnf_changed += 1;
                 work.push(Work::Pair(l, r, context));
                 continue;
             }
@@ -1496,6 +1535,7 @@ impl Probe<'_> {
                     continue 'work;
                 }
             }
+            self.profile.k_checks += 1;
             match (l.node(l.root()), r.node(r.root())) {
                 (
                     Some(ExprNode::Apply {
@@ -1507,6 +1547,7 @@ impl Probe<'_> {
                         argument: ra,
                     }),
                 ) => {
+                    self.profile.apply_peels += 1;
                     let lf = self.piece(&l, *lf)?;
                     let rf = self.piece(&r, *rf)?;
                     let la = self.piece(&l, *la)?;
@@ -1721,8 +1762,25 @@ pub(crate) fn proof_conversion_with(
         incongruent: PairSet::default(),
         answers: PairAnswers::default(),
         opened: OpenedLocals::default(),
+        profile: ProbeProfile::default(),
     };
-    match probe.run(left, right, context, true) {
+    let result = probe.run(left, right, context, true);
+    if std::env::var_os("FLN_CHECKER_PROFILE").is_some()
+        && (probe.steps >= 5_000 || result.is_err())
+    {
+        eprintln!(
+            "PROOF_CONV_PROFILE steps={} polls={} budget={} ok={:?} left_nodes={} right_nodes={} locals={} {:?}",
+            probe.steps,
+            probe.polls,
+            probe.budget.max_steps,
+            result.as_ref().ok(),
+            left.nodes().len(),
+            right.nodes().len(),
+            context.locals().len(),
+            probe.profile,
+        );
+    }
+    match result {
         Ok(equal) => ProofConversionOutcome::Complete {
             equal,
             polls: probe.steps,
