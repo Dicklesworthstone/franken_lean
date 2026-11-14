@@ -23,7 +23,7 @@ mod reducibility;
 mod simp;
 mod structures;
 
-pub use compiler::CompilerSignature;
+pub use compiler::{CompilerData, CompilerSignature};
 
 #[derive(Debug, Clone, Default)]
 pub struct SourceMetadata {
@@ -80,6 +80,10 @@ pub struct SourceMetadata {
     /// compilation. Empty on declaration-only builds. These are serialized data,
     /// not evidence of admission, termination, or an executable implementation.
     pub compiler_signatures: Vec<CompilerSignature>,
+    /// Compiler caches for owned closed nonrecursive data with Nat/String
+    /// fields. These describe constructor layouts, not executable function
+    /// implementations, and are useful even on declaration-only builds.
+    pub compiler_data: Vec<CompilerData>,
 }
 
 /// Encode source journals and the namespaces implied by local declarations.
@@ -159,6 +163,9 @@ impl Encoder {
         }
         if !metadata.compiler_signatures.is_empty() {
             blocks.extend(self.compiler_blocks(&metadata.compiler_signatures)?);
+        }
+        if !metadata.compiler_data.is_empty() {
+            blocks.extend(self.compiler_data_blocks(&metadata.compiler_data)?);
         }
         if !metadata.protected.is_empty() {
             blocks.push(self.tagged_names_block(

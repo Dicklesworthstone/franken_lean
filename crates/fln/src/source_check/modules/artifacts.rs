@@ -1,7 +1,7 @@
 //! Per-module, checked declaration products for the native Lake `.olean` facet.
 use super::*;
 use fln_olean::write::source::{
-    CompilerSignature, SourceMetadata, encode_module_with_source_metadata,
+    CompilerData, CompilerSignature, SourceMetadata, encode_module_with_source_metadata,
 };
 use std::sync::Arc;
 
@@ -794,6 +794,21 @@ impl ArtifactData {
                         })
                         .collect(),
                 });
+        }
+        // Compiler data caches belong to the declaration's defining module,
+        // just like the pin's compileInductives entries. Project only constants
+        // in this independently checked public/private view; imported or sibling
+        // declarations never acquire local layout ownership here.
+        for constant in &constants {
+            if let ConstantInfo::Induct(inductive) = constant
+                && let Some(data) = CompilerData::from_inductive(
+                    inductive,
+                    |name| checked.find(name),
+                    |work| meter.work(work),
+                )?
+            {
+                metadata.compiler_data.push(data);
+            }
         }
         Ok(Self {
             name: name.clone(),

@@ -8,6 +8,9 @@ use super::*;
 use crate::ir::{IrDecl, IrParam, IrType};
 use crate::ir_format as ir;
 
+mod data;
+pub use data::CompilerData;
+
 /// A compiled, monomorphic interface. The caller owns its relationship to the
 /// checked source and executable IR. `safe = false` conservatively withholds the
 /// compiler's termination assumption; setting it requires separate provenance.
