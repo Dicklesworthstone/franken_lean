@@ -11,6 +11,18 @@ use fln_env::constants::{ConstantInfo, DefinitionSafety};
 const COUNT: &str = "partial def count (n : Nat) : Nat := \
     if n == 0 then 7 else count (n - 1)\n";
 
+const ENUM_RECURSION: &str = r#"inductive Choice where | first | second | third
+inductive Single where | only
+partial def carryChoice (n : Nat) (value : Choice) : Choice :=
+  if n == 0 then value else carryChoice (n - 1) value
+partial def resetChoice (n : Nat) (value : Choice) : Choice :=
+  if n == 0 then value else resetChoice (n - 1) Choice.third
+partial def dropChoice (n : Nat) (ignored : Choice) : Nat :=
+  if n == 0 then 7 else dropChoice (n - 1) ignored
+partial def dropSingle (n : Nat) (ignored : Single) : Nat :=
+  if n == 0 then 7 else dropSingle (n - 1) ignored
+"#;
+
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }
@@ -205,6 +217,105 @@ partial def stringBool (s : String) : Bool := stringBool s
         "compilation exposed a partial implementation"
     );
     assert_eq!(engine.environment(), &before);
+}
+
+#[test]
+fn source_recursion_exports_checked_enum_carriers_and_reduced_entries() {
+    let engine = checked(ENUM_RECURSION);
+    let before = engine.environment().clone();
+    for (label, argument, returned, reduced) in [
+        ("carryChoice", IrType::UInt8, IrType::UInt8, false),
+        ("resetChoice", IrType::UInt8, IrType::UInt8, false),
+        ("dropChoice", IrType::UInt8, IrType::TObject, true),
+        ("dropSingle", IrType::Tagged, IrType::TObject, true),
+    ] {
+        let module = export(&engine, label)
+            .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+            .into_complete()
+            .unwrap();
+        let entry = name(label);
+        let Some(IrDecl::Function { params, result, .. }) =
+            module.decls.iter().find(|decl| decl.name() == &entry)
+        else {
+            panic!("missing recursive enum export {label}")
+        };
+        assert_eq!(
+            params
+                .iter()
+                .map(|param| param.ty.clone())
+                .collect::<Vec<_>>(),
+            [IrType::TObject, argument],
+            "{label}"
+        );
+        assert_eq!(*result, returned, "{label}");
+        let helper = Name::str(entry, "_redArg");
+        let actual = module.decls.iter().find_map(|decl| match decl {
+            IrDecl::Function {
+                name,
+                params,
+                result,
+                ..
+            } if name == &helper => Some((
+                params
+                    .iter()
+                    .map(|param| param.ty.clone())
+                    .collect::<Vec<_>>(),
+                result.clone(),
+            )),
+            _ => None,
+        });
+        assert_eq!(
+            actual,
+            reduced.then(|| (vec![IrType::TObject], IrType::TObject)),
+            "{label}"
+        );
+        assert!(
+            module
+                .decls
+                .iter()
+                .all(|decl| { !decl.name().to_display_string().contains("_unsafe_rec") })
+        );
+        assert_eq!(engine.environment(), &before);
+    }
+}
+
+#[test]
+fn recursive_enum_exports_refuse_payloads_and_constructor_replacements() {
+    use fln_elab::externs::ExternEntry;
+    let engine = checked(&format!(
+        "{ENUM_RECURSION}\
+         inductive Payload where | wrap (n : Nat)\n\
+         partial def carryPayload (n : Nat) (value : Payload) : Payload :=\n\
+           if n == 0 then value else carryPayload (n - 1) value\n\
+         def replacement : Choice := Choice.first\n"
+    ));
+    let before = engine.environment().clone();
+    assert_unsupported(&engine, "carryPayload");
+    let constructor = name("Choice.third");
+    let external = fln_elab::externs::register(
+        engine.environment(),
+        &constructor,
+        vec![ExternEntry::Standard {
+            backend: Name::anonymous(),
+            symbol: "unbound_enum_constructor".into(),
+        }],
+    )
+    .unwrap();
+    assert_unsupported(&Engine::from_environment(external), "resetChoice");
+    let replacement = fln_elab::implemented_by::register(
+        engine.environment(),
+        &constructor,
+        &name("replacement"),
+    )
+    .unwrap();
+    assert_unsupported(&Engine::from_environment(replacement), "resetChoice");
+    assert_eq!(engine.environment(), &before);
+    assert!(
+        export(&engine, "resetChoice")
+            .unwrap()
+            .into_complete()
+            .is_ok()
+    );
 }
 
 #[test]

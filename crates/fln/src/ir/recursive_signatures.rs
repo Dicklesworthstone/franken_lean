@@ -57,6 +57,51 @@ fn text(value: &Expr) -> Option<&str> {
 }
 
 impl Analysis<'_, '_> {
+    fn enum_constructor(&mut self, expression: &Expr) -> Result<bool> {
+        let ExprNode::Const { name, levels } = expression.node() else {
+            return Ok(false);
+        };
+        if !levels.is_empty() {
+            return Ok(false);
+        }
+        self.checks.meter.charge(1)?;
+        let Some(ConstantInfo::Ctor(constructor)) = self.checks.environment.find(name) else {
+            return Ok(false);
+        };
+        // A constructor literal has no source-slot uses only after its entire
+        // family passes the same fieldless layout checks as the exported type.
+        if source_enum_constructors(
+            &constructor.induct,
+            self.checks.environment,
+            self.checks.meter,
+        )?
+        .is_none()
+        {
+            return Ok(false);
+        }
+        self.checks.meter.charge(1)?;
+        let Some(ConstantInfo::Induct(family)) = self.checks.environment.find(&constructor.induct)
+        else {
+            return Ok(false);
+        };
+        if family.ctors.get(constructor.cidx as usize) != Some(name) {
+            return Err(unsupported("recursive source enum constructor"));
+        }
+        self.checks.metadata()?;
+        if self.checks.externs.as_ref().unwrap().get(name).is_some()
+            || self
+                .checks
+                .replacements
+                .as_ref()
+                .unwrap()
+                .get(name)
+                .is_some()
+        {
+            return Err(unsupported("recursive source enum constructor replacement"));
+        }
+        Ok(true)
+    }
+
     fn spine(&mut self, expression: &Expr) -> Result<(Expr, Vec<Expr>)> {
         let mut head = expression;
         let mut arguments = Vec::new();
@@ -448,7 +493,9 @@ impl Analysis<'_, '_> {
                 .ok_or_else(|| unsupported("open recursive source body")),
             ExprNode::Lit { .. } => Ok(expression.clone()),
             ExprNode::Const { .. }
-                if named(expression, "Bool.true") || named(expression, "Bool.false") =>
+                if named(expression, "Bool.true")
+                    || named(expression, "Bool.false")
+                    || self.enum_constructor(expression)? =>
             {
                 Ok(expression.clone())
             }

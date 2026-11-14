@@ -67,6 +67,8 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
     let package = Package::new(CONFIG);
     let source = concat!(
         "module\nprelude\npublic import Init.Notation\n",
+        "public inductive Lib.Choice where | first | second | third\n",
+        "public inductive Lib.Single where | only\n",
         "public def Lib.structuralCount : Nat → Nat\n",
         "  | 0 => 42\n",
         "  | Nat.succ n => Lib.structuralCount n\n",
@@ -118,6 +120,14 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
         "public partial def Lib.identityBool (n : Nat) (b : Bool) : Nat :=\n",
         "  if n == 0 then 7 else Lib.identityBool (n - 1) (if b then true else b)\n",
         "public partial def Lib.spinBoth (a b : Nat) : Nat := Lib.spinBoth a b\n",
+        "public partial def Lib.carryChoice (n : Nat) (value : Lib.Choice) : Lib.Choice :=\n",
+        "  if n == 0 then value else Lib.carryChoice (n - 1) value\n",
+        "public partial def Lib.resetChoice (n : Nat) (value : Lib.Choice) : Lib.Choice :=\n",
+        "  if n == 0 then value else Lib.resetChoice (n - 1) Lib.Choice.third\n",
+        "public partial def Lib.dropChoice (n : Nat) (ignored : Lib.Choice) : Nat :=\n",
+        "  if n == 0 then 7 else Lib.dropChoice (n - 1) ignored\n",
+        "public partial def Lib.dropSingle (n : Nat) (ignored : Lib.Single) : Nat :=\n",
+        "  if n == 0 then 7 else Lib.dropSingle (n - 1) ignored\n",
     );
     package.write("Lib/Top.lean", source);
     let binary = package.0.join("native-bin/lake");
@@ -182,6 +192,10 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
         "Lib.branchFact",
         "Lib.identityBool",
         "Lib.spinBoth",
+        "Lib.carryChoice",
+        "Lib.resetChoice",
+        "Lib.dropChoice",
+        "Lib.dropSingle",
     ] {
         assert!(
             ir.decls
@@ -250,6 +264,10 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
         "Lib.branchFact",
         "Lib.identityBool",
         "Lib.spinBoth",
+        "Lib.carryChoice",
+        "Lib.resetChoice",
+        "Lib.dropChoice",
+        "Lib.dropSingle",
     ] {
         assert!(signature(&reference_ir, label).is_some(), "{label}");
         for suffix in ["", "._redArg", "._boxed", "._redArg._boxed"] {
@@ -389,6 +407,47 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
         "42\n42\n42\n0\n14\n42\n42\n42\n42\n7\n7\n7\n9\n9\n9\ndone\ndone\ntrue\ntrue\n23\n23\nflag\nflag\ntrue\ntrue\n42\n7\n7\n7\n7\n7\n42\n11\nfalse\ntrue\n7\n7\n7\n7\n7\nfalse\ntrue\n"
     );
 
+    // Resolve executable entries dynamically so logical-body inlining cannot
+    // hide a broken enum result, source wrapper, or reduced calling convention.
+    // The singleton's tagged carrier differs from a multi-constructor UInt8.
+    package.write("RuntimeEnumRecursive.lean", concat!(
+        "import Lean\nimport Lib.Top\n",
+        "def ordinal : Lib.Choice → Nat\n",
+        "  | .first => 0 | .second => 1 | .third => 2\n",
+        "unsafe def main : IO Unit := do\n",
+        "  Lean.enableInitializersExecution\n",
+        "  let env ← Lean.importModules #[{ module := `Lib.Top, isMeta := true }] {} (loadExts := true)\n",
+        "  for entry in #[`Lib.carryChoice, `Lib.resetChoice] do\n",
+        "    match env.evalConst (Nat → Lib.Choice → Lib.Choice) {} entry (checkMeta := false) with\n",
+        "    | .ok run =>\n",
+        "      for n in [0, 12] do\n",
+        "        for value in [Lib.Choice.first, Lib.Choice.second, Lib.Choice.third] do\n",
+        "          IO.println (ordinal (run n value))\n",
+        "    | .error message => throw (IO.userError message)\n",
+        "  match env.evalConst (Nat → Lib.Choice → Nat) {} `Lib.dropChoice (checkMeta := false) with\n",
+        "  | .ok run => IO.println (run 12 Lib.Choice.third)\n",
+        "  | .error message => throw (IO.userError message)\n",
+        "  match env.evalConst (Nat → Lib.Single → Nat) {} `Lib.dropSingle (checkMeta := false) with\n",
+        "  | .ok run => IO.println (run 12 Lib.Single.only)\n",
+        "  | .error message => throw (IO.userError message)\n",
+        "  for entry in #[`Lib.dropChoice._redArg, `Lib.dropSingle._redArg] do\n",
+        "    match env.evalConst (Nat → Nat) {} entry (checkMeta := false) with\n",
+        "    | .ok run => IO.println (run 12)\n",
+        "    | .error message => throw (IO.userError message)\n",
+    ));
+    let enums = Command::new(&reference)
+        .args(["--run", "RuntimeEnumRecursive.lean"])
+        .current_dir(&package.0)
+        .env("LEAN_PATH", &search)
+        .output()
+        .unwrap();
+    assert!(enums.status.success(), "{enums:?}");
+    assert!(enums.stderr.is_empty(), "{enums:?}");
+    assert_eq!(
+        std::str::from_utf8(&enums.stdout).unwrap(),
+        "0\n1\n2\n0\n1\n2\n0\n1\n2\n2\n2\n2\n7\n7\n7\n7\n"
+    );
+
     if let Some(partition) = emitted_ir_partition() {
         let run = |entry: &str, argument: u64, fuel: Option<u64>| {
             let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
@@ -479,7 +538,11 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
         ),
         (
             "public partial def Lib.higherOrder (f : Nat → Nat) (n : Nat) : Nat := Lib.higherOrder f n\n",
-            "recursive source exports require closed Nat/String/Bool signatures",
+            "recursive source exports require closed primitive or fieldless-enum signatures",
+        ),
+        (
+            "public inductive Lib.Payload where | wrap (n : Nat)\npublic partial def Lib.payload (n : Nat) (value : Lib.Payload) : Lib.Payload := if n == 0 then value else Lib.payload (n - 1) value\n",
+            "source export carrier",
         ),
         (
             "public partial def Lib.unknownOperation (n ignored : Nat) : Nat := if n == 0 then 7 else Lib.unknownOperation (n - 1) (ignored % 2)\n",

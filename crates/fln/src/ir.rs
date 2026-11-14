@@ -2556,22 +2556,25 @@ pub(crate) fn is_checked_recursive_companion(
 /// The ordinary source exporter owns boxing and the result ABI.
 fn recursive_source_wrapper(
     definition: &mut fln_env::constants::DefinitionVal,
+    environment: &crate::Environment,
     meter: &mut Budget,
 ) -> Result<usize> {
     use fln_core::expr::{Expr, ExprNode};
-    let carriers = [
-        Name::from_components(["Nat"]),
-        Name::from_components(["String"]),
-        Name::from_components(["Bool"]),
-    ];
-    let scalar = |expression: &Expr| {
-        matches!(expression.node(), ExprNode::Const { name, levels }
-            if levels.is_empty() && carriers.contains(name))
+    const SIGNATURE: &str =
+        "recursive source exports require closed primitive or fieldless-enum signatures";
+    let scalar = |expression: &Expr, meter: &mut Budget| -> Result<()> {
+        let expression = source_without_metadata(expression, meter)?;
+        if !matches!(expression.node(), ExprNode::Const { levels, .. } if levels.is_empty()) {
+            return Err(unsupported(SIGNATURE));
+        }
+        // Use the ordinary exporter's checked enum layout. A closed name alone
+        // is not enough: payloads, proof fields and indexed families still need
+        // a different source ABI and must not enter through a recursive wrapper.
+        let mut enum_constructors = 0;
+        source_carrier(expression, environment, &mut enum_constructors, meter).map(|_| ())
     };
     if !definition.base.level_params.is_empty() {
-        return Err(unsupported(
-            "recursive source exports require closed Nat/String/Bool signatures",
-        ));
+        return Err(unsupported(SIGNATURE));
     }
     let mut telescope = Vec::new();
     let mut ty = &definition.base.type_;
@@ -2587,22 +2590,17 @@ fn recursive_source_wrapper(
         else {
             break;
         };
-        if !scalar(source_without_metadata(binder_type, meter)?) {
-            return Err(unsupported(
-                "recursive source exports require closed Nat/String/Bool signatures",
-            ));
-        }
+        scalar(binder_type, meter)?;
         telescope
             .try_reserve(1)
             .map_err(|_| CompileError::Allocation)?;
         telescope.push((binder_name.clone(), binder_type.clone(), *binder_info));
         ty = body;
     }
-    if telescope.is_empty() || !scalar(ty) {
-        return Err(unsupported(
-            "recursive source exports require closed Nat/String/Bool signatures",
-        ));
+    if telescope.is_empty() {
+        return Err(unsupported(SIGNATURE));
     }
+    scalar(ty, meter)?;
     let arity = telescope.len();
     meter.charge(arity.saturating_mul(3).saturating_add(1))?;
     let mut value = Expr::const_(definition.base.name.clone(), Vec::new());
@@ -2746,7 +2744,7 @@ pub(crate) fn compile_checked_source_definition(
                 "recursive source companion with an executable replacement or extern",
             )));
         }
-        let arity = recursive_source_wrapper(definition.to_mut(), &mut meter)
+        let arity = recursive_source_wrapper(definition.to_mut(), engine.environment(), &mut meter)
             .map_err(DefinitionCompileError::Ir)?;
         // A unary function has no smaller nonempty calling convention. With
         // several slots, the wrapper's syntactic uses are not the companion's:
