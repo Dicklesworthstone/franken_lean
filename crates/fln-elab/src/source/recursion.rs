@@ -24,8 +24,19 @@ pub(super) use well_founded::Executable as WellFoundedExecutable;
 pub(super) use well_founded::State as WellFounded;
 pub(in crate::source) use well_founded::decreasing_tactic_expansion;
 pub(in crate::source) use well_founded::mutual::{
-    MemberHint, MutualMember, Plan as WellFoundedPlan, strongly_connected,
+    MemberHint, MutualMember, Plan as WellFoundedPlan, Probe as MutualMeasureRequest,
+    strongly_connected,
 };
+
+/// One checked entry of the mutual GuessLex call matrix. Unknown is a completed
+/// failed comparison, distinct from an entry the lazy search has not inspected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutualMeasureRelation {
+    Eq,
+    Lt,
+    Le,
+    Unknown,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecursionError {
@@ -68,9 +79,8 @@ pub enum RecursionError {
     /// Internal result of a discarded mutual GuessLex candidate. No declaration
     /// is produced until all calls in the component have selected one measure.
     MutualMeasureProbe {
-        strict: usize,
+        relations: Vec<(usize, MutualMeasureRelation)>,
         total: usize,
-        unknown: bool,
         complex: bool,
     },
     /// A structurally recursive SCC outside the admitted shared-family construction.

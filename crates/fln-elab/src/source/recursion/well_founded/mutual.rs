@@ -87,6 +87,15 @@ pub(in crate::source) struct Plan {
     domains: Vec<Expr>,
 }
 
+/// The unvisited calls needed by one lazy GuessLex candidate. An initial pass
+/// also discovers the member's complete call count and complex-measure boundary.
+#[derive(Clone)]
+pub(in crate::source) enum Probe {
+    All,
+    /// Original call indices, in increasing order without duplicates.
+    Calls(Vec<usize>),
+}
+
 /// The member of a planned group being elaborated in a context, and, once its
 /// body succeeds, its fixpoint alternative `fun fixed => fun x a => body`.
 #[derive(Clone)]
@@ -97,7 +106,7 @@ pub(in crate::source) struct MutualMember {
     piece: Option<Expr>,
     /// A discarded GuessLex pass classifies each call without manufacturing a
     /// proof of a weak comparison or publishing an unfinished fixpoint.
-    probing: bool,
+    probe: Option<Probe>,
 }
 
 impl MutualMember {
@@ -105,14 +114,14 @@ impl MutualMember {
         plan: Arc<Plan>,
         index: usize,
         captures: Vec<LocalDecl>,
-        probing: bool,
+        probe: Option<Probe>,
     ) -> Self {
         Self {
             plan,
             index,
             captures,
             piece: None,
-            probing,
+            probe,
         }
     }
 
@@ -435,6 +444,37 @@ impl Context {
                 return Err(error(RecursionError::WellFoundedMeasureRequired));
             }
             Ok(measures)
+        })();
+        self.txn.lctx = saved;
+        result
+    }
+
+    /// Reopen the selected coordinates in one member's own telescope and use
+    /// the same right-nested product as single-function GuessLex. The shared
+    /// planner subsequently selects and checks the product's actual relation.
+    pub(in crate::source) fn mutual_lexicographic_measure(
+        &mut self,
+        type_: &Expr,
+        arity: usize,
+        measures: &[Expr],
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let saved = self.txn.lctx.clone();
+        let result = (|| {
+            self.txn.lctx = LocalContext::new();
+            let parameters = self.open_mutual_fixed(type_, arity)?;
+            let arguments: Vec<_> = parameters
+                .iter()
+                .map(|parameter| Expr::fvar(parameter.id.clone()))
+                .collect();
+            let mut coordinates = Vec::new();
+            for measure in measures {
+                self.tick()?;
+                let value = self.open_mutual_closed(measure, &arguments)?;
+                let type_ = self.known_type(&value)?.ok_or_else(scope)?;
+                coordinates.push(Typed { value, type_ });
+            }
+            let tuple = self.lexicographic_measure(&coordinates)?;
+            self.close_mutual_fixed(&tuple.value, &parameters, true)
         })();
         self.txn.lctx = saved;
         result
@@ -1515,37 +1555,50 @@ impl Context {
                     }
                 };
                 let prepared = self.lower_pattern_matrices(proof)?;
-                if member.probing {
-                    let mut strict = 0;
-                    let mut unknown = false;
+                if let Some(probe) = &member.probe {
+                    let mut relations = Vec::new();
                     let varying: Vec<_> = (plan.fixed..parameters.len()).collect();
                     let complex = self.complex_measure_possible(&goals, &parameters, &varying)?;
-                    for goal in &goals {
+                    let mut requested = match probe {
+                        Probe::All => None,
+                        Probe::Calls(calls) => Some(calls.iter().copied().peekable()),
+                    };
+                    for (index, goal) in goals.iter().enumerate() {
                         self.tick()?;
-                        match self.classify_call(&prepared, goal, &goal.target, false)? {
-                            Ok(CallRelation::Lt) => strict += 1,
-                            Ok(CallRelation::Eq | CallRelation::Le) => {}
-                            Err(_) => {
-                                unknown = true;
+                        if let Some(calls) = &mut requested {
+                            let Some(&next) = calls.peek() else {
                                 break;
+                            };
+                            if index != next {
+                                continue;
                             }
+                            calls.next();
+                        }
+                        let relation =
+                            match self.classify_call(&prepared, goal, &goal.target, false)? {
+                                Ok(CallRelation::Eq) => MutualMeasureRelation::Eq,
+                                Ok(CallRelation::Lt) => MutualMeasureRelation::Lt,
+                                Ok(CallRelation::Le) => MutualMeasureRelation::Le,
+                                Err(_) => MutualMeasureRelation::Unknown,
+                            };
+                        relations.push((index, relation));
+                        if relation == MutualMeasureRelation::Unknown {
+                            break;
                         }
                     }
                     return Err(error(RecursionError::MutualMeasureProbe {
-                        strict,
+                        relations,
                         total: goals.len(),
-                        unknown,
                         complex,
                     }));
                 }
                 self.prove_decreasing_goals(&prepared, goals, hint.decreasing.is_some())?;
                 self.assign_decreasing_transports(obligations)?;
             }
-            if member.probing {
+            if member.probe.is_some() {
                 return Err(error(RecursionError::MutualMeasureProbe {
-                    strict: 0,
+                    relations: Vec::new(),
                     total: 0,
-                    unknown: false,
                     complex: false,
                 }));
             }

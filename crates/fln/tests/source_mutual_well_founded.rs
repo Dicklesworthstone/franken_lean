@@ -941,6 +941,95 @@ end
 }
 
 #[test]
+fn inferred_mutual_lexicographic_measures_allow_resets_and_reordered_arguments() {
+    let uniform = r#"mutual
+def inferLexLeft (n m : Nat) : Nat :=
+  if hm : 0 < m then inferLexRight n (m - 1) + 1
+  else if hn : 0 < n then inferLexRight (n - 1) 2 + 1 else 0
+def inferLexRight (n m : Nat) : Nat :=
+  if hm : 0 < m then inferLexLeft n (m - 1) + 1
+  else if hn : 0 < n then inferLexLeft (n - 1) 2 + 1 else 0
+end
+"#;
+    // Both uniform columns already fail in the left member. Querying the right
+    // member for either would reach `repeat skip` and must exhaust its budget,
+    // never silently fall back. The aligned columns and final tuple are proved
+    // by decreasing_tactic, and the right member's call order is reversed.
+    let reordered = r#"mutual
+def inferLexLeft (n m : Nat) : Nat :=
+  if hm : 0 < m then inferLexRight (m - 1) n + 1
+  else if hn : 0 < n then inferLexRight 2 (n - 1) + 1 else 0
+def inferLexRight (m n : Nat) : Nat :=
+  if hm : m = 0 then
+    if hn : 0 < n then inferLexLeft (n - 1) 2 + 1 else 0
+  else inferLexLeft n (m - 1) + 1
+decreasing_by all_goals first | decreasing_tactic | repeat skip
+end
+"#;
+    on_large_stack(move |base| {
+        for (source, right) in [
+            (uniform, "#eval inferLexRight 2 5"),
+            (reordered, "#eval inferLexRight 5 2"),
+        ] {
+            assert_eq!(
+                oracle(&format!("{source}#eval inferLexLeft 3 4\n{right}\n"), true),
+                "13\n11\n",
+            );
+            let engine = check(base, source);
+            assert_auxiliary_fix(&engine, "inferLexLeft._mutual", "WellFounded.fix");
+            assert_companions(&engine, &["inferLexLeft", "inferLexRight"]);
+            assert!(
+                shape(&definition(&engine, "inferLexLeft._mutual").value)
+                    .contains("Prod.mk Nat Nat"),
+                "the checked fixpoint must retain the inferred tuple"
+            );
+            assert_eq!(
+                evaluate(&engine, "#eval inferLexLeft 3 4"),
+                ClosedVmValue::Scalar(13)
+            );
+            assert_eq!(evaluate(&engine, right), ClosedVmValue::Scalar(11));
+        }
+    });
+}
+
+#[test]
+fn inferred_mutual_lexicographic_measures_refuse_uncovered_and_increasing_cycles() {
+    let uncovered = r#"mutual
+def badTupleLeft (n m : Nat) : Nat :=
+  if h : 0 < n then badTupleRight (n - 1) (m + 1) else badTupleRight n m
+def badTupleRight (n m : Nat) : Nat := badTupleLeft n m
+end
+"#;
+    let increasing = r#"mutual
+def badTupleLeft (n m : Nat) : Nat :=
+  if h : 0 < n then badTupleRight (n - 1) (m + 1) else 0
+def badTupleRight (n m : Nat) : Nat :=
+  if h : 0 < m then badTupleLeft (n + 1) (m - 1) else 0
+end
+"#;
+    on_large_stack(move |base| {
+        for source in [uncovered, increasing] {
+            oracle(source, false);
+            refuse(base, source);
+            for name in [
+                "badTupleLeft",
+                "badTupleRight",
+                "badTupleLeft._mutual",
+                "badTupleLeft._unsafe_rec",
+                "badTupleRight._unsafe_rec",
+            ] {
+                assert!(!base.environment().contains(&n(name)));
+            }
+        }
+        let recovered = check(base, "def afterFailedTuple : Nat := 17");
+        assert_eq!(
+            evaluate(&recovered, "#eval afterFailedTuple"),
+            ClosedVmValue::Scalar(17)
+        );
+    });
+}
+
+#[test]
 fn inferred_mutual_measures_ignore_constant_size_functions() {
     let source = r#"mutual
 def measureHop (f : Nat → Nat) (n : Nat) : Nat :=

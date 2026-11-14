@@ -509,6 +509,40 @@ impl Context {
         Ok(true)
     }
 
+    /// GuessLex's mkProdElem: one coordinate stays a Nat; several become the
+    /// right-nested product shared by single and mutual termination inference.
+    fn lexicographic_measure(
+        &mut self,
+        coordinates: &[Typed],
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let mut coordinates = coordinates.iter().rev().cloned();
+        let mut tuple = coordinates
+            .next()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        for coordinate in coordinates {
+            self.tick()?;
+            let levels = vec![Level::zero(), Level::zero()];
+            let types = [coordinate.type_.clone(), tuple.type_.clone()];
+            let pair = [
+                types[0].clone(),
+                types[1].clone(),
+                coordinate.value,
+                tuple.value,
+            ];
+            tuple = Typed {
+                value: pair.into_iter().fold(
+                    Expr::const_(Name::from_components(["Prod", "mk"]), levels.clone()),
+                    Expr::app,
+                ),
+                type_: types.into_iter().fold(
+                    Expr::const_(Name::from_components(["Prod"]), levels),
+                    Expr::app,
+                ),
+            };
+        }
+        Ok(tuple)
+    }
+
     fn well_founded_measure(
         &mut self,
         hint: &Hint<'_>,
@@ -525,34 +559,7 @@ impl Context {
                 .ok_or_else(|| failure(SourceInferenceError::Scope));
         }
         if let Guess::Tuple(order) = &hint.guess {
-            // A singleton stays a Nat measure; a longer solution is the right-nested
-            // product used by the pin. All coordinates were checked in this context.
-            let mut coordinates = order.measures.iter().rev().cloned();
-            let mut tuple = coordinates
-                .next()
-                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-            for coordinate in coordinates {
-                self.tick()?;
-                let levels = vec![Level::zero(), Level::zero()];
-                let types = [coordinate.type_.clone(), tuple.type_.clone()];
-                let pair = [
-                    types[0].clone(),
-                    types[1].clone(),
-                    coordinate.value,
-                    tuple.value,
-                ];
-                tuple = Typed {
-                    value: pair.into_iter().fold(
-                        Expr::const_(Name::from_components(["Prod", "mk"]), levels.clone()),
-                        Expr::app,
-                    ),
-                    type_: types.into_iter().fold(
-                        Expr::const_(Name::from_components(["Prod"]), levels),
-                        Expr::app,
-                    ),
-                };
-            }
-            return Ok(tuple);
+            return self.lexicographic_measure(&order.measures);
         }
         let syntax = hint
             .measure
