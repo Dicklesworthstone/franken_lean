@@ -15,11 +15,11 @@
 //! `tactic.pseudo.antiquot` for a tactic, `Lean.Parser.Term.funBinder.pseudo.antiquot` for a
 //! `fun` binder), a node's `<kind>.antiquot` (`Lean.Parser.Tactic.tacticSeq.antiquot` where a
 //! whole tactic sequence is one), and a named one the parser its name selects (`$x:ident` is
-//! `ident.antiquot`). Its children: the `$`, the escaping `$`s (none read here), the expression,
-//! and the `antiquotName` node or nothing. Antiquotations are read only inside a quotation; a
-//! Repetition parsers own suffix splices (`$xs,*`, `$x*`, `$(xs)?`); a scalar
-//! parser still refuses them. Bracketed iteration splices and escaped `$$x`
-//! remain unsupported.
+//! `ident.antiquot`). Its children: the `$`, the escaping `$`s, the expression,
+//! and the `antiquotName` node or nothing. Antiquotations are read only inside a quotation.
+//! Repetition parsers own suffix and bracketed iteration splices; a scalar
+//! parser still refuses them. Each adjacent extra `$` is retained in the
+//! escape list, so quoting consumes one escape without capturing its expression.
 use super::*;
 use std::ops::Range;
 
@@ -525,27 +525,39 @@ pub(crate) fn antiquotation(
     if !inside() || text(tokens, start) != Some("$") || start + 1 >= end {
         return Ok(None);
     }
-    if !touching(tokens, start, start + 1) || text(tokens, start + 1) == Some("$") {
-        return Err(refuse(view, tokens, start));
+    let mut expression_at = start + 1;
+    while expression_at < end && text(tokens, expression_at) == Some("$") {
+        if !touching(tokens, expression_at - 1, expression_at) {
+            return Err(refuse(view, tokens, expression_at));
+        }
+        expression_at += 1;
     }
-    let (expression, mut next) = match &tokens[start + 1].kind {
-        TokenKind::Ident(_) => (leaves.leaf(start + 1)?, start + 2),
-        TokenKind::Symbol(symbol) if symbol == "_" => (leaves.leaf(start + 1)?, start + 2),
+    if expression_at >= end || !touching(tokens, expression_at - 1, expression_at) {
+        return Err(refuse(view, tokens, expression_at));
+    }
+    let escapes = (start + 1..expression_at)
+        .map(|at| leaves.leaf(at))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (expression, mut next) = match &tokens[expression_at].kind {
+        TokenKind::Ident(_) => (leaves.leaf(expression_at)?, expression_at + 1),
+        TokenKind::Symbol(symbol) if symbol == "_" => {
+            (leaves.leaf(expression_at)?, expression_at + 1)
+        }
         TokenKind::Symbol(symbol) if symbol == "(" => {
-            let close =
-                closing(tokens, start + 1, end).ok_or_else(|| refuse(view, tokens, start + 1))?;
+            let close = closing(tokens, expression_at, end)
+                .ok_or_else(|| refuse(view, tokens, expression_at))?;
             // `decQuotDepth`: the nested expression is ordinary syntax again.
             let _outside = Depth::shift(-1);
-            let term = nested_term(leaves, view, tokens, start + 2..close)?;
+            let term = nested_term(leaves, view, tokens, expression_at + 1..close)?;
             (
                 Syntax::node(
                     Name::from_components(["antiquotNestedExpr"]),
-                    vec![leaves.leaf(start + 1)?, term, leaves.leaf(close)?],
+                    vec![leaves.leaf(expression_at)?, term, leaves.leaf(close)?],
                 ),
                 close + 1,
             )
         }
-        _ => return Err(refuse(view, tokens, start + 1)),
+        _ => return Err(refuse(view, tokens, expression_at)),
     };
     // `(":" name)?`, touching the expression and each other.
     let named = next + 1 < end
@@ -639,7 +651,7 @@ pub(crate) fn antiquotation(
     Ok(Some((
         Syntax::node(
             kind,
-            vec![leaves.leaf(start)?, null_node(Vec::new()), expression, name],
+            vec![leaves.leaf(start)?, null_node(escapes), expression, name],
         ),
         next,
     )))

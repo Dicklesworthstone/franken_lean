@@ -10,6 +10,80 @@ pub(super) mod capture_kinds;
 pub(super) mod repetition;
 pub(super) mod templates;
 
+/// `Lean.Syntax.isEscapedAntiquot`: an extra dollar belongs to this
+/// quotation, not to the future macro's capture. Validate the escape node
+/// before any persisted template can use it as executable syntax.
+fn escaped_antiquotation(syntax: &Syntax) -> Result<bool, &'static str> {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return Ok(false);
+    };
+    if kind.leaf_view() != LeafView::Str("antiquot") {
+        return Ok(false);
+    }
+    let [Syntax::Atom { val, .. }, escapes, expression, annotation] = args.as_slice() else {
+        return Err("a malformed escaped antiquotation");
+    };
+    let escapes = null_args(escapes).ok_or("a malformed escaped antiquotation")?;
+    if escapes.len() > MAX_TEMPLATE_NODES {
+        return Err("a macro template past the node budget");
+    }
+    if val != "$"
+        || escapes
+            .iter()
+            .any(|escape| !matches!(escape, Syntax::Atom { val, .. } if val == "$"))
+    {
+        return Err("a malformed escaped antiquotation");
+    }
+    match expression {
+        Syntax::Ident { .. } => {}
+        Syntax::Atom { val, .. } if val == "_" => {}
+        Syntax::Node { kind, args, .. }
+            if *kind == Name::from_components(["antiquotNestedExpr"])
+                && matches!(args.as_slice(),
+                    [Syntax::Atom { val: open, .. }, _, Syntax::Atom { val: close, .. }]
+                        if open == "(" && close == ")") => {}
+        _ => return Err("a malformed escaped antiquotation expression"),
+    }
+    if !null_args(annotation).is_some_and(<[Syntax]>::is_empty)
+        && !matches!(annotation, Syntax::Node { kind, args, .. }
+            if *kind == Name::from_components(["antiquotName"])
+                && matches!(args.as_slice(),
+                    [Syntax::Atom { val: colon, .. }, Syntax::Atom { .. }] if colon == ":"))
+    {
+        return Err("a malformed escaped antiquotation annotation");
+    }
+    Ok(!escapes.is_empty())
+}
+
+/// The only executable child of an escaped antiquotation. Its validated
+/// dollar list and annotation are literal framing; a nested expression may
+/// still contain captures belonging to the current quotation.
+fn escaped_capture_body(
+    syntax: &Syntax,
+) -> Result<(&Syntax, &'static [usize], usize), &'static str> {
+    let Some([_, escapes, expression, annotation]) = node_args(syntax) else {
+        return Err("a malformed escaped antiquotation");
+    };
+    // The caller already counted the outer node. Count every skipped dollar,
+    // the dollar-list node, and the annotation's complete validated framing.
+    let framing = null_args(escapes)
+        .ok_or("a malformed escaped antiquotation")?
+        .len()
+        .checked_add(if null_args(annotation).is_some() { 3 } else { 5 })
+        .ok_or("macro template work overflow")?;
+    if kind_is(expression, &["antiquotNestedExpr"]) {
+        let body = node_args(expression)
+            .and_then(|args| args.get(1))
+            .ok_or("a malformed escaped antiquotation expression")?;
+        let framing = framing
+            .checked_add(3)
+            .ok_or("macro template work overflow")?;
+        Ok((body, &[2, 1], framing))
+    } else {
+        Ok((expression, &[2], framing))
+    }
+}
+
 pub(super) fn variables(children: &[Syntax]) -> Result<Vec<(Vec<usize>, Name)>, &'static str> {
     let mut tasks: Vec<_> = children
         .iter()
@@ -19,7 +93,7 @@ pub(super) fn variables(children: &[Syntax]) -> Result<Vec<(Vec<usize>, Name)>, 
         .collect();
     let mut variables = Vec::new();
     let mut bound = BTreeSet::new();
-    let mut visited = 0;
+    let mut visited = 0_usize;
     while let Some((pattern, path)) = tasks.pop() {
         visited += 1;
         if visited > MAX_TEMPLATE_NODES || path.len() > MAX_DESCR_DEPTH {
@@ -70,9 +144,20 @@ pub(super) fn variables(children: &[Syntax]) -> Result<Vec<(Vec<usize>, Name)>, 
         }
         if let Syntax::Node { kind, args, .. } = pattern {
             let leaf = components(kind).last().cloned().unwrap_or_default();
-            if leaf.contains("antiquot") || matches!(leaf.as_str(), "quot" | "quotSeq") {
+            if escaped_antiquotation(pattern)? {
+                let (body, suffix, framing) = escaped_capture_body(pattern)?;
+                visited = visited
+                    .checked_add(framing)
+                    .filter(|visited| *visited <= MAX_TEMPLATE_NODES)
+                    .ok_or("a quoted macro pattern past the node or depth budget")?;
+                let mut path = path;
+                path.extend_from_slice(suffix);
+                tasks.push((body, path));
+                continue;
+            }
+            if leaf.contains("antiquot") {
                 return Err(
-                    "a splice, expression antiquotation or nested quotation in a macro pattern",
+                    "an unsupported splice or expression antiquotation in a macro pattern",
                 );
             }
             for (index, child) in args.iter().enumerate().rev() {
@@ -163,7 +248,35 @@ pub(super) fn matches_with_budget(
                 let literal = ["num", "str", "char", "name", "scientific"]
                     .iter()
                     .any(|name| *a == Name::from_components([*name]));
-                pending.extend(pa.iter().zip(va).map(|(p, a)| (p, a, literal)));
+                if escaped_antiquotation(pattern)? {
+                    // Match the literal antiquotation after consuming one
+                    // escape, as Quotation.getHeadInfo does. Its expression
+                    // remains ordinary quoted syntax; it is not a capture at
+                    // this stage. Captures nested in that expression still are.
+                    let pattern_escapes =
+                        null_args(&pa[1]).ok_or("a malformed escaped antiquotation")?;
+                    let Some(value_escapes) = null_args(&va[1]) else {
+                        return Ok(false);
+                    };
+                    if pattern_escapes.len() - 1 != value_escapes.len() {
+                        return Ok(false);
+                    }
+                    pending.extend(
+                        pattern_escapes[..pattern_escapes.len() - 1]
+                            .iter()
+                            .zip(value_escapes)
+                            .map(|(p, a)| (p, a, false)),
+                    );
+                    pending.extend(
+                        pa.iter()
+                            .zip(va)
+                            .enumerate()
+                            .filter(|(index, _)| *index != 1)
+                            .map(|(_, (p, a))| (p, a, literal)),
+                    );
+                } else {
+                    pending.extend(pa.iter().zip(va).map(|(p, a)| (p, a, literal)));
+                }
             }
             _ => return Ok(false),
         }

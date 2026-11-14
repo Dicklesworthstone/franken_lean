@@ -7,6 +7,8 @@ on:
       - 'crates/fln-core/**'
       - 'crates/fln-syntax/**'
       - 'crates/fln-parse/**'
+      - 'crates/fln/tests/source_quoted_capture_kinds.rs'
+      - 'crates/fln/tests/source_quotation_repetitions.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -23,6 +25,11 @@ jobs:
   regressions:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -32,5 +39,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Parser grouping source reconstruction and bounded-stack regressions
         run: cargo test --locked -p fln-parse --no-fail-fast
+      - name: Check quotation expansion through the native elaborator and kernel
+        run: cargo test --locked -p fln --test source_quoted_capture_kinds --test source_quotation_repetitions --no-fail-fast
       - name: Lint the native parser
         run: cargo clippy --locked -p fln-parse --all-targets -- -D warnings

@@ -354,6 +354,64 @@ theorem nestedQuotation : (quotedNumber! : String) = "number" := rfl
 }
 
 #[test]
+fn nested_quotations_match_and_construct_syntax_without_capturing_caller_binders() {
+    let source = r#"
+syntax "unquoteNow " term : term
+macro_rules | `(unquoteNow `($x)) => `($x)
+macro "quoteRoundtrip " x:term : term => `(unquoteNow `($x))
+macro "quoteConst " v:term : term => `(unquoteNow `(fun x => $v))
+theorem direct {p : Prop} (h : p) : p := unquoteNow `(h)
+theorem constructed {p : Prop} (h : p) : p := quoteRoundtrip h
+theorem nestedBinder (x : Nat) : quoteRoundtrip (let x := x + 1; x) = x + 1 := rfl
+theorem preserved {p q : Prop} (x : p) (hq : q) : p := (quoteConst x) hq
+"#;
+    assert_eq!(check(source).unwrap(), 4);
+    assert!(check(&source.replace("= x + 1 := rfl", "= x + 2 := rfl")).is_err());
+}
+
+#[test]
+fn escaped_pattern_antiquotations_match_one_stage_without_binding_the_literal_name() {
+    let source = r#"
+syntax "quoteStage " term : term
+macro_rules
+  | `(quoteStage `($$x)) => `((1 : Nat))
+  | `(quoteStage `($$$x)) => `((2 : Nat))
+  | `(quoteStage $_) => `((3 : Nat))
+macro "produceEscaped" : term => `(quoteStage `($$x))
+theorem firstStage : quoteStage `($x) = 1 := rfl
+theorem secondStage : quoteStage `($$x) = 2 := rfl
+theorem differentName : quoteStage `($y) = 3 := rfl
+theorem ordinaryIdentifier : quoteStage `(x) = 3 := rfl
+theorem escapedTemplate : produceEscaped = 1 := rfl
+"#;
+    assert_eq!(check(source).unwrap(), 5);
+    assert!(check(&source.replace("= 2 := rfl", "= 1 := rfl")).is_err());
+}
+
+#[test]
+fn escaped_annotations_and_nested_expressions_keep_their_quotation_stage() {
+    let source = r#"
+syntax "quoteTypedStage " term : term
+macro_rules
+  | `(quoteTypedStage `($$x:ident)) => `((1 : Nat))
+  | `(quoteTypedStage $_) => `((2 : Nat))
+macro "produceTypedEscaped" : term => `(quoteTypedStage `($$x:ident))
+syntax "quoteNestedExpr " term : term
+macro_rules | `(quoteNestedExpr `($$($captured))) => `($captured)
+macro "produceNestedExpr " x:term : term => `(quoteNestedExpr `($$($x)))
+theorem typedPattern : quoteTypedStage `($x:ident) = 1 := rfl
+theorem typedTemplate : produceTypedEscaped = 1 := rfl
+theorem typedOther : quoteTypedStage `($y:ident) = 2 := rfl
+theorem otherKind : quoteTypedStage `($x:term) = 2 := rfl
+theorem nestedPattern : quoteNestedExpr `($(3)) = 3 := rfl
+theorem nestedTemplate : produceNestedExpr 4 = 4 := rfl
+"#;
+    assert_eq!(check(source).unwrap(), 6);
+    assert!(check(&source.replace("= 4 := rfl", "= 5 := rfl")).is_err());
+    assert!(check(&source.replace("= 2 := rfl", "= 1 := rfl")).is_err());
+}
+
+#[test]
 fn atomic_templates_keep_definition_site_globals_and_hygienic_binders() {
     let source = r#"
 def amount : Nat := 42

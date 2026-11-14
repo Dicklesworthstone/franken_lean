@@ -387,10 +387,11 @@ fn quotations_and_macros_produce_the_pins_trees() {
     }
 }
 
-/// Outside a quotation `$` starts no antiquotation, and the splices and escapes not read here are
-/// refused rather than read as operators. `match $c with` is refused too: the pin reads an
-/// antiquotation with no kind straight after `match` as its `(generalizing := …)` parameter and
-/// then misses the discriminant.
+/// Outside a quotation `$` starts no antiquotation, and unsupported splice shapes are refused
+/// rather than read as operators. An escaped pattern does not bind its literal identifier,
+/// so using that identifier as a template capture remains invalid. `match $c with` is refused
+/// too: the pin reads a bare capture as its `(generalizing := …)` parameter, then misses the
+/// discriminant.
 #[test]
 fn antiquotations_outside_quotations_and_unread_splices_are_refused() {
     let mut grammar = FileGrammar::new(false, &[], None).expect("Init");

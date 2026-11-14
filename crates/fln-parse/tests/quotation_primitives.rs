@@ -96,7 +96,9 @@ fn primitive_quotations_reject_wrong_types_annotations_and_partial_payloads() {
         ("str", "$x:term"),
         ("num", "$x:"),
         ("num", "$ x"),
-        ("num", "$$x"),
+        ("num", "$ $x"),
+        ("num", "$$ x"),
+        ("num", "$$"),
         ("num", "$xs,*"),
         ("num", "42 43"),
         ("str", "\"x\" \"y\""),
@@ -107,6 +109,34 @@ fn primitive_quotations_reject_wrong_types_annotations_and_partial_payloads() {
     }
     assert!(parse("def outside := $x:num").is_err());
     assert!(parse("def recovered := `(num| 7)").is_ok());
+}
+
+#[test]
+fn escaped_antiquotations_keep_each_dollar_and_the_primitive_capture_kind() {
+    for category in ["ident", "num", "str", "char", "scientific", "name"] {
+        for count in 1..=4 {
+            let dollars = "$".repeat(count);
+            let source = format!("def q := `({category}| {dollars}x:{category})");
+            let tree = parse(&source).unwrap_or_else(|error| panic!("{source}: {error}"));
+            let Syntax::Node { kind, args, .. } = dynamic_body(&tree) else {
+                panic!("{tree:?}");
+            };
+            assert_eq!(*kind, Name::from_components([category, "antiquot"]));
+            assert_eq!(args.len(), 4);
+            let Syntax::Node { args: escapes, .. } = &args[1] else {
+                panic!("{args:?}");
+            };
+            assert_eq!(escapes.len(), count - 1);
+            assert!(
+                escapes.iter().all(|escape| {
+                    matches!(escape, Syntax::Atom { val, .. } if val == "$")
+                })
+            );
+            assert!(
+                matches!(&args[2], Syntax::Ident { val, .. } if *val == Name::from_components(["x"]))
+            );
+        }
+    }
 }
 
 #[test]

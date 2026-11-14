@@ -36,6 +36,14 @@ pub(in crate::extensions) fn checked(
         }
         if let Syntax::Node { kind, args, .. } = syntax {
             let leaf = components(kind).last().cloned().unwrap_or_default();
+            if escaped_antiquotation(syntax)? {
+                let (body, _, framing) = escaped_capture_body(syntax)?;
+                for _ in 0..framing {
+                    charge(&mut visited)?;
+                }
+                pending.push((body, false));
+                continue;
+            }
             if leaf == "antiquot" {
                 let name = antiquotation_name(syntax).ok_or("an antiquotation of an expression")?;
                 if !variables
@@ -46,10 +54,8 @@ pub(in crate::extensions) fn checked(
                 }
                 continue;
             }
-            if leaf.contains("antiquot")
-                || matches!(leaf.as_str(), "quot" | "quotSeq" | "dynamicQuot")
-            {
-                return Err("a splice or a nested quotation in a macro template");
+            if leaf.contains("antiquot") && leaf != "antiquot" {
+                return Err("an unsupported splice in a macro template");
             }
             let sequence = null_args(syntax).is_some();
             pending.extend(args.iter().map(|child| (child, sequence)));
@@ -96,7 +102,7 @@ pub(in crate::extensions) fn copy_capture(
 fn replace_antiquotations(contents: &Syntax) -> Result<Syntax, &'static str> {
     enum Step<'a> {
         Visit(&'a Syntax),
-        Build(SourceInfo, &'a Name, usize),
+        Build(SourceInfo, &'a Name, usize, bool),
     }
     let mut steps = vec![Step::Visit(contents)];
     let mut built = Vec::new();
@@ -110,18 +116,33 @@ fn replace_antiquotations(contents: &Syntax) -> Result<Syntax, &'static str> {
                 match (antiquotation_name(syntax), syntax) {
                     (Some(name), _) => built.push(synthetic_ident(macro_variable(&name))),
                     (None, Syntax::Node { info, kind, args }) => {
-                        steps.push(Step::Build(*info, kind, args.len()));
+                        steps.push(Step::Build(
+                            *info,
+                            kind,
+                            args.len(),
+                            escaped_antiquotation(syntax)?,
+                        ));
                         steps.extend(args.iter().rev().map(Step::Visit));
                     }
                     (None, leaf) => built.push(leaf.clone()),
                 }
             }
-            Step::Build(info, kind, count) => {
+            Step::Build(info, kind, count, escaped) => {
                 let start = built
                     .len()
                     .checked_sub(count)
                     .ok_or("invalid template stack")?;
-                let args = built.split_off(start);
+                let mut args = built.split_off(start);
+                if escaped {
+                    // The pin's unescapeAntiquot removes exactly one dollar.
+                    // Do not revisit the resulting node: its capture belongs
+                    // to the generated macro, while captures in its children
+                    // have already been processed by this quotation.
+                    let Syntax::Node { args: escapes, .. } = &mut args[1] else {
+                        return Err("a malformed escaped antiquotation");
+                    };
+                    escapes.pop();
+                }
                 built.push(Syntax::Node {
                     info,
                     kind: kind.clone(),
@@ -692,6 +713,40 @@ mod tests {
         )]);
         assert!(instantiate(&template, &[large], &Name::anonymous(), 1).is_err());
         assert!(instantiate(&template, &[null_node(vec![])], &Name::anonymous(), 1).is_ok());
+    }
+
+    #[test]
+    fn escaped_literal_framing_is_validated_and_charged() {
+        let mut escaped = antiquot("future");
+        let Syntax::Node { args, .. } = &mut escaped else {
+            panic!("an antiquotation is a node");
+        };
+        args[1] = null_node(vec![Syntax::atom(SourceInfo::None, "$"); MAX_TEMPLATE_NODES]);
+        assert!(checked(&escaped, &[]).unwrap_err().contains("budget"));
+        assert!(
+            super::super::variables(std::slice::from_ref(&escaped))
+                .unwrap_err()
+                .contains("budget")
+        );
+        for malformed in [
+            null_node(vec![Syntax::Missing]),
+            Syntax::node(
+                Name::from_components(["antiquotName"]),
+                vec![
+                    Syntax::atom(SourceInfo::None, "?"),
+                    Syntax::atom(SourceInfo::None, "num"),
+                ],
+            ),
+        ] {
+            let mut escaped = antiquot("future");
+            let Syntax::Node { args, .. } = &mut escaped else {
+                panic!("an antiquotation is a node");
+            };
+            args[1] = null_node(vec![Syntax::atom(SourceInfo::None, "$")]);
+            args[3] = malformed;
+            assert!(checked(&escaped, &[]).is_err());
+            assert!(super::super::variables(std::slice::from_ref(&escaped)).is_err());
+        }
     }
 
     #[test]

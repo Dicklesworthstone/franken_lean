@@ -69,11 +69,22 @@ fn generated_and_dynamic_quotations_have_distinct_exact_envelopes() {
 fn empty_categories_accept_only_pseudo_captures_in_quotations() {
     let grammar = grammar(&["declare_syntax_cat emptyCategory"]);
     for prefix in ["`(emptyCategory|", "`(emptyCategory |"] {
-        for capture in ["$x", "$_", "$x:emptyCategory", "$_:emptyCategory", "$(x)"] {
+        for (capture, escape_count) in [
+            ("$x", 0),
+            ("$_", 0),
+            ("$x:emptyCategory", 0),
+            ("$_:emptyCategory", 0),
+            ("$(x)", 0),
+            ("$$x", 1),
+            ("$$x:emptyCategory", 1),
+            ("$$$x", 2),
+            ("$$(x)", 1),
+        ] {
             let source = format!("def q := {prefix} {capture})");
             let tree = parse(&grammar, &source).unwrap_or_else(|e| panic!("{source}: {e}"));
             let capture = node(&tree, &["emptyCategory", "pseudo", "antiquot"]);
             assert_eq!(capture.len(), 4);
+            assert_eq!(node(&capture[1], &["null"]).len(), escape_count);
         }
         for bad in [
             "42",
@@ -82,7 +93,9 @@ fn empty_categories_accept_only_pseudo_captures_in_quotations() {
             "$x:missing",
             "$x:",
             "$x*",
-            "$$x",
+            "$$ x",
+            "$$",
+            "$ $x",
         ] {
             let source = format!("def q := {prefix} {bad})");
             assert!(parse(&grammar, &source).is_err(), "accepted {source}");
