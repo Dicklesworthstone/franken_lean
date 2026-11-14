@@ -678,3 +678,79 @@ theorem scopedAgain : (4 : String) = "scoped" := rfl
     );
     assert_eq!(resumed.logical_root(&KVMap::new()), root);
 }
+
+#[test]
+fn nested_quotation_templates_replay_without_consuming_another_escape() {
+    use fln::source_check::modules::SourceModuleCheckLimits;
+    use fln::{Name, SourceModuleInput};
+    let admission = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let limits = SourceCheckLimits::new(admission);
+    let engine = Engine::with_source_seed(admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let library = Name::from_components(["QuoteLibrary"]);
+    let main = Name::from_components(["QuoteConsumer"]);
+    let built = engine
+        .check_source_modules(
+            &[
+                SourceModuleInput {
+                    name: &library,
+                    source: br#"
+syntax "journalUnquote " term : term
+macro_rules | `(journalUnquote `($x)) => `($x)
+macro "journalRoundtrip " x:term : term => `(journalUnquote `($x))
+syntax "journalStage " term : term
+macro_rules
+  | `(journalStage `($$x)) => `((1 : Nat))
+  | `(journalStage `($$$x)) => `((2 : Nat))
+  | `(journalStage $_) => `((3 : Nat))
+macro "journalEscaped" : term => `(journalStage `($$x))
+macro "journalDoublyEscaped" : term => `(journalStage `($$$x))
+"#,
+                },
+                SourceModuleInput {
+                    name: &main,
+                    source: br#"
+import QuoteLibrary
+theorem quoted (n : Nat) : journalRoundtrip n = n := rfl
+theorem escaped : journalEscaped = 1 := rfl
+theorem doublyEscaped : journalDoublyEscaped = 2 := rfl
+"#,
+                },
+            ],
+            &main,
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(limits),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let resumed = built.checked.engine;
+    let root = resumed.logical_root(&KVMap::new());
+    let checked = resumed
+        .check_source_files(
+            &[br#"
+theorem quotedAgain (n : Nat) : journalRoundtrip n = n := rfl
+theorem escapedAgain : journalEscaped = 1 := rfl
+theorem doublyEscapedAgain : journalDoublyEscaped = 2 := rfl
+theorem literalNameAgain : journalStage `($y) = 3 := rfl
+"#],
+            &KVMap::new(),
+            limits,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked.theorems, 4);
+    assert!(
+        resumed
+            .check_source_files(
+                &[b"theorem wrongStage : journalDoublyEscaped = 1 := rfl"],
+                &KVMap::new(),
+                limits,
+            )
+            .is_err()
+    );
+    assert_eq!(resumed.logical_root(&KVMap::new()), root);
+}

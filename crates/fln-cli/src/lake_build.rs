@@ -319,6 +319,17 @@ fn module_target<'a>(
             "target `{module}` has no library or executable olean facet; select the module explicitly as +{module}:olean"
         )));
     }
+    if package.is_none()
+        && !module.starts_with('+')
+        && sources
+            .packages
+            .iter()
+            .any(|package| package.identity == fln_lake::canonical_package_name(module))
+    {
+        return Err(Failure::unsupported(format!(
+            "package target `{module}` has no module facet; select +{module}:olean or +{module}:ir",
+        )));
+    }
     let module = name(module.strip_prefix('+').unwrap_or(module))?;
     let owner = match package {
         Some(package) => package.target_path(&module)?.map(|_| package),

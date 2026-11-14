@@ -753,6 +753,37 @@ fn package_qualifiers_disambiguate_standalone_modules_without_merging_owners() {
 }
 
 #[test]
+fn package_names_take_precedence_over_unqualified_module_names() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "root/lakefile.toml",
+        "name = \"Shared\"\n[[lean_lib]]\nname = \"Common\"\nroots = [\"Shared\"]\n",
+    );
+    workspace.write(
+        "root/Shared.lean",
+        "prelude\ntheorem Shared.keep (P : Prop) (h : P) : P := h\n",
+    );
+    refusal(
+        workspace.run(&["--json", "build", "Shared:olean"], None),
+        "unsupported",
+        "package target",
+    );
+    workspace.no_products();
+    assert!(!workspace.0.join("import-records").exists());
+    for target in ["+Shared:olean", "Shared/Shared:olean", "@Shared/+Shared:olean"] {
+        let report = build_success(workspace.run(&["--json", "build", target], None));
+        assert!(report.contains("\"modules_built\":1"), "{report}");
+    }
+    assert!(
+        workspace
+            .0
+            .join("root/.lake/build/lib/lean/Shared.olean")
+            .is_file()
+    );
+    workspace.no_manifests();
+}
+
+#[test]
 fn qualified_module_and_executable_selectors_cannot_fall_back_to_another_package() {
     let workspace = artifact_workspace();
     for (target, detail) in [
