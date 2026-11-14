@@ -140,6 +140,74 @@ partial def spin (n : Nat) : Nat := spin (n + 1)
 }
 
 #[test]
+fn source_recursion_exports_closed_primitive_signatures_without_evaluation() {
+    let engine = checked(
+        r#"partial def textCount (n : Nat) : String :=
+  if n == 0 then "done" else textCount (n - 1)
+partial def truthCount (n : Nat) : Bool :=
+  if n == 0 then true else truthCount (n - 1)
+partial def flagNat (b : Bool) : Nat :=
+  if b then flagNat false else 23
+partial def flagText (b : Bool) : String :=
+  if b then flagText false else "flag"
+partial def flagBool (b : Bool) : Bool :=
+  if b then flagBool false else true
+partial def stringNat (s : String) : Nat := stringNat s
+partial def stringText (s : String) : String := stringText s
+partial def stringBool (s : String) : Bool := stringBool s
+"#,
+    );
+    let before = engine.environment().clone();
+    for (label, parameter, returned) in [
+        ("textCount", IrType::TObject, IrType::Object),
+        ("truthCount", IrType::TObject, IrType::UInt8),
+        ("flagNat", IrType::UInt8, IrType::TObject),
+        ("flagText", IrType::UInt8, IrType::Object),
+        ("flagBool", IrType::UInt8, IrType::UInt8),
+        ("stringNat", IrType::Object, IrType::TObject),
+        ("stringText", IrType::Object, IrType::Object),
+        ("stringBool", IrType::Object, IrType::UInt8),
+    ] {
+        let entry = name(label);
+        let module = export(&engine, label)
+            .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+            .into_complete()
+            .unwrap();
+        let Some(IrDecl::Function { params, result, .. }) =
+            module.decls.iter().find(|decl| decl.name() == &entry)
+        else {
+            panic!("missing primitive recursive export {label}")
+        };
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].ty, parameter, "{label}");
+        assert_eq!(*result, returned, "{label}");
+        assert!(module.decls.iter().all(|decl| {
+            !decl.name().to_display_string().contains("_unsafe_rec")
+                && decl.name() != &Name::str(entry.clone(), "_redArg")
+        }));
+        assert_eq!(engine.environment(), &before);
+    }
+    // String-parameter examples deliberately do not terminate. Successful
+    // compilation with zero VM fuel must never sample their runtime values.
+    assert!(matches!(
+        engine.environment().find(&name("textCount")),
+        Some(ConstantInfo::Opaque(value)) if !value.is_unsafe
+    ));
+    let source = "theorem leakedText : textCount 0 = \"done\" := by rfl";
+    assert!(
+        engine
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(EngineAdmissionLimits::new(execution_limits().kernel)),
+            )
+            .is_err(),
+        "compilation exposed a partial implementation"
+    );
+    assert_eq!(engine.environment(), &before);
+}
+
+#[test]
 fn source_recursion_refuses_unsafe_entries_and_unverified_companions() {
     let engine = checked(&format!(
         "{COUNT}\
@@ -173,15 +241,15 @@ fn source_recursion_refuses_unproved_public_signatures_and_mutual_groups() {
     let engine = checked(
         r#"partial def accumulator (n total : Nat) : Nat :=
   if n == 0 then total else accumulator (n - 1) (total + 2)
-partial def text (n : Nat) : String :=
-  if n == 0 then "done" else text (n - 1)
+partial def higherOrder (n : Nat) : Nat -> Nat :=
+  fun x => higherOrder n x
 mutual
   partial def first (n : Nat) : Nat := second n
   partial def second (n : Nat) : Nat := first n
 end
 "#,
     );
-    for entry in ["accumulator", "text", "first", "second"] {
+    for entry in ["accumulator", "higherOrder", "first", "second"] {
         assert_unsupported(&engine, entry);
     }
 }

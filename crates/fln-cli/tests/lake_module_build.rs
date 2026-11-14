@@ -57,7 +57,7 @@ const MODULE_TOP: &str = "module\nprelude\npublic import Lib.Base\npublic theore
 const FAMILY_PARTS: [&str; 3] = ["olean", "olean.server", "olean.private"];
 
 #[test]
-fn native_ir_facets_export_checked_recursive_nat_definitions() {
+fn native_ir_facets_export_checked_recursive_primitive_definitions() {
     let Some(reference) = pinned_family_reference() else {
         return;
     };
@@ -79,6 +79,17 @@ fn native_ir_facets_export_checked_recursive_nat_definitions() {
         "  if n < 1 then 7 else Lib.partialCountLt (n - 1)\n",
         "public partial def Lib.partialCountLe (n : Nat) : Nat :=\n",
         "  if n ≤ 0 then 9 else Lib.partialCountLe (n - 1)\n",
+        "public partial def Lib.textCount (n : Nat) : String :=\n",
+        "  if n == 0 then \"done\" else Lib.textCount (n - 1)\n",
+        "public partial def Lib.truthCount (n : Nat) : Bool :=\n",
+        "  if n == 0 then true else Lib.truthCount (n - 1)\n",
+        "public partial def Lib.flagNat (b : Bool) : Nat :=\n",
+        "  if b then Lib.flagNat false else 23\n",
+        "public partial def Lib.flagText (b : Bool) : String :=\n",
+        "  if b then Lib.flagText false else \"flag\"\n",
+        "public partial def Lib.flagBool (b : Bool) : Bool :=\n",
+        "  if b then Lib.flagBool false else true\n",
+        "public partial def Lib.stringSpin (s : String) : String := Lib.stringSpin s\n",
         "public partial def Lib.spin (n : Nat) : Nat := Lib.spin (n + 1)\n",
     );
     package.write("Lib/Top.lean", source);
@@ -123,6 +134,12 @@ fn native_ir_facets_export_checked_recursive_nat_definitions() {
         "Lib.partialCount",
         "Lib.partialCountLt",
         "Lib.partialCountLe",
+        "Lib.textCount",
+        "Lib.truthCount",
+        "Lib.flagNat",
+        "Lib.flagText",
+        "Lib.flagBool",
+        "Lib.stringSpin",
         "Lib.spin",
     ] {
         assert!(
@@ -154,6 +171,16 @@ fn native_ir_facets_export_checked_recursive_nat_definitions() {
             "#eval Lib.partialCountLt 12\n",
             "#eval Lib.partialCountLe 0\n",
             "#eval Lib.partialCountLe 12\n",
+            "#eval Lib.textCount 0\n",
+            "#eval Lib.textCount 12\n",
+            "#eval Lib.truthCount 0\n",
+            "#eval Lib.truthCount 12\n",
+            "#eval Lib.flagNat false\n",
+            "#eval Lib.flagNat true\n",
+            "#eval Lib.flagText false\n",
+            "#eval Lib.flagText true\n",
+            "#eval Lib.flagBool false\n",
+            "#eval Lib.flagBool true\n",
         ),
     );
     let search = package.0.join(".lake/build/lib/lean");
@@ -169,7 +196,7 @@ fn native_ir_facets_export_checked_recursive_nat_definitions() {
     assert!(pinned.stderr.is_empty(), "{pinned:?}");
     assert_eq!(
         std::str::from_utf8(&pinned.stdout).unwrap(),
-        "42\n42\n0\n14\n42\n42\n42\n7\n7\n9\n9\n"
+        "42\n42\n0\n14\n42\n42\n42\n7\n7\n9\n9\n\"done\"\n\"done\"\ntrue\ntrue\n23\n23\n\"flag\"\n\"flag\"\ntrue\ntrue\n"
     );
 
     package.write("RuntimeRecursive.lean", concat!(
@@ -181,6 +208,21 @@ fn native_ir_facets_export_checked_recursive_nat_definitions() {
         "    match env.evalConst (Nat → Nat) {} entry (checkMeta := false) with\n",
         "    | .ok run => for n in [0, 7, 21] do IO.println (run n)\n",
         "    | .error message => throw (IO.userError message)\n",
+        "  match env.evalConst (Nat → String) {} `Lib.textCount (checkMeta := false) with\n",
+        "  | .ok run => for n in [0, 12] do IO.println (run n)\n",
+        "  | .error message => throw (IO.userError message)\n",
+        "  match env.evalConst (Nat → Bool) {} `Lib.truthCount (checkMeta := false) with\n",
+        "  | .ok run => for n in [0, 12] do IO.println (run n)\n",
+        "  | .error message => throw (IO.userError message)\n",
+        "  match env.evalConst (Bool → Nat) {} `Lib.flagNat (checkMeta := false) with\n",
+        "  | .ok run => for b in [false, true] do IO.println (run b)\n",
+        "  | .error message => throw (IO.userError message)\n",
+        "  match env.evalConst (Bool → String) {} `Lib.flagText (checkMeta := false) with\n",
+        "  | .ok run => for b in [false, true] do IO.println (run b)\n",
+        "  | .error message => throw (IO.userError message)\n",
+        "  match env.evalConst (Bool → Bool) {} `Lib.flagBool (checkMeta := false) with\n",
+        "  | .ok run => for b in [false, true] do IO.println (run b)\n",
+        "  | .error message => throw (IO.userError message)\n",
     ));
     let runtime = || {
         Command::new(&reference)
@@ -194,7 +236,7 @@ fn native_ir_facets_export_checked_recursive_nat_definitions() {
     assert!(pinned.status.success(), "{pinned:?}");
     assert_eq!(
         std::str::from_utf8(&pinned.stdout).unwrap(),
-        "42\n42\n42\n0\n14\n42\n42\n42\n42\n7\n7\n7\n9\n9\n9\n"
+        "42\n42\n42\n0\n14\n42\n42\n42\n42\n7\n7\n7\n9\n9\n9\ndone\ndone\ntrue\ntrue\n23\n23\nflag\nflag\ntrue\ntrue\n"
     );
 
     if let Some(partition) = emitted_ir_partition() {
@@ -226,12 +268,21 @@ fn native_ir_facets_export_checked_recursive_nat_definitions() {
             ("Lib.partialCountLt", 12, 7),
             ("Lib.partialCountLe", 0, 9),
             ("Lib.partialCountLe", 12, 9),
+            ("Lib.truthCount", 0, 1),
+            ("Lib.truthCount", 12, 1),
         ] {
             let output = run(entry, argument, None);
             let report = success(&output);
             assert!(
                 report.contains(&format!("\"value\":{expected},")),
                 "{entry} {argument}: {report}"
+            );
+        }
+        for argument in [0, 12] {
+            let report = success(&run("Lib.textCount", argument, None));
+            assert!(
+                report.contains("\"value\":\"done\","),
+                "textCount {argument}: {report}"
             );
         }
         let exhausted = run("Lib.spin", 21, Some(64));
@@ -278,7 +329,7 @@ fn native_ir_facets_export_checked_recursive_nat_definitions() {
         ),
         (
             "public partial def Lib.accumulate (n total : Nat) : Nat := if n == 0 then total else Lib.accumulate (n - 1) (total + 1)\n",
-            "recursive source exports require unary Nat -> Nat",
+            "recursive source exports require unary Nat/String/Bool signatures",
         ),
     ] {
         package.write("Lib/Top.lean", format!("{source}{unsupported}"));

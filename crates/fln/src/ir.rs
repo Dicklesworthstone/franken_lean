@@ -2448,17 +2448,22 @@ pub(crate) fn is_checked_recursive_companion(
 
 /// Compile a safe reference to the logical interface, so normal preparation
 /// selects its checked executable companion. Never re-admit a Partial body as
-/// Safe or export a partial opaque's arbitrary inhabitant. A single Nat slot
-/// has no smaller nonempty reduced-argument ABI, regardless of body use.
+/// Safe or export a partial opaque's arbitrary inhabitant. A single closed
+/// runtime slot has no smaller nonempty reduced-argument ABI, regardless of
+/// body use. The ordinary source exporter owns its boxing and result ABI.
 fn recursive_source_wrapper(
     definition: &mut fln_env::constants::DefinitionVal,
     meter: &mut Budget,
 ) -> Result<()> {
     use fln_core::expr::{Expr, ExprNode};
-    let natural = Name::from_components(["Nat"]);
+    let carriers = [
+        Name::from_components(["Nat"]),
+        Name::from_components(["String"]),
+        Name::from_components(["Bool"]),
+    ];
     let scalar = |expression: &Expr| {
         matches!(expression.node(), ExprNode::Const { name, levels }
-            if name == &natural && levels.is_empty())
+            if levels.is_empty() && carriers.contains(name))
     };
     let ty = source_without_metadata(&definition.base.type_, meter)?;
     let ExprNode::ForallE {
@@ -2469,7 +2474,7 @@ fn recursive_source_wrapper(
     } = ty.node()
     else {
         return Err(unsupported(
-            "recursive source exports require unary Nat -> Nat",
+            "recursive source exports require unary Nat/String/Bool signatures",
         ));
     };
     if !definition.base.level_params.is_empty()
@@ -2477,7 +2482,7 @@ fn recursive_source_wrapper(
         || !scalar(source_without_metadata(body, meter)?)
     {
         return Err(unsupported(
-            "recursive source exports require unary Nat -> Nat",
+            "recursive source exports require unary Nat/String/Bool signatures",
         ));
     }
     meter.charge(5)?;
