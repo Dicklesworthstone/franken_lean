@@ -41,6 +41,7 @@ fn item_category(item: &StxItem) -> Option<Name> {
 
 fn antiquotation_category(syntax: &Syntax) -> Option<Name> {
     antiquotation_name(syntax)?;
+    let syntax = canonical_antiquotation(syntax)?;
     let mut category = syntax.kind()?.parent();
     if category.leaf_view() == LeafView::Str("pseudo") {
         category = category.parent();
@@ -114,9 +115,9 @@ fn coerce_declaration_names<'syntax>(
             LeafView::Str("antiquot_suffix_splice") => continue,
             LeafView::Str("antiquot_scope") => {
                 if let Some(body) = args.first() {
-                    let whole = null_args(body).is_some_and(|items| {
-                        matches!(items, [capture] if antiquotation_name(capture).is_some())
-                    });
+                    let whole = null_args(body).is_some_and(
+                        |items| matches!(items, [capture] if antiquotation_name(capture).is_some()),
+                    );
                     if !whole {
                         pending.push(body);
                     }
@@ -192,7 +193,10 @@ fn coerce_declaration_names<'syntax>(
             }
         }
     }
-    built.pop().map(std::borrow::Cow::Owned).ok_or(TYPE_MISMATCH)
+    built
+        .pop()
+        .map(std::borrow::Cow::Owned)
+        .ok_or(TYPE_MISMATCH)
 }
 
 pub(super) fn direct(

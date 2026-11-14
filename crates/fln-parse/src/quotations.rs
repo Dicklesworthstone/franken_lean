@@ -318,8 +318,7 @@ fn read_quotation(
             Ok(term) => ("Term", term),
             Err(error) => (
                 "Command",
-                crate::extensions::command_quotation(leaves, view, tokens, inner)
-                    .ok_or(error)?,
+                crate::extensions::command_quotation(leaves, view, tokens, inner).ok_or(error)?,
             ),
         };
         Syntax::node(
@@ -508,6 +507,9 @@ pub(crate) enum Position {
     Tactic,
     TacticSeq,
     FunBinder,
+    /// `binderIdent` tries both `ident` and the term hole parser. An anonymous
+    /// capture preserves that parser choice until quotation elaboration.
+    BinderIdent,
     ConvSeq,
     OptConfig,
     RwRuleSeq,
@@ -583,6 +585,7 @@ pub(crate) fn antiquotation(
     if !named && next < end && text(tokens, next) == Some(":") && touching(tokens, next - 1, next) {
         return Err(refuse(view, tokens, next));
     }
+    let binder_choice = !named && position == Position::BinderIdent;
     let (kind, name) = if named {
         let spelled = view
             .normalized()
@@ -597,6 +600,8 @@ pub(crate) fn antiquotation(
             (Position::Token(expected), actual) if expected == actual => {
                 Name::from_components([expected, "antiquot"])
             }
+            (Position::BinderIdent, "ident") => Name::from_components(["ident", "antiquot"]),
+            (Position::BinderIdent, "hole") => parser_kind(&["Term", "hole", "antiquot"]),
             (Position::Node { label, kind }, actual) if label.trim() == actual => {
                 Name::str(kind, "antiquot")
             }
@@ -635,6 +640,7 @@ pub(crate) fn antiquotation(
             Position::FunBinder => {
                 Name::from_components(["Lean", "Parser", "Term", "funBinder", "pseudo", "antiquot"])
             }
+            Position::BinderIdent => Name::from_components(["ident", "antiquot"]),
             Position::ConvSeq => {
                 Name::from_components(["Lean", "Parser", "Tactic", "Conv", "convSeq", "antiquot"])
             }
@@ -659,13 +665,19 @@ pub(crate) fn antiquotation(
     if next < end && touching(tokens, next - 1, next) && splice {
         return Err(refuse(view, tokens, next));
     }
-    Ok(Some((
+    let args = vec![leaves.leaf(start)?, null_node(escapes), expression, name];
+    let syntax = if binder_choice {
         Syntax::node(
-            kind,
-            vec![leaves.leaf(start)?, null_node(escapes), expression, name],
-        ),
-        next,
-    )))
+            Name::from_components(["choice"]),
+            vec![
+                Syntax::node(kind, args.clone()),
+                Syntax::node(parser_kind(&["Term", "hole", "antiquot"]), args),
+            ],
+        )
+    } else {
+        Syntax::node(kind, args)
+    };
+    Ok(Some((syntax, next)))
 }
 
 /// The token parsers shared by dynamic quotations and declared syntax slots.

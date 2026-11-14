@@ -295,6 +295,8 @@ fn charge_match(visited: &mut usize) -> Result<(), &'static str> {
 }
 
 fn capture_kind_matches(pattern: &Syntax, value: &Syntax) -> Result<bool, &'static str> {
+    let pattern =
+        canonical_antiquotation(pattern).ok_or("a quoted capture without an antiquotation node")?;
     let Syntax::Node { kind, args, .. } = pattern else {
         return Err("a quoted capture without an antiquotation node");
     };

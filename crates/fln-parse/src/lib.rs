@@ -1731,6 +1731,9 @@ fn bounded_let_bindings(
         Some(TokenKind::Symbol(symbol)) if symbol == "let"
     ) && !term_locals::word(tokens, body_start + 1, ":")
         && !term_locals::word(tokens, body_start + 1, ":=")
+        // Captured names occupy more than one token and belong to the term
+        // parser's quotation-aware local binder phases.
+        && !(quotations::inside() && term_locals::word(tokens, body_start + 1, "$"))
     {
         let keyword = body_start;
         let recursive = term_locals::word(tokens, keyword + 1, "rec").then_some(keyword + 1);
@@ -3268,6 +3271,23 @@ thread_local! {
 
 struct NestedTerm;
 
+impl NestedTerm {
+    fn enter(
+        view: &SourceView,
+        tokens: &[LexedToken],
+        start: usize,
+    ) -> Result<Self, NatDefinitionParseError> {
+        if NESTED_TERMS.with(|open| open.get()) >= NESTED_TERM_DEPTH {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, start),
+                expected: NatDefinitionExpectation::ScalarValue,
+            });
+        }
+        NESTED_TERMS.with(|open| open.set(open.get() + 1));
+        Ok(Self)
+    }
+}
+
 impl Drop for NestedTerm {
     fn drop(&mut self) {
         NESTED_TERMS.with(|open| open.set(open.get() - 1));
@@ -3282,14 +3302,7 @@ fn nested_term(
     tokens: &[LexedToken],
     range: std::ops::Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    if NESTED_TERMS.with(|open| open.get()) >= NESTED_TERM_DEPTH {
-        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-            at: original_position(view, tokens, range.start),
-            expected: NatDefinitionExpectation::ScalarValue,
-        });
-    }
-    NESTED_TERMS.with(|open| open.set(open.get() + 1));
-    let _open = NestedTerm;
+    let _open = NestedTerm::enter(view, tokens, range.start)?;
     bounded_term(leaves, view, tokens, range, DefinitionGrammar::Scalar)
 }
 
@@ -3318,6 +3331,9 @@ fn bounded_term_at_precedence(
     range: std::ops::Range<usize>,
     minimum: u32,
 ) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    // A descriptor operand reenters the host parser just like an out-of-line
+    // binder annotation. Share that limit across both precedence paths.
+    let _open = NestedTerm::enter(view, tokens, range.start)?;
     if matches!(tokens.get(range.start).map(|token| &token.kind), Some(TokenKind::Symbol(symbol)) if symbol == "open")
     {
         let end = range.end;
@@ -6437,15 +6453,10 @@ fn parse_definition_with_grammar(
             },
         ) {
             Ok(capture) => capture.map(|(syntax, next)| (syntax, next, true)),
-            Err(_) => quotations::primitive(
-                &leaves,
-                &view,
-                &tokens,
-                cursor,
-                tokens.len(),
-                "ident",
-            )?
-            .map(|(syntax, next)| (syntax, next, false)),
+            Err(_) => {
+                quotations::primitive(&leaves, &view, &tokens, cursor, tokens.len(), "ident")?
+                    .map(|(syntax, next)| (syntax, next, false))
+            }
         }
     } else {
         None

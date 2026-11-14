@@ -957,7 +957,9 @@ impl ActiveGrammar {
                 (Some(category), true, descr @ Descr::Node { prec, body, .. })
                     if *category == term
                         && *prec >= LEAD_PREC
-                        && (ends_with_atom(body, 0) || symbol_then_argument(body)) =>
+                        && (ends_with_atom(body, 0)
+                            || ends_with_term(body, 0)
+                            || symbol_then_argument(body)) =>
                 {
                     // A named syntax abbreviation keeps `lead` as the default precedence even
                     // when its resolved description ends in an atom (`elabSyntax`). Its node
@@ -1124,6 +1126,28 @@ fn ends_with_atom(descr: &Descr, depth: usize) -> bool {
         Descr::Binary(name, left, right) => match simple(name).as_deref() {
             Some("andthen") => ends_with_atom(right, depth + 1),
             Some("orelse") => ends_with_atom(left, depth + 1) && ends_with_atom(right, depth + 1),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// A leading syntax with a final term owns that term through the enclosing
+/// expression's end (for example `bodyFn x => x + 1`). `Run` still applies its
+/// category precedence and delimiter boundaries, including a closing `)`.
+fn ends_with_term(descr: &Descr, depth: usize) -> bool {
+    if depth > MAX_DESCR_DEPTH {
+        return false;
+    }
+    match descr {
+        Descr::Cat(category, _) => simple(category).as_deref() == Some("term"),
+        Descr::Node { body, .. } | Descr::NodeWithAntiquot(_, _, body) => {
+            ends_with_term(body, depth + 1)
+        }
+        Descr::Unary(name, body) if input_wrapper(name) => ends_with_term(body, depth + 1),
+        Descr::Binary(name, left, right) => match simple(name).as_deref() {
+            Some("andthen") => ends_with_term(right, depth + 1),
+            Some("orelse") => ends_with_term(left, depth + 1) && ends_with_term(right, depth + 1),
             _ => false,
         },
         _ => false,
@@ -3017,6 +3041,7 @@ fn quotation_contents(quotation: &Syntax) -> Option<(Name, &Syntax)> {
 /// The variable an antiquotation `$x` (any kind, named or not) binds; `None` for anything else
 /// (a nested expression `$(e)`, an escaped `$$x`, a splice).
 fn antiquotation_name(syntax: &Syntax) -> Option<Name> {
+    let syntax = canonical_antiquotation(syntax)?;
     let Syntax::Node { kind, args, .. } = syntax else {
         return None;
     };
@@ -3036,6 +3061,28 @@ fn antiquotation_name(syntax: &Syntax) -> Option<Name> {
         }
         _ => None,
     }
+}
+
+/// The pin's `isAntiquots` / `getCanonicalAntiquot`: a parser choice among
+/// antiquotation kinds captures one syntax value. Binder identifiers produce
+/// exactly this choice because both `ident` and `hole` accept anonymous `$x`.
+fn canonical_antiquotation(syntax: &Syntax) -> Option<&Syntax> {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return None;
+    };
+    if kind.leaf_view() == LeafView::Str("antiquot") {
+        return Some(syntax);
+    }
+    if *kind != Name::from_components(["choice"]) || args.len() > MAX_TEMPLATE_NODES {
+        return None;
+    }
+    let first = args.first()?;
+    args.iter()
+        .all(|alternative| {
+            matches!(alternative, Syntax::Node { kind, .. }
+                if kind.leaf_view() == LeafView::Str("antiquot"))
+        })
+        .then_some(first)
 }
 
 /// Template nodes the macro body compiler walks before refusing.
@@ -4439,14 +4486,9 @@ impl Run<'_> {
                         return Some((vec![syntax], next));
                     }
                     Some("term") => {
-                        let syntax = crate::bounded_term(
-                            self.leaves,
-                            self.view,
-                            self.tokens,
-                            at..stop,
-                            DefinitionGrammar::Scalar,
-                        )
-                        .ok()?;
+                        let syntax =
+                            crate::nested_term(self.leaves, self.view, self.tokens, at..stop)
+                                .ok()?;
                         // `leadingNode` checks the category's requested minimum precedence.
                         // A one-token extension can fit `term_end` without meeting it; a
                         // parenthesized extension instead has the builtin parenthesis root.

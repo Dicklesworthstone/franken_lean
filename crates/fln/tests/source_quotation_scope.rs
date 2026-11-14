@@ -152,7 +152,7 @@ macro "identityType " a:ident x:ident : term => `(($a : Type) → ($x : $a) → 
 macro "allNamed " x:ident ":" t:term "," p:term : term => `(∀ ($x : $t), $p)
 def explicit : (A : Type) → A → A := polyIdentity A x
 def implicit : {A : Type} → A → A := implicitIdentity A x
-def strict : {A : Type} → A → A := strictIdentity A x
+def strict : ⦃A : Type⦄ → A → A := strictIdentity A x
 def typed : identityType A x := fun A x => x
 theorem explicit_value : explicit Nat 7 = 7 := rfl
 theorem implicit_value : implicit 7 = 7 := rfl
@@ -227,6 +227,10 @@ fn captured_binders_do_not_bypass_syntax_type_or_proof_checking() {
         (
             "wrong_domain",
             "macro \"typedFn \" x:ident : term => `(fun ($x : Bool) => $x)\ndef invalid : Nat → Nat := typedFn n",
+        ),
+        (
+            "wrong_implicit_binder_kind",
+            "macro \"strictIdentity \" a:ident x:ident : term => `(fun ⦃$a : Type⦄ ($x : $a) => $x)\ndef invalid : {A : Type} → A → A := strictIdentity A x",
         ),
         (
             "escaped_capture",

@@ -66,7 +66,7 @@ pub(super) struct DebugTrace {
 
 pub(super) struct Assertion {
     keyword: usize,
-    name: Option<usize>,
+    name: Option<Syntax>,
     pattern: Option<Syntax>,
     colon: Option<usize>,
     annotation: Option<Syntax>,
@@ -380,7 +380,7 @@ impl Prefix {
                 && matches!(&tokens[*cursor].kind, TokenKind::Ident(_))
                 && word(tokens, *cursor + 1, ":")
             {
-                assertion.name = Some(*cursor);
+                assertion.name = Some(leaves.leaf(*cursor)?);
                 assertion.colon = Some(*cursor + 1);
                 *cursor += 2;
             }
@@ -405,12 +405,17 @@ impl Prefix {
             }
             // `letId := binderIdent`: a name or the hole `_`.
             if assertion.pattern.is_none()
-                && *cursor < end
-                && (matches!(&tokens[*cursor].kind, TokenKind::Ident(_))
-                    || word(tokens, *cursor, "_"))
+                && let Some((name, next)) = term_binders::captured_name(
+                    leaves,
+                    view,
+                    tokens,
+                    *cursor,
+                    end,
+                    quotations::Position::BinderIdent,
+                )?
             {
-                assertion.name = Some(*cursor);
-                *cursor += 1;
+                assertion.name = Some(name);
+                *cursor = next;
             }
             // An anonymous `let : C := v` or `letI : C := v` names its local by hygiene, as an
             // anonymous `have` does (`letIdLhs`'s `hygieneInfo`).
@@ -697,12 +702,9 @@ impl Prefix {
         } else if p.form == Form::Suffices {
             // `atomic (group (binderIdent " : ")) <|> hygieneInfo`.
             let binder = match p.name {
-                Some(at) => Syntax::node(
+                Some(name) => Syntax::node(
                     Name::from_components(["group"]),
-                    vec![
-                        leaves.leaf(at)?,
-                        leaves.leaf(p.colon.expect("suffices colon"))?,
-                    ],
+                    vec![name, leaves.leaf(p.colon.expect("suffices colon"))?],
                 ),
                 None => hygiene_info_following(&leaves.leaf(p.keyword)?),
             };
@@ -734,13 +736,7 @@ impl Prefix {
             let equations = p.equations;
             let separator = separator(leaves, p.separator)?;
             let name = match p.name {
-                // `_` is a symbol, so its leaf is an atom: the hole `Term.hole`.
-                Some(at) => match leaves.leaf(at)? {
-                    hole @ Syntax::Atom { .. } => {
-                        Syntax::node(parser_kind(&["Term", "hole"]), vec![hole])
-                    }
-                    name => name,
-                },
+                Some(name) => name,
                 None => hygiene_info_following(&leaves.leaf(p.keyword)?),
             };
             let annotation = match (p.colon, p.annotation) {

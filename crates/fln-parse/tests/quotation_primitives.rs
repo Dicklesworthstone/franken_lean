@@ -148,3 +148,96 @@ fn nested_antiquotation_expressions_obey_quotation_depth_and_recover_on_error() 
     assert!(parse(source).is_ok(), "{source}");
     assert!(parse("def q := `(ident| «some identifier»)").is_ok());
 }
+
+/// Captured from Parser.Term's `binderIdent` alternatives on the pinned
+/// frontend. Unlike parenthesized lambda terms, these positions preserve both
+/// token-parser alternatives until the quotation selects its canonical capture.
+#[test]
+fn binder_captures_preserve_the_pins_ident_hole_choice() {
+    for body in [
+        "fun {$x : Type} => $x",
+        "fun ⦃$x : Type⦄ => $x",
+        "($x : Type) → $x",
+        "∀ ($x : Type), $x",
+        "let $x := 3; $x",
+        "have $x : Nat := 3; $x",
+    ] {
+        let source = format!("def q := `({body})");
+        let syntax = parse(&source).unwrap_or_else(|error| panic!("{source}: {error}"));
+        let mut pending = vec![&syntax];
+        let mut choices = 0;
+        while let Some(syntax) = pending.pop() {
+            if let Syntax::Node { kind, args, .. } = syntax {
+                if *kind == Name::from_components(["choice"]) {
+                    choices += 1;
+                    assert_eq!(args.len(), 2, "{source}");
+                    assert_eq!(
+                        args[0].kind(),
+                        Some(&Name::from_components(["ident", "antiquot"]))
+                    );
+                    assert_eq!(
+                        args[1].kind(),
+                        Some(&Name::from_components([
+                            "Lean", "Parser", "Term", "hole", "antiquot"
+                        ]))
+                    );
+                    let (Syntax::Node { args: ident, .. }, Syntax::Node { args: hole, .. }) =
+                        (&args[0], &args[1])
+                    else {
+                        panic!("{source}: {args:?}");
+                    };
+                    assert_eq!(ident, hole, "{source}");
+                }
+                pending.extend(args);
+            }
+        }
+        assert_eq!(choices, 1, "{source}");
+    }
+    for body in [
+        "fun ($x : Type) => $x",
+        "fun {$x:ident : Type} => $x",
+        "($x:ident : Type) → $x",
+        "let $x:ident := 3; $x",
+        "fun [$t:term] => 3",
+    ] {
+        let source = format!("def q := `({body})");
+        let syntax = parse(&source).unwrap_or_else(|error| panic!("{source}: {error}"));
+        let mut pending = vec![&syntax];
+        while let Some(syntax) = pending.pop() {
+            if let Syntax::Node { kind, args, .. } = syntax {
+                assert_ne!(*kind, Name::from_components(["choice"]), "{source}");
+                pending.extend(args);
+            }
+        }
+    }
+    for source in [
+        "def q := fun {$x : Type} => $x",
+        "def q := let $x := 3; $x",
+        "def q := `(∀ ($x:num : Type), $x)",
+        "def q := `(let $x:num := 3; $x)",
+    ] {
+        assert!(parse(source).is_err(), "accepted {source}");
+    }
+}
+
+#[test]
+fn leading_macros_own_their_final_term_and_bound_host_reentry() {
+    let mut file = FileGrammar::new(false, &[], None).unwrap();
+    let source = r#"macro "bodyFn " x:ident " => " body:term : term => `(fun $x => $body)"#;
+    let command =
+        with_grammar(&file.grammar(), || parse_source_command(source.as_bytes())).unwrap();
+    file.declare(command.syntax()).unwrap();
+    for source in [
+        "def increment : Nat → Nat := bodyFn n => n + 1",
+        "def applied : Nat := (bodyFn n => n + 1) 41",
+        "def nested := bodyFn x => bodyFn y => x + y",
+    ] {
+        let command = with_grammar(&file.grammar(), || parse_source_command(source.as_bytes()))
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        assert_eq!(command.reconstruct_original(), source.as_bytes());
+    }
+    let source = format!("def excessive := {}0", "bodyFn x => ".repeat(64));
+    assert!(with_grammar(&file.grammar(), || parse_source_command(source.as_bytes())).is_err());
+    let source = "def recovered := bodyFn n => n + 1";
+    assert!(with_grammar(&file.grammar(), || parse_source_command(source.as_bytes())).is_ok());
+}

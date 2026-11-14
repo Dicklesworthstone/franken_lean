@@ -43,7 +43,7 @@ fn predicate_operator(tokens: &[LexedToken], at: usize) -> bool {
 
 struct Group {
     open: usize,
-    names: std::ops::Range<usize>,
+    names: Vec<Syntax>,
     colon: Option<usize>,
     kind: &'static str,
     close: &'static str,
@@ -77,6 +77,22 @@ fn binder_name(
     } else {
         Ok(leaves.leaf(at)?)
     }
+}
+
+/// A name in a binder slot, including its complete quotation capture. Lambda
+/// parenthesized binders are terms; the other telescopes use `binderIdent`.
+pub(super) fn captured_name(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    at: usize,
+    end: usize,
+    position: quotations::Position,
+) -> Result<Option<(Syntax, usize)>, NatDefinitionParseError> {
+    if at < end && name(tokens, at) {
+        return Ok(Some((binder_name(leaves, tokens, at)?, at + 1)));
+    }
+    quotations::antiquotation(leaves, view, tokens, at, end, position)
 }
 
 pub(super) fn frame(
@@ -306,29 +322,47 @@ impl Prefix {
                 }
                 let open = *cursor;
                 *cursor += 1;
-                let start = *cursor;
+                let mut names = Vec::new();
                 if kind == "instBinder" {
-                    let named = name(tokens, *cursor) && symbol(tokens, *cursor + 1, ":");
-                    let colon = named.then_some(*cursor + 1);
-                    if named {
-                        *cursor += 2;
+                    let mut colon = None;
+                    // This is an optional atomic `ident :` prefix. A capture
+                    // with a different annotation may instead be its domain.
+                    if let Ok(Some((name, next))) = captured_name(
+                        leaves,
+                        view,
+                        tokens,
+                        *cursor,
+                        end,
+                        quotations::Position::Token("ident"),
+                    ) && symbol(tokens, next, ":")
+                    {
+                        names.push(name);
+                        colon = Some(next);
+                        *cursor = next + 1;
                     }
                     self.phase = Phase::Group(Group {
                         open,
-                        names: start..start + usize::from(named),
+                        names,
                         colon,
                         kind,
                         close,
                     });
                     return Ok(());
                 }
-                while *cursor < end && name(tokens, *cursor) {
-                    *cursor += 1;
+                let position = if self.lambda && kind == "explicitBinder" {
+                    quotations::Position::Term
+                } else {
+                    quotations::Position::BinderIdent
+                };
+                while let Some((name, next)) =
+                    captured_name(leaves, view, tokens, *cursor, end, position.clone())?
+                {
+                    names.push(name);
+                    *cursor = next;
                 }
-                if *cursor == start {
+                if names.is_empty() {
                     return Err(refuse(view, tokens, *cursor));
                 }
-                let names = start..*cursor;
                 if symbol(tokens, *cursor, ":") {
                     self.phase = Phase::Group(Group {
                         open,
@@ -380,16 +414,13 @@ impl Prefix {
     fn group_syntax(
         &self,
         leaves: &Leaves,
-        tokens: &[LexedToken],
+        _tokens: &[LexedToken],
         group: Group,
         at: usize,
         domain: Option<Syntax>,
         default: Option<Syntax>,
     ) -> Result<Syntax, NatDefinitionParseError> {
-        let names = group
-            .names
-            .map(|at| binder_name(leaves, tokens, at))
-            .collect::<Result<Vec<_>, _>>()?;
+        let names = group.names;
         if group.kind == "instBinder" {
             let mut named = names;
             if let Some(colon) = group.colon {
@@ -740,8 +771,33 @@ pub(super) fn arrow_openers(
             opener @ ("(" | "{" | "[" | "⦃" | ".{" | "⟨") => {
                 let binder = matches!(s.as_str(), "(" | "{" | "[" | "⦃" | ".{");
                 let mut next = at + 1;
-                while next < end && name(tokens, next) {
-                    next += 1;
+                while next < end {
+                    if name(tokens, next) {
+                        next += 1;
+                        continue;
+                    }
+                    if !quotations::inside() || !symbol(tokens, next, "$") {
+                        break;
+                    }
+                    // Scalar captures are enough to recognize a named Pi
+                    // header. The real parser validates spacing and labels.
+                    let mut after = next + 1;
+                    while after < end && symbol(tokens, after, "$") {
+                        after += 1;
+                    }
+                    if after >= end || !name(tokens, after) {
+                        break;
+                    }
+                    after += 1;
+                    if after + 1 < end
+                        && symbol(tokens, after, ":")
+                        && tokens[after - 1].extent.end() == tokens[after].extent.start()
+                        && tokens[after].extent.end() == tokens[after + 1].extent.start()
+                        && matches!(tokens[after + 1].kind, TokenKind::Ident(_))
+                    {
+                        after += 2;
+                    }
+                    next = after;
                 }
                 let typed = s == "[" || (next > at + 1 && next < end && symbol(tokens, next, ":"));
                 stack.push((at, if binder { opener } else { "" }, binder && typed));

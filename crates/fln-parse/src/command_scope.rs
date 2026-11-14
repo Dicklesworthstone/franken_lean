@@ -293,8 +293,7 @@ fn partition_declared_command_head(
     let source = view.normalized();
     let end = tokens.len().min(keyword.saturating_add(HEADER_TOKENS));
     let symbol = |at: usize, expected: &str| {
-        at < end
-            && matches!(&tokens[at].kind, TokenKind::Symbol(found) if found == expected)
+        at < end && matches!(&tokens[at].kind, TokenKind::Symbol(found) if found == expected)
     };
     let word = |at: usize, expected: &str| {
         at < end
@@ -362,8 +361,7 @@ fn partition_declared_command_head(
     for at in first + 1..end {
         let token = &tokens[at];
         if depth == 0
-            && source.line_of(token.extent.start())
-                > source.line_of(tokens[at - 1].extent.end())
+            && source.line_of(token.extent.start()) > source.line_of(tokens[at - 1].extent.end())
             && partition_column(view, token) <= base_column
         {
             return None;
@@ -428,12 +426,11 @@ fn partition_source_command_heads(
                 prefix_column.get_or_insert(column);
             } else if command_line || prefix_column.is_some() {
                 let base = prefix_column.take().unwrap_or(column);
-                if matches!(symbol, Some("syntax" | "macro")) {
-                    if let Some((head, after)) =
+                if matches!(symbol, Some("syntax" | "macro"))
+                    && let Some((head, after)) =
                         partition_declared_command_head(view, tokens, index, base)
-                    {
-                        heads.entry(head).or_insert(after);
-                    }
+                {
+                    heads.entry(head).or_insert(after);
                 }
                 if symbol == Some("#exit") {
                     break;
