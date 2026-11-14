@@ -3892,8 +3892,38 @@ pub(crate) fn infix_node(
     }
 }
 
-/// A tactic whose first token names an active `tactic` declaration: `None` when none does,
-/// otherwise the one declaration that reads exactly `range`.
+/// Select the unique highest-priority successful reading of a complete range.
+/// All candidates consume the same input, so longestMatchStep compares priority.
+/// Tied winners still require a choice node these adapters do not yet build.
+#[derive(Default)]
+struct UniquePriorityParse {
+    reading: Option<(Syntax, u32)>,
+    tied: bool,
+}
+
+impl UniquePriorityParse {
+    fn consider(&mut self, syntax: &Syntax, priority: u32) {
+        match self.reading.as_ref().map(|(_, priority)| *priority) {
+            Some(best) if best > priority => {}
+            Some(best) if best == priority => self.tied = true,
+            _ => {
+                self.reading = Some((syntax.clone(), priority));
+                self.tied = false;
+            }
+        }
+    }
+
+    fn finish(self) -> Option<Syntax> {
+        if self.tied {
+            None
+        } else {
+            self.reading.map(|(syntax, _)| syntax)
+        }
+    }
+}
+
+/// A tactic whose first token names an active tactic declaration: the unique
+/// highest-priority declaration that reads exactly the complete range.
 pub(crate) fn tactic(
     leaves: &Leaves,
     view: &SourceView,
@@ -3908,21 +3938,17 @@ pub(crate) fn tactic(
         view,
         tokens,
     };
-    let mut parsed = None;
+    let mut parsed = UniquePriorityParse::default();
     for &index in candidates {
         let descr = &grammar.decls[index].descr;
         if let Some((items, end)) = run.parse(descr, range.start, range.end, &Follow::End, 0)
             && end == range.end
             && let [syntax] = items.as_slice()
         {
-            if parsed.is_some() {
-                // Two parsers read the same input: the pin's `choice` node, not built here.
-                return None;
-            }
-            parsed = Some(syntax.clone());
+            parsed.consider(syntax, grammar.decls[index].priority);
         }
     }
-    parsed
+    parsed.finish()
 }
 
 /// An atom-like term notation of the active grammar at index, read up to end
@@ -4051,8 +4077,8 @@ pub(crate) fn is_partition_command_keyword(symbol: &str) -> bool {
     })
 }
 
-/// The command in `range` read by the active `command` declaration its first token names (`seal`,
-/// `declare_simp_like_tactic`): `None` unless exactly one such declaration reads exactly `range`.
+/// The command in the complete range read by the unique highest-priority active
+/// command declaration its first token names.
 pub(crate) fn command(
     leaves: &Leaves,
     view: &SourceView,
@@ -4067,7 +4093,7 @@ pub(crate) fn command(
             view,
             tokens,
         };
-        let mut parsed = None;
+        let mut parsed = UniquePriorityParse::default();
         for &index in grammar.commands.get(head.as_str())? {
             if !categories::tick() {
                 return None;
@@ -4081,18 +4107,15 @@ pub(crate) fn command(
             ) && end == range.end
                 && let [syntax] = items.as_slice()
             {
-                if parsed.is_some() {
-                    return None;
-                }
-                parsed = Some(syntax.clone());
+                parsed.consider(syntax, grammar.decls[index].priority);
             }
         }
-        parsed
+        parsed.finish()
     })
 }
 
-/// The attribute in `range` read by the active `attr` declaration its first token names: `None`
-/// unless exactly one such declaration reads exactly `range`.
+/// The attribute in the complete range read by the unique highest-priority active
+/// attribute declaration its first token names.
 pub(crate) fn attribute(
     leaves: &Leaves,
     view: &SourceView,
@@ -4106,7 +4129,7 @@ pub(crate) fn attribute(
         view,
         tokens,
     };
-    let mut parsed = None;
+    let mut parsed = UniquePriorityParse::default();
     for &index in grammar.attrs.get(head.as_str())? {
         if let Some((items, end)) = run.parse(
             &grammar.decls[index].descr,
@@ -4117,13 +4140,10 @@ pub(crate) fn attribute(
         ) && end == range.end
             && let [syntax] = items.as_slice()
         {
-            if parsed.is_some() {
-                return None;
-            }
-            parsed = Some(syntax.clone());
+            parsed.consider(syntax, grammar.decls[index].priority);
         }
     }
-    parsed
+    parsed.finish()
 }
 
 /// Whether a term notation of the active grammar may stand as an application's argument:

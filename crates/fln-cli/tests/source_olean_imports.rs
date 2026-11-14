@@ -607,10 +607,14 @@ fn imported_macro_checking_runs_the_real_companion_and_keeps_admission_authority
     );
     assert!(!stdout.contains("\"vmSteps\":0,"), "{stdout}");
 
+    // Keep this no-policy control independent of a materialized checkout census.
     let ordinary = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["check-source", "--json"])
         .env("LEAN_PATH", &search)
+        .env("LEAN_SYSROOT", root.join("sysroot"))
         .env("FLN_IMPORT_REUSE_DIR", &cache)
+        .env_remove("FLN_MACRO_PARTITION")
+        .env_remove("FLN_SYNTAX_MODULES")
         .arg(&entry)
         .output()
         .unwrap();

@@ -94,6 +94,87 @@ fn leading_syntax_can_end_in_a_later_argument_precedence_term() {
 }
 
 #[test]
+fn complete_extension_readings_select_the_unique_highest_priority() {
+    for (category, source) in [
+        ("tactic", "example : True := by select! 42"),
+        ("command", "select! 42"),
+        ("attr", "@[select! 42] def value := 0"),
+    ] {
+        let declarations = [
+            ("firstLow", "low"),
+            ("secondLow", "low"),
+            ("preferred", "high"),
+        ]
+        .map(|(label, priority)| {
+            format!(
+                "syntax (name := {label}) (priority := {priority}) \"select!\" num : {category}"
+            )
+        });
+        // Earlier lower-priority ties cannot hide a later winner, and later
+        // losing readings cannot make an existing winner ambiguous.
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let ordered = order.map(|index| declarations[index].as_str());
+            let grammar = grammar_after(&[], &ordered);
+            let parsed = with_grammar(&grammar.grammar(), || {
+                parse_source_command(source.as_bytes())
+            })
+            .unwrap_or_else(|error| panic!("{category}: {order:?}: {error:?}"));
+            let actual = kinds(parsed.syntax());
+            assert!(actual.contains(&name("preferred")), "{actual:?}");
+            assert!(!actual.contains(&name("firstLow")), "{actual:?}");
+            assert!(!actual.contains(&name("secondLow")), "{actual:?}");
+            assert!(!actual.contains(&name("choice")), "{actual:?}");
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn complete_extension_readings_refuse_tied_highest_priorities() {
+    for (category, source) in [
+        ("tactic", "example : True := by unresolved! 42"),
+        ("command", "unresolved! 42"),
+        ("attr", "@[unresolved! 42] def value := 0"),
+    ] {
+        let declarations = [
+            ("firstHigh", "high"),
+            ("secondHigh", "high"),
+            ("fallback", "low"),
+        ]
+        .map(|(label, priority)| {
+            format!(
+                "syntax (name := {label}) (priority := {priority}) \"unresolved!\" num : {category}"
+            )
+        });
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let ordered = order.map(|index| declarations[index].as_str());
+            let grammar = grammar_after(&[], &ordered);
+            assert!(
+                with_grammar(&grammar.grammar(), || parse_source_command(
+                    source.as_bytes()
+                ))
+                .is_err(),
+                "{category}: {order:?}: tied winners require a choice node"
+            );
+        }
+    }
+}
+
+#[test]
 fn the_census_descriptions_parse_and_count() {
     let census = extension_census();
     assert_eq!(
