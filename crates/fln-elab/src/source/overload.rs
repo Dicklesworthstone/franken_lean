@@ -131,7 +131,9 @@ impl Context {
                 self.next = next;
                 Ok(term)
             }
-            None => Err(failure(SourceInferenceError::SyntaxChoiceFailed { failures })),
+            None => Err(failure(SourceInferenceError::SyntaxChoiceFailed {
+                failures,
+            })),
         }
     }
 

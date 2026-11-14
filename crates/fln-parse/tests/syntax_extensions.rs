@@ -373,7 +373,10 @@ fn tied_leading_notations_preserve_all_readings_and_application_precedence() {
         );
     }
     assert!(
-        with_grammar(&low.grammar(), || parse_source_command(b"def v := take! (low!)")).is_ok()
+        with_grammar(&low.grammar(), || parse_source_command(
+            b"def v := take! (low!)"
+        ))
+        .is_ok()
     );
 }
 

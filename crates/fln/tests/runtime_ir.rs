@@ -826,7 +826,10 @@ fn fieldless_enum_exports_preserve_scalar_signatures_and_private_layouts() {
             panic!("enum source entry")
         };
         assert_eq!(
-            params.iter().map(|param| param.ty.clone()).collect::<Vec<_>>(),
+            params
+                .iter()
+                .map(|param| param.ty.clone())
+                .collect::<Vec<_>>(),
             case.parameters,
             "{source}",
         );
@@ -876,9 +879,11 @@ fn fieldless_enum_exports_preserve_scalar_signatures_and_private_layouts() {
                     limits(),
                     CompileLimits::default(),
                 ),
-                Err(ir::DefinitionCompileError::Ir(ir::CompileError::Unsupported {
-                    what: "source export carrier",
-                }))
+                Err(ir::DefinitionCompileError::Ir(
+                    ir::CompileError::Unsupported {
+                        what: "source export carrier",
+                    }
+                ))
             ),
             "unsupported enum layout must refuse: {source}",
         );
@@ -2047,7 +2052,14 @@ fn the_pin_executes_fieldless_enum_exports_and_observes_their_tags() {
         std::fs::write(dir.join("original.ir"), &original).unwrap();
         let expected = format!("{}\n{}", case.expected, case.expected);
         assert_probe(
-            consume_enum_ir(&lean, &dir, "original", case.ty, case.application, "compiled"),
+            consume_enum_ir(
+                &lean,
+                &dir,
+                "original",
+                case.ty,
+                case.application,
+                "compiled",
+            ),
             &dir,
             "original",
             &expected,
@@ -2067,7 +2079,11 @@ fn the_pin_executes_fieldless_enum_exports_and_observes_their_tags() {
                 &expected,
             );
         }
-        std::fs::write(dir.join("NativeIrCase.ir"), encode(&compiled.module, &original)).unwrap();
+        std::fs::write(
+            dir.join("NativeIrCase.ir"),
+            encode(&compiled.module, &original),
+        )
+        .unwrap();
         assert_probe(
             consume_enum_ir(&lean, &dir, "native", case.ty, case.application, "compiled"),
             &dir,

@@ -3981,17 +3981,14 @@ pub(crate) fn leading_term(
 /// The prefix notation of the active grammar spelled symbol: its kind and
 /// the precedence its operand is read at.
 pub(crate) fn prefix(symbol: &str) -> Option<(Name, u8)> {
-    active()?
-        .prefixes
-        .get(symbol)
-        .map(|(kinds, operand, _)| {
-            let kind = if kinds.len() == 1 {
-                kinds[0].clone()
-            } else {
-                Name::from_components(["choice"])
-            };
-            (kind, *operand)
-        })
+    active()?.prefixes.get(symbol).map(|(kinds, operand, _)| {
+        let kind = if kinds.len() == 1 {
+            kinds[0].clone()
+        } else {
+            Name::from_components(["choice"])
+        };
+        (kind, *operand)
+    })
 }
 
 /// Build every retained prefix reading around the same bounded operand.

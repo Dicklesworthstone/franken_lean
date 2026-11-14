@@ -2157,8 +2157,8 @@ fn finish_bounded_application(
         && matches!(&tokens[terms[0].1 - 1].kind, TokenKind::Symbol(s) if s == "(");
     // `app := trailing_parser:leadPrec:maxPrec many1 argArg`: a notation of the entered grammar
     // at `max` precedence is a head too (`wp⟦x⟧ Q`).
-    let notation_head = grammar == DefinitionGrammar::Scalar
-        && extensions::is_max_prec_notation(&terms[0].0);
+    let notation_head =
+        grammar == DefinitionGrammar::Scalar && extensions::is_max_prec_notation(&terms[0].0);
     // A raw operator consumes exactly its own operands at `maxPrec`; an
     // application after that complete leading term applies its result.
     let elaborator_head = grammar == DefinitionGrammar::Scalar
@@ -4920,9 +4920,7 @@ fn bounded_term_compound_token(
                     extensions::leading_term(leaves, view, tokens, index, range.end, minimum)
             {
                 let frame = frames.last_mut().expect("root term frame");
-                if !frame.application.is_empty()
-                    && !extensions::is_argument_notation(&term)
-                {
+                if !frame.application.is_empty() && !extensions::is_argument_notation(&term) {
                     return Err(NatDefinitionParseError::OutsideSeedGrammar {
                         at: original_position(view, tokens, index),
                         expected: grammar.value_expectation(),

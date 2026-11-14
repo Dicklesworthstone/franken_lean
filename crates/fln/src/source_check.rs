@@ -190,6 +190,9 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
             SourceInferenceError::Tactic(fln_elab::source::TacticError::SimprocUnsupported(_)) => {
                 ("capability", false, 5)
             }
+            SourceInferenceError::Tactic(fln_elab::source::TacticError::AuxLemmaUnsupported(_)) => {
+                ("capability", false, 5)
+            }
             // A native evaluation this engine could not run is not a verdict on the source.
             SourceInferenceError::NativeEvaluation(
                 fln_elab::native::NativeEvaluationError::Fault(_),

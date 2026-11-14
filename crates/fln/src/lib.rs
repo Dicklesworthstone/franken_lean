@@ -2364,7 +2364,17 @@ impl Engine {
                     ),
                 ))
             })?;
-        let result = self
+        let auxiliaries = if elaborated.auxiliary_declarations.is_empty() {
+            None
+        } else {
+            match self.admit_declarations(&elaborated.auxiliary_declarations, options, limits)? {
+                Outcome::Complete(admitted) => Some(admitted),
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
+        };
+        let predecessor = auxiliaries.as_ref().map_or(self, |batch| &batch.engine);
+        let result = predecessor
             .admit_declaration(elaborated.declaration, options, limits)
             .map_err(EngineExecutionError::from)?;
         Ok(match result {
@@ -2514,7 +2524,17 @@ impl Engine {
                     .for_declaration(syntax)
                     .map_err(DefinitionFrontendError::Elaborate)
                     .map_err(EngineExecutionError::Frontend)?;
-                return self.finish_source_simp_admission(admitted, simp, &scope, options, limits);
+                let result =
+                    self.finish_source_simp_admission(admitted, simp, &scope, options, limits)?;
+                return Ok(result.map_complete(|mut admitted| {
+                    // Owner-specific attributes and helpers are already complete.
+                    // Retain every real predecessor receipt in dependency order.
+                    if let Some(auxiliaries) = auxiliaries {
+                        admitted.base_logical_root = auxiliaries.base_logical_root;
+                        admitted.admissions.splice(0..0, auxiliaries.admissions);
+                    }
+                    admitted
+                }));
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -2648,20 +2668,22 @@ impl Engine {
         }
         let scope = &scope;
         let name = fresh_generated_command_name(self.environment(), command_index)?;
-        // The axioms `native_decide` added while elaborating an example.
-        let mut native_axioms = Vec::new();
+        // The ordered auxiliary candidates selected while elaborating an example.
+        let mut auxiliary_declarations = Vec::new();
         let declaration = source_records::elaboration_outcome(match parsed.kind() {
-            SourceCommandKind::Example => fln_elab::source::scope::elaborate_example_with_axioms(
-                parsed.syntax(),
-                name,
-                self.environment(),
-                limits.kernel,
-                scope,
-            )
-            .map(|(declaration, axioms)| {
-                native_axioms = axioms;
-                (declaration, Vec::new())
-            }),
+            SourceCommandKind::Example => {
+                fln_elab::source::scope::elaborate_example_with_auxiliaries(
+                    parsed.syntax(),
+                    name,
+                    self.environment(),
+                    limits.kernel,
+                    scope,
+                )
+                .map(|(declaration, axioms)| {
+                    auxiliary_declarations = axioms;
+                    (declaration, Vec::new())
+                })
+            }
             SourceCommandKind::Check
                 if scope != &fln_elab::source::scope::SourceScope::default() =>
             {
@@ -2695,13 +2717,13 @@ impl Engine {
                 });
             }
         };
-        // The scratch successor admits the axioms first, through both checkers, as the pin's
-        // `addDecl` adds them before the example citing them; it is discarded with the rest.
+        // Each auxiliary crosses both checkers before the example citing it.
+        // This entire scratch successor is discarded when the query completes.
         let environment_root = self.logical_root(options);
-        let scratch = if native_axioms.is_empty() {
+        let scratch = if auxiliary_declarations.is_empty() {
             None
         } else {
-            match self.admit_declarations(&native_axioms, options, limits)? {
+            match self.admit_declarations(&auxiliary_declarations, options, limits)? {
                 Outcome::Complete(admission) => Some(admission.engine),
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -4278,7 +4300,7 @@ impl Engine {
                         (
                             fln_elab::source::ElaboratedDeclaration {
                                 declaration,
-                                native_axioms: Vec::new(),
+                                auxiliary_declarations: Vec::new(),
                                 equation_info: None,
                                 local_functions: Vec::new(),
                                 irreducible: false,
@@ -4348,7 +4370,7 @@ impl Engine {
             )?;
             let fln_elab::source::ElaboratedDeclaration {
                 declaration,
-                native_axioms,
+                auxiliary_declarations,
                 equation_info,
                 local_functions,
                 irreducible,
@@ -4501,14 +4523,13 @@ impl Engine {
                 || is_proof_definition
                 || uses_sorry
             {
-                // The axioms `native_decide` added come first, each through both checkers, as
-                // the pin's `addDecl` adds them before the declaration citing them
-                // (vendored `Lean/Meta/Native.lean:73-80`).
-                let axioms = if native_axioms.is_empty() {
+                // Ordered auxiliary declarations cross both checkers before
+                // the owner that cites them; no receipt is inferred or merged.
+                let auxiliaries = if auxiliary_declarations.is_empty() {
                     None
                 } else {
                     match engine
-                        .admit_declarations(&native_axioms, options, limits.admission())
+                        .admit_declarations(&auxiliary_declarations, options, limits.admission())
                         .map_err(|error| EngineExecutionError::BatchCommand {
                             index: command_index,
                             error: Box::new(error.into()),
@@ -4519,7 +4540,7 @@ impl Engine {
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     }
                 };
-                let base = axioms.as_ref().map_or(&engine, |axioms| &axioms.engine);
+                let base = auxiliaries.as_ref().map_or(&engine, |batch| &batch.engine);
                 let mut admission = match base
                     .admit_declarations(&[declaration], options, limits.admission())
                     .map_err(|error| EngineExecutionError::BatchCommand {
@@ -4604,10 +4625,10 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                // One command, one transition: the axioms precede the declaration in it.
-                if let Some(axioms) = axioms {
-                    admission.base_logical_root = axioms.base_logical_root;
-                    admission.admissions.splice(0..0, axioms.admissions);
+                // One command, one transition, retaining every auxiliary receipt.
+                if let Some(auxiliaries) = auxiliaries {
+                    admission.base_logical_root = auxiliaries.base_logical_root;
+                    admission.admissions.splice(0..0, auxiliaries.admissions);
                 }
                 scopes
                     .admitted_batch(&admission, admission.engine.environment(), None)
@@ -4624,12 +4645,19 @@ impl Engine {
                 );
                 continue;
             }
-            if !native_axioms.is_empty() {
-                // An executed definition's record has no place for an axiom before it.
+            if !auxiliary_declarations.is_empty() {
+                // An executed definition's record has no predecessor receipt slot.
                 return Err(EngineExecutionError::BatchCommand {
                     index: command_index,
                     error: Box::new(EngineExecutionError::NotImplemented {
-                        feature: "`native_decide` in a definition this engine compiles",
+                        feature: if auxiliary_declarations
+                            .iter()
+                            .any(|declaration| matches!(declaration, Declaration::Axiom(_)))
+                        {
+                            "`native_decide` in a definition this engine compiles"
+                        } else {
+                            "auxiliary theorems in a definition this engine compiles"
+                        },
                     }),
                     at: Some(original_offset),
                 });
@@ -5687,6 +5715,11 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        if !elaborated.auxiliary_declarations.is_empty() {
+            return Err(EngineExecutionError::NotImplemented {
+                feature: "auxiliary declarations in a direct executable source definition",
+            });
+        }
         Ok(
             match self.execute_definition_entry_with_helpers(
                 elaborated.declaration,

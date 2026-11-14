@@ -615,9 +615,7 @@ fn fieldless_enum_ir_facets_preserve_admission_and_replay_from_checked_cache() {
             let fln_olean::ir::IrDecl::Function { params, result, .. } = ir
                 .decls
                 .iter()
-                .find(|declaration| {
-                    declaration.name() == &fln::Name::from_components(["identity"])
-                })
+                .find(|declaration| declaration.name() == &fln::Name::from_components(["identity"]))
                 .unwrap()
             else {
                 panic!("checked enum identity export")
@@ -660,9 +658,7 @@ fn singleton_enum_ir_facet_uses_the_tagged_source_carrier() {
     let fln_olean::ir::IrDecl::Function { params, result, .. } = ir
         .decls
         .iter()
-        .find(|declaration| {
-            declaration.name() == &fln::Name::from_components(["Lib", "identity"])
-        })
+        .find(|declaration| declaration.name() == &fln::Name::from_components(["Lib", "identity"]))
         .unwrap()
     else {
         panic!("checked singleton identity export")

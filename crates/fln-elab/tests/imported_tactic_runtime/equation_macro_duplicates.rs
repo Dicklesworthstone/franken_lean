@@ -87,7 +87,7 @@ fn elaborate_matrix(
     let actual = trace::elaborate_definition(&syntax, &environment, budget(), &scope)
         .unwrap_or_else(|error| panic!("{source}: {error:?}"))
         .candidate;
-    assert!(actual.native_axioms.is_empty());
+    assert!(actual.auxiliary_declarations.is_empty());
     assert!(actual.local_functions.is_empty());
     assert!(
         matches!(

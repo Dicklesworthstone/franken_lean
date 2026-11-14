@@ -390,8 +390,8 @@ impl SourceScope {
         // Validate only its source-name portion, qualify that portion in the
         // invocation namespace, and retain the complete hygiene identity.
         // Arbitrary numeric/internal names still fail the source-name check.
-        let mut scoped = fln_syntax::hygiene::extract_macro_scopes(name)
-            .map_err(|_| ScopeError::InvalidName)?;
+        let mut scoped =
+            fln_syntax::hygiene::extract_macro_scopes(name).map_err(|_| ScopeError::InvalidName)?;
         let parts = components(&scoped.name)?;
         if parts.is_empty() {
             return Err(ScopeError::InvalidName);
@@ -1078,9 +1078,9 @@ pub fn elaborate_example(
     example_in_context(syntax, name, &mut context)
 }
 
-/// [`elaborate_example`], with `native_decide` available: the axioms it added, in order
-/// (`crate::native`), which the caller admits into the scratch successor before the candidate.
-pub fn elaborate_example_with_axioms(
+/// [`elaborate_example`] with ordered auxiliary effects. Every theorem or native
+/// axiom must be admitted into the scratch successor before its example owner.
+pub fn elaborate_example_with_auxiliaries(
     syntax: &Syntax,
     name: Name,
     env: &Environment,
@@ -1089,8 +1089,12 @@ pub fn elaborate_example_with_axioms(
 ) -> Result<(Declaration, Vec<Declaration>), NatDefinitionElabError> {
     let mut context = Context::scoped(env, kernel, scope)?;
     context.native = scope.native.clone();
+    context.allow_auxiliary_declarations = true;
     let declaration = example_in_context(syntax, name, &mut context)?;
-    Ok((declaration, std::mem::take(&mut context.native_axioms)))
+    Ok((
+        declaration,
+        std::mem::take(&mut context.auxiliary_declarations),
+    ))
 }
 
 pub(super) fn example_in_context(

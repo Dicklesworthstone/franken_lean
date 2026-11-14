@@ -48,7 +48,7 @@ impl AuxNames {
 /// The universe parameters of `expr` in the order the pin's `collectLevelParams` meets them
 /// (vendored Lean/Util/CollectLevelParams.lean): function before argument, binder domain before
 /// body, a constant's levels left to right; each name once.
-fn level_params_in_order(
+pub(super) fn level_params_in_order(
     expr: &Expr,
     mut tick: impl FnMut() -> Result<(), NatDefinitionElabError>,
 ) -> Result<Vec<Name>, NatDefinitionElabError> {
@@ -165,7 +165,7 @@ impl Context {
 
     /// `mkAuxDeclName infix` (vendored Lean/CoreM.lean:149-153): the generator's next name that
     /// no constant has, keeping the index it reached.
-    fn aux_decl_name(&mut self, infix: &Name) -> Result<Name, NatDefinitionElabError> {
+    pub(super) fn aux_decl_name(&mut self, infix: &Name) -> Result<Name, NatDefinitionElabError> {
         let mut names = self
             .aux_names
             .clone()
@@ -326,6 +326,15 @@ impl Context {
         &mut self,
         axiom: fln_env::constants::AxiomVal,
     ) -> Result<(), NatDefinitionElabError> {
+        self.expose_auxiliary_declaration(Declaration::Axiom(axiom))
+    }
+
+    /// Check the candidate before later elaboration may refer to its constant.
+    /// Final publication still requires the facade's independent checker seat.
+    pub(super) fn expose_auxiliary_declaration(
+        &mut self,
+        declaration: Declaration,
+    ) -> Result<(), NatDefinitionElabError> {
         use fln_core::outcome::InternalFault;
         use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
         use fln_env::pmap::CollisionBudget;
@@ -345,7 +354,7 @@ impl Context {
             .kernel
             .narrowed(self.kernel.steps.min(remaining), self.kernel.depth);
         let nonanswer = |outcome| failure(SourceInferenceError::TypeObligation(Box::new(outcome)));
-        let admitted = match admit(&self.txn.env, Declaration::Axiom(axiom.clone()), kernel) {
+        let admitted = match admit(&self.txn.env, declaration.clone(), kernel) {
             Outcome::Complete(admitted) => admitted,
             Outcome::Inconclusive(reason) => return Err(nonanswer(Outcome::Inconclusive(reason))),
             Outcome::InternalFault(fault) => return Err(nonanswer(Outcome::InternalFault(fault))),
@@ -378,7 +387,7 @@ impl Context {
             CouncilOutcome::Halted(_) => {
                 return Err(nonanswer(Outcome::InternalFault(InternalFault::new(
                     "FL-INV-02",
-                    "an empty local native-axiom council halted",
+                    "an empty local auxiliary-declaration council halted",
                 ))));
             }
         };
@@ -393,14 +402,14 @@ impl Context {
             Outcome::Complete(_) => {
                 return Err(nonanswer(Outcome::InternalFault(InternalFault::new(
                     "FL-INV-02",
-                    "a fresh checked native axiom did not commit",
+                    "a fresh checked auxiliary declaration did not commit",
                 ))));
             }
             Outcome::Inconclusive(reason) => return Err(nonanswer(Outcome::Inconclusive(reason))),
             Outcome::InternalFault(fault) => return Err(nonanswer(Outcome::InternalFault(fault))),
         };
         self.txn.env = environment;
-        self.native_axioms.push(Declaration::Axiom(axiom));
+        self.auxiliary_declarations.push(declaration);
         Ok(())
     }
 
@@ -927,18 +936,18 @@ mod tests {
         let axiom = native_axiom("nativeAccepted", Expr::sort(Level::zero()));
         context.expose_native_axiom(axiom.clone()).unwrap();
         assert!(context.txn.env.contains(&axiom.base.name));
-        assert_eq!(context.native_axioms.len(), 1);
+        assert_eq!(context.auxiliary_declarations.len(), 1);
         assert!(context.txn.budget.heartbeats_consumed > 0);
 
         let before = context.txn.env.clone();
-        let before_count = context.native_axioms.len();
+        let before_count = context.auxiliary_declarations.len();
         let invalid = native_axiom("nativeInvalid", Expr::bvar(0).unwrap());
         let error = context.expose_native_axiom(invalid).unwrap_err();
         assert!(matches!(error,
             NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(outcome))
                 if matches!(*outcome, Outcome::Complete(Verdict::Rejected { .. }))));
         assert_eq!(context.txn.env, before);
-        assert_eq!(context.native_axioms.len(), before_count);
+        assert_eq!(context.auxiliary_declarations.len(), before_count);
         assert!(!context.txn.env.contains(&n("nativeInvalid")));
     }
 
@@ -953,10 +962,10 @@ mod tests {
             NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(outcome))
                 if matches!(*outcome, Outcome::Inconclusive(_))));
         assert_eq!(context.txn.env, before);
-        assert!(context.native_axioms.is_empty());
+        assert!(context.auxiliary_declarations.is_empty());
         context.kernel = Budget::for_stack_bytes(2 * 1024 * 1024);
         context.expose_native_axiom(axiom.clone()).unwrap();
         assert!(context.txn.env.contains(&axiom.base.name));
-        assert_eq!(context.native_axioms.len(), 1);
+        assert_eq!(context.auxiliary_declarations.len(), 1);
     }
 }

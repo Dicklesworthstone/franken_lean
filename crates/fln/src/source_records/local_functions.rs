@@ -4,7 +4,8 @@ use super::*;
 
 /// One source declaration and all of its separately checked local helpers.
 /// `checker` describes the primary declaration only. `admissions` carries every
-/// actual transition, in publication order, including the primary at index 0.
+/// actual transition in publication order: auxiliary predecessors, the primary,
+/// and any later local helpers. Metadata always describes the primary itself.
 #[derive(Debug)]
 pub struct SourceDeclarationAdmission {
     pub engine: Engine,

@@ -271,6 +271,8 @@ fn any_control_word(tokens: &[LexedToken], at: usize) -> Option<(&'static str, &
         Some(("repeat", "tacticRepeat_"))
     } else if word(tokens, at, "repeat'") {
         Some(("repeat'", "repeat'"))
+    } else if word(tokens, at, "as_aux_lemma") {
+        Some(("as_aux_lemma", "as_aux_lemma"))
     } else if let Some(&(text, kind)) = [
         // `syntax (name := k) "w " tacticSeq : tactic` (`Init/Tactics.lean`), as the census lists
         // them: the sequence takes every `;`-separated tactic after it.
@@ -425,7 +427,12 @@ fn plan_control(
     // `"case " sepBy1(caseArg, " | ") " => " tacticSeq`, each `caseArg` a tag and its names.
     let case = keyword == "case" || keyword == "case'";
     // `"set_option " ident optionValue " in " tacticSeq`: the name and the value, then `in`.
-    let (names, arrow) = if keyword == "set_option" {
+    let (names, arrow) = if keyword == "as_aux_lemma" {
+        if !symbol(tokens, start + 1, "=>") {
+            return Err(refusal(view, tokens, start + 1));
+        }
+        (start + 1..start + 1, Some(start + 1))
+    } else if keyword == "set_option" {
         if !word(tokens, start + 3, "in") {
             return Err(refusal(view, tokens, start + 3));
         }
@@ -1098,6 +1105,15 @@ fn finish_control(
             Name::from_components(["Lean", "cdot"]),
             vec![
                 Syntax::node(Name::from_components(["Lean", "cdotTk"]), vec![keyword]),
+                body,
+            ],
+        )
+    } else if plan.kind == "as_aux_lemma" {
+        Syntax::node(
+            control_kind(plan.kind),
+            vec![
+                keyword,
+                leaves.leaf(plan.arrow.expect("auxiliary arrow"))?,
                 body,
             ],
         )
@@ -2455,6 +2471,61 @@ mod tests {
 #[cfg(test)]
 mod goal_control_tests {
     use super::*;
+    #[test]
+    fn auxiliary_arrow_sequences_preserve_body_ownership() {
+        for (source, expected_body_tactics) in [
+            (
+                "theorem t (P : Prop) (h : P) : P := by as_aux_lemma => exact h",
+                1,
+            ),
+            (
+                "theorem t (P : Prop) (h : P) : P := by as_aux_lemma => skip; exact h",
+                2,
+            ),
+            (
+                "theorem t (P : Prop) (h : P) : P ∧ P := by\r\n  constructor\r\n  as_aux_lemma => exact h\r\n  exact h\r\n",
+                1,
+            ),
+        ] {
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            let mut pending = vec![parsed.syntax()];
+            let arguments = loop {
+                let syntax = pending.pop().expect("auxiliary tactic");
+                if let Syntax::Node { kind, args, .. } = syntax {
+                    if kind == &parser_kind(&["Tactic", "as_aux_lemma"]) {
+                        break args;
+                    }
+                    pending.extend(args.iter());
+                }
+            };
+            assert_eq!(arguments.len(), 3);
+            assert!(matches!(&arguments[1], Syntax::Atom { val, .. } if val == "=>"));
+            let mut pending = vec![&arguments[2]];
+            let mut body_tactics = 0;
+            while let Some(syntax) = pending.pop() {
+                if let Syntax::Node { kind, args, .. } = syntax {
+                    if kind == &parser_kind(&["Tactic", "exact"])
+                        || kind == &parser_kind(&["Tactic", "skip"])
+                    {
+                        body_tactics += 1;
+                    }
+                    pending.extend(args.iter());
+                }
+            }
+            assert_eq!(body_tactics, expected_body_tactics, "{source}");
+        }
+        for body in [
+            "as_aux_lemma",
+            "as_aux_lemma =>",
+            "as_aux_lemma exact h",
+            "as_aux_lemma x => exact h",
+        ] {
+            let source = format!("theorem t (P : Prop) (h : P) : P := by {body}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
     #[test]
     fn goal_scopes_preserve_original_leaves_and_statement_boundaries() {
         for source in [

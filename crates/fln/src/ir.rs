@@ -1428,9 +1428,7 @@ fn simple_source_parameter_uses(
                 }
             }
             ExprNode::App { f, a } => {
-                if let Some([condition, no, yes]) =
-                    source_boolean_case(expr, environment, meter)?
-                {
+                if let Some([condition, no, yes]) = source_boolean_case(expr, environment, meter)? {
                     // A literal scrutinee can erase an arm before the pin
                     // chooses its reduced entry. Leave that optimization out
                     // of multiargument source exports until it is modeled.
@@ -2062,7 +2060,7 @@ fn source_enum_constructors(
         || inductive.ctors.is_empty()
         || inductive.ctors.len() > usize::from(fln_rt::abi::TAG_MAX_CTOR_TAG) + 1
         || !matches!(source_without_metadata(&inductive.base.type_, meter)?.node(),
-            ExprNode::Sort { level } if level == &Level::succ(Level::zero()))
+            ExprNode::Sort { level } if level == &Level::one())
     {
         return Ok(None);
     }

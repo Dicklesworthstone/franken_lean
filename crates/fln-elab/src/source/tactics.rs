@@ -7,6 +7,7 @@
 
 use super::*;
 mod ac;
+mod auxiliary;
 pub(in crate::source) mod backtrack;
 mod change;
 mod congruence;
@@ -38,6 +39,7 @@ mod split;
 mod trace;
 mod trivial;
 mod unfold;
+pub(in crate::source) use auxiliary::AuxLemmaCache;
 pub(in crate::source) use decision::AuxNames;
 pub(in crate::source) use refine::RefinementFrame;
 pub(in crate::source) use rewrite::SimpKeyCache;
@@ -50,6 +52,9 @@ pub enum TacticError {
     /// A tactic this engine does not run, named by its syntax kind. Like a malformed script it
     /// is never caught by `first`/`try`: the pin would run it, and could succeed.
     UnsupportedTactic(Name),
+    /// A closure or entry point whose declaration effects are not implemented.
+    /// A successful fallback must not conceal a tactic the pin could execute.
+    AuxLemmaUnsupported(&'static str),
     /// `guard_target`'s comparison failed (`evalGuardTarget`: "The main goal is … but was
     /// expected to be …").
     GuardTargetMismatch,
@@ -259,6 +264,9 @@ impl std::fmt::Display for TacticError {
             ),
             Self::UnsupportedTactic(kind) => {
                 write!(f, "unsupported tactic `{}`", kind.to_display_string())
+            }
+            Self::AuxLemmaUnsupported(reason) => {
+                write!(f, "as_aux_lemma does not yet support {reason}")
             }
             Self::FailIfSuccessSucceeded => write!(
                 f,
@@ -737,6 +745,10 @@ pub(super) struct RewriteRule<'a> {
 }
 
 pub(super) enum ProofAction<'a> {
+    AuxLemma {
+        goal: ProofGoal,
+        body: &'a Syntax,
+    },
     Change {
         goal: ProofGoal,
         target: &'a Syntax,
@@ -1561,6 +1573,14 @@ impl Context {
             self.start_parenthesized_tactic(proof, args)?;
         } else if kind == &parser_kind(&["Tactic", "skip"]) {
             proof.work.push(Work::Goal(goal));
+        } else if kind == &parser_kind(&["Tactic", "as_aux_lemma"]) {
+            let [keyword, arrow, body] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "as_aux_lemma", "auxiliary lemma tactic")?;
+            expect_atom(arrow, "=>", "auxiliary lemma body")?;
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "as_aux_lemma"])?;
+            return Ok(Some(ProofAction::AuxLemma { goal, body }));
         } else if kind == &parser_kind(&["Tactic", "traceState"])
             || kind == &parser_kind(&["Tactic", "traceMessage"])
         {

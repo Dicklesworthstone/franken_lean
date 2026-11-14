@@ -13,6 +13,7 @@ on:
       - 'crates/fln/tests/source_backtracking.rs'
       - 'crates/fln/tests/source_simp_auto_unfold.rs'
       - 'crates/fln/tests/source_simp_auto_unfold.lean'
+      - 'crates/fln/tests/source_as_aux_lemma.rs'
       - 'crates/fln/src/source_check/**'
       - 'crates/fln/src/source_check.rs'
       - 'crates/fln/src/source_records.rs'
@@ -55,6 +56,8 @@ jobs:
         run: cargo test --locked -p fln --test source_goal_control --test source_backtracking --no-fail-fast -- --test-threads=1
       - name: Check match-aware simplification through the native kernel
         run: cargo test --locked -p fln --test source_simp_auto_unfold --no-fail-fast -- --test-threads=1
+      - name: Check auxiliary theorem closure, admission and rollback
+        run: cargo test --locked -p fln --test source_as_aux_lemma --no-fail-fast -- --test-threads=1
       - name: Preserve work accounting across failed goal attempts
         run: cargo test --locked -p fln-elab --lib source::tactics::backtrack::tests::nonprogressing_repetitions_and_backtracking_cannot_refund_work -- --exact
       - name: Check native command macros, hygiene and journal replay

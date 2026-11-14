@@ -59,13 +59,14 @@ pub fn elaborate_definition(
     let scope = scope.for_declaration(syntax)?;
     let mut context = Context::scoped(environment, kernel, &scope)?;
     context.traces.enable();
+    context.allow_auxiliary_declarations = true;
     let declaration = definition_in_context(syntax, &mut context)?;
     let local_functions = context.lift_local_functions(&declaration)?;
     let traces = context.observations()?;
     Ok(ObservedDeclaration {
         candidate: ElaboratedDeclaration {
             declaration,
-            native_axioms: Vec::new(),
+            auxiliary_declarations: std::mem::take(&mut context.auxiliary_declarations),
             equation_info: context.equation_info.take(),
             local_functions,
             irreducible: context.well_founded_definition,

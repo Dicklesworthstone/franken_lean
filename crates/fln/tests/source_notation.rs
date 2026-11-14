@@ -93,7 +93,10 @@ fn equal_successful_syntax_readings_are_still_ambiguous() {
          notation \"ambiguous!\" => Nat.zero\n\
          def picked : Nat := ambiguous!\n",
     );
-    assert!(format!("{error:?}").contains("AmbiguousSyntax"), "{error:?}");
+    assert!(
+        format!("{error:?}").contains("AmbiguousSyntax"),
+        "{error:?}"
+    );
 }
 
 #[test]

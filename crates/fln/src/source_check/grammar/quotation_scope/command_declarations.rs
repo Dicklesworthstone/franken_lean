@@ -93,7 +93,8 @@ pub(super) fn schedule<'a>(
     } else {
         shared_type(result)?;
     }
-    let Some([assignment, body, termination, helpers]) = command_args(value, "declValSimple") else {
+    let Some([assignment, body, termination, helpers]) = command_args(value, "declValSimple")
+    else {
         return Err(unsupported());
     };
     if !atom(assignment, &[":="]) || !null_args(helpers)?.is_empty() {

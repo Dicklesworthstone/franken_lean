@@ -894,11 +894,15 @@ struct Context {
     // (`codegen.rs`). Rollback restores them with the rest of the context.
     source_recursors: Vec<Name>,
     // The embedding engine's native evaluator (`crate::native`). Only an entry point that
-    // carries `native_axioms` on to admission sets it; elsewhere `native_decide` refuses typed.
+    // carries `auxiliary_declarations` on to admission sets it; elsewhere
+    // `native_decide` refuses typed.
     native: Option<crate::native::NativeProvider>,
-    // The axioms `native_decide` added (the pin's `nativeEqTrue`), in order; rollback restores
-    // them, as it restores the pin's environment.
-    native_axioms: Vec<Declaration>,
+    // Ordered declarations added by successful proof elaboration. These are
+    // candidates for independent engine admission, never publication receipts.
+    auxiliary_declarations: Vec<Declaration>,
+    // Only entry points that return all ordered effects may create auxiliaries.
+    allow_auxiliary_declarations: bool,
+    aux_lemma_cache: tactics::AuxLemmaCache,
     // The pin's `DeclNameGenerator` for the declaration being elaborated (`mkAuxDeclName`).
     aux_names: Option<tactics::AuxNames>,
     /// The definition's root `match`, read for its equation theorems
@@ -1021,7 +1025,9 @@ impl Context {
             no_implicit_lambda_types: Vec::new(),
             source_recursors: Vec::new(),
             native: None,
-            native_axioms: Vec::new(),
+            auxiliary_declarations: Vec::new(),
+            allow_auxiliary_declarations: false,
+            aux_lemma_cache: Default::default(),
             aux_names: None,
             equation_info: None,
             equation_pattern_source: None,
@@ -2484,6 +2490,7 @@ impl Context {
             ),
             Proof(tactics::ProofState<'a>),
             ProofAdvanced(tactics::ProofState<'a>, Box<tactics::ProofAction<'a>>),
+            AuxiliaryProof(tactics::ProofState<'a>, tactics::ProofGoal),
             ChangeTarget(tactics::ProofState<'a>, tactics::ProofGoal),
             SimpaTerm(tactics::ProofState<'a>, tactics::ProofGoal, &'a [Syntax]),
             ProofEliminate(
@@ -2600,6 +2607,7 @@ impl Context {
                                         | Task::DoBindJoinBody(..)
                                         | Task::DoBindJoinValue(..)
                                         | Task::ProofTerm(..)
+                                        | Task::AuxiliaryProof(..)
                                         | Task::MatchTerm(..)
                                         | Task::RefineTerm(..)
                                         | Task::ApplicationTyping(..)
@@ -4241,6 +4249,11 @@ impl Context {
                             }
                             Task::Proof(proof) => return Ok(Step::AdvanceProof(proof)),
                             Task::ProofAdvanced(mut proof, action) => match *action {
+                                tactics::ProofAction::AuxLemma { goal, body } => {
+                                    let child = self.start_auxiliary_proof(&goal, body)?;
+                                    tasks.push(Task::AuxiliaryProof(proof, goal));
+                                    tasks.push(Task::Proof(child));
+                                }
                                 tactics::ProofAction::Change { goal, target } => {
                                     self.txn.lctx = goal.lctx.clone();
                                     tasks.push(Task::ChangeTarget(proof, goal));
@@ -4499,6 +4512,11 @@ impl Context {
                                     tactic_result = Some(result);
                                 }
                             },
+                            Task::AuxiliaryProof(proof, goal) => {
+                                let term = values.pop().expect("completed auxiliary proof");
+                                self.finish_auxiliary_proof(goal, term)?;
+                                tasks.push(Task::Proof(proof));
+                            }
                             Task::SimpaTerm(mut proof, goal, args) => {
                                 let term = values.pop().expect("simpa evidence visit");
                                 self.simpa_proof_term(&mut proof, goal, args, Some(term))?;
@@ -6332,7 +6350,7 @@ pub fn elaborate_public_theorem(
     let local_functions = context.lift_local_functions(&declaration)?;
     Ok(ElaboratedDeclaration {
         declaration,
-        native_axioms: Vec::new(),
+        auxiliary_declarations: Vec::new(),
         equation_info: None,
         local_functions,
         irreducible: false,
@@ -6461,10 +6479,10 @@ pub(super) fn definition(
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElaboratedDeclaration {
     pub declaration: Declaration,
-    /// The axioms `native_decide` added while elaborating `declaration`, in order
-    /// (`crate::native`). The declaration cites them, so callers must admit every one,
-    /// through both checkers, before it.
-    pub native_axioms: Vec<Declaration>,
+    /// Auxiliary theorems and native-evaluation axioms, in dependency order.
+    /// The owner cites them, so callers must admit each through both checkers
+    /// before the owner, retaining the whole command as one atomic transition.
+    pub auxiliary_declarations: Vec<Declaration>,
     /// The root `match` of a definition by pattern matching, for its equation theorems: the
     /// caller records it with the admitted definition (`equation_theorems::journal::push`).
     pub equation_info: Option<equation_theorems::journal::Record>,
@@ -6485,7 +6503,7 @@ fn definition_scoped(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    // The declaration alone is returned, so no axiom may be added: `native_decide` refuses.
+    // The declaration alone is returned, so no auxiliary effect may be added.
     definition_scoped_elaboration(syntax, environment, kernel, scope, false)
         .map(|elaborated| elaborated.declaration)
 }
@@ -6496,7 +6514,7 @@ fn definition_scoped_with_effects(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<ElaboratedDeclaration, NatDefinitionElabError> {
-    // The result carries the axioms on to admission, so `native_decide` may run here.
+    // The result carries every auxiliary candidate on to ordinary admission.
     definition_scoped_elaboration(syntax, environment, kernel, scope, true)
 }
 
@@ -6509,6 +6527,7 @@ fn definition_scoped_elaboration(
 ) -> Result<ElaboratedDeclaration, NatDefinitionElabError> {
     let scope = scope.for_declaration(syntax)?;
     let mut context = Context::scoped(environment, kernel, &scope)?;
+    context.allow_auxiliary_declarations = native;
     if native {
         context.native = scope.native.clone();
     }
@@ -6516,7 +6535,7 @@ fn definition_scoped_elaboration(
     let local_functions = context.lift_local_functions(&declaration)?;
     Ok(ElaboratedDeclaration {
         declaration,
-        native_axioms: std::mem::take(&mut context.native_axioms),
+        auxiliary_declarations: std::mem::take(&mut context.auxiliary_declarations),
         equation_info: context.equation_info.take(),
         local_functions,
         irreducible: context.well_founded_definition,

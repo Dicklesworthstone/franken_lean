@@ -600,7 +600,7 @@ impl Engine {
                     parsed.syntax(),
                     fln_elab::source::ElaboratedDeclaration {
                         declaration: candidate,
-                        native_axioms: Vec::new(),
+                        auxiliary_declarations: Vec::new(),
                         equation_info: None,
                         local_functions,
                         irreducible: false,
@@ -979,6 +979,47 @@ impl Engine {
         })
     }
 
+    /// Auxiliary effects are a checked predecessor of the source owner. Keep
+    /// owner-specific metadata on its own batch, then prepend the real receipts
+    /// only after every attribute and local helper succeeds.
+    fn admit_scoped_elaboration(
+        &self,
+        syntax: &fln_syntax::tree::Syntax,
+        elaborated: fln_elab::source::ElaboratedDeclaration,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let auxiliaries = if elaborated.auxiliary_declarations.is_empty() {
+            None
+        } else {
+            match self.admit_declarations(&elaborated.auxiliary_declarations, options, limits)? {
+                Outcome::Complete(batch) => Some(batch),
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
+        };
+        let predecessor = auxiliaries.as_ref().map_or(self, |batch| &batch.engine);
+        let result = predecessor.admit_scoped_candidate(
+            syntax,
+            elaborated.declaration,
+            elaborated.irreducible,
+            elaborated.equation_info,
+            elaborated.noncomputable,
+            elaborated.local_functions,
+            options,
+            limits,
+            scope,
+        )?;
+        Ok(result.map_complete(|mut batch| {
+            if let Some(auxiliaries) = auxiliaries {
+                batch.base_logical_root = auxiliaries.base_logical_root;
+                batch.admissions.splice(0..0, auxiliaries.admissions);
+            }
+            batch
+        }))
+    }
+
     /// Register defaults under the actual checked declaration identity, including
     /// anonymous instances, private names and a public proof's safe interface.
     pub(super) fn register_checked_source_defaults(
@@ -1189,13 +1230,9 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                return self.admit_scoped_candidate(
+                return self.admit_scoped_elaboration(
                     parsed.syntax(),
-                    elaborated.declaration,
-                    elaborated.irreducible,
-                    elaborated.equation_info,
-                    elaborated.noncomputable,
-                    elaborated.local_functions,
+                    elaborated,
                     options,
                     limits,
                     scope,

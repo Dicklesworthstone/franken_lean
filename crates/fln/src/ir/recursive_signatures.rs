@@ -297,8 +297,8 @@ impl Analysis<'_, '_> {
                 return Ok(right);
             }
             "String.append" => match (text(&left), text(&right)) {
-                (Some(a), _) if a.is_empty() => return Ok(right),
-                (_, Some(b)) if b.is_empty() => return Ok(left),
+                (Some(""), _) => return Ok(right),
+                (_, Some("")) => return Ok(left),
                 (Some(a), Some(b)) => {
                     self.checks.meter.charge(a.len().saturating_add(b.len()))?;
                     let mut joined = String::new();
@@ -368,7 +368,9 @@ impl Analysis<'_, '_> {
         }
         self.checks.meter.charge(1)?;
         let expression = source_without_metadata(expression, self.checks.meter)?;
-        if let Some([condition, no, yes]) = source_boolean_case(expression, self.checks.meter)? {
+        if let Some([condition, no, yes]) =
+            source_boolean_case(expression, self.checks.environment, self.checks.meter)?
+        {
             let condition = self.value(condition, locals, depth + 1)?;
             if named(&condition, "Bool.false") {
                 return self.value(no, locals, depth + 1);

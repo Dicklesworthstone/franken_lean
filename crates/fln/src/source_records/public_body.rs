@@ -61,7 +61,7 @@ impl Engine {
                 syntax,
                 fln_elab::source::ElaboratedDeclaration {
                     declaration: Declaration::Defn(definition.clone()),
-                    native_axioms: Vec::new(),
+                    auxiliary_declarations: Vec::new(),
                     equation_info: None,
                     local_functions: Vec::new(),
                     irreducible: false,

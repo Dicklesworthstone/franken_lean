@@ -845,7 +845,7 @@ fn publish_captured_equations(
     alternatives: usize,
 ) -> Environment {
     use fln_elab::source::equation_theorems::{self, Request, journal};
-    assert!(result.native_axioms.is_empty());
+    assert!(result.auxiliary_declarations.is_empty());
     assert!(result.local_functions.is_empty());
     let record = result
         .equation_info
