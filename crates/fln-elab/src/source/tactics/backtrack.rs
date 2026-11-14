@@ -12,6 +12,9 @@ pub(in crate::source) enum Mode {
     /// `fail_if_success t` (`evalFailIfSuccess`, Lean/Elab/Tactic/BuiltinTactic.lean:273-277):
     /// succeeds, with the state unchanged, exactly when `t` fails.
     FailIfSuccess,
+    /// One isolated application of `any_goals`. Failure restores its original goal;
+    /// success records that the enclosing controller has at least one successful run.
+    AnyGoal,
 }
 pub(in crate::source) struct Spec<'a> {
     pub mode: Mode,
@@ -95,17 +98,25 @@ impl<'a> Checkpoint<'a> {
     pub fn optional(&self) -> bool {
         matches!(
             self.spec.mode,
-            Mode::Try | Mode::Repeat | Mode::FailIfSuccess
+            Mode::Try | Mode::Repeat | Mode::FailIfSuccess | Mode::AnyGoal
         )
     }
     /// Whether the body succeeding is this attempt's failure (`fail_if_success`).
     pub fn inverted(&self) -> bool {
         self.spec.mode == Mode::FailIfSuccess
     }
-    pub fn finish(&self, context: &mut Context, proof: &mut ProofState<'a>) {
+    pub fn finish(
+        &self,
+        context: &mut Context,
+        proof: &mut ProofState<'a>,
+    ) -> Result<(), NatDefinitionElabError> {
         context.attempt_depth = self.context.attempt_depth;
         proof.instructions = self.proof.instructions.clone();
         proof.cursor = self.proof.cursor;
+        if self.spec.mode == Mode::AnyGoal {
+            context.successful_any_goal_attempt(proof)?;
+        }
+        Ok(())
     }
     pub fn original(self) -> ProofState<'a> {
         self.proof
@@ -260,6 +271,7 @@ impl Context {
                 Mode::Try => "try",
                 Mode::Repeat => "repeat",
                 Mode::FailIfSuccess => "fail_if_success",
+                Mode::AnyGoal => return Err(error(TacticError::MalformedScript)),
             },
             "alternative keyword",
         )?;
@@ -404,6 +416,8 @@ mod tests {
             "try repeat skip",
             "first | repeat skip | skip",
             "repeat (first | fail | skip)",
+            "any_goals repeat skip",
+            "first | any_goals repeat skip | skip",
         ] {
             let source = format!("theorem t : Prop := by {body}");
             let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();

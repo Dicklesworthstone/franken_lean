@@ -213,6 +213,8 @@ pub enum TacticError {
     /// `case t => …` with no goal tagged `t` (`getCaseGoals`, vendored
     /// src/Lean/Elab/Tactic/BuiltinTactic.lean).
     CaseTagNotFound(Name),
+    /// Every original goal rejected `any_goals`' body, including an empty frontier.
+    AnyGoalsFailed,
     /// A conv tactic on a goal that is not an equation (the pin's "Internal error:
     /// Conversion-mode tactic found an invalid `conv` goal", vendored
     /// src/Lean/Elab/Tactic/Conv/Basic.lean).
@@ -556,6 +558,7 @@ impl std::fmt::Display for TacticError {
             Self::CaseTagNotFound(tag) => {
                 write!(f, "Case tag `{}` not found.", tag.to_display_string())
             }
+            Self::AnyGoalsFailed => write!(f, "Tactic failed on all goals"),
             Self::SpecializeRequiresLocal => write!(
                 f,
                 "'specialize' requires a term of the form `h x_1 .. x_n` where `h` appears in the local context"
@@ -1322,6 +1325,9 @@ impl Context {
     ) -> Result<ProofAction<'a>, NatDefinitionElabError> {
         loop {
             self.tick()?;
+            if let Some(spec) = self.next_any_goal_attempt(proof)? {
+                return Ok(ProofAction::Attempt(spec));
+            }
             if matches!(
                 proof.work.last(),
                 None | Some(

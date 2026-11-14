@@ -507,14 +507,14 @@ impl Context {
                 expect_atom(separator, "<;>", "conv sequencing separator")?;
                 self.start_goal_sequence(proof, goal, left, right)
             }
-            "allGoals" | "focus" => {
+            "allGoals" | "anyGoals" | "focus" => {
                 let [keyword, sequence] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
-                let mode = if short == "allGoals" {
-                    control::Mode::All
-                } else {
-                    control::Mode::Focus
+                let mode = match short.as_str() {
+                    "allGoals" => control::Mode::All,
+                    "anyGoals" => control::Mode::Any,
+                    _ => control::Mode::Focus,
                 };
                 expect_atom(keyword, mode.keyword(), "conv goal-control keyword")?;
                 let body = self.conv_instructions(sequence)?;
@@ -531,6 +531,37 @@ impl Context {
                     goal,
                     expect_null_args(cases, "conv case arguments")?,
                     sequence,
+                )
+            }
+            "case'" => {
+                let [keyword, cases, arrow, sequence] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "case'", "conv case' keyword")?;
+                expect_atom(arrow, "=>", "conv case' arrow")?;
+                self.start_conv_case_prime(proof, goal, cases, sequence, kind)
+            }
+            "convNext__=>_" => {
+                let [keyword, names, arrow, sequence] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "next", "conv next keyword")?;
+                expect_atom(arrow, "=>", "conv next arrow")?;
+                let goal = self.rename_conv_goal(
+                    proof,
+                    goal,
+                    expect_null_args(names, "conv next hypothesis names")?,
+                )?;
+                self.goal_tags.remove(&goal.id);
+                let body = self.conv_instructions(sequence)?;
+                self.start_conv_frame(
+                    proof,
+                    vec![Work::Goal(goal)],
+                    body,
+                    Finish::Case {
+                        remaining: &[],
+                        body: sequence,
+                    },
                 )
             }
             "convConvSeq" => {
@@ -679,6 +710,76 @@ impl Context {
         }
     }
 
+    fn rename_conv_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        names: &[Syntax],
+    ) -> Result<ProofGoal, NatDefinitionElabError> {
+        let was_conv = self.conv_goals.remove(&goal.id);
+        let goal = self.renamed_proof_goal(proof, goal, names)?;
+        if was_conv {
+            self.conv_goals.insert(goal.id.clone());
+        }
+        Ok(goal)
+    }
+
+    /// `case'` preserves unfinished conversions and restores the selected tag when
+    /// exactly one goal remains. Multiple tags select distinct original goals first.
+    fn start_conv_case_prime<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goal: ProofGoal,
+        cases: &'a Syntax,
+        sequence: &'a Syntax,
+        kind: &Name,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut tags = Vec::new();
+        for (index, case) in expect_null_args(cases, "conv case' arguments")?
+            .iter()
+            .enumerate()
+        {
+            self.tick()?;
+            if index % 2 == 1 {
+                expect_atom(case, "|", "conv case' separator")?;
+                continue;
+            }
+            let [tag, names] = expect_node(
+                case,
+                &parser_kind(&["Tactic", "caseArg"]),
+                2,
+                "conv case' argument",
+            )?
+            else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            tags.push((tag, expect_null_args(names, "conv case' names")?));
+        }
+        let body = self.conv_instructions(sequence)?;
+        if let [(tag, names)] = tags.as_slice() {
+            let goal = self.case_goal(proof, goal, tag)?;
+            let goal = self.rename_conv_goal(proof, goal, names)?;
+            self.start_case_prime_focus_body(proof, goal, body)
+        } else {
+            // As in ordinary native case', renaming several selected contexts is a
+            // separate operation from reordering their original frontier.
+            if tags.is_empty() || tags.iter().any(|(_, names)| !names.is_empty()) {
+                return Err(error(TacticError::UnsupportedTactic(kind.clone())));
+            }
+            let count = tags.len();
+            let goal = self.reorder_visible_goals(proof, goal, kind, |this, mut goals| {
+                let mut selected = Vec::new();
+                for (tag, _) in &tags {
+                    let index = this.case_tag_position(&goals, tag)?;
+                    selected.push(goals.remove(index));
+                }
+                selected.extend(goals);
+                Ok(selected)
+            })?;
+            self.start_limited_all_goals_body(proof, goal, body, count)
+        }
+    }
+
     /// The pin expands each `case` argument sequentially to an ordinary strict `case`,
     /// with `conv' => cs; all_goals rfl` as its body (`Init/Conv.lean`). Selection and
     /// inaccessible-name handling use the same helpers as ordinary tactic mode.
@@ -710,15 +811,11 @@ impl Context {
             return Err(error(TacticError::MalformedScript));
         };
         let selected = self.case_goal(proof, goal, tag)?;
-        let was_conv = self.conv_goals.remove(&selected.id);
-        let selected = self.renamed_proof_goal(
+        let selected = self.rename_conv_goal(
             proof,
             selected,
             expect_null_args(names, "conv case hypothesis names")?,
         )?;
-        if was_conv {
-            self.conv_goals.insert(selected.id.clone());
-        }
         self.goal_tags.remove(&selected.id);
         let body = self.conv_instructions(sequence)?;
         self.start_conv_frame(

@@ -4268,7 +4268,7 @@ impl Context {
                                             tactics::TacticError::FailIfSuccessSucceeded,
                                         )));
                                     }
-                                    checkpoint.finish(self, &mut proof);
+                                    checkpoint.finish(self, &mut proof)?;
                                     if let Some(mut next) = checkpoint.next_iteration(self, &proof)
                                     {
                                         proof = next.begin(self, attempts.len())?;

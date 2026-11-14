@@ -4,7 +4,8 @@
 //! `enter [n, @n, x, in p, …]`, `ext x …`, `intro x …`, `unfold f …`, `delta f …`, `rw [rules]`,
 //! `rewrite`, `simp`, `dsimp`, `apply e`, `change e`, `pattern (occs)? p`, `clear h …`,
 //! `tactic => tacs`, `first | … | …`, `try`, `repeat`, `fail_if_success`, a nested `conv => …`,
-//! `all_goals`, `focus`, `case`, `<;>`, `· convSeq`, `{ … }`, `( … )` and `calc`; any other is
+//! `all_goals`, `any_goals`, `focus`, `case`, `case'`, `next`, `<;>`, `· convSeq`, `{ … }`,
+//! `( … )` and `calc`; any other is
 //! refused where it starts. A tactic
 //! ending in a sequence of its own takes the `;`-separated tactics after it, as the pin's
 //! `sepByIndent` does. Columns count codepoints. A `(conv| …)` quotation holds one of them.
@@ -313,8 +314,11 @@ fn takes_sequence(tokens: &[LexedToken], at: usize) -> bool {
             "fail_if_success",
             "first",
             "all_goals",
+            "any_goals",
             "focus",
             "case",
+            "case'",
+            "next",
         ]
         .iter()
         .any(|keyword| word(tokens, at, keyword))
@@ -668,7 +672,11 @@ fn conv_operand(
         return first_operand(leaves, view, tokens, range, atom(start, "first")?);
     }
     // The goal-control macros use conv sequences, not ordinary tactic sequences.
-    for (keyword, kind) in [("all_goals", "allGoals"), ("focus", "focus")] {
+    for (keyword, kind) in [
+        ("all_goals", "allGoals"),
+        ("any_goals", "anyGoals"),
+        ("focus", "focus"),
+    ] {
         if word(tokens, start, keyword) && range.len() > 1 {
             return Ok(Syntax::node(
                 conv_kind(kind),
@@ -679,7 +687,12 @@ fn conv_operand(
             ));
         }
     }
-    if word(tokens, start, "case") {
+    if word(tokens, start, "case") || word(tokens, start, "case'") {
+        let keyword = if word(tokens, start, "case'") {
+            "case'"
+        } else {
+            "case"
+        };
         let arrow = (start + 1..range.end)
             .find(|&at| symbol(tokens, at, "=>"))
             .ok_or_else(|| refusal(view, tokens, start))?;
@@ -687,10 +700,28 @@ fn conv_operand(
             binder_ident(leaves, tokens, at)?.ok_or_else(|| refusal(view, tokens, at))
         })?;
         return Ok(Syntax::node(
-            conv_kind("case"),
+            conv_kind(keyword),
             vec![
-                atom(start, "case")?,
+                atom(start, keyword)?,
                 null_node(cases),
+                leaves.leaf(arrow)?,
+                sequence(leaves, view, tokens, arrow + 1..range.end)?,
+            ],
+        ));
+    }
+    if word(tokens, start, "next") {
+        let arrow = (start + 1..range.end)
+            .find(|&at| symbol(tokens, at, "=>"))
+            .ok_or_else(|| refusal(view, tokens, start))?;
+        let mut names = Vec::new();
+        for at in start + 1..arrow {
+            names.push(binder_ident(leaves, tokens, at)?.ok_or_else(|| refusal(view, tokens, at))?);
+        }
+        return Ok(Syntax::node(
+            conv_kind("convNext__=>_"),
+            vec![
+                atom(start, "next")?,
+                null_node(names),
                 leaves.leaf(arrow)?,
                 sequence(leaves, view, tokens, arrow + 1..range.end)?,
             ],

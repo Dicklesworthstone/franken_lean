@@ -66,6 +66,49 @@ fn all_goals_returns_new_goals_without_mapping_over_them_again() {
         "{BOTH}theorem nested (P Q : Prop) (p : P) (q : Q) : Both (Both P Q) (Both Q P) := by\n  constructor\n  all_goals constructor\n  · exact p\n  · exact q\n  · exact q\n  · exact p"
     ));
 }
+
+#[test]
+fn any_goals_preserves_failed_goals_and_maps_only_the_original_frontier() {
+    // These programs were accepted by pinned Lean 4.32.0 on 2026-11-14.
+    check(&format!(
+        "{BOTH}theorem pair (P Q : Prop) (p : P) (q : Q) : Both P Q := by\n  constructor\n  any_goals exact p\n  exact q"
+    ));
+    check(&format!(
+        "{BOTH}theorem nested (P Q : Prop) (p : P) (q : Q) : Both (Both P P) Q := by\n  constructor\n  any_goals constructor\n  exact p\n  exact p\n  exact q"
+    ));
+}
+
+#[test]
+fn any_goals_rolls_back_failed_assignments_and_local_introductions() {
+    check(&format!(
+        "{BOTH}theorem pair (P Q : Prop) (p : P) (q : Q) : Both P Q := by\n  constructor\n  any_goals (first | (exact p; fail) | exact q)\n  exact p"
+    ));
+    check(&format!(
+        "{BOTH}theorem functions (P Q : Prop) (q : Q) : Both (P -> P) Q := by\n  constructor\n  any_goals (first | (intro leaked; fail) | exact q)\n  intro kept\n  exact kept"
+    ));
+}
+
+#[test]
+fn any_goals_counts_successful_noops_but_requires_a_successful_application() {
+    check("theorem same : 0 = 0 := by\n  any_goals skip\n  rfl");
+    for source in [
+        "theorem bad : 0 = 1 := by\n  any_goals rfl",
+        "theorem bad : 0 = 0 := by\n  rfl\n  any_goals skip",
+    ] {
+        let problem = run(source).expect_err("no successful any_goals application");
+        assert!(problem.contains("AnyGoalsFailed"), "{source}\n{problem}");
+    }
+}
+
+#[test]
+fn any_goals_respects_constructor_branch_boundaries() {
+    check(
+        "theorem same (b : Bool) : b = b := by\n  cases b with\n  | false => any_goals rfl\n  | true => rfl",
+    );
+    reject(
+        "theorem bad (b : Bool) : 0 = 0 := by\n  cases b with\n  | false => any_goals rfl\n  | true => intro x",
+    );
+}
 #[test]
 fn all_goals_preserves_local_introductions_and_goal_order() {
     check(

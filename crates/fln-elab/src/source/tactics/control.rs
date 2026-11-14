@@ -10,6 +10,7 @@ pub(super) enum Mode {
     Solve,
     Focus,
     All,
+    Any,
 }
 impl Mode {
     pub(super) fn keyword(self) -> &'static str {
@@ -17,6 +18,7 @@ impl Mode {
             Self::Solve => "·",
             Self::Focus => "focus",
             Self::All => "all_goals",
+            Self::Any => "any_goals",
         }
     }
 }
@@ -31,6 +33,8 @@ pub(super) fn mode(kind: &Name) -> Option<Mode> {
         Some(Mode::Focus)
     } else if kind == &parser_kind(&["Tactic", "allGoals"]) {
         Some(Mode::All)
+    } else if kind == &parser_kind(&["Tactic", "anyGoals"]) {
+        Some(Mode::Any)
     } else {
         None
     }
@@ -104,6 +108,10 @@ pub(super) struct Frame<'a> {
     // A `case'` frame: the tag of the goal its current run started on, which a run leaving
     // exactly one goal gives that goal (`evalCase'`'s `g'.setTag mvarTag`).
     retag: Option<Option<Name>>,
+    // `any_goals` checks each original goal in its own transactional attempt.
+    // A successful no-op counts; a failed run restores that goal and all its effects.
+    attempt_pending: bool,
+    any_succeeded: bool,
 }
 impl Context {
     /// The index in `goals` of the goal `case tag` would select among them (`findTag?`): the
@@ -445,11 +453,50 @@ impl Context {
             conv: None,
             limit: None,
             retag: None,
+            attempt_pending: mode == Mode::Any,
+            any_succeeded: false,
         };
         let index = proof.controls.len();
         proof.controls.push(frame);
         proof.work.push(Work::EndControl(index));
         proof.work.push(Work::Goal(goal));
+        Ok(())
+    }
+
+    /// Start one `any_goals` application after its goal has been isolated. The empty
+    /// continuation lets either success or rollback return to this same controller.
+    pub(super) fn next_any_goal_attempt<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+    ) -> Result<Option<backtrack::Spec<'a>>, NatDefinitionElabError> {
+        let Some(frame) = proof.controls.last_mut() else {
+            return Ok(None);
+        };
+        if !frame.attempt_pending {
+            return Ok(None);
+        }
+        if frame.mode != Mode::Any || proof.cursor != 0 {
+            return Err(error(TacticError::MalformedScript));
+        }
+        frame.attempt_pending = false;
+        proof.instructions.clear();
+        Ok(Some(backtrack::Spec {
+            mode: backtrack::Mode::AnyGoal,
+            branches: vec![frame.body.clone()],
+        }))
+    }
+
+    pub(super) fn successful_any_goal_attempt(
+        &mut self,
+        proof: &mut ProofState<'_>,
+    ) -> Result<(), NatDefinitionElabError> {
+        let Some(frame) = proof.controls.last_mut() else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        if frame.mode != Mode::Any || frame.attempt_pending {
+            return Err(error(TacticError::MalformedScript));
+        }
+        frame.any_succeeded = true;
         Ok(())
     }
 
@@ -464,6 +511,16 @@ impl Context {
         count: usize,
     ) -> Result<(), NatDefinitionElabError> {
         let body = self.proof_instructions(syntax)?;
+        self.start_limited_all_goals_body(proof, goal, body, count)
+    }
+
+    pub(super) fn start_limited_all_goals_body<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goal: ProofGoal,
+        body: Vec<&'a Syntax>,
+        count: usize,
+    ) -> Result<(), NatDefinitionElabError> {
         let tag = self.goal_tags.get(&goal.id).cloned();
         self.start_goal_control_body(proof, goal, body, Mode::All, None)?;
         let frame = proof
@@ -483,8 +540,18 @@ impl Context {
         goal: ProofGoal,
         syntax: &'a Syntax,
     ) -> Result<(), NatDefinitionElabError> {
+        let body = self.proof_instructions(syntax)?;
+        self.start_case_prime_focus_body(proof, goal, body)
+    }
+
+    pub(super) fn start_case_prime_focus_body<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goal: ProofGoal,
+        body: Vec<&'a Syntax>,
+    ) -> Result<(), NatDefinitionElabError> {
         let tag = self.goal_tags.get(&goal.id).cloned();
-        self.start_goal_control(proof, goal, syntax, Mode::Focus)?;
+        self.start_goal_control_body(proof, goal, body, Mode::Focus, None)?;
         let frame = proof
             .controls
             .last_mut()
@@ -599,6 +666,8 @@ impl Context {
             conv: Some(Box::new(finish)),
             limit: None,
             retag: None,
+            attempt_pending: false,
+            any_succeeded: false,
         };
         let index = proof.controls.len();
         proof.controls.push(frame);
@@ -709,7 +778,7 @@ impl Context {
             self.tick()?;
             frame.deferred.push(work);
         }
-        if frame.mode == Mode::All {
+        if matches!(frame.mode, Mode::All | Mode::Any) {
             loop {
                 self.tick()?;
                 match frame.waiting.last() {
@@ -725,17 +794,18 @@ impl Context {
                         let Some(Work::Goal(goal)) = frame.waiting.pop() else {
                             unreachable!()
                         };
-                        if self.txn.mvars.is_assigned(&goal.id) {
-                            continue;
-                        }
                         if let Some(limit) = &mut frame.limit {
                             *limit -= 1;
+                        }
+                        if self.txn.mvars.is_assigned(&goal.id) {
+                            continue;
                         }
                         if frame.retag.is_some() {
                             frame.retag = Some(self.goal_tags.get(&goal.id).cloned());
                         }
                         proof.instructions = frame.body.clone();
                         proof.cursor = 0;
+                        frame.attempt_pending = frame.mode == Mode::Any;
                         proof.controls.push(frame);
                         proof.work.push(Work::EndControl(index));
                         proof.work.push(Work::Goal(goal));
@@ -745,6 +815,9 @@ impl Context {
                     _ => break,
                 }
             }
+        }
+        if frame.mode == Mode::Any && !frame.any_succeeded {
+            return Err(error(TacticError::AnyGoalsFailed));
         }
         proof.instructions = frame.instructions;
         proof.cursor = frame.cursor;
@@ -761,18 +834,27 @@ impl Context {
     ) -> Result<(), NatDefinitionElabError> {
         while let Some(Syntax::Node { kind, args, .. }) = proof.instructions.get(proof.cursor) {
             self.tick()?;
-            let conv = kind == &super::conv::conv_kind("allGoals");
-            if mode(kind) != Some(Mode::All) && !conv {
+            let conv = kind == &super::conv::conv_kind("allGoals")
+                || kind == &super::conv::conv_kind("anyGoals");
+            let any = mode(kind) == Some(Mode::Any) || kind == &super::conv::conv_kind("anyGoals");
+            if !matches!(mode(kind), Some(Mode::All | Mode::Any)) && !conv {
                 break;
             }
             let [keyword, sequence] = args.as_slice() else {
                 return Err(error(TacticError::MalformedScript));
             };
-            expect_atom(keyword, "all_goals", "all-goals keyword")?;
+            expect_atom(
+                keyword,
+                if any { "any_goals" } else { "all_goals" },
+                "goal-mapping keyword",
+            )?;
             if conv {
                 self.conv_instructions(sequence)?;
             } else {
                 self.proof_instructions(sequence)?;
+            }
+            if any {
+                return Err(error(TacticError::AnyGoalsFailed));
             }
             proof.cursor += 1;
         }

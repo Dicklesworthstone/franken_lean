@@ -1370,6 +1370,92 @@ const GOAL_CONTROL_HEADER: &str =
 
 const GOAL_CONTROL_ACCEPTED: &[(&str, &str)] = &[
     (
+        "AnyGoalsAndCases.lean",
+        r#"theorem ordinary_any (P Q : Prop) (hP : P) (hQ : Q) : P ∧ Q := by
+  constructor
+  any_goals exact hP
+  exact hQ
+
+theorem ordinary_any_rollback (P Q : Prop) (hP : P) (hQ : Q) : P ∧ Q := by
+  constructor
+  any_goals (first | (exact hP; fail) | exact hQ)
+  exact hP
+
+theorem ordinary_any_frontier (P Q : Prop) (hP : P) (hQ : Q) : (P ∧ P) ∧ Q := by
+  constructor
+  any_goals constructor
+  exact hP
+  exact hP
+  exact hQ
+
+theorem ordinary_any_noop : True := by
+  any_goals skip
+  exact True.intro
+
+theorem ordinary_any_empty : True := by
+  exact True.intro
+  fail_if_success any_goals skip
+
+theorem conv_any (a b c d : Nat) (h : a = b) (k : c = d) : a + c = b + d := by
+  conv =>
+    lhs
+    congr
+    any_goals rw [h]
+    all_goals (try rw [k])
+
+theorem conv_any_rollback (a b c d : Nat) (h : a = b) (k : c = d) : a + c = b + d := by
+  conv =>
+    lhs
+    congr
+    any_goals (first | (rw [h]; rw [k]) | rw [k])
+    rw [h]
+
+def combine (left right : Nat) : Nat := left + right
+
+theorem conv_case_prime (a b c d : Nat) (h : a = b) (k : c = d) : combine a c = combine b d := by
+  conv =>
+    lhs
+    congr
+    case' right => rw [k]
+    case right => skip
+    case left => rw [h]
+
+theorem conv_case_prime_many (a b c d : Nat) (h : a = b) (k : c = d) : combine a c = combine b d := by
+  conv =>
+    lhs
+    congr
+    case' right | left => first | rw [h] | rw [k]
+    all_goals rfl
+
+theorem conv_case_prime_rename (P Q : Nat → Prop) (h : ∀ n, P n = Q n) (hq : ∀ n, Q n) : ∀ n, P n := by
+  conv =>
+    intro
+    case' _ n => rw [h n]
+  exact hq
+
+theorem conv_next_rename (P Q : Nat → Prop) (h : ∀ n, P n = Q n) (hq : ∀ n, Q n) : ∀ n, P n := by
+  conv =>
+    intro
+    next n => rw [h n]
+  exact hq
+
+theorem conv_next_frontier (a b c d : Nat) (h : a = b) (k : c = d) : a + c = b + d := by
+  conv =>
+    lhs
+    congr
+    next => rw [h]
+    next => rw [k]
+
+axiom guarded (x : Nat) : False → x = x
+
+theorem conv_case_prime_obligation (n : Nat) (h : False) : n = n := by
+  conv =>
+    lhs
+    case' _ => apply guarded
+    tactic => exact h
+"#,
+    ),
+    (
         "Sequence.lean",
         r#"example (a b : Nat) (h : a = b) : a + a = b + b := by
   conv =>
@@ -1541,6 +1627,63 @@ example (P Q : Nat → Prop) (h : ∀ n, P n = Q n) (hq : ∀ n, Q n) : ∀ n, P
 "#;
 
 const GOAL_CONTROL_REFUSED: &[(&str, &str, &str)] = &[
+    (
+        "AnyGoalsFailed.lean",
+        r#"example (a b c : Nat) (h : a = b) : c = c := by
+  conv =>
+    lhs
+    any_goals rw [h]
+"#,
+        "Tactic failed on all goals",
+    ),
+    (
+        "AnyGoalsEmpty.lean",
+        r#"example (a : Nat) : a = a := by
+  conv =>
+    lhs
+    rfl
+    any_goals skip
+"#,
+        "Tactic failed on all goals",
+    ),
+    (
+        "CasePrimeMissing.lean",
+        r#"example (a : Nat) : a = a := by
+  conv =>
+    lhs
+    case' absent => skip
+"#,
+        "Case tag `absent` not found.",
+    ),
+    (
+        "CasePrimeObligation.lean",
+        r#"axiom guarded (x : Nat) : False → x = x
+example (a : Nat) : a = a := by
+  conv =>
+    lhs
+    case' _ => apply guarded
+"#,
+        "There are unsolved goals",
+    ),
+    (
+        "NextObligation.lean",
+        r#"axiom guarded (x : Nat) : False → x = x
+example (a : Nat) : a = a := by
+  conv =>
+    lhs
+    next => apply guarded
+"#,
+        "apply conclusion does not match the goal",
+    ),
+    (
+        "NextNames.lean",
+        r#"example (a : Nat) : a = a := by
+  conv =>
+    lhs
+    next extra => skip
+"#,
+        "too many variable names provided",
+    ),
     (
         "MappedFailure.lean",
         r#"example (a b c : Nat) (h : a = b) : a + c = b + c := by
