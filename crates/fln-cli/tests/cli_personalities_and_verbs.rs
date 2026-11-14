@@ -698,8 +698,6 @@ fn lake_refuses_every_option_the_pin_does_not_define() {
 #[test]
 fn lake_commands_without_an_implementation_say_so() {
     for command in [
-        "test",
-        "lint",
         "cache",
         "check-lint",
         "check-test",

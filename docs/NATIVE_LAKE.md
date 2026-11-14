@@ -119,12 +119,13 @@ inconclusive rather than being accepted as an empty configuration.
 
 This configuration slice supports the ordinary `import Lake` header,
 top-level `package`, `lean_lib`, and `lean_exe` after `open Lake DSL`, package
-`srcDir` and `buildDir`, library `srcDir` and `roots`, and executable `srcDir`
-and `root`. An executable's default root is its target name. Executable targets
+`srcDir` and `buildDir`, library `srcDir` and `roots`, executable `srcDir`
+and `root`, and the test/lint driver fields described below. An executable's
+default root is its target name. Executable targets
 must have distinct roots, even when their source directories differ.
 `@[default_target]` also accepts executable targets. Layout `where` fields and
-empty configurations are supported. Additional imports, commands such as
-`require` or scripts, other fields, arbitrary declaration attributes,
+empty configurations are supported. Additional imports, scripts, other fields,
+arbitrary declaration attributes,
 same-line field separators, and trailing local `where` declarations are
 explicitly refused. All configured directories must remain within the package.
 Bad types, invalid later declarations, unsafe execution, or failed evaluation
@@ -307,6 +308,55 @@ snapshot. It inherits the caller's working directory and environment; Lake's
 augmented subprocess environment is not installed. Native executable build
 facets, linking, dependency fetching, and full Lake configuration remain
 outside this execution path.
+
+### Running test and lint drivers
+
+`lake test -- [ARGS...]` and `lake lint -- [ARGS...]` run configured executable
+drivers through the same checked source closure and Golem main path as `lake exe`.
+For example, a TOML package can select an executable declared in that package:
+
+```toml
+name = "project"
+testDriver = "tests"
+testDriverArgs = ["--configured", "two words"]
+lintDriver = "tests"
+lintDriverArgs = ["--lint"]
+
+[[lean_exe]]
+name = "tests"
+root = "TestMain"
+```
+
+`lake test -- --help ""` passes four arguments to `main`, in order:
+`--configured`, `two words`, `--help`, and an empty string. Only arguments after
+`--` belong to the driver; options before it belong to Lake. Driver stdout,
+stderr and its exit status are retained. A failed source dependency prevents
+main from running, and VM limits remain typed inconclusive outcomes.
+
+Lean package configurations support the same fields as checked `String` and
+`Array String` terms, including computed values. An executable may instead carry
+`@[test_driver]` or `@[lint_driver]`, including both tags on the same executable
+and combinations with `@[default_target]`. Two targets tagged for the same
+driver, or a nonempty explicit driver field combined with its tag, are errors.
+An explicitly empty driver field permits its corresponding tag. Computed
+argument arrays retain empty elements and ordering, with a 64 KiB bound on
+returned argument text and element count; the combined program argv is also
+subject to the ordinary source runner's input limit.
+
+An unqualified driver is resolved only in the root package. A driver such as
+`"tools/testRunner"` selects the package identity assigned by a requirement,
+while configured driver arguments still come from the root package. Driver
+components use Lean name syntax: a hyphenated component must be quoted, for
+example `"«tool-package»/testRunner"`. Build-selector shorthands such as `@tools/`
+and `/` do not apply to drivers. Local and materialized locked dependencies use
+the existing checked package resolution and source containment rules.
+
+This path executes source without emitting a native executable or build
+snapshot. It inherits the caller's environment and working directory, as the
+existing `lake exe` source path does. Script drivers, library test drivers
+requiring default build facets, and builtin environment linting remain
+explicitly unsupported. Test and lint configuration does not weaken the
+requirements for checked imports or executable source.
 
 ### Querying module artifacts
 

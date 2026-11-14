@@ -14977,6 +14977,7 @@ const LAKE_USAGE: &str = concat!(
     "roots. Lean terms are checked against real Init and evaluated by Golem.\n",
     "Default library, native executable and other build facets remain unavailable.\n",
     "lake exe runs configured roots and local Lean/TOML package libraries on Golem.\n",
+    "lake test and lake lint run configured executable drivers with args after --.\n",
     "lake query builds supported module facets and prints their artifact paths.\n",
     "lake update resolves the local dependency graph and atomically writes its manifest.\n",
     "Builds recheck source. Imports default to --import-posture reuse-verified:\n",
@@ -15073,6 +15074,30 @@ const LAKE_HELP_LEAN: &str = concat!(
     "publish build artifacts or launch an upstream Lean process.\n",
 );
 
+const LAKE_HELP_TEST: &str = concat!(
+    "Test the workspace's root package using its configured test driver\n",
+    "\nUSAGE:\n  lake test [-- <args>...]\n\n",
+    "Set testDriver in lakefile.toml or lakefile.lean, or mark a Lean executable\n",
+    "@[test_driver]. testDriverArgs are prepended to the arguments after --.\n",
+    "An unqualified driver belongs to the root package; package/name selects\n",
+    "a dependency's executable. Main is checked and executed once on Golem;\n",
+    "its stdout, stderr and exit status are preserved. No native binary is emitted.\n",
+    "Script drivers and default library build facets remain unavailable.\n",
+    "The source execution, environment and resource bounds of lake exe apply.\n",
+);
+
+const LAKE_HELP_LINT: &str = concat!(
+    "Lint the workspace's root package using its configured lint driver\n",
+    "\nUSAGE:\n  lake lint [-- <args>...]\n\n",
+    "Set lintDriver in lakefile.toml or lakefile.lean, or mark a Lean executable\n",
+    "@[lint_driver]. lintDriverArgs are prepended to the arguments after --.\n",
+    "An unqualified driver belongs to the root package; package/name selects\n",
+    "a dependency's executable. Main is checked and executed once on Golem;\n",
+    "its stdout, stderr and exit status are preserved. No native binary is emitted.\n",
+    "Script drivers and builtin environment linting remain unavailable.\n",
+    "The source execution, environment and resource bounds of lake exe apply.\n",
+);
+
 const LAKE_HELP_ENV: &str = concat!(
     "Execute a command in Lake's environment\n",
     "\n",
@@ -15149,6 +15174,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     let mut command: Option<String> = None;
     let mut command_args: Vec<String> = Vec::new();
     let mut lean_arguments = Vec::new();
+    let mut driver_arguments = Vec::new();
     let mut is_json = false;
     let mut ignored_options = Vec::new();
     // `lake build --jobs N`: external `.olean` closure modules checked at once.
@@ -15168,6 +15194,10 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
         if options && s == "--" {
             if command.as_deref() == Some("lean") {
                 lean_arguments.extend(iter);
+                break;
+            }
+            if matches!(command.as_deref(), Some("test" | "lint")) {
+                driver_arguments.extend(iter);
                 break;
             }
             options = false;
@@ -15257,6 +15287,8 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 Some("lean") => LAKE_HELP_LEAN,
                 Some("query") => LAKE_HELP_QUERY,
                 Some("env") => LAKE_HELP_ENV,
+                Some("test") => LAKE_HELP_TEST,
+                Some("lint") => LAKE_HELP_LINT,
                 _ => LAKE_USAGE,
             };
             return MultiplexerOutput::success(help.to_owned());
@@ -15352,16 +15384,18 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 "env" => return MultiplexerOutput::success(LAKE_HELP_ENV.to_owned()),
                 "exe" | "exec" => return MultiplexerOutput::success(LAKE_HELP_EXE.to_owned()),
                 "lean" => return MultiplexerOutput::success(LAKE_HELP_LEAN.to_owned()),
+                "test" => return MultiplexerOutput::success(LAKE_HELP_TEST.to_owned()),
+                "lint" => return MultiplexerOutput::success(LAKE_HELP_LINT.to_owned()),
                 _ => return MultiplexerOutput::success(format!("Help for lake {sub}\n")),
             }
         }
         return MultiplexerOutput::success(LAKE_USAGE.to_owned());
     }
 
-    if vm_options.supplied() && !matches!(cmd.as_str(), "exe" | "exec" | "lean") {
+    if vm_options.supplied() && !matches!(cmd.as_str(), "exe" | "exec" | "lean" | "test" | "lint") {
         return lake_operation_failure(
             "fln.lake-exe/1",
-            "Golem execution limits require lake exe or lake lean",
+            "Golem execution limits require lake exe, lake lean, lake test or lake lint",
             false,
             is_json,
         );
@@ -15555,8 +15589,43 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             }
             lake_build::run_executable(
                 dir.unwrap_or_else(|| PathBuf::from(".")),
-                target.clone(),
+                lake_build::ExecutableSelection::Named(target.clone()),
                 executable_arguments,
+                is_json,
+                jobs.unwrap_or(std::num::NonZeroUsize::MIN),
+                import_posture,
+                vm_options.limits,
+            )
+        }
+        "test" | "lint" => {
+            let (kind, schema) = if cmd == "test" {
+                (lake_build::DriverKind::Test, "fln.lake-test/1")
+            } else {
+                (lake_build::DriverKind::Lint, "fln.lake-lint/1")
+            };
+            if let Some(option) = ignored_options.first() {
+                return lake_operation_failure(
+                    schema,
+                    &format!("{cmd} option `{option}` is unavailable"),
+                    true,
+                    is_json,
+                );
+            }
+            if !command_args.is_empty() {
+                return lake_operation_failure(
+                    schema,
+                    &format!(
+                        "unexpected arguments: {} (driver arguments must follow --)",
+                        command_args.join(" ")
+                    ),
+                    false,
+                    is_json,
+                );
+            }
+            lake_build::run_executable(
+                dir.unwrap_or_else(|| PathBuf::from(".")),
+                lake_build::ExecutableSelection::Driver(kind),
+                driver_arguments,
                 is_json,
                 jobs.unwrap_or(std::num::NonZeroUsize::MIN),
                 import_posture,
@@ -15726,11 +15795,6 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 ),
             }
         }
-        "test" | "lint" => lake_not_implemented(
-            &cmd,
-            "this command needs Lake workspace evaluation (plan §13.3), which this build does not have",
-            is_json,
-        ),
         other if lake_pinned_top_commands().contains(other) => lake_not_implemented(
             other,
             "this pinned Lake command is not implemented in this build (plan §13.3)",

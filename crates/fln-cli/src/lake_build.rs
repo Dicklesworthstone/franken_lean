@@ -14,8 +14,8 @@ mod explain;
 mod local_dependencies;
 mod update;
 pub(super) use environment::run as run_environment;
-pub(super) use executable::run as run_executable;
 pub(super) use executable::run_source;
+pub(super) use executable::{DriverKind, ExecutableSelection, run as run_executable};
 pub(super) use update::run as update_manifest;
 #[path = "lake_config.rs"]
 mod lean_config;

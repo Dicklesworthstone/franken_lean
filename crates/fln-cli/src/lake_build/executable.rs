@@ -6,6 +6,51 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(crate) enum DriverKind {
+    Test,
+    Lint,
+}
+
+impl DriverKind {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Lint => "lint",
+        }
+    }
+
+    fn configured(self, config: &LakeConfig) -> (&str, &[String]) {
+        match self {
+            Self::Test => (&config.test_driver, &config.test_driver_args),
+            Self::Lint => (&config.lint_driver, &config.lint_driver_args),
+        }
+    }
+}
+
+pub(crate) enum ExecutableSelection {
+    Named(String),
+    Driver(DriverKind),
+}
+
+impl ExecutableSelection {
+    fn schema(&self) -> &'static str {
+        match self {
+            Self::Named(_) => "fln.lake-exe/1",
+            Self::Driver(DriverKind::Test) => "fln.lake-test/1",
+            Self::Driver(DriverKind::Lint) => "fln.lake-lint/1",
+        }
+    }
+
+    fn command(&self) -> &'static str {
+        match self {
+            Self::Named(_) => "lake exe",
+            Self::Driver(DriverKind::Test) => "lake test",
+            Self::Driver(DriverKind::Lint) => "lake lint",
+        }
+    }
+}
+
 fn program(
     entry: Name,
     location: SourceLocation,
@@ -86,13 +131,15 @@ fn program(
 
 pub(crate) fn run(
     directory: PathBuf,
-    target: String,
+    selection: ExecutableSelection,
     arguments: Vec<OsString>,
     json: bool,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
     vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
+    let schema = selection.schema();
+    let command = selection.command();
     // Validate raw argv before reading or executing a Lean configuration.
     let arguments = match source_main::arguments(arguments, SOURCE_RUN_DEFAULT_MAX_BYTES) {
         Ok(arguments) => arguments,
@@ -120,7 +167,32 @@ pub(crate) fn run(
                     result => result?,
                 };
             let sources = local_dependencies::load(&root, loaded, evaluation)?;
-            let (package, executable) = sources.executable(&target)?;
+            let (package, executable, arguments) = match selection {
+                ExecutableSelection::Named(target) => {
+                    let (package, executable) = sources.executable(&target)?;
+                    (package, executable, arguments)
+                }
+                ExecutableSelection::Driver(kind) => {
+                    // Driver options belong to the invocation's root package,
+                    // including when another package owns the selected target.
+                    let root = sources.package("")?;
+                    let (driver, configured) = kind.configured(&root.config);
+                    let arguments = match source_main::arguments(
+                        configured
+                            .iter()
+                            .cloned()
+                            .chain(arguments)
+                            .map(OsString::from),
+                        SOURCE_RUN_DEFAULT_MAX_BYTES,
+                    ) {
+                        Ok(arguments) => arguments,
+                        Err(error) => return Ok(error.output()),
+                    };
+                    let (package, executable) =
+                        sources.driver(kind, driver, !arguments.is_empty())?;
+                    (package, executable, arguments)
+                }
+            };
             let [root_name] = executable.roots.as_slice() else {
                 return Err(Failure::input(
                     "an executable must have exactly one root module",
@@ -162,7 +234,7 @@ pub(crate) fn run(
             format!("could not start executable worker: {error}"),
         )),
     };
-    result.unwrap_or_else(|error| error.render_as(json, "fln.lake-exe/1", "lake exe"))
+    result.unwrap_or_else(|error| error.render_as(json, schema, command))
 }
 
 #[allow(clippy::too_many_arguments)]

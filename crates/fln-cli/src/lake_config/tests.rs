@@ -64,6 +64,59 @@ fn native_lake_config_keeps_executable_roots_typed_and_defaults_to_the_target_na
 }
 
 #[test]
+fn native_lake_config_keeps_driver_fields_typed_and_driver_tags_distinct() {
+    let source = r#"import Lake
+open Lake DSL
+def selected : String := "tools/" ++ "runner"
+def arguments : Array String := #["configured", "", "λ"]
+package p where
+  testDriver := selected
+  testDriverArgs := arguments
+  lintDriver := ""
+  lintDriverArgs := Array.push arguments "last"
+@[default_target, lint_driver] lean_exe runner where
+  root := `Main
+"#;
+    let parsed = parse(source.as_bytes()).unwrap_or_else(|error| panic!("{}", error.detail));
+    assert_eq!(parsed.config.default_targets, ["runner"]);
+    assert_eq!(parsed.tagged_test_driver, None);
+    assert_eq!(parsed.tagged_lint_driver.as_deref(), Some("runner"));
+    assert_eq!(parsed.fields.len(), 5);
+    assert!(matches!(parsed.fields[0].slot, ConfigSlot::TestDriver));
+    assert!(matches!(parsed.fields[1].slot, ConfigSlot::TestDriverArgs));
+    assert!(matches!(parsed.fields[2].slot, ConfigSlot::LintDriver));
+    assert!(matches!(parsed.fields[3].slot, ConfigSlot::LintDriverArgs));
+    for (index, type_) in [
+        (0, "_root_.String"),
+        (1, "_root_.Array _root_.String"),
+        (2, "_root_.String"),
+        (3, "_root_.Array _root_.String"),
+    ] {
+        assert!(parsed.program.contains(&format!(
+            "def {} : {type_} :=",
+            parsed.fields[index].declaration,
+        )));
+    }
+    assert!(parsed.config.test_driver.is_empty());
+    assert!(parsed.config.test_driver_args.is_empty());
+    assert!(parsed.program.contains("Array.push arguments \"last\""));
+
+    for tag in ["test_driver", "lint_driver"] {
+        let source = format!(
+            "import Lake\nopen Lake DSL\npackage p\n@[{tag}] lean_exe first\n@[{tag}] lean_exe second\n",
+        );
+        let error = parse(source.as_bytes()).unwrap_err();
+        assert_eq!(error.class, "input");
+        assert!(error.detail.contains("only one target"), "{}", error.detail);
+    }
+    let source =
+        "import Lake\nopen Lake DSL\npackage p\n@[test_driver]\n@[lint_driver] lean_exe runner\n";
+    let parsed = parse(source.as_bytes()).unwrap_or_else(|error| panic!("{}", error.detail));
+    assert_eq!(parsed.tagged_test_driver.as_deref(), Some("runner"));
+    assert_eq!(parsed.tagged_lint_driver.as_deref(), Some("runner"));
+}
+
+#[test]
 fn native_lake_config_uses_prior_local_and_scoped_notation_tokens() {
     let source = "import Lake\nopen System Lake DSL\nnamespace Config\nscoped notation \"◆\" s => System.FilePath.mk s\nend Config\nopen scoped Config\nlocal notation \"◇\" => \"src\"\npackage p where\n  srcDir := ◆ ◇\n@[default_target] lean_lib P\n";
     let parsed = parse(source.as_bytes()).unwrap_or_else(|error| panic!("{}", error.detail));

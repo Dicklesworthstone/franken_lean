@@ -395,6 +395,69 @@ fn default_targets_are_not_synthesized_and_bad_arrays_are_not_filtered() {
     );
 }
 
+#[test]
+fn executable_driver_fields_preserve_order_empty_arguments_and_strict_types() {
+    let source = concat!(
+        "name = 'drivers'\n",
+        "testDriver = 'tools/runner'\n",
+        "testDriverArgs = ['first', '', 'λ', 'first']\n",
+        "lintDriver = 'runner'\n",
+        "lintDriverArgs = ['--configured', 'two words']\n",
+        "[[lean_exe]]\nname = 'runner'\nroot = 'Main'\n",
+    );
+    for parse in [
+        LakeConfig::parse_toml,
+        LakeConfig::parse_toml_for_build,
+        LakeConfig::parse_toml_for_execution,
+    ] {
+        let config = parse(source).unwrap();
+        assert_eq!(config.test_driver, "tools/runner");
+        assert_eq!(config.test_driver_args, ["first", "", "λ", "first"]);
+        assert_eq!(config.lint_driver, "runner");
+        assert_eq!(config.lint_driver_args, ["--configured", "two words"]);
+        for field in [
+            "testDriver = 42",
+            "lintDriver = ['runner']",
+            "testDriverArgs = ['first', 42]",
+            "lintDriverArgs = 'argument'",
+        ] {
+            assert!(
+                parse(&format!("name = 'drivers'\n{field}\n")).is_err(),
+                "{field}"
+            );
+        }
+    }
+    for field in [
+        "testDriver",
+        "lintDriver",
+        "testDriverArgs",
+        "lintDriverArgs",
+    ] {
+        let value = if field.ends_with("Args") { "[]" } else { "''" };
+        assert!(
+            LakeConfig::parse_toml_for_execution(&format!(
+                "name = 'drivers'\n{field} = {value}\n{field} = {value}\n",
+            ))
+            .is_err()
+        );
+    }
+    for (input, expected) in [
+        ("tools.runner", Some("tools.runner")),
+        ("«tools-name»", Some("«tools-name»")),
+        ("«runner»", Some("runner")),
+        ("tools-name", None),
+        ("@tools", None),
+        ("", None),
+        ("[anonymous]", None),
+    ] {
+        assert_eq!(
+            fln_lake::canonical_driver_name(input).as_deref(),
+            expected,
+            "{input}"
+        );
+    }
+}
+
 /// Every file of the tree under `root`, by relative path, with its bytes.
 fn tree(root: &std::path::Path) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
@@ -1262,6 +1325,10 @@ fn update_checked_lean(name: &str, requirements: &[(&str, &str)]) -> LakeConfig 
     LakeConfig {
         name: name.to_owned(),
         default_targets: Vec::new(),
+        test_driver: String::new(),
+        test_driver_args: Vec::new(),
+        lint_driver: String::new(),
+        lint_driver_args: Vec::new(),
         lean_toolchain: None,
         src_dir: PathBuf::from("."),
         build_dir: PathBuf::from(".lake/build"),

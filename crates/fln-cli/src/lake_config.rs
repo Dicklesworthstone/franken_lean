@@ -35,6 +35,10 @@ const LAKE_COMMANDS: [&str; 10] = [
 enum ConfigSlot {
     Source,
     Build,
+    TestDriver,
+    TestDriverArgs,
+    LintDriver,
+    LintDriverArgs,
     DependencyPath(usize),
     DependencyUrl(usize),
     DependencyRevision(usize),
@@ -59,6 +63,8 @@ struct ParsedConfig {
     fields: Vec<ConfigField>,
     /// `require` itself declares these names in the pin's configuration world.
     requirement_names: Vec<Name>,
+    tagged_test_driver: Option<String>,
+    tagged_lint_driver: Option<String>,
 }
 
 pub(super) struct LoadedConfig {
@@ -413,6 +419,10 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
         config: LakeConfig {
             name: String::new(),
             default_targets: Vec::new(),
+            test_driver: String::new(),
+            test_driver_args: Vec::new(),
+            lint_driver: String::new(),
+            lint_driver_args: Vec::new(),
             lean_toolchain: None,
             src_dir: PathBuf::from("."),
             build_dir: PathBuf::from(".lake/build"),
@@ -423,6 +433,8 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
         program: String::new(),
         fields: Vec::new(),
         requirement_names: Vec::new(),
+        tagged_test_driver: None,
+        tagged_lint_driver: None,
     };
     let mut scope_depth = 0usize;
     let mut lake_open = false;
@@ -452,16 +464,32 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                 ));
             }
             let mut default_target = false;
+            let mut test_driver = false;
+            let mut lint_driver = false;
             for attribute in attributes {
-                if !matches!(keyword, "lean_lib" | "lean_exe")
-                    || attribute.len() != 1
-                    || tokens.spelling(attribute.start) != Some("default_target")
-                {
+                if !matches!(keyword, "lean_lib" | "lean_exe") {
                     return Err(Failure::unsupported(
-                        "lakefile.lean: only @[default_target] on lean_lib and lean_exe is supported",
+                        "lakefile.lean: only @[default_target], @[test_driver] and @[lint_driver] on lean_lib and lean_exe are supported",
                     ));
                 }
-                default_target = true;
+                if attribute.is_empty() || attribute.len() % 2 == 0 {
+                    return Err(Failure::unsupported(
+                        "lakefile.lean: unsupported target attribute syntax",
+                    ));
+                }
+                for (index, at) in attribute.enumerate() {
+                    match (index % 2, tokens.spelling(at)) {
+                        (0, Some("default_target")) => default_target = true,
+                        (0, Some("test_driver")) => test_driver = true,
+                        (0, Some("lint_driver")) => lint_driver = true,
+                        (1, Some(",")) => {}
+                        _ => {
+                            return Err(Failure::unsupported(
+                                "lakefile.lean: only default_target, test_driver and lint_driver target attributes are supported",
+                            ));
+                        }
+                    }
+                }
             }
             let declaration_name = tokens.name(head + 1)?;
             // This is a package/target identity, not a diagnostic display. The
@@ -700,6 +728,16 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                 if default_target {
                     parsed.config.default_targets.push(declaration.clone());
                 }
+                for (tagged, selected, label) in [
+                    (&mut parsed.tagged_test_driver, test_driver, "test"),
+                    (&mut parsed.tagged_lint_driver, lint_driver, "lint"),
+                ] {
+                    if selected && tagged.replace(declaration.clone()).is_some() {
+                        return Err(Failure::input(format!(
+                            "lakefile.lean: only one target can be tagged @[{label}_driver]",
+                        )));
+                    }
+                }
                 Some(index)
             };
             let declaration_column = tokens.column(0).min(tokens.column(head));
@@ -707,6 +745,10 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                 let slot = match (target, field.as_str()) {
                     (None, "srcDir") => ConfigSlot::Source,
                     (None, "buildDir") => ConfigSlot::Build,
+                    (None, "testDriver") => ConfigSlot::TestDriver,
+                    (None, "testDriverArgs") => ConfigSlot::TestDriverArgs,
+                    (None, "lintDriver") => ConfigSlot::LintDriver,
+                    (None, "lintDriverArgs") => ConfigSlot::LintDriverArgs,
                     (Some(index), "srcDir") => ConfigSlot::TargetSource(index),
                     (Some(index), "roots") if keyword == "lean_lib" => {
                         ConfigSlot::LibraryRoots(index)
@@ -726,6 +768,10 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                 let type_ = match slot {
                     ConfigSlot::LibraryRoots(_) => "_root_.Array _root_.Lean.Name",
                     ConfigSlot::ExecutableRoot(_) => "_root_.Lean.Name",
+                    ConfigSlot::TestDriver | ConfigSlot::LintDriver => "_root_.String",
+                    ConfigSlot::TestDriverArgs | ConfigSlot::LintDriverArgs => {
+                        "_root_.Array _root_.String"
+                    }
                     _ => "_root_.System.FilePath",
                 };
                 parsed.program.push_str(&format!(
@@ -910,6 +956,50 @@ fn module_roots(exit: &fln::VmExit, label: &str) -> Result<Vec<String>, Failure>
     Ok(roots)
 }
 
+/// Observe the checked Array String result; never parse source terms as text
+/// or flatten an argument list through a shell command line.
+fn driver_arguments(exit: &fln::VmExit, label: &str) -> Result<Vec<String>, Failure> {
+    let malformed = || {
+        Failure::new(
+            "internal-fault",
+            format!("lakefile.lean: {label} did not return its checked Array String"),
+        )
+    };
+    let fln::VmExit::Returned(returned) = exit else {
+        return Err(Failure::new(
+            "execution",
+            format!("lakefile.lean: {label} did not return: {exit:?}"),
+        ));
+    };
+    let (count, _) = returned.value.try_array_view().ok_or_else(malformed)?;
+    let too_large = || {
+        Failure::new(
+            "resource",
+            format!("lakefile.lean: {label} arguments exceed 64 KiB"),
+        )
+    };
+    if count > MAX_CONFIG_BYTES {
+        return Err(too_large());
+    }
+    let mut arguments = Vec::with_capacity(count);
+    let mut bytes = count;
+    for index in 0..count {
+        let value = returned.value.array_child(index);
+        let (_, _, _, buffer) = value.try_borrow_string_view().ok_or_else(malformed)?;
+        let text = buffer.strip_suffix(&[0]).ok_or_else(malformed)?;
+        bytes = bytes
+            .checked_add(text.len())
+            .filter(|bytes| *bytes <= MAX_CONFIG_BYTES)
+            .ok_or_else(too_large)?;
+        arguments.push(
+            std::str::from_utf8(text)
+                .map_err(|_| malformed())?
+                .to_owned(),
+        );
+    }
+    Ok(arguments)
+}
+
 fn evaluate(
     mut parsed: ParsedConfig,
     engine: fln::Engine,
@@ -975,8 +1065,15 @@ fn evaluate(
                 "def {projection} : _root_.Array _root_.Lean.Name := #[_root_.{}]",
                 field.declaration
             ),
-            ConfigSlot::DependencyUrl(_) | ConfigSlot::DependencyRevision(_) => format!(
+            ConfigSlot::DependencyUrl(_)
+            | ConfigSlot::DependencyRevision(_)
+            | ConfigSlot::TestDriver
+            | ConfigSlot::LintDriver => format!(
                 "def {projection} : _root_.String := _root_.{}",
+                field.declaration
+            ),
+            ConfigSlot::TestDriverArgs | ConfigSlot::LintDriverArgs => format!(
+                "def {projection} : _root_.Array _root_.String := _root_.{}",
                 field.declaration
             ),
             _ => format!(
@@ -997,6 +1094,14 @@ fn evaluate(
             })?;
         let execution = complete(execution, &field.label)?;
         match field.slot {
+            ConfigSlot::TestDriverArgs => {
+                parsed.config.test_driver_args = driver_arguments(&execution.exit, &field.label)?;
+                continue;
+            }
+            ConfigSlot::LintDriverArgs => {
+                parsed.config.lint_driver_args = driver_arguments(&execution.exit, &field.label)?;
+                continue;
+            }
             ConfigSlot::LibraryRoots(index) => {
                 // Replace the default even for #[]; absence and an explicit empty
                 // root set are different Lake configurations.
@@ -1039,6 +1144,20 @@ fn evaluate(
             }
         };
         match field.slot {
+            ConfigSlot::TestDriver | ConfigSlot::LintDriver => {
+                if value.len() > MAX_CONFIG_BYTES {
+                    return Err(Failure::new(
+                        "resource",
+                        format!("lakefile.lean: {} exceeds 64 KiB", field.label),
+                    ));
+                }
+                if matches!(field.slot, ConfigSlot::TestDriver) {
+                    parsed.config.test_driver = value;
+                } else {
+                    parsed.config.lint_driver = value;
+                }
+                continue;
+            }
             ConfigSlot::DependencyUrl(index) => {
                 parsed.config.requires[index].url = Some(value);
                 continue;
@@ -1070,10 +1189,35 @@ fn evaluate(
             | ConfigSlot::DependencyUrl(_)
             | ConfigSlot::DependencyRevision(_)
             | ConfigSlot::DependencySubdir(_)
+            | ConfigSlot::TestDriver
+            | ConfigSlot::TestDriverArgs
+            | ConfigSlot::LintDriver
+            | ConfigSlot::LintDriverArgs
             | ConfigSlot::LibraryRoots(_)
             | ConfigSlot::ExecutableRoot(_) => {
-                unreachable!("module roots and dependency fields were read above")
+                unreachable!("module roots, drivers and dependency fields were read above")
             }
+        }
+    }
+    for (label, configured, tagged) in [
+        (
+            "test",
+            &mut parsed.config.test_driver,
+            parsed.tagged_test_driver,
+        ),
+        (
+            "lint",
+            &mut parsed.config.lint_driver,
+            parsed.tagged_lint_driver,
+        ),
+    ] {
+        if let Some(tagged) = tagged {
+            if !configured.is_empty() {
+                return Err(Failure::input(format!(
+                    "lakefile.lean: cannot both set {label}Driver and use @[{label}_driver]",
+                )));
+            }
+            *configured = tagged;
         }
     }
     validate_executable_roots(&parsed.config)?;

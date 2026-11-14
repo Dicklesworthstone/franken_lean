@@ -689,3 +689,344 @@ fn help_names_the_native_execution_contract_without_claiming_linked_artifacts() 
         "{output:?}"
     );
 }
+
+#[test]
+fn configured_test_and_lint_drivers_match_pinned_arguments_streams_and_status() {
+    let _guard = serial_execution();
+    let Some(reference) = reference() else {
+        return;
+    };
+    let toml = format!(
+        "testDriver = 'runner'\ntestDriverArgs = ['configured', '', 'λ🙂']\nlintDriver = 'runner'\nlintDriverArgs = ['lint', 'two words']\n{CONFIG}",
+    );
+    let lean = LEAN_CONFIG
+        .replace(
+            "package program where",
+            concat!(
+                "package program where\n",
+                "  testDriver := \"run\" ++ \"ner\"\n",
+                "  testDriverArgs := Array.push #[\"configured\", \"\"] (\"λ\" ++ \"🙂\")\n",
+                "  lintDriver := \"\"\n",
+                "  lintDriverArgs := #[\"lint\", \"two words\"]",
+            ),
+        )
+        .replace(
+            "@[default_target] lean_exe",
+            "@[default_target, lint_driver] lean_exe",
+        );
+    let source = MAIN.replace("  pure 7", "  IO.eprintln \"driver-stderr\"\n  pure 7");
+    let cli = ["--help", "--json", "--jobs=0", "--", "", "a b"];
+    for (file, config) in [("lakefile.toml", toml), ("lakefile.lean", lean)] {
+        let native = Package::with_configuration(file, &config);
+        let oracle = Package::with_configuration(file, &config);
+        for package in [&native, &oracle] {
+            package.write("src/library/Shared.lean", LIBRARY);
+            package.write("src/application/App/Main.lean", &source);
+        }
+        for (command, configured) in [
+            ("test", vec!["configured", "", "λ🙂"]),
+            ("lint", vec!["lint", "two words"]),
+        ] {
+            let mut args = vec![command, "--"];
+            args.extend(cli);
+            let expected = configured
+                .into_iter()
+                .chain(cli)
+                .map(|arg| format!("prefix:{arg}\n"))
+                .collect::<String>();
+            let actual = native.run_with_jobs(&args, Some(reference), 1);
+            assert_eq!(
+                actual.status.code(),
+                Some(7),
+                "{file} {command}: {actual:?}"
+            );
+            assert_eq!(text(&actual.stdout), expected, "{actual:?}");
+            assert_eq!(text(&actual.stderr), "driver-stderr\n", "{actual:?}");
+            assert!(!native.0.join("artifacts").exists());
+            let pinned = Command::new(&reference.lake)
+                .arg("--quiet")
+                .arg("--dir")
+                .arg(&oracle.0)
+                .args(&args)
+                .env("LEAN_PATH", &reference.lib)
+                .output()
+                .unwrap();
+            assert_eq!(pinned.status.code(), actual.status.code(), "{pinned:?}");
+            assert_eq!(pinned.stdout, actual.stdout, "{pinned:?}");
+            assert_eq!(pinned.stderr, actual.stderr, "{pinned:?}");
+        }
+        native.write(
+            "src/library/Shared.lean",
+            &format!("{LIBRARY}theorem impossible (P Q : Prop) (h : P) : Q := h\n"),
+        );
+        let refused = native.run_with_jobs(&["test", "--", "must-not-run"], Some(reference), 1);
+        assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+        assert!(refused.stdout.is_empty(), "{refused:?}");
+        assert!(text(&refused.stderr).contains("NotDefEq"), "{refused:?}");
+        assert!(
+            !text(&refused.stderr).contains("driver-stderr"),
+            "{refused:?}"
+        );
+    }
+}
+
+#[test]
+fn dependency_drivers_keep_the_assigned_owner_and_root_configured_arguments() {
+    let _guard = serial_execution();
+    let Some(reference) = reference() else {
+        return;
+    };
+    let config = concat!(
+        "name = 'consumer'\n",
+        "testDriver = 'toolAlias/runner'\n",
+        "testDriverArgs = ['root-test']\n",
+        "lintDriver = 'runner'\n",
+        "lintDriverArgs = ['root-lint']\n",
+        "[[require]]\nname = 'toolAlias'\npath = 'tools'\n",
+        "[[lean_exe]]\nname = 'runner'\nroot = 'RootMain'\n",
+    );
+    let native = Package::new(config);
+    let oracle = Package::new(config);
+    for package in [&native, &oracle] {
+        package.write(
+            "tools/lakefile.toml",
+            concat!(
+                "name = 'declaredTools'\n",
+                "testDriver = 'runner'\ntestDriverArgs = ['dependency-args-must-not-leak']\n",
+                "[[lean_lib]]\nname = 'Tools'\n",
+                "[[lean_exe]]\nname = 'runner'\nroot = 'ToolMain'\nsrcDir = 'app'\n",
+            ),
+        );
+        package.write(
+            "tools/Tools.lean",
+            "prelude\ntheorem Tools.keep (P : Prop) (h : P) : P := h\n",
+        );
+        package.write(
+            "tools/app/ToolMain.lean",
+            concat!(
+                "prelude\nimport Init.System.IO\nimport Tools\n",
+                "def main (args : List String) : IO UInt32 := do\n",
+                "  for arg in args do\n    IO.println (\"dependency:\" ++ arg)\n",
+                "  IO.eprintln \"dependency-stderr\"\n  pure 11\n",
+            ),
+        );
+        package.write(
+            "RootMain.lean",
+            concat!(
+                "prelude\nimport Init.System.IO\n",
+                "def main (args : List String) : IO UInt32 := do\n",
+                "  for arg in args do\n    IO.println (\"root:\" ++ arg)\n",
+                "  IO.eprintln \"root-stderr\"\n  pure 9\n",
+            ),
+        );
+    }
+    for (command, status, stdout, stderr) in [
+        (
+            "test",
+            11,
+            "dependency:root-test\ndependency:cli\n",
+            "dependency-stderr\n",
+        ),
+        ("lint", 9, "root:root-lint\nroot:cli\n", "root-stderr\n"),
+    ] {
+        let args = [command, "--", "cli"];
+        let actual = native.run_with_jobs(&args, Some(reference), 1);
+        assert_eq!(actual.status.code(), Some(status), "{actual:?}");
+        assert_eq!(text(&actual.stdout), stdout, "{actual:?}");
+        assert_eq!(text(&actual.stderr), stderr, "{actual:?}");
+        let pinned = Command::new(&reference.lake)
+            .arg("--quiet")
+            .arg("--dir")
+            .arg(&oracle.0)
+            .args(args)
+            .env("LEAN_PATH", &reference.lib)
+            .output()
+            .unwrap();
+        assert_eq!(pinned.status.code(), actual.status.code(), "{pinned:?}");
+        assert_eq!(pinned.stdout, actual.stdout, "{pinned:?}");
+        assert_eq!(pinned.stderr, actual.stderr, "{pinned:?}");
+    }
+    let stopped = native.run_with_jobs(&["--fln-max-steps=1", "test"], Some(reference), 1);
+    assert_eq!(stopped.status.code(), Some(3), "{stopped:?}");
+    assert!(stopped.stdout.is_empty(), "{stopped:?}");
+    assert!(
+        text(&stopped.stderr).contains("inconclusive"),
+        "{stopped:?}"
+    );
+    assert!(!native.0.join(".lake").exists());
+    assert!(!native.0.join("tools/.lake").exists());
+}
+
+#[test]
+fn lean_driver_attributes_and_fields_require_checked_unambiguous_values() {
+    let _guard = serial_execution();
+    let Some(reference) = reference() else {
+        return;
+    };
+    let config = LEAN_CONFIG.replace(
+        "@[default_target]",
+        "@[default_target, test_driver, lint_driver]",
+    );
+    let package = Package::with_configuration("lakefile.lean", &config);
+    package.write("src/library/Shared.lean", LIBRARY);
+    package.write("src/application/App/Main.lean", MAIN);
+    for command in ["test", "lint"] {
+        let output = package.run_with_jobs(&[command, "--", "tagged"], Some(reference), 1);
+        assert_eq!(output.status.code(), Some(7), "{output:?}");
+        assert_eq!(text(&output.stdout), "prefix:tagged\n", "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+    for (field, class, diagnostic) in [
+        (
+            "testDriver := \"runner\"",
+            "input",
+            "cannot both set testDriver",
+        ),
+        (
+            "lintDriver := \"runner\"",
+            "input",
+            "cannot both set lintDriver",
+        ),
+        ("testDriverArgs := (#[1] : Array Nat)", "elaboration", ""),
+        ("lintDriver := (7 : Nat)", "elaboration", ""),
+    ] {
+        package.write(
+            "lakefile.lean",
+            &config.replace(
+                "package program where",
+                &format!("package program where\n  {field}"),
+            ),
+        );
+        let refused = package.run_with_jobs(
+            &["--json", "test", "--", "must-not-run"],
+            Some(reference),
+            1,
+        );
+        assert_eq!(refused.status.code(), Some(1), "{field}: {refused:?}");
+        assert!(refused.stdout.is_empty(), "{refused:?}");
+        assert!(
+            text(&refused.stderr).contains(&format!("\"class\":\"{class}\"")),
+            "{refused:?}"
+        );
+        assert!(text(&refused.stderr).contains(diagnostic), "{refused:?}");
+    }
+    assert!(!package.0.join("artifacts").exists());
+}
+
+#[test]
+fn driver_selection_is_root_scoped_and_refuses_missing_or_unsupported_drivers() {
+    let config = concat!(
+        "name = 'root'\ntestDriver = 'runner'\nlintDriver = 'runner'\n",
+        "[[require]]\nname = 'toolAlias'\npath = 'tools'\n",
+        "[[lean_lib]]\nname = 'Proofs'\n",
+    );
+    let package = Package::new(config);
+    package.write("Proofs.lean", "prelude\n");
+    package.write("tools/lakefile.toml", SIMPLE_CONFIG);
+    package.write("tools/Main.lean", "prelude\n");
+    for command in ["test", "lint"] {
+        let unqualified = package.run(&["--json", command], None);
+        assert_eq!(unqualified.status.code(), Some(1), "{unqualified:?}");
+        assert!(unqualified.stdout.is_empty(), "{unqualified:?}");
+        assert!(
+            text(&unqualified.stderr).contains("unknown script"),
+            "{unqualified:?}"
+        );
+        assert!(text(&unqualified.stderr).contains(&format!("fln.lake-{command}/1")));
+    }
+    for (selector, diagnostic, class) in [
+        ("", "no test driver configured", "input"),
+        ("absent", "unknown script", "input"),
+        ("missing/runner", "unknown test driver package", "input"),
+        ("isolated/runner", "unknown test driver package", "input"),
+        ("@toolAlias/runner", "unknown test driver package", "input"),
+        ("/runner", "unknown test driver package", "input"),
+        ("toolAlias/runner/extra", "too many '/'", "input"),
+        ("Proofs", "default library build facets", "unsupported"),
+    ] {
+        package.write(
+            "lakefile.toml",
+            &config.replace(
+                "testDriver = 'runner'",
+                &format!("testDriver = '{selector}'"),
+            ),
+        );
+        let refused = package.run(&["--json", "test"], None);
+        assert_eq!(refused.status.code(), Some(1), "{selector}: {refused:?}");
+        assert!(refused.stdout.is_empty(), "{refused:?}");
+        assert!(
+            text(&refused.stderr).contains(diagnostic),
+            "{selector}: {refused:?}"
+        );
+        assert!(
+            text(&refused.stderr).contains(&format!("\"class\":\"{class}\"")),
+            "{refused:?}"
+        );
+    }
+    let library_args = package.run(&["test", "--", "not-a-library-argument"], None);
+    assert!(
+        text(&library_args.stderr).contains("arguments cannot be passed to a library"),
+        "{library_args:?}"
+    );
+    package.write(
+        "lakefile.toml",
+        &config.replace("testDriver = 'runner'", "testDriver = 'toolAlias/runner'"),
+    );
+    let selected = package.run(&["test"], None);
+    assert_eq!(selected.status.code(), Some(1), "{selected:?}");
+    assert!(
+        text(&selected.stderr).contains("unknown executable declaration `main`"),
+        "{selected:?}"
+    );
+    assert!(!package.0.join(".lake").exists());
+    assert!(!package.0.join("tools/.lake").exists());
+    let script = Package::with_configuration(
+        "lakefile.lean",
+        "import Lake\nopen Lake DSL\npackage scripts\n@[test_driver] script check := return 0\n",
+    );
+    let refused = script.run(&["--json", "test"], None);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        text(&refused.stderr).contains("\"class\":\"unsupported\""),
+        "{refused:?}"
+    );
+    assert!(
+        text(&refused.stderr).contains("`script` configuration"),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn driver_cli_validates_arguments_before_configuration_and_reserves_lake_options() {
+    let package = Package::new("not a valid configuration");
+    for command in ["test", "lint"] {
+        let positional = package.run(&["--json", command, "unseparated"], None);
+        assert_eq!(positional.status.code(), Some(1), "{positional:?}");
+        assert!(
+            text(&positional.stderr).contains("unexpected arguments"),
+            "{positional:?}"
+        );
+        assert!(!text(&positional.stderr).contains("Lake configuration"));
+        let output = fln_cli::run_lake([
+            OsString::from("--dir"),
+            package.0.as_os_str().to_owned(),
+            OsString::from(command),
+            OsString::from("--"),
+            OsString::from("x".repeat(fln_cli::SOURCE_RUN_DEFAULT_MAX_BYTES)),
+        ]);
+        assert_eq!(output.exit_code, 3, "{output:?}");
+        assert!(
+            output.stderr.contains("script arguments exceed"),
+            "{output:?}"
+        );
+        assert!(!output.stderr.contains("configuration"), "{output:?}");
+        let help = package.run(&[command, "--help"], None);
+        assert!(help.status.success(), "{help:?}");
+        assert!(text(&help.stdout).contains("executed once on Golem"));
+        assert!(help.stderr.is_empty(), "{help:?}");
+    }
+    let builtin = package.run(&["lint", "--builtin-only"], None);
+    assert_eq!(builtin.status.code(), Some(1), "{builtin:?}");
+    assert!(text(&builtin.stderr).contains("unavailable"), "{builtin:?}");
+}

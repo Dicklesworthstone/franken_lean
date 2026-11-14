@@ -33,6 +33,14 @@ pub struct LakeConfig {
     pub name: String,
     /// Default build targets.
     pub default_targets: Vec<String>,
+    /// Script, executable, or library selected by `lake test`.
+    pub test_driver: String,
+    /// Arguments prepended to the test driver's command-line arguments.
+    pub test_driver_args: Vec<String>,
+    /// Script or executable selected by `lake lint`.
+    pub lint_driver: String,
+    /// Arguments prepended to the lint driver's command-line arguments.
+    pub lint_driver_args: Vec<String>,
     /// Lean toolchain version constraint from `lean-toolchain`.
     pub lean_toolchain: Option<String>,
     /// Source directory root.
@@ -615,11 +623,15 @@ impl LakeConfig {
                 )));
             }
             let array = match (section, key) {
-                ("package", "defaultTargets" | "keywords") | ("lean_lib", "roots") => true,
+                (
+                    "package",
+                    "defaultTargets" | "keywords" | "testDriverArgs" | "lintDriverArgs",
+                )
+                | ("lean_lib", "roots") => true,
                 (
                     "package",
                     "name" | "version" | "description" | "homepage" | "license" | "srcDir"
-                    | "buildDir",
+                    | "buildDir" | "testDriver" | "lintDriver",
                 )
                 | ("lean_lib" | "lean_exe", "name" | "srcDir")
                 | ("lean_exe", "root")
@@ -687,6 +699,10 @@ impl LakeConfig {
     pub fn parse_toml(content: &str) -> Result<Self, LakeParseError> {
         let mut name: Option<String> = None;
         let mut default_targets: Vec<String> = Vec::new();
+        let mut test_driver = String::new();
+        let mut test_driver_args = Vec::new();
+        let mut lint_driver = String::new();
+        let mut lint_driver_args = Vec::new();
         let mut src_dir = PathBuf::from(".");
         let mut build_dir = PathBuf::from(".lake/build");
         let mut requires: Vec<LakeRequire> = Vec::new();
@@ -776,6 +792,32 @@ impl LakeConfig {
                                 )));
                             }
                         }
+                        "testDriver" | "lintDriver" => {
+                            let driver = parse_string_val(val).ok_or_else(|| {
+                                LakeParseError::InvalidSyntax(format!(
+                                    "line {}: invalid string value for {key}: {val}",
+                                    line_idx + 1,
+                                ))
+                            })?;
+                            if key == "testDriver" {
+                                test_driver = driver;
+                            } else {
+                                lint_driver = driver;
+                            }
+                        }
+                        "testDriverArgs" | "lintDriverArgs" => {
+                            let arguments = parse_string_array(val).ok_or_else(|| {
+                                LakeParseError::InvalidSyntax(format!(
+                                    "line {}: invalid string array for {key}: {val}",
+                                    line_idx + 1,
+                                ))
+                            })?;
+                            if key == "testDriverArgs" {
+                                test_driver_args = arguments;
+                            } else {
+                                lint_driver_args = arguments;
+                            }
+                        }
                         "srcDir" | "src_dir" => {
                             if let Some(s) = parse_string_val(val) {
                                 src_dir = PathBuf::from(s);
@@ -861,6 +903,10 @@ impl LakeConfig {
         Ok(LakeConfig {
             name,
             default_targets,
+            test_driver,
+            test_driver_args,
+            lint_driver,
+            lint_driver_args,
             lean_toolchain: None,
             src_dir,
             build_dir,
@@ -1607,6 +1653,15 @@ pub fn canonical_package_name(name: &str) -> String {
     } else {
         format!("«{name}»")
     }
+}
+
+/// A test/lint driver component uses Lean's `String.toName`, which requires
+/// a legal name spelling. Unlike TOML package declarations and executable CLI
+/// selectors, an unquoted hyphenated spelling must not become a simple name.
+pub fn canonical_driver_name(name: &str) -> Option<String> {
+    (name != "[anonymous]")
+        .then(|| parse_manifest_name(name).ok())
+        .flatten()
 }
 
 fn manifest_bool(

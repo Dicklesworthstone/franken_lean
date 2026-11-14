@@ -594,6 +594,80 @@ impl Sources {
         selected.ok_or_else(|| Failure::input(format!("unknown executable `{selector}`")))
     }
 
+    /// Unlike `lake exe`, unqualified drivers belong only to the root package.
+    /// Both components use the pin's String.toName rules, with no `@` or empty
+    /// root-package selector shorthand (Lake/CLI/Actions.lean:resolveDriver).
+    pub(super) fn driver(
+        &self,
+        kind: DriverKind,
+        selector: &str,
+        has_arguments: bool,
+    ) -> Result<(&Package, &fln_lake::LakeTarget), Failure> {
+        let root = self.package("")?;
+        let label = kind.label();
+        if selector.is_empty() {
+            return Err(Failure::input(format!(
+                "{}: no {label} driver configured",
+                root.config.name,
+            )));
+        }
+        let (package, target) = if let Some((owner, target)) = selector.split_once('/') {
+            if target.contains('/') {
+                return Err(Failure::input(format!(
+                    "{}: invalid {label} driver '{selector}' (too many '/')",
+                    root.config.name,
+                )));
+            }
+            let identity = fln_lake::canonical_driver_name(owner);
+            let package = self
+                .packages
+                .iter()
+                .find(|package| identity.as_ref() == Some(&package.identity))
+                .ok_or_else(|| {
+                    Failure::input(format!(
+                        "{}: unknown {label} driver package '{owner}'",
+                        root.config.name,
+                    ))
+                })?;
+            (package, target)
+        } else {
+            (root, selector)
+        };
+        let identity = fln_lake::canonical_driver_name(target);
+        if let Some(executable) = package.config.targets.iter().find(|candidate| {
+            identity.as_ref() == Some(&fln_lake::canonical_package_name(&candidate.name))
+                && candidate.kind == TargetKind::Executable
+        }) {
+            return Ok((package, executable));
+        }
+        if matches!(kind, DriverKind::Test)
+            && package.config.targets.iter().any(|candidate| {
+                identity.as_ref() == Some(&fln_lake::canonical_package_name(&candidate.name))
+                    && candidate.kind == TargetKind::Library
+            })
+        {
+            return Err(if has_arguments {
+                Failure::input(format!(
+                    "{}: arguments cannot be passed to a library test driver",
+                    package.config.name,
+                ))
+            } else {
+                Failure::unsupported(
+                    "library test drivers require default library build facets, which are unavailable",
+                )
+            });
+        }
+        Err(Failure::input(format!(
+            "{}: invalid {label} driver: unknown {} '{target}'",
+            package.config.name,
+            if matches!(kind, DriverKind::Test) {
+                "script, executable, or library"
+            } else {
+                "script or executable"
+            },
+        )))
+    }
+
     /// These paths describe discovered inputs; a snapshot reader must resolve
     /// the current package graph again before opening any configuration file.
     pub(super) fn configuration_rows(&self, invocation_root: &Path) -> Vec<snapshot::ConfigRow> {
@@ -1012,6 +1086,10 @@ mod tests {
         let config = LakeConfig {
             name: name.to_owned(),
             default_targets: Vec::new(),
+            test_driver: String::new(),
+            test_driver_args: Vec::new(),
+            lint_driver: String::new(),
+            lint_driver_args: Vec::new(),
             lean_toolchain: None,
             src_dir: PathBuf::from("src"),
             build_dir: PathBuf::from(build_dir),
@@ -1089,6 +1167,46 @@ mod tests {
             assert!(selected.executable(selector).is_err(), "{selector}");
         }
         assert!(selected.executable("@left/nested/tool-name").is_err());
+    }
+
+    #[test]
+    fn driver_selectors_use_root_scope_and_strict_name_components() {
+        let mut root = package(LakeConfigFormat::Toml, "RootMain");
+        root.identity = "root".to_owned();
+        root.config.targets[0].name = "runner".to_owned();
+        root.config.targets[0].kind = TargetKind::Executable;
+        let mut dependency = package(LakeConfigFormat::Toml, "ToolMain");
+        dependency.identity = "tools".to_owned();
+        dependency.config.targets[0].name = "tool-name".to_owned();
+        dependency.config.targets[0].kind = TargetKind::Executable;
+        let selected = sources(vec![root, dependency]);
+        for kind in [DriverKind::Test, DriverKind::Lint] {
+            for (selector, owner, module) in [
+                ("runner", "root", "RootMain"),
+                ("root/runner", "root", "RootMain"),
+                ("tools/«tool-name»", "tools", "ToolMain"),
+            ] {
+                let (package, target) = selected
+                    .driver(kind, selector, false)
+                    .unwrap_or_else(|error| panic!("{selector}: {}", error.detail));
+                assert_eq!(package.identity, owner);
+                assert_eq!(target.roots, [module]);
+            }
+            for selector in [
+                "«tool-name»",
+                "tools/tool-name",
+                "tomlPart/«tool-name»",
+                "@tools/«tool-name»",
+                "/runner",
+                "root/runner/more",
+                "tools/",
+            ] {
+                assert!(
+                    selected.driver(kind, selector, false).is_err(),
+                    "{selector}"
+                );
+            }
+        }
     }
 
     fn artifacts(names: &[&str]) -> BTreeMap<Name, ModuleArtifacts> {
