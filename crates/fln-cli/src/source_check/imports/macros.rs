@@ -36,7 +36,7 @@ impl Config {
             && !sysroot.is_empty()
         {
             return Self::discover_at([
-                PathBuf::from(sysroot).join("share/franken_lean/builtin_partition.tsv"),
+                PathBuf::from(sysroot).join("share/franken_lean/builtin_partition.tsv")
             ]);
         }
         let mut candidates = Vec::new();

@@ -656,14 +656,17 @@ pub fn discover_imported_user_extensions(
         let user_macro = macro_entries
             .iter()
             .any(|entry| outside_census(&entry.declaration));
-        let user_parser = parser_entries.entries.iter().any(|entry| match &entry.kind {
-            metadata::parsers::ParserEntryKind::Category { declaration, .. }
-            | metadata::parsers::ParserEntryKind::Parser { declaration, .. } => {
-                outside_census(declaration)
-            }
-            metadata::parsers::ParserEntryKind::Token(_)
-            | metadata::parsers::ParserEntryKind::Kind(_) => false,
-        });
+        let user_parser = parser_entries
+            .entries
+            .iter()
+            .any(|entry| match &entry.kind {
+                metadata::parsers::ParserEntryKind::Category { declaration, .. }
+                | metadata::parsers::ParserEntryKind::Parser { declaration, .. } => {
+                    outside_census(declaration)
+                }
+                metadata::parsers::ParserEntryKind::Token(_)
+                | metadata::parsers::ParserEntryKind::Kind(_) => false,
+            });
         if user_macro || user_parser {
             selected.push(module.name.clone());
         }

@@ -62,28 +62,27 @@ impl ModuleBuildContext {
         macros: Option<&ImportedMacroConfig>,
         modules: &[fln::SourceModuleInput<'_>],
     ) -> Result<(Self, Option<ImportPostureReport>), BuildBaseFailure> {
-        let base = imports::load_module_build_base(roots, source_root, jobs, posture, macros, || {
-            for module in modules {
-                fln::source_check::preflight_source_module(module.name, module.source).map_err(
-                    |error| {
-                        let (class, authority, exit) = error.disposition();
-                        imports::Failure::new(class, &error.to_string(), authority, exit)
-                    },
-                )?;
-            }
-            Ok(())
-        })
-        .map_err(|error| (error.class, error.detail, error.authority))?;
+        let base =
+            imports::load_module_build_base(roots, source_root, jobs, posture, macros, || {
+                for module in modules {
+                    fln::source_check::preflight_source_module(module.name, module.source)
+                        .map_err(|error| {
+                            let (class, authority, exit) = error.disposition();
+                            imports::Failure::new(class, &error.to_string(), authority, exit)
+                        })?;
+                }
+                Ok(())
+            })
+            .map_err(|error| (error.class, error.detail, error.authority))?;
         let base = match base {
             imports::ModuleBuildBase::Ordinary(base) => base.map(|base| *base),
             imports::ModuleBuildBase::ImportedMacros(base) => {
                 let (base, report) = *base;
                 return Ok((
                     Self {
-                        kind: ModuleBuildKind::ImportedMacros(Box::new(ImportedMacroBuildContext {
-                            base,
-                            limits,
-                        })),
+                        kind: ModuleBuildKind::ImportedMacros(Box::new(
+                            ImportedMacroBuildContext { base, limits },
+                        )),
                     },
                     Some(report),
                 ));
