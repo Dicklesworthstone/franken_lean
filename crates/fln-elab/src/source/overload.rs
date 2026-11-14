@@ -1,4 +1,5 @@
-//! Overloaded identifiers (beads `fln-wh2j`, `fln-qb5`): the pin's `elabAppAux` (vendored
+//! Overloaded identifiers and parser choices (beads `fln-wh2j`, `fln-qb5`,
+//! `fln-pin-syntax-corpus-7b5b`): the pin's `elabAppAux` (vendored
 //! `src/Lean/Elab/App.lean:2201-2219`, with `elabAppFnResolutions` at 1926-1945).
 //!
 //! When name resolution (`scope.rs`, the pin's `resolveGlobalName`) yields more than
@@ -56,6 +57,84 @@ use super::*;
 pub(super) const MAX_OVERLOAD_DEPTH: u8 = 16;
 
 impl Context {
+    /// The pin's elabAppFn flattens a parser's choices before trying the
+    /// complete application. Trials share only their spent budget and fresh
+    /// name supplies; assignments, goals, instances and declarations belong
+    /// to the uniquely successful interpretation.
+    ///
+    /// As for identifier overloads below, an unsupported or still-undetermined
+    /// interpretation cannot be discarded. The pin's later synthetic-metavariable
+    /// filtering is not evidence that an unimplemented reading fails.
+    pub(super) fn syntax_choice(
+        &mut self,
+        alternatives: &[Syntax],
+        arguments: Option<&[Syntax]>,
+        expected: Option<&Expr>,
+        explicit: bool,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        if self.overload_depth >= MAX_OVERLOAD_DEPTH {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        let mut pending: Vec<&Syntax> = alternatives.iter().rev().collect();
+        let mut successes: Vec<(usize, Box<Context>, Typed)> = Vec::new();
+        let mut failures: Vec<(usize, String)> = Vec::new();
+        let mut undetermined = None;
+        let mut index = 0;
+        while let Some(candidate) = pending.pop() {
+            self.tick()?;
+            if let Some(nested) = syntax_alternatives(candidate) {
+                pending.extend(nested.iter().rev());
+                continue;
+            }
+            index += 1;
+            let syntax = application_syntax(candidate.clone(), arguments, explicit);
+            let mut trial = Box::new(self.clone());
+            trial.overload_depth += 1;
+            let outcome = trial.interpretation(&syntax, expected);
+            self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+            self.aux_names = trial.aux_names.clone();
+            self.next = trial.next;
+            match outcome? {
+                Some(Ok(term)) => successes.push((index, trial, term)),
+                Some(Err(reason)) => failures.push((index, reason)),
+                None => {
+                    undetermined.get_or_insert(index);
+                }
+            }
+        }
+        if index == 0 {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        if successes.len() > 1 {
+            return Err(failure(SourceInferenceError::AmbiguousSyntax {
+                alternatives: successes
+                    .into_iter()
+                    .map(|(alternative, _, _)| alternative)
+                    .collect(),
+            }));
+        }
+        if let Some(alternative) = undetermined {
+            return Err(failure(SourceInferenceError::SyntaxChoiceUndetermined {
+                alternative,
+            }));
+        }
+        match successes.pop() {
+            Some((_, trial, term)) => {
+                let spent = self.txn.budget.heartbeats_consumed;
+                let depth = self.overload_depth;
+                let aux_names = self.aux_names.take();
+                let next = self.next;
+                *self = *trial;
+                self.txn.budget.heartbeats_consumed = spent;
+                self.overload_depth = depth;
+                self.aux_names = aux_names;
+                self.next = next;
+                Ok(term)
+            }
+            None => Err(failure(SourceInferenceError::SyntaxChoiceFailed { failures })),
+        }
+    }
+
     /// `elabAppAux` over the interpretations of an overloaded `head`, applied to
     /// `arguments` when it heads an application.
     pub(super) fn overloaded(
@@ -173,6 +252,34 @@ impl Context {
             return Ok(Some(Ok(term)));
         }
         Ok(Some(Err("type mismatch".to_owned())))
+    }
+}
+
+/// Parser alternatives retain their order and are never deduplicated by kind,
+/// spelling or elaborated value.
+pub(super) fn syntax_alternatives(syntax: &Syntax) -> Option<&[Syntax]> {
+    match syntax {
+        Syntax::Node { kind, args, .. } if kind == &Name::from_components(["choice"]) => Some(args),
+        _ => None,
+    }
+}
+
+fn application_syntax(mut head: Syntax, arguments: Option<&[Syntax]>, explicit: bool) -> Syntax {
+    if explicit {
+        head = Syntax::node(
+            parser_kind(&["Term", "explicit"]),
+            vec![Syntax::atom(head.info(), "@"), head],
+        );
+    }
+    match arguments {
+        Some(arguments) if !arguments.is_empty() => Syntax::node(
+            parser_kind(&["Term", "app"]),
+            vec![
+                head,
+                Syntax::node(Name::from_components(["null"]), arguments.to_vec()),
+            ],
+        ),
+        _ => head,
     }
 }
 

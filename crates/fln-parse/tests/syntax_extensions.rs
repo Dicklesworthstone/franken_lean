@@ -323,6 +323,130 @@ fn two_active_infix_notations_are_the_pins_choice_most_recent_first() {
     );
 }
 
+/// Native regressions for longestMatchFn's successful alternatives. The
+/// descriptor order follows addLeadingParser/TokenMap.insert in the pin.
+#[test]
+fn tied_leading_notations_preserve_all_readings_and_application_precedence() {
+    let grammar = grammar_after(
+        &[],
+        &[
+            "syntax:max (name := firstReading) \"pick!\" : term",
+            "syntax:max (name := secondReading) \"pick!\" : term",
+        ],
+    );
+    for source in [
+        "def v := pick!",
+        "def v := pick! 7",
+        "def v := Nat.succ pick!",
+    ] {
+        let parsed = with_grammar(&grammar.grammar(), || {
+            parse_source_command(source.as_bytes())
+        })
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        let found = kinds(parsed.syntax());
+        let choice = found
+            .iter()
+            .position(|kind| *kind == name("choice"))
+            .expect("both leading readings survive");
+        assert_eq!(
+            found[choice + 1..choice + 3],
+            [name("secondReading"), name("firstReading")]
+        );
+    }
+    let low = grammar_after(
+        &[],
+        &[
+            "syntax:1022 (name := firstLow) \"low!\" : term",
+            "syntax:1022 (name := secondLow) \"low!\" : term",
+            "syntax:max (name := needsMax) \"take!\" term:max : term",
+        ],
+    );
+    for source in [
+        "def v := low! 7",
+        "def v := Nat.succ low!",
+        "def v := take! low!",
+    ] {
+        assert!(
+            with_grammar(&low.grammar(), || parse_source_command(source.as_bytes())).is_err(),
+            "a choice must retain its alternatives' minimum precedence: {source}"
+        );
+    }
+    assert!(
+        with_grammar(&low.grammar(), || parse_source_command(b"def v := take! (low!)")).is_ok()
+    );
+}
+
+#[test]
+fn leading_choices_use_priority_only_after_longest_match() {
+    let grammar = grammar_after(
+        &[],
+        &[
+            "syntax:max (name := lower) \"rank!\" : term",
+            "syntax:max (name := higher) (priority := high) \"rank!\" : term",
+            "syntax:max (name := longer) \"rank!\" \"now\" : term",
+        ],
+    );
+    for (source, expected) in [
+        ("def v := rank!", "higher"),
+        ("def v := rank! now", "longer"),
+    ] {
+        let parsed = with_grammar(&grammar.grammar(), || {
+            parse_source_command(source.as_bytes())
+        })
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        let found = kinds(parsed.syntax());
+        assert!(found.contains(&name(expected)), "{source}: {found:?}");
+        assert!(!found.contains(&name("choice")), "{source}: {found:?}");
+        assert!(!found.contains(&name("lower")), "{source}: {found:?}");
+    }
+}
+
+#[test]
+fn equal_precedence_prefixes_build_a_choice_around_the_same_operand() {
+    let grammar = grammar_after(
+        &[],
+        &[
+            "notation:75 (name := firstPrefix) \"▹▹\" x:75 => Nat.succ x",
+            "notation:75 (name := secondPrefix) \"▹▹\" x:75 => Nat.zero x",
+        ],
+    );
+    let parsed = with_grammar(&grammar.grammar(), || {
+        parse_source_command("def v := ▹▹4 + 1".as_bytes())
+    })
+    .expect("equal-binding-power prefix alternatives");
+    let found = kinds(parsed.syntax());
+    let choice = found
+        .iter()
+        .position(|kind| *kind == name("choice"))
+        .expect("a prefix choice");
+    assert_eq!(found[choice + 1], name("secondPrefix"));
+    let first = found
+        .iter()
+        .position(|kind| *kind == name("firstPrefix"))
+        .expect("the other prefix reading");
+    assert!(first > choice + 1);
+}
+
+#[test]
+fn lower_priority_infix_readings_never_enter_a_choice() {
+    let grammar = grammar_after(
+        &[],
+        &[
+            "infixl:65 (name := higherInfix) (priority := high) \" +++ \" => Nat.add",
+            "infixl:65 (name := lowerInfix) \" +++ \" => Nat.mul",
+        ],
+    );
+    let parsed = with_grammar(&grammar.grammar(), || {
+        parse_source_command(b"def v := 1 +++ 2")
+    })
+    .expect("the higher-priority infix");
+    let found = kinds(parsed.syntax());
+    assert!(found.contains(&name("higherInfix")), "{found:?}");
+    assert!(!found.contains(&name("lowerInfix")), "{found:?}");
+    assert!(!found.contains(&name("choice")), "{found:?}");
+}
+
 #[test]
 fn an_atom_like_notation_is_an_operand_an_application_head_and_a_pattern() {
     // `notation "-[" n "+1]" => negSucc n`, scoped in `Int` (Init/Data/Int/Basic.lean).

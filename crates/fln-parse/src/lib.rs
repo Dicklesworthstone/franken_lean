@@ -2158,10 +2158,7 @@ fn finish_bounded_application(
     // `app := trailing_parser:leadPrec:maxPrec many1 argArg`: a notation of the entered grammar
     // at `max` precedence is a head too (`wp⟦x⟧ Q`).
     let notation_head = grammar == DefinitionGrammar::Scalar
-        && terms[0]
-            .0
-            .kind()
-            .is_some_and(extensions::is_max_prec_notation);
+        && extensions::is_max_prec_notation(&terms[0].0);
     // A raw operator consumes exactly its own operands at `maxPrec`; an
     // application after that complete leading term applies its result.
     let elaborator_head = grammar == DefinitionGrammar::Scalar
@@ -2740,12 +2737,16 @@ fn finish_negation_frame(
     let TokenKind::Symbol(symbol) = &tokens[prefix].kind else {
         unreachable!("a prefix operator is a symbol");
     };
-    // A prefix notation of the entered grammar (`extensions`) has its declared kind.
-    let kind = extensions::prefix(symbol).map_or_else(
-        || Name::str(Name::anonymous(), format!("term{symbol}_")),
-        |(kind, _)| kind,
-    );
-    let syntax = Syntax::node(kind, vec![leaves.leaf(prefix)?, body]);
+    // Equal-priority declarations retain all their readings around this operand.
+    let atom = leaves.leaf(prefix)?;
+    let syntax = if extensions::prefix(symbol).is_some() {
+        extensions::prefix_node(symbol, atom, body).expect("the active prefix remains registered")
+    } else {
+        Syntax::node(
+            Name::str(Name::anonymous(), format!("term{symbol}_")),
+            vec![atom, body],
+        )
+    };
     frames
         .last_mut()
         .expect("negation has a parent")
@@ -4920,8 +4921,7 @@ fn bounded_term_compound_token(
             {
                 let frame = frames.last_mut().expect("root term frame");
                 if !frame.application.is_empty()
-                    && !matches!(&term, Syntax::Node { kind, .. }
-                        if extensions::is_argument_notation(kind))
+                    && !extensions::is_argument_notation(&term)
                 {
                     return Err(NatDefinitionParseError::OutsideSeedGrammar {
                         at: original_position(view, tokens, index),

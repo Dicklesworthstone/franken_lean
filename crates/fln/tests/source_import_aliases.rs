@@ -400,6 +400,42 @@ const OVERLOAD_BY_TYPE: &[(&str, &str)] = &[
     ),
 ];
 
+/// Parser-choice regressions against the real imported coercion registry.
+/// Direct value/function/prefix/infix examples were also checked with the
+/// pinned Lean 4.32.0; parentheses deliberately retain a separate head check.
+const SYNTAX_CHOICE_BY_TYPE: &[(&str, &str)] = &[
+    (
+        "def natValue : Nat := 7\ndef boolValue : Bool := true\nnotation \"pickValue\" => natValue\nnotation \"pickValue\" => boolValue\ndef bar : Nat := pickValue",
+        "natValue",
+    ),
+    (
+        "def natValue : Nat := 7\ndef boolValue : Bool := true\nnotation \"pickValue\" => boolValue\nnotation \"pickValue\" => natValue\ndef bar : Nat := pickValue",
+        "natValue",
+    ),
+    (
+        "def natValue : Nat := 7\ndef boolValue : Bool := true\nnotation \"pickValue\" => natValue\nnotation \"pickValue\" => boolValue\ndef bar : Prop := pickValue",
+        "boolValue",
+    ),
+    (
+        "def natFn (n : Nat) : Nat := n\ndef boolFn (_b : Bool) : Nat := 0\nnotation \"pickFn\" => natFn\nnotation \"pickFn\" => boolFn\ndef bar : Nat := pickFn (1 : Nat)",
+        "natFn",
+    ),
+    (
+        "def natFn (n : Nat) : Nat := n\ndef boolFn (_b : Bool) : Nat := 0\nprefix:75 \"▹▹\" => natFn\nprefix:75 \"▹▹\" => boolFn\ndef bar : Nat := ▹▹(1 : Nat)",
+        "natFn",
+    ),
+    (
+        "def natFn (n m : Nat) : Nat := Nat.add n m\ndef boolFn (_b _c : Bool) : Nat := 0\ninfixl:65 \" +++ \" => natFn\ninfixl:65 \" +++ \" => boolFn\ndef bar : Nat := (1 : Nat) +++ (2 : Nat)",
+        "natFn",
+    ),
+    // The first trial (boolFn) infers the shared let-value's element type
+    // before its result type fails. That assignment must not reach natFn.
+    (
+        "def natFn (_xs : List Nat) : Nat := 0\ndef boolFn (_xs : List Bool) : Bool := true\nnotation \"pickList\" => natFn\nnotation \"pickList\" => boolFn\ndef bar : Nat := let xs := []; pickList xs",
+        "natFn",
+    ),
+];
+
 /// Whether `expr` mentions the constant `name` anywhere.
 fn mentions(expr: &fln_core::expr::Expr, name: &Name) -> bool {
     use fln_core::expr::ExprNode;
@@ -467,7 +503,28 @@ fn imported_overloads_are_ambiguous_unless_the_type_chooses_as_at_the_pin() {
                     "{source} must be refused as the pin refuses it: {refused}"
                 );
             }
-            for (source, chosen) in OVERLOAD_BY_TYPE {
+            let parenthesized_choice = "def natFn (n : Nat) : Nat := n\ndef boolFn (_b : Bool) : Nat := 0\nnotation \"pickFn\" => natFn\nnotation \"pickFn\" => boolFn\ndef bar : Nat := (pickFn) (1 : Nat)";
+            let refused = engine
+                .check_source_files(&[parenthesized_choice.as_bytes()], &KVMap::new(), limits)
+                .expect_err("parentheses elaborate the choice before applying the argument");
+            assert!(
+                format!("{refused:?}").contains("AmbiguousSyntax"),
+                "{parenthesized_choice}: {refused:?}"
+            );
+            let priority_blocks_fallback = "def natFn (n m : Nat) : Nat := Nat.add n m\ndef boolFn (_b _c : Bool) : Nat := 0\ninfixl:65 (priority := high) \" +++ \" => boolFn\ninfixl:65 \" +++ \" => natFn\ndef bar : Nat := (1 : Nat) +++ (2 : Nat)";
+            let refused = engine
+                .check_source_files(&[priority_blocks_fallback.as_bytes()], &KVMap::new(), limits)
+                .expect_err("a lower parser priority is not an elaboration fallback");
+            assert_eq!(refused.disposition().0, "elaboration", "{refused:?}");
+            let all_fail = "def boolValue : Bool := true\ndef propValue : Prop := True\nnotation \"badChoice\" => boolValue\nnotation \"badChoice\" => propValue\ndef bar : Nat := badChoice";
+            let refused = engine
+                .check_source_files(&[all_fail.as_bytes()], &KVMap::new(), limits)
+                .expect_err("both parser readings have the wrong result type");
+            assert!(
+                format!("{refused:?}").contains("SyntaxChoiceFailed"),
+                "{all_fail}: {refused:?}"
+            );
+            for (source, chosen) in OVERLOAD_BY_TYPE.iter().chain(SYNTAX_CHOICE_BY_TYPE) {
                 let checked =
                     engine.check_source_files(&[source.as_bytes()], &KVMap::new(), limits);
                 assert!(

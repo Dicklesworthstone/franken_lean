@@ -48,8 +48,8 @@
 //!   so the parser refuses where it refused before.
 //! - `macro` and `declare_syntax_cat` commands, which the hand parser does not read, and a
 //!   `syntax` naming a hand-written `Parser` declaration: [`FileGrammar::declare`] refuses them.
-//! - Two active parsers succeeding on the same input, where the pin builds a `choice` node:
-//!   this refuses.
+//! - Ambiguous tactic or command parsers. Leading terms and equal-binding-power
+//!   prefix/infix notations preserve their tied readings as `choice` nodes.
 //!
 //! Production does not enter a grammar yet: [`with_grammar`] is how a caller that knows a
 //! file's imports and scopes (the frontier harness) parses under them, and without it every
@@ -794,9 +794,9 @@ pub struct ActiveGrammar {
     /// registration alone must never enable a hand-written parser alternative.
     artifact_kinds: BTreeSet<Name>,
     /// Leading `term` declarations of the prefix shape `node k p (andthen (symbol s) (cat term
-    /// q))` (`notation:25 "⊢ₛ " p:25`): by symbol, the kind, operand precedence
+    /// q))` (`notation:25 "⊢ₛ " p:25`): by symbol, the kinds, operand precedence
     /// `q`, and the leading parser's own precedence `p`.
-    prefixes: BTreeMap<String, (Name, u8, u32)>,
+    prefixes: BTreeMap<String, (Vec<Name>, u8, u32)>,
     /// Leading `attr` declarations by the text of their first atom.
     attrs: BTreeMap<String, Vec<usize>>,
     /// Leading `command` declarations by the text of their first atom.
@@ -857,7 +857,7 @@ impl ActiveGrammar {
         let tactic = Name::from_components(["tactic"]);
         let attr = Name::from_components(["attr"]);
         let command = Name::from_components(["command"]);
-        let mut prefixes: BTreeMap<String, Vec<(Name, u8, u32)>> = BTreeMap::new();
+        let mut prefixes: BTreeMap<String, Vec<(Name, u8, u32, u32)>> = BTreeMap::new();
         for decl in &decls {
             if let (Some(category), true, Descr::Node { kind, prec, body }) =
                 (&decl.category, decl.leading, &decl.descr)
@@ -874,15 +874,30 @@ impl ActiveGrammar {
                     kind.clone(),
                     *rbp as u8,
                     *prec,
+                    decl.priority,
                 ));
             }
         }
-        // One reading per symbol: two prefix notations on one symbol are the pin's `choice`, not
-        // built here.
+        // Equal binding powers read the same operand. The highest-priority
+        // readings survive longestMatchFn, in reverse registration order.
+        // Different binding powers still require independent Pratt parses.
         let prefixes = prefixes
             .into_iter()
-            .filter_map(|(symbol, mut entries)| {
-                (entries.len() == 1).then(|| (symbol, entries.remove(0)))
+            .filter_map(|(symbol, entries)| {
+                let (_, operand, leading, _) = entries[0];
+                if entries
+                    .iter()
+                    .any(|(_, rbp, prec, _)| (*rbp, *prec) != (operand, leading))
+                {
+                    return None;
+                }
+                let priority = entries.iter().map(|(_, _, _, priority)| *priority).max()?;
+                let kinds = entries
+                    .into_iter()
+                    .rev()
+                    .filter_map(|(kind, _, _, prio)| (prio == priority).then_some(kind))
+                    .collect();
+                Some((symbol, (kinds, operand, leading)))
             })
             .collect();
         for (index, decl) in decls.iter().enumerate() {
@@ -994,10 +1009,19 @@ impl ActiveGrammar {
             }) {
                 continue;
             }
-            if entries
+            // Equal binding powers consume the same input, so the pin keeps
+            // only the highest parser priority. Lower-priority readings must
+            // never be offered to elaboration as fallback alternatives.
+            let priority = entries
                 .iter()
-                .all(|(_, _, priority)| *priority > DEFAULT_PRIORITY)
-            {
+                .map(|(_, _, priority)| *priority)
+                .max()
+                .expect("an operator has a declaration");
+            let entries: Vec<_> = entries
+                .into_iter()
+                .filter(|(_, _, prio)| *prio == priority)
+                .collect();
+            if priority > DEFAULT_PRIORITY {
                 overriding.insert(symbol.clone());
             }
             infix.insert(
@@ -3901,9 +3925,9 @@ pub(crate) fn tactic(
     parsed
 }
 
-/// An atom-like `term` notation of the active grammar at `index`, read up to `end` at most: its
-/// node and the index after it. The longest reading wins, as `longestMatchFn` picks; two of the
-/// same length are the pin's `choice`, not built here.
+/// An atom-like term notation of the active grammar at index, read up to end
+/// at most. longestMatchFn first picks the longest successful reading, then
+/// its highest priority, retaining tied readings as a choice.
 pub(crate) fn leading_term(
     leaves: &Leaves,
     view: &SourceView,
@@ -3920,10 +3944,11 @@ pub(crate) fn leading_term(
         view,
         tokens,
     };
-    let mut parsed: Option<(Syntax, usize)> = None;
-    let mut tied = false;
-    for &candidate in candidates {
-        let descr = &grammar.decls[candidate].descr;
+    let mut parsed = Vec::new();
+    let mut score = None;
+    for &candidate in candidates.iter().rev() {
+        let decl = &grammar.decls[candidate];
+        let descr = &decl.descr;
         if matches!(descr, Descr::Node { prec, .. } if *prec < minimum) {
             continue;
         }
@@ -3933,25 +3958,57 @@ pub(crate) fn leading_term(
         let [syntax] = items.as_slice() else {
             continue;
         };
-        match &parsed {
-            Some((_, longest)) if *longest > next => {}
-            Some((_, longest)) if *longest == next => tied = true,
+        let candidate_score = (next, decl.priority);
+        match score {
+            Some(best) if best > candidate_score => {}
+            Some(best) if best == candidate_score => parsed.push(syntax.clone()),
             _ => {
-                parsed = Some((syntax.clone(), next));
-                tied = false;
+                parsed.clear();
+                parsed.push(syntax.clone());
+                score = Some(candidate_score);
             }
         }
     }
-    if tied { None } else { parsed }
+    let (next, _) = score?;
+    let syntax = if parsed.len() == 1 {
+        parsed.pop()?
+    } else {
+        Syntax::node(Name::from_components(["choice"]), parsed)
+    };
+    Some((syntax, next))
 }
 
-/// The prefix notation of the active grammar spelled `symbol`: its kind and the precedence its
-/// operand is read at.
+/// The prefix notation of the active grammar spelled symbol: its kind and
+/// the precedence its operand is read at.
 pub(crate) fn prefix(symbol: &str) -> Option<(Name, u8)> {
     active()?
         .prefixes
         .get(symbol)
-        .map(|(kind, operand, _)| (kind.clone(), *operand))
+        .map(|(kinds, operand, _)| {
+            let kind = if kinds.len() == 1 {
+                kinds[0].clone()
+            } else {
+                Name::from_components(["choice"])
+            };
+            (kind, *operand)
+        })
+}
+
+/// Build every retained prefix reading around the same bounded operand.
+pub(crate) fn prefix_node(symbol: &str, atom: Syntax, operand: Syntax) -> Option<Syntax> {
+    let grammar = active()?;
+    let (kinds, _, _) = grammar.prefixes.get(symbol)?;
+    let args = vec![atom, operand];
+    Some(match kinds.as_slice() {
+        [kind] => Syntax::node(kind.clone(), args),
+        _ => Syntax::node(
+            Name::from_components(["choice"]),
+            kinds
+                .iter()
+                .map(|kind| Syntax::node(kind.clone(), args.clone()))
+                .collect(),
+        ),
+    })
 }
 
 /// The actual selected prefix parser's leading precedence. Its syntax kind
@@ -4072,16 +4129,11 @@ pub(crate) fn attribute(
     parsed
 }
 
-/// Whether `kind`, a term notation of the active grammar, may stand as an application's argument:
+/// Whether a term notation of the active grammar may stand as an application's argument:
 /// its node is at `arg` precedence or above. `syntax "dbl " term:max : term` is at `lead`, so
 /// `f dbl x` is no application at the pin.
-pub(crate) fn is_argument_notation(kind: &Name) -> bool {
-    active().is_some_and(|grammar| {
-        grammar.terms.values().flatten().any(|&index| {
-            matches!(&grammar.decls[index].descr,
-                Descr::Node { kind: declared, prec, .. } if declared == kind && *prec >= 1023)
-        })
-    })
+pub(crate) fn is_argument_notation(syntax: &Syntax) -> bool {
+    notation_admits(syntax, 1023)
 }
 
 /// Whether a declaration of the active grammar builds `kind`.
@@ -4089,15 +4141,57 @@ pub(crate) fn is_active_kind(kind: &Name) -> bool {
     active().is_some_and(|grammar| grammar.kinds.contains(kind))
 }
 
-/// Whether `kind` is an atom-like notation of the active grammar at `max` precedence, so its node
+/// Whether a term is an atom-like notation of the active grammar at `max` precedence, so its node
 /// can head an application.
-pub(crate) fn is_max_prec_notation(kind: &Name) -> bool {
-    active().is_some_and(|grammar| {
-        grammar.terms.values().flatten().any(|&index| {
+pub(crate) fn is_max_prec_notation(syntax: &Syntax) -> bool {
+    notation_admits(syntax, MAX_PREC)
+}
+
+fn notation_admits(syntax: &Syntax, minimum: u32) -> bool {
+    let Some(grammar) = active() else {
+        return false;
+    };
+    let mut pending = vec![syntax];
+    while let Some(syntax) = pending.pop() {
+        let Syntax::Node { kind, args, .. } = syntax else {
+            return false;
+        };
+        if kind == &Name::from_components(["choice"]) {
+            if args.is_empty() {
+                return false;
+            }
+            pending.extend(args);
+        } else if !grammar.terms.values().flatten().any(|&index| {
             matches!(&grammar.decls[index].descr,
-                Descr::Node { kind: declared, prec, .. } if declared == kind && *prec >= MAX_PREC)
-        })
-    })
+                Descr::Node { kind: declared, prec, .. } if declared == kind && *prec >= minimum)
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A choice carries the minimum leading precedence of its readings at the
+/// pin. A descriptor's term operand must check every reading, too.
+fn notation_below_minimum(syntax: &Syntax, minimum: u32) -> bool {
+    let Some(grammar) = active() else {
+        return false;
+    };
+    let mut pending = vec![syntax];
+    while let Some(syntax) = pending.pop() {
+        let Syntax::Node { kind, args, .. } = syntax else {
+            continue;
+        };
+        if kind == &Name::from_components(["choice"]) {
+            pending.extend(args);
+        } else if grammar.terms.values().flatten().any(|&index| {
+            matches!(&grammar.decls[index].descr,
+                Descr::Node { kind: declared, prec, .. } if declared == kind && *prec < minimum)
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 fn token_text(token: &LexedToken) -> Option<String> {
@@ -4492,15 +4586,7 @@ impl Run<'_> {
                         // `leadingNode` checks the category's requested minimum precedence.
                         // A one-token extension can fit `term_end` without meeting it; a
                         // parenthesized extension instead has the builtin parenthesis root.
-                        if let Some(kind) = syntax.kind()
-                            && active().is_some_and(|grammar| {
-                                grammar.terms.values().flatten().any(|&index| {
-                                    matches!(&grammar.decls[index].descr,
-                                        Descr::Node { kind: declared, prec: node_prec, .. }
-                                            if declared == kind && node_prec < prec)
-                                })
-                            })
-                        {
+                        if notation_below_minimum(&syntax, *prec) {
                             return None;
                         }
                         syntax

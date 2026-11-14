@@ -128,6 +128,20 @@ pub enum SourceInferenceError {
         name: Name,
         interpretations: Vec<Name>,
     },
+    /// More than one parser alternative elaborates. Distinct syntax readings
+    /// remain ambiguous even when they produce definitionally equal terms.
+    AmbiguousSyntax {
+        alternatives: Vec<usize>,
+    },
+    /// Every parser alternative has a definite elaboration failure.
+    SyntaxChoiceFailed {
+        failures: Vec<(usize, String)>,
+    },
+    /// An alternative cannot yet be accepted or ruled out, so choosing a
+    /// different reading would guess at overload resolution.
+    SyntaxChoiceUndetermined {
+        alternative: usize,
+    },
     /// `{}` elaborated both as the empty structure instance and as `∅`; the pin's `choice`
     /// reports the term ambiguous.
     AmbiguousEmptyBraces,
@@ -393,6 +407,27 @@ impl std::fmt::Display for SourceInferenceError {
             }
             Self::AmbiguousEmptyBraces => f.write_str(
                 "Ambiguous term `{}`; Possible interpretations: `∅` and the empty structure instance",
+            ),
+            Self::AmbiguousSyntax { alternatives } => {
+                f.write_str("Ambiguous term; Possible syntax interpretations:")?;
+                for (index, alternative) in alternatives.iter().enumerate() {
+                    let separator = if index == 0 { " " } else { ", " };
+                    write!(f, "{separator}{alternative}")?;
+                }
+                Ok(())
+            }
+            Self::SyntaxChoiceFailed { failures } => {
+                f.write_str("overloaded syntax, errors:")?;
+                for (index, (alternative, reason)) in failures.iter().enumerate() {
+                    let separator = if index == 0 { " " } else { "; " };
+                    write!(f, "{separator}interpretation {alternative}: {reason}")?;
+                }
+                Ok(())
+            }
+            Self::SyntaxChoiceUndetermined { alternative } => write!(
+                f,
+                "overloaded syntax: interpretation {alternative} can be neither established nor \
+                 ruled out here, so none is chosen"
             ),
             Self::OverloadFailed { name, failures } => {
                 write!(f, "overloaded `{}`, errors:", name.to_display_string())?;
@@ -2120,6 +2155,12 @@ impl Context {
         loop {
             self.tick()?;
             if let Some(inner) = parenthesized_inner(syntax)? {
+                if overload::syntax_alternatives(inner).is_some() {
+                    // App.elabAppFn tries a direct choice with all arguments,
+                    // but its generic parenthesized head is elaborated first
+                    // with no expected type. Preserve that ambiguity boundary.
+                    return Ok((syntax, false));
+                }
                 syntax = inner;
                 continue;
             }
@@ -2934,6 +2975,15 @@ impl Context {
                                     continue;
                                 }
                                 if let Syntax::Node { kind, args, .. } = syntax {
+                                    if kind == &Name::from_components(["choice"]) {
+                                        values.push(self.syntax_choice(
+                                            args,
+                                            None,
+                                            expected.as_ref(),
+                                            false,
+                                        )?);
+                                        continue;
+                                    }
                                     if kind == &parser_kind(&["Term", "set_option"]) {
                                         let (body, options) = self.enter_source_options(args)?;
                                         tasks.push(Task::RestoreOptions(options));
@@ -4560,6 +4610,18 @@ impl Context {
                                 tasks.push(Task::Proof(proof));
                             }
                             Task::StartApplication(head, arguments, expected, explicit) => {
+                                if let Some(alternatives) = overload::syntax_alternatives(head) {
+                                    // Each reading must see the entire application:
+                                    // its arguments and expected result can distinguish
+                                    // functions that are ambiguous in isolation.
+                                    values.push(self.syntax_choice(
+                                        alternatives,
+                                        Some(arguments),
+                                        expected.as_ref(),
+                                        explicit,
+                                    )?);
+                                    continue;
+                                }
                                 // Quotation metadata fixes the head's declaration
                                 // candidates at its definition site. Resolve it
                                 // before field notation's textual namespace lookup,

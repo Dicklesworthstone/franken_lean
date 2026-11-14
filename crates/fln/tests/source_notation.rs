@@ -69,6 +69,50 @@ fn multi_argument_macro_sequences_reach_checked_elaboration() {
     }
 }
 
+/// Native regression: a missing function coercion on the source seed cannot
+/// prove that one syntax reading is impossible in the pin's environment.
+#[test]
+fn overloaded_notation_does_not_guess_when_a_function_reading_is_undetermined() {
+    for declarations in [
+        "notation \"pickFn\" => Nat.zero\nnotation \"pickFn\" => Nat.succ\n",
+        "notation \"pickFn\" => Nat.succ\nnotation \"pickFn\" => Nat.zero\n",
+    ] {
+        let error = check(&format!("{declarations}def picked : Nat := pickFn 4\n"))
+            .expect_err("an incomplete coercion search cannot resolve a choice");
+        assert!(
+            format!("{error:?}").contains("SyntaxChoiceUndetermined"),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
+fn equal_successful_syntax_readings_are_still_ambiguous() {
+    let error = refused(
+        "notation \"ambiguous!\" => Nat.zero\n\
+         notation \"ambiguous!\" => Nat.zero\n\
+         def picked : Nat := ambiguous!\n",
+    );
+    assert!(format!("{error:?}").contains("AmbiguousSyntax"), "{error:?}");
+}
+
+#[test]
+fn an_undetermined_syntax_reading_cannot_be_silently_discarded() {
+    // The source seed lacks the pin's imported coercion instances. A type
+    // mismatch on that seed is not evidence that the other reading fails
+    // in Lean's environment, just as for an overloaded identifier.
+    let error = check(
+        "notation \"maybeNat!\" => Nat.zero\n\
+         notation \"maybeNat!\" => True\n\
+         def picked : Nat := maybeNat!\n",
+    )
+    .expect_err("the seed cannot rule out a coercion from another syntax reading");
+    assert!(
+        format!("{error:?}").contains("SyntaxChoiceUndetermined"),
+        "{error:?}"
+    );
+}
+
 /// `infixl`, `prefix` and a bracketed `notation`: accepted at the pin (exit 0).
 #[test]
 fn declared_notation_elaborates_through_its_expansion() {
