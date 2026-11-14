@@ -6,6 +6,9 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "lake_local_dependencies/query.rs"]
+mod query;
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Workspace(PathBuf, Option<PathBuf>);
@@ -743,10 +746,8 @@ fn package_qualifiers_disambiguate_standalone_modules_without_merging_owners() {
     // A broken sibling with the same module name is not substituted for the
     // selected package, even on a warm module-record hit.
     workspace.write("root/Shared.lean", "not valid Lean source");
-    let warm = build_success(workspace.run(
-        &["--json", "build", "@dependency/+Shared:olean"],
-        None,
-    ));
+    let warm =
+        build_success(workspace.run(&["--json", "build", "@dependency/+Shared:olean"], None));
     assert!(warm.contains("\"modules_cached\":1"), "{warm}");
     assert_eq!(std::fs::read(&dependency_output).unwrap(), dependency_bytes);
     assert_eq!(std::fs::read(&root_output).unwrap(), root_bytes);
@@ -770,7 +771,11 @@ fn package_names_take_precedence_over_unqualified_module_names() {
     );
     workspace.no_products();
     assert!(!workspace.0.join("import-records").exists());
-    for target in ["+Shared:olean", "Shared/Shared:olean", "@Shared/+Shared:olean"] {
+    for target in [
+        "+Shared:olean",
+        "Shared/Shared:olean",
+        "@Shared/+Shared:olean",
+    ] {
         let report = build_success(workspace.run(&["--json", "build", target], None));
         assert!(report.contains("\"modules_built\":1"), "{report}");
     }

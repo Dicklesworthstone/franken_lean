@@ -1013,7 +1013,11 @@ mod tests {
             assert_eq!(package.identity, owner);
             assert_eq!(target.roots, [module]);
         }
-        for selector in ["root/tool-name", "@tomlPart/tool-name", "@missing/tool-name"] {
+        for selector in [
+            "root/tool-name",
+            "@tomlPart/tool-name",
+            "@missing/tool-name",
+        ] {
             assert!(selected.executable(selector).is_err(), "{selector}");
         }
         assert!(selected.executable("@left/nested/tool-name").is_err());
@@ -1122,10 +1126,7 @@ mod tests {
         combined.config.targets.push(target);
         let selected = sources(vec![combined]);
         selected
-            .validate_entry_imports(
-                &BTreeMap::from([(shared, &selected.packages[0])]),
-                &modules,
-            )
+            .validate_entry_imports(&BTreeMap::from([(shared, &selected.packages[0])]), &modules)
             .unwrap_or_else(|error| panic!("{}", error.detail));
     }
 

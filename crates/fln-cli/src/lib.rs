@@ -14977,6 +14977,7 @@ const LAKE_USAGE: &str = concat!(
     "roots. Lean terms are checked against real Init and evaluated by Golem.\n",
     "Default library, native executable and other build facets remain unavailable.\n",
     "lake exe runs configured roots and local Lean/TOML package libraries on Golem.\n",
+    "lake query builds supported module facets and prints their artifact paths.\n",
     "lake update resolves the local dependency graph and atomically writes its manifest.\n",
     "Builds recheck source. Imports default to --import-posture reuse-verified:\n",
     "a record of an earlier admission of the identical .olean bytes by the same\n",
@@ -15032,6 +15033,9 @@ const LAKE_HELP_QUERY: &str = concat!(
     "output configured will be printed as an empty string or `null`.\n",
     "\n",
     "See `lake help build` for information on and examples of targets.\n",
+    "\nFrankenLean queries checked +Module:olean and supported +Module:ir facets,\n",
+    "including package-qualified modules. Results retain request order and\n",
+    "duplicates; JSON output contains one path string per line.\n",
 );
 
 const LAKE_HELP_EXE: &str = concat!(
@@ -15212,10 +15216,10 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             continue;
         }
         if s == "--help" || s == "-h" {
-            let help = if matches!(command.as_deref(), Some("exe" | "exec")) {
-                LAKE_HELP_EXE
-            } else {
-                LAKE_USAGE
+            let help = match command.as_deref() {
+                Some("exe" | "exec") => LAKE_HELP_EXE,
+                Some("query") => LAKE_HELP_QUERY,
+                _ => LAKE_USAGE,
             };
             return MultiplexerOutput::success(help.to_owned());
         }
@@ -15230,6 +15234,10 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
         }
         if s == "--json" || s == "-J" {
             is_json = true;
+            continue;
+        }
+        if s == "--text" {
+            is_json = false;
             continue;
         }
         if s == "--dir" || s == "-d" {
@@ -15254,10 +15262,14 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             return MultiplexerOutput::failure(refusal, 1);
         }
         if s.starts_with('-') {
-            if command.as_deref() == Some("build") {
+            if let Some(operation @ ("build" | "query")) = command.as_deref() {
                 return lake_operation_failure(
-                    "fln.lake-build/2",
-                    &format!("build option `{s}` is unavailable"),
+                    if operation == "query" {
+                        "fln.lake-query/1"
+                    } else {
+                        "fln.lake-build/2"
+                    },
+                    &format!("{operation} option `{s}` is unavailable"),
                     true,
                     is_json,
                 );
@@ -15318,11 +15330,15 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
 
     match cmd.as_str() {
         "serve" => serve_lsp(),
-        "build" => {
+        "build" | "query" => {
             if let Some(option) = ignored_options.first() {
                 return lake_operation_failure(
-                    "fln.lake-build/2",
-                    &format!("build option `{option}` is unavailable"),
+                    if cmd == "query" {
+                        "fln.lake-query/1"
+                    } else {
+                        "fln.lake-build/2"
+                    },
+                    &format!("{cmd} option `{option}` is unavailable"),
                     true,
                     is_json,
                 );
@@ -15334,6 +15350,11 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 is_json,
                 jobs.unwrap_or_else(default_import_jobs),
                 import_posture,
+                if cmd == "query" {
+                    lake_build::BuildCommand::Query
+                } else {
+                    lake_build::BuildCommand::Build
+                },
             )
         }
         "clean" => {
@@ -15651,7 +15672,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 ),
             }
         }
-        "query" | "test" | "lint" | "lean" => lake_not_implemented(
+        "test" | "lint" | "lean" => lake_not_implemented(
             &cmd,
             "this command needs Lake workspace evaluation (plan §13.3), which this build does not have",
             is_json,

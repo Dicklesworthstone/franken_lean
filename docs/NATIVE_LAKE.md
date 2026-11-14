@@ -308,6 +308,31 @@ augmented subprocess environment is not installed. Native executable build
 facets, linking, dependency fetching, and full Lake configuration remain
 outside this execution path.
 
+### Querying module artifacts
+
+`lake query` builds the same checked module facets as `lake build` and prints
+their actual output paths. For example:
+
+```sh
+lake query +Proofs:olean
+lake query --json @dependency/+Support:olean +Proofs:olean
+```
+
+Results follow the requested target order, including duplicate requests.
+`--json` (or `-J`) emits one JSON path string per line, and `--text` selects
+plain paths; the last format option takes effect. Package-qualified selections
+retain the selected package's source and output directories. Dependencies are
+built as needed but do not add result lines unless explicitly requested.
+Supported queries include `:olean` and the executable `:ir` facet described
+below. Each query uses the checked module records and writes build provenance
+for `fln build explain`. A failed target or compilation emits no result paths
+and does not replace the previous module products or successful snapshot.
+
+With no explicit targets and no configured defaults, query succeeds with no
+results. Default library or executable facets, additional artifact facets, and
+`--no-build` remain unsupported; query does not invent paths for unavailable
+products.
+
 ### Executable module companions
 
 `lake build +Module:ir` additionally compiles native executable IR for that

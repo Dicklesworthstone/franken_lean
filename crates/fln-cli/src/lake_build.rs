@@ -279,6 +279,39 @@ struct BuildPlan<'a> {
     entries: Vec<Name>,
     owners: ModuleOwners<'a>,
     ir: BTreeSet<Name>,
+    /// Query results preserve request order and duplicates independently of
+    /// the deduplicated compilation graph and its combined facet demands.
+    requests: Vec<(Name, ModuleFacet)>,
+}
+
+#[derive(Clone, Copy)]
+enum ModuleFacet {
+    Olean,
+    Ir,
+}
+
+impl ModuleFacet {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Olean => "olean",
+            Self::Ir => "ir",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum BuildCommand {
+    Build,
+    Query,
+}
+
+impl BuildCommand {
+    fn failure(self, error: Failure, json: bool) -> MultiplexerOutput {
+        match self {
+            Self::Build => error.render(json),
+            Self::Query => error.render_as(json, "fln.lake-query/1", "lake query"),
+        }
+    }
 }
 
 fn module_target<'a>(
@@ -366,6 +399,7 @@ fn plan_modules<'a>(
         entries: Vec::new(),
         owners: BTreeMap::new(),
         ir: BTreeSet::new(),
+        requests: Vec::new(),
     };
     for target in targets {
         let Some((module, facet)) = target.split_once(':') else {
@@ -373,11 +407,15 @@ fn plan_modules<'a>(
                 "default target `{target}` requires Lean artifacts or executable linking that are unavailable; request +Module:olean for a declared library module"
             )));
         };
-        if !matches!(facet, "olean" | "ir") {
-            return Err(Failure::unsupported(format!(
-                "facet `{facet}` is unavailable; supported module facets: +Module:olean, +Module:ir"
-            )));
-        }
+        let facet = match facet {
+            "olean" => ModuleFacet::Olean,
+            "ir" => ModuleFacet::Ir,
+            _ => {
+                return Err(Failure::unsupported(format!(
+                    "facet `{facet}` is unavailable; supported module facets: +Module:olean, +Module:ir"
+                )));
+            }
+        };
         let (module, owner) = module_target(sources, module)?;
         if let Some(previous) = plan.owners.get(&module) {
             if !std::ptr::eq(*previous, owner) {
@@ -390,11 +428,52 @@ fn plan_modules<'a>(
             plan.entries.push(module.clone());
             plan.owners.insert(module.clone(), owner);
         }
-        if facet == "ir" {
+        plan.requests.push((module.clone(), facet));
+        if matches!(facet, ModuleFacet::Ir) {
             plan.ir.insert(module);
         }
     }
     Ok(plan)
+}
+
+/// Lake prints one target result per line, including repeated requests. The
+/// result is selected from this compilation's actual artifact family; an old
+/// output on disk can never supply a missing query result.
+fn query_results(
+    plan: &BuildPlan<'_>,
+    artifacts: &BTreeMap<Name, ModuleArtifacts>,
+    destinations: &BTreeMap<Name, (PathBuf, PathBuf)>,
+    json: bool,
+) -> Result<String, Failure> {
+    let mut output = String::new();
+    for (module, facet) in &plan.requests {
+        let family = artifacts
+            .get(module)
+            .ok_or_else(|| Failure::new("internal-fault", "queried module was not built"))?;
+        let extension = facet.extension();
+        if !family.parts().any(|(part, _)| part == extension) {
+            return Err(Failure::new(
+                "internal-fault",
+                format!(
+                    "queried module `{}` did not produce its {extension} facet",
+                    module.to_display_string(),
+                ),
+            ));
+        }
+        let (_, directory) = destinations
+            .get(module)
+            .ok_or_else(|| Failure::new("internal-fault", "queried module has no output owner"))?;
+        let mut relative = source_import_relative_path(module)?;
+        relative.set_extension(extension);
+        let path = directory.join(relative).display().to_string();
+        if json {
+            output.push_str(&json_string(&path));
+        } else {
+            output.push_str(&path);
+        }
+        output.push('\n');
+    }
+    Ok(output)
 }
 
 fn load_sources_with(
@@ -987,6 +1066,7 @@ fn build(
     json: bool,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
+    command: BuildCommand,
 ) -> Result<MultiplexerOutput, Failure> {
     let root = directory
         .canonicalize()
@@ -1002,6 +1082,14 @@ fn build(
     let config = loaded.config.clone();
     let sources = local_dependencies::load(&root, loaded, evaluation)?;
     let configuration_imports = &sources.configuration_imports;
+    // The pin queries an empty result set when no explicit or default targets
+    // exist. Defaults that do exist still need their complete artifact facets.
+    if matches!(command, BuildCommand::Query)
+        && targets.is_empty()
+        && config.default_targets.is_empty()
+    {
+        return Ok(MultiplexerOutput::success(String::new()));
+    }
     let plan = plan_modules(&sources, &targets)?;
     let modules = load_sources_with(&plan.entries, |module| {
         sources.resolve_build(module, &plan.owners)
@@ -1035,6 +1123,11 @@ fn build(
         macro_config.as_ref(),
     )?;
     let destinations = sources.destinations(&artifacts, &plan.owners)?;
+    let queried = if matches!(command, BuildCommand::Query) {
+        Some(query_results(&plan, &artifacts, &destinations, json)?)
+    } else {
+        None
+    };
     sources.verify_configurations()?;
     let paths = publish_locations_with(&artifacts, &destinations, fln::publish_file_atomic)?;
     let snapshot = record_snapshot(
@@ -1050,6 +1143,19 @@ fn build(
         posture,
         records_state,
     );
+    if let Some(stdout) = queried {
+        // Publication has succeeded before any result is exposed. Preserve a
+        // failed provenance write as a diagnostic without mixing it into the
+        // pin-compatible query result stream.
+        let stderr = snapshot.err().map_or_else(String::new, |reason| {
+            format!("lake query: the build snapshot was not written: {reason}\n")
+        });
+        return Ok(MultiplexerOutput {
+            stdout,
+            stderr,
+            exit_code: 0,
+        });
+    }
     let executable_count = artifacts
         .values()
         .filter(|family| family.ir.is_some())
@@ -1282,23 +1388,29 @@ pub(super) fn run(
     json: bool,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
+    command: BuildCommand,
 ) -> MultiplexerOutput {
     let worker = std::thread::Builder::new()
         .name("fln-lake-build".to_owned())
         // Imports are admitted on this thread under the `.olean` depth budget.
         .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
-        .spawn(move || build(directory, targets, json, jobs, posture));
+        .spawn(move || build(directory, targets, json, jobs, posture, command));
     match worker {
         Ok(worker) => match worker.join() {
             Ok(Ok(output)) => output,
-            Ok(Err(error)) => error.render(json),
-            Err(_) => Failure::new("internal-fault", "module build worker panicked").render(json),
+            Ok(Err(error)) => command.failure(error, json),
+            Err(_) => command.failure(
+                Failure::new("internal-fault", "module build worker panicked"),
+                json,
+            ),
         },
-        Err(error) => Failure::new(
-            "resource",
-            format!("could not start module build worker: {error}"),
-        )
-        .render(json),
+        Err(error) => command.failure(
+            Failure::new(
+                "resource",
+                format!("could not start module build worker: {error}"),
+            ),
+            json,
+        ),
     }
 }
 
