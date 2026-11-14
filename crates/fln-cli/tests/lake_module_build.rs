@@ -91,6 +91,33 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
         "  if b then Lib.flagBool false else true\n",
         "public partial def Lib.stringSpin (s : String) : String := Lib.stringSpin s\n",
         "public partial def Lib.spin (n : Nat) : Nat := Lib.spin (n + 1)\n",
+        "public partial def Lib.accumulate (n total : Nat) : Nat :=\n",
+        "  if n == 0 then total else Lib.accumulate (n - 1) (total + 2)\n",
+        "public partial def Lib.dropSecond (n ignored : Nat) : Nat :=\n",
+        "  if n == 0 then 7 else Lib.dropSecond (n - 1) ignored\n",
+        "public partial def Lib.swap (n left right : Nat) : Nat :=\n",
+        "  if n == 0 then left else Lib.swap (n - 1) right left\n",
+        "public partial def Lib.flags (n : Nat) (value ignored : Bool) : Bool :=\n",
+        "  if n == 0 then value else Lib.flags (n - 1) value ignored\n",
+        "public partial def Lib.dropText (n : Nat) (ignored : String) : Nat :=\n",
+        "  if n == 0 then 7 else Lib.dropText (n - 1) ignored\n",
+        "public partial def Lib.identityArg (n ignored : Nat) : Nat :=\n",
+        "  if n == 0 then 7 else Lib.identityArg (n - 1) (ignored + 0)\n",
+        "public partial def Lib.changedArg (n ignored : Nat) : Nat :=\n",
+        "  if n == 0 then 7 else Lib.changedArg (n - 1) (ignored + 2)\n",
+        "public partial def Lib.erasedProduct (n ignored : Nat) : Nat :=\n",
+        "  if n == 0 then 7 else Lib.erasedProduct (n - 1) (ignored * 0)\n",
+        "public partial def Lib.subSelf (n ignored : Nat) : Nat :=\n",
+        "  if n == 0 then 7 else Lib.subSelf (n - 1) (ignored - ignored)\n",
+        "public partial def Lib.eqSelf (n ignored : Nat) : Nat :=\n",
+        "  if ignored == ignored then n else Lib.eqSelf n ignored\n",
+        "public partial def Lib.leSelf (n ignored : Nat) : Nat :=\n",
+        "  if Nat.ble ignored ignored then n else Lib.leSelf n ignored\n",
+        "public partial def Lib.branchFact (n : Nat) (b : Bool) : Nat :=\n",
+        "  if (if b then b else true) then n else Lib.branchFact n b\n",
+        "public partial def Lib.identityBool (n : Nat) (b : Bool) : Nat :=\n",
+        "  if n == 0 then 7 else Lib.identityBool (n - 1) (if b then true else b)\n",
+        "public partial def Lib.spinBoth (a b : Nat) : Nat := Lib.spinBoth a b\n",
     );
     package.write("Lib/Top.lean", source);
     let binary = package.0.join("native-bin/lake");
@@ -141,6 +168,20 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
         "Lib.flagBool",
         "Lib.stringSpin",
         "Lib.spin",
+        "Lib.accumulate",
+        "Lib.dropSecond",
+        "Lib.swap",
+        "Lib.flags",
+        "Lib.dropText",
+        "Lib.identityArg",
+        "Lib.changedArg",
+        "Lib.erasedProduct",
+        "Lib.subSelf",
+        "Lib.eqSelf",
+        "Lib.leSelf",
+        "Lib.branchFact",
+        "Lib.identityBool",
+        "Lib.spinBoth",
     ] {
         assert!(
             ir.decls
@@ -149,6 +190,77 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
         );
     }
     assert!(ir.initializers.is_empty());
+
+    // Independently compile the same source with the pin. Reduced entries are
+    // part of the calling convention, including simplifications before
+    // reduceArity, changed/permuted self arguments and the no-used-slot case.
+    // Comparing emitted signatures catches a guessed mask even when a normal
+    // source consumer could inline a logical body and conceal the discrepancy.
+    // The native seed supplies String's inhabitant; the pin needs its normal
+    // Init import to compile the existing partial String-returning examples.
+    package.write(
+        "ReferenceMasks.lean",
+        source.replace("public import Init.Notation\n", "public import Init\n"),
+    );
+    let reference_output = Command::new(&reference)
+        .args(["-o", "ReferenceMasks.olean", "ReferenceMasks.lean"])
+        .current_dir(&package.0)
+        .env("LEAN_PATH", &lib)
+        .output()
+        .unwrap();
+    assert!(reference_output.status.success(), "{reference_output:?}");
+    let reference_bytes = std::fs::read(package.0.join("ReferenceMasks.ir")).unwrap();
+    let reference_view = fln_olean::region::OleanView::parse(&reference_bytes).unwrap();
+    let reference_blocks = reference_view
+        .extension_payloads(fln_olean::region::WalkBudget::default(), 16 << 20)
+        .unwrap();
+    let reference_ir = fln_olean::ir::decode_ir(&reference_blocks, Default::default()).unwrap();
+    let signature = |module: &fln_olean::ir::IrModule, label: &str| {
+        module
+            .decls
+            .iter()
+            .find_map(|declaration| match declaration {
+                fln_olean::ir::IrDecl::Function {
+                    name,
+                    params,
+                    result,
+                    ..
+                } if name.to_display_string() == label => Some((
+                    params
+                        .iter()
+                        .map(|param| param.ty.clone())
+                        .collect::<Vec<_>>(),
+                    result.clone(),
+                )),
+                _ => None,
+            })
+    };
+    for label in [
+        "Lib.accumulate",
+        "Lib.dropSecond",
+        "Lib.swap",
+        "Lib.flags",
+        "Lib.dropText",
+        "Lib.identityArg",
+        "Lib.changedArg",
+        "Lib.erasedProduct",
+        "Lib.subSelf",
+        "Lib.eqSelf",
+        "Lib.leSelf",
+        "Lib.branchFact",
+        "Lib.identityBool",
+        "Lib.spinBoth",
+    ] {
+        assert!(signature(&reference_ir, label).is_some(), "{label}");
+        for suffix in ["", "._redArg", "._boxed", "._redArg._boxed"] {
+            let entry = format!("{label}{suffix}");
+            assert_eq!(
+                signature(&ir, &entry),
+                signature(&reference_ir, &entry),
+                "source ABI for {entry} differs from the pin"
+            );
+        }
+    }
     let warm = success(&build());
     assert!(warm.contains("\"modules_cached\":1"), "{warm}");
     assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
@@ -181,6 +293,21 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
             "#eval Lib.flagText true\n",
             "#eval Lib.flagBool false\n",
             "#eval Lib.flagBool true\n",
+            "#eval Lib.accumulate 7 28\n",
+            "#eval Lib.dropSecond 12 999\n",
+            "#eval Lib.swap 7 11 42\n",
+            "#eval Lib.swap 8 11 42\n",
+            "#eval Lib.flags 12 false true\n",
+            "#eval Lib.flags 12 true false\n",
+            "#eval Lib.dropText 12 \"unused heap argument\"\n",
+            "#eval Lib.identityArg 12 999\n",
+            "#eval Lib.changedArg 12 999\n",
+            "#eval Lib.erasedProduct 12 999\n",
+            "#eval Lib.subSelf 12 999\n",
+            "#eval Lib.eqSelf 42 999\n",
+            "#eval Lib.leSelf 42 999\n",
+            "#eval Lib.branchFact 42 false\n",
+            "#eval Lib.identityBool 12 false\n",
         ),
     );
     let search = package.0.join(".lake/build/lib/lean");
@@ -196,7 +323,7 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
     assert!(pinned.stderr.is_empty(), "{pinned:?}");
     assert_eq!(
         std::str::from_utf8(&pinned.stdout).unwrap(),
-        "42\n42\n0\n14\n42\n42\n42\n7\n7\n9\n9\n\"done\"\n\"done\"\ntrue\ntrue\n23\n23\n\"flag\"\n\"flag\"\ntrue\ntrue\n"
+        "42\n42\n0\n14\n42\n42\n42\n7\n7\n9\n9\n\"done\"\n\"done\"\ntrue\ntrue\n23\n23\n\"flag\"\n\"flag\"\ntrue\ntrue\n42\n7\n42\n11\nfalse\ntrue\n7\n7\n7\n7\n7\n42\n42\n42\n7\n"
     );
 
     package.write("RuntimeRecursive.lean", concat!(
@@ -223,6 +350,29 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
         "  match env.evalConst (Bool → Bool) {} `Lib.flagBool (checkMeta := false) with\n",
         "  | .ok run => for b in [false, true] do IO.println (run b)\n",
         "  | .error message => throw (IO.userError message)\n",
+        "  match env.evalConst (Nat → Nat → Nat) {} `Lib.accumulate (checkMeta := false) with\n",
+        "  | .ok run => IO.println (run 7 28)\n",
+        "  | .error message => throw (IO.userError message)\n",
+        "  for entry in #[`Lib.dropSecond, `Lib.identityArg, `Lib.changedArg, `Lib.erasedProduct, `Lib.subSelf] do\n",
+        "    match env.evalConst (Nat → Nat → Nat) {} entry (checkMeta := false) with\n",
+        "    | .ok run => IO.println (run 12 999)\n",
+        "    | .error message => throw (IO.userError message)\n",
+        "  match env.evalConst (Nat → Nat → Nat → Nat) {} `Lib.swap (checkMeta := false) with\n",
+        "  | .ok run => IO.println (run 7 11 42); IO.println (run 8 11 42)\n",
+        "  | .error message => throw (IO.userError message)\n",
+        "  match env.evalConst (Nat → Bool → Bool → Bool) {} `Lib.flags (checkMeta := false) with\n",
+        "  | .ok run => IO.println (run 12 false true); IO.println (run 12 true false)\n",
+        "  | .error message => throw (IO.userError message)\n",
+        "  match env.evalConst (Nat → String → Nat) {} `Lib.dropText (checkMeta := false) with\n",
+        "  | .ok run => IO.println (run 12 \"unused heap argument\")\n",
+        "  | .error message => throw (IO.userError message)\n",
+        "  for entry in #[`Lib.dropSecond._redArg, `Lib.identityArg._redArg, `Lib.erasedProduct._redArg, `Lib.identityBool._redArg] do\n",
+        "    match env.evalConst (Nat → Nat) {} entry (checkMeta := false) with\n",
+        "    | .ok run => IO.println (run 12)\n",
+        "    | .error message => throw (IO.userError message)\n",
+        "  match env.evalConst (Nat → Bool → Bool) {} `Lib.flags._redArg (checkMeta := false) with\n",
+        "  | .ok run => IO.println (run 12 false); IO.println (run 12 true)\n",
+        "  | .error message => throw (IO.userError message)\n",
     ));
     let runtime = || {
         Command::new(&reference)
@@ -236,7 +386,7 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
     assert!(pinned.status.success(), "{pinned:?}");
     assert_eq!(
         std::str::from_utf8(&pinned.stdout).unwrap(),
-        "42\n42\n42\n0\n14\n42\n42\n42\n42\n7\n7\n7\n9\n9\n9\ndone\ndone\ntrue\ntrue\n23\n23\nflag\nflag\ntrue\ntrue\n"
+        "42\n42\n42\n0\n14\n42\n42\n42\n42\n7\n7\n7\n9\n9\n9\ndone\ndone\ntrue\ntrue\n23\n23\nflag\nflag\ntrue\ntrue\n42\n7\n7\n7\n7\n7\n42\n11\nfalse\ntrue\n7\n7\n7\n7\n7\nfalse\ntrue\n"
     );
 
     if let Some(partition) = emitted_ir_partition() {
@@ -328,8 +478,24 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
             "unsafe or partial source export",
         ),
         (
-            "public partial def Lib.accumulate (n total : Nat) : Nat := if n == 0 then total else Lib.accumulate (n - 1) (total + 1)\n",
-            "recursive source exports require unary Nat/String/Bool signatures",
+            "public partial def Lib.higherOrder (f : Nat → Nat) (n : Nat) : Nat := Lib.higherOrder f n\n",
+            "recursive source exports require closed Nat/String/Bool signatures",
+        ),
+        (
+            "public partial def Lib.unknownOperation (n ignored : Nat) : Nat := if n == 0 then 7 else Lib.unknownOperation (n - 1) (ignored % 2)\n",
+            "recursive source operation",
+        ),
+        (
+            "public partial def Lib.literalBeq (n x : Nat) : Nat := if Nat.beq 0 0 then n else Lib.literalBeq x n\n",
+            "recursive source literal comparison",
+        ),
+        (
+            "public partial def Lib.literalBle (n x : Nat) : Nat := if Nat.ble 0 0 then n else Lib.literalBle x n\n",
+            "recursive source literal comparison",
+        ),
+        (
+            "public partial def Lib.literalDictionary (n x : Nat) : Nat := if 0 == 0 then n else Lib.literalDictionary x n\n",
+            "recursive source literal comparison",
         ),
     ] {
         package.write("Lib/Top.lean", format!("{source}{unsupported}"));

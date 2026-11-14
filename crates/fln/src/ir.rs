@@ -25,6 +25,8 @@ use fln_olean::ir::{
     IrTerminal, IrType,
 };
 
+mod recursive_signatures;
+
 #[derive(Debug, Clone, Copy)]
 pub struct CompileLimits {
     pub ownership: flbc::OwnershipLimits,
@@ -2060,6 +2062,7 @@ fn source_carrier(ty: &fln_core::expr::Expr, meter: &mut Budget) -> Result<IrTyp
 fn source_signature(
     definition: &fln_env::constants::DefinitionVal,
     erasures: &[bool],
+    parameter_uses: Option<&[bool]>,
     environment: &crate::Environment,
     ingress: fln_comp::ingress::IngressLimits,
     meter: &mut Budget,
@@ -2110,8 +2113,19 @@ fn source_signature(
         return Err(invariant("source erasure arity"));
     }
     let reduced = if !params.is_empty() {
-        let mut used =
-            source_parameter_uses(&definition.value, params.len(), environment, ingress, meter)?;
+        let mut used = if let Some(used) = parameter_uses {
+            if used.len() != params.len() {
+                return Err(invariant("recursive source use arity"));
+            }
+            meter.charge(used.len())?;
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(used.len())
+                .map_err(|_| CompileError::Allocation)?;
+            copy.extend_from_slice(used);
+            copy
+        } else {
+            source_parameter_uses(&definition.value, params.len(), environment, ingress, meter)?
+        };
         for (used, erased) in used.iter_mut().zip(erasures) {
             *used &= !erased;
         }
@@ -2448,13 +2462,13 @@ pub(crate) fn is_checked_recursive_companion(
 
 /// Compile a safe reference to the logical interface, so normal preparation
 /// selects its checked executable companion. Never re-admit a Partial body as
-/// Safe or export a partial opaque's arbitrary inhabitant. A single closed
-/// runtime slot has no smaller nonempty reduced-argument ABI, regardless of
-/// body use. The ordinary source exporter owns its boxing and result ABI.
+/// Safe or export a partial opaque's arbitrary inhabitant. Source slots retain
+/// their telescope order; the companion analysis supplies any reduced entry.
+/// The ordinary source exporter owns boxing and the result ABI.
 fn recursive_source_wrapper(
     definition: &mut fln_env::constants::DefinitionVal,
     meter: &mut Budget,
-) -> Result<()> {
+) -> Result<usize> {
     use fln_core::expr::{Expr, ExprNode};
     let carriers = [
         Name::from_components(["Nat"]),
@@ -2465,37 +2479,53 @@ fn recursive_source_wrapper(
         matches!(expression.node(), ExprNode::Const { name, levels }
             if levels.is_empty() && carriers.contains(name))
     };
-    let ty = source_without_metadata(&definition.base.type_, meter)?;
-    let ExprNode::ForallE {
-        binder_name,
-        binder_type,
-        body,
-        binder_info,
-    } = ty.node()
-    else {
+    if !definition.base.level_params.is_empty() {
         return Err(unsupported(
-            "recursive source exports require unary Nat/String/Bool signatures",
-        ));
-    };
-    if !definition.base.level_params.is_empty()
-        || !scalar(source_without_metadata(binder_type, meter)?)
-        || !scalar(source_without_metadata(body, meter)?)
-    {
-        return Err(unsupported(
-            "recursive source exports require unary Nat/String/Bool signatures",
+            "recursive source exports require closed Nat/String/Bool signatures",
         ));
     }
-    meter.charge(5)?;
-    definition.value = Expr::lam(
-        binder_name.clone(),
-        binder_type.clone(),
-        Expr::app(
-            Expr::const_(definition.base.name.clone(), Vec::new()),
-            Expr::bvar(0).expect("zero source parameter index"),
-        ),
-        *binder_info,
-    );
-    Ok(())
+    let mut telescope = Vec::new();
+    let mut ty = &definition.base.type_;
+    loop {
+        meter.charge(1)?;
+        ty = source_without_metadata(ty, meter)?;
+        let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } = ty.node()
+        else {
+            break;
+        };
+        if !scalar(source_without_metadata(binder_type, meter)?) {
+            return Err(unsupported(
+                "recursive source exports require closed Nat/String/Bool signatures",
+            ));
+        }
+        telescope
+            .try_reserve(1)
+            .map_err(|_| CompileError::Allocation)?;
+        telescope.push((binder_name.clone(), binder_type.clone(), *binder_info));
+        ty = body;
+    }
+    if telescope.is_empty() || !scalar(ty) {
+        return Err(unsupported(
+            "recursive source exports require closed Nat/String/Bool signatures",
+        ));
+    }
+    let arity = telescope.len();
+    meter.charge(arity.saturating_mul(3).saturating_add(1))?;
+    let mut value = Expr::const_(definition.base.name.clone(), Vec::new());
+    for index in (0..arity).rev() {
+        let index = u32::try_from(index).map_err(|_| CompileError::Limit)?;
+        value = Expr::app(value, Expr::bvar(index).map_err(|_| CompileError::Limit)?);
+    }
+    for (name, type_, info) in telescope.into_iter().rev() {
+        value = Expr::lam(name, type_, value, info);
+    }
+    definition.value = value;
+    Ok(arity)
 }
 
 /// Compile an exact definition or safe opaque body from a module's privately
@@ -2613,6 +2643,7 @@ pub(crate) fn compile_checked_source_definition(
             "source export with an executable replacement or extern",
         )));
     }
+    let mut recursive_uses = None;
     if let Some(companion) = checked_recursive_companion(engine, name, engine_limits, &mut meter)? {
         if noncomputable.contains(&companion.base.name) {
             return Err(DefinitionCompileError::Ir(unsupported(
@@ -2626,8 +2657,24 @@ pub(crate) fn compile_checked_source_definition(
                 "recursive source companion with an executable replacement or extern",
             )));
         }
-        recursive_source_wrapper(definition.to_mut(), &mut meter)
+        let arity = recursive_source_wrapper(definition.to_mut(), &mut meter)
             .map_err(DefinitionCompileError::Ir)?;
+        // A unary function has no smaller nonempty calling convention. With
+        // several slots, the wrapper's syntactic uses are not the companion's:
+        // unchanged self-call arguments are ignored by the pin's ReduceArity.
+        if arity > 1 {
+            recursive_uses = Some(
+                recursive_signatures::parameters(
+                    name,
+                    &companion,
+                    arity,
+                    engine.environment(),
+                    engine_limits.ingress,
+                    &mut meter,
+                )
+                .map_err(DefinitionCompileError::Ir)?,
+            );
+        }
     }
     let mut ingress = engine_limits.ingress;
     ingress.max_nodes = ingress
@@ -2642,6 +2689,7 @@ pub(crate) fn compile_checked_source_definition(
     let signature = source_signature(
         &definition,
         &erasures,
+        recursive_uses.as_deref(),
         engine.environment(),
         ingress,
         &mut meter,
@@ -2719,6 +2767,7 @@ fn compile_definition_impl(
                 source_signature(
                     definition,
                     &erasures,
+                    None,
                     engine.environment(),
                     ingress,
                     &mut meter,

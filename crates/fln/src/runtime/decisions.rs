@@ -37,6 +37,36 @@ fn canonical_decision_proof_alias(actual: Option<&ConstantInfo>, expected: &Defi
             && actual.all == expected.all)
 }
 
+/// Share the existing admitted decision models with source ABI analysis.
+/// The caller opens actual dictionary bodies and separately checks executable
+/// journals on the seeded decision; this function grants no name-only rule.
+/// Returning consumed work also on refusal keeps the caller's budget exact.
+pub(crate) fn source_nat_equality_contract(
+    environment: &Environment,
+    pinned: bool,
+    limits: IngressLimits,
+) -> (Result<(), IngressError>, usize) {
+    let mut preparation = Preparation::new(environment, limits);
+    let result = if pinned {
+        // The @Nat.decEq inventory also binds Decidable.decide, its
+        // casesOn/recursor and Bool constructors. The shared checker validates
+        // each dependency's digest and executable journals, including the
+        // outer Boolean projection; the name alone grants no authority.
+        preparation
+            .native_natural_decision_model(&name("Nat.decEq"))
+            .and_then(|canonical| {
+                if canonical {
+                    Ok(())
+                } else {
+                    Err(unsupported("source natural equality decision model"))
+                }
+            })
+    } else {
+        preparation.checked_equality_decision_contract("Nat", false)
+    };
+    (result, preparation.visited)
+}
+
 impl Preparation<'_> {
     /// Native decisions return immediate tags at the ABI. Golem's Decidable
     /// layout instead retains one inert proof slot. Adapt only after the full

@@ -10,6 +10,7 @@ mod callables;
 mod conditionals;
 mod data_recursion;
 mod decisions;
+pub(super) use decisions::source_nat_equality_contract;
 mod diagnostics;
 mod empty;
 mod evaluation;

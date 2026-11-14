@@ -237,19 +237,137 @@ fn source_recursion_refuses_unsafe_entries_and_unverified_companions() {
 }
 
 #[test]
-fn source_recursion_refuses_unproved_public_signatures_and_mutual_groups() {
+fn source_recursion_preserves_multiargument_and_reduced_abis_without_evaluation() {
     let engine = checked(
         r#"partial def accumulator (n total : Nat) : Nat :=
   if n == 0 then total else accumulator (n - 1) (total + 2)
-partial def higherOrder (n : Nat) : Nat -> Nat :=
-  fun x => higherOrder n x
+partial def dropSecond (n ignored : Nat) : Nat :=
+  if n == 0 then 7 else dropSecond (n - 1) ignored
+partial def swap (n left right : Nat) : Nat :=
+  if n == 0 then left else swap (n - 1) right left
+partial def flags (n : Nat) (value ignored : Bool) : Bool :=
+  if n == 0 then value else flags (n - 1) value ignored
+partial def identityArg (n ignored : Nat) : Nat :=
+  if n == 0 then 7 else identityArg (n - 1) (ignored + 0)
+partial def changedArg (n ignored : Nat) : Nat :=
+  if n == 0 then 7 else changedArg (n - 1) (ignored + 2)
+partial def erasedProduct (n ignored : Nat) : Nat :=
+  if n == 0 then 7 else erasedProduct (n - 1) (ignored * 0)
+partial def subSelf (n ignored : Nat) : Nat :=
+  if n == 0 then 7 else subSelf (n - 1) (ignored - ignored)
+partial def eqSelf (n ignored : Nat) : Nat :=
+  if ignored == ignored then n else eqSelf n ignored
+partial def leSelf (n ignored : Nat) : Nat :=
+  if Nat.ble ignored ignored then n else leSelf n ignored
+partial def branchFact (n : Nat) (b : Bool) : Nat :=
+  if (if b then b else true) then n else branchFact n b
+partial def identityBool (n : Nat) (b : Bool) : Nat :=
+  if n == 0 then 7 else identityBool (n - 1) (if b then true else b)
+partial def spinBoth (a b : Nat) : Nat := spinBoth a b
+"#,
+    );
+    let before = engine.environment().clone();
+    // These masks match the pinned compiler's reduceArity pass. In particular,
+    // changed/permuted recursive arguments count, unchanged same-slot arguments
+    // do not, and the pin preserves the telescope when no parameters are used.
+    for (label, arity, reduced) in [
+        ("accumulator", 2, None),
+        ("dropSecond", 2, Some(1)),
+        ("swap", 3, None),
+        ("flags", 3, Some(2)),
+        ("identityArg", 2, Some(1)),
+        ("changedArg", 2, None),
+        ("erasedProduct", 2, Some(1)),
+        ("subSelf", 2, None),
+        ("eqSelf", 2, None),
+        ("leSelf", 2, None),
+        ("branchFact", 2, Some(1)),
+        ("identityBool", 2, Some(1)),
+        ("spinBoth", 2, None),
+    ] {
+        let entry = name(label);
+        let module = export(&engine, label)
+            .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+            .into_complete()
+            .unwrap();
+        let Some(IrDecl::Function { params, result, .. }) =
+            module.decls.iter().find(|decl| decl.name() == &entry)
+        else {
+            panic!("missing recursive exported function {label}")
+        };
+        assert_eq!(params.len(), arity, "{label}");
+        assert_eq!(
+            *result,
+            if label == "flags" {
+                IrType::UInt8
+            } else {
+                IrType::TObject
+            },
+            "{label}"
+        );
+        let helper = Name::str(entry.clone(), "_redArg");
+        let actual = module.decls.iter().find_map(|decl| match decl {
+            IrDecl::Function { name, params, .. } if name == &helper => Some(params.len()),
+            _ => None,
+        });
+        assert_eq!(actual, reduced, "{label}");
+        assert!(
+            module
+                .decls
+                .iter()
+                .all(|decl| { !decl.name().to_display_string().contains("_unsafe_rec") })
+        );
+        assert!(matches!(
+            engine.environment().find(&entry),
+            Some(ConstantInfo::Opaque(value)) if !value.is_unsafe
+        ));
+        assert_eq!(engine.environment(), &before);
+    }
+}
+
+#[test]
+fn source_recursion_refuses_unproved_public_signatures_and_mutual_groups() {
+    let engine = checked(
+        r#"partial def higherOrder (f : Nat -> Nat) (n : Nat) : Nat :=
+  higherOrder f n
+partial def generic (A : Type) (a : A) : A := generic A a
+partial def unknownOperation (n ignored : Nat) : Nat :=
+  if n == 0 then 7 else unknownOperation (n - 1) (ignored % 2)
+partial def recursiveInitializer (n ignored : Nat) : Nat :=
+  let x := recursiveInitializer n ignored
+  n
+partial def conditionalArgument (n : Nat) (b : Bool) : Nat :=
+  conditionalArgument n (if b then false else true)
+partial def conditionalRecursion (n : Nat) (b : Bool) : Nat :=
+  if b then conditionalRecursion n false else n
+partial def sharedDiscriminator (n ignored : Nat) : Nat :=
+  if n == 0 then (if n == 0 then ignored else 7) else sharedDiscriminator n ignored
+partial def literalBeq (n x : Nat) : Nat :=
+  if Nat.beq 0 0 then n else literalBeq x n
+partial def literalBle (n x : Nat) : Nat :=
+  if Nat.ble 0 0 then n else literalBle x n
+partial def literalDictionary (n x : Nat) : Nat :=
+  if 0 == 0 then n else literalDictionary x n
 mutual
   partial def first (n : Nat) : Nat := second n
   partial def second (n : Nat) : Nat := first n
 end
 "#,
     );
-    for entry in ["accumulator", "higherOrder", "first", "second"] {
+    for entry in [
+        "higherOrder",
+        "generic",
+        "unknownOperation",
+        "recursiveInitializer",
+        "conditionalArgument",
+        "conditionalRecursion",
+        "sharedDiscriminator",
+        "literalBeq",
+        "literalBle",
+        "literalDictionary",
+        "first",
+        "second",
+    ] {
         assert_unsupported(&engine, entry);
     }
 }
