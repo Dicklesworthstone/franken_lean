@@ -365,11 +365,12 @@ fn strip_metadata(mut expr: &Expr) -> &Expr {
 }
 
 impl Context {
-    /// GuessLex's direct-Nat `simpleMeasures`, in the varying telescope's
-    /// order. The common fixed prefix has already been computed from all call
-    /// edges. Other SizeOf measures retain their explicit-measure boundary:
-    /// skipping one could select a different earlier lexicographic prefix.
-    pub(in crate::source) fn mutual_nat_measures(
+    /// GuessLex's `simpleMeasures`, in the varying telescope's order
+    /// (`WF/GuessLex.lean`). A parameter whose selected SizeOf instance reduces
+    /// to a literal contributes no measure. Every other non-Nat parameter is
+    /// measured by that instance, so different member types share a Nat
+    /// codomain without dropping an earlier candidate from the search order.
+    pub(in crate::source) fn mutual_simple_measures(
         &mut self,
         type_: &Expr,
         arity: usize,
@@ -385,24 +386,50 @@ impl Context {
             let mut measures = Vec::new();
             for parameter in parameters.iter().skip(fixed) {
                 self.tick()?;
+                let argument = Expr::fvar(parameter.id.clone());
+                let target = self
+                    .mutual_apply(&["SizeOf"], [parameter.type_.clone()])?
+                    .value;
+                let dictionary = self.coercion_instance(target)?.ok_or_else(|| {
+                    failure(SourceInferenceError::InstanceSynthesisRequired(None))
+                })?;
+                let size = self
+                    .mutual_apply(
+                        &["SizeOf", "sizeOf"],
+                        [parameter.type_.clone(), dictionary, argument.clone()],
+                    )?
+                    .value;
+                let size = self.instantiate(&size)?;
+                self.require_resolved_terms(std::slice::from_ref(&size))?;
+                // The pin tests whnfD, not syntactic occurrence of the parameter.
+                // Prop, Type and custom constant SizeOf instances are ignored only
+                // when their actual selected computation produces a literal.
+                let reduced =
+                    self.reduce_source_head(&size, UnificationTransparency::Default, true)?;
+                if matches!(reduced.node(), ExprNode::Lit { .. }) {
+                    continue;
+                }
                 let type_ = self.reduce_source_head(
                     &parameter.type_,
                     UnificationTransparency::Abbreviations,
                     true,
                 )?;
-                if !matches!(type_.node(), ExprNode::Const { name, levels }
+                let measure = if matches!(type_.node(), ExprNode::Const { name, levels }
                     if name == &Name::from_components(["Nat"]) && levels.is_empty())
-                    || !self.native_nat_size_measure(parameter)?
                 {
-                    return Err(unsupported(
-                        "inferred measures over non-Nat or nonstandard SizeOf parameters",
-                    ));
-                }
-                measures.push(self.close_mutual_fixed(
-                    &Expr::fvar(parameter.id.clone()),
-                    &parameters,
-                    true,
-                )?);
+                    // `mayOmitSizeOf` omits it for Nat, but the pin's call matrix
+                    // still compares natFn. Until those are represented separately,
+                    // retain the existing boundary for a nonidentity Nat instance.
+                    if !self.well_founded_default_conversion(&reduced, &argument)? {
+                        return Err(unsupported(
+                            "inferred measures with a nonstandard Nat SizeOf",
+                        ));
+                    }
+                    argument
+                } else {
+                    size
+                };
+                measures.push(self.close_mutual_fixed(&measure, &parameters, true)?);
             }
             if measures.is_empty() {
                 return Err(error(RecursionError::WellFoundedMeasureRequired));

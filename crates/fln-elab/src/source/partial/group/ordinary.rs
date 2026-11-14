@@ -1,7 +1,7 @@
 //! Ordinary mutual predefinitions, following MutualDef's header/body boundary
 //! and dependency partition. Headers are private candidate data, never
 //! temporary environment axioms. Same-family structural components share one
-//! course-of-values recursor; explicit measures and inferred direct-Nat measures
+//! course-of-values recursor; explicit measures and inferred SizeOf measures
 //! share one well-founded fixpoint. Unsupported components are never downgraded
 //! to partial logical definitions.
 use super::*;
@@ -846,7 +846,7 @@ fn mutual_well_founded(
         planner.level_params = levels.clone();
         planner.explicit_levels = levels.len();
         for (type_, &arity) in types.iter().zip(&arities) {
-            let result = planner.mutual_nat_measures(type_, arity, fixed);
+            let result = planner.mutual_simple_measures(type_, arity, fixed);
             meter.txn.budget = planner.txn.budget.clone();
             choices.push(result?);
         }

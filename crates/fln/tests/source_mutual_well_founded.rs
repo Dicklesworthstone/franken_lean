@@ -941,6 +941,131 @@ end
 }
 
 #[test]
+fn inferred_mutual_measures_ignore_constant_size_functions() {
+    let source = r#"mutual
+def measureHop (f : Nat → Nat) (n : Nat) : Nat :=
+  if h : n = 0 then f 0 else measureSkip (fun x => f (x + 1)) (n - 1)
+def measureSkip (f : Nat → Nat) (n : Nat) : Nat :=
+  if h : n = 0 then f 0 else measureHop (fun x => f (x + 2)) (n - 1)
+end
+"#;
+    on_large_stack(move |base| {
+        assert_eq!(
+            oracle(
+                &format!(
+                    "{source}#eval measureHop (fun x => x) 4\n#eval measureHop (fun x => x) 5\n"
+                ),
+                true,
+            ),
+            "6\n7\n",
+        );
+        let engine = check(base, source);
+        assert_auxiliary(&engine, "measureHop._mutual");
+        for (query, expected) in [
+            ("#eval measureHop (fun x => x) 4", 6),
+            ("#eval measureHop (fun x => x) 5", 7),
+        ] {
+            assert_eq!(evaluate(&engine, query), ClosedVmValue::Scalar(expected));
+        }
+    });
+}
+
+#[test]
+fn inferred_mutual_measures_ignore_type_and_proof_parameters() {
+    let source = r#"mutual
+def typedLeft (α : Type) (n : Nat) : Nat :=
+  if h : n = 0 then 2 else typedRight (α × α) (n - 1)
+def typedRight (α : Type) (n : Nat) : Nat :=
+  if h : n = 0 then 3 else typedLeft (α × α) (n - 1)
+end
+mutual
+def erasedLeft (n : Nat) (_h : True) : Nat :=
+  if he : n = 0 then 4 else erasedRight (n - 1) True.intro
+def erasedRight (n : Nat) (_h : True) : Nat :=
+  if he : n = 0 then 5 else erasedLeft (n - 1) True.intro
+end
+"#;
+    on_large_stack(move |base| {
+        assert_eq!(
+            oracle(
+                &format!(
+                    "{source}#eval typedLeft Nat 4\n#eval typedLeft Nat 5\n#eval erasedLeft 4 True.intro\n#eval erasedLeft 5 True.intro\n"
+                ),
+                true,
+            ),
+            "2\n3\n4\n5\n",
+        );
+        let engine = check(base, source);
+        for (query, expected) in [
+            ("#eval typedLeft Nat 4", 2),
+            ("#eval typedLeft Nat 5", 3),
+            ("#eval erasedLeft 4 True.intro", 4),
+            ("#eval erasedLeft 5 True.intro", 5),
+        ] {
+            assert_eq!(evaluate(&engine, query), ClosedVmValue::Scalar(expected));
+        }
+    });
+}
+
+#[test]
+fn inferred_mutual_measures_use_a_nonconstant_size_of_instance() {
+    let source = r#"structure MeasureBox where
+  value : Nat
+mutual
+def boxLeft : MeasureBox → Nat
+  | ⟨0⟩ => 7
+  | ⟨n+1⟩ => boxRight ⟨n⟩
+def boxRight : MeasureBox → Nat
+  | ⟨0⟩ => 9
+  | ⟨n+1⟩ => boxLeft ⟨n⟩
+end
+"#;
+    on_large_stack(move |base| {
+        assert_eq!(
+            oracle(
+                &format!("{source}#eval boxLeft ⟨4⟩\n#eval boxLeft ⟨5⟩\n"),
+                true,
+            ),
+            "7\n9\n",
+        );
+        let engine = check(base, source);
+        assert_auxiliary(&engine, "boxLeft._mutual");
+        assert_companions(&engine, &["boxLeft", "boxRight"]);
+        assert!(
+            shape(&definition(&engine, "boxLeft._mutual").value)
+                .contains("SizeOf.sizeOf MeasureBox"),
+            "the inferred measure must retain its selected SizeOf application"
+        );
+        assert_eq!(
+            evaluate(&engine, "#eval boxLeft ⟨4⟩"),
+            ClosedVmValue::Scalar(7)
+        );
+        assert_eq!(
+            evaluate(&engine, "#eval boxLeft ⟨5⟩"),
+            ClosedVmValue::Scalar(9)
+        );
+    });
+}
+
+#[test]
+fn inferred_size_of_measures_do_not_accept_nondecreasing_mutual_calls() {
+    let source = r#"structure BadMeasureBox where
+  value : Nat
+mutual
+def badBoxLeft (x : BadMeasureBox) : Nat := badBoxRight ⟨x.value + 1⟩
+def badBoxRight (x : BadMeasureBox) : Nat := badBoxLeft x
+end
+"#;
+    on_large_stack(move |base| {
+        oracle(source, false);
+        refuse(base, source);
+        for name in ["badBoxLeft", "badBoxRight", "badBoxLeft._mutual"] {
+            assert!(!base.environment().contains(&n(name)));
+        }
+    });
+}
+
+#[test]
 fn inferred_mutual_measures_refuse_nondecreasing_calls_and_recover() {
     let source = r#"mutual
 def badLeft (n : Nat) : Nat := badRight (n + 1)
