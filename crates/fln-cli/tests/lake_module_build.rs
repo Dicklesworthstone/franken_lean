@@ -702,6 +702,166 @@ fn fieldless_enum_ir_facets_preserve_admission_and_replay_from_checked_cache() {
 }
 
 #[test]
+fn boxed_data_ir_facets_build_import_and_execute_payloads() {
+    let Some(reference) = pinned_family_reference() else {
+        return;
+    };
+    let lib = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| reference.parent().unwrap().join("../lib/lean"));
+    let package = Package::new(CONFIG);
+    package.write(
+        "Lib/Base.lean",
+        concat!(
+            "module\nprelude\npublic import Init.Notation\n",
+            "public structure Lib.Payload where\n  number : Nat\n  text : String\n",
+            "public inductive Lib.Message where\n  | empty\n  | value (number : Nat) (text : String)\n",
+            "public def Lib.makePayload (number : Nat) (text : String) : Lib.Payload := Lib.Payload.mk number text\n",
+        ),
+    );
+    let top = concat!(
+        "module\nprelude\npublic import Lib.Base\n",
+        "public def Lib.payloadIdentity (p : Lib.Payload) : Lib.Payload := p\n",
+        "public def Lib.payloadText (p : Lib.Payload) : String := p.text\n",
+        "public def Lib.applyPayload (f : Lib.Payload -> Lib.Payload) (p : Lib.Payload) : Lib.Payload := f p\n",
+        "public def Lib.messageText (m : Lib.Message) : String := match m with | .empty => \"empty\" | .value _ text => text\n",
+        "public def Lib.makeMessage (number : Nat) (text : String) : Lib.Message := Lib.Message.value number text\n",
+        "public def Lib.keepNumber (_p : Lib.Payload) (n : Nat) : Nat := n\n",
+        "public def Lib.user.recOn (n : Nat) : Nat := n\n",
+    );
+    package.write("Lib/Top.lean", top);
+    let build = || {
+        Command::new(env!("CARGO_BIN_EXE_lake"))
+            .arg("--dir")
+            .arg(&package.0)
+            .args(["--json", "build", "+Lib.Top:ir"])
+            .env("LEAN_PATH", &lib)
+            .env("FLN_IMPORT_REUSE_DIR", package.0.join(".records"))
+            .output()
+            .unwrap()
+    };
+    let report = success(&build());
+    assert!(report.contains("\"executable_modules\":2"), "{report}");
+    let originals: Vec<_> = ["Lib.Base", "Lib.Top"]
+        .into_iter()
+        .map(|name| {
+            (
+                family_bytes(&package, name),
+                std::fs::read(package.artifact(name).with_extension("ir")).unwrap(),
+            )
+        })
+        .collect();
+    let warm = success(&build());
+    assert!(warm.contains("\"modules_cached\":2"), "{warm}");
+    assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
+    for (index, name) in ["Lib.Base", "Lib.Top"].into_iter().enumerate() {
+        assert_eq!(family_bytes(&package, name), originals[index].0);
+        assert_eq!(
+            std::fs::read(package.artifact(name).with_extension("ir")).unwrap(),
+            originals[index].1,
+        );
+    }
+    package.write("heap.txt", "boxed heap payload");
+    package.write("number.txt", "184467440737095516160");
+    // Every logical companion and executable file was produced by Lake above.
+    // The pin must compile a downstream user of these native data declarations,
+    // then dynamically load their emitted functions instead of inlining bodies.
+    package.write(
+        "BoxedRuntime.lean",
+        concat!(
+            "import Lean\nimport Lib.Top\n",
+            "private unsafe def fetch (α : Type) (env : Lean.Environment) (n : Lean.Name) : IO α :=\n",
+            "  match env.evalConst α {} n (checkMeta := false) with\n",
+            "  | .error message => throw (IO.userError message)\n",
+            "  | .ok value => pure value\n",
+            "unsafe def main : IO Unit := do\n",
+            "  let heap ← IO.FS.readFile \"heap.txt\"\n",
+            "  let digits ← IO.FS.readFile \"number.txt\"\n",
+            "  let large := digits.toNat!\n",
+            "  Lean.enableInitializersExecution\n",
+            "  let env ← Lean.importModules #[{ module := `Lib.Top, isMeta := true }] {} (loadExts := true)\n",
+            "  let make ← fetch (Nat -> String -> Lib.Payload) env `Lib.makePayload\n",
+            "  let keep ← fetch (Lib.Payload -> Lib.Payload) env `Lib.payloadIdentity\n",
+            "  let text ← fetch (Lib.Payload -> String) env `Lib.payloadText\n",
+            "  let invoke ← fetch ((Lib.Payload -> Lib.Payload) -> Lib.Payload -> Lib.Payload) env `Lib.applyPayload\n",
+            "  let message ← fetch (Nat -> String -> Lib.Message) env `Lib.makeMessage\n",
+            "  let messageText ← fetch (Lib.Message -> String) env `Lib.messageText\n",
+            "  let keepNumber ← fetch (Lib.Payload -> Nat -> Nat) env `Lib.keepNumber\n",
+            "  let reduced ← fetch (Nat -> Nat) env `Lib.keepNumber._redArg\n",
+            "  let ordinary ← fetch (Nat -> Nat) env `Lib.user.recOn\n",
+            "  let p := make large heap\n",
+            "  let q := keep p\n",
+            "  IO.println (reprStr (q.number, q.text, p.text))\n",
+            "  let r := invoke (fun x => Lib.Payload.mk (x.number + 1) (x.text ++ \"!\")) p\n",
+            "  IO.println (reprStr (r.number, r.text, p.text))\n",
+            "  IO.println (text p)\n",
+            "  IO.println (messageText (message large heap))\n",
+            "  IO.println (messageText Lib.Message.empty)\n",
+            "  IO.println (keepNumber p 42)\n",
+            "  IO.println (reduced 43)\n",
+            "  IO.println (ordinary 44)\n",
+        ),
+    );
+    let output = Command::new(&reference)
+        .current_dir(&package.0)
+        .env("LEAN_PATH", package.0.join(".lake/build/lib/lean"))
+        .args(["-j", "1", "--run", "BoxedRuntime.lean"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "native data companions and IR: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        concat!(
+            "(184467440737095516160, \"boxed heap payload\", \"boxed heap payload\")\n",
+            "(184467440737095516161, \"boxed heap payload!\", \"boxed heap payload\")\n",
+            "boxed heap payload\nboxed heap payload\nempty\n42\n43\n44\n",
+        ),
+    );
+    let snapshot = package.0.join(".lake/build/fln-build.snapshot");
+    let previous_snapshot = std::fs::read(&snapshot).unwrap();
+    for (replacement, reason, declaration) in [
+        (
+            concat!(
+                "module\nprelude\npublic import Lib.Base\n",
+                "public structure Lib.Packed where\n  flag : Bool\n  number : Nat\n",
+                "public def Lib.bad (p : Lib.Packed) : Lib.Packed := p\n",
+            ),
+            "source export carrier",
+            "Lib.Packed",
+        ),
+        (
+            concat!(
+                "module\nprelude\npublic import Lib.Base\n",
+                "public def Lib.user.recOn (_f : Nat -> Nat) (n : Nat) : Nat := n\n",
+            ),
+            "unused higher-order source parameter",
+            "Lib.user.recOn",
+        ),
+    ] {
+        // Generated auxiliaries may be omitted; unsupported ordinary functions
+        // with the same suffix must still fail without replacing any artifacts.
+        package.write("Lib/Top.lean", replacement);
+        let report = failure(&build());
+        assert!(report.contains(reason), "{report}");
+        assert!(report.contains(declaration), "{report}");
+        for (index, name) in ["Lib.Base", "Lib.Top"].into_iter().enumerate() {
+            assert_eq!(family_bytes(&package, name), originals[index].0);
+            assert_eq!(
+                std::fs::read(package.artifact(name).with_extension("ir")).unwrap(),
+                originals[index].1,
+            );
+        }
+        assert_eq!(std::fs::read(&snapshot).unwrap(), previous_snapshot);
+    }
+}
+
+#[test]
 fn singleton_enum_ir_facet_uses_the_tagged_source_carrier() {
     let package = Package::new(CONFIG);
     package.write("Lib/Base.lean", "module\nprelude\n");

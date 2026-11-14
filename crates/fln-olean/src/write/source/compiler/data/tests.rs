@@ -111,6 +111,68 @@ fn projection(constants: &[ConstantInfo]) -> Vec<CompilerData> {
         .collect()
 }
 
+#[test]
+fn compiler_data_rejects_allocator_overflow_even_without_constructor_code() {
+    use fln_env::constants::{ConstantVal, ConstructorVal};
+
+    // Identity functions and callbacks need only the signature's data layout;
+    // there need not be a constructor instruction for FIR's field bound to see.
+    // The shared projection must therefore enforce the physical bound itself.
+    for (count, accepted) in [(255, true), (256, false), (257, false)] {
+        let family = name("WriterBoundary");
+        let constructor = name("WriterBoundary.mk");
+        let inductive = InductiveVal {
+            base: ConstantVal {
+                name: family.clone(),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::one()),
+            },
+            num_params: 0,
+            num_indices: 0,
+            all: vec![family.clone()],
+            ctors: vec![constructor.clone()],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        };
+        let ty = (0..count)
+            .rev()
+            .fold(Expr::const_(family.clone(), Vec::new()), |body, index| {
+                Expr::forall_e(
+                    Name::num(Name::anonymous(), index as u64),
+                    Expr::const_(name("Nat"), Vec::new()),
+                    body,
+                    BinderInfo::Default,
+                )
+            });
+        let constructor = ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: constructor,
+                level_params: Vec::new(),
+                type_: ty,
+            },
+            induct: family,
+            cidx: 0,
+            num_params: 0,
+            num_fields: count,
+            is_unsafe: false,
+        });
+        let projected = CompilerData::from_inductive(
+            &inductive,
+            |name| (name == constructor.name()).then_some(&constructor),
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap();
+        assert_eq!(projected.is_some(), accepted, "{count} object fields");
+        if let Some(projected) = projected {
+            assert_eq!(projected.carrier(), &IrType::Object);
+            assert_eq!(projected.constructors().len(), 1);
+            assert_eq!(projected.constructors().next().unwrap().1.len(), 255);
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum MapValue {
     Nontrivial,

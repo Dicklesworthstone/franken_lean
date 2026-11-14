@@ -149,13 +149,14 @@ impl SourceModuleArtifact {
     /// No runtime evaluation occurs, no partially compiled module is returned,
     /// and failure leaves every member of this artifact unchanged.
     ///
-    /// This currently supports module-system files and the native compiler's
-    /// closed Nat/String/Bool signatures. Legacy files require IR embedded in
-    /// their `.olean`, so a standalone companion is refused. Unsupported
-    /// executable definitions refuse the entire facet. Safe opaque bodies use
-    /// their checked implementation without changing the logical declaration. Theorems and declaration-only constants need no
-    /// executable bodies; explicit `noncomputable` definitions are omitted as at
-    /// the pin. Ordinary `.olean` compilation does not require this facet.
+    /// This supports module-system files with checked scalar, enum and boxed-data
+    /// signatures. Legacy files require IR embedded in their `.olean`, so a
+    /// standalone companion is refused. Unsupported executable definitions refuse
+    /// the entire facet. Safe opaque bodies use their checked implementation
+    /// without changing the logical declaration. Theorems, declaration-only
+    /// constants and tagged auxiliary recursors need no standalone executable
+    /// entries; explicit `noncomputable` definitions are omitted as at the pin.
+    /// Ordinary `.olean` compilation does not require this facet.
     pub fn compile_ir(
         &mut self,
         limits: SourceModuleIrLimits,
@@ -193,6 +194,16 @@ impl SourceModuleArtifact {
                     refuse(&input.name, "invalid noncomputable metadata")
                 }
             })?;
+        let auxiliary_recursors =
+            fln_elab::aux_recursors::AuxRecursors::read(input.engine.environment()).map_err(
+                |error| {
+                    if matches!(error, fln_elab::aux_recursors::AuxRecursorError::Limit) {
+                        limit("auxiliary-recursor metadata")
+                    } else {
+                        refuse(&input.name, "invalid auxiliary-recursor metadata")
+                    }
+                },
+            )?;
         let mut module = IrModule::default();
         let mut names = std::collections::BTreeSet::new();
         let public_names: BTreeSet<_> = input
@@ -204,7 +215,13 @@ impl SourceModuleArtifact {
         let local_names: BTreeSet<_> = input.constants.iter().map(ConstantInfo::name).collect();
         let mut public_signatures = Vec::new();
         for constant in &input.constants {
-            if noncomputable.contains(constant.name()) {
+            // The pin's generated auxiliary recursors are logical definitions
+            // unfolded into callers, not separately scheduled source exports.
+            // Only validated generator/importer tags grant this exemption; a
+            // user function named recOn or casesOn still requires executable IR.
+            if noncomputable.contains(constant.name())
+                || auxiliary_recursors.contains(constant.name())
+            {
                 continue;
             }
             if matches!(constant,

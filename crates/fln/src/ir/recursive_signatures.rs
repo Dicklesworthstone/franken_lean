@@ -70,13 +70,16 @@ impl Analysis<'_, '_> {
         };
         // A constructor literal has no source-slot uses only after its entire
         // family passes the same fieldless layout checks as the exported type.
-        if source_enum_constructors(
+        let Some(layout) = source_data_layout(
             &constructor.induct,
             self.checks.environment,
             self.checks.meter,
         )?
-        .is_none()
-        {
+        else {
+            return Ok(false);
+        };
+        self.checks.meter.charge(layout.constructors().len())?;
+        if layout.constructors().any(|(_, fields)| !fields.is_empty()) {
             return Ok(false);
         }
         self.checks.meter.charge(1)?;

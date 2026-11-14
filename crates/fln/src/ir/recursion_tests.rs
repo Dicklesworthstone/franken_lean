@@ -287,10 +287,23 @@ fn recursive_enum_exports_refuse_payloads_and_constructor_replacements() {
          inductive Payload where | wrap (n : Nat)\n\
          partial def carryPayload (n : Nat) (value : Payload) : Payload :=\n\
            if n == 0 then value else carryPayload (n - 1) value\n\
+         inductive BoxedPayload where | empty | value (n : Nat)\n\
+         def identityBoxed (value : BoxedPayload) : BoxedPayload := value\n\
+         partial def carryBoxed (n : Nat) (value : BoxedPayload) : BoxedPayload :=\n\
+           if n == 0 then value else carryBoxed (n - 1) value\n\
          def replacement : Choice := Choice.first\n"
     ));
     let before = engine.environment().clone();
     assert_unsupported(&engine, "carryPayload");
+    // This layout is supported by ordinary exports. It must not enter through
+    // the recursive enum path just because both use the shared data projection.
+    assert!(
+        export(&engine, "identityBoxed")
+            .unwrap()
+            .into_complete()
+            .is_ok()
+    );
+    assert_unsupported(&engine, "carryBoxed");
     let constructor = name("Choice.third");
     let external = fln_elab::externs::register(
         engine.environment(),

@@ -99,7 +99,11 @@ impl CompilerData {
                 || ctor.num_params != 0
                 || ctor.is_unsafe
                 || !ctor.base.level_params.is_empty()
-                || ctor.num_fields > u32::from(u16::MAX)
+                // lean_alloc_ctor stores the object count in its eight-bit
+                // header and requires num_objs < LEAN_MAX_CTOR_FIELDS. Apply
+                // this even if a caller only passes values through a closure
+                // and no constructor instruction reaches FIR validation.
+                || ctor.num_fields as usize >= fln_rt::abi::MAX_CTOR_FIELDS
             {
                 return Ok(None);
             }
