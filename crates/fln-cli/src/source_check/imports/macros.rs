@@ -1,4 +1,4 @@
-//! Explicit imported-macro source commands over the same captured artifact closure.
+//! Imported-macro source commands over the same captured artifact closure.
 //! The census remains pinned, every registration must validate, and no ambient
 //! search root can supply code for an artifact selected from another root.
 use super::*;
@@ -22,14 +22,82 @@ pub(crate) struct Config {
 }
 
 impl Config {
-    /// Runtime personalities preserve their existing argument grammar. Their
-    /// imported-macro mode is an explicit environment opt-in using the same
-    /// verified policy and bounded companion loader as check-source.
+    /// Explicit overrides preserve their existing argument grammar and fail
+    /// closed. Default policy discovery happens only after capturing imports.
     pub(in crate::source_check) fn from_environment() -> Result<Option<Self>, Failure> {
         Self::environment(
             std::env::var_os("FLN_MACRO_PARTITION"),
             std::env::var_os("FLN_SYNTAX_MODULES"),
         )
+    }
+
+    fn discover() -> Result<Option<Self>, Failure> {
+        if let Some(sysroot) = std::env::var_os("LEAN_SYSROOT")
+            && !sysroot.is_empty()
+        {
+            return Self::discover_at([
+                PathBuf::from(sysroot).join("share/franken_lean/builtin_partition.tsv"),
+            ]);
+        }
+        let mut candidates = Vec::new();
+        if let Ok(executable) = std::env::current_exe() {
+            if let Ok(installation) = crate::derive_lean_installation_paths(&executable) {
+                candidates.push(
+                    installation
+                        .prefix
+                        .join("share/franken_lean/builtin_partition.tsv"),
+                );
+            }
+            if let Some(checkout) = crate::doctor_checkout_root(&executable) {
+                candidates.push(checkout.join("contracts/builtin_partition.tsv"));
+            }
+        }
+        if let Ok(directory) = std::env::current_dir()
+            && let Some(checkout) = crate::doctor_checkout_root(&directory)
+        {
+            candidates.push(checkout.join("contracts/builtin_partition.tsv"));
+        }
+        Self::discover_at(candidates)
+    }
+
+    fn discover_at(candidates: impl IntoIterator<Item = PathBuf>) -> Result<Option<Self>, Failure> {
+        for partition in candidates {
+            let metadata = match std::fs::symlink_metadata(&partition) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(Failure::io(&partition, error)),
+            };
+            if !metadata.is_file() {
+                return Err(Failure::input(format!(
+                    "{} is not a regular pinned imported-macro census",
+                    partition.display()
+                )));
+            }
+            return Ok(Some(Self {
+                partition,
+                max_bytes: DEFAULT_IR_BYTES,
+                syntax_modules: Vec::new(),
+            }));
+        }
+        Ok(None)
+    }
+
+    fn verified_partition(&self) -> Result<VerifiedPartition, Failure> {
+        let bytes = read_bounded(
+            &self.partition,
+            MAX_PARTITION_BYTES,
+            "pinned imported-macro census",
+        )
+        .map_err(read_failure)?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| policy_failure(format!("imported-macro census: {error}")))?;
+        VerifiedPartition::from_pinned_tsv(text).map_err(|error| {
+            if error.is_resource() {
+                Failure::resource(error.to_string())
+            } else {
+                policy_failure(error.to_string())
+            }
+        })
     }
 
     fn environment(
@@ -332,6 +400,68 @@ fn owned_ancestor(owners: &BTreeSet<&Name>, name: &Name) -> bool {
 }
 
 impl Loaded {
+    pub(in crate::source_check) fn resolve_macros(
+        &self,
+        config: Option<&Config>,
+    ) -> Result<Option<Prepared>, Failure> {
+        if let Some(config) = config {
+            return self.prepare_macros(config).map(Some);
+        }
+        if !matches!(&self.inputs, Inputs::Modules { .. }) {
+            return Ok(None);
+        }
+        self.resolve_artifact_macros(None)
+    }
+
+    /// Select user-owned extension journals from the captured closure. Merely
+    /// installing a policy must not replace native Init handling or disable
+    /// source records for files that do not import user extensions.
+    pub(in crate::source_check) fn resolve_artifact_macros(
+        &self,
+        config: Option<&Config>,
+    ) -> Result<Option<Prepared>, Failure> {
+        if let Some(config) = config {
+            return self.prepare_artifact_macros(config).map(Some);
+        }
+        if self.oleans.is_empty() {
+            return Ok(None);
+        }
+        let Some(mut config) = Config::discover()? else {
+            return Ok(None);
+        };
+        let partition = config.verified_partition()?;
+        let inputs: Vec<_> = self
+            .oleans
+            .iter()
+            .map(|import| {
+                let [exported, server, private] = &import.parts;
+                fln::OleanModuleInput {
+                    name: &import.name,
+                    artifact: exported,
+                    server_artifact: (!server.is_empty()).then_some(server.as_slice()),
+                    private_artifact: (!private.is_empty()).then_some(private.as_slice()),
+                }
+            })
+            .collect();
+        config.syntax_modules =
+            fln::source_check::modules::imported::discover_imported_user_extensions(
+                &inputs,
+                &self.olean_roots,
+                &partition,
+                fln::source_check::modules::imported::SourceOleanImportLimits::new(
+                    fln::OleanCheckLimits::new(
+                        MAX_OLEAN_BYTES,
+                        fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
+                    ),
+                ),
+            )
+            .map_err(metadata::failure)?;
+        if config.syntax_modules.is_empty() {
+            return Ok(None);
+        }
+        self.capture_macro_ir(&config, partition).map(Some)
+    }
+
     pub(in crate::source_check) fn prepare_macros(
         &self,
         config: &Config,
@@ -356,21 +486,14 @@ impl Loaded {
                 "imported macros require an external .olean import",
             ));
         }
-        let bytes = read_bounded(
-            &config.partition,
-            MAX_PARTITION_BYTES,
-            "pinned imported-macro census",
-        )
-        .map_err(read_failure)?;
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|error| policy_failure(format!("imported-macro census: {error}")))?;
-        let partition = VerifiedPartition::from_pinned_tsv(text).map_err(|error| {
-            if error.is_resource() {
-                Failure::resource(error.to_string())
-            } else {
-                policy_failure(error.to_string())
-            }
-        })?;
+        self.capture_macro_ir(config, config.verified_partition()?)
+    }
+
+    fn capture_macro_ir(
+        &self,
+        config: &Config,
+        partition: VerifiedPartition,
+    ) -> Result<Prepared, Failure> {
         let mut modules = Vec::new();
         let mut names = Vec::new();
         let mut total = 0usize;

@@ -60,23 +60,37 @@ impl ModuleBuildContext {
         posture: ImportPosture,
         limits: fln::source_check::modules::SourceModuleCheckLimits,
         macros: Option<&ImportedMacroConfig>,
+        modules: &[fln::SourceModuleInput<'_>],
     ) -> Result<(Self, Option<ImportPostureReport>), BuildBaseFailure> {
-        if let Some(config) = macros {
-            let (base, report) =
-                imports::load_macro_build_base(roots, source_root, jobs, posture, config)
-                    .map_err(|error| (error.class, error.detail, error.authority))?;
-            return Ok((
-                Self {
-                    kind: ModuleBuildKind::ImportedMacros(Box::new(ImportedMacroBuildContext {
-                        base,
-                        limits,
-                    })),
-                },
-                Some(report),
-            ));
-        }
+        let base = imports::load_module_build_base(roots, source_root, jobs, posture, macros, || {
+            for module in modules {
+                fln::source_check::preflight_source_module(module.name, module.source).map_err(
+                    |error| {
+                        let (class, authority, exit) = error.disposition();
+                        imports::Failure::new(class, &error.to_string(), authority, exit)
+                    },
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(|error| (error.class, error.detail, error.authority))?;
+        let base = match base {
+            imports::ModuleBuildBase::Ordinary(base) => base.map(|base| *base),
+            imports::ModuleBuildBase::ImportedMacros(base) => {
+                let (base, report) = *base;
+                return Ok((
+                    Self {
+                        kind: ModuleBuildKind::ImportedMacros(Box::new(ImportedMacroBuildContext {
+                            base,
+                            limits,
+                        })),
+                    },
+                    Some(report),
+                ));
+            }
+        };
         use fln::source_check::modules::{SourceModuleCacheLimits, SourceModuleSession};
-        let (session, report) = match load_build_base(roots, source_root, jobs, posture)? {
+        let (session, report) = match base {
             Some((receipt, report)) => (
                 SourceModuleSession::from_imports(
                     receipt,
@@ -466,20 +480,18 @@ pub(super) fn run(
             };
             let mut limits = fln::SourceCheckLimits::new(admission);
             limits.max_bytes = max_bytes;
-            let macro_inputs = if let Some(config) = imported_macros.as_ref() {
-                // Headers and source bytes were checked by the loader. Body
-                // parsing belongs to the macro-aware checker after its exact
-                // imported grammar world is available, not this early preflight.
-                match loaded.prepare_macros(config) {
-                    Ok(inputs) => Some(inputs),
-                    Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
-                }
-            } else {
+            // Headers and bytes were checked by the loader. User syntax needs
+            // its receipt-bound grammar before parsing bodies. Ordinary imports
+            // retain their native preflight and do not open executable inputs.
+            let macro_inputs = match loaded.resolve_macros(imported_macros.as_ref()) {
+                Ok(inputs) => inputs,
+                Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
+            };
+            if macro_inputs.is_none() {
                 if let Err(error) = loaded.preflight(limits) {
                     return failed(error.class, &error.detail, error.authority, json, error.exit);
                 }
-                None
-            };
+            }
             let (engine, mut olean_base) = match loaded.base_engine(seed, jobs, posture) {
                 Ok(base) => base,
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),

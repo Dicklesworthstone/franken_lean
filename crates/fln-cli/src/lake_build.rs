@@ -619,21 +619,6 @@ fn compile(
         SOURCE_RUN_KERNEL_STACK_BYTES,
     ));
     let limits = SourceModuleCheckLimits::new(fln::SourceCheckLimits::new(admission));
-    // Ordinary sources can be parsed before expensive import admission.
-    // Imported syntax needs its receipt-bound grammar before parsing bodies;
-    // the loader has already validated their headers and bounded their bytes.
-    if macro_config.is_none() {
-        for (name, module) in modules {
-            fln::source_check::preflight_source_module(name, &module.source).map_err(|error| {
-                let (class, authority, _) = error.disposition();
-                Failure {
-                    class,
-                    detail: error.to_string(),
-                    authority,
-                }
-            })?;
-        }
-    }
     let mut artifact_bytes = 0usize;
     for entry in facets.entries {
         let mut closure = BTreeSet::new();
@@ -653,6 +638,13 @@ fn compile(
                 external.push(name);
             }
         }
+        let inputs: Vec<_> = closure
+            .iter()
+            .map(|name| fln::SourceModuleInput {
+                name,
+                source: &modules.get(name).expect("loaded dependency").source,
+            })
+            .collect();
         // The import receipt retains exact per-module declaration and metadata
         // provenance. The facade projects each local module's own external
         // closure and declared order; sibling imports are never ambient.
@@ -666,6 +658,7 @@ fn compile(
                 posture,
                 limits,
                 macro_config,
+                &inputs,
             )
             .map_err(|(class, detail, authority)| Failure {
                 class,
@@ -677,13 +670,6 @@ fn compile(
             }
             active = Some((external, context));
         }
-        let inputs: Vec<_> = closure
-            .iter()
-            .map(|name| fln::SourceModuleInput {
-                name,
-                source: &modules.get(name).expect("loaded dependency").source,
-            })
-            .collect();
         let budget = fln::OleanWriteBudget {
             max_bytes: MAX_ARTIFACT_BYTES as u64,
             ..Default::default()
@@ -1099,9 +1085,6 @@ fn build(
     let records = macro_config
         .is_none()
         .then(|| source_check::module_records(posture));
-    let records_state = records
-        .as_ref()
-        .map_or(MACRO_RECORDS_UNAVAILABLE, |records| records.state());
     let Compilation {
         artifacts,
         elaborated_modules,
@@ -1122,6 +1105,13 @@ fn build(
         records.as_ref().and_then(|records| records.persisted()),
         macro_config.as_ref(),
     )?;
+    let records_state = if macro_reports.is_empty() {
+        records
+            .as_ref()
+            .map_or(MACRO_RECORDS_UNAVAILABLE, |records| records.state())
+    } else {
+        MACRO_RECORDS_UNAVAILABLE
+    };
     let destinations = sources.destinations(&artifacts, &plan.owners)?;
     let queried = if matches!(command, BuildCommand::Query) {
         Some(query_results(&plan, &artifacts, &destinations, json)?)

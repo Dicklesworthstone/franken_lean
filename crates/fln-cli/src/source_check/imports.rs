@@ -744,13 +744,19 @@ pub(super) struct MacroBuildBase {
     pub(super) ir_bytes: usize,
 }
 
-pub(super) fn load_macro_build_base(
+pub(super) enum ModuleBuildBase {
+    Ordinary(Option<Box<(SourceOleanImport, ImportPostureReport)>>),
+    ImportedMacros(Box<(MacroBuildBase, ImportPostureReport)>),
+}
+
+pub(super) fn load_module_build_base(
     roots: &[Name],
     source_root: &Path,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
-    config: &macros::Config,
-) -> Result<(MacroBuildBase, ImportPostureReport), Failure> {
+    config: Option<&macros::Config>,
+    preflight_native: impl FnOnce() -> Result<(), Failure>,
+) -> Result<ModuleBuildBase, Failure> {
     let loaded = Loaded {
         inputs: Inputs::Files(Vec::new()),
         total_bytes: 0,
@@ -759,28 +765,32 @@ pub(super) fn load_macro_build_base(
     };
     // Capture code beside the selected artifacts before admission. No later
     // search-path lookup can substitute a different module's executable bytes.
-    let prepared = loaded.prepare_artifact_macros(config)?;
+    let prepared = loaded.resolve_artifact_macros(config)?;
+    if prepared.is_none() {
+        preflight_native()?;
+    }
     let (_, base) = loaded.base_engine(
-        || {
-            Err(Failure::input(
-                "imported macros require an admitted artifact receipt",
-            ))
-        },
+        || Ok(fln::Engine::from_environment(fln::Environment::new())),
         jobs,
         posture,
     )?;
+    let Some(prepared) = prepared else {
+        return Ok(ModuleBuildBase::Ordinary(
+            base.map(|base| Box::new((base.receipt, base.report))),
+        ));
+    };
     let mut base =
         base.ok_or_else(|| Failure::input("imported macros require an admitted artifact receipt"))?;
     prepared.enable_syntax(&mut base.receipt)?;
     let (input, ir_bytes) = prepared.into_inputs(&base.receipt, None)?;
-    Ok((
+    Ok(ModuleBuildBase::ImportedMacros(Box::new((
         MacroBuildBase {
             receipt: base.receipt,
             input,
             ir_bytes,
         },
         base.report,
-    ))
+    ))))
 }
 
 /// An editor session's `.olean` import world (bead `fln-uyuz`): the closure as

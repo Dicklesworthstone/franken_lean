@@ -564,6 +564,113 @@ impl SourceOleanImportError {
 
 type Result<T> = std::result::Result<T, SourceOleanImportError>;
 
+/// Find complete extension journals that introduce registrations outside the
+/// pinned toolchain census. This is a bounded, data-only preflight: the returned
+/// module names confer no parser or executable authority. Consumers must still
+/// admit the artifacts and validate every selected registration before use.
+///
+/// Native toolchain syntax continues to use its native implementations. User
+/// declarations are identified structurally against the verified census, never
+/// by a module path, namespace prefix, or the source of an artifact filename.
+pub fn discover_imported_user_extensions(
+    modules: &[OleanModuleInput<'_>],
+    roots: &[Name],
+    partition: &crate::imported_ir::VerifiedPartition,
+    limits: SourceOleanImportLimits,
+) -> Result<Vec<Name>> {
+    if modules.is_empty() && roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    if roots.is_empty() {
+        return Err(SourceOleanImportError::EmptyRoots);
+    }
+    if roots.len() > limits.max_roots {
+        return Err(SourceOleanImportError::Limit("import roots"));
+    }
+    let metadata = match metadata_modules(modules, limits.check, None)? {
+        Outcome::Complete(modules) => modules,
+        _ => {
+            return Err(SourceOleanImportError::Internal(
+                "uncancelled extension discovery did not complete",
+            ));
+        }
+    };
+    let order = replay_order(
+        metadata
+            .iter()
+            .map(|module| (&module.name, module.imports.as_slice())),
+        roots,
+    )?;
+    let inputs = modules.iter().map(|module| (module.name, module)).collect();
+    let retained = BTreeSet::from([
+        Name::from_components(metadata::macros::MACRO_EXTENSION.split('.')),
+        metadata::parsers::extension_name(),
+    ]);
+    let mut macros = metadata::macros::Decoder::new(limits.metadata);
+    let mut parsers = metadata::parsers::Decoder::new(limits.metadata);
+    let mut capture_left = limits.max_capture_bytes;
+    let mut selected = Vec::new();
+    for (&index, captured) in order.iter().zip(capture_modules(
+        &metadata, &order, &inputs, &limits, &retained, false,
+    )) {
+        let module = &metadata[index];
+        let mut seen = BTreeSet::new();
+        let mut blocks = Vec::new();
+        for block in captured? {
+            if !seen.insert(block.name.clone()) {
+                return Err(SourceOleanImportError::Metadata {
+                    module: module.name.clone(),
+                    declaration: block.name,
+                    reason: "duplicate extension block",
+                });
+            }
+            capture_left = capture_left
+                .checked_sub(block.payload_bytes)
+                .ok_or(SourceOleanImportError::Limit("captured extension bytes"))?;
+            if let Some(entries) = block.entries {
+                blocks.push(OpaqueExtensionBlock {
+                    name: block.name,
+                    entries,
+                });
+            }
+        }
+        let macro_entries = macros
+            .decode(&blocks)
+            .map_err(SourceOleanImportError::Decode)?;
+        let parser_entries = parsers
+            .decode(&blocks)
+            .map_err(SourceOleanImportError::Decode)?;
+        let outside_census = |name: &Name| {
+            let mut current = name.clone();
+            loop {
+                if partition.classify(&current).is_some() {
+                    return false;
+                }
+                let parent = current.parent();
+                if parent == current {
+                    return true;
+                }
+                current = parent;
+            }
+        };
+        let user_macro = macro_entries
+            .iter()
+            .any(|entry| outside_census(&entry.declaration));
+        let user_parser = parser_entries.entries.iter().any(|entry| match &entry.kind {
+            metadata::parsers::ParserEntryKind::Category { declaration, .. }
+            | metadata::parsers::ParserEntryKind::Parser { declaration, .. } => {
+                outside_census(declaration)
+            }
+            metadata::parsers::ParserEntryKind::Token(_)
+            | metadata::parsers::ParserEntryKind::Kind(_) => false,
+        });
+        if user_macro || user_parser {
+            selected.push(module.name.clone());
+        }
+    }
+    Ok(selected)
+}
+
 impl SourceOleanImportLimits {
     /// The limits `fln_admission`'s import orchestration reads; the rest are this
     /// host's own, for its metadata activation.

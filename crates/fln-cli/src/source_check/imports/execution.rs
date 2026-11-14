@@ -403,7 +403,7 @@ fn run_loaded(
             if !explicit_world {
                 return None;
             }
-            let macro_inputs = match macro_config.as_ref().map(|config| loaded.prepare_macros(config)).transpose() {
+            let macro_inputs = match loaded.resolve_macros(macro_config.as_ref()) {
                 Ok(prepared) => prepared,
                 Err(error) => return Some(failure(error, presentation)),
             };

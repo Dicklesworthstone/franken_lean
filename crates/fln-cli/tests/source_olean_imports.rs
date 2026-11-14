@@ -909,6 +909,14 @@ impl ImportedMacroProject {
         std::env::join_paths([self.root.join("objects"), self.library.clone()]).unwrap()
     }
 
+    fn install_default_partition(&self) -> PathBuf {
+        let directory = self.root.join("sysroot/share/franken_lean");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("builtin_partition.tsv");
+        std::fs::copy(&self.partition, &path).unwrap();
+        path
+    }
+
     fn lake(
         &self,
         targets: &[&str],
@@ -921,6 +929,7 @@ impl ImportedMacroProject {
             .args(targets)
             .current_dir(self.root.join("client"))
             .env("LEAN_PATH", self.search_path())
+            .env("LEAN_SYSROOT", self.root.join("sysroot"))
             .env("FLN_IMPORT_REUSE_DIR", self.root.join("records"))
             .env_remove("FLN_MACRO_PARTITION")
             .env_remove("FLN_SYNTAX_MODULES");
@@ -969,6 +978,7 @@ impl ImportedMacroProject {
             .arg(self.source(source))
             .current_dir(self.root.join("client"))
             .env("LEAN_PATH", self.search_path())
+            .env("LEAN_SYSROOT", self.root.join("sysroot"))
             .env("FLN_IMPORT_REUSE_DIR", self.root.join("records"))
             .env_remove("FLN_MACRO_PARTITION")
             .env_remove("FLN_SYNTAX_MODULES");
@@ -1715,6 +1725,122 @@ const IMPORTED_SYNTAX_DECLARATIONS: &str = concat!(
 );
 
 #[test]
+fn installed_default_imported_extensions_work_through_ordinary_source_doors() {
+    let Some(project) =
+        ImportedMacroProject::prepare_with_source(&imported_syntax_provider_source())
+    else {
+        return;
+    };
+    let installed_partition = project.install_default_partition();
+    let checked = project.native("check-source", IMPORTED_SYNTAX_DECLARATIONS, None);
+    assert!(checked.status.success(), "{checked:?}; {:?}", project.root);
+    assert!(checked.stderr.is_empty(), "{checked:?}");
+    let report = String::from_utf8(checked.stdout).unwrap();
+    assert!(report.contains("\"theorems\":3"), "{report}");
+    assert_imported_macro_provenance(&report);
+
+    let queries = format!(
+        "{IMPORTED_SYNTAX_DECLARATIONS}#check syntaxMacroValue\n#check chosenMacroValue\n#check scopedMacroValue\n"
+    );
+    let oracle = project.oracle(&queries);
+    assert!(oracle.status.success(), "{oracle:?}");
+    let lean = project.native("lean", &queries, None);
+    assert!(lean.status.success(), "{lean:?}");
+    assert_eq!(lean.stdout, oracle.stdout);
+    assert_eq!(lean.stderr, oracle.stderr);
+
+    let executable = format!("{queries}#eval admittedWrap% (31 : Bool) endWrap%\n");
+    let run = project.native("run", &executable, None);
+    assert!(run.status.success(), "{run:?}");
+    let report = String::from_utf8(run.stdout).unwrap();
+    assert!(report.contains("\"kind\":\"nat\",\"value\":31"), "{report}");
+    assert_imported_macro_provenance(&report);
+
+    let false_proof = format!(
+        "{IMPORTED_SYNTAX_DECLARATIONS}theorem bad : Eq chosenMacroValue 29 := Eq.refl chosenMacroValue\n"
+    );
+    ImportedMacroProject::refused(project.native("lean", &false_proof, None));
+
+    // An explicit override keeps priority over a valid installed policy; a
+    // corrupt installed policy is likewise refused instead of ignored.
+    let invalid = project.root.join("invalid-partition.tsv");
+    std::fs::write(&invalid, b"not the pinned census").unwrap();
+    assert_macro_refusal(
+        project.native("check-source", IMPORTED_SYNTAX_DECLARATIONS, Some(&invalid)),
+        1,
+        "policy-refusal",
+        "partition",
+    );
+    std::fs::write(installed_partition, b"not the pinned census").unwrap();
+    assert_macro_refusal(
+        project.native("check-source", IMPORTED_SYNTAX_DECLARATIONS, None),
+        1,
+        "policy-refusal",
+        "partition",
+    );
+    // A file with no external imports does not need any executable policy.
+    let empty = project.native("lean", "prelude\n", None);
+    assert!(empty.status.success(), "{empty:?}");
+    assert!(empty.stdout.is_empty(), "{empty:?}");
+    assert!(empty.stderr.is_empty(), "{empty:?}");
+}
+
+#[test]
+fn installed_default_lake_imports_user_extensions_and_keeps_ordinary_records() {
+    let Some(project) =
+        ImportedMacroProject::prepare_with_source(&imported_syntax_provider_source())
+    else {
+        return;
+    };
+    project.install_default_partition();
+    let client = project.root.join("client");
+    std::fs::write(
+        client.join("lakefile.toml"),
+        "name = \"default_macros\"\n[[lean_lib]]\nname = \"Client\"\nroots = [\"Main\", \"Plain\"]\n",
+    )
+    .unwrap();
+    project.source(IMPORTED_SYNTAX_DECLARATIONS);
+    std::fs::write(
+        client.join("Plain.lean"),
+        "prelude\nimport Init.Prelude\ndef plainValue : Nat := 7\ntheorem plainValue_eq : Eq plainValue 7 := Eq.refl plainValue\n",
+    )
+    .unwrap();
+    let built = project.lake(&["+Main:olean"], false, &[]);
+    assert!(built.status.success(), "{built:?}; {:?}", project.root);
+    assert!(built.stderr.is_empty(), "{built:?}");
+    let report = String::from_utf8(built.stdout).unwrap();
+    assert_imported_macro_provenance(&report);
+    assert!(
+        report.contains("\"module_records\":\"disabled-imported-macros\""),
+        "{report}"
+    );
+    assert!(report.contains("\"modules_cached\":0"), "{report}");
+    let output = client.join(".lake/build/lib/lean/Main.olean");
+    let artifact = std::fs::read(&output).unwrap();
+    assert!(!artifact.is_empty());
+
+    let ordinary = project.lake(&["+Plain:olean"], false, &[]);
+    assert!(ordinary.status.success(), "{ordinary:?}");
+    let report = String::from_utf8(ordinary.stdout).unwrap();
+    assert!(!report.contains("\"importedMacros\""), "{report}");
+    assert!(!report.contains("disabled-imported-macros"), "{report}");
+    let warm = project.lake(&["+Plain:olean"], false, &[]);
+    assert!(warm.status.success(), "{warm:?}");
+    let report = String::from_utf8(warm.stdout).unwrap();
+    assert!(report.contains("\"modules_cached\":1"), "{report}");
+    assert!(!report.contains("\"importedMacros\""), "{report}");
+
+    // A warm artifact cannot conceal a changed executable companion.
+    std::fs::write(
+        project.root.join("objects/AdmittedSourceMacro.ir"),
+        b"invalid imported macro IR",
+    )
+    .unwrap();
+    ImportedMacroProject::refused(project.lake(&["+Main:olean"], false, &[]));
+    assert_eq!(std::fs::read(output).unwrap(), artifact);
+}
+
+#[test]
 fn installed_imported_syntax_drives_macro_parsing_and_execution() {
     let Some(project) =
         ImportedMacroProject::prepare_with_source(&imported_syntax_provider_source())
@@ -2156,6 +2282,7 @@ fn installed_lake_builds_imported_macro_expansions_and_reimports_the_checked_art
         .arg(&use_path)
         .current_dir(&consumer)
         .env("LEAN_PATH", &search)
+        .env("LEAN_SYSROOT", project.root.join("sysroot"))
         .env("FLN_IMPORT_REUSE_DIR", project.root.join("records"))
         .env_remove("FLN_MACRO_PARTITION")
         .env_remove("FLN_SYNTAX_MODULES")
