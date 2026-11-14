@@ -15057,6 +15057,22 @@ const LAKE_HELP_EXE: &str = concat!(
     "environment is not installed by this source-execution route.\n",
 );
 
+const LAKE_HELP_LEAN: &str = concat!(
+    "Elaborate a Lean file in Lake's context\n",
+    "\nUSAGE:\n  lake [--dir DIR] lean FILE [-- LEAN-OPTIONS...]\n\n",
+    "FrankenLean checks the file and its transitive declared package imports\n",
+    "with the native source engine. Source commands such as #check and #eval\n",
+    "retain their ordinary Lean output; a definition of main is not invoked.\n",
+    "FILE is relative to the caller's directory, including when --dir selects\n",
+    "a different workspace. Library and executable source directories, local\n",
+    "dependencies and materialized locked Git dependencies use the same\n",
+    "configuration and ownership rules as lake build and lake exe.\n",
+    "Forwarded --threads/-j, --quiet/-q, --max-bytes, --fln-max-steps and\n",
+    "--fln-max-frames are supported. Other forwarded Lean modes and options\n",
+    "are rejected before configuration evaluation. Source checking does not\n",
+    "publish build artifacts or launch an upstream Lean process.\n",
+);
+
 const LAKE_HELP_ENV: &str = concat!(
     "Execute a command in Lake's environment\n",
     "\n",
@@ -15117,6 +15133,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     let mut iter = arguments.into_iter();
     let mut command: Option<String> = None;
     let mut command_args: Vec<String> = Vec::new();
+    let mut lean_arguments = Vec::new();
     let mut is_json = false;
     let mut ignored_options = Vec::new();
     // `lake build --jobs N`: external `.olean` closure modules checked at once.
@@ -15134,6 +15151,10 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             );
         };
         if options && s == "--" {
+            if command.as_deref() == Some("lean") {
+                lean_arguments.extend(iter);
+                break;
+            }
             options = false;
             continue;
         }
@@ -15218,6 +15239,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
         if s == "--help" || s == "-h" {
             let help = match command.as_deref() {
                 Some("exe" | "exec") => LAKE_HELP_EXE,
+                Some("lean") => LAKE_HELP_LEAN,
                 Some("query") => LAKE_HELP_QUERY,
                 _ => LAKE_USAGE,
             };
@@ -15313,16 +15335,17 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 "query" => return MultiplexerOutput::success(LAKE_HELP_QUERY.to_owned()),
                 "env" => return MultiplexerOutput::success(LAKE_HELP_ENV.to_owned()),
                 "exe" | "exec" => return MultiplexerOutput::success(LAKE_HELP_EXE.to_owned()),
+                "lean" => return MultiplexerOutput::success(LAKE_HELP_LEAN.to_owned()),
                 _ => return MultiplexerOutput::success(format!("Help for lake {sub}\n")),
             }
         }
         return MultiplexerOutput::success(LAKE_USAGE.to_owned());
     }
 
-    if vm_options.supplied() && !matches!(cmd.as_str(), "exe" | "exec") {
+    if vm_options.supplied() && !matches!(cmd.as_str(), "exe" | "exec" | "lean") {
         return lake_operation_failure(
             "fln.lake-exe/1",
-            "Golem execution limits require lake exe",
+            "Golem execution limits require lake exe or lake lean",
             false,
             is_json,
         );
@@ -15524,6 +15547,65 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 vm_options.limits,
             )
         }
+        "lean" => {
+            if let Some(option) = ignored_options.first() {
+                return lake_operation_failure(
+                    "fln.lake-lean/1",
+                    &format!("source-check option `{option}` is unavailable"),
+                    true,
+                    is_json,
+                );
+            }
+            if command_args.len() != 1 {
+                return lake_operation_failure(
+                    "fln.lake-lean/1",
+                    "lake lean requires exactly one Lean file before --",
+                    false,
+                    is_json,
+                );
+            }
+            // Reuse the ordinary Lean option parser, so unsupported flags,
+            // conflicting modes and invalid limits fail before a Lean package
+            // configuration can execute. Arguments after -- belong to Lean.
+            let mut arguments: Vec<OsString> =
+                command_args.into_iter().map(OsString::from).collect();
+            if let Some(jobs) = jobs {
+                arguments.push(format!("--threads={jobs}").into());
+            }
+            if vm_options.steps_seen {
+                arguments.push(format!("--fln-max-steps={}", vm_options.limits.max_steps).into());
+            }
+            if vm_options.frames_seen {
+                arguments
+                    .push(format!("--fln-max-frames={}", vm_options.limits.max_stack_depth).into());
+            }
+            arguments.extend(lean_arguments);
+            match parse_lean_command(arguments) {
+                Ok(LeanCommand::Source {
+                    path,
+                    max_bytes,
+                    import_jobs,
+                    vm_limits,
+                }) => lake_build::run_source(
+                    dir.unwrap_or_else(|| PathBuf::from(".")),
+                    path,
+                    is_json,
+                    max_bytes,
+                    import_jobs,
+                    import_posture,
+                    vm_limits,
+                ),
+                Ok(_) => lake_operation_failure(
+                    "fln.lake-lean/1",
+                    "lake lean requires source checking; forwarded Lean modes are unavailable",
+                    true,
+                    is_json,
+                ),
+                Err(UsageError(detail)) => {
+                    lake_operation_failure("fln.lake-lean/1", &detail, false, is_json)
+                }
+            }
+        }
         "env" => {
             // The sysroot is a fact about where this binary is installed. A
             // development binary has none, and inventing one would hand every
@@ -15672,7 +15754,7 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 ),
             }
         }
-        "test" | "lint" | "lean" => lake_not_implemented(
+        "test" | "lint" => lake_not_implemented(
             &cmd,
             "this command needs Lake workspace evaluation (plan §13.3), which this build does not have",
             is_json,

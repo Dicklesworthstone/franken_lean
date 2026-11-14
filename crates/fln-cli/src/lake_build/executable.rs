@@ -1,4 +1,4 @@
-//! Execute declared Lake programs on the checked native Golem pipeline.
+//! Check Lake source files and execute declared programs on the native pipeline.
 //! Package discovery supplies exact module identities and source directories;
 //! the ordinary Lean runner supplies import admission, compilation, main's ABI,
 //! bounded stdout and the program's exit status. This does not emit or claim a
@@ -7,39 +7,28 @@
 use super::*;
 
 fn program(
-    package: &local_dependencies::Package,
-    executable: &fln_lake::LakeTarget,
+    entry: Name,
+    location: SourceLocation,
+    import_root: PathBuf,
     sources: &local_dependencies::Sources,
+    max_bytes: usize,
 ) -> Result<source_check::PackageProgram, Failure> {
-    let root = &package.root;
-    let config = &package.config;
-    let [root_name] = executable.roots.as_slice() else {
-        return Err(Failure::input(
-            "an executable must have exactly one root module",
-        ));
-    };
-    let entry = name(root_name)?;
-    let directory = executable.src_dir.as_deref().unwrap_or(Path::new("."));
-    relative_directory(directory)?;
-    let entry_path = root
-        .join(&config.src_dir)
-        .join(directory)
-        .join(source_import_relative_path(&entry)?);
-    // Only the selected executable's root is an executable source module.
+    let entry_path = location.path.clone();
+    // Only the selected entry can be an executable or external source module.
     // Other local imports belong to declared libraries, as in Lake's
     // findModule? / findTargetModule? distinction. A loose file or another
     // executable cannot silently become an ambient library.
     let mut paths = BTreeMap::<PathBuf, Name>::new();
-    let mut modules = load_sources_with(std::slice::from_ref(&entry), |module| {
-        let location = if module == &entry {
+    let mut modules = load_sources_with(std::slice::from_ref(&entry), max_bytes, |module| {
+        let selected = if module == &entry {
             Some(SourceLocation {
-                package: root.to_path_buf(),
+                package: location.package.clone(),
                 path: entry_path.clone(),
             })
         } else {
             sources.resolve(module)?
         };
-        let Some(location) = location else {
+        let Some(location) = selected else {
             return Ok(None);
         };
         let path = &location.path;
@@ -48,7 +37,7 @@ fn program(
             .canonicalize()
             .map_err(|error| Failure::io(path, error))?;
         if !canonical.starts_with(&location.package) {
-            return Err(Failure::input("executable source escaped its package"));
+            return Err(Failure::input("source file escaped its package"));
         }
         if let Some(previous) = paths.insert(canonical, module.clone())
             && previous != *module
@@ -61,10 +50,26 @@ fn program(
         }
         Ok(Some(location))
     })?;
+    // Selecting a file does not make an executable root or external module
+    // importable, nor override a different package's same-named library file.
+    if modules
+        .values()
+        .any(|module| module.imports.contains(&entry))
+    {
+        let imported = sources.resolve(&entry)?;
+        if imported.as_ref().is_none_or(|imported| {
+            imported.package != location.package || imported.path != entry_path
+        }) {
+            return Err(Failure::unsupported(format!(
+                "selected source module `{}` has a different library-import source or is not importable",
+                entry.to_display_string(),
+            )));
+        }
+    }
     sources.verify_configurations()?;
     let first = modules
         .remove(&entry)
-        .ok_or_else(|| Failure::new("internal-fault", "executable root was not captured"))?;
+        .ok_or_else(|| Failure::new("internal-fault", "source entry was not captured"))?;
     let mut sources = Vec::with_capacity(modules.len() + 1);
     sources.push((entry, first.source));
     sources.extend(
@@ -74,7 +79,7 @@ fn program(
     );
     Ok(source_check::PackageProgram {
         entry_path,
-        root: root.to_path_buf(),
+        root: import_root,
         modules: sources,
     })
 }
@@ -116,9 +121,36 @@ pub(crate) fn run(
                 };
             let sources = local_dependencies::load(&root, loaded, evaluation)?;
             let (package, executable) = sources.executable(&target)?;
-            let program = program(package, executable, &sources)?;
-            Ok(source_check::run_package_main(
-                program, arguments, jobs, posture, vm_limits,
+            let [root_name] = executable.roots.as_slice() else {
+                return Err(Failure::input(
+                    "an executable must have exactly one root module",
+                ));
+            };
+            let entry = name(root_name)?;
+            let directory = executable.src_dir.as_deref().unwrap_or(Path::new("."));
+            relative_directory(directory)?;
+            let location = SourceLocation {
+                package: package.root.clone(),
+                path: package
+                    .root
+                    .join(&package.config.src_dir)
+                    .join(directory)
+                    .join(source_import_relative_path(&entry)?),
+            };
+            let program = program(
+                entry,
+                location,
+                package.root.clone(),
+                &sources,
+                SOURCE_RUN_DEFAULT_MAX_BYTES,
+            )?;
+            Ok(source_check::run_package(
+                program,
+                Some(arguments),
+                SOURCE_RUN_DEFAULT_MAX_BYTES,
+                jobs,
+                posture,
+                vm_limits,
             ))
         });
     let result = match worker {
@@ -131,4 +163,70 @@ pub(crate) fn run(
         )),
     };
     result.unwrap_or_else(|error| error.render_as(json, "fln.lake-exe/1", "lake exe"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_source(
+    directory: PathBuf,
+    path: PathBuf,
+    json: bool,
+    max_bytes: usize,
+    jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
+    vm_limits: fln::VmExecutionLimits,
+) -> MultiplexerOutput {
+    let worker = std::thread::Builder::new()
+        .name("fln-lake-source".to_owned())
+        .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
+        .spawn(move || {
+            let root = directory
+                .canonicalize()
+                .map_err(|error| Failure::io(&directory, error))?;
+            // Like prepareLeanCommand in the pin, FILE is relative to the
+            // caller's directory, even when --dir selects another workspace.
+            let path = std::path::absolute(&path).map_err(|error| Failure::io(&path, error))?;
+            let filesystem_root = path
+                .ancestors()
+                .last()
+                .ok_or_else(|| Failure::input("source file has no filesystem root"))?;
+            check_path(filesystem_root, &path, false)?;
+            let path = path
+                .canonicalize()
+                .map_err(|error| Failure::io(&path, error))?;
+            if !source_import_candidate_is_file(&path)? {
+                return Err(Failure::input("source file is missing"));
+            }
+            let evaluation = Some((jobs, posture));
+            let loaded = load_configuration(&root, ConfigurationSelection::Default, evaluation)?;
+            let sources = local_dependencies::load(&root, loaded, evaluation)?;
+            let (entry, location) = match sources.source_file(&path)? {
+                Some(selected) => selected,
+                None => (
+                    // setupExternalModule supplies exactly this synthetic
+                    // module identity to Lean's --setup input in the pin.
+                    Name::from_components(["_unknown"]),
+                    SourceLocation {
+                        package: path
+                            .parent()
+                            .ok_or_else(|| Failure::input("source file has no parent"))?
+                            .to_path_buf(),
+                        path,
+                    },
+                ),
+            };
+            let program = program(entry, location, root, &sources, max_bytes)?;
+            Ok(source_check::run_package(
+                program, None, max_bytes, jobs, posture, vm_limits,
+            ))
+        });
+    let result = match worker {
+        Ok(worker) => worker
+            .join()
+            .unwrap_or_else(|_| Err(Failure::new("internal-fault", "source worker panicked"))),
+        Err(error) => Err(Failure::new(
+            "resource",
+            format!("could not start source worker: {error}"),
+        )),
+    };
+    result.unwrap_or_else(|error| error.render_as(json, "fln.lake-lean/1", "lake lean"))
 }

@@ -480,6 +480,74 @@ impl Package {
 }
 
 impl Sources {
+    /// Lake identifies `lake lean FILE` from the actual source path, including
+    /// configured library directories and the exact roots of executables.
+    /// Files outside these declarations remain external source inputs; their
+    /// imports still resolve only through declared workspace libraries.
+    pub(super) fn source_file(
+        &self,
+        path: &Path,
+    ) -> Result<Option<(Name, SourceLocation)>, Failure> {
+        for package in &self.packages {
+            for library in package.libraries.iter().rev() {
+                let Ok(relative) = path.strip_prefix(&library.directory) else {
+                    continue;
+                };
+                if relative.extension().and_then(|part| part.to_str()) != Some("lean") {
+                    continue;
+                }
+                let without_extension = relative.with_extension("");
+                let components = without_extension
+                    .components()
+                    .map(|component| match component {
+                        Component::Normal(value) => value
+                            .to_str()
+                            .ok_or_else(|| Failure::input("source module path is not UTF-8")),
+                        _ => Err(Failure::input("source module path is not normalized")),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let module = Name::from_components(components);
+                if !library.roots.iter().any(|root| belongs(&module, root)) {
+                    continue;
+                }
+                if let Some(candidate) = source_path(&module, std::slice::from_ref(library))?
+                    && candidate == path
+                {
+                    return Ok(Some((
+                        module,
+                        SourceLocation {
+                            package: package.root.clone(),
+                            path: candidate,
+                        },
+                    )));
+                }
+            }
+            for executable in package.config.targets.iter().rev() {
+                if executable.kind != TargetKind::Executable {
+                    continue;
+                }
+                let [root] = executable.roots.as_slice() else {
+                    return Err(Failure::input(
+                        "an executable must have exactly one root module",
+                    ));
+                };
+                let module = name(root)?;
+                if let Some(candidate) = package.executable_path(&module)?
+                    && candidate == path
+                {
+                    return Ok(Some((
+                        module,
+                        SourceLocation {
+                            package: package.root.clone(),
+                            path: candidate,
+                        },
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Package selectors are Lake names, never filesystem paths. An empty
     /// selector denotes the invocation's root package (`/+Module:olean`).
     pub(super) fn package(&self, selector: &str) -> Result<&Package, Failure> {

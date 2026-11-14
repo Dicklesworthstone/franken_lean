@@ -279,7 +279,8 @@ pub(in crate::source_check) fn run_stdin(
 
 pub(in crate::source_check) fn run_package(
     program: PackageProgram,
-    arguments: Vec<String>,
+    arguments: Option<Vec<String>>,
+    max_bytes: usize,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
     vm_limits: fln::VmExecutionLimits,
@@ -295,13 +296,13 @@ pub(in crate::source_check) fn run_package(
         sources,
         EntryOrigin::File,
         Some((root, names)),
-        SOURCE_RUN_DEFAULT_MAX_BYTES,
+        max_bytes,
         Presentation::Lean,
         SourcePublication::None,
         jobs,
         posture,
         vm_limits,
-        Some(arguments),
+        arguments,
     )
     .unwrap_or_else(|| {
         failure(

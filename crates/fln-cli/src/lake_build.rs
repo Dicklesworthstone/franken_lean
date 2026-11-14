@@ -13,6 +13,7 @@ mod explain;
 mod local_dependencies;
 mod update;
 pub(super) use executable::run as run_executable;
+pub(super) use executable::run_source;
 pub(super) use update::run as update_manifest;
 #[path = "lake_config.rs"]
 mod lean_config;
@@ -478,6 +479,7 @@ fn query_results(
 
 fn load_sources_with(
     entries: &[Name],
+    max_bytes: usize,
     mut resolve: impl FnMut(&Name) -> Result<Option<SourceLocation>, Failure>,
 ) -> Result<BTreeMap<Name, Module>, Failure> {
     let mut pending: BTreeSet<_> = entries.iter().cloned().collect();
@@ -501,11 +503,7 @@ fn load_sources_with(
                 path.display()
             )));
         }
-        let source = read_bounded(
-            &path,
-            SOURCE_RUN_DEFAULT_MAX_BYTES - source_bytes,
-            "Lake module source",
-        )?;
+        let source = read_bounded(&path, max_bytes - source_bytes, "Lake module source")?;
         source_bytes += source.len();
         let header = parse_source_header(&source)
             .map_err(|error| Failure::input(format!("{}: {error}", path.display())))?;
@@ -1091,7 +1089,7 @@ fn build(
         return Ok(MultiplexerOutput::success(String::new()));
     }
     let plan = plan_modules(&sources, &targets)?;
-    let modules = load_sources_with(&plan.entries, |module| {
+    let modules = load_sources_with(&plan.entries, SOURCE_RUN_DEFAULT_MAX_BYTES, |module| {
         sources.resolve_build(module, &plan.owners)
     })?;
     sources.validate_entry_imports(&plan.owners, &modules)?;

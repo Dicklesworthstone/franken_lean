@@ -700,7 +700,6 @@ fn lake_commands_without_an_implementation_say_so() {
     for command in [
         "test",
         "lint",
-        "lean",
         "cache",
         "check-lint",
         "check-test",

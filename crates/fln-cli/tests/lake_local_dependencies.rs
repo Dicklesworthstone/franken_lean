@@ -563,6 +563,279 @@ fn artifact_workspace() -> Workspace {
     workspace
 }
 
+#[test]
+fn lake_lean_checks_transitive_sources_without_running_main_or_publishing() {
+    let workspace = artifact_workspace();
+    workspace.write(
+        "root/src/app/App/Main.lean",
+        concat!(
+            "prelude\nimport Feature.Left\nimport Feature.Right\n",
+            // This is an ordinary checked definition, deliberately not a
+            // runnable executable ABI. `lake lean` must not try to invoke it.
+            "def main (A : Type) (a : A) : A := Feature.left A (Feature.right A a)\n",
+            "#check main\n",
+        ),
+    );
+    workspace.write(
+        "right/vendor/shared library/sources/lib/Shared.lean",
+        format!("{CHECKED_SHARED}#check Shared.identity\n"),
+    );
+    let args = ["lean", "root/src/app/App/Main.lean"];
+    let output = workspace.run(&args, None);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    assert!(stdout.contains("main"), "{stdout}");
+    assert!(!stdout.contains("Shared.identity"), "{stdout}");
+    workspace.no_products();
+    workspace.no_manifests();
+
+    workspace.write(
+        "right/vendor/shared library/sources/lib/Shared.lean",
+        "prelude\ndef Shared.identity (A : Type) (a : A) : A := A\n",
+    );
+    let invalid = workspace.run(&args, None);
+    assert_eq!(invalid.status.code(), Some(1), "{invalid:?}");
+    assert!(invalid.stdout.is_empty(), "{invalid:?}");
+    let error = std::str::from_utf8(&invalid.stderr).unwrap();
+    assert!(
+        error.contains("Shared") && error.contains("NotDefEq"),
+        "{error}"
+    );
+    workspace.write(
+        "right/vendor/shared library/sources/lib/Shared.lean",
+        CHECKED_SHARED,
+    );
+    let repaired = workspace.run(&args, None);
+    assert!(repaired.status.success(), "{repaired:?}");
+    assert_eq!(repaired.stdout, output.stdout, "{repaired:?}");
+    assert!(repaired.stderr.is_empty(), "{repaired:?}");
+    workspace.no_products();
+    workspace.no_manifests();
+}
+
+#[test]
+fn lake_lean_preserves_source_ownership_caller_paths_and_forwarded_limits() {
+    let workspace = artifact_workspace();
+    workspace.write(
+        "external samples/consumer λ.lean",
+        concat!(
+            "prelude\nimport App.Top\n",
+            "def externalConsumer (A : Type) (a : A) : A := App.combine A a\n",
+            "#check externalConsumer\n",
+        ),
+    );
+    // --dir changes configuration discovery, not resolution of the file. A
+    // nested caller and .. are therefore both significant here.
+    let output = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .args([
+            "--dir",
+            "../root",
+            "lean",
+            "../external samples/consumer λ.lean",
+        ])
+        .args(["--", "--quiet", "--threads=0", "--max-bytes=4096"])
+        .current_dir(workspace.0.join("left"))
+        .env("LEAN_PATH", workspace.0.join("absent-imports"))
+        .env("FLN_IMPORT_REUSE_DIR", workspace.0.join("import-records"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(
+        std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .contains("externalConsumer")
+    );
+
+    let selected = workspace.run(&["lean", "left/code/lib/Feature/Left.lean"], None);
+    assert!(selected.status.success(), "{selected:?}");
+    assert!(
+        selected.stdout.is_empty() && selected.stderr.is_empty(),
+        "{selected:?}"
+    );
+    refusal(
+        workspace.run(
+            &[
+                "--json",
+                "lean",
+                "root/src/lib/App/Top.lean",
+                "--",
+                "--max-bytes=32",
+            ],
+            None,
+        ),
+        "resource",
+        "limit",
+    );
+    workspace.no_products();
+    workspace.no_manifests();
+}
+
+#[test]
+fn lake_lean_skips_unrelated_library_prefixes_when_selecting_a_file() {
+    let workspace = artifact_workspace();
+    workspace.write(
+        "root/lakefile.toml",
+        concat!(
+            "name = \"root\"\n",
+            "[[lean_lib]]\nname = \"Root\"\n",
+            "[[require]]\nname = \"dep\"\npath = \".lake/packages/dep\"\n",
+        ),
+    );
+    workspace.write(
+        "root/.lake/packages/dep/lakefile.toml",
+        "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
+    );
+    workspace.write(
+        "root/.lake/packages/dep/Dep.lean",
+        "prelude\ntheorem Dep.keep (P : Prop) (h : P) : P := h\n",
+    );
+    workspace.write(
+        "root/.external samples/input λ.lean",
+        "prelude\nimport Dep\ntheorem useDep (P : Prop) (h : P) : P := Dep.keep P h\n",
+    );
+    for path in [
+        "root/.lake/packages/dep/Dep.lean",
+        "root/.external samples/input λ.lean",
+    ] {
+        let output = workspace.run(&["lean", path], None);
+        assert!(output.status.success(), "{path}: {output:?}");
+        assert!(
+            output.stdout.is_empty() && output.stderr.is_empty(),
+            "{output:?}"
+        );
+    }
+    workspace.no_products();
+    workspace.no_manifests();
+}
+
+#[test]
+fn lake_lean_rejects_invalid_requests_before_loading_configuration() {
+    let workspace = artifact_workspace();
+    workspace.write("root/lakefile.lean", "deliberately invalid configuration\n");
+    for (args, class, detail) in [
+        (vec!["lean"], "input", "exactly one Lean file"),
+        (
+            vec!["lean", "one.lean", "two.lean"],
+            "input",
+            "exactly one Lean file",
+        ),
+        (
+            vec!["lean", "one.lean", "--no-build"],
+            "unsupported",
+            "--no-build",
+        ),
+        (
+            vec!["lean", "one.lean", "--", "--src-deps"],
+            "unsupported",
+            "forwarded Lean modes",
+        ),
+        (
+            vec!["lean", "one.lean", "--", "--fln-max-steps=-1"],
+            "input",
+            "nonnegative integer",
+        ),
+        (
+            vec!["lean", "one.lean", "--", "--threads=bad"],
+            "input",
+            "thread",
+        ),
+        (
+            vec!["lean", "one.lean", "--", "--unavailable"],
+            "input",
+            "unknown lean option",
+        ),
+    ] {
+        let mut json_args = vec!["--json"];
+        json_args.extend(args);
+        let output = workspace.run(&json_args, None);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let error = std::str::from_utf8(&output.stderr).unwrap();
+        let status = if class == "unsupported" {
+            "unsupported"
+        } else {
+            "error"
+        };
+        assert!(error.contains("\"schema\":\"fln.lake-lean/1\""), "{error}");
+        assert!(
+            error.contains(&format!("\"status\":\"{status}\"")),
+            "{error}"
+        );
+        assert!(error.contains(detail), "{error}");
+    }
+    workspace.no_products();
+    workspace.no_manifests();
+}
+
+#[test]
+fn lake_lean_refuses_invalid_utf8_and_missing_source_files() {
+    let workspace = artifact_workspace();
+    workspace.write("outside/Invalid.lean", b"prelude\n\xff");
+    let invalid = workspace.run(&["--json", "lean", "outside/Invalid.lean"], None);
+    assert_eq!(invalid.status.code(), Some(1), "{invalid:?}");
+    assert!(invalid.stdout.is_empty(), "{invalid:?}");
+    let error = std::str::from_utf8(&invalid.stderr).unwrap();
+    assert!(
+        error.contains("UTF-8") || error.contains("UTF8") || error.contains("Utf8"),
+        "{error}"
+    );
+    refusal(
+        workspace.run(&["--json", "lean", "outside/Missing.lean"], None),
+        "io",
+        "Missing.lean",
+    );
+    workspace.no_products();
+    workspace.no_manifests();
+}
+
+#[test]
+fn lake_lean_command_output_matches_the_pin() {
+    let Some((lake, lib)) = reference() else {
+        return;
+    };
+    let native = artifact_workspace();
+    let oracle = artifact_workspace();
+    for workspace in [&native, &oracle] {
+        // The pin builds native Lean artifacts for imports. These deliberately
+        // prelude-only logical fixtures have no runtime bootstrap constants,
+        // so keep them noncomputable on both sides of the comparison.
+        for relative in [
+            "root/src/lib/App/Top.lean",
+            "left/code/lib/Feature/Left.lean",
+            "right/Feature/Right.lean",
+            "right/vendor/shared library/sources/lib/Shared.lean",
+        ] {
+            let source = std::fs::read_to_string(workspace.0.join(relative)).unwrap();
+            workspace.write(relative, source.replace("\ndef ", "\nnoncomputable def "));
+        }
+        workspace.write(
+            "outside/Checks.lean",
+            "prelude\nimport App.Top\n#check App.combine\n#check Shared.identity\n",
+        );
+    }
+    let args = ["lean", "outside/Checks.lean", "--", "-j1"];
+    let pinned = Command::new(&lake)
+        .arg("--dir")
+        .arg(oracle.0.join("root"))
+        .args(args)
+        .current_dir(&oracle.0)
+        .env("LEAN_PATH", &lib)
+        .output()
+        .unwrap();
+    assert!(pinned.status.success(), "{pinned:?}");
+    let output = native.run(&args, Some(&lib));
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout, pinned.stdout,
+        "native: {output:?}\npinned: {pinned:?}"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+    native.no_products();
+    native.no_manifests();
+}
+
 fn artifact_paths(workspace: &Workspace) -> [PathBuf; 4] {
     [
         "root/output/lib/lean/App/Top.olean",
@@ -577,6 +850,33 @@ fn build_success(output: Output) -> String {
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
     String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn lake_query_repairs_corrupt_outputs_from_checked_sources() {
+    let workspace = artifact_workspace();
+    let args = [
+        "--json",
+        "query",
+        "+App.Top:olean",
+        "@right/+Feature.Right:olean",
+    ];
+    let expected = build_success(workspace.run(&args, None));
+    let paths = artifact_paths(&workspace);
+    let previous: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    // Neither the entry nor a transitive dependency's existing bytes are
+    // evidence for the query. Both must be restored from checked source or
+    // re-admitted records before their result paths are printed again.
+    std::fs::write(&paths[0], b"corrupt entry artifact").unwrap();
+    std::fs::write(&paths[3], b"corrupt dependency artifact").unwrap();
+    assert_eq!(build_success(workspace.run(&args, None)), expected);
+    for (path, bytes) in paths.iter().zip(&previous) {
+        assert_eq!(std::fs::read(path).unwrap(), *bytes, "{}", path.display());
+    }
+    workspace.no_manifests();
 }
 
 #[test]

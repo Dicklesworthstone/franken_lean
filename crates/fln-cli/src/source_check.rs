@@ -257,16 +257,18 @@ pub(super) struct PackageProgram {
     pub(super) modules: Vec<(fln::Name, Vec<u8>)>,
 }
 
-/// Run a Lake executable through the same checked module and main pipeline as
-/// `lean --run`, preserving the package's source-root and module boundaries.
-pub(super) fn run_package_main(
+/// Check a captured Lake source closure through the ordinary Lean pipeline.
+/// Supplying arguments also runs `main`, as for `lean --run`; ordinary
+/// `lake lean` checks and evaluates source commands without invoking `main`.
+pub(super) fn run_package(
     program: PackageProgram,
-    arguments: Vec<String>,
+    arguments: Option<Vec<String>>,
+    max_bytes: usize,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
     vm_limits: fln::VmExecutionLimits,
 ) -> MultiplexerOutput {
-    imports::execution::run_package(program, arguments, jobs, posture, vm_limits)
+    imports::execution::run_package(program, arguments, max_bytes, jobs, posture, vm_limits)
 }
 
 /// Standard input has the same import and admission semantics as a Lean file.
