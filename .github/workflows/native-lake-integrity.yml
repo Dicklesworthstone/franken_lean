@@ -11,6 +11,9 @@ on:
       - 'crates/fln/src/imported_macros/**'
       - 'crates/fln/src/ir.rs'
       - 'crates/fln/src/source_check/modules/artifacts/ir.rs'
+      - 'crates/fln/tests/source_notation.rs'
+      - 'crates/fln/tests/source_import_aliases.rs'
+      - 'crates/fln/tests/runtime_ir.rs'
   workflow_dispatch:
 permissions:
   contents: read
@@ -129,6 +132,12 @@ jobs:
           printf '%s\n' "$ELAN_HOME/bin" >> "$GITHUB_PATH"
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Check overloaded notation against the pinned Reference
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p fln --test source_notation --test source_import_aliases --no-fail-fast -- --nocapture --test-threads=1
+      - name: Check fieldless enum ABI and live IR interchange
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p fln --test runtime_ir fieldless_enum --no-fail-fast -- --nocapture --test-threads=1
       - name: Check conversion goal controls against the pinned Reference
         if: ${{ !cancelled() }}
         run: cargo test --locked -p fln-cli --test conv_mode --no-fail-fast -- --nocapture --test-threads=1

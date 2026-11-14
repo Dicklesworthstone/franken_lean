@@ -6,17 +6,18 @@
 //! This is not the source declaration's unboxed/exported ABI, nor a certificate
 //! of kernel admission or faithful byte identity. Module publication must bind
 //! the entry and additional names to its own checked declaration/ABI contract.
-//! `compile_source_definition` additionally exports closed Nat/String/Bool
-//! function signatures under their source names, with owned object arguments
-//! and the pin's UInt8 Boolean convention. Type-dependent runtime carriers and
-//! other scalar conventions remain unsupported. Acyclic control flow preserves
+//! `compile_source_definition` additionally exports closed Nat/String/Bool and
+//! fieldless-enum signatures under their source names, with owned object arguments
+//! and the pin's scalar conventions. Type-dependent runtime carriers and other
+//! scalar conventions remain unsupported. Acyclic control flow preserves
 //! reachable branches and their ownership cleanup; expansion is work/depth bounded.
 //! Type/proof slots retain their original source positions.
 //! Closed source exports may use private boxed data and dictionaries internally.
 //! Their object layouts receive private tags, preserving both tag and field-count
-//! tests even when unrelated records share a source tag. These objects cannot
-//! cross the source ABI; arbitrary FIR cannot enable this profile or claim the
-//! pin's source data representation. Packed/scalar payloads remain unsupported.
+//! tests even when unrelated records share a source tag. Closed fieldless enums
+//! retain canonical ordinal tags across the source ABI; payload-bearing objects
+//! remain private. Arbitrary FIR cannot enable this profile or claim the pin's
+//! source data representation. Packed/scalar payloads remain unsupported.
 
 use fln_comp::{fir, flbc};
 use fln_core::name::Name;
@@ -265,9 +266,9 @@ impl ConstructorTags {
     }
 }
 
-/// Native source data has an all-boxed representation, independent of the pin's
-/// source compiler. Only a closed source ABI lets us keep that representation
-/// private. Assigning tags by the *whole* layout preserves the VM's shape tests:
+/// Native source data has an all-boxed representation. A checked closed enum
+/// reserves its ordinal tags at the source boundary; other layouts stay private.
+/// Assigning private tags by the *whole* layout preserves the VM's shape tests:
 /// two constructors with tag zero but different field counts must stay distinct.
 struct InternalConstructors {
     type_name: Name,
@@ -1079,17 +1080,25 @@ fn compile_module(
     if entry.is_anonymous() {
         return Err(unsupported("anonymous entry name"));
     }
-    // No constructor can enter or leave a closed Nat/String/Bool source ABI,
-    // recursively through callbacks. ABI casts and constructor externs remain
-    // refused. Every internal object therefore comes from these checked boxed
-    // layouts, including objects reached through a constructor's object fields.
-    // The arbitrary-FIR API has no such guarantee and keeps this table empty.
+    // Only checked fieldless enums may carry source constructors through this
+    // ABI, including callbacks. Reserve their canonical ordinal tags first.
+    // Payload-bearing objects originate in the checked private layouts below;
+    // ABI casts and constructor externs remain refused. The arbitrary-FIR API
+    // has no source-signature guarantee and keeps this table empty.
     let mut constructors = InternalConstructors {
         type_name: Name::str(entry.clone(), "_fln_data"),
         layouts: std::collections::BTreeMap::new(),
         tags: ConstructorTags::default(),
     };
-    if source_exports.is_some() {
+    if let Some(source) = source_exports {
+        // Caller-supplied enum values use the pin's canonical ordinal tags.
+        // Reserve those layouts even when this body constructs no enum value.
+        for index in 0..source.enum_constructors {
+            meter.charge(1)?;
+            let tag = u8::try_from(index).map_err(|_| CompileError::Limit)?;
+            constructors.layouts.insert((tag, 0), tag);
+            constructors.tags.insert(tag);
+        }
         for constructor in program.constructors() {
             meter.charge(constructor.fields.len().saturating_add(1))?;
             if !constructor.static_scalar_bytes.is_empty() {
@@ -1252,6 +1261,10 @@ struct SourceSignature {
     params: Vec<IrParam>,
     result: IrType,
     reduced: Option<Vec<ReducedArgument>>,
+    /// The largest fieldless enum reachable through the source signature.
+    /// Every constructor below this bound retains its source ordinal, even
+    /// when only a caller-supplied callback can construct the value.
+    enum_constructors: usize,
 }
 
 enum ReducedArgument {
@@ -1299,9 +1312,11 @@ fn source_spine<'a, const N: usize>(
 // This is a bounded source subset, not a guess about general simplification.
 fn source_boolean_case<'a>(
     expression: &'a fln_core::expr::Expr,
+    environment: &crate::Environment,
     meter: &mut Budget,
 ) -> Result<Option<[&'a fln_core::expr::Expr; 3]>> {
     use fln_core::expr::ExprNode;
+    let mut enum_constructors = 0;
     if let Some((head, [motive, no, yes, condition])) = source_spine::<4>(expression, meter)?
         && matches!(head.node(), ExprNode::Const { name, levels }
             if name == &Name::from_components(["Bool", "rec"]) && levels.len() == 1)
@@ -1309,7 +1324,7 @@ fn source_boolean_case<'a>(
         let ExprNode::Lam { body, .. } = motive.node() else {
             return Err(unsupported("source Boolean case motive"));
         };
-        source_carrier(body, meter)?;
+        source_carrier(body, environment, &mut enum_constructors, meter)?;
         return Ok(Some([condition, no, yes]));
     }
     let Some((head, [ty, proposition, decision, yes, no])) = source_spine::<5>(expression, meter)?
@@ -1321,7 +1336,7 @@ fn source_boolean_case<'a>(
     {
         return Ok(None);
     }
-    source_carrier(ty, meter)?;
+    source_carrier(ty, environment, &mut enum_constructors, meter)?;
     let Some((equality, [boolean, condition, truth])) = source_spine::<3>(proposition, meter)?
     else {
         return Ok(None);
@@ -1354,6 +1369,7 @@ fn source_boolean_case<'a>(
 fn simple_source_parameter_uses(
     value: &fln_core::expr::Expr,
     arity: usize,
+    environment: &crate::Environment,
     meter: &mut Budget,
 ) -> Result<Vec<bool>> {
     use fln_core::expr::ExprNode;
@@ -1412,7 +1428,9 @@ fn simple_source_parameter_uses(
                 }
             }
             ExprNode::App { f, a } => {
-                if let Some([condition, no, yes]) = source_boolean_case(expr, meter)? {
+                if let Some([condition, no, yes]) =
+                    source_boolean_case(expr, environment, meter)?
+                {
                     // A literal scrutinee can erase an arm before the pin
                     // chooses its reduced entry. Leave that optimization out
                     // of multiargument source exports until it is modeled.
@@ -2000,7 +2018,7 @@ fn source_parameter_uses(
     ingress: fln_comp::ingress::IngressLimits,
     meter: &mut Budget,
 ) -> Result<Vec<bool>> {
-    match simple_source_parameter_uses(value, arity, meter) {
+    match simple_source_parameter_uses(value, arity, environment, meter) {
         Err(CompileError::Unsupported {
             what: "specializable source call" | "parameter-dependent source initializer",
         }) => SourceUses {
@@ -2017,9 +2035,65 @@ fn source_parameter_uses(
     }
 }
 
+/// The pin's `LCNF.computeImpureType` classifies all-nullary inductives as
+/// enums. This boundary admits only closed Type-valued families with genuinely
+/// fieldless constructors; proof-field erasure, parameters and indices need
+/// their own checked layout projection. The current FIR constructor tag bound
+/// is stricter than the pin's UInt8 enum range and remains in force here.
+fn source_enum_constructors(
+    name: &Name,
+    environment: &crate::Environment,
+    meter: &mut Budget,
+) -> Result<Option<usize>> {
+    use fln_core::{expr::ExprNode, level::Level};
+    use fln_env::constants::ConstantInfo;
+
+    meter.charge(1)?;
+    let Some(ConstantInfo::Induct(inductive)) = environment.find(name) else {
+        return Ok(None);
+    };
+    if !inductive.base.level_params.is_empty()
+        || inductive.num_params != 0
+        || inductive.num_indices != 0
+        || inductive.num_nested != 0
+        || inductive.is_rec
+        || inductive.is_unsafe
+        || inductive.all.as_slice() != std::slice::from_ref(name)
+        || inductive.ctors.is_empty()
+        || inductive.ctors.len() > usize::from(fln_rt::abi::TAG_MAX_CTOR_TAG) + 1
+        || !matches!(source_without_metadata(&inductive.base.type_, meter)?.node(),
+            ExprNode::Sort { level } if level == &Level::succ(Level::zero()))
+    {
+        return Ok(None);
+    }
+    for (index, constructor) in inductive.ctors.iter().enumerate() {
+        meter.charge(1)?;
+        let Some(ConstantInfo::Ctor(constructor)) = environment.find(constructor) else {
+            return Ok(None);
+        };
+        if constructor.induct != *name
+            || constructor.cidx as usize != index
+            || constructor.num_params != 0
+            || constructor.num_fields != 0
+            || constructor.is_unsafe
+            || !constructor.base.level_params.is_empty()
+            || !matches!(source_without_metadata(&constructor.base.type_, meter)?.node(),
+                ExprNode::Const { name: result, levels } if result == name && levels.is_empty())
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(inductive.ctors.len()))
+}
+
 // Walk source types before erasure. In particular, a proof/type argument must
 // not disappear and silently change the exported source calling convention.
-fn source_carrier(ty: &fln_core::expr::Expr, meter: &mut Budget) -> Result<IrType> {
+fn source_carrier(
+    ty: &fln_core::expr::Expr,
+    environment: &crate::Environment,
+    enum_constructors: &mut usize,
+    meter: &mut Budget,
+) -> Result<IrType> {
     use fln_core::expr::ExprNode;
     let nat = Name::from_components(["Nat"]);
     let string = Name::from_components(["String"]);
@@ -2037,6 +2111,16 @@ fn source_carrier(ty: &fln_core::expr::Expr, meter: &mut Budget) -> Result<IrTyp
             }
             ExprNode::Const { name, levels } if levels.is_empty() && name == &boolean => {
                 IrType::UInt8
+            }
+            ExprNode::Const { name, levels } if levels.is_empty() => {
+                let count = source_enum_constructors(name, environment, meter)?
+                    .ok_or_else(|| unsupported("source export carrier"))?;
+                *enum_constructors = (*enum_constructors).max(count);
+                if count == 1 {
+                    IrType::Tagged
+                } else {
+                    IrType::UInt8
+                }
             }
             ExprNode::ForallE {
                 binder_type, body, ..
@@ -2070,6 +2154,7 @@ fn source_signature(
     use fln_core::expr::ExprNode;
     let mut params = Vec::new();
     let mut function_parameters = Vec::new();
+    let mut enum_constructors = 0;
     let mut ty = &definition.base.type_;
     let result = loop {
         meter.charge(1)?;
@@ -2084,7 +2169,7 @@ fn source_signature(
                 let carrier = if erased {
                     IrType::Erased
                 } else {
-                    source_carrier(binder_type, meter)?
+                    source_carrier(binder_type, environment, &mut enum_constructors, meter)?
                 };
                 let mut parameter = binder_type;
                 while let ExprNode::MData { expr, .. } = parameter.node() {
@@ -2106,13 +2191,16 @@ fn source_signature(
                 ty = body;
             }
             ExprNode::MData { expr, .. } => ty = expr,
-            _ => break source_carrier(ty, meter)?,
+            _ => break source_carrier(ty, environment, &mut enum_constructors, meter)?,
         }
     };
     if params.len() != erasures.len() {
         return Err(invariant("source erasure arity"));
     }
-    let reduced = if !params.is_empty() {
+    // The pin preserves a wholly unused telescope, and a unary telescope has
+    // no strictly smaller nonempty form. Avoid imposing a reduction analysis
+    // on unary enum matches that cannot need a reduced entry.
+    let reduced = if params.len() > 1 {
         let mut used = if let Some(used) = parameter_uses {
             if used.len() != params.len() {
                 return Err(invariant("recursive source use arity"));
@@ -2150,10 +2238,10 @@ fn source_signature(
                         IrLit::Num(IrNat::Small(0)),
                         IrType::TObject,
                     ));
-                } else if param.ty == IrType::UInt8 {
+                } else if matches!(param.ty, IrType::UInt8 | IrType::Tagged) {
                     args.push(ReducedArgument::Literal(
                         IrLit::Num(IrNat::Small(0)),
-                        IrType::UInt8,
+                        param.ty.clone(),
                     ));
                 } else {
                     args.push(ReducedArgument::Literal(
@@ -2174,6 +2262,7 @@ fn source_signature(
         params,
         result,
         reduced,
+        enum_constructors,
     })
 }
 
@@ -2206,7 +2295,7 @@ fn export_source(
         closure
     } else {
         // Closure application takes boxed operands, while the source-facing
-        // Boolean entry takes UInt8. Keep that boundary explicit in both
+        // Boolean or enum entry takes UInt8. Keep that boundary explicit in both
         // directions; the internal FIR program remains entirely boxed.
         let mut args = Vec::new();
         for p in &signature.params {
@@ -2382,8 +2471,10 @@ pub fn compile_definition(
 }
 
 /// Export a checked definition under its source name and source argument count.
-/// Runtime types are closed arrows over Nat/String (including higher-order
-/// arguments), using owned object parameters. Source type/proof slots are
+/// Runtime types are closed arrows over Nat/String/Bool and fieldless enums
+/// (including higher-order arguments), using the pin's object/scalar parameters.
+/// Enums have 1..=244 constructors and no parameters, indices or fields; all
+/// other source-data layouts remain unsupported. Source type/proof slots are
 /// classified in their original telescope and retained as erased parameters.
 /// A runtime carrier depending on a source type parameter remains unsupported.
 /// Source arrows require an explicit lambda telescope. Multiple arguments allow

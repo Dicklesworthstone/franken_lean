@@ -25,6 +25,155 @@ const INTERNAL_DATA_HELPERS: &str = concat!(
     "structure IRBoolBox where\n  value : Bool\n",
 );
 
+const ENUM_DATA_HELPERS: &str = concat!(
+    "inductive IRChoice where\n | north\n | east\n | west\n",
+    "inductive IROther where\n | first\n | second\n | third\n | fourth\n",
+    "inductive IRSingle where\n | only\n",
+    "structure IREnumBox where\n first : IRChoice\n second : IRChoice\n",
+    "inductive IRPayload where\n | empty\n | value (n : Nat)\n",
+    "inductive IRParameterized (A : Type) where\n | first\n | second\n",
+    "abbrev IRAlias := IRChoice\n",
+);
+
+struct EnumExportCase {
+    ty: &'static str,
+    body: &'static str,
+    application: &'static str,
+    expected: &'static str,
+    parameters: Vec<IrType>,
+    result: IrType,
+    reduced: Option<(&'static str, &'static str)>,
+}
+
+fn enum_export_cases() -> Vec<EnumExportCase> {
+    vec![
+        EnumExportCase {
+            ty: "IRChoice",
+            body: "IRChoice.west",
+            application: "match compiled with | .north => 0 | .east => 1 | .west => 2",
+            expected: "2",
+            parameters: vec![],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        EnumExportCase {
+            ty: "IRChoice -> IRChoice",
+            body: "fun c => c",
+            application: "match compiled IRChoice.east with | .north => 0 | .east => 1 | .west => 2",
+            expected: "1",
+            parameters: vec![IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        EnumExportCase {
+            ty: "IRChoice -> IRChoice",
+            body: "fun c => match c with | .north => IRChoice.east | .east => IRChoice.west | .west => IRChoice.north",
+            application: "((match compiled IRChoice.north with | .north => 0 | .east => 1 | .west => 2), (match compiled IRChoice.east with | .north => 0 | .east => 1 | .west => 2), (match compiled IRChoice.west with | .north => 0 | .east => 1 | .west => 2))",
+            expected: "(1, 2, 0)",
+            parameters: vec![IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        EnumExportCase {
+            ty: "(IRChoice -> IRChoice) -> IRChoice -> IRChoice",
+            body: "fun f c => f c",
+            application: "match compiled (fun _ => IRChoice.west) IRChoice.north with | .north => 0 | .east => 1 | .west => 2",
+            expected: "2",
+            parameters: vec![IrType::Object, IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        EnumExportCase {
+            ty: "IRSingle",
+            body: "IRSingle.only",
+            application: "match compiled with | .only => 7",
+            expected: "7",
+            parameters: vec![],
+            result: IrType::Tagged,
+            reduced: None,
+        },
+        EnumExportCase {
+            ty: "IRSingle -> IRSingle",
+            body: "fun x => x",
+            application: "match compiled IRSingle.only with | .only => 7",
+            expected: "7",
+            parameters: vec![IrType::Tagged],
+            result: IrType::Tagged,
+            reduced: None,
+        },
+        EnumExportCase {
+            ty: "IRSingle -> Nat -> Nat",
+            body: "fun _ n => n",
+            application: "compiled IRSingle.only 42",
+            expected: "42",
+            parameters: vec![IrType::Tagged, IrType::TObject],
+            result: IrType::TObject,
+            reduced: Some(("Nat -> Nat", "compiled 42")),
+        },
+        EnumExportCase {
+            ty: "IRChoice -> Nat -> Nat",
+            body: "fun _ n => n",
+            application: "compiled IRChoice.west 42",
+            expected: "42",
+            parameters: vec![IrType::UInt8, IrType::TObject],
+            result: IrType::TObject,
+            reduced: Some(("Nat -> Nat", "compiled 42")),
+        },
+        EnumExportCase {
+            ty: "IRChoice -> IRChoice",
+            body: "fun c => let boxed := IREnumBox.mk IRChoice.east c; boxed.second",
+            application: "match compiled IRChoice.west with | .north => 0 | .east => 1 | .west => 2",
+            expected: "2",
+            parameters: vec![IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        EnumExportCase {
+            ty: "IRChoice -> IROther -> IRChoice",
+            body: "fun c _ => c",
+            application: "match compiled IRChoice.east IROther.fourth with | .north => 0 | .east => 1 | .west => 2",
+            expected: "1",
+            parameters: vec![IrType::UInt8, IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: Some((
+                "IRChoice -> IRChoice",
+                "match compiled IRChoice.east with | .north => 0 | .east => 1 | .west => 2",
+            )),
+        },
+        EnumExportCase {
+            ty: "(IRChoice -> Nat) -> IRChoice -> Nat",
+            body: "fun f c => f c",
+            application: "compiled (fun c => match c with | .north => 11 | .east => 22 | .west => 33) IRChoice.west",
+            expected: "33",
+            parameters: vec![IrType::Object, IrType::UInt8],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        EnumExportCase {
+            ty: "(IRChoice -> Nat) -> Nat",
+            body: "fun f => f IRChoice.west",
+            application: "compiled (fun c => match c with | .north => 11 | .east => 22 | .west => 33)",
+            expected: "33",
+            parameters: vec![IrType::Object],
+            result: IrType::TObject,
+            reduced: None,
+        },
+    ]
+}
+
+fn enum_base() -> Engine {
+    base()
+        .check_source_files(
+            &[ENUM_DATA_HELPERS.as_bytes()],
+            &KVMap::new(),
+            fln::SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine
+}
+
 fn name(s: &str) -> Name {
     Name::from_components(s.split('.'))
 }
@@ -641,6 +790,100 @@ fn private_data_operations(module: &fln_olean::ir::IrModule) -> (usize, usize) {
         }
     }
     (constructors, projections)
+}
+
+#[test]
+fn fieldless_enum_exports_preserve_scalar_signatures_and_private_layouts() {
+    let base = enum_base();
+    let options = KVMap::new();
+    let original = base.logical_root(&options);
+    let mut no_execution = limits();
+    no_execution.vm.max_steps = 0;
+    for case in enum_export_cases() {
+        let source = format!("def compiled : {} := {}", case.ty, case.body);
+        let (declaration, checked) = checked_definition(&base, &source);
+        let compiled = ir::compile_source_definition(
+            &base,
+            declaration.clone(),
+            &options,
+            no_execution,
+            CompileLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+        .into_complete()
+        .unwrap();
+        assert_eq!(
+            compiled.admission.result_logical_root,
+            checked.logical_root(&options)
+        );
+        let IrDecl::Function { params, result, .. } = compiled
+            .module
+            .decls
+            .iter()
+            .find(|declaration| declaration.name() == &name("compiled"))
+            .unwrap()
+        else {
+            panic!("enum source entry")
+        };
+        assert_eq!(
+            params.iter().map(|param| param.ty.clone()).collect::<Vec<_>>(),
+            case.parameters,
+            "{source}",
+        );
+        assert_eq!(*result, case.result, "{source}");
+        assert_eq!(
+            compiled
+                .module
+                .decls
+                .iter()
+                .any(|declaration| declaration.name() == &name("compiled._redArg")),
+            case.reduced.is_some(),
+            "{source}",
+        );
+        if case.body.contains("IREnumBox.mk") {
+            let (constructors, projections) = private_data_operations(&compiled.module);
+            assert!(constructors > 0 && projections > 0);
+        }
+        assert!(matches!(
+            ir::compile_source_definition(
+                &base,
+                declaration,
+                &options,
+                no_execution,
+                CompileLimits {
+                    max_work: 0,
+                    ..CompileLimits::default()
+                },
+            ),
+            Err(ir::DefinitionCompileError::Ir(ir::CompileError::Limit))
+        ));
+        assert_eq!(base.logical_root(&options), original);
+    }
+    for source in [
+        "def compiled (x : IRPayload) : IRPayload := x",
+        "def compiled (x : IRParameterized Nat) : IRParameterized Nat := x",
+        "def compiled (x : IRAlias) : IRAlias := x",
+        "def compiled : True := True.intro",
+        "def compiled (f : IRPayload -> Nat) : Nat := f IRPayload.empty",
+    ] {
+        let (declaration, _) = checked_definition(&base, source);
+        assert!(
+            matches!(
+                ir::compile_source_definition(
+                    &base,
+                    declaration,
+                    &options,
+                    limits(),
+                    CompileLimits::default(),
+                ),
+                Err(ir::DefinitionCompileError::Ir(ir::CompileError::Unsupported {
+                    what: "source export carrier",
+                }))
+            ),
+            "unsupported enum layout must refuse: {source}",
+        );
+        assert_eq!(base.logical_root(&options), original);
+    }
 }
 
 #[test]
@@ -1713,6 +1956,175 @@ fn assert_probe(output: std::process::Output, dir: &Path, label: &str, expected:
         expected,
         "{label}"
     );
+}
+
+fn consume_enum_ir(
+    lean: &Path,
+    dir: &Path,
+    label: &str,
+    ty: &str,
+    application: &str,
+    entry: &str,
+) -> std::process::Output {
+    // Import the enum declarations for typechecking this consumer, but obtain
+    // the target value dynamically. No reference to the logical compiled
+    // constant can substitute its body for the executable under test.
+    let source = format!(
+        "import Lean\nimport NativeIrCase\nunsafe def main : IO Unit := do\n  Lean.enableInitializersExecution\n  let env ← Lean.importModules #[{{ module := `NativeIrCase, isMeta := true }}] {{}} (loadExts := true)\n  match env.evalConst ({ty}) {{}} `{entry} (checkMeta := false) with\n  | .error message => throw (IO.userError message)\n  | .ok compiled => do\n    IO.println (reprStr ({application}))\n    IO.println (reprStr ({application}))\n",
+    );
+    let filename = format!("EnumRuntime-{label}.lean");
+    std::fs::write(dir.join(&filename), source).unwrap();
+    Command::new(lean)
+        .current_dir(dir)
+        .env("LEAN_PATH", dir)
+        .args(["-j", "1", "--run", &filename])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn the_pin_executes_fieldless_enum_exports_and_observes_their_tags() {
+    let Some(lean) = reference() else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "pinned Reference is required"
+        );
+        eprintln!("SKIP: native enum IR compilation consumer requires the pin");
+        return;
+    };
+    let pin = include_str!("../../../SUITE.lock")
+        .lines()
+        .find(|line| line.starts_with("reference "))
+        .unwrap()
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("commit="))
+        .unwrap();
+    let identity = Command::new(&lean).arg("--githash").output().unwrap();
+    assert!(identity.status.success());
+    assert_eq!(String::from_utf8(identity.stdout).unwrap().trim(), pin);
+    let base = enum_base();
+    let options = KVMap::new();
+    let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    for (index, case) in enum_export_cases().into_iter().enumerate() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = root.join(format!(
+            "native-enum-ir-{}-{unique}-{index}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = format!("def compiled : {} := {}", case.ty, case.body);
+        let (declaration, _) = checked_definition(&base, &source);
+        let compiled = ir::compile_source_definition(
+            &base,
+            declaration,
+            &options,
+            limits(),
+            CompileLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+        .into_complete()
+        .unwrap();
+        std::fs::write(
+            dir.join("NativeIrCase.lean"),
+            format!(
+                "module\npublic section\n{ENUM_DATA_HELPERS}\nopaque compiled : {} := {}\n",
+                case.ty, case.body,
+            ),
+        )
+        .unwrap();
+        let generated = Command::new(&lean)
+            .current_dir(&dir)
+            .args(["-o", "NativeIrCase.olean", "NativeIrCase.lean"])
+            .output()
+            .unwrap();
+        assert_probe(generated, &dir, "compile", "");
+        let original = std::fs::read(dir.join("NativeIrCase.ir")).unwrap();
+        std::fs::write(dir.join("original.ir"), &original).unwrap();
+        let expected = format!("{}\n{}", case.expected, case.expected);
+        assert_probe(
+            consume_enum_ir(&lean, &dir, "original", case.ty, case.application, "compiled"),
+            &dir,
+            "original",
+            &expected,
+        );
+        if let Some((ty, application)) = case.reduced {
+            assert_probe(
+                consume_enum_ir(
+                    &lean,
+                    &dir,
+                    "original-reduced",
+                    ty,
+                    application,
+                    "compiled._redArg",
+                ),
+                &dir,
+                "original-reduced",
+                &expected,
+            );
+        }
+        std::fs::write(dir.join("NativeIrCase.ir"), encode(&compiled.module, &original)).unwrap();
+        assert_probe(
+            consume_enum_ir(&lean, &dir, "native", case.ty, case.application, "compiled"),
+            &dir,
+            "native",
+            &expected,
+        );
+        if let Some((ty, application)) = case.reduced {
+            assert_probe(
+                consume_enum_ir(
+                    &lean,
+                    &dir,
+                    "native-reduced",
+                    ty,
+                    application,
+                    "compiled._redArg",
+                ),
+                &dir,
+                "native-reduced",
+                &expected,
+            );
+        }
+        if index == 0 {
+            // Change only the exported nullary enum tag. The logical opaque
+            // and every internal declaration stay byte-for-byte unchanged.
+            let mut mutant = compiled.module.clone();
+            let IrDecl::Function { body, .. } = mutant
+                .decls
+                .iter_mut()
+                .find(|declaration| declaration.name() == &name("compiled"))
+                .unwrap()
+            else {
+                panic!("enum source entry")
+            };
+            *body = IrBody {
+                stmts: vec![IrStmt::VDecl {
+                    x: 1,
+                    ty: IrType::UInt8,
+                    expr: IrExpr::Lit(IrLit::Num(IrNat::Small(0))),
+                }],
+                terminal: Box::new(IrTerminal::Ret(IrArg::Var(1))),
+            };
+            std::fs::write(dir.join("NativeIrCase.ir"), encode(&mutant, &original)).unwrap();
+            assert_probe(
+                consume_enum_ir(
+                    &lean,
+                    &dir,
+                    "changed-tag",
+                    case.ty,
+                    case.application,
+                    "compiled",
+                ),
+                &dir,
+                "changed-tag",
+                "0\n0",
+            );
+        }
+    }
 }
 
 fn reduced_case(index: usize) -> Option<(&'static str, &'static str)> {

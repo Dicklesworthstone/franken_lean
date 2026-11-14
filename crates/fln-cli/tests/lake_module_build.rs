@@ -591,8 +591,94 @@ fn module_library() -> Package {
 }
 
 #[test]
+fn fieldless_enum_ir_facets_preserve_admission_and_replay_from_checked_cache() {
+    // This exact two-constructor module used to refuse its executable facet.
+    // Retain it as a positive before testing genuinely unsupported payloads.
+    let package = module_library();
+    success(&package.build(&["+Lib.Top:olean"]));
+    let previous: Vec<_> = ["Lib.Base", "Lib.Top"]
+        .into_iter()
+        .map(|name| family_bytes(&package, name))
+        .collect();
+    let report = success(&package.build(&["+Lib.Top:ir"]));
+    assert!(report.contains("\"executable_modules\":2"), "{report}");
+    let mut executables = Vec::new();
+    for (name, original) in ["Lib.Base", "Lib.Top"].into_iter().zip(&previous) {
+        assert_eq!(&family_bytes(&package, name), original);
+        let bytes = std::fs::read(package.artifact(name).with_extension("ir")).unwrap();
+        if name == "Lib.Base" {
+            let view = fln_olean::region::OleanView::parse(&bytes).unwrap();
+            let blocks = view
+                .extension_payloads(fln_olean::region::WalkBudget::default(), 16 << 20)
+                .unwrap();
+            let ir = fln_olean::ir::decode_ir(&blocks, Default::default()).unwrap();
+            let fln_olean::ir::IrDecl::Function { params, result, .. } = ir
+                .decls
+                .iter()
+                .find(|declaration| {
+                    declaration.name() == &fln::Name::from_components(["identity"])
+                })
+                .unwrap()
+            else {
+                panic!("checked enum identity export")
+            };
+            assert_eq!(params.len(), 1);
+            assert_eq!(params[0].ty, fln_olean::ir::IrType::UInt8);
+            assert_eq!(*result, fln_olean::ir::IrType::UInt8);
+        }
+        executables.push(bytes);
+    }
+    let warm = success(&package.build(&["+Lib.Top:ir"]));
+    assert!(warm.contains("\"modules_cached\":2"), "{warm}");
+    assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
+    for (index, name) in ["Lib.Base", "Lib.Top"].into_iter().enumerate() {
+        assert_eq!(family_bytes(&package, name), previous[index]);
+        assert_eq!(
+            std::fs::read(package.artifact(name).with_extension("ir")).unwrap(),
+            executables[index],
+        );
+    }
+}
+
+#[test]
+fn singleton_enum_ir_facet_uses_the_tagged_source_carrier() {
+    let package = Package::new(CONFIG);
+    package.write("Lib/Base.lean", "module\nprelude\n");
+    // Keep the exact singleton input formerly used as the failure control in
+    // the pinned module execution test below.
+    package.write(
+        "Lib/Top.lean",
+        "module\nprelude\npublic import Lib.Base\npublic inductive Token where | mk\npublic def Lib.identity (x : Token) : Token := x\n",
+    );
+    success(&package.build(&["+Lib.Top:ir"]));
+    let bytes = std::fs::read(package.artifact("Lib.Top").with_extension("ir")).unwrap();
+    let view = fln_olean::region::OleanView::parse(&bytes).unwrap();
+    let blocks = view
+        .extension_payloads(fln_olean::region::WalkBudget::default(), 16 << 20)
+        .unwrap();
+    let ir = fln_olean::ir::decode_ir(&blocks, Default::default()).unwrap();
+    let fln_olean::ir::IrDecl::Function { params, result, .. } = ir
+        .decls
+        .iter()
+        .find(|declaration| {
+            declaration.name() == &fln::Name::from_components(["Lib", "identity"])
+        })
+        .unwrap()
+    else {
+        panic!("checked singleton identity export")
+    };
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].ty, fln_olean::ir::IrType::Tagged);
+    assert_eq!(*result, fln_olean::ir::IrType::Tagged);
+}
+
+#[test]
 fn unsupported_ir_facet_preserves_the_previous_admission_artifacts() {
     let package = module_library();
+    package.write(
+        "Lib/Base.lean",
+        MODULE_BASE.replace(" | right\n", " | right (previous : Token)\n"),
+    );
     success(&package.build(&["+Lib.Top:olean"]));
     let previous: Vec<_> = ["Lib.Base", "Lib.Top"]
         .into_iter()
@@ -944,7 +1030,7 @@ fn native_ir_facets_build_dependencies_and_execute_in_the_pinned_reference() {
     let previous_snapshot = std::fs::read(&snapshot).unwrap();
     for (source, unsupported_export) in [
         (
-            "module\nprelude\npublic import Lib.Base\npublic inductive Token where | mk\npublic def Lib.identity (x : Token) : Token := x\n",
+            "module\nprelude\npublic import Lib.Base\npublic inductive Token where | mk (value : Nat)\npublic def Lib.identity (x : Token) : Token := x\n",
             true,
         ),
         (
