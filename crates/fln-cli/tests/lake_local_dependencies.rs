@@ -270,6 +270,82 @@ fn transitive_diamond_and_name_precedence_match_the_pin() {
 }
 
 #[test]
+fn dependency_executable_selectors_match_the_pinned_workspace_order() {
+    let Some((lake, lib)) = reference() else {
+        return;
+    };
+    let native = Workspace::new();
+    let oracle = Workspace::new();
+    for workspace in [&native, &oracle] {
+        workspace.write(
+            "right/lakefile.toml",
+            format!(
+                "{RIGHT}[[lean_exe]]\nname = \"tool-name\"\nroot = \"RightTool.Main\"\nsrcDir = \"tools\"\n",
+            ),
+        );
+        workspace.write(
+            "left/lakefile.toml",
+            format!(
+                "{LEFT}[[lean_exe]]\nname = \"tool-name\"\nroot = \"LeftTool.Main\"\nsrcDir = \"tools\"\n",
+            ),
+        );
+        for (path, module, call, exit) in [
+            (
+                "right/tools/RightTool/Main.lean",
+                "Feature.Right",
+                "Feature.right",
+                23,
+            ),
+            (
+                "left/code/tools/LeftTool/Main.lean",
+                "Feature.Left",
+                "Feature.left",
+                29,
+            ),
+        ] {
+            workspace.write(
+                path,
+                format!(
+                    "prelude\nimport {module}\ndef main (args : List String) : IO UInt32 := do\n  for value in args do\n    IO.println ({call} value)\n  pure {exit}\n",
+                ),
+            );
+        }
+    }
+    // The reverse breadth-first package order chooses right before left.
+    // An explicit package qualifier must still select left, and an empty
+    // qualifier names the root executable rather than any dependency.
+    for (target, exit) in [
+        ("tool-name", 23),
+        ("@left/tool-name", 29),
+        ("right/tool-name", 23),
+        ("@right/«tool-name»", 23),
+        ("@/runner", 17),
+    ] {
+        let args = ["exe", target, "--help", "", "λ with spaces"];
+        let expected = Command::new(&lake)
+            .arg("--dir")
+            .arg(oracle.0.join("root"))
+            .args(args)
+            .env("LEAN_PATH", &lib)
+            .output()
+            .unwrap();
+        assert_eq!(expected.status.code(), Some(exit), "{target}: {expected:?}");
+        let output = native.run(&args, Some(&lib));
+        assert_eq!(output.status.code(), Some(exit), "{target}: {output:?}");
+        assert_eq!(output.stdout, expected.stdout, "{target}: {output:?}");
+        assert!(output.stderr.is_empty(), "{target}: {output:?}");
+    }
+    // Running a tool from a dependency does not compile an unused root main.
+    native.write("root/src/app/App/Main.lean", "not valid Lean source");
+    let selected = native.run(&["exe", "@right/tool-name", "selected"], Some(&lib));
+    assert_eq!(selected.status.code(), Some(23), "{selected:?}");
+    assert_eq!(selected.stdout, b"right:chosen:selected\n");
+    assert!(selected.stderr.is_empty(), "{selected:?}");
+    native.no_products();
+    native.no_manifests();
+}
+
+#[test]
 fn package_cycles_are_refused_like_the_pinned_executable_build() {
     let native = Workspace::new();
     let cyclic = format!("{RIGHT}\n[[require]]\nname = \"program\"\npath = \"../root\"\n");
@@ -501,6 +577,214 @@ fn build_success(output: Output) -> String {
 }
 
 #[test]
+fn package_qualified_modules_keep_owners_cache_records_and_rebuild_explanations() {
+    let workspace = artifact_workspace();
+    for (index, target) in [
+        "@program/+App.Top:olean",
+        "program/App.Top:olean",
+        "/+App.Top:olean",
+        "@/+App.Top:olean",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let report = build_success(workspace.run(&["--json", "build", target], None));
+        assert!(report.contains("\"modules_built\":4"), "{report}");
+        assert!(report.contains("\"snapshot\":\"written\""), "{report}");
+        if index != 0 {
+            assert!(report.contains("\"modules_cached\":4"), "{report}");
+            assert!(report.contains("\"module_elaborations\":0"), "{report}");
+        }
+    }
+    let paths = artifact_paths(&workspace);
+    let previous: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    // The requirement's name selects the dependency, even though its own
+    // lakefile calls itself `name_overridden_by_requirement`.
+    for target in ["right/+Feature.Right:olean", "@right/Feature.Right:olean"] {
+        let report = build_success(workspace.run(&["--json", "build", target], None));
+        assert!(report.contains("\"modules_built\":2"), "{report}");
+        assert!(report.contains("\"modules_cached\":2"), "{report}");
+        assert!(report.contains(&paths[2].display().to_string()), "{report}");
+        assert!(report.contains(&paths[3].display().to_string()), "{report}");
+    }
+    for (path, before) in paths.iter().zip(&previous) {
+        assert_eq!(std::fs::read(path).unwrap(), *before);
+    }
+    let explain = |target: &str| {
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["build", "explain", "--json", "--dir"])
+            .arg(workspace.0.join("root"))
+            .arg(target)
+            .env("LEAN_PATH", workspace.0.join("absent-imports"))
+            .output()
+            .unwrap()
+    };
+    let unchanged = build_success(explain("@right/+Feature.Right:olean"));
+    assert!(
+        unchanged.contains("\"reference_decision\":\"up-to-date\""),
+        "{unchanged}",
+    );
+    assert!(unchanged.contains("\"name\":\"Shared\""), "{unchanged}");
+    workspace.write(
+        "right/vendor/shared library/sources/lib/Shared.lean",
+        format!("{CHECKED_SHARED}-- changed dependency source\n"),
+    );
+    let changed = build_success(explain("right/Feature.Right:olean"));
+    assert!(
+        changed.contains("\"reference_decision\":\"rebuild\""),
+        "{changed}",
+    );
+    assert!(changed.contains("source changed"), "{changed}");
+    assert!(
+        !workspace
+            .0
+            .join("root/output/lib/lean/Feature/Right.olean")
+            .exists(),
+    );
+    workspace.no_manifests();
+}
+
+#[test]
+fn package_qualifiers_disambiguate_standalone_modules_without_merging_owners() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "root/lakefile.toml",
+        concat!(
+            "name = \"root\"\nbuildDir = \"root-out\"\n",
+            "[[require]]\nname = \"dependency\"\npath = \"../right\"\n",
+            "[[lean_lib]]\nname = \"Common\"\nroots = [\"Shared\", \"Consumer\"]\n",
+        ),
+    );
+    workspace.write(
+        "right/lakefile.toml",
+        "name = \"not_the_assigned_name\"\nbuildDir = \"dep-out\"\n[[lean_lib]]\nname = \"Common\"\nroots = [\"Shared\"]\n",
+    );
+    workspace.write(
+        "root/Shared.lean",
+        "prelude\ntheorem Shared.root (P : Prop) (h : P) : P := h\n",
+    );
+    workspace.write(
+        "right/Shared.lean",
+        "prelude\ntheorem Shared.dependency (P : Prop) (h : P) : P := h\n",
+    );
+    let root_output = workspace.0.join("root/root-out/lib/lean/Shared.olean");
+    let dependency_output = workspace.0.join("right/dep-out/lib/lean/Shared.olean");
+    build_success(workspace.run(&["--json", "build", "@dependency/+Shared:olean"], None));
+    assert!(dependency_output.is_file());
+    assert!(!root_output.exists());
+    let dependency_bytes = std::fs::read(&dependency_output).unwrap();
+    build_success(workspace.run(&["--json", "build", "@root/+Shared:olean"], None));
+    let root_bytes = std::fs::read(&root_output).unwrap();
+    assert_ne!(root_bytes, dependency_bytes);
+    for (path, declaration) in [
+        (&root_output, "Shared.root"),
+        (&dependency_output, "Shared.dependency"),
+    ] {
+        let inspected = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["olean", "inspect", "--constants"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(build_success(inspected).contains(declaration));
+    }
+    refusal(
+        workspace.run(
+            &[
+                "--json",
+                "build",
+                "@root/+Shared:olean",
+                "@dependency/+Shared:olean",
+            ],
+            None,
+        ),
+        "unsupported",
+        "selects different packages in one build",
+    );
+    assert_eq!(std::fs::read(&root_output).unwrap(), root_bytes);
+    assert_eq!(std::fs::read(&dependency_output).unwrap(), dependency_bytes);
+    workspace.write(
+        "root/Consumer.lean",
+        "prelude\nimport Shared\ntheorem consume (P : Prop) (h : P) : P := Shared.dependency P h\n",
+    );
+    // An explicit target cannot replace what a different module's unqualified
+    // import selects. Without the ownership check this graph would type-check
+    // using the wrong package and publish a misleading Consumer.olean.
+    refusal(
+        workspace.run(
+            &[
+                "--json",
+                "build",
+                "@root/+Consumer:olean",
+                "@dependency/+Shared:olean",
+            ],
+            None,
+        ),
+        "unsupported",
+        "multiple local packages",
+    );
+    assert!(!root_output.with_file_name("Consumer.olean").exists());
+    assert_eq!(std::fs::read(&root_output).unwrap(), root_bytes);
+    assert_eq!(std::fs::read(&dependency_output).unwrap(), dependency_bytes);
+    let mismatched_explanation = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["build", "explain", "--json", "--dir"])
+        .arg(workspace.0.join("root"))
+        .arg("@dependency/+Shared:olean")
+        .output()
+        .unwrap();
+    assert_eq!(mismatched_explanation.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&mismatched_explanation.stderr)
+            .contains("different package from the recorded build"),
+        "{mismatched_explanation:?}",
+    );
+    // A broken sibling with the same module name is not substituted for the
+    // selected package, even on a warm module-record hit.
+    workspace.write("root/Shared.lean", "not valid Lean source");
+    let warm = build_success(workspace.run(
+        &["--json", "build", "@dependency/+Shared:olean"],
+        None,
+    ));
+    assert!(warm.contains("\"modules_cached\":1"), "{warm}");
+    assert_eq!(std::fs::read(&dependency_output).unwrap(), dependency_bytes);
+    assert_eq!(std::fs::read(&root_output).unwrap(), root_bytes);
+}
+
+#[test]
+fn qualified_module_and_executable_selectors_cannot_fall_back_to_another_package() {
+    let workspace = artifact_workspace();
+    for (target, detail) in [
+        ("@missing/+Feature.Right:olean", "unknown package"),
+        (
+            "@name_overridden_by_requirement/+Feature.Right:olean",
+            "unknown package",
+        ),
+        ("@right/+Feature.Left:olean", "in package `right`"),
+        ("@left/+Feature.Right:olean", "in package `left`"),
+        ("@right/nested/+Feature.Right:olean", "package separator"),
+        ("@right:olean", "package target"),
+    ] {
+        let output = workspace.run(&["--json", "build", target], None);
+        assert_eq!(output.status.code(), Some(1), "{target}: {output:?}");
+        assert!(output.stdout.is_empty(), "{target}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(detail),
+            "{target}: {output:?}",
+        );
+    }
+    for target in ["@missing/runner", "right/runner", "@right/nested/runner"] {
+        let output = workspace.run(&["--json", "exe", target], None);
+        assert_eq!(output.status.code(), Some(1), "{target}: {output:?}");
+        assert!(output.stdout.is_empty(), "{target}: {output:?}");
+    }
+    workspace.no_products();
+    workspace.no_manifests();
+    assert!(!workspace.0.join("import-records").exists());
+}
+
+#[test]
 fn artifact_builds_follow_transitive_package_ownership_and_reuse_checked_records() {
     let workspace = artifact_workspace();
     let report = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
@@ -672,6 +956,27 @@ fn ir_facets_publish_complete_module_families_across_local_packages() {
             let bytes = std::fs::read(&part).unwrap();
             fln_olean::region::OleanView::parse(&bytes).unwrap();
         }
+    }
+    let before: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path.with_extension("ir")).unwrap())
+        .collect();
+    // One selected module requested through both spellings still has one
+    // owner; the IR facet wins over an additional admission-only request.
+    let warm = build_success(workspace.run(
+        &[
+            "--json",
+            "build",
+            "@program/+App.Top:olean",
+            "program/App.Top:ir",
+        ],
+        None,
+    ));
+    assert!(warm.contains("\"modules_built\":4"), "{warm}");
+    assert!(warm.contains("\"modules_cached\":4"), "{warm}");
+    assert!(warm.contains("\"executable_modules\":4"), "{warm}");
+    for (path, previous) in paths.iter().zip(before) {
+        assert_eq!(std::fs::read(path.with_extension("ir")).unwrap(), previous);
     }
     workspace.write(
         "Consumer.lean",

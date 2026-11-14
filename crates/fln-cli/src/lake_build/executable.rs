@@ -7,16 +7,12 @@
 use super::*;
 
 fn program(
-    root: &Path,
-    config: &LakeConfig,
+    package: &local_dependencies::Package,
+    executable: &fln_lake::LakeTarget,
     sources: &local_dependencies::Sources,
-    target: &str,
 ) -> Result<source_check::PackageProgram, Failure> {
-    let executable = config
-        .targets
-        .iter()
-        .find(|candidate| candidate.name == target && candidate.kind == TargetKind::Executable)
-        .ok_or_else(|| Failure::input(format!("unknown executable `{target}`")))?;
+    let root = &package.root;
+    let config = &package.config;
     let [root_name] = executable.roots.as_slice() else {
         return Err(Failure::input(
             "an executable must have exactly one root module",
@@ -118,9 +114,9 @@ pub(crate) fn run(
                     }
                     result => result?,
                 };
-            let config = loaded.config.clone();
             let sources = local_dependencies::load(&root, loaded, evaluation)?;
-            let program = program(&root, &config, &sources, &target)?;
+            let (package, executable) = sources.executable(&target)?;
+            let program = program(package, executable, &sources)?;
             Ok(source_check::run_package_main(
                 program, arguments, jobs, posture, vm_limits,
             ))

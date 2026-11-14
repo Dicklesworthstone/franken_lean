@@ -17,8 +17,8 @@
 //! through `trace_state`; then failures the pin reports, and a conv tactic this engine refuses,
 //! typed.
 //!
-//! Every program was run through the pinned `lean` v4.32.0 with the same header first
-//! (2026-10-24), and its output is compared with the pinned binary's again when that is present.
+//! The original fixture set was run through pinned `lean` v4.32.0 with the same header
+//! (2026-10-24). Every test compares its programs with the pinned binary when it is present.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1293,7 +1293,6 @@ example (a : Nat) : a = a := by
         r#"invalid 'congr' conv tactic, application or implication expected"#,
     ),
 ];
-
 
 /// Goal combinators share the ordinary tactic controller: each maps only the original
 /// frontier, keeps siblings outside focus, and participates in transactional alternatives.

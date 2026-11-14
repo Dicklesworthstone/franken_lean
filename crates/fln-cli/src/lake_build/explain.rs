@@ -85,17 +85,25 @@ struct Report {
     modules: Vec<Explained>,
 }
 
-/// `Lib.Top`, `+Lib.Top:olean`, or the source path `Lib/Top.lean`.
-fn target_name(text: &str) -> std::result::Result<Name, Failure> {
+/// An unqualified module, a package-qualified module selector, or a source
+/// path. A package qualifier is checked against the recorded build's owner.
+fn target_name<'a>(
+    sources: &'a local_dependencies::Sources,
+    text: &str,
+) -> std::result::Result<(Name, Option<&'a local_dependencies::Package>), Failure> {
     if let Some(path) = text.strip_suffix(".lean") {
-        return name(&path.trim_start_matches("./").replace(['/', '\\'], "."));
+        return name(&path.trim_start_matches("./").replace(['/', '\\'], "."))
+            .map(|module| (module, None));
     }
-    let bare = text.strip_prefix('+').unwrap_or(text);
-    let bare = bare
+    let bare = text
         .strip_suffix(":olean")
-        .or_else(|| bare.strip_suffix(":ir"))
-        .unwrap_or(bare);
-    name(bare)
+        .or_else(|| text.strip_suffix(":ir"))
+        .unwrap_or(text);
+    if bare.contains('/') || bare.starts_with('@') {
+        module_target(sources, bare).map(|(module, owner)| (module, Some(owner)))
+    } else {
+        name(bare.strip_prefix('+').unwrap_or(bare)).map(|module| (module, None))
+    }
 }
 
 fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result<Report, Refusal> {
@@ -172,19 +180,11 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
             (old != new).then(|| (path, old.map(str::to_owned), new.map(str::to_owned)))
         })
         .collect();
-    let recorded_entries = plan_modules(
-        sources
-            .packages
-            .iter()
-            .flat_map(|package| package.config.targets.iter())
-            .map(|target| target.name.as_str()),
-        &sources,
-        &recorded.targets,
-    )?;
-    let resolve = |module: &Name| sources.resolve_build_package(module, &recorded_entries);
+    let recorded_plan = plan_modules(&sources, &recorded.targets)?;
+    let resolve = |module: &Name| sources.resolve_build_package(module, &recorded_plan.owners);
     let entries = match target {
         Some(text) => {
-            let module = target_name(text)?;
+            let (module, requested_owner) = target_name(&sources, text)?;
             let display = module.to_display_string();
             if !recorded.modules.iter().any(|row| row.name == display) {
                 return Err(Failure::input(format!(
@@ -193,14 +193,20 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
                 ))
                 .into());
             }
-            if resolve(&module)?.is_none() {
+            let Some((owner, _)) = resolve(&module)? else {
                 return Err(Refusal::Unavailable(format!(
                     "recorded module `{display}` no longer belongs to a selected local package"
                 )));
+            };
+            if requested_owner.is_some_and(|requested| !std::ptr::eq(requested, owner)) {
+                return Err(Failure::input(format!(
+                    "module target `{text}` selects a different package from the recorded build",
+                ))
+                .into());
             }
             vec![module]
         }
-        None => recorded_entries.clone(),
+        None => recorded_plan.entries.clone(),
     };
 
     // The current local import graph, from the entries, without elaborating.

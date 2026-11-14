@@ -435,6 +435,9 @@ impl ManifestSelection {
 }
 
 pub(super) struct Package {
+    /// Lake assigns a dependency the name of the selecting requirement, which
+    /// may differ from the name in that dependency's own configuration.
+    pub(super) identity: String,
     pub(super) root: PathBuf,
     pub(super) config: LakeConfig,
     /// Exact input captured before parsing or checked evaluation.
@@ -443,7 +446,86 @@ pub(super) struct Package {
     libraries: Vec<Library>,
 }
 
+impl Package {
+    fn executable_path(&self, module: &Name) -> Result<Option<PathBuf>, Failure> {
+        for target in self.config.targets.iter().rev() {
+            if target.kind != TargetKind::Executable {
+                continue;
+            }
+            let [root] = target.roots.as_slice() else {
+                return Err(Failure::input(
+                    "an executable must have exactly one root module",
+                ));
+            };
+            if name(root)? == *module {
+                let directory = target.src_dir.as_deref().unwrap_or(Path::new("."));
+                relative_directory(directory)?;
+                return Ok(Some(
+                    self.root
+                        .join(&self.config.src_dir)
+                        .join(directory)
+                        .join(source_import_relative_path(module)?),
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(super) fn target_path(&self, module: &Name) -> Result<Option<PathBuf>, Failure> {
+        match self.executable_path(module)? {
+            Some(path) => Ok(Some(path)),
+            None => source_path(module, &self.libraries),
+        }
+    }
+}
+
 impl Sources {
+    /// Package selectors are Lake names, never filesystem paths. An empty
+    /// selector denotes the invocation's root package (`/+Module:olean`).
+    pub(super) fn package(&self, selector: &str) -> Result<&Package, Failure> {
+        if selector.is_empty() {
+            return self
+                .packages
+                .first()
+                .ok_or_else(|| Failure::new("internal-fault", "workspace has no root package"));
+        }
+        let identity = fln_lake::canonical_package_name(selector);
+        self.packages
+            .iter()
+            .find(|package| package.identity == identity)
+            .ok_or_else(|| Failure::input(format!("unknown package `{selector}`")))
+    }
+
+    /// Match `Workspace.findLeanExe?` and `parseExeTargetSpec`: an unqualified
+    /// executable is found in workspace package order; a qualifier restricts
+    /// the lookup to exactly the named package.
+    pub(super) fn executable(
+        &self,
+        selector: &str,
+    ) -> Result<(&Package, &fln_lake::LakeTarget), Failure> {
+        let find = |package: &Package, target: &str| {
+            let target = fln_lake::canonical_package_name(target);
+            package.config.targets.iter().position(|candidate| {
+                candidate.kind == TargetKind::Executable
+                    && fln_lake::canonical_package_name(&candidate.name) == target
+            })
+        };
+        let selected = if let Some((package, target)) = selector.split_once('/') {
+            if target.contains('/') {
+                return Err(Failure::input(format!(
+                    "invalid executable target `{selector}`: more than one package separator",
+                )));
+            }
+            let package = self.package(package.strip_prefix('@').unwrap_or(package))?;
+            find(package, target).map(|index| (package, &package.config.targets[index]))
+        } else {
+            self.packages.iter().find_map(|package| {
+                find(package, selector).map(|index| (package, &package.config.targets[index]))
+            })
+        };
+        selected.ok_or_else(|| Failure::input(format!("unknown executable `{selector}`")))
+    }
+
     /// These paths describe discovered inputs; a snapshot reader must resolve
     /// the current package graph again before opening any configuration file.
     pub(super) fn configuration_rows(&self, invocation_root: &Path) -> Vec<snapshot::ConfigRow> {
@@ -534,32 +616,11 @@ impl Sources {
     ) -> Result<Option<(&Package, PathBuf)>, Failure> {
         let mut found: Option<(&Package, PathBuf)> = None;
         for package in &self.packages {
-            let mut path = None;
-            if include_executables {
-                for target in package.config.targets.iter().rev() {
-                    if target.kind != TargetKind::Executable {
-                        continue;
-                    }
-                    let [root] = target.roots.as_slice() else {
-                        return Err(Failure::input(
-                            "an executable must have exactly one root module",
-                        ));
-                    };
-                    if name(root)? != *module {
-                        continue;
-                    }
-                    let directory = target.src_dir.as_deref().unwrap_or(Path::new("."));
-                    relative_directory(directory)?;
-                    path = Some(
-                        package
-                            .root
-                            .join(&package.config.src_dir)
-                            .join(directory)
-                            .join(source_import_relative_path(module)?),
-                    );
-                    break;
-                }
-            }
+            let path = if include_executables {
+                package.executable_path(module)?
+            } else {
+                None
+            };
             // Workspace target lookup is ordered by package: a later
             // executable must not override an earlier library or executable.
             if let Some(path) = path {
@@ -597,24 +658,15 @@ impl Sources {
             }))
     }
 
-    pub(super) fn resolve_target(&self, module: &Name) -> Result<Option<SourceLocation>, Failure> {
-        Ok(self
-            .resolve_target_package(module)?
-            .map(|(package, path)| SourceLocation {
-                package: package.root.clone(),
-                path,
-            }))
-    }
-
     /// Resolve a node in a build without making unselected executable roots
     /// available to its dependencies.
-    pub(super) fn resolve_build_package(
-        &self,
+    pub(super) fn resolve_build_package<'a>(
+        &'a self,
         module: &Name,
-        entries: &[Name],
-    ) -> Result<Option<(&Package, PathBuf)>, Failure> {
-        if entries.contains(module) {
-            self.resolve_target_package(module)
+        owners: &ModuleOwners<'a>,
+    ) -> Result<Option<(&'a Package, PathBuf)>, Failure> {
+        if let Some(package) = owners.get(module) {
+            Ok(package.target_path(module)?.map(|path| (*package, path)))
         } else {
             self.resolve_package(module)
         }
@@ -623,10 +675,10 @@ impl Sources {
     pub(super) fn resolve_build(
         &self,
         module: &Name,
-        entries: &[Name],
+        owners: &ModuleOwners<'_>,
     ) -> Result<Option<SourceLocation>, Failure> {
         Ok(self
-            .resolve_build_package(module, entries)?
+            .resolve_build_package(module, owners)?
             .map(|(package, path)| SourceLocation {
                 package: package.root.clone(),
                 path,
@@ -637,16 +689,15 @@ impl Sources {
     /// configuration for the distinct library module an import would select.
     pub(super) fn validate_entry_imports(
         &self,
-        entries: &[Name],
+        owners: &ModuleOwners<'_>,
         modules: &BTreeMap<Name, Module>,
     ) -> Result<(), Failure> {
         for module in modules.values() {
             for imported in &module.imports {
-                if !entries.contains(imported) {
+                let Some(target_owner) = owners.get(imported) else {
                     continue;
-                }
-                let Some((target_owner, target_path)) = self.resolve_target_package(imported)?
-                else {
+                };
+                let Some(target_path) = target_owner.target_path(imported)? else {
                     return Err(Failure::new(
                         "internal-fault",
                         "build target lost its owner",
@@ -663,7 +714,7 @@ impl Sources {
                     || path != target_path
                 {
                     return Err(Failure::unsupported(format!(
-                        "module `{}` has different executable-target and library-import sources or configurations",
+                        "module `{}` has different build-target and library-import sources or configurations",
                         imported.to_display_string(),
                     )));
                 }
@@ -675,12 +726,12 @@ impl Sources {
     pub(super) fn destinations(
         &self,
         artifacts: &BTreeMap<Name, ModuleArtifacts>,
-        entries: &[Name],
+        owners: &ModuleOwners<'_>,
     ) -> Result<BTreeMap<Name, (PathBuf, PathBuf)>, Failure> {
         artifacts
             .keys()
             .map(|name| {
-                let (package, _) = self.resolve_build_package(name, entries)?.ok_or_else(|| {
+                let (package, _) = self.resolve_build_package(name, owners)?.ok_or_else(|| {
                     Failure::new("internal-fault", "built module has no source owner")
                 })?;
                 Ok((
@@ -776,7 +827,8 @@ pub(super) fn load(
     let mut metadata_guards = Vec::new();
     let mut git_checkouts = Vec::new();
     let config = &configuration.config;
-    let mut selected = BTreeMap::from([(fln_lake::canonical_package_name(&config.name), 0)]);
+    let identity = fln_lake::canonical_package_name(&config.name);
+    let mut selected = BTreeMap::from([(identity.clone(), 0)]);
     let mut edges = vec![Vec::new()];
     let mut requirements = 0usize;
     if !config.requires.is_empty() {
@@ -786,10 +838,10 @@ pub(super) fn load(
             &mut metadata_guards,
         )?;
     }
-    let mut packages = vec![(root.to_path_buf(), configuration)];
+    let mut packages = vec![(identity, root.to_path_buf(), configuration)];
     let mut next = 0;
     while next < packages.len() {
-        let (owner, configuration) = &packages[next];
+        let (_, owner, configuration) = &packages[next];
         let owner = owner.clone();
         let declared = configuration.config.requires.clone();
         requirements = requirements
@@ -819,8 +871,8 @@ pub(super) fn load(
             // Lake's loader uses the requirement name as package identity;
             // the dependency's own name field does not override that selection.
             let index = packages.len();
-            selected.insert(identity, index);
-            packages.push((directory, configuration));
+            selected.insert(identity.clone(), index);
+            packages.push((identity, directory, configuration));
             edges.push(Vec::new());
             edges[next].push(index);
         }
@@ -846,7 +898,7 @@ pub(super) fn load(
     let mut configuration_imports = Vec::new();
     let packages = packages
         .into_iter()
-        .map(|(root, loaded)| {
+        .map(|(identity, root, loaded)| {
             let Configuration {
                 config,
                 input: configuration,
@@ -856,6 +908,7 @@ pub(super) fn load(
             configuration_imports.extend(imports);
             let libraries = library_sources(&root, &config)?;
             Ok(Package {
+                identity,
                 root,
                 config,
                 configuration,
@@ -906,6 +959,7 @@ mod tests {
         let libraries = library_sources(&root, &config)
             .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
         Package {
+            identity: fln_lake::canonical_package_name(&config.name),
             configuration: (root.join(filename), filename.to_owned()),
             root,
             config,
@@ -928,6 +982,41 @@ mod tests {
             git_checkouts: Vec::new(),
             metadata_guards: Vec::new(),
         }
+    }
+
+    #[test]
+    fn executable_selectors_keep_assigned_names_and_workspace_precedence() {
+        let mut root = package(LakeConfigFormat::Toml, "RootMain");
+        root.identity = "root".to_owned();
+        root.config.targets[0].name = "root-tool".to_owned();
+        root.config.targets[0].kind = TargetKind::Executable;
+        let mut right = package(LakeConfigFormat::Toml, "RightMain");
+        right.identity = "right".to_owned();
+        right.config.targets[0].name = "tool-name".to_owned();
+        right.config.targets[0].kind = TargetKind::Executable;
+        let mut left = package(LakeConfigFormat::Lean, "LeftMain");
+        left.identity = "left".to_owned();
+        left.config.targets[0].name = "tool-name".to_owned();
+        left.config.targets[0].kind = TargetKind::Executable;
+        let selected = sources(vec![root, right, left]);
+        for (selector, owner, module) in [
+            ("tool-name", "right", "RightMain"),
+            ("@left/tool-name", "left", "LeftMain"),
+            ("right/«tool-name»", "right", "RightMain"),
+            ("@/root-tool", "root", "RootMain"),
+            ("/root-tool", "root", "RootMain"),
+            ("root-tool", "root", "RootMain"),
+        ] {
+            let (package, target) = selected
+                .executable(selector)
+                .unwrap_or_else(|error| panic!("{selector}: {}", error.detail));
+            assert_eq!(package.identity, owner);
+            assert_eq!(target.roots, [module]);
+        }
+        for selector in ["root/tool-name", "@tomlPart/tool-name", "@missing/tool-name"] {
+            assert!(selected.executable(selector).is_err(), "{selector}");
+        }
+        assert!(selected.executable("@left/nested/tool-name").is_err());
     }
 
     fn artifacts(names: &[&str]) -> BTreeMap<Name, ModuleArtifacts> {
@@ -958,7 +1047,10 @@ mod tests {
             }
             let sources = sources(packages);
             let destinations = sources
-                .destinations(&artifacts(&["LeanPart.Child", "TomlPart.Child"]), &[])
+                .destinations(
+                    &artifacts(&["LeanPart.Child", "TomlPart.Child"]),
+                    &BTreeMap::new(),
+                )
                 .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
             for (module, build_dir) in [("LeanPart", "lean-out"), ("TomlPart", "toml-out")] {
                 let name = Name::from_components([module, "Child"]);
@@ -991,7 +1083,7 @@ mod tests {
                 packages.reverse();
             }
             let destinations = sources(packages)
-                .destinations(&artifacts(&["Shared"]), &[])
+                .destinations(&artifacts(&["Shared"]), &BTreeMap::new())
                 .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
             let root = PathBuf::from("/workspace/shared");
             assert_eq!(
@@ -1004,12 +1096,11 @@ mod tests {
     #[test]
     fn explicit_targets_and_imports_must_select_the_same_configuration() {
         let shared = Name::from_components(["Shared"]);
-        let entries = vec![shared.clone()];
         let modules = BTreeMap::from([(
             Name::from_components(["Consumer"]),
             Module {
                 source: Vec::new(),
-                imports: vec![shared],
+                imports: vec![shared.clone()],
             },
         )]);
         let mut executable = package(LakeConfigFormat::Lean, "Shared");
@@ -1017,8 +1108,9 @@ mod tests {
         executable.libraries.clear();
         let library = package(LakeConfigFormat::Toml, "Shared");
         let selected = sources(vec![executable, library]);
+        let owners = BTreeMap::from([(shared.clone(), &selected.packages[0])]);
         let error = selected
-            .validate_entry_imports(&entries, &modules)
+            .validate_entry_imports(&owners, &modules)
             .expect_err("identical source paths cannot erase distinct configurations");
         assert_eq!(error.class, "unsupported");
         assert!(error.detail.contains("sources or configurations"));
@@ -1028,8 +1120,12 @@ mod tests {
         target.name = "runner".to_owned();
         target.kind = TargetKind::Executable;
         combined.config.targets.push(target);
-        sources(vec![combined])
-            .validate_entry_imports(&entries, &modules)
+        let selected = sources(vec![combined]);
+        selected
+            .validate_entry_imports(
+                &BTreeMap::from([(shared, &selected.packages[0])]),
+                &modules,
+            )
             .unwrap_or_else(|error| panic!("{}", error.detail));
     }
 
@@ -1042,7 +1138,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
         let sources = sources(vec![lean, toml]);
         let error = sources
-            .destinations(&artifacts(&["Shared"]), &[])
+            .destinations(&artifacts(&["Shared"]), &BTreeMap::new())
             .expect_err("different physical sources remain ambiguous");
         assert_eq!(error.class, "unsupported");
         assert!(error.detail.contains("belongs to multiple local packages"));

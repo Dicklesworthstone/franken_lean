@@ -1905,7 +1905,7 @@ fn explicit_executable_roots_do_not_replace_library_import_sources() {
     ] {
         let error = failure(&package.build(&targets));
         assert!(
-            error.contains("different executable-target and library-import"),
+            error.contains("different build-target and library-import"),
             "{error}"
         );
         assert_eq!(std::fs::read(package.artifact("App.Main")).unwrap(), old);

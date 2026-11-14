@@ -270,12 +270,79 @@ fn library_sources(root: &Path, config: &LakeConfig) -> Result<Vec<Library>, Fai
     Ok(libraries)
 }
 
+/// The same module name cannot stand for two source/configuration owners in a
+/// single compilation. Keep the selected owner through publication and snapshot
+/// reconstruction instead of erasing package qualifiers after argument parsing.
+type ModuleOwners<'a> = BTreeMap<Name, &'a local_dependencies::Package>;
+
+struct BuildPlan<'a> {
+    entries: Vec<Name>,
+    owners: ModuleOwners<'a>,
+    ir: BTreeSet<Name>,
+}
+
+fn module_target<'a>(
+    sources: &'a local_dependencies::Sources,
+    target: &str,
+) -> Result<(Name, &'a local_dependencies::Package), Failure> {
+    let (package, module) = if !target.starts_with('+')
+        && let Some((package, module)) = target.split_once('/')
+    {
+        if module.contains('/') {
+            return Err(Failure::input(format!(
+                "invalid module target `{target}`: more than one package separator",
+            )));
+        }
+        (
+            Some(sources.package(package.strip_prefix('@').unwrap_or(package))?),
+            module,
+        )
+    } else if target.starts_with('@') {
+        return Err(Failure::unsupported(format!(
+            "package target `{target}` has no module facet; select @package/+Module:olean or @package/+Module:ir",
+        )));
+    } else {
+        (None, target)
+    };
+    let named_target = |package: &local_dependencies::Package| {
+        let identity = fln_lake::canonical_package_name(module);
+        package
+            .config
+            .targets
+            .iter()
+            .any(|target| fln_lake::canonical_package_name(&target.name) == identity)
+    };
+    if !module.starts_with('+')
+        && package.map_or_else(|| sources.packages.iter().any(named_target), named_target)
+    {
+        return Err(Failure::unsupported(format!(
+            "target `{module}` has no library or executable olean facet; select the module explicitly as +{module}:olean"
+        )));
+    }
+    let module = name(module.strip_prefix('+').unwrap_or(module))?;
+    let owner = match package {
+        Some(package) => package.target_path(&module)?.map(|_| package),
+        None => sources
+            .resolve_target_package(&module)?
+            .map(|(package, _)| package),
+    }
+    .ok_or_else(|| {
+        Failure::input(format!(
+            "module `{}` does not belong to a declared lean_lib or lean_exe root{}",
+            module.to_display_string(),
+            package.map_or_else(String::new, |package| format!(
+                " in package `{}`",
+                package.identity,
+            )),
+        ))
+    })?;
+    Ok((module, owner))
+}
+
 fn plan_modules<'a>(
-    target_names: impl IntoIterator<Item = &'a str>,
-    sources: &local_dependencies::Sources,
+    sources: &'a local_dependencies::Sources,
     targets: &[String],
-) -> Result<Vec<Name>, Failure> {
-    let target_names: BTreeSet<_> = target_names.into_iter().collect();
+) -> Result<BuildPlan<'a>, Failure> {
     if targets.is_empty() {
         return Err(Failure::unsupported(
             "default library and executable facets are unavailable; request +Module:olean for a declared lean_lib module",
@@ -284,7 +351,11 @@ fn plan_modules<'a>(
     if targets.len() > MAX_MODULES {
         return Err(Failure::new("resource", "build target count exceeds 256"));
     }
-    let mut modules = Vec::new();
+    let mut plan = BuildPlan {
+        entries: Vec::new(),
+        owners: BTreeMap::new(),
+        ir: BTreeSet::new(),
+    };
     for target in targets {
         let Some((module, facet)) = target.split_once(':') else {
             return Err(Failure::unsupported(format!(
@@ -296,23 +367,23 @@ fn plan_modules<'a>(
                 "facet `{facet}` is unavailable; supported module facets: +Module:olean, +Module:ir"
             )));
         }
-        if !module.starts_with('+') && target_names.contains(module) {
-            return Err(Failure::unsupported(format!(
-                "target `{module}` has no library or executable olean facet; select the module explicitly as +{module}:olean"
-            )));
+        let (module, owner) = module_target(sources, module)?;
+        if let Some(previous) = plan.owners.get(&module) {
+            if !std::ptr::eq(*previous, owner) {
+                return Err(Failure::unsupported(format!(
+                    "module `{}` selects different packages in one build",
+                    module.to_display_string(),
+                )));
+            }
+        } else {
+            plan.entries.push(module.clone());
+            plan.owners.insert(module.clone(), owner);
         }
-        let module = name(module.strip_prefix('+').unwrap_or(module))?;
-        if sources.resolve_target(&module)?.is_none() {
-            return Err(Failure::input(format!(
-                "module `{}` does not belong to a declared lean_lib or lean_exe root",
-                module.to_display_string()
-            )));
-        }
-        if !modules.contains(&module) {
-            modules.push(module);
+        if facet == "ir" {
+            plan.ir.insert(module);
         }
     }
-    Ok(modules)
+    Ok(plan)
 }
 
 fn load_sources_with(
@@ -420,15 +491,10 @@ struct CompileFacets<'a> {
 /// Every local dependency of an executable target also needs its own companion.
 /// Other requested admission-only targets keep their independent facet contract.
 fn executable_modules(
-    targets: &[String],
+    entries: &BTreeSet<Name>,
     modules: &BTreeMap<Name, Module>,
-) -> Result<BTreeSet<Name>, Failure> {
-    let mut pending = Vec::new();
-    for target in targets {
-        if let Some((module, "ir")) = target.split_once(':') {
-            pending.push(name(module.strip_prefix('+').unwrap_or(module))?);
-        }
-    }
+) -> BTreeSet<Name> {
+    let mut pending: Vec<_> = entries.iter().cloned().collect();
     let mut executable = BTreeSet::new();
     while let Some(name) = pending.pop() {
         if let Some(module) = modules.get(&name)
@@ -437,7 +503,7 @@ fn executable_modules(
             pending.extend(module.imports.iter().cloned());
         }
     }
-    Ok(executable)
+    executable
 }
 
 fn compile(
@@ -925,20 +991,12 @@ fn build(
     let config = loaded.config.clone();
     let sources = local_dependencies::load(&root, loaded, evaluation)?;
     let configuration_imports = &sources.configuration_imports;
-    let entries = plan_modules(
-        sources.packages.iter().flat_map(|package| {
-            package
-                .config
-                .targets
-                .iter()
-                .map(|target| target.name.as_str())
-        }),
-        &sources,
-        &targets,
-    )?;
-    let modules = load_sources_with(&entries, |module| sources.resolve_build(module, &entries))?;
-    sources.validate_entry_imports(&entries, &modules)?;
-    let executable = executable_modules(&targets, &modules)?;
+    let plan = plan_modules(&sources, &targets)?;
+    let modules = load_sources_with(&plan.entries, |module| {
+        sources.resolve_build(module, &plan.owners)
+    })?;
+    sources.validate_entry_imports(&plan.owners, &modules)?;
+    let executable = executable_modules(&plan.ir, &modules);
     let records = macro_config
         .is_none()
         .then(|| source_check::module_records(posture));
@@ -956,7 +1014,7 @@ fn build(
     } = compile(
         &root,
         CompileFacets {
-            entries: &entries,
+            entries: &plan.entries,
             executable: &executable,
         },
         &modules,
@@ -965,7 +1023,7 @@ fn build(
         records.as_ref().and_then(|records| records.persisted()),
         macro_config.as_ref(),
     )?;
-    let destinations = sources.destinations(&artifacts, &entries)?;
+    let destinations = sources.destinations(&artifacts, &plan.owners)?;
     sources.verify_configurations()?;
     let paths = publish_locations_with(&artifacts, &destinations, fln::publish_file_atomic)?;
     let snapshot = record_snapshot(
@@ -973,7 +1031,7 @@ fn build(
         &config,
         &sources,
         &targets,
-        &entries,
+        &plan.owners,
         &modules,
         &artifacts,
         &destinations,
@@ -1111,7 +1169,7 @@ fn record_snapshot(
     config: &LakeConfig,
     sources: &local_dependencies::Sources,
     targets: &[String],
-    entries: &[Name],
+    owners: &ModuleOwners<'_>,
     modules: &BTreeMap<Name, Module>,
     artifacts: &BTreeMap<Name, ModuleArtifacts>,
     destinations: &BTreeMap<Name, (PathBuf, PathBuf)>,
@@ -1132,7 +1190,7 @@ fn record_snapshot(
             .get(name)
             .ok_or("an artifact has no source module")?;
         let source = sources
-            .resolve_build(name, entries)
+            .resolve_build(name, owners)
             .map_err(|failure| failure.detail)?
             .ok_or("a built module has no source owner")?;
         let (owner, output_dir) = destinations
