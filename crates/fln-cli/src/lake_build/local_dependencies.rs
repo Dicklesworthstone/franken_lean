@@ -647,7 +647,10 @@ impl Sources {
                 }
                 let Some((target_owner, target_path)) = self.resolve_target_package(imported)?
                 else {
-                    return Err(Failure::new("internal-fault", "build target lost its owner"));
+                    return Err(Failure::new(
+                        "internal-fault",
+                        "build target lost its owner",
+                    ));
                 };
                 let Some((owner, path)) = self.resolve_package(imported)? else {
                     return Err(Failure::input(format!(

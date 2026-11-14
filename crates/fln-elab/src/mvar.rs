@@ -4,7 +4,7 @@
 //! delayed assignments, assignment justifications, DAG-preserving instantiation, occurs-check,
 //! and targeted wake-up dependency tracking.
 
-use crate::lctx::LocalContext;
+use crate::lctx::{LocalContext, LocalDecl};
 use fln_core::expr::{Expr, ExprNode, FVarId, MVarId};
 use fln_core::name::Name;
 use std::collections::{HashMap, HashSet};
@@ -257,6 +257,57 @@ impl MetavarStore {
 
     pub fn get_decl(&self, id: &MVarId) -> Option<&MetavarDecl> {
         self.decls.get(id)
+    }
+
+    /// Insert a generalized dependency only into a saved scope that already
+    /// contains its auto-bound anchor. Other scopes and all metavariable
+    /// metadata stay intact. The caller meters the declaration/context walks.
+    pub(crate) fn insert_local_before(
+        &mut self,
+        id: &MVarId,
+        anchor: &FVarId,
+        local: &LocalDecl,
+    ) -> Result<bool, MetavarError> {
+        let declaration = self
+            .decls
+            .get(id)
+            .ok_or_else(|| MetavarError::NotDeclared { id: id.clone() })?;
+        let Some(position) = declaration
+            .lctx
+            .decls()
+            .iter()
+            .position(|entry| &entry.id == anchor)
+        else {
+            return Ok(false);
+        };
+        if declaration.lctx.contains(&local.id) {
+            return Ok(false);
+        }
+        let mut locals = declaration.lctx.decls().to_vec();
+        locals.insert(position, local.clone());
+        let mut lctx = LocalContext::new();
+        for entry in locals {
+            match entry.value {
+                Some(value) => {
+                    lctx.add_let(entry.id, entry.user_name, entry.type_, value);
+                }
+                None => {
+                    lctx.add_param(entry.id, entry.user_name, entry.type_, entry.binder_info);
+                }
+            }
+        }
+        let mut dependencies = self.collect_mvars(&local.type_);
+        if let Some(value) = &local.value {
+            dependencies.extend(self.collect_mvars(value));
+        }
+        self.decls
+            .get_mut(id)
+            .ok_or_else(|| MetavarError::NotDeclared { id: id.clone() })?
+            .lctx = lctx;
+        for read in dependencies {
+            self.readers.entry(read).or_default().insert(id.clone());
+        }
+        Ok(true)
     }
 
     /// Change inference policy without replacing scope, dependencies, or assignments.
@@ -585,6 +636,108 @@ mod tests {
 
     fn metadata(expr: Expr) -> Expr {
         Expr::mdata(KVMap::new(), expr)
+    }
+
+    #[test]
+    fn generalized_locals_rebase_only_anchored_scopes_and_preserve_state() {
+        let mut store = MetavarStore::new();
+        let outside = declare(&mut store, "outside");
+        store
+            .assign(
+                outside.clone(),
+                Expr::sort(Level::zero()),
+                AssignmentJustification::DirectDefEq,
+            )
+            .unwrap();
+        let type_dep = declare(&mut store, "carrier_type");
+        let value_dep = declare(&mut store, "carrier_value");
+        let anchor = FVarId(Name::from_components(["auto"]));
+        let tail = FVarId(Name::from_components(["tail"]));
+        let mut scope = LocalContext::new();
+        scope.add_param(
+            anchor.clone(),
+            anchor.0.clone(),
+            Expr::sort(Level::one()),
+            BinderInfo::Implicit,
+        );
+        scope.add_let(
+            tail.clone(),
+            tail.0.clone(),
+            Expr::sort(Level::one()),
+            Expr::sort(Level::zero()),
+        );
+        let inside = MVarId(Name::from_components(["inside"]));
+        store.declare(
+            inside.clone(),
+            inside.0.clone(),
+            Expr::sort(Level::one()),
+            scope,
+            MetavarKind::SyntheticOpaque,
+            3,
+            Some(Name::from_components(["origin"])),
+        );
+        let declaration = store.decls.get_mut(&inside).unwrap();
+        declaration.delayed = Some(DelayedAssignment {
+            fvars: vec![anchor.clone()],
+            val: Expr::fvar(anchor.clone()),
+        });
+        declaration.scope_args = Some(2);
+        let original_inside = store.get_decl(&inside).unwrap().clone();
+        let original_outside = store.get_decl(&outside).unwrap().clone();
+        let assignments = store.assignments().clone();
+        let revision = store.assignment_revision();
+        let carrier = LocalDecl {
+            id: FVarId(Name::from_components(["carrier"])),
+            user_name: Name::from_components(["carrier"]),
+            type_: metadata(Expr::mvar(type_dep.clone())),
+            value: Some(metadata(Expr::mvar(value_dep.clone()))),
+            binder_info: BinderInfo::Default,
+            index: 99,
+        };
+        assert!(
+            !store
+                .insert_local_before(&outside, &anchor, &carrier)
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_local_before(&inside, &anchor, &carrier)
+                .unwrap()
+        );
+        assert_eq!(store.get_decl(&outside), Some(&original_outside));
+        let mut rebased = store.get_decl(&inside).unwrap().clone();
+        assert_eq!(
+            rebased
+                .lctx
+                .decls()
+                .iter()
+                .map(|local| (local.id.clone(), local.index))
+                .collect::<Vec<_>>(),
+            [(carrier.id.clone(), 0), (anchor, 1), (tail, 2)]
+        );
+        assert_eq!(
+            rebased.lctx.decls()[2].value,
+            original_inside.lctx.decls()[1].value
+        );
+        rebased.lctx = original_inside.lctx.clone();
+        assert_eq!(rebased, original_inside);
+        assert_eq!(store.assignments(), &assignments);
+        assert_eq!(store.assignment_revision(), revision);
+        assert_eq!(
+            store.targeted_wake_up(&type_dep),
+            HashSet::from([inside.clone()])
+        );
+        assert_eq!(
+            store.targeted_wake_up(&value_dep),
+            HashSet::from([inside.clone()])
+        );
+        let snapshot = store.clone();
+        assert!(
+            !store
+                .insert_local_before(&inside, &carrier.id, &carrier)
+                .unwrap()
+        );
+        assert_eq!(store, snapshot);
     }
 
     #[test]

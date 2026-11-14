@@ -1834,14 +1834,25 @@ fn executable_module_facets_build_checked_dependencies_and_reuse_their_records()
         explanation.contains("\"reference_decision\":\"up-to-date\""),
         "{explanation}"
     );
-    assert!(explanation.contains("\"name\":\"Shared.Base\""), "{explanation}");
+    assert!(
+        explanation.contains("\"name\":\"Shared.Base\""),
+        "{explanation}"
+    );
     assert!(failure(&package.build(&["runner:olean"])).contains("select the module"));
     assert!(failure(&package.build(&["+App.Main.Child:olean"])).contains("declared lean_lib"));
     assert!(failure(&package.build(&["runner"])).contains("unavailable"));
     assert!(!package.0.join("products/bin/runner").exists());
-    assert!(!package.0.join("products/lib/lean/App/Unused.olean").exists());
+    assert!(
+        !package
+            .0
+            .join("products/lib/lean/App/Unused.olean")
+            .exists()
+    );
 
-    package.write("src/app/App/Main.lean", "prelude\ntheorem impossible : False := by rfl\n");
+    package.write(
+        "src/app/App/Main.lean",
+        "prelude\ntheorem impossible : False := by rfl\n",
+    );
     failure(&package.build(&targets));
     for (path, previous) in outputs.iter().zip(&bytes) {
         assert_eq!(std::fs::read(path).unwrap(), *previous);
@@ -1883,14 +1894,20 @@ fn explicit_executable_roots_do_not_replace_library_import_sources() {
         .output()
         .unwrap();
     let explain = success(&explain);
-    assert!(explain.contains("\"reference_decision\":\"up-to-date\""), "{explain}");
+    assert!(
+        explain.contains("\"reference_decision\":\"up-to-date\""),
+        "{explain}"
+    );
     let old = std::fs::read(package.artifact("App.Main")).unwrap();
     for targets in [
         ["+App.Main:olean", "+App.Use:olean"],
         ["+App.Use:olean", "+App.Main:olean"],
     ] {
         let error = failure(&package.build(&targets));
-        assert!(error.contains("different executable-target and library-import"), "{error}");
+        assert!(
+            error.contains("different executable-target and library-import"),
+            "{error}"
+        );
         assert_eq!(std::fs::read(package.artifact("App.Main")).unwrap(), old);
     }
 }
@@ -1909,7 +1926,10 @@ fn selecting_executable_modules_does_not_make_them_library_imports() {
         ["+Second:olean", "+First:olean"],
     ] {
         let error = failure(&package.build(&targets));
-        assert!(error.contains("not an importable lean_lib module"), "{error}");
+        assert!(
+            error.contains("not an importable lean_lib module"),
+            "{error}"
+        );
         assert!(!package.0.join(".lake").exists());
     }
 }

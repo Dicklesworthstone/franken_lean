@@ -10,6 +10,7 @@ on:
       - 'crates/fln/src/**'
       - 'crates/fln/tests/source*decis*.rs'
       - 'crates/fln/tests/source_deriving_ord.rs'
+      - 'crates/fln/tests/source_auto_bound_implicits.rs'
       - 'crates/fln/tests/source_record_defaults.rs'
       - 'crates/fln/tests/source_module_artifacts/structures.rs'
       - 'crates/fln-cli/src/**'
@@ -67,8 +68,8 @@ jobs:
           printf 'ELAN_HOME=%s\nFLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\nFLN_REQUIRE_REFERENCE=1\n' \
             "$ELAN_HOME" "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
           printf '%s\n' "$ELAN_HOME/bin" >> "$GITHUB_PATH"
-      - name: Check derived ordering through both checkers and serialized bytecode
-        run: cargo test --locked -p fln --test source_deriving_ord
+      - name: Check datatype headers and derived ordering through both checkers
+        run: cargo test --locked -p fln --test source_deriving_ord --test source_auto_bound_implicits
       - name: Check inherited structure defaults and transactional refusals
         run: cargo test --locked -p fln --test source_record_defaults
       - name: Check structure defaults through physical module export and import
@@ -81,6 +82,6 @@ jobs:
           cargo test --locked -p fln-elab --no-fail-fast
       - name: Check formatting, linting and workspace compatibility
         run: |
-          rustfmt --check --edition 2024 --config skip_children=true crates/fln-elab/src/source/deriving.rs crates/fln-elab/src/source/deriving/ord.rs crates/fln-elab/src/source/record.rs crates/fln-elab/src/source/record/flat.rs crates/fln-elab/src/source/record_terms/imported.rs crates/fln/src/source_records.rs crates/fln/tests/source_deriving_ord.rs crates/fln/tests/source_record_defaults.rs crates/fln-elab/src/seed/decidable_eq.rs crates/fln-elab/src/seed/decidable_generic.rs crates/fln/tests/source_equality_decisions.rs crates/fln/tests/source_generic_decisions.rs crates/fln-cli/tests/source_equality_decisions.rs
+          rustfmt --check --edition 2024 --config skip_children=true crates/fln-elab/src/source/deriving.rs crates/fln-elab/src/source/deriving/ord.rs crates/fln-elab/src/source/record.rs crates/fln-elab/src/source/record/flat.rs crates/fln-elab/src/source/record_terms/imported.rs crates/fln/src/source_records.rs crates/fln/tests/source_deriving_ord.rs crates/fln/tests/source_auto_bound_implicits.rs crates/fln/tests/source_record_defaults.rs crates/fln-elab/src/seed/decidable_eq.rs crates/fln-elab/src/seed/decidable_generic.rs crates/fln/tests/source_equality_decisions.rs crates/fln/tests/source_generic_decisions.rs crates/fln-cli/tests/source_equality_decisions.rs
           cargo clippy --locked -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets

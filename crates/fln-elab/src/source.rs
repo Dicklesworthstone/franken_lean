@@ -6662,6 +6662,39 @@ impl Context {
                 }
             }
         }
+        // Written binder holes were created before these carriers existed.
+        // Rebase only snapshots containing the corresponding auto: copying
+        // the whole current context would grant access to later binders.
+        for _ in 0..self.txn.mvars.len() {
+            self.tick()?;
+        }
+        let mut saved: Vec<_> = self.txn.mvars.decls().keys().cloned().collect();
+        saved.sort_by(|left, right| left.0.cmp(&right.0));
+        for ((id, _, _), position) in locals.iter().zip(&before) {
+            let local = self.txn.lctx.find(id).expect("generalized local").clone();
+            let anchor = &autos_ids[*position];
+            for hole in &saved {
+                self.tick()?;
+                let length = self
+                    .txn
+                    .mvars
+                    .get_decl(hole)
+                    .expect("saved metavariable")
+                    .lctx
+                    .len();
+                for _ in 0..length {
+                    self.tick()?;
+                }
+                self.txn
+                    .mvars
+                    .insert_local_before(hole, anchor, &local)
+                    .map_err(|error| {
+                        failure(SourceInferenceError::Unification(Box::new(
+                            UnificationError::Metavariable(error),
+                        )))
+                    })?;
+            }
+        }
         let mut rebuilt = Vec::with_capacity(parameters.len() + locals.len());
         for (position, parameter) in parameters.iter().enumerate() {
             if position < autos {
@@ -7164,9 +7197,19 @@ fn definition_elaboration(
     // header holes; inferred results may still constrain ordinary parameters.
     context.resolve_instances(true)?;
     context.resume_postponed_eliminators(true)?;
-    if let Some(expected) = &expected {
+    if expected.is_some() || auto_count > 0 {
         context.flush(true)?;
-        context.generalize_auto_bound_holes(&mut parameters, auto_count, expected)?;
+        // `MutualDef.elabHeaders` calls `addAutoBoundImplicits` even when
+        // the result type is inferred. Generalize those carriers before the
+        // body can specialize them; ordinary written binder holes stay open.
+        // With no written result, only the parameter types supply names.
+        let result = expected
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Expr::sort(Level::zero()));
+        context.generalize_auto_bound_holes(&mut parameters, auto_count, &result)?;
+    }
+    if let Some(expected) = &expected {
         let mut types = Vec::with_capacity(parameters.len() + 1);
         for parameter in &parameters {
             types.push(context.instantiate(&parameter.type_)?);

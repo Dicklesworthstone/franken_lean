@@ -741,6 +741,28 @@ impl Context {
         let level = self.level()?;
         let sort = Expr::sort(level.clone());
         let body = self.hole(sort.clone())?;
+        let first = self
+            .txn
+            .lctx
+            .decls()
+            .iter()
+            .position(|local| parameters.iter().any(|p| p.id == local.id))
+            .unwrap_or(self.txn.lctx.decls().len());
+        let inner = self.txn.lctx.clone();
+        let mut outer = inner.clone();
+        outer.truncate(first);
+        // A written binder's type can still be inferred by the body. Capture
+        // its holes before closing the reference telescope: a later solution
+        // may depend on an earlier parameter, including an auto-bound carrier.
+        // Process domains in order so later captures see earlier abstractions.
+        for parameter in parameters {
+            self.tick()?;
+            let mut local = Typed {
+                value: Expr::fvar(parameter.id.clone()),
+                type_: parameter.type_.clone(),
+            };
+            self.capture_bound_metavars(parameters, &outer, &mut local)?;
+        }
         let mut type_ = Expr::sort(level);
         for parameter in parameters.iter().rev() {
             self.tick()?;
@@ -755,15 +777,7 @@ impl Context {
         }
         // `?F` lives outside the parameters, as the pin's abstracted metavariable does: its
         // solution `fun α x n => α` may then mention them only through its own binders.
-        let first = self
-            .txn
-            .lctx
-            .decls()
-            .iter()
-            .position(|local| parameters.iter().any(|p| p.id == local.id))
-            .unwrap_or(self.txn.lctx.decls().len());
-        let inner = self.txn.lctx.clone();
-        self.txn.lctx.truncate(first);
+        self.txn.lctx = outer;
         let hole = self.hole(type_);
         self.txn.lctx = inner;
         let mut reference = hole?;

@@ -1,6 +1,6 @@
 //! Auto-bound implicits in source declaration headers (`withAutoBoundImplicit`,
 //! `addAutoBoundImplicits`, Lean/Elab/Term/TermElabM.lean:1932-2058).
-//! Earlier cases record their own pinned v4.32.0 observations below. The datatype-carrier
+//! Earlier cases record their own pinned v4.32.0 observations below. Additional carrier
 //! cases exercise the vendored header rules through native admission; their separate
 //! Reference comparison runs only when the pinned binary is available.
 #![forbid(unsafe_code)]
@@ -466,7 +466,6 @@ fn variables_bind_and_a_field_cannot_fix_its_own_universe() {
     refused("structure P where\n  x : α\n");
 }
 
-
 // Derived from MutualInductive.elabHeadersAux, Inductive.elabCtors, and
 // Structure.elabFieldType at the vendored pin. Native admission runs these
 // unconditionally; the final test compares the same inputs with a live pin.
@@ -488,16 +487,48 @@ const CONSTRUCTOR_CARRIERS: &str = r#"
 inductive Packed (α : Type) (x : α) : Type 1 where
   | mk (h : HEq a x) : Packed α x
   | later (h : HEq a x) : (b : α) → Packed α x
-example : Packed Nat 7 := Packed.mk (a := 7) rfl
-example : Packed Bool true := Packed.later (a := true) rfl false
+example : Packed Nat 7 := Packed.mk (a := 7) (by rfl)
+example : Packed Bool true := Packed.later (a := true) (by rfl) false
 "#;
 
 const FIELD_CARRIERS: &str = r#"
 structure FieldCarrier (α : Type) (x : α) : Type where
   compare (h : HEq a x) : HEq a x := h
 def fieldCarrier : FieldCarrier Nat 7 := {}
-example : HEq (7 : Nat) 7 := fieldCarrier.compare (a := 7) rfl
+example : HEq (7 : Nat) 7 := fieldCarrier.compare (a := 7) (by rfl)
 "#;
+
+// `MutualDef.elabHeaders` binds auto carriers before elaborating a definition's
+// body, including definitions without a written result. Ordinary written
+// binder holes remain available for the body's type inference.
+const INFERRED_RESULT_CARRIERS: &str = r#"
+def inferredEq (h : a = b) := h
+abbrev abbreviatedEq (h : a = b) := h
+def inferredHEq (h : HEq a b) := h
+def mixedCarrier (h : a = a) (n) := Nat.succ n
+def inferCarrier (h : a = a) (x) := (a = x)
+def inferTwo (h : HEq a b) (x) (y) := ((a = x) = (b = y))
+def inferWrittenCarrier (A : Type) (x) := (x : A)
+def inferWritten (n) := Nat.succ n
+example : (3 : Nat) = 3 := inferredEq (a := (3 : Nat)) (b := 3) rfl
+example : True.intro = True.intro := abbreviatedEq (a := True.intro) (b := True.intro) rfl
+example : HEq (3 : Nat) (3 : Nat) := inferredHEq (a := (3 : Nat)) (b := (3 : Nat)) (by rfl)
+example : mixedCarrier (a := true) rfl 4 = 5 := rfl
+example : inferWritten 3 = 4 := rfl
+example : inferCarrier (a := (3 : Nat)) rfl 3 := rfl
+example : inferTwo (a := true) (b := true) (by rfl) true true := rfl
+example : inferWrittenCarrier Nat 5 = 5 := rfl
+"#;
+
+const INVALID_INFERRED_RESULT_CARRIERS: &[&str] = &[
+    "def bodySpecializes (h : a = a) := Nat.succ a\n",
+    "def unresolvedWritten (x) := x\n",
+    "def unresolvedMixed (h : a = a) (x) := h\n",
+    "def laterWrittenType (h : a = a) (x) (A : Type) := (x : A)\n",
+    "def laterBodyType (h : a = a) (x) := fun (A : Type) => (x : A)\n",
+    "def laterDependency (A : Type) (x : A) (h : x = y) := h\n",
+    "set_option autoImplicit false in\ndef disabled (h : a = a) := h\n",
+];
 
 const INVALID_CARRIERS: &[&str] = &[
     "inductive Bad (A : Type) (x : A) (h : x = y) : Prop where\n  | mk\n",
@@ -597,6 +628,99 @@ fn field_carriers_close_before_defaults_and_do_not_escape_the_record() {
 }
 
 #[test]
+fn inferred_result_headers_generalize_carriers_before_body_inference() {
+    let engine = checked(INFERRED_RESULT_CARRIERS);
+    for name in ["inferredEq", "abbreviatedEq"] {
+        let found = binders(&engine, name, 4);
+        assert_eq!(declaration_binder_count(&engine, name), 4);
+        assert!(found[0].0.contains("._@."), "{name}: {found:?}");
+        assert!(matches!(found[0].2.node(), ExprNode::Sort { .. }));
+        assert_eq!((found[1].0.as_str(), found[2].0.as_str()), ("a", "b"));
+        assert_eq!(found[1].2, Expr::bvar(0).unwrap());
+        assert_eq!(found[2].2, Expr::bvar(1).unwrap());
+        assert_eq!(found[3].0, "h");
+        assert_eq!(
+            found.iter().map(|(_, style, _)| *style).collect::<Vec<_>>(),
+            [
+                BinderInfo::Implicit,
+                BinderInfo::Implicit,
+                BinderInfo::Implicit,
+                BinderInfo::Default
+            ]
+        );
+        let info = engine
+            .environment()
+            .find(&Name::from_components([name]))
+            .unwrap();
+        assert_eq!(info.constant_val().level_params.len(), 1, "{name}");
+        assert!(!info.constant_val().type_.has_expr_mvar());
+        assert!(!info.constant_val().type_.has_level_mvar());
+    }
+    let heq = binders(&engine, "inferredHEq", 5);
+    assert_eq!(declaration_binder_count(&engine, "inferredHEq"), 5);
+    assert!(heq[0].0.contains("._@."));
+    assert!(heq[2].0.contains("._@."));
+    assert_ne!(heq[0].0, heq[2].0);
+    assert!(matches!(heq[0].2.node(), ExprNode::Sort { .. }));
+    assert_eq!(heq[0].2, heq[2].2);
+    assert_eq!((heq[1].0.as_str(), heq[3].0.as_str()), ("a", "b"));
+    assert_eq!(heq[1].2, Expr::bvar(0).unwrap());
+    assert_eq!(heq[3].2, Expr::bvar(0).unwrap());
+    assert!(
+        heq[..4]
+            .iter()
+            .all(|(_, style, _)| *style == BinderInfo::Implicit)
+    );
+    assert_eq!(heq[4].1, BinderInfo::Default);
+
+    // Generalizing an auto carrier must not turn the separately written `(n)`
+    // into another implicit parameter or prevent the body from inferring Nat.
+    let mixed = binders(&engine, "mixedCarrier", 4);
+    assert_eq!(declaration_binder_count(&engine, "mixedCarrier"), 4);
+    assert!(mixed[0].0.contains("._@."));
+    assert_eq!(mixed[0].1, BinderInfo::Implicit);
+    assert_eq!(mixed[1].0, "a");
+    assert_eq!(mixed[1].1, BinderInfo::Implicit);
+    assert_eq!(mixed[2].0, "h");
+    assert_eq!(mixed[2].1, BinderInfo::Default);
+    assert_eq!(mixed[3].0, "n");
+    assert_eq!(mixed[3].1, BinderInfo::Default);
+    assert_eq!(mixed[3].2, constant("Nat"));
+    let same = binders(&engine, "inferCarrier", 4);
+    assert_eq!(declaration_binder_count(&engine, "inferCarrier"), 4);
+    assert_eq!(same[3].0, "x");
+    assert_eq!(same[3].1, BinderInfo::Default);
+    assert_eq!(same[3].2, Expr::bvar(2).unwrap());
+    let two = binders(&engine, "inferTwo", 7);
+    assert_eq!(declaration_binder_count(&engine, "inferTwo"), 7);
+    assert_ne!(two[0].0, two[2].0);
+    assert_eq!((two[5].0.as_str(), two[6].0.as_str()), ("x", "y"));
+    assert_eq!(two[5].1, BinderInfo::Default);
+    assert_eq!(two[6].1, BinderInfo::Default);
+    assert_eq!(two[5].2, Expr::bvar(4).unwrap());
+    assert_eq!(two[6].2, Expr::bvar(3).unwrap());
+    let written_carrier = binders(&engine, "inferWrittenCarrier", 2);
+    assert_eq!(declaration_binder_count(&engine, "inferWrittenCarrier"), 2);
+    assert_eq!(written_carrier[0].0, "A");
+    assert_eq!(written_carrier[0].1, BinderInfo::Default);
+    assert_eq!(written_carrier[1].0, "x");
+    assert_eq!(written_carrier[1].1, BinderInfo::Default);
+    assert_eq!(written_carrier[1].2, Expr::bvar(0).unwrap());
+    let written = binders(&engine, "inferWritten", 1);
+    assert_eq!(declaration_binder_count(&engine, "inferWritten"), 1);
+    assert_eq!(written[0].0, "n");
+    assert_eq!(written[0].1, BinderInfo::Default);
+    assert_eq!(written[0].2, constant("Nat"));
+}
+
+#[test]
+fn inferred_result_bodies_cannot_specialize_generalized_carriers() {
+    for source in INVALID_INFERRED_RESULT_CARRIERS {
+        refused(source);
+    }
+}
+
+#[test]
 fn auto_bound_carrier_generalization_does_not_rescue_invalid_headers() {
     for source in INVALID_CARRIERS {
         refused(source);
@@ -604,7 +728,7 @@ fn auto_bound_carrier_generalization_does_not_rescue_invalid_headers() {
 }
 
 #[test]
-fn datatype_carrier_programs_match_the_installed_reference() {
+fn auto_bound_carrier_programs_match_the_installed_reference() {
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -621,11 +745,10 @@ fn datatype_carrier_programs_match_the_installed_reference() {
     let reference = library
         .and_then(|lib| {
             let root = lib.parent()?.parent()?;
-            Some(root.join("bin").join(if cfg!(windows) {
-                "lean.exe"
-            } else {
-                "lean"
-            }))
+            Some(
+                root.join("bin")
+                    .join(if cfg!(windows) { "lean.exe" } else { "lean" }),
+            )
         })
         .filter(|binary| binary.is_file());
     let Some(reference) = reference else {
@@ -633,7 +756,7 @@ fn datatype_carrier_programs_match_the_installed_reference() {
             std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
             "the pinned Reference binary is required"
         );
-        eprintln!("SKIP: datatype carrier differential requires the pinned Reference binary");
+        eprintln!("SKIP: auto-bound carrier differential requires the pinned Reference binary");
         return;
     };
     let identity = Command::new(&reference).arg("--githash").output().unwrap();
@@ -644,7 +767,7 @@ fn datatype_carrier_programs_match_the_installed_reference() {
         "unexpected Reference identity"
     );
     let root = std::env::temp_dir().join(format!(
-        "fln-datatype-carriers-{}-{}",
+        "fln-auto-bound-carriers-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -652,15 +775,22 @@ fn datatype_carrier_programs_match_the_installed_reference() {
             .as_nanos()
     ));
     std::fs::create_dir(&root).unwrap();
-    for (index, (source, accepted)) in [
+    let accepted_sources = [
         DATATYPE_CARRIERS,
         CONSTRUCTOR_CARRIERS,
         FIELD_CARRIERS,
-    ]
-    .into_iter()
-    .map(|source| (source, true))
-    .chain(INVALID_CARRIERS.iter().copied().map(|source| (source, false)))
-    .enumerate()
+        INFERRED_RESULT_CARRIERS,
+    ];
+    let rejected_sources = INVALID_CARRIERS
+        .iter()
+        .chain(INVALID_INFERRED_RESULT_CARRIERS)
+        .copied()
+        .map(|source| (source, false));
+    for (index, (source, accepted)) in accepted_sources
+        .into_iter()
+        .map(|source| (source, true))
+        .chain(rejected_sources)
+        .enumerate()
     {
         let path = root.join(format!("case-{index}.lean"));
         std::fs::write(&path, source).unwrap();
