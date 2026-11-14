@@ -128,9 +128,9 @@ fn escaped_antiquotations_keep_each_dollar_and_the_primitive_capture_kind() {
             };
             assert_eq!(escapes.len(), count - 1);
             assert!(
-                escapes.iter().all(|escape| {
-                    matches!(escape, Syntax::Atom { val, .. } if val == "$")
-                })
+                escapes
+                    .iter()
+                    .all(|escape| { matches!(escape, Syntax::Atom { val, .. } if val == "$") })
             );
             assert!(
                 matches!(&args[2], Syntax::Ident { val, .. } if *val == Name::from_components(["x"]))

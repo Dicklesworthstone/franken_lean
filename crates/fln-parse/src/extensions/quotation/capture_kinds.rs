@@ -14,6 +14,7 @@ pub(in crate::extensions) fn registration_error(reason: &str) -> bool {
         reason,
         INCOMPATIBLE_CAPTURE
             | repetition::DUPLICATE_ITERATION_CAPTURE
+            | "an antiquotation of no macro variable"
             | "a quoted macro pattern past the node or depth budget"
             | "a macro template past the node budget"
             | "a captured template value past the node budget"

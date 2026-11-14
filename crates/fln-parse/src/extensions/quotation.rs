@@ -69,7 +69,11 @@ fn escaped_capture_body(
     let framing = null_args(escapes)
         .ok_or("a malformed escaped antiquotation")?
         .len()
-        .checked_add(if null_args(annotation).is_some() { 3 } else { 5 })
+        .checked_add(if null_args(annotation).is_some() {
+            3
+        } else {
+            5
+        })
         .ok_or("macro template work overflow")?;
     if kind_is(expression, &["antiquotNestedExpr"]) {
         let body = node_args(expression)
@@ -156,9 +160,7 @@ pub(super) fn variables(children: &[Syntax]) -> Result<Vec<(Vec<usize>, Name)>, 
                 continue;
             }
             if leaf.contains("antiquot") {
-                return Err(
-                    "an unsupported splice or expression antiquotation in a macro pattern",
-                );
+                return Err("an unsupported splice or expression antiquotation in a macro pattern");
             }
             for (index, child) in args.iter().enumerate().rev() {
                 let mut path = path.clone();

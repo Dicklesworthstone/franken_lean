@@ -370,9 +370,22 @@ theorem preserved {p q : Prop} (x : p) (hq : q) : p := (quoteConst x) hq
 }
 
 #[test]
+fn escaped_pattern_identifiers_do_not_bind_template_captures() {
+    for pattern in ["$$x", "`($$x)", "`($$x:ident)"] {
+        let source =
+            format!("syntax \"h \" term : term\nmacro_rules | `(h {pattern}) => `(g $x)\n");
+        let error = check(&source).expect_err("escaped x is syntax, not a bound macro variable");
+        assert!(
+            error.contains("an antiquotation of no macro variable"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn escaped_pattern_antiquotations_match_one_stage_without_binding_the_literal_name() {
     let source = r#"
-syntax "quoteStage " term : term
+syntax "quoteStage " term:max : term
 macro_rules
   | `(quoteStage `($$x)) => `((1 : Nat))
   | `(quoteStage `($$$x)) => `((2 : Nat))
@@ -391,14 +404,14 @@ theorem escapedTemplate : produceEscaped = 1 := rfl
 #[test]
 fn escaped_annotations_and_nested_expressions_keep_their_quotation_stage() {
     let source = r#"
-syntax "quoteTypedStage " term : term
+syntax "quoteTypedStage " term:max : term
 macro_rules
   | `(quoteTypedStage `($$x:ident)) => `((1 : Nat))
   | `(quoteTypedStage $_) => `((2 : Nat))
 macro "produceTypedEscaped" : term => `(quoteTypedStage `($$x:ident))
-syntax "quoteNestedExpr " term : term
+syntax "quoteNestedExpr " term:max : term
 macro_rules | `(quoteNestedExpr `($$($captured))) => `($captured)
-macro "produceNestedExpr " x:term : term => `(quoteNestedExpr `($$($x)))
+macro "produceNestedExpr " x:term:max : term => `(quoteNestedExpr `($$($x)))
 theorem typedPattern : quoteTypedStage `($x:ident) = 1 := rfl
 theorem typedTemplate : produceTypedEscaped = 1 := rfl
 theorem typedOther : quoteTypedStage `($y:ident) = 2 := rfl
@@ -700,7 +713,7 @@ fn nested_quotation_templates_replay_without_consuming_another_escape() {
 syntax "journalUnquote " term : term
 macro_rules | `(journalUnquote `($x)) => `($x)
 macro "journalRoundtrip " x:term : term => `(journalUnquote `($x))
-syntax "journalStage " term : term
+syntax "journalStage " term:max : term
 macro_rules
   | `(journalStage `($$x)) => `((1 : Nat))
   | `(journalStage `($$$x)) => `((2 : Nat))

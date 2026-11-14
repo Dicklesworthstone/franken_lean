@@ -388,10 +388,9 @@ fn quotations_and_macros_produce_the_pins_trees() {
 }
 
 /// Outside a quotation `$` starts no antiquotation, and unsupported splice shapes are refused
-/// rather than read as operators. An escaped pattern does not bind its literal identifier,
-/// so using that identifier as a template capture remains invalid. `match $c with` is refused
-/// too: the pin reads a bare capture as its `(generalizing := …)` parameter, then misses the
-/// discriminant.
+/// rather than read as operators. `match $c with` is refused too: the pin reads a bare capture
+/// as its `(generalizing := …)` parameter, then misses the discriminant. Escaped antiquotations
+/// are valid syntax; the source checker separately rejects their use as unbound captures.
 #[test]
 fn antiquotations_outside_quotations_and_unread_splices_are_refused() {
     let mut grammar = FileGrammar::new(false, &[], None).expect("Init");
@@ -399,7 +398,6 @@ fn antiquotations_outside_quotations_and_unread_splices_are_refused() {
         "def f (x : Nat) : Nat := $x",
         "def f (c : Lean.Term) : Lean.MacroM Lean.Term := `(match $c with | _ => 1)",
         "macro_rules | `(h $xs*) => `(g $xs*)",
-        "macro_rules | `(h $$x) => `(g $x)",
         "macro_rules | `(h $x) => `(g $[$x]?)",
     ] {
         assert!(parse(&mut grammar, source).is_err(), "{source}");
@@ -408,6 +406,20 @@ fn antiquotations_outside_quotations_and_unread_splices_are_refused() {
     // unsupported splices above refused, rather than dropping this boundary.
     parse(&mut grammar, "macro_rules | `(h [$xs,*]) => `([$xs,*])")
         .expect("a list repetition capture has the pinned suffix-splice shape");
+    parse(&mut grammar, r#"syntax "h " term:max : term"#).expect("a native macro syntax");
+    let current = grammar.grammar();
+    let parsed = with_grammar(&current, || {
+        parse_source_command(b"macro_rules | `(h $$x) => `(g $x)")
+    })
+    .expect("an escaped pattern is syntactically valid before capture checking");
+    let mut escaped = String::new();
+    render(parsed.syntax(), &mut escaped);
+    assert!(escaped.contains(r#"(term.pseudo.antiquot "$" ["$"] `x [])"#));
+    assert!(escaped.contains(r#"(term.pseudo.antiquot "$" [] `x [])"#));
+    assert_eq!(
+        grammar.declare(parsed.syntax()).unwrap_err(),
+        "an antiquotation of no macro variable"
+    );
 }
 
 #[test]

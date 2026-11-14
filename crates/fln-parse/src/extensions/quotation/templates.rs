@@ -721,7 +721,10 @@ mod tests {
         let Syntax::Node { args, .. } = &mut escaped else {
             panic!("an antiquotation is a node");
         };
-        args[1] = null_node(vec![Syntax::atom(SourceInfo::None, "$"); MAX_TEMPLATE_NODES]);
+        args[1] = null_node(vec![
+            Syntax::atom(SourceInfo::None, "$");
+            MAX_TEMPLATE_NODES
+        ]);
         assert!(checked(&escaped, &[]).unwrap_err().contains("budget"));
         assert!(
             super::super::variables(std::slice::from_ref(&escaped))
