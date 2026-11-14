@@ -36,6 +36,7 @@ pub(super) fn signature(
         .or_else(|| word(row))
         .or_else(|| floating(row))
         .or_else(|| float_array(row))
+        .or_else(|| byte_array(row))
         .or_else(|| expressions::review(row))
         .or_else(|| levels::review(row))
         .or_else(|| names::review(row))
@@ -68,6 +69,165 @@ pub(super) fn signature(
         });
     }
     Ok(Some(review.signature))
+}
+
+/// ByteArray's ordinary externs use both boxed arrays and scalar bytes, words
+/// and Booleans. Proof-bearing get/set/uget/uset remain in array_proofs. The
+/// source telescopes are pinned by Init.Prelude, Init.Data.ByteArray.Basic and
+/// Init.Data.String.Basic; the generic copySlice ownership row does not encode
+/// the source compiler's separate borrowed/consumed parameter annotations.
+fn byte_array(row: &GeneratedExternRow) -> Option<Review> {
+    let (name, symbol, module, kind, ownership, parameters, result): (
+        _,
+        _,
+        _,
+        _,
+        _,
+        &'static [IrType],
+        &'static IrType,
+    ) = match row.id {
+        "extern:ByteArray.mk" => (
+            "ByteArray.mk",
+            "lean_byte_array_mk",
+            "Init.Prelude",
+            "ctor",
+            "abi((a: owned_arg) -> owned_res)",
+            &[IrType::Object],
+            &IrType::Object,
+        ),
+        "extern:ByteArray.data" => (
+            "ByteArray.data",
+            "lean_byte_array_data",
+            "Init.Prelude",
+            "defn",
+            "abi((a: owned_arg) -> owned_res)",
+            &[IrType::Object],
+            &IrType::Object,
+        ),
+        "extern:ByteArray.emptyWithCapacity" => (
+            "ByteArray.emptyWithCapacity",
+            "lean_mk_empty_byte_array",
+            "Init.Prelude",
+            "defn",
+            "abi((capacity: borrowed_arg) -> owned_res)",
+            &[IrType::TObject],
+            &IrType::Object,
+        ),
+        "extern:ByteArray.push" => (
+            "ByteArray.push",
+            "lean_byte_array_push",
+            "Init.Prelude",
+            "defn",
+            "abi((a: owned_arg, b: value) -> owned_res)",
+            &[IrType::Object, IrType::UInt8],
+            &IrType::Object,
+        ),
+        "extern:ByteArray.size" => (
+            "ByteArray.size",
+            "lean_byte_array_size",
+            "Init.Prelude",
+            "defn",
+            "abi((a: borrowed_arg) -> owned_res)",
+            &[IrType::Object],
+            &IrType::Tagged,
+        ),
+        "extern:ByteArray.usize" => (
+            "ByteArray.usize",
+            "lean_sarray_size",
+            "Init.Data.ByteArray.Basic",
+            "defn",
+            "abi((o: borrowed_arg) -> value)",
+            &[IrType::Object],
+            &IrType::USize,
+        ),
+        "extern:ByteArray.get!" => (
+            "ByteArray.get!",
+            "lean_byte_array_get",
+            "Init.Data.ByteArray.Basic",
+            "defn",
+            "abi((a: borrowed_arg, i: borrowed_arg) -> value)",
+            &[IrType::Object, IrType::TObject],
+            &IrType::UInt8,
+        ),
+        "extern:ByteArray.set!" => (
+            "ByteArray.set!",
+            "lean_byte_array_set",
+            "Init.Data.ByteArray.Basic",
+            "defn",
+            "abi((a: owned_arg, i: borrowed_arg, b: value) -> owned_res)",
+            &[IrType::Object, IrType::TObject, IrType::UInt8],
+            &IrType::Object,
+        ),
+        "extern:ByteArray.beq" => (
+            "ByteArray.beq",
+            "lean_sarray_dec_eq",
+            "Init.Data.ByteArray.Basic",
+            "defn",
+            "abi((a1: borrowed_arg, a2: borrowed_arg) -> value)",
+            &[IrType::Object, IrType::Object],
+            &IrType::UInt8,
+        ),
+        "extern:ByteArray.decEq" => (
+            "ByteArray.decEq",
+            "lean_sarray_dec_eq",
+            "Init.Data.ByteArray.Basic",
+            "defn",
+            "abi((a1: borrowed_arg, a2: borrowed_arg) -> value)",
+            &[IrType::Object, IrType::Object],
+            &IrType::UInt8,
+        ),
+        "extern:ByteArray.hash" => (
+            "ByteArray.hash",
+            "lean_byte_array_hash",
+            "Init.Data.ByteArray.Basic",
+            "opaque",
+            "abi((a: borrowed_arg) -> value)",
+            &[IrType::Object],
+            &IrType::UInt64,
+        ),
+        "extern:ByteArray.copySlice" => (
+            "ByteArray.copySlice",
+            "lean_byte_array_copy_slice",
+            "Init.Data.ByteArray.Basic",
+            "defn",
+            "rule(borrowed-args,owned-result)",
+            &[
+                IrType::Object,
+                IrType::TObject,
+                IrType::Object,
+                IrType::TObject,
+                IrType::TObject,
+                IrType::UInt8,
+            ],
+            &IrType::Object,
+        ),
+        "extern:ByteArray.validateUTF8" => (
+            "ByteArray.validateUTF8",
+            "lean_string_validate_utf8",
+            "Init.Data.String.Basic",
+            "defn",
+            "rule(borrowed-args,owned-result)",
+            &[IrType::Object],
+            &IrType::UInt8,
+        ),
+        _ => return None,
+    };
+    Some(Review {
+        name,
+        symbol,
+        module,
+        kind,
+        ownership,
+        signature: PrimitiveSignature {
+            parameters,
+            result,
+            exact_borrowed: if row.id == "extern:ByteArray.copySlice" {
+                Some(&[true, false, false, false, false, false])
+            } else {
+                None
+            },
+        },
+    })
 }
 
 /// FloatArray is an opaque packed object in native IR, while every element
