@@ -14972,11 +14972,12 @@ const LAKE_USAGE: &str = concat!(
     "\n",
     "\n",
     "See `lake help <command>` for more information on a specific command.\n",
-    "\nFrankenLean builds checked +Module:olean facets from declared libraries.\n",
+    "\nFrankenLean builds checked +Module:olean and supported +Module:ir facets.\n",
     "Supported TOML/Lean fields cover package paths, library roots and executable\n",
     "roots. Lean terms are checked against real Init and evaluated by Golem.\n",
     "Default library, native executable and other build facets remain unavailable.\n",
-    "lake exe runs configured roots and local TOML package libraries on Golem.\n",
+    "lake exe runs configured roots and local Lean/TOML package libraries on Golem.\n",
+    "lake update resolves the local dependency graph and atomically writes its manifest.\n",
     "Builds recheck source. Imports default to --import-posture reuse-verified:\n",
     "a record of an earlier admission of the identical .olean bytes by the same\n",
     "admission authority is rebuilt and re-proved by logical root;\n",
@@ -14996,11 +14997,14 @@ const LAKE_HELP_BUILD: &str = concat!(
     "  [@[<package>]/][<target>|[+]<module>][:<facet>]\n",
     "\n",
     "See `lake help <command>` for more information on a specific command.\n",
-    "\nFrankenLean supports +Module:olean for modules owned by a declared lean_lib.\n",
+    "\nFrankenLean supports +Module:olean and supported +Module:ir exports\n",
+    "for modules owned by a declared lean_lib.\n",
     "A native lakefile.lean may define checked helpers, package srcDir/buildDir\n",
     "and lean_lib srcDir/roots, with @[default_target] and computed module names.\n",
     "lean_exe root/srcDir configure source execution through lake exe/exec.\n",
-    "Other build fields and package dependency builds remain unavailable.\n",
+    "Local require paths may be checked FilePath terms. Mixed Lean/TOML\n",
+    "dependencies build into their own output directories; a root manifest\n",
+    "locks their selection. Remote dependencies and other build fields remain unavailable.\n",
     "Local source imports are built first; external imports (including implicit\n",
     "Init) are read from LEAN_PATH or the pinned toolchain and admitted by K1\n",
     "and the independent checker, or under the default --import-posture\n",
@@ -15040,10 +15044,10 @@ const LAKE_HELP_EXE: &str = concat!(
     "then runs main once on Golem. Every word after TARGET is a program argument,\n",
     "including options and --. Program output and its exit status are preserved.\n",
     "This executes checked source; it does not emit a native binary or satisfy\n",
-    "the executable build facet. TOML local-path requirements are resolved\n",
+    "the executable build facet. Lean/TOML local-path requirements are resolved\n",
     "transitively; each library source stays within its owning package.\n",
-    "Manifests, package overrides, remote dependencies, Lean dependency\n",
-    "configurations and custom build settings remain unavailable. Ordinary\n",
+    "A root manifest locks dependency paths and configuration filenames.\n",
+    "Package overrides, remote dependencies and custom build settings remain unavailable. Ordinary\n",
     "import admission and resource limits apply.\n",
     "Golem inherits the caller's environment; Lake's augmented subprocess\n",
     "environment is not installed by this source-execution route.\n",
@@ -15466,47 +15470,13 @@ pub fn run_lake(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 );
             }
             let target_dir = dir.unwrap_or_else(|| PathBuf::from("."));
-            match fln_lake::update_manifest(&target_dir) {
-                Ok(manifest) => {
-                    if is_json {
-                        MultiplexerOutput::success(format!(
-                            "{{\"schema\":\"fln.lake-update/1\",\"status\":\"success\",\"package\":{},\"packages_count\":{}}}\n",
-                            json_string(&manifest.name),
-                            manifest.packages.len()
-                        ))
-                    } else {
-                        MultiplexerOutput::success(String::new())
-                    }
-                }
-                Err(err @ fln_lake::LakeUpdateError::DependencyResolutionUnavailable { .. })
-                | Err(err @ fln_lake::LakeUpdateError::Unsupported(_)) => {
-                    lake_not_implemented(&cmd, &err.to_string(), is_json)
-                }
-                Err(err @ fln_lake::LakeUpdateError::Resource(_)) => {
-                    let detail = if is_json {
-                        format!(
-                            "{{\"schema\":\"fln.lake-update/1\",\"status\":\"inconclusive\",\"class\":\"resource\",\"authority\":false,\"error\":{}}}\n",
-                            json_string(&err.to_string()),
-                        )
-                    } else {
-                        format!("{err}\n")
-                    };
-                    MultiplexerOutput::failure(detail, 3)
-                }
-                Err(err) => {
-                    if is_json {
-                        MultiplexerOutput::failure(
-                            format!(
-                                "{{\"schema\":\"fln.lake-update/1\",\"status\":\"error\",\"error\":{}}}\n",
-                                json_string(&err.to_string()),
-                            ),
-                            1,
-                        )
-                    } else {
-                        MultiplexerOutput::failure(format!("{err}\n"), 1)
-                    }
-                }
-            }
+            lake_build::update_manifest(
+                target_dir,
+                is_json,
+                jobs.unwrap_or_else(default_import_jobs),
+                import_posture,
+                &cmd,
+            )
         }
         "exe" | "exec" => {
             let Some(target) = command_args.first() else {

@@ -11,7 +11,9 @@ use std::path::Component;
 mod executable;
 mod explain;
 mod local_dependencies;
+mod update;
 pub(super) use executable::run as run_executable;
+pub(super) use update::run as update_manifest;
 #[path = "lake_config.rs"]
 mod lean_config;
 mod snapshot;
@@ -201,52 +203,26 @@ fn source_path(module: &Name, libraries: &[Library]) -> Result<Option<PathBuf>, 
     Ok(found)
 }
 
-fn config(root: &Path) -> Result<LakeConfig, Failure> {
-    toml_config(root, false)
+#[derive(Clone, Copy)]
+enum ConfigurationSelection {
+    /// Lake's extensionless selector probes Lean before TOML.
+    Default,
+    Toml,
+    Lean,
 }
 
-fn executable_config(root: &Path) -> Result<LakeConfig, Failure> {
-    toml_config(root, true)
+struct Configuration {
+    config: LakeConfig,
+    /// The exact bytes parsed/evaluated, never a later read of the same path.
+    input: (PathBuf, String),
+    /// Absence of Lean selected TOML through the extensionless selector.
+    default_toml: bool,
+    imports: Option<ImportPostureReport>,
 }
 
-fn toml_config(root: &Path, local_requirements: bool) -> Result<LakeConfig, Failure> {
-    let path = root.join("lakefile.toml");
-    if !path.is_file() {
-        if !root.join("lakefile.lean").exists() {
-            return Err(Failure::input(format!(
-                "error: no such file or directory (error code: 2)\n  file: {}",
-                root.join("lakefile.lean").display()
-            )));
-        }
-        if local_requirements {
-            return Err(Failure::unsupported(
-                "local-path executable dependencies require lakefile.toml configurations",
-            ));
-        }
-        return Err(Failure::unsupported(
-            "build explain requires lakefile.toml because it does not elaborate or execute lakefile.lean configuration",
-        ));
-    }
-    check_path(root, &path, false)?;
-    let bytes = read_bounded(&path, 64 * 1024, "Lake configuration")?;
-    let text =
-        std::str::from_utf8(&bytes).map_err(|_| Failure::input("lakefile.toml is not UTF-8"))?;
-    let parsed = if local_requirements {
-        LakeConfig::parse_toml_for_execution(text)
-    } else {
-        LakeConfig::parse_toml_for_build(text)
-    };
-    let config = parsed.map_err(|error| {
-        let class = if matches!(error, fln_lake::LakeParseError::UnsupportedBuildSetting(_)) {
-            "unsupported"
-        } else {
-            "input"
-        };
-        Failure::new(class, error.to_string())
-    })?;
-    validate_executable_roots(&config)?;
-    Ok(config)
-}
+/// `None` keeps rebuild explanations entirely read-only: selected Lean
+/// configurations are unavailable rather than evaluated to reconstruct a graph.
+type ConfigurationEvaluation = Option<(std::num::NonZeroUsize, ImportPosture)>;
 
 /// Lake rejects executable targets that claim the same root module, even when
 /// their target names or source directories differ.
@@ -860,28 +836,72 @@ fn publish_locations_with(
 
 fn load_configuration(
     root: &Path,
-    jobs: std::num::NonZeroUsize,
-    posture: ImportPosture,
-) -> Result<(LakeConfig, Option<ImportPostureReport>), Failure> {
-    if root.join("lakefile.toml").is_file() {
-        return Ok((config(root)?, None));
-    }
+    selection: ConfigurationSelection,
+    evaluation: ConfigurationEvaluation,
+) -> Result<Configuration, Failure> {
     let lean = root.join("lakefile.lean");
     let toml = root.join("lakefile.toml");
-    if !lean
-        .try_exists()
-        .map_err(|error| Failure::io(&lean, error))?
-        && !toml
-            .try_exists()
-            .map_err(|error| Failure::io(&toml, error))?
-    {
-        return Err(Failure::new(
-            "missing-configuration",
-            format!("{}\n{}", lean.display(), toml.display()),
-        ));
+    let (is_lean, default_toml) = match selection {
+        ConfigurationSelection::Lean => (true, false),
+        ConfigurationSelection::Toml => (false, false),
+        ConfigurationSelection::Default => {
+            // Check the probe itself, including dangling symlinks, before it
+            // can select the fallback configuration.
+            check_path(root, &lean, true)?;
+            if lean
+                .try_exists()
+                .map_err(|error| Failure::io(&lean, error))?
+            {
+                (true, false)
+            } else {
+                check_path(root, &toml, true)?;
+                if !toml
+                    .try_exists()
+                    .map_err(|error| Failure::io(&toml, error))?
+                {
+                    return Err(Failure::new(
+                        "missing-configuration",
+                        format!("{}\n{}", lean.display(), toml.display()),
+                    ));
+                }
+                (false, true)
+            }
+        }
+    };
+    if is_lean {
+        let Some((jobs, posture)) = evaluation else {
+            return Err(Failure::unsupported(format!(
+                "build explain does not elaborate or execute lakefile.lean configuration: {}",
+                lean.display(),
+            )));
+        };
+        let loaded = lean_config::load(root, jobs, posture)?;
+        return Ok(Configuration {
+            config: loaded.config,
+            input: (lean, snapshot::digest(&loaded.source)),
+            default_toml,
+            imports: Some(loaded.imports),
+        });
     }
-    let loaded = lean_config::load(root, jobs, posture)?;
-    Ok((loaded.config, Some(loaded.imports)))
+    check_path(root, &toml, false)?;
+    let bytes = read_bounded(&toml, 64 * 1024, "Lake configuration")?;
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| Failure::input("lakefile.toml is not UTF-8"))?;
+    let config = LakeConfig::parse_toml_for_build(text).map_err(|error| {
+        let class = if matches!(error, fln_lake::LakeParseError::UnsupportedBuildSetting(_)) {
+            "unsupported"
+        } else {
+            "input"
+        };
+        Failure::new(class, error.to_string())
+    })?;
+    validate_executable_roots(&config)?;
+    Ok(Configuration {
+        config,
+        input: (toml, snapshot::digest(&bytes)),
+        default_toml,
+        imports: None,
+    })
 }
 
 fn build(
@@ -900,8 +920,11 @@ fn build(
             detail,
             authority,
         })?;
-    let (config, configuration_imports) = load_configuration(&root, jobs, posture)?;
-    let sources = local_dependencies::load(&root, &config)?;
+    let evaluation = Some((jobs, posture));
+    let loaded = load_configuration(&root, ConfigurationSelection::Default, evaluation)?;
+    let config = loaded.config.clone();
+    let sources = local_dependencies::load(&root, loaded, evaluation)?;
+    let configuration_imports = &sources.configuration_imports;
     let libraries = sources.libraries();
     let entries = plan_modules(
         sources.packages.iter().flat_map(|package| {
@@ -973,15 +996,18 @@ fn build(
             .map(|report| format!("{{{}}}", source_check::posture_json(report)))
             .collect::<Vec<_>>()
             .join(",");
-        let configuration_imports = configuration_imports
-            .as_ref()
-            .map(|report| {
-                format!(
-                    ",\"configuration_imports\":[{{{}}}]",
-                    source_check::posture_json(report)
-                )
-            })
-            .unwrap_or_default();
+        let configuration_imports = if configuration_imports.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ",\"configuration_imports\":[{}]",
+                configuration_imports
+                    .iter()
+                    .map(|report| format!("{{{}}}", source_check::posture_json(report)))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        };
         let rows = provenance
             .iter()
             .map(|row| {
@@ -1045,14 +1071,14 @@ fn build(
             .map(|report| format!(" Imports: {}.", source_check::posture_sentence(report)))
             .collect::<String>();
         let configuration_imports = configuration_imports
-            .as_ref()
+            .iter()
             .map(|report| {
                 format!(
                     " Configuration imports: {}.",
                     source_check::posture_sentence(report)
                 )
             })
-            .unwrap_or_default();
+            .collect::<String>();
         let macros = macro_reports
             .iter()
             .map(|(entry, report)| format!(" {}: {}", entry.to_display_string(), report.sentence))

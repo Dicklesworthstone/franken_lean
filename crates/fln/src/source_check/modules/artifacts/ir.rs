@@ -201,9 +201,32 @@ impl SourceModuleArtifact {
             .iter()
             .map(ConstantInfo::name)
             .collect();
+        let local_names: BTreeSet<_> = input.constants.iter().map(ConstantInfo::name).collect();
         let mut public_signatures = Vec::new();
         for constant in &input.constants {
             if noncomputable.contains(constant.name()) {
+                continue;
+            }
+            if matches!(constant,
+                ConstantInfo::Defn(definition)
+                    if definition.safety == fln_env::constants::DefinitionSafety::Partial)
+                && local_names.contains(&constant.name().parent())
+                && !noncomputable.contains(&constant.name().parent())
+                && crate::ir::is_checked_recursive_companion(
+                    &input.engine,
+                    constant.name(),
+                    limits.execution,
+                    limits.compiler,
+                )
+                .map_err(|error| SourceModuleIrError::Compile {
+                    module: input.name.clone(),
+                    declaration: constant.name().clone(),
+                    error: Box::new(error),
+                })?
+            {
+                // The owned logical declaration is compiled separately under
+                // its source ABI. Its exact executable companion is selected
+                // by runtime preparation, not emitted as an unsafe source API.
                 continue;
             }
             match constant {

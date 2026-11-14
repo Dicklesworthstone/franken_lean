@@ -120,7 +120,7 @@ fn local_requirements_are_retained_for_checked_execution_and_artifact_builds() {
 fn checked_requirements_do_not_ignore_remote_or_custom_settings() {
     for fields in [
         "name = \"dep\"\n",
-        "name = \"dep\"\ngit = \"https://example.invalid/dep\"\n",
+        "name = \"dep\"\npath = \"../dep\"\ngit = \"https://example.invalid/dep\"\n",
         "name = \"dep\"\npath = \"../dep\"\nrev = \"branch\"\n",
         "name = \"dep\"\npath = \"../dep\"\nscope = \"owner\"\n",
         "name = \"dep\"\npath = \"../dep\"\noptions = []\n",
@@ -1254,4 +1254,354 @@ fn local_update_uses_canonical_names_and_an_inherited_explicit_toml_selector() {
         std::fs::read_to_string(root.join("lake-manifest.json")).unwrap(),
     );
     assert_eq!(tree(&base), expected);
+}
+
+// These core resolver tests inject already checked configurations. The CLI's
+// installed tests exercise the actual source loader and Golem evaluation.
+fn update_checked_lean(name: &str, requirements: &[(&str, &str)]) -> LakeConfig {
+    LakeConfig {
+        name: name.to_owned(),
+        default_targets: Vec::new(),
+        lean_toolchain: None,
+        src_dir: PathBuf::from("."),
+        build_dir: PathBuf::from(".lake/build"),
+        requires: requirements
+            .iter()
+            .map(|(name, path)| fln_lake::LakeRequire {
+                name: (*name).to_owned(),
+                path: Some(PathBuf::from(path)),
+                url: None,
+                rev: None,
+                subdir: None,
+            })
+            .collect(),
+        targets: Vec::new(),
+        format: LakeConfigFormat::Lean,
+    }
+}
+
+#[test]
+fn local_update_lean_loader_resolves_mixed_packages_and_inherited_locks() {
+    let base = fresh_temp_dir("update-lean-mixed");
+    update_write_package(&base, "root", "this TOML must not be selected\n");
+    std::fs::write(
+        base.join("root/lakefile.lean"),
+        "package «root-project»\r\n",
+    )
+    .unwrap();
+    update_write_package(
+        &base,
+        "parent",
+        concat!(
+            "name = \"parent-lib\"\n",
+            "[[require]]\nname = \"leaf-lib\"\npath = \"missing-unlocked-leaf\"\n",
+            "[[require]]\nname = \"transitive-lib\"\npath = \"missing-unlocked-transitive\"\n",
+        ),
+    );
+    for (directory, source) in [
+        ("direct", "package leafOwnName\n"),
+        ("parent/vendor/locked", "package transitiveOwnName\n"),
+    ] {
+        std::fs::create_dir_all(base.join(directory)).unwrap();
+        std::fs::write(base.join(directory).join("lakefile.lean"), source).unwrap();
+    }
+    let mut inherited = fln_lake::Manifest::new("parent-lib");
+    let mut transitive = update_path_entry("«transitive-lib»", "vendor/locked", false);
+    transitive.config_file = "lakefile.lean".to_owned();
+    inherited.packages = vec![
+        update_path_entry("«leaf-lib»", "missing-shadowed-by-root", false),
+        transitive,
+    ];
+    inherited.save_to_dir(&base.join("parent")).unwrap();
+    let before = tree(&base);
+    let canonical_base = std::fs::canonicalize(&base).unwrap();
+    let mut loaded = Vec::new();
+    let manifest = fln_lake::update_manifest_with_lean::<fln_lake::LakeUpdateError>(
+        &base.join("root"),
+        |directory, bytes| {
+            let relative = directory.strip_prefix(&canonical_base).unwrap();
+            loaded.push(relative.to_path_buf());
+            let config = if relative == std::path::Path::new("root") {
+                assert_eq!(bytes, "package «root-project»\r\n".as_bytes());
+                update_checked_lean(
+                    "root-project",
+                    &[("leaf-lib", "../direct"), ("parent-lib", "../parent")],
+                )
+            } else if relative == std::path::Path::new("direct") {
+                assert_eq!(bytes, b"package leafOwnName\n");
+                update_checked_lean("leafOwnName", &[])
+            } else {
+                assert_eq!(relative, std::path::Path::new("parent/vendor/locked"));
+                assert_eq!(bytes, b"package transitiveOwnName\n");
+                update_checked_lean("transitiveOwnName", &[])
+            };
+            Ok(config)
+        },
+    )
+    .unwrap();
+    assert_eq!(manifest.name, "«root-project»");
+    let mut leaf = update_path_entry("«leaf-lib»", "../direct", false);
+    leaf.config_file = "lakefile.lean".to_owned();
+    let mut transitive = update_path_entry("«transitive-lib»", "../parent/vendor/locked", true);
+    transitive.config_file = "lakefile.lean".to_owned();
+    assert_eq!(
+        manifest.packages,
+        [
+            update_path_entry("«parent-lib»", "../parent", false),
+            leaf,
+            transitive
+        ],
+    );
+    assert_eq!(
+        loaded,
+        [
+            PathBuf::from("root"),
+            PathBuf::from("direct"),
+            PathBuf::from("parent/vendor/locked")
+        ],
+    );
+    let mut expected = before;
+    expected.insert(
+        std::path::Path::new("root/lake-manifest.json")
+            .display()
+            .to_string(),
+        manifest.to_json(),
+    );
+    assert_eq!(tree(&base), expected);
+}
+
+#[test]
+fn local_update_lean_and_toml_selectors_do_not_override_or_fall_back() {
+    for (selector, lean_exists, toml_exists, selected) in [
+        ("lakefile", true, true, Some("lakefile.lean")),
+        ("lakefile", false, true, Some("lakefile.toml")),
+        ("lakefile.toml", true, true, Some("lakefile.toml")),
+        ("lakefile.lean", true, true, Some("lakefile.lean")),
+        ("lakefile.toml", true, false, None),
+        ("lakefile.lean", false, true, None),
+    ] {
+        let base = fresh_temp_dir("update-lean-selector");
+        update_write_package(
+            &base,
+            "root",
+            "name = \"root\"\n[[require]]\nname = \"parent\"\npath = \"../parent\"\n",
+        );
+        update_write_package(
+            &base,
+            "parent",
+            "name = \"parent\"\n[[require]]\nname = \"leaf\"\npath = \"missing\"\n",
+        );
+        std::fs::create_dir_all(base.join("leaf")).unwrap();
+        if toml_exists {
+            update_write_package(&base, "leaf", "name = \"tomlLeaf\"\n");
+        }
+        if lean_exists {
+            std::fs::write(base.join("leaf/lakefile.lean"), "package leanLeaf\n").unwrap();
+        }
+        let mut child = fln_lake::Manifest::new("parent");
+        let mut entry = update_path_entry("leaf", "../leaf", false);
+        entry.config_file = selector.to_owned();
+        child.packages = vec![entry];
+        child.save_to_dir(&base.join("parent")).unwrap();
+        fln_lake::Manifest::new("previous")
+            .save_to_dir(&base.join("root"))
+            .unwrap();
+        let before = tree(&base);
+        let leaf = std::fs::canonicalize(base.join("leaf")).unwrap();
+        let mut calls = 0;
+        let result = fln_lake::update_manifest_with_lean::<fln_lake::LakeUpdateError>(
+            &base.join("root"),
+            |directory, bytes| {
+                assert_eq!(directory, leaf);
+                assert_eq!(bytes, b"package leanLeaf\n");
+                calls += 1;
+                Ok(update_checked_lean("leanLeaf", &[]))
+            },
+        );
+        if let Some(selected) = selected {
+            let manifest = result.unwrap();
+            assert_eq!(manifest.packages[1].name, "leaf");
+            assert_eq!(manifest.packages[1].config_file, selected);
+            assert_eq!(calls, usize::from(selected == "lakefile.lean"));
+        } else {
+            assert!(matches!(
+                result,
+                Err(fln_lake::LakeUpdateError::Discovery(_))
+            ));
+            assert_eq!(calls, 0);
+            assert_eq!(tree(&base), before);
+        }
+    }
+}
+
+#[test]
+fn local_update_rechecks_captured_lean_bytes_and_side_inputs_after_loading() {
+    for (relative, replacement) in [
+        ("lakefile.lean", "package changed\n"),
+        ("lean-toolchain", "leanprover/lean4:v4.33.0\n"),
+        (".lake/package-overrides.json", "{}"),
+    ] {
+        let root = fresh_temp_dir("update-lean-input-change");
+        std::fs::write(root.join("lakefile.lean"), "package original\n").unwrap();
+        fln_lake::Manifest::new("previous")
+            .save_to_dir(&root)
+            .unwrap();
+        let previous = std::fs::read(root.join("lake-manifest.json")).unwrap();
+        let result = fln_lake::update_manifest_with_lean::<fln_lake::LakeUpdateError>(
+            &root,
+            |directory, bytes| {
+                let changed = directory.join(relative);
+                std::fs::create_dir_all(changed.parent().unwrap()).unwrap();
+                std::fs::write(changed, replacement).unwrap();
+                // The loader still sees the captured source, even after its path changes.
+                assert_eq!(bytes, b"package original\n");
+                Ok(update_checked_lean("original", &[]))
+            },
+        );
+        let filename = std::path::Path::new(relative)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            matches!(result, Err(fln_lake::LakeUpdateError::Parse(detail))
+            if detail.contains("changed during dependency resolution") && detail.contains(filename)),
+            "{relative}"
+        );
+        assert_eq!(
+            std::fs::read(root.join("lake-manifest.json")).unwrap(),
+            previous
+        );
+    }
+}
+
+#[test]
+fn local_update_detects_a_new_preferred_lean_file_while_loading_a_dependency() {
+    let base = fresh_temp_dir("update-lean-precedence-change");
+    update_write_package(
+        &base,
+        "root",
+        "name = \"root\"\n[[require]]\nname = \"leaf\"\npath = \"../leaf\"\n",
+    );
+    std::fs::create_dir_all(base.join("leaf")).unwrap();
+    std::fs::write(base.join("leaf/lakefile.lean"), "package leaf\n").unwrap();
+    let root = base.join("root");
+    fln_lake::Manifest::new("previous")
+        .save_to_dir(&root)
+        .unwrap();
+    let previous = std::fs::read(root.join("lake-manifest.json")).unwrap();
+    let result =
+        fln_lake::update_manifest_with_lean::<fln_lake::LakeUpdateError>(&root, |_, bytes| {
+            assert_eq!(bytes, b"package leaf\n");
+            std::fs::write(root.join("lakefile.lean"), "package newlyPreferred\n").unwrap();
+            Ok(update_checked_lean("leaf", &[]))
+        });
+    assert!(
+        matches!(result, Err(fln_lake::LakeUpdateError::Parse(detail))
+        if detail.contains("changed during dependency resolution") && detail.contains("lakefile.lean"))
+    );
+    assert_eq!(
+        std::fs::read(root.join("lake-manifest.json")).unwrap(),
+        previous
+    );
+}
+
+#[derive(Debug)]
+enum UpdateLoaderError {
+    Resolution(fln_lake::LakeUpdateError),
+    Source {
+        class: &'static str,
+        declaration: &'static str,
+    },
+}
+
+impl From<fln_lake::LakeUpdateError> for UpdateLoaderError {
+    fn from(error: fln_lake::LakeUpdateError) -> Self {
+        Self::Resolution(error)
+    }
+}
+
+#[test]
+fn local_update_preserves_loader_errors_and_bounds_source_and_returned_requirements() {
+    let root = fresh_temp_dir("update-lean-errors");
+    std::fs::write(root.join("lakefile.lean"), "package example\n").unwrap();
+    fln_lake::Manifest::new("previous")
+        .save_to_dir(&root)
+        .unwrap();
+    let previous = std::fs::read(root.join("lake-manifest.json")).unwrap();
+    let failed = fln_lake::update_manifest_with_lean(&root, |_, bytes| {
+        assert_eq!(bytes, b"package example\n");
+        Err(UpdateLoaderError::Source {
+            class: "resource",
+            declaration: "choosePackage",
+        })
+    });
+    assert!(matches!(
+        failed,
+        Err(UpdateLoaderError::Source {
+            class: "resource",
+            declaration: "choosePackage"
+        })
+    ));
+    let oversized = fln_lake::update_manifest_with_lean::<UpdateLoaderError>(&root, |_, _| {
+        let mut config = update_checked_lean("example", &[("leaf", "../leaf")]);
+        config.requires = vec![config.requires[0].clone(); 4097];
+        Ok(config)
+    });
+    assert!(
+        matches!(oversized, Err(UpdateLoaderError::Resolution(fln_lake::LakeUpdateError::Resource(detail)))
+        if detail.contains("requirement count exceeds 4096"))
+    );
+    let remote = fln_lake::update_manifest_with_lean::<UpdateLoaderError>(&root, |_, _| {
+        let mut config = update_checked_lean("example", &[("remote", "../unused")]);
+        config.requires[0].url = Some("https://example.invalid/repository".to_owned());
+        Ok(config)
+    });
+    assert!(
+        matches!(remote, Err(UpdateLoaderError::Resolution(fln_lake::LakeUpdateError::DependencyResolutionUnavailable { requirements }))
+        if requirements == ["remote"])
+    );
+    std::fs::write(root.join("lakefile.lean"), " ".repeat(64 * 1024 + 1)).unwrap();
+    let bounded = fln_lake::update_manifest_with_lean::<UpdateLoaderError>(&root, |_, _| {
+        panic!("oversized source must not reach the loader")
+    });
+    assert!(
+        matches!(bounded, Err(UpdateLoaderError::Resolution(fln_lake::LakeUpdateError::Resource(detail)))
+        if detail.contains("65536 bytes"))
+    );
+    assert_eq!(
+        std::fs::read(root.join("lake-manifest.json")).unwrap(),
+        previous
+    );
+}
+
+#[test]
+fn checked_git_requirements_preserve_source_fields_without_materializing_them() {
+    let source = concat!(
+        "name = \"program\"\n",
+        "[[require]]\nname = \"dep-name\"\ngit = \"https://example.invalid/dep\"\n",
+        "rev = \"branch\"\nsubDir = \"lib/nested\"\n",
+        "[[require]]\nname = \"other\"\ngit = \"../local-repository\"\n",
+    );
+    for parse in [
+        LakeConfig::parse_toml_for_execution,
+        LakeConfig::parse_toml_for_build,
+    ] {
+        let config = parse(source).unwrap();
+        assert_eq!(config.requires.len(), 2);
+        let dependency = &config.requires[0];
+        assert_eq!(dependency.name, "dep-name");
+        assert_eq!(
+            dependency.url.as_deref(),
+            Some("https://example.invalid/dep")
+        );
+        assert_eq!(dependency.rev.as_deref(), Some("branch"));
+        assert_eq!(dependency.subdir.as_deref(), Some("lib/nested"));
+        assert!(dependency.path.is_none());
+        assert_eq!(
+            config.requires[1].url.as_deref(),
+            Some("../local-repository")
+        );
+        assert!(config.requires[1].rev.is_none());
+    }
 }

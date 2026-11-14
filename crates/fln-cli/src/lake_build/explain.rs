@@ -113,8 +113,9 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
     let root = directory
         .canonicalize()
         .map_err(|error| Failure::io(directory, error))?;
-    let config = config(&root)?;
-    let sources = local_dependencies::load(&root, &config)?;
+    let loaded = load_configuration(&root, ConfigurationSelection::Default, None)?;
+    let config = loaded.config.clone();
+    let sources = local_dependencies::load(&root, loaded, None)?;
     let path = root.join(&config.build_dir).join(snapshot::FILE);
     check_path(&root, &path, true)?;
     let relative = |path: &Path| {
@@ -212,19 +213,13 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
         if current.contains_key(&module) || external.contains(&module) {
             continue;
         }
-        let Some(location) = sources.resolve(&module)? else {
+        let Some((package, source)) = sources.resolve_package(&module)? else {
             external.insert(module);
             continue;
         };
         if current.len() >= MAX_MODULES {
             return Err(Failure::new("resource", "source module count exceeds 256").into());
         }
-        let source = location.path;
-        let package = sources
-            .packages
-            .iter()
-            .find(|package| package.root == location.package)
-            .ok_or_else(|| Failure::new("internal-fault", "source module lost its package"))?;
         let mut artifact = source_import_relative_path(&module).map_err(Failure::from)?;
         artifact.set_extension("olean");
         let artifact = package
@@ -232,7 +227,7 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
             .join(&package.config.build_dir)
             .join("lib/lean")
             .join(artifact);
-        let bytes = check_path(&location.package, &source, false)
+        let bytes = check_path(&package.root, &source, false)
             .map_err(|failure| failure.detail)
             .and_then(|()| {
                 read_bounded(
@@ -265,7 +260,7 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
             module,
             Current {
                 source: relative(&source),
-                package: location.package,
+                package: package.root.clone(),
                 artifact,
                 digest: bytes.map(|bytes| snapshot::digest(&bytes)),
                 imports,

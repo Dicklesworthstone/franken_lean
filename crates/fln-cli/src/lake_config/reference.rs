@@ -101,6 +101,7 @@ def countDown : Nat → Nat
   | Nat.succ n => countDown n + 1
 def unusedComputation : Nat := countDown 10000000
 def folder (suffix : String) : FilePath := FilePath.mk ("src/" ++ suffix)
+def sibling (suffix : String) : FilePath := FilePath.mk ("../" ++ suffix)
 def libraryRoot (suffix : String) : Lean.Name :=
   Lean.Name.str (Lean.Name.str Lean.Name.anonymous "Demo") suffix
 def selectedRoots (suffix : String) : Array Lean.Name :=
@@ -112,6 +113,7 @@ scoped notation "◆" s => folder s
 end Config
 open scoped Config
 local notation "◇" => "lean"
+require shared from sibling ("shared" ++ " library")
 package demo where
   srcDir := ◆ ◇
   buildDir := FilePath.mk (".lake/" ++ "native")
@@ -125,6 +127,8 @@ lean_lib Literals where
 @[default_target] lean_exe runner where
   srcDir := FilePath.mk ("ap" ++ "p")
   root := libraryRoot ("Ma" ++ "in")
+require "quoted-dependency" from
+  (match true with | true => sibling "next" | false => folder "other")
 "#;
     let config = configured(&engine, declarations, limits)
         .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
@@ -141,6 +145,48 @@ lean_lib Literals where
     assert_eq!(config.targets[3].kind, TargetKind::Executable);
     assert_eq!(config.targets[3].roots, ["Demo.Main"]);
     assert_eq!(config.targets[3].src_dir, Some(PathBuf::from("app")));
+    assert_eq!(config.requires.len(), 2);
+    assert_eq!(config.requires[0].name, "shared");
+    assert_eq!(
+        config.requires[0].path,
+        Some(PathBuf::from("../shared library"))
+    );
+    assert_eq!(config.requires[1].name, "«quoted-dependency»");
+    assert_eq!(config.requires[1].path, Some(PathBuf::from("../next")));
+    assert!(config.requires.iter().all(|requirement| {
+        requirement.url.is_none() && requirement.rev.is_none() && requirement.subdir.is_none()
+    }));
+
+    let git = configured(
+        &engine,
+        r#"import Lake
+open System Lake DSL
+def endpoint (suffix : String) : String := "https://example.invalid/" ++ suffix
+def branch : String := "main"
+def subtree (suffix : String) : FilePath := FilePath.mk ("sub/" ++ suffix)
+package gitConsumer
+require "source-dependency" from git (endpoint "repo") @ branch / subtree "lib"
+require optional from git ("../" ++ "repository")
+lean_lib GitConsumer
+"#,
+        limits,
+    )
+    .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
+    assert_eq!(git.requires.len(), 2);
+    assert_eq!(git.requires[0].name, "«source-dependency»");
+    assert_eq!(
+        git.requires[0].url.as_deref(),
+        Some("https://example.invalid/repo"),
+    );
+    assert_eq!(git.requires[0].rev.as_deref(), Some("main"));
+    assert_eq!(git.requires[0].subdir.as_deref(), Some("sub/lib"));
+    assert!(git.requires[0].path.is_none());
+    assert_eq!(git.requires[1].url.as_deref(), Some("../repository"));
+    assert!(git.requires[1].path.is_none());
+    assert!(git.requires[1].rev.is_none());
+    assert!(git.requires[1].subdir.is_none());
+    assert_eq!(git.src_dir, PathBuf::from("."));
+    assert_eq!(git.build_dir, PathBuf::from(".lake/build"));
 
     // A field-free ordinary package retains Lake's defaults without evaluating
     // even one of the user's closed definitions.
@@ -164,6 +210,12 @@ lean_lib Literals where
         "import Lake\nopen Lake DSL\npackage bad where\n  srcDir := \"src\"\nlean_lib Bad where\n  roots := (42 : Nat)\n",
         "import Lake\nopen Lake DSL\npackage bad\nlean_exe runner where\n  root := (#[`Main] : Array Lean.Name)\n",
         "import Lake\nopen Lake DSL\npackage bad\nlean_exe runner where\n  root := (42 : Nat)\n",
+        "import Lake\nopen Lake DSL\npackage bad\nrequire dep from (42 : Nat)\n",
+        "import Lake\nopen Lake DSL\npackage bad\nrequire dep from git (42 : Nat)\n",
+        "import Lake\nopen Lake DSL\npackage bad\nrequire dep from git \"repo\" @ (42 : Nat)\n",
+        "import Lake\nopen Lake DSL\npackage bad\nrequire dep from git \"repo\" / (42 : Nat)\n",
+        "import Lake\nopen Lake DSL\npackage bad\nrequire dep from later\ndef later : System.FilePath := \"../dep\"\n",
+        "import Lake\nopen Lake DSL\npackage bad\nrequire dep from \"../dep\"\ndef invalidUnused : Nat := \"wrong\"\n",
     ] {
         let error = configured(&engine, source, limits).unwrap_err();
         assert_eq!(error.class, "elaboration", "{}", error.detail);
@@ -176,6 +228,8 @@ lean_lib Literals where
         "import Lake\nopen Lake DSL\n@[extern \"foreign_lake_roots\"] def foreignRoots : Array Lean.Name := #[Lean.Name.str Lean.Name.anonymous \"Bad\"]\npackage bad\nlean_lib Bad where\n  roots := foreignRoots\n",
         "import Lake\nopen Lake DSL\nunsafe def unsafeRoot : Lean.Name := `Main\npackage bad\nlean_exe runner where\n  root := unsafeRoot\n",
         "import Lake\nopen Lake DSL\n@[extern \"foreign_lake_root\"] def foreignRoot : Lean.Name := `Main\npackage bad\nlean_exe runner where\n  root := foreignRoot\n",
+        "import Lake\nopen Lake DSL\nunsafe def unsafePath : System.FilePath := System.FilePath.mk \"../dep\"\npackage bad\nrequire dep from unsafePath\n",
+        "import Lake\nopen Lake DSL\n@[extern \"foreign_lake_dependency\"] def foreignPath : System.FilePath := System.FilePath.mk \"../dep\"\npackage bad\nrequire dep from foreignPath\n",
     ] {
         assert!(configured(&engine, source, limits).is_err());
     }
@@ -187,6 +241,61 @@ lean_lib Literals where
             .unwrap_err();
     assert_eq!(error.class, "unsupported");
     assert!(error.detail.contains("within the package"));
+
+    for body in [
+        "def dep : Nat := 1\nrequire dep from \"../dep\"",
+        "require dep from \"../dep\"\ndef dep : Nat := 1",
+        "def dep : Nat := 1\nrequire _root_.dep from \"../dep\"",
+        "require _root_.dep from \"../dep\"\ndef dep : Nat := 1",
+        "require Nat from \"../dep\"",
+        "require _root_.Nat from \"../dep\"",
+        "namespace N\ndef dep : Nat := 1\nend N\nrequire N.dep from \"../dep\"",
+    ] {
+        let source = format!("import Lake\nopen Lake DSL\npackage bad\n{body}\n");
+        let error = configured(&engine, &source, limits).unwrap_err();
+        assert_eq!(error.class, "input", "{}", error.detail);
+        assert!(
+            error.detail.contains("already declared"),
+            "{}",
+            error.detail
+        );
+        assert!(!error.authority);
+    }
+    let names = configured(
+        &engine,
+        "import Lake\nopen Lake DSL\npackage p\ndef existing : Nat := 0\nrequire _root_.newName from \"../dep\"\nrequire \"_root_.existing\" from \"../dep\"\nrequire pkgConfig from \"../dep\"\nrequire \"_package.name\" from \"../dep\"\n",
+        limits,
+    )
+    .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
+    assert_eq!(
+        names
+            .requires
+            .iter()
+            .map(|requirement| requirement.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "_root_.newName",
+            "«_root_.existing»",
+            "pkgConfig",
+            "«_package.name»"
+        ],
+    );
+    // The pin rejects existing Lake.Package and Lean.Expr, but accepts a fresh
+    // namespace member such as _package.other. Native loading lacks the full
+    // imported name world, so both cases are honest capability refusals rather
+    // than a fabricated declaration-collision judgment.
+    for name in ["Lake.Package", "Lean.Expr", "_package.other"] {
+        let source =
+            format!("import Lake\nopen Lake DSL\npackage p\nrequire {name} from \"../dep\"\n");
+        let error = configured(&engine, &source, limits).unwrap_err();
+        assert_eq!(error.class, "unsupported", "{}", error.detail);
+        assert!(
+            error.detail.contains("imported-name inventory"),
+            "{}",
+            error.detail
+        );
+        assert!(!error.authority);
+    }
 
     // The observer reads Name components, not a flattened display string. In
     // particular the single component "Demo.Extra" is not the checked
@@ -268,6 +377,14 @@ lean_lib Literals where
     let error = configured(
         &engine,
         "import Lake\nopen Lake DSL\npackage bounded\nlean_exe runner where\n  root := `Main\n",
+        exhausted,
+    )
+    .unwrap_err();
+    assert_eq!(error.class, "inconclusive", "{}", error.detail);
+    assert!(!error.authority);
+    let error = configured(
+        &engine,
+        "import Lake\nopen Lake DSL\npackage bounded\nrequire dep from \"../dep\"\n",
         exhausted,
     )
     .unwrap_err();

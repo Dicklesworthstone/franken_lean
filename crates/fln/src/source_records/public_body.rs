@@ -19,6 +19,9 @@ impl Engine {
             public_scope,
             private_scope,
         };
+        if fln_elab::source::partial::is_partial(syntax) {
+            return self.admit_hidden_public_partial(public, syntax, &worlds, options, limits);
+        }
         let candidate = match elaboration_outcome(fln_elab::source::elaborate_public_definition(
             syntax,
             &worlds,
@@ -29,6 +32,95 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
         self.admit_hidden_public_candidate(public, syntax, candidate, options, limits, public_scope)
+    }
+
+    fn admit_hidden_public_partial(
+        &self,
+        public: &Engine,
+        syntax: &fln_syntax::tree::Syntax,
+        worlds: &fln_elab::source::TheoremWorlds<'_>,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<PublicSourceAdmission>, EngineExecutionError> {
+        let candidate = match elaboration_outcome(fln_elab::source::partial::elaborate_public(
+            syntax,
+            worlds,
+            limits.kernel,
+        ))? {
+            Outcome::Complete(candidate) => candidate,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        if let [Declaration::Defn(definition)] = candidate.declarations() {
+            // A partial command with no surviving self reference is an ordinary
+            // safe definition. Keep the existing hidden-body publication path,
+            // which defers its owner's metadata to the public world's replay.
+            let noncomputable = candidate.noncomputable().contains(&definition.base.name);
+            return self.admit_hidden_public_candidate(
+                public,
+                syntax,
+                fln_elab::source::ElaboratedDeclaration {
+                    declaration: Declaration::Defn(definition.clone()),
+                    native_axioms: Vec::new(),
+                    equation_info: None,
+                    local_functions: Vec::new(),
+                    irreducible: false,
+                    noncomputable,
+                },
+                options,
+                limits,
+                worlds.public_scope,
+            );
+        }
+        if !matches!(
+            candidate.declarations(),
+            [Declaration::Opaque(_), Declaration::Mutual(_)]
+        ) {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "a recursive public partial definition must retain both checked halves",
+            });
+        }
+        // Both candidates cross the ordinary council together. A bad executable
+        // companion cannot publish a successful logical default or signature.
+        let private_implementation = match self.admit_partial_result(&candidate, options, limits)? {
+            Outcome::Complete(checked) => checked,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let Some(admitted) = private_implementation.admissions.first() else {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "a public partial definition must admit its logical interface",
+            });
+        };
+        let Declaration::Opaque(logical) = &admitted.declaration else {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "a public partial definition must preserve its checked opaque interface",
+            });
+        };
+        let interface = Declaration::Axiom(AxiomVal {
+            base: logical.base.clone(),
+            is_unsafe: logical.is_unsafe,
+        });
+        Ok(
+            match public.admit_scoped_candidate(
+                syntax,
+                interface,
+                false,
+                None,
+                false,
+                Vec::new(),
+                options,
+                limits,
+                worlds.public_scope,
+            )? {
+                Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
+                    public,
+                    private_implementation: Some(private_implementation),
+                }),
+                Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+            },
+        )
     }
 
     /// Shared by definitions, abbreviations, opaques and explicitly hidden

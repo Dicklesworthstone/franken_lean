@@ -6,7 +6,8 @@
 //! Configuration and package operations are implemented here. Artifact
 //! compilation and provenance-backed build decisions are not yet connected;
 //! their entry points return explicit errors rather than synthetic products
-//! or cache hits. Executable Lean configuration is likewise unavailable.
+//! or cache hits. Executable Lean configuration is supplied by the caller's
+//! checked source loader; this crate never imports a compiler or runs Lean.
 //!
 //! The Lake surface must match the Reference pin's exit codes, `--json`
 //! output, manifest format, and `lean-toolchain` layout so that `elan`
@@ -571,8 +572,9 @@ impl LakeConfig {
         Self::parse_toml_strict(content)
     }
 
-    /// Checked executables and artifact builds resolve the same bounded local
-    /// path requirements without silently accepting remote or custom settings.
+    /// Checked executables and artifact builds share explicit path and Git
+    /// requirements. Git sources still need a materialized, locked checkout;
+    /// parsing a URL does not authorize fetching or updating the manifest.
     pub fn parse_toml_for_execution(content: &str) -> Result<Self, LakeParseError> {
         Self::parse_toml_strict(content)
     }
@@ -621,7 +623,7 @@ impl LakeConfig {
                 )
                 | ("lean_lib" | "lean_exe", "name" | "srcDir")
                 | ("lean_exe", "root")
-                | ("require", "name" | "path") => false,
+                | ("require", "name" | "path" | "git" | "rev" | "subDir") => false,
                 _ => {
                     return Err(LakeParseError::UnsupportedBuildSetting(format!(
                         "line {}: {section}.{key}",
@@ -648,9 +650,23 @@ impl LakeConfig {
             if requirement.name.is_empty() {
                 return Err(LakeParseError::MissingField("require name"));
             }
-            if requirement.path.is_none() {
+            if requirement.path.is_some() && requirement.url.is_some() {
                 return Err(LakeParseError::UnsupportedBuildSetting(format!(
-                    "require {} has no local path",
+                    "require {} combines path and Git sources",
+                    requirement.name
+                )));
+            }
+            if requirement.path.is_none() && requirement.url.is_none() {
+                return Err(LakeParseError::UnsupportedBuildSetting(format!(
+                    "require {} has no supported path or Git source",
+                    requirement.name
+                )));
+            }
+            if requirement.url.is_none()
+                && (requirement.rev.is_some() || requirement.subdir.is_some())
+            {
+                return Err(LakeParseError::UnsupportedBuildSetting(format!(
+                    "require {} uses Git revision or subDir without a Git source",
                     requirement.name
                 )));
             }
@@ -1910,13 +1926,47 @@ impl Manifest {
 /// changes remain explicit unavailable outcomes. Every input is rechecked
 /// before the one atomic root-manifest publication.
 pub fn update_manifest(dir: &Path) -> Result<Manifest, LakeUpdateError> {
+    update_manifest_with_lean(dir, |root, _| {
+        Err(LakeUpdateError::Unsupported(format!(
+            "local manifest updates require a checked Lean configuration loader for {}",
+            root.join("lakefile.lean").display(),
+        )))
+    })
+}
+
+/// Resolve local Lean/TOML packages using the caller's checked Lean loader.
+///
+/// `load_lean` receives the canonical package directory and the exact bounded
+/// `lakefile.lean` bytes already retained in this update's input snapshot. It
+/// must elaborate those bytes rather than reread the configuration path. The
+/// returned configuration must describe the complete supported package; unknown
+/// options or effects must be refused by the loader, never omitted.
+///
+/// The default `lakefile` selector prefers Lean to TOML. Explicit inherited
+/// `lakefile.lean` and `lakefile.toml` selectors name only that file. The resolver
+/// records the actual filename, validates every returned local requirement,
+/// and rechecks all captured inputs before publishing the root manifest. Loader
+/// errors remain the caller's `E`; filesystem/resolution errors enter through
+/// `From<LakeUpdateError>`. No dependency manifest is written.
+pub fn update_manifest_with_lean<E>(
+    dir: &Path,
+    mut load_lean: impl FnMut(&Path, &[u8]) -> Result<LakeConfig, E>,
+) -> Result<Manifest, E>
+where
+    E: From<LakeUpdateError>,
+{
     use std::collections::BTreeMap;
 
     let root = fs::canonicalize(dir).map_err(|error| LakeUpdateError::Io(error.to_string()))?;
     let mut inputs = Vec::new();
     let mut input_bytes = 0usize;
-    let (config, toolchain) =
-        update_package_configuration(&root, false, &mut inputs, &mut input_bytes)?;
+    let (config, toolchain, _) = update_package_configuration(
+        &root,
+        "lakefile",
+        &mut inputs,
+        &mut input_bytes,
+        &mut load_lean,
+    )?;
     let previous = capture_update_input(
         &root,
         Path::new("lake-manifest.json"),
@@ -1935,19 +1985,19 @@ pub fn update_manifest(dir: &Path) -> Result<Manifest, LakeUpdateError> {
                     return Err(LakeUpdateError::Unsupported(
                         "updating a manifest with a custom packagesDir requires package-directory relocation"
                             .to_owned(),
-                    ));
+                    ).into());
                 }
             }
             // The pin's bare update deliberately rebuilds a malformed root
             // manifest. A resource stop is not a malformed-input judgment.
             Err(LakeUpdateError::Parse(_)) => {}
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
     }
     if config.requires.len() > LOCAL_UPDATE_MAX_REQUIREMENTS {
-        return Err(LakeUpdateError::Resource(
-            "local requirement count exceeds 4096".to_owned(),
-        ));
+        return Err(
+            LakeUpdateError::Resource("local requirement count exceeds 4096".to_owned()).into(),
+        );
     }
     let mut manifest = Manifest::new(&config.name);
     let mut locked = BTreeMap::new();
@@ -1986,9 +2036,9 @@ pub fn update_manifest(dir: &Path) -> Result<Manifest, LakeUpdateError> {
                 continue;
             }
             if packages.len() >= LOCAL_UPDATE_MAX_PACKAGES {
-                return Err(LakeUpdateError::Resource(
-                    "local package count exceeds 64".to_owned(),
-                ));
+                return Err(
+                    LakeUpdateError::Resource("local package count exceeds 64".to_owned()).into(),
+                );
             }
             let mut entry = if let Some(entry) = locked.get(&requirement.name) {
                 entry.clone()
@@ -2007,38 +2057,43 @@ pub fn update_manifest(dir: &Path) -> Result<Manifest, LakeUpdateError> {
             if entry.entry_type != "path" {
                 return Err(LakeUpdateError::DependencyResolutionUnavailable {
                     requirements: vec![entry.name.clone()],
-                });
+                }
+                .into());
             }
-            if !matches!(entry.config_file.as_str(), "lakefile" | "lakefile.toml")
-                || entry
-                    .manifest_file
-                    .as_deref()
-                    .is_some_and(|path| path != Path::new("lake-manifest.json"))
+            if !matches!(
+                entry.config_file.as_str(),
+                "lakefile" | "lakefile.toml" | "lakefile.lean"
+            ) || entry
+                .manifest_file
+                .as_deref()
+                .is_some_and(|path| path != Path::new("lake-manifest.json"))
             {
                 return Err(LakeUpdateError::Unsupported(format!(
                     "dependency {} has a custom configuration or manifest selector",
                     entry.name,
-                )));
+                ))
+                .into());
             }
             let path = entry.dir.as_deref().ok_or_else(|| {
                 LakeUpdateError::Parse(format!("path dependency {} has no directory", entry.name))
             })?;
             let directory = update_dependency_directory(&root, path)?;
             let relative = relative_update_directory(&root, &directory)?;
-            let (config, dependency_toolchain) = update_package_configuration(
+            let (config, dependency_toolchain, config_file) = update_package_configuration(
                 &directory,
-                entry.config_file == "lakefile.toml",
+                &entry.config_file,
                 &mut inputs,
                 &mut input_bytes,
+                &mut load_lean,
             )?;
             if next == 0 && dependency_toolchain.is_some() && dependency_toolchain != toolchain {
                 return Err(LakeUpdateError::Unsupported(format!(
                     "dependency {} requires toolchain selection; local manifest updates do not change lean-toolchain",
                     entry.name,
-                )));
+                )).into());
             }
             entry.dir = Some(relative.clone());
-            entry.config_file = "lakefile.toml".to_owned();
+            entry.config_file = config_file.to_owned();
             entry.manifest_file = Some(PathBuf::from("lake-manifest.json"));
             locked.insert(entry.name.clone(), entry.clone());
             if let Some(bytes) = capture_update_input(
@@ -2056,7 +2111,8 @@ pub fn update_manifest(dir: &Path) -> Result<Manifest, LakeUpdateError> {
                     if locked.len() >= LOCAL_UPDATE_MAX_REQUIREMENTS {
                         return Err(LakeUpdateError::Resource(
                             "local manifest entry count exceeds 4096".to_owned(),
-                        ));
+                        )
+                        .into());
                     }
                     inherited_entry.inherited = true;
                     if let Some(path) = inherited_entry.dir.take() {
@@ -2089,16 +2145,15 @@ pub fn update_manifest(dir: &Path) -> Result<Manifest, LakeUpdateError> {
         false
     }
     if cyclic(0, &edges, &mut vec![0; packages.len()]) {
-        return Err(LakeUpdateError::Parse(
-            "local package dependency cycle".to_owned(),
-        ));
+        return Err(LakeUpdateError::Parse("local package dependency cycle".to_owned()).into());
     }
     for input in inputs {
         if read_update_input(&input.root, &input.relative, input.max_bytes)? != input.bytes {
             return Err(LakeUpdateError::Parse(format!(
                 "Lake configuration or manifest changed during dependency resolution: {}",
                 input.root.join(&input.relative).display(),
-            )));
+            ))
+            .into());
         }
     }
     manifest.packages = packages
@@ -2235,38 +2290,132 @@ fn read_update_input(
     Ok(Some(bytes))
 }
 
-fn update_package_configuration(
+fn update_package_configuration<E>(
     root: &Path,
-    explicit_toml: bool,
+    selector: &str,
     inputs: &mut Vec<LocalUpdateInput>,
     input_bytes: &mut usize,
-) -> Result<(LakeConfig, Option<String>), LakeUpdateError> {
-    for relative in ["lakefile.lean", ".lake/package-overrides.json"] {
-        if relative == "lakefile.lean" && explicit_toml {
-            continue;
-        }
-        if capture_update_input(root, Path::new(relative), 64 * 1024, inputs, input_bytes)?
-            .is_some()
-        {
-            return Err(LakeUpdateError::Unsupported(format!(
-                "local manifest updates do not support {}",
-                root.join(relative).display(),
-            )));
-        }
-    }
-    let bytes = capture_update_input(
+    load_lean: &mut impl FnMut(&Path, &[u8]) -> Result<LakeConfig, E>,
+) -> Result<(LakeConfig, Option<String>, &'static str), E>
+where
+    E: From<LakeUpdateError>,
+{
+    if capture_update_input(
         root,
-        Path::new("lakefile.toml"),
+        Path::new(".lake/package-overrides.json"),
         64 * 1024,
         inputs,
         input_bytes,
     )?
-    .ok_or_else(|| LakeUpdateError::Discovery(LakeDiscoveryError::NotFound(root.to_path_buf())))?;
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| LakeUpdateError::Parse("lakefile.toml is not UTF-8".to_owned()))?;
-    let unchecked = LakeConfig::parse_toml(text)
-        .map_err(|error| LakeUpdateError::Discovery(LakeDiscoveryError::Parse(error)))?;
-    let unavailable: Vec<_> = unchecked
+    .is_some()
+    {
+        return Err(LakeUpdateError::Unsupported(format!(
+            "local manifest updates do not support {}",
+            root.join(".lake/package-overrides.json").display(),
+        ))
+        .into());
+    }
+    let (config_file, bytes) = match selector {
+        "lakefile" | "lakefile.lean" => {
+            let lean = capture_update_input(
+                root,
+                Path::new("lakefile.lean"),
+                64 * 1024,
+                inputs,
+                input_bytes,
+            )?;
+            if lean.is_some() || selector == "lakefile.lean" {
+                ("lakefile.lean", lean)
+            } else {
+                (
+                    "lakefile.toml",
+                    capture_update_input(
+                        root,
+                        Path::new("lakefile.toml"),
+                        64 * 1024,
+                        inputs,
+                        input_bytes,
+                    )?,
+                )
+            }
+        }
+        "lakefile.toml" => (
+            "lakefile.toml",
+            capture_update_input(
+                root,
+                Path::new("lakefile.toml"),
+                64 * 1024,
+                inputs,
+                input_bytes,
+            )?,
+        ),
+        _ => {
+            return Err(LakeUpdateError::Unsupported(format!(
+                "custom configuration selector {selector}",
+            ))
+            .into());
+        }
+    };
+    let bytes = bytes.ok_or_else(|| {
+        LakeUpdateError::Discovery(LakeDiscoveryError::NotFound(root.to_path_buf()))
+    })?;
+    // Capture all package-level side inputs before invoking executable source
+    // loading, so even a loader-time toolchain or override edit is detected.
+    let toolchain =
+        capture_update_input(root, Path::new("lean-toolchain"), 4096, inputs, input_bytes)?
+            .map(|bytes| {
+                String::from_utf8(bytes)
+                    .map(|text| text.trim().to_owned())
+                    .map_err(|_| LakeUpdateError::Parse("lean-toolchain is not UTF-8".to_owned()))
+            })
+            .transpose()?
+            .filter(|text| !text.is_empty());
+    let mut config = if config_file == "lakefile.lean" {
+        let config = load_lean(root, &bytes)?;
+        if config.format != LakeConfigFormat::Lean {
+            return Err(LakeUpdateError::Unsupported(
+                "checked Lean configuration loader returned a different format".to_owned(),
+            )
+            .into());
+        }
+        config
+    } else {
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| LakeUpdateError::Parse("lakefile.toml is not UTF-8".to_owned()))?;
+        let unchecked = LakeConfig::parse_toml(text)
+            .map_err(|error| LakeUpdateError::Discovery(LakeDiscoveryError::Parse(error)))?;
+        validate_update_requirements(&unchecked)?;
+        LakeConfig::parse_toml_for_execution(text).map_err(|error| match error {
+            LakeParseError::UnsupportedBuildSetting(detail) => LakeUpdateError::Unsupported(detail),
+            error => LakeUpdateError::Discovery(LakeDiscoveryError::Parse(error)),
+        })?
+    };
+    validate_update_requirements(&config)?;
+    config.name = canonical_package_name(&config.name);
+    for requirement in &mut config.requires {
+        requirement.name = canonical_package_name(&requirement.name);
+    }
+    config.lean_toolchain = toolchain.clone();
+    Ok((config, toolchain, config_file))
+}
+
+/// A source loader cannot bypass the same dependency scope as the TOML path.
+fn validate_update_requirements(config: &LakeConfig) -> Result<(), LakeUpdateError> {
+    if config.requires.len() > LOCAL_UPDATE_MAX_REQUIREMENTS {
+        return Err(LakeUpdateError::Resource(
+            "local requirement count exceeds 4096".to_owned(),
+        ));
+    }
+    if config
+        .requires
+        .iter()
+        .any(|requirement| requirement.name.is_empty())
+    {
+        return Err(LakeUpdateError::Discovery(LakeDiscoveryError::Parse(
+            LakeParseError::MissingField("require name"),
+        )));
+    }
+    let unavailable: Vec<_> = config
         .requires
         .iter()
         .filter(|requirement| {
@@ -2282,24 +2431,7 @@ fn update_package_configuration(
             requirements: unavailable,
         });
     }
-    let mut config = LakeConfig::parse_toml_for_execution(text).map_err(|error| match error {
-        LakeParseError::UnsupportedBuildSetting(detail) => LakeUpdateError::Unsupported(detail),
-        error => LakeUpdateError::Discovery(LakeDiscoveryError::Parse(error)),
-    })?;
-    config.name = canonical_package_name(&config.name);
-    for requirement in &mut config.requires {
-        requirement.name = canonical_package_name(&requirement.name);
-    }
-    let toolchain =
-        capture_update_input(root, Path::new("lean-toolchain"), 4096, inputs, input_bytes)?
-            .map(|bytes| {
-                String::from_utf8(bytes)
-                    .map(|text| text.trim().to_owned())
-                    .map_err(|_| LakeUpdateError::Parse("lean-toolchain is not UTF-8".to_owned()))
-            })
-            .transpose()?
-            .filter(|text| !text.is_empty());
-    Ok((config, toolchain))
+    Ok(())
 }
 
 /// Inspect every component BEFORE normalizing away parent components.

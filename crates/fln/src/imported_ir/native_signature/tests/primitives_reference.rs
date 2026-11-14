@@ -349,6 +349,11 @@ fn native_prototypes_from_library(library: &Path) -> IrModule {
     let wanted: BTreeSet<_> = names()
         .into_iter()
         .chain(STRING_PREDICATES.into_iter().map(str::to_owned))
+        .chain(
+            super::array_operations::BYTE_ARRAY_NAMES
+                .into_iter()
+                .map(str::to_owned),
+        )
         .collect();
     let mut externs = BTreeSet::new();
     let mut wrappers = BTreeSet::new();
@@ -358,6 +363,8 @@ fn native_prototypes_from_library(library: &Path) -> IrModule {
         "Init/Data/String/Defs.ir",
         "Init/Data/String/Bootstrap.ir",
         "Init/Data/String/Length.ir",
+        "Init/Data/String/Basic.ir",
+        "Init/Data/ByteArray/Basic.ir",
         "Init/Data/UInt/BasicAux.ir",
         "Init/Data/UInt/Basic.ir",
         "Init/Data/UInt/Log2.ir",
@@ -662,6 +669,289 @@ public section
         assert!(
             observed.contains(&format!("extern:{target}")),
             "{target} was not linked"
+        );
+    }
+}
+
+#[test]
+fn live_pinned_byte_array_closures_preserve_scalars_aliasing_and_canonical_replay() {
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let library = PathBuf::from(std::env::var_os("FLN_REFERENCE_LIB")?);
+            Some(library.parent()?.parent()?.join("bin/lean"))
+        });
+    let Some(reference) = reference else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "pinned Reference required for live ByteArray closures"
+        );
+        eprintln!("SKIP: live ByteArray closures require FLN_REFERENCE_LEAN");
+        return;
+    };
+    let pin = include_str!("../../../../../../SUITE.lock")
+        .lines()
+        .find(|line| line.starts_with("reference "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|part| part.strip_prefix("commit="))
+        })
+        .expect("SUITE.lock Reference commit");
+    let version = Command::new(&reference).arg("--githash").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(String::from_utf8(version.stdout).unwrap().trim(), pin);
+    let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = root.join(format!(
+        "byte-array-reference-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = r#"module
+prelude
+public import Init
+public import Init.Data.ByteArray.Basic
+public import Init.Data.String.Basic
+public section
+
+@[noinline] def byteSeed (n : Nat) : ByteArray :=
+  (ByteArray.emptyWithCapacity 0).push (UInt8.ofNat n)
+
+@[noinline, nospecialize] def byteUsePack
+    (f : Array UInt8 → ByteArray) (a : Array UInt8) : Nat :=
+  (f a).size + ((f a).get! 0).toNat
+
+@[noinline, nospecialize] def byteUseData
+    (f : ByteArray → Array UInt8) (a : ByteArray) : Nat :=
+  (f a).size + ((f a)[0]!).toNat
+
+@[noinline, nospecialize] def byteUseEmpty (f : Nat → ByteArray) (n : Nat) : Nat :=
+  (f n).size + (f 0).size
+
+@[noinline, nospecialize] def byteUsePush
+    (f : UInt8 → ByteArray) (n : UInt8) : Nat :=
+  let first := f n
+  let second := f 255
+  first.size + (first.get! 1).toNat + (second.get! 1).toNat
+
+@[noinline, nospecialize] def byteUseMeasure
+    (f : ByteArray → Nat) (a : ByteArray) : Nat :=
+  f a + f (a.push 65)
+
+@[noinline, nospecialize] def byteUseWord
+    (f : ByteArray → USize) (a : ByteArray) : Nat :=
+  (f a).toNat + (f (a.push 65)).toNat
+
+@[noinline, nospecialize] def byteUseGet (f : Nat → UInt8) (n : Nat) : Nat :=
+  (f 0).toNat + (f (n % 2)).toNat
+
+@[noinline, nospecialize] def byteUseSet
+    (f : UInt8 → ByteArray) (n : UInt8) : Nat :=
+  ((f n).get! 0).toNat + ((f 255).get! 0).toNat
+
+@[noinline, nospecialize] def byteUsePredicate
+    (f : ByteArray → Bool) (a : ByteArray) : Nat :=
+  (if f a then 1 else 0) + (if f (a.push 65) then 2 else 0)
+
+@[noinline, nospecialize] def byteUseDecision {p : ByteArray → Prop}
+    (f : (a : ByteArray) → Decidable (p a)) (a : ByteArray) : Nat :=
+  (match f a with | .isTrue _ => 1 | .isFalse _ => 0) +
+  (match f (a.push 65) with | .isTrue _ => 2 | .isFalse _ => 0)
+
+@[noinline, nospecialize] def byteUseHash
+    (f : ByteArray → UInt64) (a : ByteArray) : Nat :=
+  (f a).toNat
+
+@[noinline, nospecialize] def byteUseCopy (f : Bool → ByteArray) : Nat :=
+  let exact := f true
+  let growing := f false
+  exact.size + (exact.get! 1).toNat + (growing.get! 2).toNat
+
+@[noinline] def byteBoxedMk (n : Nat) : Nat :=
+  byteUsePack ByteArray.mk #[UInt8.ofNat n, 65]
+@[noinline] def byteBoxedData (n : Nat) : Nat :=
+  byteUseData ByteArray.data (byteSeed n)
+@[noinline] def byteBoxedEmpty (n : Nat) : Nat :=
+  byteUseEmpty ByteArray.emptyWithCapacity n
+@[noinline] def byteBoxedPush (n : Nat) : Nat :=
+  let original := byteSeed 65
+  byteUsePush (ByteArray.push original) (UInt8.ofNat n) + original.size
+@[noinline] def byteBoxedSize (n : Nat) : Nat :=
+  byteUseMeasure ByteArray.size (byteSeed n)
+@[noinline] def byteBoxedUsize (n : Nat) : Nat :=
+  byteUseWord ByteArray.usize (byteSeed n)
+@[noinline] def byteBoxedGet (n : Nat) : Nat :=
+  byteUseGet (ByteArray.get! ((byteSeed n).push 65)) n
+@[noinline] def byteBoxedSet (n : Nat) : Nat :=
+  let original := byteSeed 65
+  byteUseSet (ByteArray.set! original 0) (UInt8.ofNat n) +
+    (original.get! 0).toNat
+@[noinline] def byteBoxedBeq (n : Nat) : Nat :=
+  let original := byteSeed n
+  byteUsePredicate (ByteArray.beq original) original
+@[noinline] def byteBoxedDecEq (n : Nat) : Nat :=
+  let original := byteSeed n
+  byteUseDecision (ByteArray.decEq original) original
+@[noinline] def byteBoxedHash (n : Nat) : Nat :=
+  byteUseHash ByteArray.hash (byteSeed n)
+@[noinline] def byteBoxedCopy (n : Nat) : Nat :=
+  let original := (byteSeed n).push 65
+  byteUseCopy (ByteArray.copySlice original 0 original 1 2) +
+    (original.get! 1).toNat
+@[noinline] def byteBoxedUtf8 (n : Nat) : Nat :=
+  byteUsePredicate ByteArray.validateUTF8 (byteSeed n)
+"#;
+    std::fs::write(dir.join("NativeByteArray.lean"), source).unwrap();
+    let generated = Command::new(&reference)
+        .current_dir(&dir)
+        .args(["-j1", "-o", "NativeByteArray.olean", "NativeByteArray.lean"])
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("compile.stdout"), &generated.stdout).unwrap();
+    std::fs::write(dir.join("compile.stderr"), &generated.stderr).unwrap();
+    assert!(
+        generated.status.success(),
+        "{dir:?}: {}{}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    assert!(generated.stdout.is_empty());
+    assert!(generated.stderr.is_empty());
+    let module = crate::decode_ir_artifact(
+        &std::fs::read(dir.join("NativeByteArray.ir")).unwrap(),
+        32 * 1024 * 1024,
+    )
+    .unwrap();
+    std::fs::write(dir.join("decoded-ir.txt"), format!("{module:#?}")).unwrap();
+    let partials: BTreeSet<_> = module
+        .decls
+        .iter()
+        .flat_map(|declaration| {
+            let bodies = match declaration {
+                IrDecl::Function { body, .. } => body.bodies(),
+                IrDecl::Extern { .. } => Vec::new(),
+            };
+            bodies
+                .into_iter()
+                .flat_map(|body| body.stmts.iter())
+                .filter_map(|statement| match statement {
+                    IrStmt::VDecl {
+                        expr: IrExpr::Pap { function, .. },
+                        ..
+                    } => Some(function.clone()),
+                    _ => None,
+                })
+        })
+        .collect();
+    for target in super::array_operations::BYTE_ARRAY_NAMES {
+        assert!(
+            partials.contains(&Name::str(name(target), "_boxed")),
+            "{target} partial application optimized away; {dir:?}"
+        );
+    }
+    let entries = [
+        "byteBoxedMk",
+        "byteBoxedData",
+        "byteBoxedEmpty",
+        "byteBoxedPush",
+        "byteBoxedSize",
+        "byteBoxedUsize",
+        "byteBoxedGet",
+        "byteBoxedSet",
+        "byteBoxedBeq",
+        "byteBoxedDecEq",
+        "byteBoxedHash",
+        "byteBoxedCopy",
+        "byteBoxedUtf8",
+    ];
+    let cases: Vec<_> = entries
+        .into_iter()
+        .flat_map(|entry| [0u64, 65, 255].into_iter().map(move |n| (entry, n)))
+        .collect();
+    let mut oracle_source = source.to_owned();
+    for (entry, n) in &cases {
+        oracle_source.push_str(&format!("\n#eval {entry} {n}\n"));
+    }
+    std::fs::write(dir.join("Oracle.lean"), oracle_source).unwrap();
+    let oracle = Command::new(&reference)
+        .current_dir(&dir)
+        .args(["-j1", "Oracle.lean"])
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("oracle.stdout"), &oracle.stdout).unwrap();
+    std::fs::write(dir.join("oracle.stderr"), &oracle.stderr).unwrap();
+    assert!(
+        oracle.status.success(),
+        "{dir:?}: {}{}",
+        String::from_utf8_lossy(&oracle.stdout),
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+    assert!(oracle.stderr.is_empty());
+    let output = String::from_utf8(oracle.stdout).unwrap();
+    let expected: Vec<_> = output.lines().collect();
+    assert_eq!(
+        expected.len(),
+        cases.len(),
+        "unexpected oracle output: {output}"
+    );
+    assert!(
+        expected
+            .iter()
+            .all(|line| !line.is_empty() && line.bytes().all(|byte| byte.is_ascii_digit()))
+    );
+    let users: BTreeSet<_> = module
+        .decls
+        .iter()
+        .filter(|declaration| matches!(declaration, IrDecl::Function { .. }))
+        .map(|declaration| declaration.name().clone())
+        .collect();
+    let modules = [module, native_prototypes(&reference)];
+    let partition = VerifiedPartition::user_fixture();
+    let mut observed = BTreeSet::new();
+    for ((entry, n), expected) in cases.into_iter().zip(expected) {
+        let compiled = compile(
+            &modules,
+            &name(entry),
+            &[EntryArgument::Nat(IrNat::Small(n))],
+            &partition,
+            &users,
+            IrExecutionLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("{entry} {n}: {error:?}; {dir:?}"));
+        assert_nat_replay(&compiled, expected);
+        assert!(compiled.reference_functions().iter().all(|function| {
+            function.producer() == "reference" && users.contains(&function.name)
+        }));
+        assert!(matches!(
+            compiled
+                .execute(
+                    ExecutionLimits {
+                        max_steps: 0,
+                        ..ExecutionLimits::default()
+                    },
+                    None
+                )
+                .outcome,
+            Outcome::Inconclusive(_)
+        ));
+        assert!(matches!(
+            compiled
+                .execute(ExecutionLimits::default(), Some(&|| true))
+                .outcome,
+            Outcome::Inconclusive(_)
+        ));
+        assert_nat_replay(&compiled, expected);
+        observed.extend(compiled.native_externs().iter().cloned());
+    }
+    for target in super::array_operations::BYTE_ARRAY_NAMES {
+        assert!(
+            observed.contains(&format!("extern:{target}")),
+            "{target} not linked"
         );
     }
 }
