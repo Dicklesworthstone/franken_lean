@@ -1181,6 +1181,9 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 .0
     };
     let mut declaration_column = None;
+    // Wrappers keep the column of their first command token. An inline custom
+    // operand must measure later indentation from the wrapper, not its own word.
+    let mut command_column = None;
     let mut attribute_prefix = false;
     // The column of the attribute or modifier that opened the current declaration, so its
     // body's layout block is measured from the command's first token, not its keyword.
@@ -1220,6 +1223,7 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 // member may be published before the entire group is checked.
                 if !open_in {
                     starts.push(view.to_original(token.extent.start()).0);
+                    command_column = Some(column(token));
                 }
                 open_in = false;
                 current_open = false;
@@ -1242,6 +1246,7 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
             if depth == 0 && command_line && !open_in && doc_comment(token) {
                 doc_comment_is_carried(&view, (&tokens, &refused), index, source.len())?;
                 starts.push(view.to_original(token.extent.start()).0);
+                command_column = Some(column(token));
                 current_open = false;
                 declaration_column = None;
                 attribute_prefix = false;
@@ -1259,10 +1264,16 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
             let deriving_command = symbol == "deriving"
                 && matches!(tokens.get(index + 1).map(|t| &t.kind),
                     Some(TokenKind::Symbol(next)) if next == "instance");
-            let custom_head = crate::extensions::is_partition_command_keyword(symbol)
-                || source_heads
-                    .get(symbol)
-                    .is_some_and(|after| token.extent.start() >= *after);
+            // Census entries also include hand-written query heads such as
+            // "#reduce" and "#guard". Keep their existing declaration boundaries
+            // and the built-in wrappers' explicit "in" handling.
+            let custom_head = !declaration(symbol)
+                && !control(symbol)
+                && symbol != "#guard_msgs"
+                && (crate::extensions::is_partition_command_keyword(symbol)
+                    || source_heads
+                        .get(symbol)
+                        .is_some_and(|after| token.extent.start() >= *after));
             let scope_start =
                 (control(symbol) || line_command(symbol) || deriving_command || custom_head)
                     && command_line;
@@ -1304,6 +1315,7 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 if !continues_prefix {
                     if !open_in {
                         starts.push(view.to_original(token.extent.start()).0);
+                        command_column = Some(column(token));
                     }
                     open_in = false;
                     // `Command.in` (`cmd " in " cmd`): after these, a top-level `in` takes
@@ -1336,7 +1348,14 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 declaration_column = (declaration(symbol)
                     || custom_head
                     || matches!(symbol.as_str(), "syntax" | "macro" | "macro_rules"))
-                .then(|| prefix_column.map_or(column(token), |base| base.min(column(token))));
+                .then(|| {
+                    let base = prefix_column.map_or(column(token), |base| base.min(column(token)));
+                    if custom_head {
+                        command_column.map_or(base, |outer| outer.min(base))
+                    } else {
+                        base
+                    }
+                });
             } else if depth == 0 && attribute_prefix {
                 // Any other keyword ends the prefix: it carries the prefix (`abbrev`, `opaque`,
                 // `axiom`, …) and belongs to its command, and the next declaration starts anew.
@@ -1526,6 +1545,47 @@ def after : Nat := 2
         assert_eq!(commands[0].1, b"already_registered def first : Nat := 0\n");
         assert!(commands[1].1.starts_with(b"already_registered\n  theorem"));
         assert_eq!(commands[2].1, b"def last : Nat := 1\n");
+    }
+
+    #[test]
+    fn wrapped_custom_commands_measure_layout_from_the_wrapper() {
+        let source = r###"syntax "pass_command " command : command
+open Generated in pass_command
+  def first : Nat := 1
+set_option pp.all true in pass_command
+  theorem checked : first = 1 := by
+    rfl
+/-- info: generated -/
+#guard_msgs in pass_command
+  def guarded : Nat := 2
+def after : Nat := 3
+"###;
+        let commands = partition(source.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 5);
+        let text = |index: usize| std::str::from_utf8(commands[index].1).unwrap();
+        assert_eq!(
+            text(1),
+            "open Generated in pass_command\n  def first : Nat := 1\n"
+        );
+        assert!(text(2).starts_with("set_option pp.all true in pass_command\n  theorem"));
+        assert!(text(2).ends_with("    rfl\n"));
+        assert!(text(3).starts_with("/-- info: generated -/\n#guard_msgs in pass_command\n"));
+        assert!(text(3).ends_with("  def guarded : Nat := 2\n"));
+        assert_eq!(text(4), "def after : Nat := 3\n");
+    }
+
+    #[test]
+    fn builtin_query_heads_keep_inline_declaration_boundaries() {
+        let grammar = crate::extensions::FileGrammar::new(false, &[], None).unwrap();
+        let active = grammar.grammar();
+        let source =
+            b"#reduce 0 def first : Nat := 0\n#guard true theorem checked : first = 0 := rfl\n";
+        let commands = crate::extensions::with_grammar(&active, || partition(source)).unwrap();
+        assert_eq!(commands.len(), 4);
+        assert_eq!(commands[0].1, b"#reduce 0 ");
+        assert_eq!(commands[1].1, b"def first : Nat := 0\n");
+        assert_eq!(commands[2].1, b"#guard true ");
+        assert_eq!(commands[3].1, b"theorem checked : first = 0 := rfl\n");
     }
 
     #[test]
