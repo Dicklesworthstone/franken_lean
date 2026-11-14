@@ -1,4 +1,4 @@
-//! Native `package`, local `require`, `lean_lib` and `lean_exe` configuration.
+//! Native `package`, path/Git `require`, `lean_lib` and `lean_exe` configuration.
 //!
 //! Lake's commands elaborate field terms at their declared types, then its loader evaluates
 //! the resulting configurations (`Lake/DSL/DeclUtil.lean`, `Lake/Load/Lean/Eval.lean`). This
@@ -36,6 +36,9 @@ enum ConfigSlot {
     Source,
     Build,
     DependencyPath(usize),
+    DependencyUrl(usize),
+    DependencyRevision(usize),
+    DependencySubdir(usize),
     TargetSource(usize),
     LibraryRoots(usize),
     ExecutableRoot(usize),
@@ -181,6 +184,34 @@ impl Tokens {
                 "lakefile.lean: package and targets currently require an explicit name",
             )),
         }
+    }
+}
+
+/// The pin's Git URL and revision grammar is term:max. Support literal/name
+/// operands and parenthesized expressions without splitting a nested term at
+/// an @ or / token. More elaborate leading forms remain explicit refusals.
+fn git_operand_end(tokens: &Tokens, start: usize) -> Result<usize, Failure> {
+    match tokens.tokens.get(start).map(|token| &token.kind) {
+        Some(TokenKind::Ident(_) | TokenKind::Literal(LiteralKind::Str)) => Ok(start + 1),
+        _ if tokens.symbol(start, "(") => {
+            let mut depth = 0usize;
+            for at in start..tokens.tokens.len() {
+                if tokens.symbol(at, "(") {
+                    depth += 1;
+                } else if tokens.symbol(at, ")") {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(at + 1);
+                    }
+                }
+            }
+            Err(Failure::input(
+                "lakefile.lean: unclosed parenthesized Git requirement operand",
+            ))
+        }
+        _ => Err(Failure::unsupported(
+            "lakefile.lean: Git URL and revision operands require a String literal, a name or a parenthesized term",
+        )),
     }
 }
 
@@ -468,14 +499,9 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                     Some("from") => {}
                     _ => {
                         return Err(Failure::unsupported(
-                            "lakefile.lean: requirements need an explicit local `from` path; registry dependencies are not implemented",
+                            "lakefile.lean: requirements need an explicit `from` source; registry dependencies are not implemented",
                         ));
                     }
-                }
-                if tokens.spelling(head + 3) == Some("git") {
-                    return Err(Failure::unsupported(
-                        "lakefile.lean: git dependency requirements are not implemented",
-                    ));
                 }
                 if head + 3 == tokens.tokens.len() {
                     return Err(Failure::input(
@@ -487,6 +513,83 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                     return Err(Failure::input(format!(
                         "lakefile.lean: configuration declaration `{declaration}` is already declared"
                     )));
+                }
+                if tokens.spelling(head + 3) == Some("git") {
+                    let index = parsed.config.requires.len();
+                    let mut at = head + 4;
+                    let end = git_operand_end(&tokens, at)?;
+                    let mut operands = vec![(ConfigSlot::DependencyUrl(index), at, end, "url")];
+                    at = end;
+                    if tokens.symbol(at, "@") {
+                        let start = at + 1;
+                        let end = git_operand_end(&tokens, start)?;
+                        operands.push((ConfigSlot::DependencyRevision(index), start, end, "rev"));
+                        at = end;
+                    }
+                    if tokens.symbol(at, "/") {
+                        let start = at + 1;
+                        if start == tokens.tokens.len() {
+                            return Err(Failure::input(
+                                "lakefile.lean: Git subDir requires a FilePath expression",
+                            ));
+                        }
+                        operands.push((
+                            ConfigSlot::DependencySubdir(index),
+                            start,
+                            tokens.tokens.len(),
+                            "subDir",
+                        ));
+                        at = tokens.tokens.len();
+                    }
+                    if at != tokens.tokens.len() {
+                        return Err(Failure::unsupported(
+                            "lakefile.lean: unsupported Git requirement suffix or dependency options",
+                        ));
+                    }
+                    parsed.requirement_names.push(identity);
+                    parsed.config.requires.push(fln_lake::LakeRequire {
+                        name: declaration.clone(),
+                        path: None,
+                        url: None,
+                        rev: None,
+                        subdir: None,
+                    });
+                    for (slot, start, end, label) in operands {
+                        let generated = fresh_name(original, &mut next);
+                        let expression = std::str::from_utf8(
+                            &command[tokens.offset(start)..tokens.offset(end)],
+                        )
+                        .map_err(|_| Failure::input("lakefile.lean: expression is not UTF-8"))?;
+                        let type_ = match slot {
+                            ConfigSlot::DependencySubdir(_) => "_root_.System.FilePath",
+                            _ => "_root_.String",
+                        };
+                        let definition =
+                            format!("\ndef {generated} : {type_} := (\n{expression}\n)\n");
+                        // A subdirectory is a full term and may itself contain
+                        // 'with' (e.g. match). A trailing dependency options
+                        // clause cannot become part of its checked expression.
+                        if tokens.tokens[start..end]
+                            .iter()
+                            .enumerate()
+                            .any(|(offset, _)| tokens.spelling(start + offset) == Some("with"))
+                            && with_grammar(&active, || {
+                                fln_parse::parse_source_command(definition.as_bytes())
+                            })
+                            .is_err()
+                        {
+                            return Err(Failure::unsupported(
+                                "lakefile.lean: dependency `with` options are not implemented",
+                            ));
+                        }
+                        parsed.program.push_str(&definition);
+                        parsed.fields.push(ConfigField {
+                            slot,
+                            declaration: generated,
+                            label: format!("require {declaration}.{label}"),
+                        });
+                    }
+                    continue;
                 }
                 let generated = fresh_name(original, &mut next);
                 let expression_start = tokens.offset(head + 3);
@@ -828,7 +931,7 @@ fn evaluate(
         })?;
     let checked = complete(checked, "checking configuration")?;
     for name in &parsed.requirement_names {
-        // The adapter lowers a requirement's selected path, not Lake's
+        // The adapter lowers a requirement's source operands, not Lake's
         // Dependency structure. Keep the original declaration's collision
         // semantics against ordinary source and imported declarations.
         if checked.engine.environment().contains(name) {
@@ -869,6 +972,10 @@ fn evaluate(
             ),
             ConfigSlot::ExecutableRoot(_) => format!(
                 "def {projection} : _root_.Array _root_.Lean.Name := #[_root_.{}]",
+                field.declaration
+            ),
+            ConfigSlot::DependencyUrl(_) | ConfigSlot::DependencyRevision(_) => format!(
+                "def {projection} : _root_.String := _root_.{}",
                 field.declaration
             ),
             _ => format!(
@@ -930,6 +1037,21 @@ fn evaluate(
                 ));
             }
         };
+        match field.slot {
+            ConfigSlot::DependencyUrl(index) => {
+                parsed.config.requires[index].url = Some(value);
+                continue;
+            }
+            ConfigSlot::DependencyRevision(index) => {
+                parsed.config.requires[index].rev = Some(value);
+                continue;
+            }
+            ConfigSlot::DependencySubdir(index) => {
+                parsed.config.requires[index].subdir = Some(value);
+                continue;
+            }
+            _ => {}
+        }
         let path = PathBuf::from(value);
         if let ConfigSlot::DependencyPath(index) = field.slot {
             // Local requirements may name sibling packages or absolute paths.
@@ -944,9 +1066,12 @@ fn evaluate(
             ConfigSlot::Build => parsed.config.build_dir = path,
             ConfigSlot::TargetSource(index) => parsed.config.targets[index].src_dir = Some(path),
             ConfigSlot::DependencyPath(_)
+            | ConfigSlot::DependencyUrl(_)
+            | ConfigSlot::DependencyRevision(_)
+            | ConfigSlot::DependencySubdir(_)
             | ConfigSlot::LibraryRoots(_)
             | ConfigSlot::ExecutableRoot(_) => {
-                unreachable!("module roots and dependency paths were read above")
+                unreachable!("module roots and dependency fields were read above")
             }
         }
     }

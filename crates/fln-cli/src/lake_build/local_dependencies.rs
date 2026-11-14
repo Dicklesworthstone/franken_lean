@@ -1,4 +1,4 @@
-//! Read-only local package discovery for checked source builds and executables.
+//! Read-only local and locked Git package discovery for checked source builds and executables.
 //!
 //! Package identity follows Lake's reverse, breadth-first requirement order.
 //! A root manifest locks the path for every reachable package by name; its paths
@@ -11,11 +11,248 @@ use super::*;
 const MAX_PACKAGES: usize = 64;
 const MAX_REQUIREMENTS: usize = 4096;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_GIT_REFERENCE_BYTES: usize = 4096;
+const MAX_GIT_PACKED_REFS_BYTES: usize = 1024 * 1024;
+const MAX_GIT_REFERENCE_DEPTH: usize = 16;
+
+/// An already materialized checkout. The root lock remains authoritative; this
+/// guard never fetches, checks out, cleans or writes Git metadata.
+struct GitCheckout {
+    directory: PathBuf,
+    package_directory: PathBuf,
+    revision: String,
+}
+
+impl GitCheckout {
+    fn verify(&self) -> Result<(), Failure> {
+        // Rewalk canonical paths as well: check_path treats its root as trusted,
+        // but a checkout or subdirectory may have been replaced since discovery.
+        dependency_root(Path::new(""), &self.directory)?;
+        dependency_root(Path::new(""), &self.package_directory)?;
+        let actual = checkout_revision(&self.directory)?;
+        if actual != self.revision {
+            return Err(Failure::unsupported(format!(
+                "locked Git checkout {} is at {actual}, expected {}; materialize the locked revision before building",
+                self.directory.display(),
+                self.revision,
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn git_hash(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Only ordinary relative Git references are supported. In particular, an
+/// untrusted symbolic reference cannot turn a metadata read into a path escape.
+fn git_reference(text: &str) -> bool {
+    text.starts_with("refs/")
+        && !text.contains("..")
+        && !text.contains("@{")
+        && !text.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
+        && text.split('/').all(|component| {
+            !component.is_empty()
+                && !component.starts_with('.')
+                && !component.ends_with('.')
+                && !component.ends_with(".lock")
+        })
+}
+
+fn git_metadata(
+    directory: &Path,
+    relative: &Path,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, Failure> {
+    let path = directory.join(relative);
+    check_path(directory, &path, true)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.is_file() => Err(Failure::input(format!(
+            "Git metadata is not a regular file: {}",
+            path.display(),
+        ))),
+        Ok(_) => read_bounded(&path, max_bytes, "locked Git metadata")
+            .map(Some)
+            .map_err(Failure::from),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Failure::io(&path, error)),
+    }
+}
+
+fn packed_revision(directory: &Path, reference: &str) -> Result<String, Failure> {
+    let bytes = git_metadata(
+        directory,
+        Path::new("packed-refs"),
+        MAX_GIT_PACKED_REFS_BYTES,
+    )?
+    .ok_or_else(|| {
+        Failure::unsupported(format!(
+            "locked Git reference {reference} is absent from {}",
+            directory.display(),
+        ))
+    })?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| Failure::input("Git packed-refs is not UTF-8"))?;
+    let mut selected = None;
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(peeled) = line.strip_prefix('^') {
+            if !git_hash(peeled) {
+                return Err(Failure::input("malformed peeled Git reference"));
+            }
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let (Some(revision), Some(name), None) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(Failure::input("malformed Git packed reference"));
+        };
+        if !git_hash(revision) || !git_reference(name) {
+            return Err(Failure::input("malformed Git packed reference"));
+        }
+        if name == reference && selected.replace(revision.to_owned()).is_some() {
+            return Err(Failure::input("duplicate selected Git packed reference"));
+        }
+    }
+    selected.ok_or_else(|| {
+        Failure::unsupported(format!(
+            "locked Git reference {reference} is absent from {}",
+            directory.display(),
+        ))
+    })
+}
+
+/// Resolve HEAD from the ordinary .git directory layout without running Git.
+/// Gitfiles, common directories and unfamiliar reference stores remain explicit
+/// refusals. Like the pin's getHeadRevision?, this observes a revision identity;
+/// source bytes are separately captured and checked by the ordinary build path.
+fn checkout_revision(directory: &Path) -> Result<String, Failure> {
+    let git = directory.join(".git");
+    check_path(directory, &git, true)?;
+    match std::fs::symlink_metadata(&git) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(Failure::unsupported(format!(
+                "locked Git checkout {} requires an ordinary .git directory",
+                directory.display(),
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Failure::unsupported(format!(
+                "locked Git checkout is not materialized: {}",
+                directory.display(),
+            )));
+        }
+        Err(error) => return Err(Failure::io(&git, error)),
+    }
+    // A HEAD file by itself is not a repository. These directories are the
+    // ordinary Git repository-discovery shape; individual objects are not read.
+    for relative in ["objects", "refs"] {
+        let path = git.join(relative);
+        check_path(&git, &path, true)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(Failure::unsupported(format!(
+                    "locked Git checkout requires an ordinary {relative} directory",
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Failure::unsupported(format!(
+                    "locked Git checkout requires an ordinary {relative} directory",
+                )));
+            }
+            Err(error) => return Err(Failure::io(&path, error)),
+        }
+    }
+    if git_metadata(&git, Path::new("commondir"), MAX_GIT_REFERENCE_BYTES)?.is_some() {
+        return Err(Failure::unsupported(
+            "locked Git common-directory layouts are not implemented",
+        ));
+    }
+    let mut reference = "HEAD".to_owned();
+    let mut visited = BTreeSet::new();
+    for _ in 0..MAX_GIT_REFERENCE_DEPTH {
+        if !visited.insert(reference.clone()) {
+            return Err(Failure::input("cyclic Git symbolic reference"));
+        }
+        let Some(bytes) =
+            git_metadata(&git, Path::new(&reference), MAX_GIT_REFERENCE_BYTES)?
+        else {
+            if reference == "HEAD" {
+                return Err(Failure::unsupported("locked Git checkout has no HEAD"));
+            }
+            return packed_revision(&git, &reference);
+        };
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| Failure::input("Git reference is not UTF-8"))?
+            .trim_end_matches(['\r', '\n']);
+        if git_hash(text) {
+            return Ok(text.to_owned());
+        }
+        let Some(next) = text.strip_prefix("ref: ") else {
+            return Err(Failure::input("malformed Git reference"));
+        };
+        if !git_reference(next) {
+            return Err(Failure::unsupported(
+                "locked Git symbolic reference is outside the supported refs namespace",
+            ));
+        }
+        reference = next.to_owned();
+    }
+    Err(Failure::new(
+        "resource",
+        "locked Git symbolic reference depth exceeds 16",
+    ))
+}
+
+/// Lake uses Name.toString(escape := false) for the checkout directory. Keep
+/// quoted components intact while removing only their quotation delimiters.
+fn git_package_directory(name: &str) -> Result<String, Failure> {
+    if name.len() > MAX_GIT_REFERENCE_BYTES {
+        return Err(Failure::new("resource", "Git package name exceeds 4096 bytes"));
+    }
+    let mut rendered = String::new();
+    let mut quoted = false;
+    for character in name.chars() {
+        match character {
+            '«' if !quoted => quoted = true,
+            '»' if quoted => quoted = false,
+            '»' => return Err(Failure::input("malformed quoted Git package name")),
+            _ => rendered.push(character),
+        }
+    }
+    if quoted
+        || rendered.is_empty()
+        || matches!(rendered.as_str(), "." | ".." | "[anonymous]")
+        || rendered
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':'))
+        || !matches!(
+            Path::new(&rendered).components().collect::<Vec<_>>().as_slice(),
+            [Component::Normal(_)]
+        )
+    {
+        return Err(Failure::unsupported(
+            "Git package identity is not a safe single directory name",
+        ));
+    }
+    Ok(rendered)
+}
 
 pub(super) struct Sources {
     pub(super) packages: Vec<Package>,
     pub(super) configuration_imports: Vec<ImportPostureReport>,
     manifest: ManifestSelection,
+    git_checkouts: Vec<GitCheckout>,
     /// Files whose absence selected the supported configuration/resolution path.
     metadata_guards: Vec<(PathBuf, &'static str)>,
 }
@@ -25,6 +262,7 @@ struct ManifestSelection {
     path: PathBuf,
     digest: Option<String>,
     entries: Option<BTreeMap<String, fln_lake::ManifestPackageEntry>>,
+    packages_dir: PathBuf,
 }
 
 fn manifest_bytes(root: &Path, path: &Path) -> Result<Option<Vec<u8>>, Failure> {
@@ -46,7 +284,7 @@ impl ManifestSelection {
     fn load(root: &Path) -> Result<Self, Failure> {
         let path = root.join("lake-manifest.json");
         let bytes = manifest_bytes(root, &path)?;
-        let (digest, entries) = if let Some(bytes) = bytes {
+        let (digest, entries, packages_dir) = if let Some(bytes) = bytes {
             let text = std::str::from_utf8(&bytes)
                 .map_err(|_| Failure::input("lake-manifest.json is not UTF-8"))?;
             let manifest = fln_lake::Manifest::parse_json(text).map_err(|error| {
@@ -69,15 +307,22 @@ impl ManifestSelection {
                 .into_iter()
                 .map(|entry| (entry.name.clone(), entry))
                 .collect();
-            (Some(snapshot::digest(&bytes)), Some(entries))
+            (
+                Some(snapshot::digest(&bytes)),
+                Some(entries),
+                manifest
+                    .packages_dir
+                    .unwrap_or_else(|| PathBuf::from(".lake/packages")),
+            )
         } else {
-            (None, None)
+            (None, None, PathBuf::from(".lake/packages"))
         };
         Ok(Self {
             root: root.to_path_buf(),
             path,
             digest,
             entries,
+            packages_dir,
         })
     }
 
@@ -99,10 +344,13 @@ impl ManifestSelection {
         owner: &Path,
         requirement: &fln_lake::LakeRequire,
         metadata_guards: &mut Vec<(PathBuf, &'static str)>,
+        git_checkouts: &mut Vec<GitCheckout>,
     ) -> Result<(PathBuf, ConfigurationSelection), Failure> {
         let Some(entries) = &self.entries else {
             let path = requirement.path.as_deref().ok_or_else(|| {
-                Failure::unsupported("only local path dependencies are supported")
+                Failure::unsupported(
+                    "Git dependencies require a root lake-manifest.json and an existing checkout at its locked revision",
+                )
             })?;
             let directory = dependency_root(owner, path)?;
             guard_metadata(
@@ -120,19 +368,51 @@ impl ManifestSelection {
                 owner.display(),
             ))
         })?;
-        if entry.entry_type != "path" {
-            return Err(Failure::unsupported(format!(
-                "manifest dependency '{}' requires '{}'; only local path dependencies are supported",
-                requirement.name, entry.entry_type,
-            )));
-        }
-        let path = entry.dir.as_deref().ok_or_else(|| {
-            Failure::input(format!(
-                "manifest path dependency '{}' has no directory",
-                requirement.name,
-            ))
-        })?;
-        let directory = dependency_root(&self.root, path)?;
+        let directory = match entry.entry_type.as_str() {
+            "path" => {
+                let path = entry.dir.as_deref().ok_or_else(|| {
+                    Failure::input(format!(
+                        "manifest path dependency '{}' has no directory",
+                        requirement.name,
+                    ))
+                })?;
+                dependency_root(&self.root, path)?
+            }
+            "git" => {
+                let revision = entry
+                    .rev
+                    .as_deref()
+                    .filter(|revision| git_hash(revision))
+                    .ok_or_else(|| {
+                        Failure::unsupported(
+                            "locked Git dependencies require a full hexadecimal commit revision",
+                        )
+                    })?;
+                let package = git_package_directory(&entry.name)?;
+                let checkout = dependency_root(&self.root, &self.packages_dir.join(package))?;
+                let directory = if let Some(subdir) = &entry.subdir {
+                    let subdir = Path::new(subdir);
+                    relative_directory(subdir)?;
+                    dependency_root(&checkout, subdir)?
+                } else {
+                    checkout.clone()
+                };
+                let guard = GitCheckout {
+                    directory: checkout,
+                    package_directory: directory.clone(),
+                    revision: revision.to_owned(),
+                };
+                guard.verify()?;
+                git_checkouts.push(guard);
+                directory
+            }
+            other => {
+                return Err(Failure::unsupported(format!(
+                    "manifest dependency '{}' has unsupported source '{other}'",
+                    requirement.name,
+                )));
+            }
+        };
         let selection = match entry.config_file.as_str() {
             "lakefile.toml" => ConfigurationSelection::Toml,
             "lakefile.lean" => ConfigurationSelection::Lean,
@@ -191,6 +471,9 @@ impl Sources {
     /// changed while source modules were being checked and published.
     pub(super) fn verify_configurations(&self) -> Result<(), Failure> {
         self.manifest.verify()?;
+        for checkout in &self.git_checkouts {
+            checkout.verify()?;
+        }
         for (root, relative) in &self.metadata_guards {
             absent_metadata(root, relative)?;
         }
@@ -367,6 +650,7 @@ pub(super) fn load(
 ) -> Result<Sources, Failure> {
     let manifest = ManifestSelection::load(root)?;
     let mut metadata_guards = Vec::new();
+    let mut git_checkouts = Vec::new();
     let config = &configuration.config;
     let mut selected = BTreeMap::from([(fln_lake::canonical_package_name(&config.name), 0)]);
     let mut edges = vec![Vec::new()];
@@ -402,7 +686,12 @@ pub(super) fn load(
                 return Err(Failure::new("resource", "local package count exceeds 64"));
             }
             let (directory, selection) =
-                manifest.dependency(&owner, requirement, &mut metadata_guards)?;
+                manifest.dependency(
+                    &owner,
+                    requirement,
+                    &mut metadata_guards,
+                    &mut git_checkouts,
+                )?;
             let configuration = load_configuration(&directory, selection, evaluation)?;
             // Lake's loader uses the requirement name as package identity;
             // the dependency's own name field does not override that selection.
@@ -456,6 +745,7 @@ pub(super) fn load(
         packages,
         configuration_imports,
         manifest,
+        git_checkouts,
         metadata_guards,
     };
     sources.verify_configurations()?;
@@ -510,7 +800,9 @@ mod tests {
                 path: PathBuf::from("/workspace/root/lake-manifest.json"),
                 digest: None,
                 entries: None,
+                packages_dir: PathBuf::from(".lake/packages"),
             },
+            git_checkouts: Vec::new(),
             metadata_guards: Vec::new(),
         }
     }
@@ -600,4 +892,132 @@ mod tests {
         assert_eq!(error.class, "unsupported");
         assert!(error.detail.contains("belongs to multiple local packages"));
     }
+
+    fn locked_checkout_fixture() -> GitCheckout {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fln-locked-git-{}-{stamp}",
+            std::process::id(),
+        ));
+        for relative in [".git/objects", ".git/refs/heads", "lib"] {
+            std::fs::create_dir_all(directory.join(relative)).unwrap();
+        }
+        let revision = "1".repeat(40);
+        std::fs::write(directory.join(".git/HEAD"), format!("{revision}\n")).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        GitCheckout {
+            package_directory: directory.join("lib"),
+            directory,
+            revision,
+        }
+    }
+
+    #[test]
+    fn locked_git_guards_recheck_revision_identity_before_publication() {
+        let guard = locked_checkout_fixture();
+        guard.verify().unwrap_or_else(|error| panic!("{}", error.detail));
+        std::fs::write(guard.directory.join(".git/HEAD"), "2".repeat(40)).unwrap();
+        let error = guard.verify().expect_err("changed HEAD must invalidate the guard");
+        assert_eq!(error.class, "unsupported");
+        assert!(error.detail.contains("materialize the locked revision"));
+    }
+
+    #[test]
+    fn ordinary_git_layout_and_reference_metadata_are_required() {
+        let guard = locked_checkout_fixture();
+        let git = guard.directory.join(".git");
+        std::fs::rename(git.join("objects"), git.join("saved-objects")).unwrap();
+        let error = guard.verify().expect_err("a HEAD file alone is not a repository");
+        assert_eq!(error.class, "unsupported");
+        assert!(error.detail.contains("ordinary objects directory"));
+        std::fs::rename(git.join("saved-objects"), git.join("objects")).unwrap();
+
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let error = guard.verify().expect_err("missing refs are not accepted");
+        assert_eq!(error.class, "unsupported");
+        assert!(error.detail.contains("is absent"));
+        std::fs::write(
+            git.join("packed-refs"),
+            format!(
+                "# pack-refs with: peeled fully-peeled sorted\n{} refs/heads/main\n",
+                guard.revision,
+            ),
+        )
+        .unwrap();
+        guard.verify().unwrap_or_else(|error| panic!("{}", error.detail));
+        std::fs::write(
+            git.join("packed-refs"),
+            format!("{0} refs/heads/main\n{0} refs/heads/main\n", guard.revision),
+        )
+        .unwrap();
+        let error = guard.verify().expect_err("duplicate packed refs are ambiguous");
+        assert_eq!(error.class, "input");
+        assert!(error.detail.contains("duplicate selected"));
+        std::fs::write(git.join("refs/heads/main"), "ref: refs/heads/main\n").unwrap();
+        let error = guard.verify().expect_err("cyclic loose refs must not loop");
+        assert_eq!(error.class, "input");
+        assert!(error.detail.contains("cyclic Git symbolic reference"));
+
+        std::fs::rename(&git, guard.directory.join("saved-git")).unwrap();
+        std::fs::write(&git, "gitdir: saved-git\n").unwrap();
+        let error = guard.verify().expect_err("gitfiles remain unsupported");
+        assert_eq!(error.class, "unsupported");
+        assert!(error.detail.contains("ordinary .git directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_guard_revalidation_refuses_swapped_checkout_and_subdirectory_roots() {
+        for subdir in [false, true] {
+            let guard = locked_checkout_fixture();
+            guard.verify().unwrap_or_else(|error| panic!("{}", error.detail));
+            let path = if subdir {
+                &guard.package_directory
+            } else {
+                &guard.directory
+            };
+            let moved = path.with_extension("original");
+            std::fs::rename(path, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, path).unwrap();
+            let error = guard.verify().expect_err("a swapped root must not become trusted");
+            assert_eq!(error.class, "input");
+            assert!(error.detail.contains("refusing symlink"));
+        }
+        let guard = locked_checkout_fixture();
+        let head = guard.directory.join(".git/HEAD");
+        let moved = guard.directory.join(".git/saved-HEAD");
+        std::fs::rename(&head, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &head).unwrap();
+        let error = guard.verify().expect_err("HEAD must be a regular file");
+        assert_eq!(error.class, "input");
+        assert!(error.detail.contains("refusing symlink"));
+    }
+
+    #[test]
+    fn git_checkout_names_render_quoted_components_without_path_escapes() {
+        for (name, directory) in [
+            ("«dep-name»", "dep-name"),
+            ("scope.«dep-name»", "scope.dep-name"),
+            ("«part«name»", "part«name"),
+        ] {
+            assert_eq!(
+                git_package_directory(name).unwrap_or_else(|error| panic!("{}", error.detail)),
+                directory,
+            );
+        }
+        for name in [
+            "«../dep»",
+            "..",
+            "«dep/sub»",
+            "«dep\\sub»",
+            "«dep:sub»",
+            "«unclosed",
+        ] {
+            assert!(git_package_directory(name).is_err(), "{name}");
+        }
+    }
+
 }

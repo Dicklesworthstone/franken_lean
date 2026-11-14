@@ -157,6 +157,37 @@ require "quoted-dependency" from
         requirement.url.is_none() && requirement.rev.is_none() && requirement.subdir.is_none()
     }));
 
+    let git = configured(
+        &engine,
+        r#"import Lake
+open System Lake DSL
+def endpoint (suffix : String) : String := "https://example.invalid/" ++ suffix
+def branch : String := "main"
+def subtree (suffix : String) : FilePath := FilePath.mk ("sub/" ++ suffix)
+package gitConsumer
+require "source-dependency" from git (endpoint "repo") @ branch / subtree "lib"
+require optional from git ("../" ++ "repository")
+lean_lib GitConsumer
+"#,
+        limits,
+    )
+    .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
+    assert_eq!(git.requires.len(), 2);
+    assert_eq!(git.requires[0].name, "«source-dependency»");
+    assert_eq!(
+        git.requires[0].url.as_deref(),
+        Some("https://example.invalid/repo"),
+    );
+    assert_eq!(git.requires[0].rev.as_deref(), Some("main"));
+    assert_eq!(git.requires[0].subdir.as_deref(), Some("sub/lib"));
+    assert!(git.requires[0].path.is_none());
+    assert_eq!(git.requires[1].url.as_deref(), Some("../repository"));
+    assert!(git.requires[1].path.is_none());
+    assert!(git.requires[1].rev.is_none());
+    assert!(git.requires[1].subdir.is_none());
+    assert_eq!(git.src_dir, PathBuf::from("."));
+    assert_eq!(git.build_dir, PathBuf::from(".lake/build"));
+
     // A field-free ordinary package retains Lake's defaults without evaluating
     // even one of the user's closed definitions.
     let default = configured(
@@ -180,6 +211,9 @@ require "quoted-dependency" from
         "import Lake\nopen Lake DSL\npackage bad\nlean_exe runner where\n  root := (#[`Main] : Array Lean.Name)\n",
         "import Lake\nopen Lake DSL\npackage bad\nlean_exe runner where\n  root := (42 : Nat)\n",
         "import Lake\nopen Lake DSL\npackage bad\nrequire dep from (42 : Nat)\n",
+        "import Lake\nopen Lake DSL\npackage bad\nrequire dep from git (42 : Nat)\n",
+        "import Lake\nopen Lake DSL\npackage bad\nrequire dep from git \"repo\" @ (42 : Nat)\n",
+        "import Lake\nopen Lake DSL\npackage bad\nrequire dep from git \"repo\" / (42 : Nat)\n",
         "import Lake\nopen Lake DSL\npackage bad\nrequire dep from later\ndef later : System.FilePath := \"../dep\"\n",
         "import Lake\nopen Lake DSL\npackage bad\nrequire dep from \"../dep\"\ndef invalidUnused : Nat := \"wrong\"\n",
     ] {

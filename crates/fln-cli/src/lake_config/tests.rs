@@ -173,9 +173,12 @@ fn native_lake_config_requirements_keep_package_names_separate_from_binding_name
 #[test]
 fn native_lake_config_refuses_unsupported_or_ambiguous_requirements() {
     for (body, diagnostic) in [
-        ("require dep", "explicit local `from` path"),
+        ("require dep", "explicit `from` source"),
         ("require dep @ \"1.0.0\" from \"../dep\"", "version"),
-        ("require dep from git \"../dep\"", "git dependency"),
+        ("require dep from git", "Git URL and revision"),
+        ("require dep from git \"../dep\" @", "Git URL and revision"),
+        ("require dep from git \"../dep\" /", "FilePath expression"),
+        ("require dep from git \"../dep\" with {}", "suffix"),
         (
             "require \"owner\" / dep from \"../dep\"",
             "scoped dependency",
@@ -254,7 +257,7 @@ fn native_lake_config_refuses_unimplemented_build_semantics() {
         "package p\nlean_lib Main where\n  root := `Main\n",
         "package p\nlean_lib Main\nlean_exe Main\n",
         "lean_exe Main\npackage p\n",
-        "package p\nrequire dep from git \"https://example.test/dep\"\n",
+        "package p\nrequire dep from git \"https://example.test/dep\" @ \"main\" with {}\n",
         "package p\nscript hi := return 0\n",
         "package p where\n  moreLeanArgs := #[\"--foo\"]\nlean_lib P\n",
         "package p where\n  roots := #[`Other]\nlean_lib P\n",
@@ -283,4 +286,83 @@ fn native_lake_config_does_not_invent_imports_or_capture_generated_names() {
     }
     let parsed = parse(b"import Lake\nopen Lake DSL\ndef _fln_lake_path_0 : Nat := 7\npackage p where\n  srcDir := \"src\"\nlean_lib P\n").unwrap_or_else(|error| panic!("{}", error.detail));
     assert_eq!(parsed.fields[0].declaration, "_fln_lake_path_1");
+}
+
+#[test]
+fn native_lake_config_keeps_git_fields_as_checked_string_and_path_terms() {
+    let source = r#"import Lake
+open System Lake DSL
+def endpoint : String := "https://example.invalid/" ++ "source"
+def revision : String := "lock" ++ "ed"
+package p
+require "dep-name" from git endpoint @ (revision) / FilePath.mk ("lib/" ++ "nested")
+require other from git ("https://example.invalid/" ++ "other")
+lean_lib P
+"#;
+    let parsed = parse(source.as_bytes()).unwrap_or_else(|error| panic!("{}", error.detail));
+    assert_eq!(parsed.config.requires.len(), 2);
+    assert_eq!(parsed.config.requires[0].name, "«dep-name»");
+    assert_eq!(parsed.fields.len(), 4);
+    assert!(matches!(parsed.fields[0].slot, ConfigSlot::DependencyUrl(0)));
+    assert!(matches!(
+        parsed.fields[1].slot,
+        ConfigSlot::DependencyRevision(0)
+    ));
+    assert!(matches!(parsed.fields[2].slot, ConfigSlot::DependencySubdir(0)));
+    assert!(matches!(parsed.fields[3].slot, ConfigSlot::DependencyUrl(1)));
+    for (index, type_) in [
+        (0, "_root_.String"),
+        (1, "_root_.String"),
+        (2, "_root_.System.FilePath"),
+        (3, "_root_.String"),
+    ] {
+        assert!(
+            parsed.program.contains(&format!(
+                "def {} : {type_} :=",
+                parsed.fields[index].declaration
+            )),
+            "{}",
+            parsed.program,
+        );
+    }
+    assert!(parsed.program.contains("FilePath.mk (\"lib/\" ++ \"nested\")"));
+    assert!(
+        parsed
+            .program
+            .contains("(\"https://example.invalid/\" ++ \"other\")")
+    );
+    // Values are deliberately unresolved here: only checked Golem execution
+    // may populate the dependency configuration.
+    assert!(
+        parsed
+            .config
+            .requires
+            .iter()
+            .all(|dependency| dependency.path.is_none() && dependency.url.is_none())
+    );
+    let windows = parse(source.replace('\n', "\r\n").as_bytes())
+        .unwrap_or_else(|error| panic!("{}", error.detail));
+    assert_eq!(windows.config.requires, parsed.config.requires);
+    assert_eq!(windows.fields.len(), parsed.fields.len());
+}
+
+#[test]
+fn git_requirement_delimiters_do_not_split_nested_terms_or_accept_options() {
+    let accepted = [
+        "git (\"https://example.invalid/@/repo\") @ (\"rev/@\") / (match true with | true => \"lib\" | false => \"other\")",
+        "git \"repo\" / System.FilePath.mk (let s := \"with @ /\"; s)",
+    ];
+    for expression in accepted {
+        let source = format!("import Lake\nopen Lake DSL\npackage p\nrequire dep from {expression}\n");
+        parse(source.as_bytes()).unwrap_or_else(|error| panic!("{expression}: {}", error.detail));
+    }
+    for expression in [
+        "git \"repo\" extra",
+        "git \"repo\" @ \"rev\" extra",
+        "git \"repo\" / \"lib\" with {}",
+        "git \"repo\" / (match true with | true => \"lib\" | false => \"other\") with {}",
+    ] {
+        let source = format!("import Lake\nopen Lake DSL\npackage p\nrequire dep from {expression}\n");
+        assert!(parse(source.as_bytes()).is_err(), "{expression}");
+    }
 }

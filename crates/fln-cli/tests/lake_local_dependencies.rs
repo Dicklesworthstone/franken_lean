@@ -394,7 +394,7 @@ fn missing_dependency_and_unsupported_remote_sources_fail_before_execution() {
     refusal(
         workspace.run(&["--json", "exe", "runner"], None),
         "unsupported",
-        "require.git",
+        "require a root lake-manifest.json",
     );
     assert!(!workspace.0.join("import-records").exists());
     workspace.no_products();
@@ -827,7 +827,7 @@ fn locked_resolution_failures_preserve_every_published_artifact() {
                 "\"type\":\"git\",\"name\":\"shared\",\"url\":\"https://example.invalid/shared\",\"rev\":\"deadbeef\"",
             ),
             "unsupported",
-            "only local path dependencies",
+            "full hexadecimal commit revision",
         ),
         (
             LOCKED_MANIFEST.replace(
@@ -1423,4 +1423,385 @@ fn checked_lean_path_dependencies_execute_the_selected_program() {
     );
     assert!(output.stderr.is_empty(), "{output:?}");
     workspace.no_products();
+}
+
+// Git is only a fixture writer here. Production resolution never spawns it and
+// never fetches; the deliberately unreachable URL cannot be materialized.
+fn local_git(directory: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=disabled-hooks",
+        ])
+        .arg("-C")
+        .arg(directory)
+        .args(arguments)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env("GIT_CONFIG_COUNT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", directory.join("absent-global-config"))
+        .env("GIT_AUTHOR_NAME", "Lake fixture")
+        .env("GIT_AUTHOR_EMAIL", "lake-fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Lake fixture")
+        .env("GIT_COMMITTER_EMAIL", "lake-fixture@example.invalid")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{arguments:?}: {output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+const LOCKED_GIT_CONFIG: &str = concat!(
+    "name = \"root\"\nbuildDir = \"output\"\n",
+    "[[require]]\nname = \"dep-name\"\n",
+    "git = \"https://example.invalid/never-fetch.git\"\n",
+    "rev = \"unselected-input-branch\"\nsubDir = \"unselected-input-subdir\"\n",
+    "[[lean_lib]]\nname = \"App\"\n",
+);
+
+const LOCKED_GIT_SOURCE: &str = concat!(
+    "prelude\nimport Shared\n",
+    "def Remote.keep (A : Type) (a : A) : A := Shared.identity A a\n",
+);
+
+fn locked_git_workspace() -> (Workspace, String) {
+    let workspace = Workspace::new();
+    workspace.write("root/lakefile.toml", LOCKED_GIT_CONFIG);
+    workspace.write(
+        "root/App/Top.lean",
+        "prelude\nimport Remote.Base\ndef App.keep (A : Type) (a : A) : A := Remote.keep A a\n",
+    );
+    workspace.write(
+        "root/vendor/dep-name/lib/lakefile.toml",
+        concat!(
+            "name = \"declaredName\"\nbuildDir = \"products\"\n",
+            "[[require]]\nname = \"shared\"\npath = \"missing-transitive-path\"\n",
+            "[[lean_lib]]\nname = \"Remote\"\n",
+        ),
+    );
+    workspace.write("root/vendor/dep-name/lib/Remote/Base.lean", LOCKED_GIT_SOURCE);
+    // The lock explicitly selects TOML, including when a sibling Lean
+    // configuration and dependency-local resolution metadata are present.
+    for relative in [
+        "lakefile.lean",
+        "lake-manifest.json",
+        ".lake/package-overrides.json",
+    ] {
+        workspace.write(
+            &format!("root/vendor/dep-name/lib/{relative}"),
+            "unselected metadata\n",
+        );
+    }
+    workspace.write(
+        "shared/lakefile.toml",
+        "name = \"shared\"\n[[lean_lib]]\nname = \"Shared\"\n",
+    );
+    workspace.write("shared/Shared.lean", CHECKED_SHARED);
+    let checkout = workspace.0.join("root/vendor/dep-name");
+    local_git(
+        &checkout,
+        &[
+            "init",
+            "--quiet",
+            "--initial-branch=main",
+            "--object-format=sha1",
+            "--template=",
+        ],
+    );
+    local_git(&checkout, &["add", "."]);
+    local_git(&checkout, &["commit", "--quiet", "-m", "locked fixture"]);
+    let revision = local_git(&checkout, &["rev-parse", "--verify", "HEAD"]);
+    workspace.write(
+        "root/lake-manifest.json",
+        format!(
+            r#"{{
+  "version":"1.2.0",
+  "name":"root",
+  "lakeDir":".lake",
+  "packagesDir":"vendor",
+  "packages":[
+    {{"type":"git","name":"«dep-name»","url":"https://example.invalid/never-fetch.git","rev":"{revision}","inputRev":"unselected-input-branch","subDir":"lib","inherited":false,"configFile":"lakefile.toml"}},
+    {{"type":"path","name":"shared","dir":"../shared","inherited":true,"configFile":"lakefile.toml"}}
+  ]
+}}
+"#
+        ),
+    );
+    (workspace, revision)
+}
+
+fn locked_git_artifacts(workspace: &Workspace) -> [PathBuf; 3] {
+    [
+        "root/output/lib/lean/App/Top.olean",
+        "root/vendor/dep-name/lib/products/lib/lean/Remote/Base.olean",
+        "shared/.lake/build/lib/lean/Shared.olean",
+    ]
+    .map(|path| workspace.0.join(path))
+}
+
+#[test]
+fn locked_git_builds_preserve_package_ownership_and_reuse_loose_packed_and_detached_heads() {
+    let (workspace, revision) = locked_git_workspace();
+    let manifest_path = workspace.0.join("root/lake-manifest.json");
+    let manifest = std::fs::read(&manifest_path).unwrap();
+    let report = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(report.contains("\"modules_built\":3"), "{report}");
+    let paths = locked_git_artifacts(&workspace);
+    let original: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            assert!(report.contains(&path.display().to_string()), "{report}");
+            let bytes = std::fs::read(path).unwrap();
+            fln_olean::region::OleanView::parse(&bytes).unwrap();
+            bytes
+        })
+        .collect();
+    assert!(
+        !workspace
+            .0
+            .join("root/output/lib/lean/Remote/Base.olean")
+            .exists()
+    );
+    assert!(!workspace.0.join("root/vendor/«dep-name»").exists());
+    let warm = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(warm.contains("\"modules_cached\":3"), "{warm}");
+    assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
+
+    // The root lock selects the source kind as well as its path. A differing
+    // declaration must not redirect this already locked package.
+    workspace.write(
+        "root/lakefile.toml",
+        LOCKED_GIT_CONFIG.replace(
+            concat!(
+                "git = \"https://example.invalid/never-fetch.git\"\n",
+                "rev = \"unselected-input-branch\"\nsubDir = \"unselected-input-subdir\"\n",
+            ),
+            "path = \"missing-declared-path\"\n",
+        ),
+    );
+    build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    workspace.write("root/lakefile.toml", LOCKED_GIT_CONFIG);
+
+    let checkout = workspace.0.join("root/vendor/dep-name");
+    local_git(&checkout, &["pack-refs", "--all"]);
+    let packed = std::fs::read_to_string(checkout.join(".git/packed-refs")).unwrap();
+    assert!(packed.contains(&revision), "{packed}");
+    let warm = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(warm.contains("\"modules_cached\":3"), "{warm}");
+    local_git(&checkout, &["checkout", "--quiet", "--detach", &revision]);
+    let warm = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(warm.contains("\"modules_cached\":3"), "{warm}");
+    assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
+    for (path, bytes) in paths.iter().zip(original) {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest);
+    assert_eq!(
+        local_git(&checkout, &["rev-parse", "--verify", "HEAD"]),
+        revision,
+    );
+}
+
+#[test]
+fn changed_git_revision_and_invalid_dirty_sources_preserve_previous_artifacts() {
+    let (workspace, revision) = locked_git_workspace();
+    build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    let paths = locked_git_artifacts(&workspace);
+    let original: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let snapshot = workspace.0.join("root/output/fln-build.snapshot");
+    let previous_snapshot = std::fs::read(&snapshot).unwrap();
+    let manifest_path = workspace.0.join("root/lake-manifest.json");
+    let manifest = std::fs::read(&manifest_path).unwrap();
+    let unchanged = || {
+        assert_eq!(std::fs::read(&snapshot).unwrap(), previous_snapshot);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest);
+        for (path, bytes) in paths.iter().zip(&original) {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
+    };
+    let checkout = workspace.0.join("root/vendor/dep-name");
+    local_git(
+        &checkout,
+        &["commit", "--quiet", "--allow-empty", "-m", "moved HEAD"],
+    );
+    assert_ne!(
+        local_git(&checkout, &["rev-parse", "--verify", "HEAD"]),
+        revision,
+    );
+    refusal(
+        workspace.run(&["--json", "build", "+App.Top:olean"], None),
+        "unsupported",
+        "materialize the locked revision",
+    );
+    unchanged();
+    local_git(&checkout, &["checkout", "--quiet", "--detach", &revision]);
+    workspace.write(
+        "root/vendor/dep-name/lib/Remote/Base.lean",
+        "prelude\nimport Shared\ndef Remote.keep (A : Type) (a : A) : A := A\n",
+    );
+    // HEAD identity never exempts dirty source from kernel admission.
+    let rejected = workspace.run(&["--json", "build", "+App.Top:olean"], None);
+    assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+    assert!(rejected.stdout.is_empty(), "{rejected:?}");
+    unchanged();
+    workspace.write("root/vendor/dep-name/lib/Remote/Base.lean", LOCKED_GIT_SOURCE);
+    let recovered = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    assert!(recovered.contains("\"modules_cached\":3"), "{recovered}");
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest);
+    for (path, bytes) in paths.iter().zip(&original) {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn absent_or_unsafe_locked_git_inputs_fail_without_fetching_or_publishing() {
+    let (workspace, revision) = locked_git_workspace();
+    build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+    let paths = locked_git_artifacts(&workspace);
+    let original: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let snapshot = workspace.0.join("root/output/fln-build.snapshot");
+    let previous_snapshot = std::fs::read(&snapshot).unwrap();
+    let manifest_path = workspace.0.join("root/lake-manifest.json");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    for (changed, class, detail) in [
+        (
+            manifest.replace(&revision, "deadbeef"),
+            "unsupported",
+            "full hexadecimal commit revision",
+        ),
+        (
+            manifest.replace("\"subDir\":\"lib\"", "\"subDir\":\"../escape\""),
+            "unsupported",
+            "must stay within the package",
+        ),
+        (
+            manifest.replace("\"packagesDir\":\"vendor\"", "\"packagesDir\":\"absent-packages\""),
+            "io",
+            "absent-packages",
+        ),
+    ] {
+        workspace.write("root/lake-manifest.json", &changed);
+        refusal(
+            workspace.run(&["--json", "build", "+App.Top:olean"], None),
+            class,
+            detail,
+        );
+        assert_eq!(std::fs::read_to_string(&manifest_path).unwrap(), changed);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), previous_snapshot);
+        for (path, bytes) in paths.iter().zip(&original) {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
+    }
+    workspace.write("root/lake-manifest.json", &manifest);
+    let head = workspace.0.join("root/vendor/dep-name/.git/HEAD");
+    let original_head = std::fs::read(&head).unwrap();
+    for (bytes, class, detail) in [
+        (
+            b"ref: ../outside\n".to_vec(),
+            "unsupported",
+            "supported refs namespace",
+        ),
+        (
+            b"not-a-revision\n".to_vec(),
+            "input",
+            "malformed Git reference",
+        ),
+        (vec![b'x'; 4097], "resource", "locked Git metadata"),
+    ] {
+        std::fs::write(&head, bytes).unwrap();
+        refusal(
+            workspace.run(&["--json", "build", "+App.Top:olean"], None),
+            class,
+            detail,
+        );
+        assert_eq!(std::fs::read(&snapshot).unwrap(), previous_snapshot);
+        for (path, bytes) in paths.iter().zip(&original) {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
+    }
+    std::fs::write(&head, original_head).unwrap();
+    build_success(workspace.run(&["--json", "build", "+App.Top:olean"], None));
+}
+
+const LOCKED_GIT_LEAN: &str = r#"import Lake
+open System Lake DSL
+def endpoint (suffix : String) : String := "https://example.invalid/" ++ suffix
+def revision (suffix : String) : String := "unselected-input-" ++ suffix
+def subtree (suffix : String) : FilePath := FilePath.mk ("unselected-input-" ++ suffix)
+package root where
+  buildDir := FilePath.mk ("out" ++ "put")
+require "dep-name" from git (endpoint "never-fetch.git") @ (revision "branch") / subtree "subdir"
+lean_lib App
+"#;
+
+#[test]
+fn checked_lean_git_requirements_build_the_locked_workspace_and_match_the_pin() {
+    let Some((lake, lib)) = reference() else {
+        return;
+    };
+    let (workspace, _) = locked_git_workspace();
+    workspace.write("root/lakefile.lean", LOCKED_GIT_LEAN);
+    let report = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], Some(&lib)));
+    assert!(report.contains("\"modules_built\":3"), "{report}");
+    let paths = locked_git_artifacts(&workspace);
+    let original: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let snapshot = workspace.0.join("root/output/fln-build.snapshot");
+    let previous_snapshot = std::fs::read(&snapshot).unwrap();
+    let manifest_path = workspace.0.join("root/lake-manifest.json");
+    let manifest = std::fs::read(&manifest_path).unwrap();
+
+    // Each operand must still be checked when the root lock overrides it.
+    for (before, after) in [
+        ("(endpoint \"never-fetch.git\")", "(42 : Nat)"),
+        ("(revision \"branch\")", "(42 : Nat)"),
+        ("subtree \"subdir\"", "(42 : Nat)"),
+    ] {
+        workspace.write("root/lakefile.lean", LOCKED_GIT_LEAN.replace(before, after));
+        refusal(
+            workspace.run(&["--json", "build", "+App.Top:olean"], Some(&lib)),
+            "elaboration",
+            "lakefile.lean",
+        );
+        assert_eq!(std::fs::read(&snapshot).unwrap(), previous_snapshot);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest);
+        for (path, bytes) in paths.iter().zip(&original) {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
+    }
+    workspace.write("root/lakefile.lean", LOCKED_GIT_LEAN);
+    let warm = build_success(workspace.run(&["--json", "build", "+App.Top:olean"], Some(&lib)));
+    assert!(warm.contains("\"modules_cached\":3"), "{warm}");
+
+    // An independent real checkout lets the pin materialize the same lock
+    // offline without consuming the native artifacts or rewriting their traces.
+    let (oracle, _) = locked_git_workspace();
+    oracle.write("root/lakefile.lean", LOCKED_GIT_LEAN);
+    let pinned = Command::new(&lake)
+        .arg("--dir")
+        .arg(oracle.0.join("root"))
+        .args(["build", "+App.Top:olean"])
+        .env_remove("LEAN_PATH")
+        .output()
+        .unwrap();
+    assert!(pinned.status.success(), "{pinned:?}");
+    for path in locked_git_artifacts(&oracle) {
+        assert!(path.is_file(), "{}", path.display());
+    }
 }

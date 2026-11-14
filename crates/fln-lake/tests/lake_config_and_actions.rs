@@ -120,7 +120,7 @@ fn local_requirements_are_retained_for_checked_execution_and_artifact_builds() {
 fn checked_requirements_do_not_ignore_remote_or_custom_settings() {
     for fields in [
         "name = \"dep\"\n",
-        "name = \"dep\"\ngit = \"https://example.invalid/dep\"\n",
+        "name = \"dep\"\npath = \"../dep\"\ngit = \"https://example.invalid/dep\"\n",
         "name = \"dep\"\npath = \"../dep\"\nrev = \"branch\"\n",
         "name = \"dep\"\npath = \"../dep\"\nscope = \"owner\"\n",
         "name = \"dep\"\npath = \"../dep\"\noptions = []\n",
@@ -1573,4 +1573,29 @@ fn local_update_preserves_loader_errors_and_bounds_source_and_returned_requireme
         std::fs::read(root.join("lake-manifest.json")).unwrap(),
         previous
     );
+}
+
+#[test]
+fn checked_git_requirements_preserve_source_fields_without_materializing_them() {
+    let source = concat!(
+        "name = \"program\"\n",
+        "[[require]]\nname = \"dep-name\"\ngit = \"https://example.invalid/dep\"\n",
+        "rev = \"branch\"\nsubDir = \"lib/nested\"\n",
+        "[[require]]\nname = \"other\"\ngit = \"../local-repository\"\n",
+    );
+    for parse in [
+        LakeConfig::parse_toml_for_execution,
+        LakeConfig::parse_toml_for_build,
+    ] {
+        let config = parse(source).unwrap();
+        assert_eq!(config.requires.len(), 2);
+        let dependency = &config.requires[0];
+        assert_eq!(dependency.name, "dep-name");
+        assert_eq!(dependency.url.as_deref(), Some("https://example.invalid/dep"));
+        assert_eq!(dependency.rev.as_deref(), Some("branch"));
+        assert_eq!(dependency.subdir.as_deref(), Some("lib/nested"));
+        assert!(dependency.path.is_none());
+        assert_eq!(config.requires[1].url.as_deref(), Some("../local-repository"));
+        assert!(config.requires[1].rev.is_none());
+    }
 }

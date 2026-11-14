@@ -572,8 +572,9 @@ impl LakeConfig {
         Self::parse_toml_strict(content)
     }
 
-    /// Checked executables and artifact builds resolve the same bounded local
-    /// path requirements without silently accepting remote or custom settings.
+    /// Checked executables and artifact builds share explicit path and Git
+    /// requirements. Git sources still need a materialized, locked checkout;
+    /// parsing a URL does not authorize fetching or updating the manifest.
     pub fn parse_toml_for_execution(content: &str) -> Result<Self, LakeParseError> {
         Self::parse_toml_strict(content)
     }
@@ -622,7 +623,7 @@ impl LakeConfig {
                 )
                 | ("lean_lib" | "lean_exe", "name" | "srcDir")
                 | ("lean_exe", "root")
-                | ("require", "name" | "path") => false,
+                | ("require", "name" | "path" | "git" | "rev" | "subDir") => false,
                 _ => {
                     return Err(LakeParseError::UnsupportedBuildSetting(format!(
                         "line {}: {section}.{key}",
@@ -649,9 +650,23 @@ impl LakeConfig {
             if requirement.name.is_empty() {
                 return Err(LakeParseError::MissingField("require name"));
             }
-            if requirement.path.is_none() {
+            if requirement.path.is_some() && requirement.url.is_some() {
                 return Err(LakeParseError::UnsupportedBuildSetting(format!(
-                    "require {} has no local path",
+                    "require {} combines path and Git sources",
+                    requirement.name
+                )));
+            }
+            if requirement.path.is_none() && requirement.url.is_none() {
+                return Err(LakeParseError::UnsupportedBuildSetting(format!(
+                    "require {} has no supported path or Git source",
+                    requirement.name
+                )));
+            }
+            if requirement.url.is_none()
+                && (requirement.rev.is_some() || requirement.subdir.is_some())
+            {
+                return Err(LakeParseError::UnsupportedBuildSetting(format!(
+                    "require {} uses Git revision or subDir without a Git source",
                     requirement.name
                 )));
             }
