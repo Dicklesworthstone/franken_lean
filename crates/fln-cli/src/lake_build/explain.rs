@@ -172,16 +172,16 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
             (old != new).then(|| (path, old.map(str::to_owned), new.map(str::to_owned)))
         })
         .collect();
-    let libraries = sources.libraries();
     let recorded_entries = plan_modules(
         sources
             .packages
             .iter()
             .flat_map(|package| package.config.targets.iter())
             .map(|target| target.name.as_str()),
-        &libraries,
+        &sources,
         &recorded.targets,
     )?;
+    let resolve = |module: &Name| sources.resolve_build_package(module, &recorded_entries);
     let entries = match target {
         Some(text) => {
             let module = target_name(text)?;
@@ -193,14 +193,14 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
                 ))
                 .into());
             }
-            if sources.resolve(&module)?.is_none() {
+            if resolve(&module)?.is_none() {
                 return Err(Refusal::Unavailable(format!(
                     "recorded module `{display}` no longer belongs to a selected local package"
                 )));
             }
             vec![module]
         }
-        None => recorded_entries,
+        None => recorded_entries.clone(),
     };
 
     // The current local import graph, from the entries, without elaborating.
@@ -213,7 +213,7 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
         if current.contains_key(&module) || external.contains(&module) {
             continue;
         }
-        let Some((package, source)) = sources.resolve_package(&module)? else {
+        let Some((package, source)) = resolve(&module)? else {
             external.insert(module);
             continue;
         };

@@ -1771,3 +1771,200 @@ fn warm_module_system_builds_readmit_tripartite_records_and_recover_from_corrupt
         "{warm_after_recovery}"
     );
 }
+
+#[test]
+fn executable_module_facets_build_checked_dependencies_and_reuse_their_records() {
+    let package = Package::new(concat!(
+        "name = \"program\"\nsrcDir = \"src\"\nbuildDir = \"products\"\n",
+        "[[require]]\nname = \"shared\"\npath = \"dep\"\n",
+        "[[lean_lib]]\nname = \"Library\"\nroots = [\"Lib\"]\nsrcDir = \"proofs\"\n",
+        "[[lean_exe]]\nname = \"runner\"\nroot = \"App.Main\"\nsrcDir = \"app\"\n",
+    ));
+    package.write(
+        "dep/lakefile.toml",
+        concat!(
+            "name = \"shared\"\nsrcDir = \"code\"\nbuildDir = \"out\"\n",
+            "[[lean_lib]]\nname = \"Shared\"\n",
+            "[[lean_exe]]\nname = \"shadow\"\nroot = \"App.Main\"\n",
+        ),
+    );
+    package.write(
+        "dep/code/Shared/Base.lean",
+        "prelude\ndef Shared.identity (A : Type) (a : A) : A := a\n",
+    );
+    package.write(
+        "src/proofs/Lib/Base.lean",
+        "prelude\nimport Shared.Base\ndef Lib.identity (A : Type) (a : A) : A := Shared.identity A a\n",
+    );
+    package.write(
+        "src/app/App/Main.lean",
+        "prelude\nimport Lib.Base\ndef App.identity (A : Type) (a : A) : A := Lib.identity A a\n",
+    );
+    package.write("src/app/App/Main/Child.lean", BASE);
+    package.write("src/app/App/Unused.lean", "not a Lean module");
+    let targets = ["+App.Main:olean"];
+    let cold = success(&package.build(&targets));
+    assert!(cold.contains("\"modules_built\":3"), "{cold}");
+    assert!(cold.contains("\"snapshot\":\"written\""), "{cold}");
+    let outputs = [
+        package.0.join("products/lib/lean/App/Main.olean"),
+        package.0.join("products/lib/lean/Lib/Base.olean"),
+        package.0.join("dep/out/lib/lean/Shared/Base.olean"),
+    ];
+    assert!(inspect(&outputs[0]).contains("App.identity"));
+    let bytes: Vec<_> = outputs
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let warm = success(&package.build(&targets));
+    assert!(warm.contains("\"modules_cached\":3"), "{warm}");
+    assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
+    for (path, previous) in outputs.iter().zip(&bytes) {
+        assert_eq!(std::fs::read(path).unwrap(), *previous);
+    }
+    let explanation = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["build", "explain", "--json", "--dir"])
+        .arg(&package.0)
+        .arg("+App.Main:olean")
+        .env("LEAN_PATH", package.0.join("no-imports"))
+        .output()
+        .unwrap();
+    let explanation = success(&explanation);
+    assert!(
+        explanation.contains("\"reference_decision\":\"up-to-date\""),
+        "{explanation}"
+    );
+    assert!(explanation.contains("\"name\":\"Shared.Base\""), "{explanation}");
+    assert!(failure(&package.build(&["runner:olean"])).contains("select the module"));
+    assert!(failure(&package.build(&["+App.Main.Child:olean"])).contains("declared lean_lib"));
+    assert!(failure(&package.build(&["runner"])).contains("unavailable"));
+    assert!(!package.0.join("products/bin/runner").exists());
+    assert!(!package.0.join("products/lib/lean/App/Unused.olean").exists());
+
+    package.write("src/app/App/Main.lean", "prelude\ntheorem impossible : False := by rfl\n");
+    failure(&package.build(&targets));
+    for (path, previous) in outputs.iter().zip(&bytes) {
+        assert_eq!(std::fs::read(path).unwrap(), *previous);
+    }
+}
+
+#[test]
+fn explicit_executable_roots_do_not_replace_library_import_sources() {
+    let package = Package::new(concat!(
+        "name = \"selection\"\n",
+        "[[lean_lib]]\nname = \"Library\"\nroots = [\"App\"]\nsrcDir = \"lib\"\n",
+        "[[lean_exe]]\nname = \"runner\"\nroot = \"App.Main\"\nsrcDir = \"app\"\n",
+    ));
+    package.write(
+        "app/App/Main.lean",
+        "prelude\ndef executableOrigin (A : Type) (a : A) : A := a\n",
+    );
+    package.write(
+        "lib/App/Main.lean",
+        "prelude\ndef libraryOrigin (A : Type) (a : A) : A := a\n",
+    );
+    package.write(
+        "lib/App/Use.lean",
+        "prelude\nimport App.Main\ndef consumer (A : Type) (a : A) : A := libraryOrigin A a\n",
+    );
+    success(&package.build(&["+App.Main:olean"]));
+    assert!(inspect(&package.artifact("App.Main")).contains("executableOrigin"));
+    success(&package.build(&["+App.Use:olean"]));
+    let imported = inspect(&package.artifact("App.Main"));
+    assert!(imported.contains("libraryOrigin"), "{imported}");
+    assert!(!imported.contains("executableOrigin"), "{imported}");
+    // A focused explanation of an imported node retains the original import
+    // selection; it does not become a new explicit executable-root target.
+    let explain = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["build", "explain", "--json", "--dir"])
+        .arg(&package.0)
+        .arg("App.Main")
+        .env("LEAN_PATH", package.0.join("no-imports"))
+        .output()
+        .unwrap();
+    let explain = success(&explain);
+    assert!(explain.contains("\"reference_decision\":\"up-to-date\""), "{explain}");
+    let old = std::fs::read(package.artifact("App.Main")).unwrap();
+    for targets in [
+        ["+App.Main:olean", "+App.Use:olean"],
+        ["+App.Use:olean", "+App.Main:olean"],
+    ] {
+        let error = failure(&package.build(&targets));
+        assert!(error.contains("different executable-target and library-import"), "{error}");
+        assert_eq!(std::fs::read(package.artifact("App.Main")).unwrap(), old);
+    }
+}
+
+#[test]
+fn selecting_executable_modules_does_not_make_them_library_imports() {
+    let package = Package::new(concat!(
+        "name = \"visibility\"\n",
+        "[[lean_exe]]\nname = \"first\"\nroot = \"First\"\n",
+        "[[lean_exe]]\nname = \"second\"\nroot = \"Second\"\n",
+    ));
+    package.write("First.lean", "prelude\nimport Second\n");
+    package.write("Second.lean", BASE);
+    for targets in [
+        ["+First:olean", "+Second:olean"],
+        ["+Second:olean", "+First:olean"],
+    ] {
+        let error = failure(&package.build(&targets));
+        assert!(error.contains("not an importable lean_lib module"), "{error}");
+        assert!(!package.0.join(".lake").exists());
+    }
+}
+
+#[test]
+fn executable_module_ir_facets_execute_in_the_pinned_reference() {
+    let Some(reference) = pinned_family_reference() else {
+        return;
+    };
+    let lib = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| reference.parent().unwrap().join("../lib/lean"));
+    let package = Package::new(
+        "name = \"irProgram\"\n[[lean_exe]]\nname = \"runner\"\nroot = \"App.Main\"\n",
+    );
+    package.write(
+        "App/Main.lean",
+        concat!(
+            "module\nprelude\npublic import Init.Notation\n",
+            "public def entryAnswer (n : Nat) : Nat := n + 2\n",
+        ),
+    );
+    let build = || {
+        Command::new(env!("CARGO_BIN_EXE_lake"))
+            .arg("--dir")
+            .arg(&package.0)
+            .args(["--json", "build", "+App.Main:ir"])
+            .env("LEAN_PATH", &lib)
+            .env("FLN_IMPORT_REUSE_DIR", package.0.join(".records"))
+            .output()
+            .unwrap()
+    };
+    let report = success(&build());
+    assert!(report.contains("\"executable_modules\":1"), "{report}");
+    let artifact = package.artifact("App.Main");
+    let bytes = std::fs::read(artifact.with_extension("ir")).unwrap();
+    let view = fln_olean::region::OleanView::parse(&bytes).unwrap();
+    let blocks = view
+        .extension_payloads(fln_olean::region::WalkBudget::default(), 16 << 20)
+        .unwrap();
+    let ir = fln_olean::ir::decode_ir(&blocks, Default::default()).unwrap();
+    assert!(
+        ir.decls
+            .iter()
+            .any(|declaration| declaration.name().to_display_string() == "entryAnswer")
+    );
+    package.write("Use.lean", "import App.Main\n#eval entryAnswer 40\n");
+    let output = Command::new(&reference)
+        .arg(package.0.join("Use.lean"))
+        .env("LEAN_PATH", package.0.join(".lake/build/lib/lean"))
+        .output()
+        .unwrap();
+    assert_eq!(success(&output), "42\n");
+    let warm = success(&build());
+    assert!(warm.contains("\"modules_cached\":1"), "{warm}");
+    assert_eq!(std::fs::read(artifact.with_extension("ir")).unwrap(), bytes);
+    assert!(!package.0.join(".lake/build/bin/runner").exists());
+}

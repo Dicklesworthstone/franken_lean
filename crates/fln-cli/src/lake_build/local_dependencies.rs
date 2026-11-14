@@ -508,13 +508,6 @@ impl Sources {
         Ok(())
     }
 
-    pub(super) fn libraries(&self) -> Vec<Library> {
-        self.packages
-            .iter()
-            .flat_map(|package| package.libraries.iter().cloned())
-            .collect()
-    }
-
     /// Keep the exact selected configuration as the module's owner. Different
     /// package identities may share a directory while selecting different
     /// configuration files, source libraries and build directories.
@@ -522,8 +515,59 @@ impl Sources {
         &self,
         module: &Name,
     ) -> Result<Option<(&Package, PathBuf)>, Failure> {
+        self.resolve_package_with(module, false)
+    }
+
+    /// Explicit module facets use Lake's `findTargetModule?`: an executable's
+    /// exact root is buildable even when no library makes it importable.
+    pub(super) fn resolve_target_package(
+        &self,
+        module: &Name,
+    ) -> Result<Option<(&Package, PathBuf)>, Failure> {
+        self.resolve_package_with(module, true)
+    }
+
+    fn resolve_package_with(
+        &self,
+        module: &Name,
+        include_executables: bool,
+    ) -> Result<Option<(&Package, PathBuf)>, Failure> {
         let mut found: Option<(&Package, PathBuf)> = None;
         for package in &self.packages {
+            let mut path = None;
+            if include_executables {
+                for target in package.config.targets.iter().rev() {
+                    if target.kind != TargetKind::Executable {
+                        continue;
+                    }
+                    let [root] = target.roots.as_slice() else {
+                        return Err(Failure::input(
+                            "an executable must have exactly one root module",
+                        ));
+                    };
+                    if name(root)? != *module {
+                        continue;
+                    }
+                    let directory = target.src_dir.as_deref().unwrap_or(Path::new("."));
+                    relative_directory(directory)?;
+                    path = Some(
+                        package
+                            .root
+                            .join(&package.config.src_dir)
+                            .join(directory)
+                            .join(source_import_relative_path(module)?),
+                    );
+                    break;
+                }
+            }
+            // Workspace target lookup is ordered by package: a later
+            // executable must not override an earlier library or executable.
+            if let Some(path) = path {
+                if found.is_none() {
+                    return Ok(Some((package, path)));
+                }
+                continue;
+            }
             let Some(path) = source_path(module, &package.libraries)? else {
                 continue;
             };
@@ -553,14 +597,87 @@ impl Sources {
             }))
     }
 
+    pub(super) fn resolve_target(&self, module: &Name) -> Result<Option<SourceLocation>, Failure> {
+        Ok(self
+            .resolve_target_package(module)?
+            .map(|(package, path)| SourceLocation {
+                package: package.root.clone(),
+                path,
+            }))
+    }
+
+    /// Resolve a node in a build without making unselected executable roots
+    /// available to its dependencies.
+    pub(super) fn resolve_build_package(
+        &self,
+        module: &Name,
+        entries: &[Name],
+    ) -> Result<Option<(&Package, PathBuf)>, Failure> {
+        if entries.contains(module) {
+            self.resolve_target_package(module)
+        } else {
+            self.resolve_package(module)
+        }
+    }
+
+    pub(super) fn resolve_build(
+        &self,
+        module: &Name,
+        entries: &[Name],
+    ) -> Result<Option<SourceLocation>, Failure> {
+        Ok(self
+            .resolve_build_package(module, entries)?
+            .map(|(package, path)| SourceLocation {
+                package: package.root.clone(),
+                path,
+            }))
+    }
+
+    /// A name-keyed build cannot substitute an explicit target's source or
+    /// configuration for the distinct library module an import would select.
+    pub(super) fn validate_entry_imports(
+        &self,
+        entries: &[Name],
+        modules: &BTreeMap<Name, Module>,
+    ) -> Result<(), Failure> {
+        for module in modules.values() {
+            for imported in &module.imports {
+                if !entries.contains(imported) {
+                    continue;
+                }
+                let Some((target_owner, target_path)) = self.resolve_target_package(imported)?
+                else {
+                    return Err(Failure::new("internal-fault", "build target lost its owner"));
+                };
+                let Some((owner, path)) = self.resolve_package(imported)? else {
+                    return Err(Failure::input(format!(
+                        "executable module `{}` is not an importable lean_lib module",
+                        imported.to_display_string(),
+                    )));
+                };
+                if owner.root != target_owner.root
+                    || owner.configuration != target_owner.configuration
+                    || path != target_path
+                {
+                    return Err(Failure::unsupported(format!(
+                        "module `{}` has different executable-target and library-import sources or configurations",
+                        imported.to_display_string(),
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn destinations(
         &self,
         artifacts: &BTreeMap<Name, ModuleArtifacts>,
+        entries: &[Name],
     ) -> Result<BTreeMap<Name, (PathBuf, PathBuf)>, Failure> {
         artifacts
             .keys()
             .map(|name| {
-                let (package, _) = self.resolve_package(name)?.ok_or_else(|| {
+                let (package, _) = self.resolve_build_package(name, entries)?.ok_or_else(|| {
                     Failure::new("internal-fault", "built module has no source owner")
                 })?;
                 Ok((
@@ -838,7 +955,7 @@ mod tests {
             }
             let sources = sources(packages);
             let destinations = sources
-                .destinations(&artifacts(&["LeanPart.Child", "TomlPart.Child"]))
+                .destinations(&artifacts(&["LeanPart.Child", "TomlPart.Child"]), &[])
                 .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
             for (module, build_dir) in [("LeanPart", "lean-out"), ("TomlPart", "toml-out")] {
                 let name = Name::from_components([module, "Child"]);
@@ -871,7 +988,7 @@ mod tests {
                 packages.reverse();
             }
             let destinations = sources(packages)
-                .destinations(&artifacts(&["Shared"]))
+                .destinations(&artifacts(&["Shared"]), &[])
                 .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
             let root = PathBuf::from("/workspace/shared");
             assert_eq!(
@@ -879,6 +996,38 @@ mod tests {
                 (root.clone(), root.join(build_dir).join("lib/lean")),
             );
         }
+    }
+
+    #[test]
+    fn explicit_targets_and_imports_must_select_the_same_configuration() {
+        let shared = Name::from_components(["Shared"]);
+        let entries = vec![shared.clone()];
+        let modules = BTreeMap::from([(
+            Name::from_components(["Consumer"]),
+            Module {
+                source: Vec::new(),
+                imports: vec![shared],
+            },
+        )]);
+        let mut executable = package(LakeConfigFormat::Lean, "Shared");
+        executable.config.targets[0].kind = TargetKind::Executable;
+        executable.libraries.clear();
+        let library = package(LakeConfigFormat::Toml, "Shared");
+        let selected = sources(vec![executable, library]);
+        let error = selected
+            .validate_entry_imports(&entries, &modules)
+            .expect_err("identical source paths cannot erase distinct configurations");
+        assert_eq!(error.class, "unsupported");
+        assert!(error.detail.contains("sources or configurations"));
+
+        let mut combined = package(LakeConfigFormat::Toml, "Shared");
+        let mut target = combined.config.targets[0].clone();
+        target.name = "runner".to_owned();
+        target.kind = TargetKind::Executable;
+        combined.config.targets.push(target);
+        sources(vec![combined])
+            .validate_entry_imports(&entries, &modules)
+            .unwrap_or_else(|error| panic!("{}", error.detail));
     }
 
     #[test]
@@ -890,7 +1039,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
         let sources = sources(vec![lean, toml]);
         let error = sources
-            .destinations(&artifacts(&["Shared"]))
+            .destinations(&artifacts(&["Shared"]), &[])
             .expect_err("different physical sources remain ambiguous");
         assert_eq!(error.class, "unsupported");
         assert!(error.detail.contains("belongs to multiple local packages"));

@@ -272,7 +272,7 @@ fn library_sources(root: &Path, config: &LakeConfig) -> Result<Vec<Library>, Fai
 
 fn plan_modules<'a>(
     target_names: impl IntoIterator<Item = &'a str>,
-    libraries: &[Library],
+    sources: &local_dependencies::Sources,
     targets: &[String],
 ) -> Result<Vec<Name>, Failure> {
     let target_names: BTreeSet<_> = target_names.into_iter().collect();
@@ -302,9 +302,9 @@ fn plan_modules<'a>(
             )));
         }
         let module = name(module.strip_prefix('+').unwrap_or(module))?;
-        if source_path(&module, libraries)?.is_none() {
+        if sources.resolve_target(&module)?.is_none() {
             return Err(Failure::input(format!(
-                "module `{}` does not belong to a declared lean_lib root",
+                "module `{}` does not belong to a declared lean_lib or lean_exe root",
                 module.to_display_string()
             )));
         }
@@ -925,7 +925,6 @@ fn build(
     let config = loaded.config.clone();
     let sources = local_dependencies::load(&root, loaded, evaluation)?;
     let configuration_imports = &sources.configuration_imports;
-    let libraries = sources.libraries();
     let entries = plan_modules(
         sources.packages.iter().flat_map(|package| {
             package
@@ -934,10 +933,11 @@ fn build(
                 .iter()
                 .map(|target| target.name.as_str())
         }),
-        &libraries,
+        &sources,
         &targets,
     )?;
-    let modules = load_sources_with(&entries, |module| sources.resolve(module))?;
+    let modules = load_sources_with(&entries, |module| sources.resolve_build(module, &entries))?;
+    sources.validate_entry_imports(&entries, &modules)?;
     let executable = executable_modules(&targets, &modules)?;
     let records = macro_config
         .is_none()
@@ -965,7 +965,7 @@ fn build(
         records.as_ref().and_then(|records| records.persisted()),
         macro_config.as_ref(),
     )?;
-    let destinations = sources.destinations(&artifacts)?;
+    let destinations = sources.destinations(&artifacts, &entries)?;
     sources.verify_configurations()?;
     let paths = publish_locations_with(&artifacts, &destinations, fln::publish_file_atomic)?;
     let snapshot = record_snapshot(
@@ -973,6 +973,7 @@ fn build(
         &config,
         &sources,
         &targets,
+        &entries,
         &modules,
         &artifacts,
         &destinations,
@@ -1110,6 +1111,7 @@ fn record_snapshot(
     config: &LakeConfig,
     sources: &local_dependencies::Sources,
     targets: &[String],
+    entries: &[Name],
     modules: &BTreeMap<Name, Module>,
     artifacts: &BTreeMap<Name, ModuleArtifacts>,
     destinations: &BTreeMap<Name, (PathBuf, PathBuf)>,
@@ -1130,9 +1132,9 @@ fn record_snapshot(
             .get(name)
             .ok_or("an artifact has no source module")?;
         let source = sources
-            .resolve(name)
+            .resolve_build(name, entries)
             .map_err(|failure| failure.detail)?
-            .ok_or("a built module has no library owner")?;
+            .ok_or("a built module has no source owner")?;
         let (owner, output_dir) = destinations
             .get(name)
             .ok_or("a built module has no output destination")?;
