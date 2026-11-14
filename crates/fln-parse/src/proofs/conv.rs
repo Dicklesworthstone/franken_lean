@@ -271,7 +271,10 @@ fn items(
                 && (symbol(tokens, at, ";") && !owns_sequence
                     || at > item
                         && starts_line(view, tokens, at)
-                        && column(view, tokens, at) == base);
+                        && column(view, tokens, at) == base
+                        // `first` alternatives may align with their owning sequence.
+                        // A bar belongs to that sequence, including after `<;>`.
+                        && !(owns_sequence && symbol(tokens, at, "|")));
         if boundary {
             items.push(conv_tactic(leaves, view, tokens, item..at)?);
             if at < range.end {
@@ -680,15 +683,9 @@ fn conv_operand(
         let arrow = (start + 1..range.end)
             .find(|&at| symbol(tokens, at, "=>"))
             .ok_or_else(|| refusal(view, tokens, start))?;
-        let cases = super::elimination::case_args(
-            leaves,
-            view,
-            tokens,
-            start + 1..arrow,
-            |at| {
-                binder_ident(leaves, tokens, at)?.ok_or_else(|| refusal(view, tokens, at))
-            },
-        )?;
+        let cases = super::elimination::case_args(leaves, view, tokens, start + 1..arrow, |at| {
+            binder_ident(leaves, tokens, at)?.ok_or_else(|| refusal(view, tokens, at))
+        })?;
         return Ok(Syntax::node(
             conv_kind("case"),
             vec![
