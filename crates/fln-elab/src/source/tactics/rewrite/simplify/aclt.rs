@@ -307,6 +307,7 @@ impl Context {
                 | SimpRule::Decide
                 | SimpRule::Conditional { .. }
                 | SimpRule::Simprocs(_)
+                | SimpRule::AutoUnfold(_)
                 | SimpRule::Global(_) => continue,
                 SimpRule::Explicit(explicit) if explicit.global.is_some() => continue,
                 SimpRule::Local(id) => {

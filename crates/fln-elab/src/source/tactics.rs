@@ -1886,22 +1886,49 @@ impl Context {
                 equation,
                 expression,
             }));
-        } else if kind == &parser_kind(&["Tactic", "simpAll"]) {
+        } else if kind == &parser_kind(&["Tactic", "simpAll"])
+            || kind == &parser_kind(&["Tactic", "simpAllAutoUnfold"])
+        {
+            if kind == &parser_kind(&["Tactic", "simpAllAutoUnfold"]) {
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "simpAllAutoUnfold"])?;
+            }
             self.simplify_all_proof_goal(proof, goal, args)?;
-        } else if kind == &parser_kind(&["Tactic", "dsimp"]) {
+        } else if kind == &parser_kind(&["Tactic", "dsimp"])
+            || kind == &parser_kind(&["Tactic", "dsimpAutoUnfold"])
+        {
+            if kind == &parser_kind(&["Tactic", "dsimpAutoUnfold"]) {
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "dsimpAutoUnfold"])?;
+            }
             self.dsimplify_proof_goal(proof, goal, args)?;
-        } else if kind == &parser_kind(&["Tactic", "simp"]) {
+        } else if kind == &parser_kind(&["Tactic", "simp"])
+            || kind == &parser_kind(&["Tactic", "simpAutoUnfold"])
+        {
+            if kind == &parser_kind(&["Tactic", "simpAutoUnfold"]) {
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "simpAutoUnfold"])?;
+            }
             self.simplify_proof_goal(proof, goal, args)?;
         } else if kind == &parser_kind(&["Tactic", "simpTrace"])
             || kind == &parser_kind(&["Tactic", "simpAllTrace"])
             || kind == &parser_kind(&["Tactic", "dsimpTrace"])
         {
             self.simp_trace_proof_goal(proof, goal, kind, args)?;
-        } else if kind == &parser_kind(&["Tactic", "simpa"]) {
-            let [keyword, _, _, rest] = args.as_slice() else {
-                return Err(error(TacticError::MalformedScript));
+        } else if kind == &parser_kind(&["Tactic", "simpa"])
+            || kind == &parser_kind(&["Tactic", "tacticSimpa!_"])
+        {
+            let bang = kind == &parser_kind(&["Tactic", "tacticSimpa!_"]);
+            let (keyword, rest) = match (bang, args.as_slice()) {
+                (false, [keyword, _, _, rest]) => (keyword, rest),
+                (true, [keyword, rest]) => {
+                    self.require_declared_tactic(&["Lean", "Parser", "Tactic", "tacticSimpa!_"])?;
+                    (keyword, rest)
+                }
+                _ => return Err(error(TacticError::MalformedScript)),
             };
-            expect_atom(keyword, "simpa", "simplifying completion")?;
+            expect_atom(
+                keyword,
+                if bang { "simpa!" } else { "simpa" },
+                "simplifying completion",
+            )?;
             let rest = expect_node(
                 rest,
                 &parser_kind(&["Tactic", "simpaArgsRest"]),

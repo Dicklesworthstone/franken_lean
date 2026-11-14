@@ -336,7 +336,11 @@ pub(crate) fn tactic(
             "injections",
             "simp",
             "simp_all",
+            "simp!",
+            "simp_all!",
+            "dsimp!",
             "simpa",
+            "simpa!",
             // An identifier may end in `?` (`isIdRest`), so these lex as names.
             "simp?",
             "simp_all?",
@@ -432,6 +436,10 @@ pub(crate) fn tactic(
         TokenKind::Symbol(symbol) if symbol == "simp?" => Some("simp?"),
         TokenKind::Symbol(symbol) if symbol == "simp_all?" => Some("simp_all?"),
         TokenKind::Symbol(symbol) if symbol == "dsimp?" => Some("dsimp?"),
+        TokenKind::Symbol(symbol) if symbol == "simp!" => Some("simp!"),
+        TokenKind::Symbol(symbol) if symbol == "simp_all!" => Some("simp_all!"),
+        TokenKind::Symbol(symbol) if symbol == "dsimp!" => Some("dsimp!"),
+        TokenKind::Symbol(symbol) if symbol == "simpa!" => Some("simpa!"),
         _ => None,
     };
     let Some(keyword) = keyword else {
@@ -448,8 +456,45 @@ pub(crate) fn tactic(
     };
     match keyword {
         "simp" | "dsimp" => simplify(leaves, view, tokens, range, atom, keyword),
+        "simp!" | "dsimp!" => {
+            let base = if keyword == "simp!" { "simp" } else { "dsimp" };
+            let mut syntax = simplify(leaves, view, tokens, range, atom, base)?;
+            if let Syntax::Node { kind, .. } = &mut syntax {
+                *kind = parser_kind(&[
+                    "Tactic",
+                    if base == "simp" {
+                        "simpAutoUnfold"
+                    } else {
+                        "dsimpAutoUnfold"
+                    },
+                ]);
+            }
+            Ok(syntax)
+        }
         "simp_all" => simplify_all(leaves, view, tokens, range, atom),
+        "simp_all!" => {
+            let mut syntax = simplify_all(leaves, view, tokens, range, atom)?;
+            if let Syntax::Node { kind, .. } = &mut syntax {
+                *kind = parser_kind(&["Tactic", "simpAllAutoUnfold"]);
+            }
+            Ok(syntax)
+        }
         "simpa" => simpa(leaves, view, tokens, range, atom),
+        "simpa!" => {
+            let mut syntax = simpa(leaves, view, tokens, range, atom)?;
+            let Syntax::Node { kind, args, .. } = &mut syntax else {
+                unreachable!("simpa builds a tactic node");
+            };
+            // The no-space spelling is the pin's two-slot macro, not the four-slot
+            // `simpa "!"?` syntax. Keep that original tree for quotations and macro matching.
+            if kind != &parser_kind(&["Tactic", "simpa"]) {
+                return Err(refusal(view, tokens, start));
+            }
+            *kind = parser_kind(&["Tactic", "tacticSimpa!_"]);
+            args.remove(1);
+            args.remove(1);
+            Ok(syntax)
+        }
         "simp?" | "simp_all?" | "dsimp?" => simplify_trace(leaves, view, tokens, range, atom),
         "rw" | "rewrite" | "rwa" | "erw" | "rw_mod_cast" => {
             rewrite(leaves, view, tokens, range, atom, keyword)

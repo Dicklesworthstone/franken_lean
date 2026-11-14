@@ -6052,6 +6052,34 @@ fn guards_produce_the_pins_trees() {
     }
 }
 
+/// Captured with dump_command_syntax.lean at the locked 4.32.0 pin on 2026-11-14.
+/// In particular `simpa!` has its own two-slot macro kind, unlike `simpa !`.
+#[test]
+fn automatic_simplification_bangs_produce_the_pins_trees() {
+    let rows = [
+        Accepted {
+            source: "theorem sb1 (n : Nat) : n = n := by simp! only []",
+            tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `sb1 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simpAutoUnfold "simp!" (Tactic.optConfig []) [] ["only"] ["[" [] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+        },
+        Accepted {
+            source: "theorem sb2 (n : Nat) : n = n := by dsimp! -autoUnfold only []",
+            tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `sb2 []) (Command.declSig [(Term.explicitBinder "(" [`n] [":" `Nat] [] ")")] (Term.typeSpec ":" («term_=_» `n "=" `n))) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.dsimpAutoUnfold "dsimp!" (Tactic.optConfig [(Tactic.configItem (Tactic.negConfigItem "-" `autoUnfold))]) [] ["only"] ["[" [] "]"] [])]))) (Termination.suffix [] []) [])))"#,
+        },
+        Accepted {
+            source: "theorem sb3 (p : Prop) (h : p) : p := by simp_all! only []",
+            tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `sb3 []) (Command.declSig [(Term.explicitBinder "(" [`p] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" `p] [] ")")] (Term.typeSpec ":" `p)) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.simpAllAutoUnfold "simp_all!" (Tactic.optConfig []) [] ["only"] ["[" [] "]"])]))) (Termination.suffix [] []) [])))"#,
+        },
+        Accepted {
+            source: "theorem sb4 (p : Prop) (h : p) : p := by simpa! only [] using h",
+            tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `sb4 []) (Command.declSig [(Term.explicitBinder "(" [`p] [":" (Term.prop "Prop")] [] ")") (Term.explicitBinder "(" [`h] [":" `p] [] ")")] (Term.typeSpec ":" `p)) (Command.declValSimple ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.tacticSimpa!_ "simpa!" (Tactic.simpaArgsRest (Tactic.optConfig []) [] ["only"] [(Tactic.simpArgs "[" [] "]")] ["using" `h]))]))) (Termination.suffix [] []) [])))"#,
+        },
+    ];
+    for row in rows {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
 #[test]
 fn cdots_produce_the_pins_trees() {
     for row in CDOTS {

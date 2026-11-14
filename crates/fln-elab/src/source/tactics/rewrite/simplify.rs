@@ -6,6 +6,7 @@
 mod ac;
 mod aclt;
 mod arith;
+mod auto_unfold;
 mod binders;
 mod conditional;
 mod config;
@@ -22,6 +23,7 @@ use super::matching::RigidTypeHead;
 use super::*;
 use crate::lctx::LocalContext;
 use aclt::{SimpPlace, SimpReach, SimpRewrite};
+use auto_unfold::AutoUnfold;
 pub(in crate::source) use config::SimpConfig;
 use fln_core::expr::BinderInfo;
 use fln_env::environment::Environment;
@@ -61,6 +63,8 @@ pub(in crate::source) enum SimpRule<'a> {
     /// theorem and before `+arith`'s normalization: the pin's `userPostSimprocs` follows
     /// `rewritePost` and precedes `simpArith` (`Rewrite.lean:542-546`).
     Simprocs(NatSimprocs),
+    /// `autoUnfold`'s branch-selecting reduction, including structural smart unfolding.
+    AutoUnfold(Arc<AutoUnfold>),
 }
 impl SimpRule<'_> {
     fn reverse(&self) -> bool {
@@ -72,7 +76,8 @@ impl SimpRule<'_> {
             | Self::Arith
             | Self::Decide
             | Self::Conditional { .. }
-            | Self::Simprocs(_) => false,
+            | Self::Simprocs(_)
+            | Self::AutoUnfold(_) => false,
         }
     }
 }
@@ -431,6 +436,7 @@ impl Context {
                 | SimpRule::Decide
                 | SimpRule::Conditional { .. }
                 | SimpRule::Simprocs(_)
+                | SimpRule::AutoUnfold(_)
         ) {
             return matches!(side, SimpKeySide::Rewrite);
         }
@@ -807,7 +813,8 @@ impl Context {
             | SimpRule::Ac
             | SimpRule::Decide
             | SimpRule::Conditional { .. }
-            | SimpRule::Simprocs(_) => Err(error(TacticError::MalformedScript)),
+            | SimpRule::Simprocs(_)
+            | SimpRule::AutoUnfold(_) => Err(error(TacticError::MalformedScript)),
         }
     }
 
@@ -879,37 +886,60 @@ impl Context {
         self.tick()?;
         // `simp`'s six slots, or the pin's `simpa` (`"simpa" "?"? "!"? simpaArgsRest`), whose
         // arguments are `simpaArgsRest`'s first four slots and whose fifth is its evidence.
-        let (keyword, config, discharger, only, arguments, location) = match args {
-            [keyword, config, discharger, only, arguments, location] => {
-                (keyword, config, discharger, only, arguments, Some(location))
-            }
-            [keyword, question, bang, rest] => {
-                expect_empty_null(question, "plain simpa")?;
-                expect_empty_null(bang, "plain simpa")?;
+        let (keyword, config, discharger, only, arguments, location, bang) = match args {
+            [keyword, config, discharger, only, arguments, location] => (
+                keyword,
+                config,
+                discharger,
+                only,
+                arguments,
+                Some(location),
+                false,
+            ),
+            [keyword, rest] => {
+                expect_atom(keyword, "simpa!", "automatic simplifying completion")?;
                 let rest = expect_node(
                     rest,
                     &parser_kind(&["Tactic", "simpaArgsRest"]),
                     5,
                     "simpa arguments",
                 )?;
-                (keyword, &rest[0], &rest[1], &rest[2], &rest[3], None)
+                (keyword, &rest[0], &rest[1], &rest[2], &rest[3], None, true)
+            }
+            [keyword, question, bang, rest] => {
+                expect_empty_null(question, "plain simpa")?;
+                let bang = match expect_null_args(bang, "optional simpa bang")? {
+                    [] => false,
+                    [bang] => {
+                        expect_atom(bang, "!", "simpa bang")?;
+                        true
+                    }
+                    _ => return Err(error(TacticError::MalformedScript)),
+                };
+                let rest = expect_node(
+                    rest,
+                    &parser_kind(&["Tactic", "simpaArgsRest"]),
+                    5,
+                    "simpa arguments",
+                )?;
+                (keyword, &rest[0], &rest[1], &rest[2], &rest[3], None, bang)
             }
             _ => return Err(error(TacticError::MalformedScript)),
         };
-        let simpa = matches!(keyword, Syntax::Atom { val, .. } if val == "simpa");
-        let dsimp = matches!(keyword, Syntax::Atom { val, .. } if val == "dsimp");
-        expect_atom(
-            keyword,
-            if simpa {
-                "simpa"
-            } else if dsimp {
-                "dsimp"
-            } else {
-                "simp"
-            },
-            "simplification keyword",
-        )?;
-        let config = self.simp_config(config, dsimp)?;
+        let simpa =
+            matches!(keyword, Syntax::Atom { val, .. } if val == "simpa" || val == "simpa!");
+        let dsimp =
+            matches!(keyword, Syntax::Atom { val, .. } if val == "dsimp" || val == "dsimp!");
+        let auto_unfold = bang
+            || matches!(keyword, Syntax::Atom { val, .. } if val == "simp!" || val == "dsimp!");
+        if !matches!(keyword, Syntax::Atom { val, .. } if matches!(val.as_str(), "simp" | "simp!" | "dsimp" | "dsimp!" | "simpa" | "simpa!"))
+        {
+            return Err(error(TacticError::MalformedScript));
+        }
+        let mut config = self.simp_config(config, dsimp)?;
+        // The pin's bang macros append their setting after the user's config; `simpa!`
+        // likewise sets it on the completed context. Even `-autoUnfold` cannot undo `!`.
+        config.auto_unfold |= auto_unfold;
         // `dsimp` decides nothing here: its `decide` is not wired to its reductions.
         if dsimp && config.decide {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
@@ -921,7 +951,28 @@ impl Context {
             let location = location.ok_or_else(|| error(TacticError::MalformedScript))?;
             self.rewrite_locations(location)?;
         }
-        let mut rules = self.simp_rule_selection(dsimp, only, arguments)?;
+        let (mut rules, erased) = self.simp_rule_selection(dsimp, only, arguments)?;
+        if config.auto_unfold {
+            // Attribute re-registration does not un-erase its origin in the pin. Retain
+            // default tombstones, including the validated equation origins erased with a
+            // definition. An explicit theorem argument can un-erase its own origin, but
+            // selecting a definition must not bypass the auto branch's erasure fallback.
+            rules.retain(|rule| {
+                let Some(entry) = simp_rule_entry(rule) else {
+                    return true;
+                };
+                !erased.contains(&entry.declaration)
+                    || !(matches!(rule, SimpRule::Global(_))
+                        || matches!(
+                            self.txn.env.find(&entry.declaration),
+                            Some(fln_env::constants::ConstantInfo::Defn(_))
+                        ))
+            });
+            rules.insert(
+                0,
+                SimpRule::AutoUnfold(Arc::new(self.simp_auto_unfold(erased)?)),
+            );
+        }
         if config.decide {
             rules.insert(0, SimpRule::Decide);
         }
@@ -966,7 +1017,7 @@ impl Context {
         dsimp: bool,
         only: &'a Syntax,
         arguments: &'a Syntax,
-    ) -> Result<Vec<SimpRule<'a>>, NatDefinitionElabError> {
+    ) -> Result<(Vec<SimpRule<'a>>, HashSet<Name>), NatDefinitionElabError> {
         let use_default = match expect_null_args(only, "optional explicit simp set")? {
             [] => true,
             [only] => {
@@ -977,9 +1028,11 @@ impl Context {
         };
         // Even `simp []` reads the default set; `simp only` never reads it. A
         // malformed registry therefore cannot silently become an empty success.
+        let mut erased = HashSet::new();
         let mut defaults = if use_default {
-            let mut rules = scope::simp::read(&self.txn.env)
+            let (mut rules, default_erased) = scope::simp::read_with_erased(&self.txn.env)
                 .map_err(|e| failure(SourceInferenceError::SimpSet(e)))?;
+            erased.extend(default_erased);
             // The enclosing scope's `attribute [local simp]` rules, after the registered ones; a
             // rule already registered is not read twice.
             for local in &self.source_scope.local_simp {
@@ -1033,7 +1086,10 @@ impl Context {
             arguments = args.as_slice();
         }
         if arguments.is_empty() {
-            return Ok(self.simp_rules_with_procedures(defaults, procedures));
+            return Ok((
+                self.simp_rules_with_procedures(defaults, procedures),
+                erased,
+            ));
         }
         let [open, rows, close] = arguments else {
             return Err(error(TacticError::MalformedScript));
@@ -1102,6 +1158,9 @@ impl Context {
                     continue;
                 }
                 let name = self.simp_erasure_name(val)?;
+                // The pin keeps declaration erasures for auto-unfolding even when a later
+                // explicit argument re-adds an equation theorem for the same declaration.
+                erased.insert(name.clone());
                 for _ in 0..rules.len().saturating_add(defaults.len()) {
                     self.tick()?;
                 }
@@ -1171,7 +1230,7 @@ impl Context {
             .map(|(_, rule)| rule)
             .chain(defaults)
             .collect();
-        Ok(self.simp_rules_with_procedures(rules, procedures))
+        Ok((self.simp_rules_with_procedures(rules, procedures), erased))
     }
 
     /// `rules` followed by the call's procedures, where there are any and this environment

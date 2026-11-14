@@ -451,6 +451,59 @@ impl Context {
         self.rebuild_application(value, arguments)
     }
 
+    /// Automatic simplification unfolds only a selected source match or a structural smart
+    /// unfolding companion. In particular `Plain` is not permission to delta-reduce an
+    /// arbitrary definition. Source match selection never contributes a replacement term:
+    /// this function instantiates only the admitted definition's actual value.
+    pub(in crate::source) fn unfold_auto_definition(
+        &mut self,
+        term: &Expr,
+        definition: &DefinitionVal,
+        selected_match: bool,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let mut head = term.clone();
+        let mut arguments = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.tick()?;
+            arguments.push(a.clone());
+            head = f.clone();
+        }
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(term.clone());
+        };
+        if name != &definition.base.name || definition.safety != DefinitionSafety::Safe {
+            return Ok(term.clone());
+        }
+        if definition.base.level_params.len() != levels.len() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let unfolding = self.smart_unfolding(
+            definition,
+            levels,
+            &arguments,
+            UnificationTransparency::Abbreviations,
+            false,
+            KEndpointCheck::Kernel,
+        )?;
+        let unfolding = match unfolding {
+            SmartUnfolding::Plain => {
+                self.imported_smart_unfolding(definition, levels, &arguments)?
+            }
+            result => result,
+        };
+        let value = match unfolding {
+            SmartUnfolding::Plain if selected_match => {
+                self.instantiate_params(&definition.value, &definition.base.level_params, levels)?
+            }
+            SmartUnfolding::Plain | SmartUnfolding::Folded => return Ok(term.clone()),
+            SmartUnfolding::Alternative { value, consumed } => {
+                arguments.truncate(arguments.len() - consumed);
+                value
+            }
+        };
+        self.rebuild_application(value, arguments)
+    }
+
     /// The pin's smart unfolding (vendored Lean/Meta/WHNF.lean:871-930) of a source structural
     /// definition applied to `arguments`, this reduction's reversed spine. The pin unfolds such a
     /// definition only through its `_sunfold` companion

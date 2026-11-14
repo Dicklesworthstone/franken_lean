@@ -15,6 +15,7 @@ mod tests;
 
 struct DsimpSet<'a> {
     definitions: Vec<Selection>,
+    automatic: Option<Arc<AutoUnfold>>,
     /// Theorem rules in the set's order, each with whether it is structurally reflexive.
     /// A registered rule is classified the first time a node admits its key
     /// (`dsimp_rewrite`), as the pin retrieves candidates per node; classifying all of
@@ -33,6 +34,7 @@ impl Default for DsimpSet<'_> {
     fn default() -> Self {
         Self {
             definitions: Vec::new(),
+            automatic: None,
             rewrites: Vec::new(),
             tagged: std::collections::BTreeSet::new(),
             procedures: super::NatSimprocs::default(),
@@ -104,7 +106,15 @@ impl Context {
         let [keyword, ..] = args else {
             return Err(error(TacticError::MalformedScript));
         };
-        expect_atom(keyword, "dsimp", "definitional simplification")?;
+        expect_atom(
+            keyword,
+            if matches!(keyword, Syntax::Atom { val, .. } if val == "dsimp!") {
+                "dsimp!"
+            } else {
+                "dsimp"
+            },
+            "definitional simplification",
+        )?;
         let set = self.dsimp_set(args)?;
         let original = self.instantiate(expression)?;
         self.dsimp_expression(&original, &set)
@@ -118,7 +128,15 @@ impl Context {
         let [keyword, _, _, _, _, location] = args else {
             return Err(error(TacticError::MalformedScript));
         };
-        expect_atom(keyword, "dsimp", "definitional simplification")?;
+        expect_atom(
+            keyword,
+            if matches!(keyword, Syntax::Atom { val, .. } if val == "dsimp!") {
+                "dsimp!"
+            } else {
+                "dsimp"
+            },
+            "definitional simplification",
+        )?;
         self.txn.lctx = goal.lctx.clone();
         let set = self.dsimp_set(args)?;
         let locations = self.rewrite_locations(location)?;

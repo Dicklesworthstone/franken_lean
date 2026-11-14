@@ -154,7 +154,7 @@ impl Context {
                 Some(unfold::Selection::Local(id, value)) => {
                     selections.locals.insert(id, value);
                 }
-                None => {}
+                Some(unfold::Selection::Automatic(_)) | None => {}
             }
         }
         Ok(selections)

@@ -357,6 +357,12 @@ impl Context {
         term: &Expr,
         set: &DsimpSet<'_>,
     ) -> Result<Expr, NatDefinitionElabError> {
+        if let Some(policy) = &set.automatic {
+            let next = self.simp_auto_unfold_head(term, policy)?;
+            if !self.rewrite_same(term, &next)? {
+                return Ok(next);
+            }
+        }
         let rewritten = self.dsimp_rewrite(term, set)?;
         if !self.rewrite_same(term, &rewritten)? {
             return Ok(rewritten);
@@ -374,7 +380,9 @@ impl Context {
                     return Ok(arguments.into_iter().fold(value.clone(), Expr::app));
                 }
                 Selection::Global(definition) => {
-                    if self.dsimp_unfoldable(definition)? {
+                    // `Simp.unfold?` chooses the auto branch instead of `toUnfold`, including
+                    // explicit definitions. Reflexive theorem rules above remain available.
+                    if set.automatic.is_none() && self.dsimp_unfoldable(definition)? {
                         let mut body = &definition.value;
                         let mut arity = 0usize;
                         while let ExprNode::Lam { body: next, .. } = body.node() {
@@ -392,6 +400,7 @@ impl Context {
                         }
                     }
                 }
+                Selection::Automatic(_) => unreachable!("automatic selection has its own slot"),
             }
         }
         if let ExprNode::Const { name, .. } = head.node()

@@ -891,10 +891,21 @@ pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
     Ok(read_state(env)?.rows)
 }
 
+/// Active rules and the declaration erasures retained by `SimpTheorems.eraseCore`.
+/// An automatic unfolding must respect an erased definition even when a later entry
+/// selects one of its equation theorems. `simp only` starts with neither part of this set.
+pub(in crate::source) fn read_with_erased(
+    env: &Environment,
+) -> Result<(Vec<SimpEntry>, std::collections::BTreeSet<Name>), SimpSetError> {
+    let state = read_state(env)?;
+    Ok((state.rows, state.erased))
+}
+
 #[derive(Default)]
 struct SimpState {
     rows: Vec<SimpEntry>,
     unfold_theorems: BTreeMap<Name, Vec<Name>>,
+    erased: std::collections::BTreeSet<Name>,
 }
 
 fn read_state(env: &Environment) -> Result<SimpState, SimpSetError> {
@@ -909,6 +920,7 @@ fn read_state(env: &Environment) -> Result<SimpState, SimpSetError> {
     let mut active: BTreeMap<Name, BTreeMap<Option<Name>, SimpEntry>> = BTreeMap::new();
     let mut positions = BTreeMap::new();
     let mut unfold_theorems: BTreeMap<Name, Vec<Name>> = BTreeMap::new();
+    let mut erased = std::collections::BTreeSet::new();
     let mut erase_work = MAX_JOURNAL_BYTES;
     for (order, (row, validation)) in env.metadata_validation_entries(&expected.name).enumerate() {
         match decode_entry(&row.payload, order)? {
@@ -930,6 +942,7 @@ fn read_state(env: &Environment) -> Result<SimpState, SimpSetError> {
                     if !seen.insert(name.clone()) {
                         continue;
                     }
+                    erased.insert(name.clone());
                     active.remove(&name);
                     if let Some(theorems) = unfold_theorems.get(&name) {
                         pending.extend(theorems.iter().cloned());
@@ -985,6 +998,7 @@ fn read_state(env: &Environment) -> Result<SimpState, SimpSetError> {
     Ok(SimpState {
         rows,
         unfold_theorems,
+        erased,
     })
 }
 

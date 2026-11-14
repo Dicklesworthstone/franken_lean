@@ -71,7 +71,7 @@ fn pack(args: impl IntoIterator<Item = Expr>) -> Expr {
         .fold(Expr::const_(pack_name(), Vec::new()), Expr::app)
 }
 
-pub(super) fn unpack(expr: &Expr) -> Option<Vec<Expr>> {
+pub(in crate::source) fn unpack(expr: &Expr) -> Option<Vec<Expr>> {
     let mut args = Vec::new();
     let mut head = expr;
     while let ExprNode::App { f, a } = head.node() {

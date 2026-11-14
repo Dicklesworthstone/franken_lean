@@ -54,6 +54,7 @@ impl Context {
                 | SimpRule::Decide
                 | SimpRule::Conditional { .. }
                 | SimpRule::Simprocs(_)
+                | SimpRule::AutoUnfold(_)
         ) {
             return Ok(false);
         }
@@ -92,7 +93,12 @@ impl Context {
         let [keyword, config, discharger, only, arguments] = args else {
             return Err(error(TacticError::MalformedScript));
         };
-        expect_atom(keyword, "simp_all", "whole-context simplification keyword")?;
+        let bang = matches!(keyword, Syntax::Atom { val, .. } if val == "simp_all!");
+        expect_atom(
+            keyword,
+            if bang { "simp_all!" } else { "simp_all" },
+            "whole-context simplification keyword",
+        )?;
         // The configuration is read, and `+arith` admitted, by the ordinary set parser.
         // Reuse the ordinary set parser without reparsing source or changing
         // the persistent registry. Its location slot is an empty null node.
@@ -100,7 +106,7 @@ impl Context {
         let selection = [
             Syntax::Atom {
                 info: keyword.info(),
-                val: "simp".to_string(),
+                val: if bang { "simp!" } else { "simp" }.to_string(),
             },
             config.clone(),
             discharger.clone(),

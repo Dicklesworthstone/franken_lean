@@ -11,12 +11,17 @@ impl Context {
         let (rules, config) = self.simp_selection(args)?;
         let mut set = DsimpSet {
             definitions: Vec::new(),
+            automatic: None,
             rewrites: Vec::new(),
             tagged,
             procedures: NatSimprocs::default(),
             fail_if_unchanged: config.fail_if_unchanged,
         };
         for rule in rules {
+            if let SimpRule::AutoUnfold(policy) = rule {
+                set.automatic = Some(policy);
+                continue;
+            }
             if let SimpRule::Simprocs(procedures) = rule {
                 set.procedures = procedures;
                 continue;
@@ -88,7 +93,7 @@ impl Context {
         self.dsimp_rfl_proof(term, tagged)
     }
 
-    pub(super) fn dsimp_spine(
+    pub(in crate::source::tactics::rewrite::simplify) fn dsimp_spine(
         &mut self,
         term: &Expr,
     ) -> Result<(Expr, Vec<Expr>), NatDefinitionElabError> {

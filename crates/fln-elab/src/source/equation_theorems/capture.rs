@@ -476,7 +476,7 @@ impl Context {
             patterns.push(pattern);
         }
         let mut fields = Vec::new();
-        for field in &builder.fields {
+        for (field, name) in &builder.fields {
             let mut local = self
                 .txn
                 .lctx
@@ -487,6 +487,9 @@ impl Context {
             if local.type_.has_expr_mvar() {
                 return Ok(None);
             }
+            // Anonymous pattern locals are inaccessible while the RHS is elaborated, but
+            // the matcher and its equation binders retain the pin's original field name.
+            local.user_name = name.clone();
             fields.push(local);
         }
         Ok(Some(Alternative {
@@ -514,6 +517,7 @@ impl Context {
                 self,
                 name.clone(),
                 expected.clone(),
+                true,
             )?));
         }
         if let Some((alias, inner)) = super::super::patterns::named::parts(syntax)? {
@@ -535,6 +539,7 @@ impl Context {
                 self,
                 val.clone(),
                 expected.clone(),
+                false,
             )?));
         }
         if numeral(syntax).is_some() {
@@ -847,7 +852,7 @@ impl Context {
                     None => return Ok(None),
                 }
             } else {
-                builder.variable(self, binder_name, binder_type)?
+                builder.variable(self, binder_name, binder_type, true)?
             };
             type_ = self.substitute(&body, &field)?;
             value = Expr::app(value, field);
@@ -946,7 +951,7 @@ impl Context {
 
 #[derive(Default)]
 struct Builder {
-    fields: Vec<FVarId>,
+    fields: Vec<(FVarId, Name)>,
     named: Vec<(Name, Expr)>,
 }
 
@@ -956,12 +961,20 @@ impl Builder {
         cx: &mut Context,
         name: Name,
         type_: Expr,
+        inaccessible: bool,
     ) -> Result<Expr, NatDefinitionElabError> {
         let id = FVarId(cx.fresh_name()?);
+        // `_` and inferred constructor fields do not bind source identifiers. Giving
+        // them their printed name here could shadow a real outer RHS parameter.
+        let user_name = if inaccessible {
+            cx.fresh_inaccessible(&name)?
+        } else {
+            name.clone()
+        };
         cx.txn
             .lctx
-            .add_param(id.clone(), name, type_, BinderInfo::Default);
-        self.fields.push(id.clone());
+            .add_param(id.clone(), user_name, type_, BinderInfo::Default);
+        self.fields.push((id.clone(), name));
         Ok(Expr::fvar(id))
     }
 }

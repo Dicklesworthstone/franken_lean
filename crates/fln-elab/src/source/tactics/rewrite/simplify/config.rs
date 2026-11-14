@@ -5,8 +5,8 @@
 //! Boolean literal, and `(config := { … })` resets every field to its default and then sets the
 //! instance's fields.
 //!
-//! A field set to its declared default changes nothing and is accepted. `arith`, `decide` and
-//! `failIfUnchanged` are honoured. Every other field set away from its default, a field the
+//! A field set to its declared default changes nothing and is accepted. `arith`, `decide`,
+//! `autoUnfold` and `failIfUnchanged` are honoured. Every other field set away from its default, a field the
 //! structure does not declare, a value other than a Boolean literal, and any other configuration
 //! term (`Lean.Meta.Simp.neutralConfig`, `{ c with … }`) remain this slot's typed refusal.
 use super::*;
@@ -20,6 +20,8 @@ pub(in crate::source) struct SimpConfig {
     pub(super) arith: bool,
     /// `decide`: closed decidable propositions become `True` or `False` (`decide.rs`).
     pub(super) decide: bool,
+    /// `autoUnfold`: reduce matched definitions when their discriminants select a branch.
+    pub(super) auto_unfold: bool,
     /// `failIfUnchanged`: a call that changes nothing fails, rather than leaving its goal.
     pub(super) fail_if_unchanged: bool,
 }
@@ -29,6 +31,7 @@ impl Default for SimpConfig {
         Self {
             arith: false,
             decide: false,
+            auto_unfold: false,
             fail_if_unchanged: true,
         }
     }
@@ -187,6 +190,7 @@ fn set_field(
     match field {
         "arith" => config.arith = value,
         "decide" => config.decide = value,
+        "autoUnfold" => config.auto_unfold = value,
         "failIfUnchanged" => config.fail_if_unchanged = value,
         _ if value == default => {}
         _ => return Err(unsupported()),
@@ -300,6 +304,10 @@ mod tests {
         assert_eq!(declared(SIMP_FIELDS, "arith"), Some(default.arith));
         assert_eq!(declared(SIMP_FIELDS, "decide"), Some(default.decide));
         assert_eq!(
+            declared(SIMP_FIELDS, "autoUnfold"),
+            Some(default.auto_unfold)
+        );
+        assert_eq!(
             declared(SIMP_FIELDS, "failIfUnchanged"),
             Some(default.fail_if_unchanged)
         );
@@ -322,7 +330,8 @@ mod tests {
         assert!(set_field(&mut config, SIMP_FIELDS, &field("unknownField"), false).is_err());
         assert!(set_field(&mut config, DSIMP_FIELDS, &field("arith"), true).is_err());
         set_field(&mut config, SIMP_FIELDS, &field("decide"), true).unwrap();
+        set_field(&mut config, DSIMP_FIELDS, &field("autoUnfold"), true).unwrap();
         set_field(&mut config, SIMP_FIELDS, &field("failIfUnchanged"), false).unwrap();
-        assert!(config.decide && !config.fail_if_unchanged && !config.arith);
+        assert!(config.decide && config.auto_unfold && !config.fail_if_unchanged && !config.arith);
     }
 }

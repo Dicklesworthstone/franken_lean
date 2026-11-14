@@ -9,6 +9,7 @@ use fln_env::constants::{ConstantInfo, DefinitionVal};
 pub(super) enum Selection {
     Global(DefinitionVal),
     Local(FVarId, Expr),
+    Automatic(Arc<AutoUnfold>),
 }
 
 pub(super) enum UnfoldResult {
@@ -38,7 +39,7 @@ impl Context {
     /// theorem and a local never unfold.
     pub(super) fn simp_rule_may_unfold(&self, rule: &SimpRule<'_>) -> bool {
         match rule {
-            SimpRule::Explicit(_) => true,
+            SimpRule::Explicit(_) | SimpRule::AutoUnfold(_) => true,
             SimpRule::Local(_)
             | SimpRule::Ac
             | SimpRule::Arith
@@ -63,6 +64,7 @@ impl Context {
         rule: &SimpRule<'_>,
     ) -> Result<Option<Selection>, NatDefinitionElabError> {
         match rule {
+            SimpRule::AutoUnfold(policy) => Ok(Some(Selection::Automatic(Arc::clone(policy)))),
             SimpRule::Explicit(rule) => {
                 self.simp_unfold_selection_for_term(rule.syntax, rule.reverse)
             }
@@ -386,6 +388,9 @@ impl Context {
             let rebuilt = match selection {
                 Some(Selection::Global(definition)) => {
                     self.unfold_selected_definition(&rebuilt, definition)?
+                }
+                Some(Selection::Automatic(policy)) => {
+                    self.simp_auto_unfold_head(&rebuilt, policy)?
                 }
                 _ => rebuilt,
             };
