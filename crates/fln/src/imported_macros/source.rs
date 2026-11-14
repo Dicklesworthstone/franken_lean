@@ -79,6 +79,9 @@ pub enum SourceMacroError {
     AtomicExpansion {
         kind: Name,
     },
+    ChoiceExpansion {
+        kind: Name,
+    },
     TacticExpansion {
         kind: Name,
     },
@@ -114,6 +117,11 @@ impl std::fmt::Display for SourceMacroError {
             Self::AtomicExpansion { kind } => write!(
                 f,
                 "source macro adapter requires term elaborator dispatch for atomic kind {}",
+                kind.to_display_string()
+            ),
+            Self::ChoiceExpansion { kind } => write!(
+                f,
+                "source macro adapter requires transactional term dispatch inside a parser choice for kind {}",
                 kind.to_display_string()
             ),
             Self::TacticExpansion { kind } => write!(
@@ -1912,11 +1920,18 @@ fn deferred_candidate(
     runtime_macros: bool,
 ) -> Result<Option<SourceMacroError>, Inconclusive> {
     let tactic = Name::from_components(["Lean", "Parser", "Term", "byTactic"]);
-    let mut pending = vec![(syntax, false)];
-    while let Some((syntax, in_tactic)) = pending.pop() {
+    let choice = Name::from_components(["choice"]);
+    let mut pending = vec![(syntax, false, false)];
+    while let Some((syntax, in_tactic, in_choice)) = pending.pop() {
         let kind = match syntax {
             Syntax::Node { kind, args, .. } => {
                 let in_tactic = in_tactic || *kind == tactic;
+                let in_choice = in_choice || *kind == choice;
+                if !runtime_macros && in_choice && registry.declarations(kind).next().is_some() {
+                    return Ok(Some(SourceMacroError::ChoiceExpansion {
+                        kind: kind.clone(),
+                    }));
+                }
                 if !runtime_macros
                     && fln_parse::extensions::is_atomic_macro_kind(kind)
                     && registry.declarations(kind).next().is_some()
@@ -1938,7 +1953,7 @@ fn deferred_candidate(
                         "source macro deferred boundary allocation",
                     )
                 })?;
-                pending.extend(args.iter().map(|argument| (argument, in_tactic)));
+                pending.extend(args.iter().map(|argument| (argument, in_tactic, in_choice)));
                 continue;
             }
             Syntax::Ident { .. } => Name::from_components(["ident"]),
@@ -1946,7 +1961,11 @@ fn deferred_candidate(
             Syntax::Atom { val, .. } => Name::str(Name::anonymous(), val),
         };
         if !runtime_macros && registry.declarations(&kind).next().is_some() {
-            return Ok(Some(SourceMacroError::AtomicExpansion { kind }));
+            return Ok(Some(if in_choice {
+                SourceMacroError::ChoiceExpansion { kind }
+            } else {
+                SourceMacroError::AtomicExpansion { kind }
+            }));
         }
     }
     Ok(None)

@@ -800,6 +800,9 @@ impl Context {
         let mut found = false;
         while let Some(node) = scan.pop() {
             self.tick()?;
+            if overload::syntax_alternatives(node).is_some() {
+                continue;
+            }
             if self.watches_equation_rhs(node) {
                 found = true;
                 break;
@@ -831,6 +834,9 @@ impl Context {
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
+                Task::Visit(node) if overload::syntax_alternatives(node).is_some() => {
+                    built.push(self.copy_pattern_syntax(node)?);
+                }
                 Task::Visit(node @ Syntax::Node { args, .. }) => {
                     tasks.push(Task::Build(node, built.len()));
                     tasks.extend(args.iter().rev().map(Task::Visit));

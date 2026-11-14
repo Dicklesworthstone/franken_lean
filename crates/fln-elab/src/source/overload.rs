@@ -90,7 +90,16 @@ impl Context {
             let syntax = application_syntax(candidate.clone(), arguments, explicit);
             let mut trial = Box::new(self.clone());
             trial.overload_depth += 1;
-            let outcome = trial.interpretation(&syntax, expected);
+            // The source expansion pass preserves the complete choice. Its
+            // compound macros must execute only inside this trial, just like
+            // descendants of a generated macro term. Restore the reader mode
+            // before keeping a successful context.
+            let macro_terms = trial.tactic_macro_terms;
+            trial.tactic_macro_terms = macro_terms
+                .checked_add(1)
+                .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+            let outcome = trial.interpretation(&syntax, expected, true);
+            trial.tactic_macro_terms = macro_terms;
             self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
             self.aux_names = trial.aux_names.clone();
             self.next = trial.next;
@@ -160,7 +169,7 @@ impl Context {
                 interpretation_syntax(head, arguments, candidate, &self.source_scope, explicit)?;
             let mut trial = Box::new(self.clone());
             trial.overload_depth += 1;
-            let outcome = trial.interpretation(&syntax, expected);
+            let outcome = trial.interpretation(&syntax, expected, false);
             self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
             match outcome? {
                 Some(Ok(term)) => successes.push((candidate.clone(), trial, term)),
@@ -207,10 +216,46 @@ impl Context {
         &mut self,
         syntax: &Syntax,
         expected: Option<&Expr>,
+        prepare: bool,
     ) -> Result<Option<Result<Typed, String>>, NatDefinitionElabError> {
-        let term = match self.term_prepared(syntax, expected.cloned()) {
+        let attempted = (|| {
+            let syntax = if prepare {
+                self.lower_pattern_matrices(syntax)?
+            } else {
+                std::borrow::Cow::Borrowed(syntax)
+            };
+            self.term_prepared(&syntax, expected.cloned())
+        })();
+        let term = match attempted {
             Ok(term) => term,
             Err(error) => {
+                if matches!(
+                    &error,
+                    NatDefinitionElabError::Inference(
+                        SourceInferenceError::PatternMacroDiagnostic { .. }
+                    )
+                ) {
+                    // The pin logs/recoveries pattern errors rather than
+                    // necessarily throwing from the term interpretation.
+                    // Retain the diagnostic; it cannot eliminate a reading.
+                    return Err(error);
+                }
+                if let NatDefinitionElabError::Inference(SourceInferenceError::TacticMacro(
+                    reason,
+                )) = &error
+                {
+                    // observing catches ordinary macro diagnostics. Runtime
+                    // stops and internal faults escape every alternative;
+                    // missing implementation establishes no negative answer.
+                    return match reason {
+                        crate::tactic_macros::TacticMacroError::Diagnostic { .. } => {
+                            Ok(Some(Err(reason.to_string())))
+                        }
+                        crate::tactic_macros::TacticMacroError::Unsupported(_) => Ok(None),
+                        crate::tactic_macros::TacticMacroError::Inconclusive(_)
+                        | crate::tactic_macros::TacticMacroError::InternalFault(_) => Err(error),
+                    };
+                }
                 if matches!(
                     &error,
                     NatDefinitionElabError::Inference(SourceInferenceError::FunctionCoercionAbsent)

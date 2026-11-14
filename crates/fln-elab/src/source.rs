@@ -193,6 +193,13 @@ pub enum SourceInferenceError {
     NativeEvaluationInconclusive(Box<fln_core::outcome::Inconclusive>),
     /// Imported macro execution retains its diagnostic/nonanswer distinction.
     TacticMacro(crate::tactic_macros::TacticMacroError),
+    /// Pattern elaboration can recover from a macro diagnostic and leave a
+    /// successful, erroneous interpretation at the pin. It is not evidence
+    /// that an overloaded term's interpretation definitely fails.
+    PatternMacroDiagnostic {
+        declaration: Name,
+        message: String,
+    },
     /// A generated tree's delayed callee belongs to an enclosing source
     /// argument. Carry only its identity and failure until that checkpoint can
     /// replay the original argument; no generated Syntax escapes its owner.
@@ -485,6 +492,11 @@ impl std::fmt::Display for SourceInferenceError {
                 write!(f, "native evaluation did not complete: {:?}", reason.cause)
             }
             Self::TacticMacro(error) => write!(f, "{error}"),
+            Self::PatternMacroDiagnostic { declaration, message } => write!(
+                f,
+                "imported pattern macro {}: {message}",
+                declaration.to_display_string()
+            ),
             Self::OwnedMacroSuspension { problem, .. } => {
                 write!(f, "imported macro awaits an enclosing argument: {problem}")
             }

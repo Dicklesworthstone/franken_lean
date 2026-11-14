@@ -941,8 +941,10 @@ impl RegisteredMacros {
 
     /// Source commands contain literal data as well as terms: universe levels,
     /// projection indices and quoted names must reach their native consumers
-    /// unchanged. The owned elaborator provider expands deferred literal nodes
-    /// only when those consumers actually visit a term or literal pattern.
+    /// unchanged. Parser choices also remain whole: their macro diagnostics
+    /// belong to separate elaboration trials, not to this command-wide pass.
+    /// The owned elaborator provider expands deferred nodes only when their
+    /// term or literal-pattern consumers actually visit them.
     pub(crate) fn expand_source_tree_with_context(
         &self,
         input: &Syntax,
@@ -1051,6 +1053,7 @@ impl RegisteredMacros {
         let mut tasks = vec![Task::Visit(input.clone(), context.current_recursion_depth)];
         let mut built = Vec::new();
         let tactic = Name::from_components(["Lean", "Parser", "Term", "byTactic"]);
+        let choice = Name::from_components(["choice"]);
         while let Some(task) = tasks.pop() {
             if cancellation.is_some_and(CancellationProbe::is_cancelled) {
                 return Outcome::Inconclusive(Inconclusive::cancelled("macro tree traversal"));
@@ -1077,6 +1080,7 @@ impl RegisteredMacros {
                         continue;
                     };
                     if *kind == tactic
+                        || (matches!(traversal, MacroTreeTraversal::Source) && *kind == choice)
                         || (!matches!(traversal, MacroTreeTraversal::Full)
                             && fln_parse::extensions::is_atomic_macro_kind(kind))
                     {

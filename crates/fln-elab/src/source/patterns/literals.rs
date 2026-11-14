@@ -82,11 +82,20 @@ impl Context {
                         built.push(node);
                         continue;
                     }
-                    if (generated || literal_kind(kind))
+                    if (generated || self.tactic_macro_terms > 0 || literal_kind(kind))
                         && let Some(expanded) = provider
                             .0
                             .expand_term(&node, depth, &self.txn.env, &self.source_scope)
-                            .map_err(tactics::imported_macros::macro_error)?
+                            .map_err(|error| match error {
+                                TacticMacroError::Diagnostic {
+                                    declaration,
+                                    message,
+                                } => failure(SourceInferenceError::PatternMacroDiagnostic {
+                                    declaration,
+                                    message,
+                                }),
+                                error => tactics::imported_macros::macro_error(error),
+                            })?
                     {
                         pending.push(Task::Visit(expanded, pattern_macro_depth(depth)?, true));
                         continue;

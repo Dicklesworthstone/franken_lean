@@ -1728,6 +1728,176 @@ const IMPORTED_SYNTAX_DECLARATIONS: &str = concat!(
     "theorem scopedMacroValue_eq : Eq scopedMacroValue 29 := Eq.refl scopedMacroValue\n",
 );
 
+fn imported_choice_provider_source() -> String {
+    format!(
+        "{}\n{}",
+        include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
+        r#"
+public section
+
+syntax (name := admittedChoiceGood) "recoverFirst%" "[" term "]" : term
+@[macro admittedChoiceGood]
+meta def admittedChoiceGoodMacro : Macro := fun stx _ state =>
+  .ok (stx.getArg 2) state
+syntax (name := admittedChoiceBad) "recoverFirst%" "[" term "]" : term
+@[macro admittedChoiceBad]
+meta def admittedChoiceBadMacro : Macro := fun stx _ state =>
+  .error (.error stx "this interpretation failed") state
+
+syntax (name := admittedChoiceBadFirst) "recoverLast%" "[" term "]" : term
+@[macro admittedChoiceBadFirst]
+meta def admittedChoiceBadFirstMacro : Macro := fun stx _ state =>
+  .error (.error stx "this interpretation also failed") state
+syntax (name := admittedChoiceGoodLast) "recoverLast%" "[" term "]" : term
+@[macro admittedChoiceGoodLast]
+meta def admittedChoiceGoodLastMacro : Macro := fun stx _ state =>
+  .ok (stx.getArg 2) state
+
+syntax (name := admittedChoiceOnlyBad) "badChoice%" : term
+@[macro admittedChoiceOnlyBad]
+meta def admittedChoiceOnlyBadMacro : Macro := fun stx _ state =>
+  .error (.error stx "failed generated interpretation") state
+
+syntax (name := admittedChooseTerms) "chooseTerms%" "[" term "]" "[" term "]" : term
+@[macro admittedChooseTerms]
+meta def admittedChooseTermsMacro : Macro := fun stx _ state =>
+  .ok (.node .none `choice (Array.mkArray2 (stx.getArg 2) (stx.getArg 5))) state
+
+syntax (name := admittedChoiceLoopGood) "loopChoice%" "[" term "]" : term
+@[macro admittedChoiceLoopGood]
+meta def admittedChoiceLoopGoodMacro : Macro := fun stx _ state =>
+  .ok (stx.getArg 2) state
+syntax (name := admittedChoiceLoop) "loopChoice%" "[" term "]" : term
+@[macro admittedChoiceLoop]
+meta def admittedChoiceLoopMacro : Macro := fun stx _ state => .ok stx state
+"#
+    )
+}
+
+#[test]
+fn default_door_imported_macro_choices_are_transactional() {
+    let Some(project) =
+        ImportedMacroProject::prepare_with_source(&imported_choice_provider_source())
+    else {
+        return;
+    };
+    project.install_default_partition();
+    // The real compiler owns the syntax journals and macro IR. All native
+    // commands discover them through ordinary imports and the installed policy.
+    let declarations = concat!(
+        "prelude\nimport AdmittedSourceMacro\n",
+        "def firstChoice : Nat := recoverFirst% [11]\n",
+        "def lastChoice : Nat := recoverLast% [13]\n",
+        "def nestedChoice : Nat := recoverFirst% [recoverLast% [17]]\n",
+        "def appliedChoice : Nat := recoverFirst% [Nat.succ] 18\n",
+        "def parenthesizedChoice : Nat := (recoverLast% [Nat.succ]) 22\n",
+        "def generatedChoice : Nat := chooseTerms% [chooseTerms% [29] [badChoice%]] [badChoice%]\n",
+        "theorem firstChoice_eq : Eq firstChoice 11 := Eq.refl firstChoice\n",
+        "theorem lastChoice_eq : Eq lastChoice 13 := Eq.refl lastChoice\n",
+        "theorem nestedChoice_eq : Eq nestedChoice 17 := Eq.refl nestedChoice\n",
+        "theorem appliedChoice_eq : Eq appliedChoice 19 := Eq.refl appliedChoice\n",
+        "theorem parenthesizedChoice_eq : Eq parenthesizedChoice 23 := Eq.refl parenthesizedChoice\n",
+        "theorem generatedChoice_eq : Eq generatedChoice 29 := Eq.refl generatedChoice\n",
+    );
+    let queries = concat!(
+        "#check firstChoice\n#check lastChoice\n#check nestedChoice\n",
+        "#check appliedChoice\n#check parenthesizedChoice\n",
+        "#check generatedChoice\n",
+    );
+    let client = format!("{declarations}{queries}");
+    let oracle = project.oracle(&client);
+    assert!(oracle.status.success(), "{oracle:?}; {:?}", project.root);
+    assert!(oracle.stderr.is_empty(), "{oracle:?}");
+
+    let checked = project.native("check-source", declarations, None);
+    assert!(checked.status.success(), "{checked:?}; {:?}", project.root);
+    assert!(checked.stderr.is_empty(), "{checked:?}");
+    let checked = String::from_utf8(checked.stdout).unwrap();
+    assert!(checked.contains("\"theorems\":6"), "{checked}");
+    assert_imported_macro_execution(&checked);
+    for owner in [
+        "admittedChoiceGoodMacro",
+        "admittedChoiceBadMacro",
+        "admittedChoiceGoodLastMacro",
+        "admittedChoiceBadFirstMacro",
+        "admittedChooseTermsMacro",
+        "admittedChoiceOnlyBadMacro",
+    ] {
+        assert!(
+            checked.contains(&format!("\"name\":\"{owner}\"")),
+            "{checked}"
+        );
+    }
+    let lean = project.native("lean", &client, None);
+    assert!(lean.status.success(), "{lean:?}; {:?}", project.root);
+    assert_eq!(lean.stdout, oracle.stdout);
+    assert!(lean.stderr.is_empty(), "{lean:?}");
+
+    let run = project.native("run", &format!("{client}#eval generatedChoice\n"), None);
+    assert!(run.status.success(), "{run:?}; {:?}", project.root);
+    assert!(run.stderr.is_empty(), "{run:?}");
+    let report = String::from_utf8(run.stdout).unwrap();
+    assert_imported_macro_execution(&report);
+    for value in [29] {
+        assert!(
+            report.contains(&format!("\"kind\":\"nat\",\"value\":{value}")),
+            "{report}"
+        );
+    }
+
+    // Successful alternatives do not license selecting an arbitrary reading.
+    let ambiguous = concat!(
+        "prelude\nimport AdmittedSourceMacro\n",
+        "def ambiguous : Nat := chooseTerms% [37] [37]\n",
+    );
+    let oracle = project.oracle(ambiguous);
+    assert!(!oracle.status.success(), "{oracle:?}");
+    let refused = ImportedMacroProject::refused(project.native("check-source", ambiguous, None));
+    assert!(
+        refused.contains("Ambiguous term; Possible syntax interpretations"),
+        "{refused}"
+    );
+
+    // Pattern elaboration logs and recovers from this diagnostic at the pin:
+    // the match is an erroneous successful reading, not a rejected alternative.
+    // Native checking must retain that diagnostic instead of selecting 31.
+    let pattern = concat!(
+        "prelude\nimport AdmittedSourceMacro\n",
+        "def patternChoice : Nat := chooseTerms% [31] [match 0 with | badChoice% => 1 | _ => 2]\n",
+    );
+    let oracle = project.oracle(pattern);
+    assert!(!oracle.status.success(), "{oracle:?}");
+    assert!(
+        String::from_utf8_lossy(&oracle.stdout).contains("failed generated interpretation"),
+        "{oracle:?}"
+    );
+    assert_macro_refusal(
+        project.native("check-source", pattern, None),
+        1,
+        "macro",
+        "failed generated interpretation",
+    );
+
+    // A resource stop remains inconclusive even when another reading succeeds.
+    let exhausted = concat!(
+        "prelude\nimport AdmittedSourceMacro\n",
+        "set_option maxRecDepth 64\n",
+        "def exhausted : Nat := loopChoice% [41]\n",
+    );
+    let oracle = project.oracle(exhausted);
+    assert!(!oracle.status.success(), "{oracle:?}");
+    assert!(
+        String::from_utf8_lossy(&oracle.stdout).contains("maximum recursion depth"),
+        "{oracle:?}"
+    );
+    assert_macro_refusal(
+        project.native("check-source", exhausted, None),
+        3,
+        "inconclusive",
+        "recursion",
+    );
+}
+
 #[test]
 fn installed_default_imported_extensions_work_through_ordinary_source_doors() {
     let Some(project) =

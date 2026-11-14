@@ -332,13 +332,16 @@ impl Context {
         // The source pass expands compound nodes, but deliberately leaves
         // literal nodes and identifiers for actual term positions. A binder,
         // universe level or projection index must never be rewritten here.
-        // Generated terms have not passed through that source pass, so their
-        // nodes must also dispatch here. Missing syntax is handled directly by
-        // the term elaborator, as in the pin's elabTermAux.
+        // Generated terms and deferred parser-choice trials have not passed
+        // through that source pass, so their nodes also dispatch here. A
+        // choice root itself may have a registered macro before elabChoice
+        // runs. Missing syntax is handled directly by the term elaborator,
+        // as in the pin's elabTermAux.
         if matches!(syntax, Syntax::Missing)
             || (self.tactic_macro_terms == 0
                 && matches!(syntax, Syntax::Node { kind, .. }
-                    if !fln_parse::extensions::is_atomic_macro_kind(kind)))
+                    if !fln_parse::extensions::is_atomic_macro_kind(kind)
+                        && kind != &Name::from_components(["choice"])))
         {
             return Ok(None);
         }

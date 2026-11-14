@@ -174,6 +174,7 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
         )) => match reason {
             SourceInferenceError::ArithmeticInconclusive(_)
             | SourceInferenceError::NativeEvaluationInconclusive(_) => ("inconclusive", false, 3),
+            SourceInferenceError::PatternMacroDiagnostic { .. } => ("macro", false, 1),
             SourceInferenceError::TacticMacro(error) => match error {
                 fln_elab::tactic_macros::TacticMacroError::Diagnostic { .. } => ("macro", false, 1),
                 fln_elab::tactic_macros::TacticMacroError::Unsupported(_) => {

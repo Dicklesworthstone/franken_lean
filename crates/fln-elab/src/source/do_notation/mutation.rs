@@ -53,6 +53,9 @@ fn is_block(syntax: &Syntax) -> bool {
 fn contains_mutation(block: &Syntax) -> bool {
     let mut pending = vec![block];
     while let Some(syntax) = pending.pop() {
+        if overload::syntax_alternatives(syntax).is_some() {
+            continue;
+        }
         if is_mutation(syntax) {
             return true;
         }
@@ -611,6 +614,9 @@ impl Context {
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
+                Task::Visit(node) if overload::syntax_alternatives(node).is_some() => {
+                    built.push(self.copy_pattern_syntax(node)?);
+                }
                 Task::Visit(node @ Syntax::Node { args, .. }) => {
                     tasks.push(Task::Build(node, built.len()));
                     tasks.extend(args.iter().rev().map(Task::Visit));
@@ -639,6 +645,9 @@ impl Context {
         let mut pending = vec![&result];
         while let Some(syntax) = pending.pop() {
             self.tick()?;
+            if overload::syntax_alternatives(syntax).is_some() {
+                continue;
+            }
             if is_mutation(syntax) {
                 return Err(refused());
             }

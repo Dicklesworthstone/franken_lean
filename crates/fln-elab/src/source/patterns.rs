@@ -673,6 +673,9 @@ impl Context {
         let mut found = false;
         while let Some(node) = scan.pop() {
             self.tick()?;
+            if overload::syntax_alternatives(node).is_some() {
+                continue;
+            }
             if let_equations(node) {
                 found = true;
                 break;
@@ -693,6 +696,9 @@ impl Context {
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
+                Task::Visit(node) if overload::syntax_alternatives(node).is_some() => {
+                    built.push(self.copy_pattern_syntax(node)?);
+                }
                 Task::Visit(node @ Syntax::Node { args, .. }) => {
                     tasks.push(Task::Build(node, built.len()));
                     tasks.extend(args.iter().rev().map(Task::Visit));
@@ -1696,6 +1702,9 @@ impl Context {
         let mut needed = false;
         while let Some(node) = scan.pop() {
             self.tick()?;
+            if overload::syntax_alternatives(node).is_some() {
+                continue;
+            }
             if alternative_groups(node) > 1 {
                 needed = true;
                 break;
@@ -1717,6 +1726,9 @@ impl Context {
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
+                Task::Visit(node) if overload::syntax_alternatives(node).is_some() => {
+                    built.push(self.copy_pattern_syntax(node)?);
+                }
                 Task::Visit(node @ Syntax::Node { args, .. }) => {
                     tasks.push(Task::Build(node, built.len()));
                     tasks.extend(args.iter().rev().map(Task::Visit));
@@ -1747,6 +1759,12 @@ impl Context {
         &mut self,
         syntax: &'a Syntax,
     ) -> Result<Cow<'a, Syntax>, NatDefinitionElabError> {
+        // Preparation can execute pattern macros and emit diagnostics. Each
+        // parser alternative gets this pass inside its own speculative Context,
+        // including choices returned by an imported macro expansion.
+        if overload::syntax_alternatives(syntax).is_some() {
+            return Ok(Cow::Borrowed(syntax));
+        }
         if let Some(marked) = self.mark_equation_source(syntax)? {
             return Ok(Cow::Owned(
                 self.lower_pattern_matrices(&marked)?.into_owned(),
@@ -1767,7 +1785,9 @@ impl Context {
         let mut local_roots = HashSet::new();
         while let Some(node) = scan.pop() {
             self.tick()?;
-            if node.kind() == Some(&parser_kind(&["Term", "localRecValue"])) {
+            if node.kind() == Some(&parser_kind(&["Term", "localRecValue"]))
+                || overload::syntax_alternatives(node).is_some()
+            {
                 continue;
             }
             mutation |= do_notation::is_mutation(node);
@@ -1841,7 +1861,8 @@ impl Context {
             self.tick()?;
             match task {
                 Task::Visit(node, _)
-                    if node.kind() == Some(&parser_kind(&["Term", "localRecValue"])) =>
+                    if node.kind() == Some(&parser_kind(&["Term", "localRecValue"]))
+                        || overload::syntax_alternatives(node).is_some() =>
                 {
                     built.push(self.copy_pattern_syntax(node)?);
                 }

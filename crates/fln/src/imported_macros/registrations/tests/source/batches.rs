@@ -411,6 +411,348 @@ fn succeeded(report: &SourceMacroFileCheck) -> &SourceFileCheck {
     checked
 }
 
+fn source_choice_declarations(reverse: bool) -> String {
+    let good = "syntax (name := sourceChoiceGood) \"recover%\" \"[\" term \"]\" : term\n";
+    let bad = "syntax (name := sourceChoiceBad) \"recover%\" \"[\" term \"]\" : term\n";
+    if reverse {
+        format!("{bad}{good}")
+    } else {
+        format!("{good}{bad}")
+    }
+}
+
+const SOURCE_CHOICE_ROWS: &[(&str, &str, Option<&str>)] = &[
+    ("sourceChoiceGood", "SourceLibrary.right", None),
+    ("sourceChoiceBad", "SourceLibrary.diagnostic", None),
+];
+
+#[test]
+fn source_choice_diagnostic_is_local_to_each_imported_interpretation() {
+    let (engine, registry) = artifact_fixture_with_extra_rows(SOURCE_CHOICE_ROWS);
+    let before = engine.logical_root(&KVMap::new());
+    for reverse in [false, true] {
+        let source = format!(
+            "{}def chosen : Nat := recover% [11]\n\
+             def nested : Nat := recover% [recover% [13]]\n\
+             def applied : Nat := recover% [Nat.succ] 16\n\
+             def parenthesized : Nat := (recover% [Nat.succ]) 18\n\
+             theorem chosen_eq : Eq chosen 11 := Eq.refl chosen\n",
+            source_choice_declarations(reverse)
+        );
+        let report = batch(
+            &engine,
+            &registry,
+            &[source.as_bytes()],
+            MacroTreeLimits::default(),
+            None,
+        );
+        let checked = succeeded(&report);
+        for (declaration, value) in [
+            ("chosen", 11),
+            ("nested", 13),
+            ("applied", 17),
+            ("parenthesized", 19),
+        ] {
+            assert_declared_value(&checked.engine, declaration, value);
+        }
+        assert!(
+            report
+                .attempts
+                .iter()
+                .any(|attempt| { attempt.declaration == name("SourceLibrary.diagnostic") })
+        );
+        assert!(
+            report
+                .attempts
+                .iter()
+                .any(|attempt| { attempt.declaration == name("SourceLibrary.right") })
+        );
+        assert_eq!(engine.logical_root(&KVMap::new()), before);
+        assert!(!engine.environment().contains(&name("chosen")));
+    }
+}
+
+#[test]
+fn source_choice_pattern_macro_diagnostics_cannot_eliminate_an_interpretation() {
+    let mut rows = SOURCE_CHOICE_ROWS.to_vec();
+    rows.push(("sourcePatternBad", "SourceLibrary.diagnostic", None));
+    let (engine, registry) = artifact_fixture_with_extra_rows(&rows);
+    let before = engine.logical_root(&KVMap::new());
+    // The same actual parser choice as the successful term fixtures contains
+    // a match. Its pattern dispatch runs during matrix preparation, before the
+    // normal term driver. Lean can recover/log this diagnostic rather than
+    // rejecting the interpretation, so choosing another reading is unsound.
+    for reverse in [false, true] {
+        let grammar = format!(
+            "{}syntax (name := sourcePatternBad) \"badPattern%\" : term\n",
+            source_choice_declarations(reverse),
+        );
+        let valid = format!(
+            "{grammar}def chosenMatrix : Nat := recover% [match 0 with | 0 => 23 | _ => 2]\n\
+             theorem chosenMatrix_eq : Eq chosenMatrix 23 := Eq.refl chosenMatrix\n",
+        );
+        let accepted = batch(
+            &engine,
+            &registry,
+            &[valid.as_bytes()],
+            MacroTreeLimits::default(),
+            None,
+        );
+        assert_declared_value(&succeeded(&accepted).engine, "chosenMatrix", 23);
+        let source = format!(
+            "{grammar}def chosenMatrix : Nat := recover% [match 0 with | badPattern% => 23 | _ => 2]\n",
+        );
+        let report = batch(
+            &engine,
+            &registry,
+            &[source.as_bytes()],
+            MacroTreeLimits::default(),
+            None,
+        );
+        let Outcome::Complete(Err(SourceCheckError::Command { error, .. })) = &report.outcome
+        else {
+            panic!("{report:?}")
+        };
+        assert!(
+            matches!(error.as_ref(),
+            crate::EngineExecutionError::Frontend(crate::NatDefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::PatternMacroDiagnostic { declaration, message }
+                )
+            )) if *declaration == name("SourceLibrary.diagnostic") && message == "λ\0diagnostic"),
+            "{report:?}"
+        );
+        assert!(report.state.is_none());
+        assert!(
+            report
+                .attempts
+                .iter()
+                .any(|attempt| { attempt.declaration == name("SourceLibrary.diagnostic") }),
+            "the losing matrix must actually execute its pattern macro: {report:?}"
+        );
+        assert_eq!(engine.logical_root(&KVMap::new()), before);
+    }
+}
+
+#[test]
+fn source_choice_resources_are_cumulative_and_not_an_alternative_failure() {
+    let (engine, registry) = artifact_fixture_with_extra_rows(SOURCE_CHOICE_ROWS);
+    let before = engine.logical_root(&KVMap::new());
+    for reverse in [false, true] {
+        let source = format!(
+            "{}def chosen : Nat := recover% [29]\n",
+            source_choice_declarations(reverse)
+        );
+        let mut limited = MacroTreeLimits::default();
+        limited.dispatch.max_attempts = 1;
+        let stopped = batch(&engine, &registry, &[source.as_bytes()], limited, None);
+        let Outcome::Inconclusive(reason) = &stopped.outcome else {
+            panic!("a successful sibling cannot hide exhausted macro work: {stopped:?}")
+        };
+        assert!(
+            matches!(&reason.cause,
+            fln_core::outcome::InconclusiveCause::ResourceExhausted { usage }
+                if usage.allowed == 0 && usage.observed == 1),
+            "{reason:?}"
+        );
+        assert_eq!(stopped.attempts.len(), 1);
+        assert!(stopped.state.is_none());
+        assert_eq!(engine.logical_root(&KVMap::new()), before);
+        let recovered = batch(
+            &engine,
+            &registry,
+            &[source.as_bytes()],
+            MacroTreeLimits::default(),
+            None,
+        );
+        assert_declared_value(&succeeded(&recovered).engine, "chosen", 29);
+    }
+}
+
+#[test]
+fn source_choice_malformed_and_unsupported_macros_are_not_discarded() {
+    for (behavior, malformed) in [(Behavior::Malformed, true), (Behavior::Unsupported, false)] {
+        let (imported, mut code) = artifact_import_fixture_with_extra_rows(SOURCE_CHOICE_ROWS);
+        let replacement = function("SourceLibrary.diagnostic", behavior);
+        let slot = code[0]
+            .decls
+            .iter_mut()
+            .find(|declaration| {
+                matches!(declaration, IrDecl::Function { name: declaration, .. }
+                if *declaration == name("SourceLibrary.diagnostic"))
+            })
+            .unwrap();
+        *slot = replacement;
+        let registry = imported
+            .prepare_imported_macros(
+                &code,
+                &VerifiedPartition::user_fixture(),
+                &users(&code),
+                MacroRegistryLimits::default(),
+            )
+            .unwrap();
+        let engine = imported.engine;
+        let before = engine.logical_root(&KVMap::new());
+        let valid = batch(
+            &engine,
+            &registry,
+            &[
+                b"syntax (name := sourceChoiceGood) \"recover%\" \"[\" term \"]\" : term\n\
+                def validSibling : Nat := recover% [31]\n",
+            ],
+            MacroTreeLimits::default(),
+            None,
+        );
+        assert_declared_value(&succeeded(&valid).engine, "validSibling", 31);
+        for reverse in [false, true] {
+            let source = format!(
+                "{}def wouldChoose : Nat := recover% [31]\n",
+                source_choice_declarations(reverse)
+            );
+            let report = batch(
+                &engine,
+                &registry,
+                &[source.as_bytes()],
+                MacroTreeLimits::default(),
+                None,
+            );
+            let Outcome::Complete(Err(SourceCheckError::Command { error, .. })) = &report.outcome
+            else {
+                panic!("{report:?}")
+            };
+            let crate::EngineExecutionError::Frontend(
+                crate::NatDefinitionFrontendError::Elaborate(error),
+            ) = error.as_ref()
+            else {
+                panic!("{report:?}")
+            };
+            // Malformed VM output leaves a capability-undetermined reading.
+            // `unsupportedSyntax` instead permits native fallback, whose
+            // missing syntax implementation remains its own fatal nonanswer.
+            match (malformed, error) {
+                (
+                    true,
+                    fln_elab::NatDefinitionElabError::Inference(
+                        fln_elab::source::SourceInferenceError::SyntaxChoiceUndetermined { .. },
+                    ),
+                ) => {}
+                (false, fln_elab::NatDefinitionElabError::UnexpectedSyntax { expected })
+                    if *expected == "supported scalar literal or constant identifier" => {}
+                _ => panic!("{report:?}"),
+            }
+            assert!(
+                report
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.declaration == name("SourceLibrary.diagnostic")),
+                "{report:?}"
+            );
+            assert!(report.state.is_none());
+            assert!(!engine.environment().contains(&name("wouldChoose")));
+            assert_eq!(engine.logical_root(&KVMap::new()), before);
+        }
+    }
+}
+
+#[test]
+fn source_choice_borrowed_sessions_require_an_owned_provider() {
+    struct NeverCancelled;
+    impl CancellationProbe for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+    let (engine, registry) = artifact_fixture_with_extra_rows(SOURCE_CHOICE_ROWS);
+    let before = engine.logical_root(&KVMap::new());
+    let source = format!(
+        "{}def deferred : Nat := recover% [37]\n",
+        source_choice_declarations(false)
+    );
+    let report = batch(
+        &engine,
+        &registry,
+        &[source.as_bytes()],
+        MacroTreeLimits::default(),
+        Some(&NeverCancelled),
+    );
+    assert!(
+        matches!(&report.outcome,
+        Outcome::Complete(Err(SourceCheckError::ImportedMacro { error, .. }))
+            if matches!(error.as_ref(), SourceMacroError::ChoiceExpansion { kind }
+                if *kind == name("sourceChoiceGood") || *kind == name("sourceChoiceBad"))),
+        "{report:?}"
+    );
+    assert!(report.state.is_none());
+    assert!(report.attempts.is_empty());
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+
+    // Source notation creates registered template macros too. A borrowed
+    // session must not silently bypass those registrations inside a choice.
+    let native = batch(
+        &engine,
+        &registry,
+        &[b"notation \"nativeChoice%\" => 41\n\
+            notation \"nativeChoice%\" => 43\n\
+            def native : Nat := nativeChoice%"],
+        MacroTreeLimits::default(),
+        Some(&NeverCancelled),
+    );
+    assert!(
+        matches!(&native.outcome,
+        Outcome::Complete(Err(SourceCheckError::ImportedMacro { error, .. }))
+            if matches!(error.as_ref(), SourceMacroError::ChoiceExpansion { kind }
+                if *kind == name("termNativeChoice%"))),
+        "{native:?}"
+    );
+    assert!(native.state.is_none());
+    assert!(native.attempts.is_empty());
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn source_choice_tree_pass_preserves_nested_alternatives_without_executing_them() {
+    let (_, registry) = artifact_fixture_with_extra_rows(SOURCE_CHOICE_ROWS);
+    let syntax = Syntax::node(
+        name("choice"),
+        vec![
+            Syntax::node(name("sourceChoiceBad"), vec![]),
+            Syntax::node(
+                name("choice"),
+                vec![Syntax::node(name("sourceChoiceGood"), vec![])],
+            ),
+        ],
+    );
+    let source = SourceText::from_utf8(b"").unwrap();
+    let expand = |source_pass| {
+        let invocation = MacroDispatchInvocation {
+            source: &source,
+            context: &context(),
+            state: MacroState::default(),
+            lookup: None,
+        };
+        if source_pass {
+            registry.expand_source_tree_with_context(
+                &syntax,
+                invocation,
+                MacroTreeLimits::default(),
+                None,
+            )
+        } else {
+            registry.expand_tree_with_context(&syntax, invocation, MacroTreeLimits::default(), None)
+        }
+    };
+    let preserved = expand(true);
+    assert!(matches!(preserved.outcome,
+        Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax: result, .. })) if result == syntax));
+    assert!(preserved.attempts.is_empty());
+    let eager = expand(false);
+    assert!(matches!(
+        eager.outcome,
+        Outcome::Complete(Ok(MacroTreeResult::Error { .. }))
+    ));
+    assert_eq!(eager.attempts.len(), 1);
+}
+
 #[test]
 fn imported_macro_batches_restore_scopes_sections_in_commands_and_file_boundaries() {
     let (engine, registry) = artifact_fixture();
