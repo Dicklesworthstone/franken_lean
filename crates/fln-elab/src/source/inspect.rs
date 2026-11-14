@@ -34,6 +34,86 @@ pub struct ObservedGoal {
     pub user_name: Option<Name>,
     pub target: Expr,
     pub locals: LocalContext,
+    // The world actually used at the observation point. Public headers and
+    // private bodies may have different environments in the same declaration.
+    environment: Environment,
+}
+
+impl ObservedGoal {
+    /// Construct an inspector in this observation's actual native world, not
+    /// the caller's later environment or the module's private prefix.
+    pub fn expression_inspector(
+        &self,
+        kernel: Budget,
+        max_heartbeats: u64,
+    ) -> Result<ExpressionInspector, NatDefinitionElabError> {
+        ExpressionInspector::new(&self.environment, &self.locals, kernel, max_heartbeats)
+    }
+}
+
+/// Read-only type reconstruction for expressions already observed by the native
+/// elaborator. The private transaction never publishes assignments or admits a
+/// declaration. In particular, a reconstructed type is presentation metadata,
+/// not a kernel verdict. Unassigned metavariables may have no recoverable type.
+pub struct ExpressionInspector {
+    context: Context,
+    types: std::collections::HashMap<Expr, Option<Expr>>,
+}
+
+impl ExpressionInspector {
+    /// All queries share one heartbeat budget and a bounded cache. Zero is a
+    /// refusal, not the elaborator's convention for an unlimited budget.
+    pub fn new(
+        environment: &Environment,
+        locals: &LocalContext,
+        kernel: Budget,
+        max_heartbeats: u64,
+    ) -> Result<Self, NatDefinitionElabError> {
+        if max_heartbeats == 0 || locals.len() > 4096 {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        let mut context = Context::new(environment, kernel);
+        context.txn.budget.max_heartbeats = max_heartbeats;
+        context.txn.lctx = locals.clone();
+        // Type reconstruction opens binders using the source driver's name
+        // generator. Its temporaries must not capture an observed free variable.
+        let generated = Name::from_components(["_fln_source"]);
+        for local in locals.decls() {
+            context.tick()?;
+            if local.id.0.parent() == generated
+                && let fln_core::name::LeafView::Num(index) = local.id.0.leaf_view()
+            {
+                context.next = context.next.max(
+                    index
+                        .checked_add(1)
+                        .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?,
+                );
+            }
+        }
+        Ok(Self {
+            context,
+            types: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Reuse the same native reconstruction used by source constraints, including
+    /// universe instantiation and dependent application/projection types. Loose
+    /// bound variables require an enclosing binder and are not guessed here.
+    pub fn type_of(&mut self, expression: &Expr) -> Result<Option<Expr>, NatDefinitionElabError> {
+        self.context.tick()?;
+        if expression.has_loose_bvars() {
+            return Ok(None);
+        }
+        if let Some(type_) = self.types.get(expression) {
+            return Ok(type_.clone());
+        }
+        if self.types.len() >= 4096 {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        let type_ = self.context.known_type(expression)?;
+        self.types.insert(expression.clone(), type_.clone());
+        Ok(type_)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -480,6 +560,7 @@ impl Context {
             self.flush(true)?;
             let target = self.instantiate(&term.type_)?;
             let locals = self.observation_locals(&locals, &[&target])?;
+            let environment = self.txn.env.clone();
             let probe = self.inspection.as_mut().expect("selected term-goal probe");
             probe.result = Some(SourceObservation::Goals {
                 range: probe.site.range().clone(),
@@ -488,6 +569,7 @@ impl Context {
                     user_name: None,
                     target,
                     locals,
+                    environment,
                 }],
             });
             return Err(failure(SourceInferenceError::ObservationComplete));
@@ -576,6 +658,7 @@ impl Context {
                     .cloned(),
                 target,
                 locals,
+                environment: self.txn.env.clone(),
             });
         }
         let probe = self.inspection.as_mut().expect("selected probe");
@@ -584,5 +667,118 @@ impl Context {
             goals: observed,
         });
         Err(failure(SourceInferenceError::ObservationComplete))
+    }
+}
+
+#[cfg(test)]
+mod expression_tests {
+    use super::*;
+
+    #[test]
+    fn a_native_goal_retains_the_environment_used_for_its_observation() {
+        let kernel = Budget::for_stack_bytes(2 * 1024 * 1024);
+        let source = "def pending (f : Nat → Nat) : Nat := f _";
+        let goal = {
+            let environment = crate::seed::bootstrap_nat_environment(kernel).unwrap();
+            let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
+            let Some(SourceObservation::Goals { mut goals, .. }) = declaration(
+                parsed.syntax(),
+                &environment,
+                kernel,
+                &SourceScope::default(),
+                source.rfind('_').unwrap(),
+                ObservationKind::TermGoal,
+            )
+            .unwrap() else {
+                panic!("native term goal was not observed");
+            };
+            goals.pop().unwrap()
+        };
+        let mut inspector = goal.expression_inspector(kernel, 10_000).unwrap();
+        assert_eq!(
+            inspector.type_of(&goal.target).unwrap(),
+            Some(Expr::sort(Level::one()))
+        );
+        let f = goal
+            .locals
+            .find_by_user_name(&Name::from_components(["f"]))
+            .unwrap();
+        let application = Expr::app(
+            Expr::fvar(f.id.clone()),
+            Expr::lit(Literal::Nat(fln_core::expr::NatLit::from_u64(7))),
+        );
+        assert_eq!(inspector.type_of(&application).unwrap(), Some(goal.target));
+    }
+
+    #[test]
+    fn expression_types_preserve_dependent_locals_and_fresh_binder_identity() {
+        let environment = Environment::new();
+        let parameter = FVarId(Name::num(Name::from_components(["_fln_source"]), 0));
+        let p = Expr::fvar(parameter.clone());
+        let mut locals = LocalContext::new();
+        locals.add_param(
+            parameter,
+            Name::from_components(["P"]),
+            Expr::sort(Level::zero()),
+            BinderInfo::Default,
+        );
+        let before = locals.clone();
+        let mut inspector = ExpressionInspector::new(
+            &environment,
+            &locals,
+            Budget::for_stack_bytes(2 * 1024 * 1024),
+            10_000,
+        )
+        .unwrap();
+        let binder = Name::from_components(["h"]);
+        let identity = Expr::lam(
+            binder.clone(),
+            p.clone(),
+            Expr::bvar(0).unwrap(),
+            BinderInfo::Default,
+        );
+        let expected = Expr::forall_e(binder, p.clone(), p.clone(), BinderInfo::Default);
+        assert_eq!(
+            inspector.type_of(&identity).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(inspector.type_of(&identity).unwrap(), Some(expected));
+        assert_eq!(
+            inspector.type_of(&p).unwrap(),
+            Some(Expr::sort(Level::zero()))
+        );
+        assert_eq!(locals, before);
+        // Opening h at _fln_source.0 would alias P and infer Prop as h's type.
+        assert_eq!(inspector.context.txn.lctx, before);
+    }
+
+    #[test]
+    fn expression_inspection_is_bounded_and_does_not_guess_missing_context() {
+        let environment = Environment::new();
+        let locals = LocalContext::new();
+        let kernel = Budget::for_stack_bytes(2 * 1024 * 1024);
+        assert!(ExpressionInspector::new(&environment, &locals, kernel, 0).is_err());
+        let mut short = ExpressionInspector::new(&environment, &locals, kernel, 1).unwrap();
+        assert!(matches!(
+            short.type_of(&Expr::sort(Level::zero())),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
+        assert!(short.type_of(&Expr::sort(Level::zero())).is_err());
+        let mut inspector =
+            ExpressionInspector::new(&environment, &locals, kernel, 10_000).unwrap();
+        assert_eq!(inspector.type_of(&Expr::bvar(0).unwrap()).unwrap(), None);
+        assert_eq!(
+            inspector
+                .type_of(&Expr::const_(Name::from_components(["Missing"]), vec![]))
+                .unwrap(),
+            None
+        );
+        let u = Level::param(Name::from_components(["u"]));
+        assert_eq!(
+            inspector.type_of(&Expr::sort(u.clone())).unwrap(),
+            Some(Expr::sort(u.succ().unwrap()))
+        );
     }
 }

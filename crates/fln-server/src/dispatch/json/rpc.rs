@@ -152,8 +152,8 @@ pub(in crate::dispatch) fn references(
             return Err("RPC release exceeds its reference limit");
         }
         let end = parse_value_end(array, cursor, 0).ok_or("malformed RPC release reference")?;
-        let reference = &array[cursor..end];
-        result.push(integer(object_field(reference, format.key()))?);
+        let row = &array[cursor..end];
+        result.push(reference(RawField::Value(row), format)?);
         cursor = skip_ws(bytes, end);
         match bytes.get(cursor) {
             Some(b']') if skip_ws(bytes, cursor + 1) == bytes.len() => return Ok(result),
@@ -161,6 +161,21 @@ pub(in crate::dispatch) fn references(
             _ => return Err("malformed RPC reference array"),
         }
     }
+}
+
+pub(in crate::dispatch) fn reference(
+    value: RawField<'_>,
+    format: WireFormat,
+) -> Result<u64, &'static str> {
+    let raw = object(value)?;
+    let other_key = match format {
+        WireFormat::V0 => WireFormat::V1.key(),
+        WireFormat::V1 => WireFormat::V0.key(),
+    };
+    if !matches!(object_field(raw, other_key), RawField::Missing) {
+        return Err("RPC reference uses an unnegotiated or ambiguous wire format");
+    }
+    integer(object_field(raw, format.key()))
 }
 
 #[cfg(test)]
@@ -199,7 +214,14 @@ mod tests {
                 references(RawField::Value(&value), format),
                 Ok(vec![17, 17])
             );
-            for suffix in ["1", "null", "{}", "{\"p\":\"2\",\"p\":\"3\"}"] {
+            for suffix in [
+                "1",
+                "null",
+                "{}",
+                "{\"p\":\"2\",\"p\":\"3\"}",
+                "{\"__rpcref\":\"2\",\"__rpc\\u0072ef\":\"3\"}",
+                "{\"p\":\"2\",\"__rpcref\":\"2\"}",
+            ] {
                 let value = format!(r#"{{"refs":[{},{suffix}]}}"#, format.reference(17));
                 assert!(references(RawField::Value(&value), format).is_err());
             }

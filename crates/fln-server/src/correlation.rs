@@ -1270,6 +1270,51 @@ mod tests {
         assert!(RpcProcedure::TermGoal.result("null"));
     }
 
+    #[test]
+    fn interactive_expression_tags_and_popups_have_distinct_native_profiles() {
+        use crate::json::RpcProcedure;
+        for key in ["p", "__rpcref"] {
+            let code = format!(
+                r#"{{"tag":[{{"info":{{"{key}":"17"}},"subexprPos":"/1"}},{{"text":"β"}}]}}"#
+            );
+            let goal = format!(
+                r#"{{"goals":[{{"hyps":[],"type":{code},"ctx":{{"{key}":"0"}},"goalPrefix":"⊢ ","mvarId":"g"}}]}}"#
+            );
+            assert!(RpcProcedure::Goals.result(&goal), "{goal}");
+            assert!(!RpcProcedure::Highlight.result(&code));
+            let popup = format!(
+                r#"{{"exprExplicit":{code},"type":{{"text":"P"}},"doc":"Native expression"}}"#
+            );
+            let response = format!(r#"{{"jsonrpc":"2.0","id":"call","result":{popup}}}"#);
+            let (client, server) = rpc_pair(
+                "Lean.Widget.InteractiveDiagnostics.infoToInteractive",
+                &response,
+            );
+            let stats = correlate_transcripts(&client, &server).unwrap();
+            assert_eq!(stats.rpc_call_results, 1);
+
+            for bad_tag in [
+                format!(r#"{{"info":{{"{key}":17}},"subexprPos":"/1"}}"#),
+                format!(r#"{{"info":{{"{key}":"17"}},"subexprPos":5}}"#),
+                format!(r#"{{"info":{{"{key}":"17"}},"subexprPos":"/4"}}"#),
+                format!(r#"{{"info":{{"{key}":"17"}},"subexprPos":"/1","subexpr\u0050os":"/0"}}"#),
+            ] {
+                let bad = format!(r#"{{"exprExplicit":{{"tag":[{bad_tag},{{"text":"β"}}]}}}}"#);
+                assert!(!RpcProcedure::InfoPopup.result(&bad), "{bad}");
+            }
+        }
+        for bad in [
+            "null",
+            r#"{"goals":[]}"#,
+            r#"{"exprExplicit":"P"}"#,
+            r#"{"exprExplicit":{"text":"P"},"type":17}"#,
+            r#"{"exprExplicit":{"text":"P"},"doc":17}"#,
+            r#"{"exprExplicit":{"text":"P"},"expr\u0045xplicit":{"text":"Q"}}"#,
+        ] {
+            assert!(!RpcProcedure::InfoPopup.result(bad), "{bad}");
+        }
+    }
+
     fn framed(bodies: &[&str]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for body in bodies {

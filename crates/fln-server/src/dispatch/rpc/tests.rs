@@ -1,5 +1,6 @@
 //! Deterministic state tests; installed-binary tests exercise native elaboration.
 use super::*;
+use semantic::{Goal, Hypothesis, TermGoal};
 const URI: &str = "file:///Rpc.lean";
 fn answer(target: &str) -> Answer {
     Answer::InteractiveGoals {
@@ -17,11 +18,259 @@ fn answer(target: &str) -> Answer {
     }
 }
 fn snapshot(target: &str) -> Arc<Snapshot> {
+    let answer = answer(target);
+    let bytes = semantic::interactive::payload_bytes(&answer).unwrap();
     Arc::new(Snapshot {
         version: 1,
         offset: 0,
-        answer: answer(target),
+        answer,
+        bytes,
     })
+}
+
+fn annotated_answer() -> Answer {
+    let mut result = answer("(f β)");
+    let Answer::InteractiveGoals { goals } = &mut result else {
+        unreachable!()
+    };
+    goals[0].target.info = Some(ExpressionInfo {
+        type_: Some("P".into()),
+    });
+    goals[0].target.subexpressions = vec![
+        semantic::SubexpressionInfo {
+            range: 1..2,
+            position: 4,
+            info: ExpressionInfo {
+                type_: Some("P → P".into()),
+            },
+        },
+        semantic::SubexpressionInfo {
+            range: 3..5,
+            position: 5,
+            info: ExpressionInfo {
+                type_: Some("P".into()),
+            },
+        },
+    ];
+    result
+}
+
+fn info_call(session: u64, reference: &str) -> String {
+    format!(
+        r#"{{"textDocument":{{"uri":"{URI}"}},"position":{{"line":0,"character":0}},"sessionId":"{session}","method":"Lean.Widget.InteractiveDiagnostics.infoToInteractive","params":{reference}}}"#
+    )
+}
+
+fn popup(
+    sessions: &mut Sessions,
+    id: u64,
+    reference: &str,
+    docs: &DocumentSession,
+    provider: &mut Provider,
+) -> Result<String> {
+    sessions.execute(
+        "$/lean/rpc/call",
+        RawField::Value(&info_call(id, reference)),
+        docs,
+        provider,
+    )
+}
+
+#[test]
+fn expression_popups_retain_native_metadata_across_edits_until_release() {
+    for format in [WireFormat::V0, WireFormat::V1] {
+        let mut sessions = Sessions {
+            format,
+            ..Sessions::default()
+        };
+        let id = sessions.create(URI.into(), Instant::now()).unwrap();
+        let mut docs = documents();
+        let mut provider = Provider {
+            result: Some(annotated_answer()),
+            ..Provider::new()
+        };
+        let result = execute(&mut sessions, id, &docs, &mut provider).unwrap();
+        assert!(result.contains(r#""subexprPos":"/0""#), "{result}");
+        assert!(result.contains(r#""subexprPos":"/1""#), "{result}");
+        assert!(result.contains(r#""subexprPos":"/""#), "{result}");
+        let find = |address| {
+            sessions.sessions[&id]
+                .references
+                .iter()
+                .find_map(|(id, reference)| {
+                    (reference.kind == ReferenceKind::Info(address)).then_some(*id)
+                })
+                .unwrap()
+        };
+        let root = find(InfoAddress {
+            code: CodeAddress {
+                goal: 0,
+                field: CodeField::Target,
+            },
+            subexpression: None,
+        });
+        let beta = find(InfoAddress {
+            code: CodeAddress {
+                goal: 0,
+                field: CodeField::Target,
+            },
+            subexpression: Some(1),
+        });
+        assert_eq!(
+            popup(
+                &mut sessions,
+                id,
+                &format.reference(root),
+                &docs,
+                &mut provider
+            )
+            .unwrap(),
+            r#"{"exprExplicit":{"text":"(f β)"},"type":{"text":"P"},"doc":null}"#,
+        );
+        assert_eq!(
+            popup(
+                &mut sessions,
+                id,
+                &format.reference(beta),
+                &docs,
+                &mut provider
+            )
+            .unwrap(),
+            r#"{"exprExplicit":{"text":"β"},"type":{"text":"P"},"doc":null}"#,
+        );
+        assert_eq!(provider.calls, 1, "hover must not re-elaborate a snapshot");
+        let session = &sessions.sessions[&id];
+        let bytes = session.references[&root].snapshot.bytes;
+        assert_eq!(session.bytes, bytes + 128 * session.references.len());
+        docs.save_with_text(URI, "changed source".into()).unwrap();
+        assert_eq!(
+            popup(
+                &mut sessions,
+                id,
+                &format.reference(beta),
+                &docs,
+                &mut provider
+            )
+            .unwrap(),
+            r#"{"exprExplicit":{"text":"β"},"type":{"text":"P"},"doc":null}"#,
+        );
+        assert_eq!(provider.calls, 1);
+
+        // Dropping the first/context reference cannot uncharge a snapshot held
+        // by its expression references. The payload is released exactly once.
+        sessions.sessions.get_mut(&id).unwrap().release(0);
+        let session = &sessions.sessions[&id];
+        assert_eq!(session.bytes, bytes + 128 * session.references.len());
+        sessions.sessions.get_mut(&id).unwrap().release(beta);
+        assert!(matches!(
+            popup(
+                &mut sessions,
+                id,
+                &format.reference(beta),
+                &docs,
+                &mut provider
+            ),
+            Err((-32602, _))
+        ));
+        let refs: Vec<_> = sessions.sessions[&id].references.keys().copied().collect();
+        for reference in refs {
+            sessions.sessions.get_mut(&id).unwrap().release(reference);
+        }
+        assert!(sessions.sessions[&id].references.is_empty());
+        assert_eq!(sessions.sessions[&id].bytes, 0);
+    }
+}
+
+#[test]
+fn expression_popup_rejects_wrong_types_formats_and_dead_sessions() {
+    for format in [WireFormat::V0, WireFormat::V1] {
+        let mut sessions = Sessions {
+            format,
+            ..Sessions::default()
+        };
+        let id = sessions.create(URI.into(), Instant::now()).unwrap();
+        let docs = documents();
+        let mut provider = Provider {
+            result: Some(annotated_answer()),
+            ..Provider::new()
+        };
+        execute(&mut sessions, id, &docs, &mut provider).unwrap();
+        let other = match format {
+            WireFormat::V0 => WireFormat::V1,
+            WireFormat::V1 => WireFormat::V0,
+        };
+        for bad in [
+            format.reference(0), // ContextInfo cannot be used as InfoWithCtx.
+            format.reference(u64::MAX),
+            other.reference(1),
+            format!(r#"{{"{}":1}}"#, format.key()),
+            format!(r#"{{"{}":"1","{}":"2"}}"#, format.key(), format.key()),
+            r#"{"p":"1","__rpcref":"1"}"#.to_owned(),
+            "null".to_owned(),
+        ] {
+            assert!(
+                matches!(
+                    popup(&mut sessions, id, &bad, &docs, &mut provider),
+                    Err((-32602, _))
+                ),
+                "{bad}"
+            );
+        }
+        let second = sessions.create(URI.into(), Instant::now()).unwrap();
+        assert!(matches!(
+            popup(
+                &mut sessions,
+                second,
+                &format.reference(1),
+                &docs,
+                &mut provider
+            ),
+            Err((-32602, _))
+        ));
+        sessions.sessions.get_mut(&id).unwrap().expires = Instant::now();
+        assert!(matches!(
+            popup(
+                &mut sessions,
+                id,
+                &format.reference(1),
+                &docs,
+                &mut provider
+            ),
+            Err((RECONNECT, _))
+        ));
+        assert_eq!(provider.calls, 1);
+    }
+}
+
+#[test]
+fn malformed_expression_annotations_and_late_exhaustion_publish_no_references() {
+    let mut sessions = Sessions::default();
+    let id = sessions.create(URI.into(), Instant::now()).unwrap();
+    let docs = documents();
+    let mut provider = Provider::new();
+    for mutation in 0..4 {
+        let mut bad = annotated_answer();
+        let Answer::InteractiveGoals { goals } = &mut bad else {
+            unreachable!()
+        };
+        let code = &mut goals[0].target;
+        match mutation {
+            0 => code.subexpressions[1].range = 4..5, // Split UTF-8 β.
+            1 => code.subexpressions[1].range = 1..5, // Overlap another leaf.
+            2 => code.subexpressions[1].position = 4, // Duplicate identity.
+            _ => code.info.as_mut().unwrap().type_ = Some("x".repeat(65537)),
+        }
+        provider.result = Some(bad);
+        assert!(execute(&mut sessions, id, &docs, &mut provider).is_err());
+        assert!(sessions.sessions[&id].references.is_empty());
+        assert_eq!(sessions.sessions[&id].bytes, 0);
+    }
+    provider.result = Some(annotated_answer());
+    sessions.sessions.get_mut(&id).unwrap().next_reference = u64::MAX - 2;
+    assert!(execute(&mut sessions, id, &docs, &mut provider).is_err());
+    assert!(sessions.sessions[&id].references.is_empty());
+    assert_eq!(sessions.sessions[&id].bytes, 0);
+    assert_eq!(sessions.sessions[&id].next_reference, u64::MAX - 2);
 }
 fn documents() -> DocumentSession {
     let mut docs = DocumentSession::new();
@@ -283,7 +532,7 @@ fn current_queries_do_not_read_retained_snapshots_and_invalid_edits_refuse() {
     );
     assert!(
         matches!(&sessions.sessions[&id].references[&0].snapshot.answer,
-        Answer::InteractiveGoals { goals } if goals[0].target == "β")
+        Answer::InteractiveGoals { goals } if goals[0].target.text == "β")
     );
     docs.reject_change(URI, 2).unwrap();
     let before = provider.calls;

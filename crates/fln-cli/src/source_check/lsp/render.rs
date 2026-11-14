@@ -10,6 +10,21 @@ const MAX_WORK: usize = 100_000;
 const LIMIT: &str = "semantic expression presentation exceeded its budget";
 type Result<T> = std::result::Result<T, String>;
 
+pub(super) struct ExpressionSpan {
+    pub range: std::ops::Range<usize>,
+    pub position: u64,
+    pub expression: Expr,
+}
+
+pub(super) struct Rendered {
+    pub text: String,
+    pub expressions: Vec<ExpressionSpan>,
+}
+
+fn child_position(position: Option<u64>, child: u64) -> Option<u64> {
+    position?.checked_mul(4)?.checked_add(child)
+}
+
 pub(super) struct Renderer {
     locals: HashMap<FVarId, String>,
     names: HashSet<String>,
@@ -85,16 +100,31 @@ impl Renderer {
         Ok(name)
     }
     pub(super) fn expr(&mut self, expr: &Expr) -> Result<String> {
+        Ok(self.render(expr, false)?.text)
+    }
+    /// Record native expression leaves while printing them. No identifier is
+    /// recovered by reparsing display text. Very deep positions that exceed the
+    /// bounded position representation remain plain text, never wrapped IDs.
+    pub(super) fn annotated(&mut self, expr: &Expr) -> Result<Rendered> {
+        self.render(expr, true)
+    }
+    fn render(&mut self, expr: &Expr, annotated: bool) -> Result<Rendered> {
         enum Work<'a> {
-            Expr(&'a Expr),
+            Expr(&'a Expr, Option<u64>),
             Text(String),
             Level(&'a Level),
             Bind(String),
             Unbind,
+            EndTag {
+                start: usize,
+                expression: &'a Expr,
+                position: u64,
+            },
         }
-        let mut work = vec![Work::Expr(expr)];
+        let mut work = vec![Work::Expr(expr, annotated.then_some(1))];
         let mut binders = Vec::new();
         let mut out = String::new();
+        let mut expressions = Vec::new();
         while let Some(task) = work.pop() {
             self.tick()?;
             match task {
@@ -102,6 +132,20 @@ impl Renderer {
                 Work::Bind(name) => binders.push(name),
                 Work::Unbind => {
                     binders.pop();
+                }
+                Work::EndTag {
+                    start,
+                    expression,
+                    position,
+                } => {
+                    if expressions.len() >= 4096 {
+                        return Err(LIMIT.to_owned());
+                    }
+                    expressions.push(ExpressionSpan {
+                        range: start..out.len(),
+                        position,
+                        expression: expression.clone(),
+                    });
                 }
                 Work::Level(level) => match level.view() {
                     LevelView::Zero => self.text(&mut out, "0")?,
@@ -134,164 +178,242 @@ impl Renderer {
                         ]);
                     }
                 },
-                Work::Expr(expr) => match expr.node() {
-                    ExprNode::BVar { idx } => {
-                        let name = binders
-                            .len()
-                            .checked_sub(*idx as usize + 1)
-                            .and_then(|i| binders.get(i))
-                            .cloned()
-                            .ok_or("unbound variable in semantic expression")?;
-                        self.text(&mut out, &name)?;
+                Work::Expr(expr, position) => {
+                    if let Some(position) = position.filter(|position| *position != 1)
+                        && matches!(
+                            expr.node(),
+                            ExprNode::Const { .. }
+                                | ExprNode::FVar { .. }
+                                | ExprNode::Sort { .. }
+                                | ExprNode::Lit { .. }
+                        )
+                    {
+                        work.push(Work::EndTag {
+                            start: out.len(),
+                            expression: expr,
+                            position,
+                        });
                     }
-                    ExprNode::FVar { id } => {
-                        let name = self
-                            .locals
-                            .get(id)
-                            .cloned()
-                            .ok_or("missing local in semantic expression")?;
-                        self.text(&mut out, &name)?;
-                    }
-                    ExprNode::MVar { id } => {
-                        let n = self.name(&id.0)?;
-                        self.text(&mut out, &format!("?{n}"))?;
-                    }
-                    ExprNode::Sort { level } => {
-                        if level.is_zero() {
-                            self.text(&mut out, "Prop")?;
-                        } else if let LevelView::Succ(child) = level.view() {
-                            if child.is_zero() {
-                                self.text(&mut out, "Type")?;
+                    match expr.node() {
+                        ExprNode::BVar { idx } => {
+                            let name = binders
+                                .len()
+                                .checked_sub(*idx as usize + 1)
+                                .and_then(|i| binders.get(i))
+                                .cloned()
+                                .ok_or("unbound variable in semantic expression")?;
+                            self.text(&mut out, &name)?;
+                        }
+                        ExprNode::FVar { id } => {
+                            let name = self
+                                .locals
+                                .get(id)
+                                .cloned()
+                                .ok_or("missing local in semantic expression")?;
+                            self.text(&mut out, &name)?;
+                        }
+                        ExprNode::MVar { id } => {
+                            let n = self.name(&id.0)?;
+                            self.text(&mut out, &format!("?{n}"))?;
+                        }
+                        ExprNode::Sort { level } => {
+                            if level.is_zero() {
+                                self.text(&mut out, "Prop")?;
+                            } else if let LevelView::Succ(child) = level.view() {
+                                if child.is_zero() {
+                                    self.text(&mut out, "Type")?;
+                                } else {
+                                    self.text(&mut out, "Type ")?;
+                                    work.push(Work::Level(child));
+                                }
                             } else {
-                                self.text(&mut out, "Type ")?;
-                                work.push(Work::Level(child));
-                            }
-                        } else {
-                            self.text(&mut out, "Sort ")?;
-                            work.push(Work::Level(level));
-                        }
-                    }
-                    ExprNode::Const { name, levels } => {
-                        let name = self.name(name)?;
-                        if self.names.contains(&name) {
-                            self.text(&mut out, "_root_.")?;
-                        }
-                        self.text(&mut out, &name)?;
-                        if !levels.is_empty() {
-                            self.text(&mut out, ".{")?;
-                            work.push(Work::Text("}".to_owned()));
-                            for (i, level) in levels.iter().enumerate().rev() {
+                                self.text(&mut out, "Sort ")?;
                                 work.push(Work::Level(level));
-                                if i > 0 {
-                                    work.push(Work::Text(", ".to_owned()));
+                            }
+                        }
+                        ExprNode::Const { name, levels } => {
+                            let name = self.name(name)?;
+                            if self.names.contains(&name) {
+                                self.text(&mut out, "_root_.")?;
+                            }
+                            self.text(&mut out, &name)?;
+                            if !levels.is_empty() {
+                                self.text(&mut out, ".{")?;
+                                work.push(Work::Text("}".to_owned()));
+                                for (i, level) in levels.iter().enumerate().rev() {
+                                    work.push(Work::Level(level));
+                                    if i > 0 {
+                                        work.push(Work::Text(", ".to_owned()));
+                                    }
                                 }
                             }
                         }
-                    }
-                    ExprNode::App { f, a } => {
-                        self.text(&mut out, "(")?;
-                        work.extend([
-                            Work::Text(")".to_owned()),
-                            Work::Expr(a),
-                            Work::Text(" ".to_owned()),
-                            Work::Expr(f),
-                        ]);
-                    }
-                    ExprNode::Lam {
-                        binder_name,
-                        binder_type,
-                        body,
-                        binder_info,
-                    }
-                    | ExprNode::ForallE {
-                        binder_name,
-                        binder_type,
-                        body,
-                        binder_info,
-                    } => {
-                        let name = self.fresh(binder_name)?;
-                        let (left, right) = match binder_info {
-                            BinderInfo::Default => ("(", ")"),
-                            BinderInfo::Implicit => ("{", "}"),
-                            BinderInfo::StrictImplicit => ("⦃", "⦄"),
-                            BinderInfo::InstImplicit => ("[", "]"),
-                        };
-                        let (head, sep) = if matches!(expr.node(), ExprNode::Lam { .. }) {
-                            ("fun", " => ")
-                        } else {
-                            ("∀", ", ")
-                        };
-                        self.text(&mut out, &format!("({head} {left}{name} : "))?;
-                        work.extend([
-                            Work::Text(")".to_owned()),
-                            Work::Unbind,
-                            Work::Expr(body),
-                            Work::Bind(name),
-                            Work::Text(format!("{right}{sep}")),
-                            Work::Expr(binder_type),
-                        ]);
-                    }
-                    ExprNode::LetE {
-                        decl_name,
-                        type_,
-                        value,
-                        body,
-                        ..
-                    } => {
-                        let name = self.fresh(decl_name)?;
-                        self.text(&mut out, &format!("(let {name} : "))?;
-                        work.extend([
-                            Work::Text(")".to_owned()),
-                            Work::Unbind,
-                            Work::Expr(body),
-                            Work::Bind(name),
-                            Work::Text("; ".to_owned()),
-                            Work::Expr(value),
-                            Work::Text(" := ".to_owned()),
-                            Work::Expr(type_),
-                        ]);
-                    }
-                    ExprNode::MData { expr, .. } => work.push(Work::Expr(expr)),
-                    ExprNode::Proj {
-                        struct_name,
-                        idx,
-                        expr,
-                    } => {
-                        let name = self.name(struct_name)?;
-                        self.text(&mut out, "(")?;
-                        work.extend([Work::Text(format!(").{name}.{idx}")), Work::Expr(expr)]);
-                    }
-                    ExprNode::Lit {
-                        literal: Literal::Nat(n),
-                    } => {
-                        if let Some(n) = n.to_u64() {
-                            self.text(&mut out, &n.to_string())?;
-                        } else {
-                            self.text(&mut out, "0x")?;
-                            for limb in n.limbs_le().iter().rev() {
-                                self.tick()?;
-                                self.text(&mut out, &format!("{limb:016x}"))?;
+                        ExprNode::App { f, a } => {
+                            self.text(&mut out, "(")?;
+                            work.extend([
+                                Work::Text(")".to_owned()),
+                                Work::Expr(a, child_position(position, 1)),
+                                Work::Text(" ".to_owned()),
+                                Work::Expr(f, child_position(position, 0)),
+                            ]);
+                        }
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        }
+                        | ExprNode::ForallE {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => {
+                            let name = self.fresh(binder_name)?;
+                            let (left, right) = match binder_info {
+                                BinderInfo::Default => ("(", ")"),
+                                BinderInfo::Implicit => ("{", "}"),
+                                BinderInfo::StrictImplicit => ("⦃", "⦄"),
+                                BinderInfo::InstImplicit => ("[", "]"),
+                            };
+                            let (head, sep) = if matches!(expr.node(), ExprNode::Lam { .. }) {
+                                ("fun", " => ")
+                            } else {
+                                ("∀", ", ")
+                            };
+                            self.text(&mut out, &format!("({head} {left}{name} : "))?;
+                            work.extend([
+                                Work::Text(")".to_owned()),
+                                Work::Unbind,
+                                Work::Expr(body, child_position(position, 1)),
+                                Work::Bind(name),
+                                Work::Text(format!("{right}{sep}")),
+                                Work::Expr(binder_type, child_position(position, 0)),
+                            ]);
+                        }
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            value,
+                            body,
+                            ..
+                        } => {
+                            let name = self.fresh(decl_name)?;
+                            self.text(&mut out, &format!("(let {name} : "))?;
+                            work.extend([
+                                Work::Text(")".to_owned()),
+                                Work::Unbind,
+                                Work::Expr(body, child_position(position, 2)),
+                                Work::Bind(name),
+                                Work::Text("; ".to_owned()),
+                                Work::Expr(value, child_position(position, 1)),
+                                Work::Text(" := ".to_owned()),
+                                Work::Expr(type_, child_position(position, 0)),
+                            ]);
+                        }
+                        ExprNode::MData { expr, .. } => work.push(Work::Expr(expr, position)),
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => {
+                            let name = self.name(struct_name)?;
+                            self.text(&mut out, "(")?;
+                            work.extend([
+                                Work::Text(format!(").{name}.{idx}")),
+                                Work::Expr(expr, child_position(position, 0)),
+                            ]);
+                        }
+                        ExprNode::Lit {
+                            literal: Literal::Nat(n),
+                        } => {
+                            if let Some(n) = n.to_u64() {
+                                self.text(&mut out, &n.to_string())?;
+                            } else {
+                                self.text(&mut out, "0x")?;
+                                for limb in n.limbs_le().iter().rev() {
+                                    self.tick()?;
+                                    self.text(&mut out, &format!("{limb:016x}"))?;
+                                }
                             }
                         }
-                    }
-                    ExprNode::Lit {
-                        literal: Literal::Str(s),
-                    } => {
-                        if s.len() > self.bytes / 6 {
-                            return Err(LIMIT.to_owned());
+                        ExprNode::Lit {
+                            literal: Literal::Str(s),
+                        } => {
+                            if s.len() > self.bytes / 6 {
+                                return Err(LIMIT.to_owned());
+                            }
+                            self.text(&mut out, &format!("{s:?}"))?;
                         }
-                        self.text(&mut out, &format!("{s:?}"))?;
                     }
-                },
+                }
             }
         }
-        Ok(out)
+        Ok(Rendered {
+            text: out,
+            expressions,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn expression_annotations_follow_native_children_and_unicode_byte_ranges() {
+        let beta = FVarId(Name::from_components(["beta"]));
+        let mut renderer = Renderer::new();
+        renderer
+            .local(&beta, &Name::from_components(["β"]))
+            .unwrap();
+        let f = Expr::const_(Name::from_components(["f"]), vec![]);
+        let a = Expr::const_(Name::from_components(["a"]), vec![]);
+        let expression = Expr::app(Expr::app(f.clone(), a.clone()), Expr::fvar(beta.clone()));
+        let rendered = renderer.annotated(&expression).unwrap();
+        assert_eq!(rendered.text, "((f a) β)");
+        let spans: Vec<_> = rendered
+            .expressions
+            .iter()
+            .map(|span| {
+                (
+                    span.range.clone(),
+                    span.position,
+                    rendered.text[span.range.clone()].to_owned(),
+                    span.expression.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                (2..3, 16, "f".to_owned(), f),
+                (4..5, 17, "a".to_owned(), a),
+                (7..9, 5, "β".to_owned(), Expr::fvar(beta)),
+            ]
+        );
+    }
+
+    #[test]
+    fn expression_positions_never_wrap_or_alias_on_deep_terms() {
+        let leaf = Expr::const_(Name::from_components(["a"]), vec![]);
+        let mut expression = leaf.clone();
+        for _ in 0..40 {
+            expression = Expr::app(expression, leaf.clone());
+        }
+        let rendered = Renderer::new().annotated(&expression).unwrap();
+        assert_eq!(rendered.text, Renderer::new().expr(&expression).unwrap());
+        let mut positions = HashSet::new();
+        for span in &rendered.expressions {
+            assert!(positions.insert(span.position));
+            assert!(span.position >= 4);
+            let mut root = span.position;
+            while root >= 4 {
+                root /= 4;
+            }
+            assert_eq!(root, 1);
+        }
+        assert!(rendered.expressions.len() < 41);
+    }
     #[test]
     fn dependent_binders_cannot_capture_outer_locals() {
         let name = Name::from_components(["x"]);

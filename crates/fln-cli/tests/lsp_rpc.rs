@@ -48,6 +48,29 @@ fn extract_string<'a>(value: &'a str, key: &str) -> &'a str {
         .next()
         .unwrap()
 }
+fn expression_reference<'a>(value: &'a str, expression: &str, key: &str) -> &'a str {
+    let marker = format!(r#","subexprPos":"/"}},{{"text":{}}}]}}"#, quote(expression));
+    let prefix = value
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("missing tagged expression {expression}: {value}"))
+        .0;
+    prefix
+        .rsplit_once(&format!("\"{key}\":\""))
+        .unwrap_or_else(|| panic!("missing expression reference {key}: {value}"))
+        .1
+        .split('"')
+        .next()
+        .unwrap()
+}
+fn info_call(id: &str, session: &str, key: &str, reference: &str) -> String {
+    request(
+        id,
+        "$/lean/rpc/call",
+        &format!(
+            r#"{{"textDocument":{{"uri":"{URI}"}},"position":{{"line":0,"character":0}},"sessionId":"{session}","method":"Lean.Widget.InteractiveDiagnostics.infoToInteractive","params":{{"{key}":"{reference}"}}}}"#
+        ),
+    )
+}
 struct Client {
     child: Child,
     input: ChildStdin,
@@ -191,9 +214,14 @@ fn both_doors_and_wire_formats_show_native_goals_terms_and_current_edits() {
                 &call("goals", &session, "Lean.Widget.getInteractiveGoals", 1, 2),
             );
             assert!(goals.contains("\"names\":[\"β\"]"), "{goals}");
-            assert!(goals.contains("\"type\":{\"text\":\"P\"}"), "{goals}");
+            let info = expression_reference(&goals, "P", key).to_owned();
+            info.parse::<u64>().unwrap();
+            let popup = client.exchange("popup", &info_call("popup", &session, key, &info));
+            assert!(popup.contains(r#""exprExplicit":{"text":"P"}"#), "{popup}");
+            assert!(popup.contains(r#""type":{"text":"Prop"}"#), "{popup}");
             assert!(!extract_string(&goals, "mvarId").is_empty());
-            let reference = extract_string(&goals, key);
+            let context = goals.split_once("\"ctx\":").unwrap().1;
+            let reference = extract_string(context, key);
             let release = format!(
                 r#"{{"uri":"{URI}","sessionId":"{session}","refs":[{{"{key}":"{reference}"}}]}}"#
             );
@@ -221,6 +249,34 @@ fn both_doors_and_wire_formats_show_native_goals_terms_and_current_edits() {
             );
             assert!(changed.contains("\"text\":\"Q\""), "{changed}");
             assert!(!changed.contains("\"text\":\"P\""));
+            let current_info = expression_reference(&changed, "Q", key);
+            let current_popup = client.exchange(
+                "current-popup",
+                &info_call("current-popup", &session, key, current_info),
+            );
+            assert!(
+                current_popup.contains(r#""exprExplicit":{"text":"Q"}"#),
+                "{current_popup}"
+            );
+            // Old references deliberately retain the earlier immutable proof
+            // presentation; they must not silently requery the edited source.
+            let old_popup =
+                client.exchange("old-popup", &info_call("old-popup", &session, key, &info));
+            assert!(
+                old_popup.contains(r#""exprExplicit":{"text":"P"}"#),
+                "{old_popup}"
+            );
+            client.send(&notification(
+                "$/lean/rpc/release",
+                &format!(
+                    r#"{{"uri":"{URI}","sessionId":"{session}","refs":[{{"{key}":"{info}"}}]}}"#
+                ),
+            ));
+            let released = client.exchange(
+                "released-popup",
+                &info_call("released-popup", &session, key, &info),
+            );
+            assert!(released.contains("\"code\":-32602"), "{released}");
             client.send(&notification(
                 "textDocument/didChange",
                 &format!(

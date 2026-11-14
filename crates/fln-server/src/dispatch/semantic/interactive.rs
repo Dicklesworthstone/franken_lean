@@ -3,24 +3,63 @@
 use super::{Answer, Query};
 use std::ops::Range;
 
+/// A native expression presentation and its semantic annotations. These are
+/// provisional observations, never certificates. Ranges address UTF-8 bytes in
+/// `text`; atomic subexpressions are disjoint and ordered from left to right.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Code {
+    pub text: String,
+    pub info: Option<ExpressionInfo>,
+    pub subexpressions: Vec<SubexpressionInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpressionInfo {
+    pub type_: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubexpressionInfo {
+    pub range: Range<usize>,
+    /// Internal Lean.SubExpr.Pos: root 1, children append base-four coordinates.
+    /// The wire representation is the pin's slash path, never a JSON number.
+    pub position: u64,
+    pub info: ExpressionInfo,
+}
+
+impl From<String> for Code {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            info: None,
+            subexpressions: Vec::new(),
+        }
+    }
+}
+impl From<&str> for Code {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hypothesis {
     pub name: String,
     pub fvar_id: String,
-    pub type_: String,
-    pub value: Option<String>,
+    pub type_: Code,
+    pub value: Option<Code>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Goal {
     pub mvar_id: String,
     pub user_name: Option<String>,
     pub hypotheses: Vec<Hypothesis>,
-    pub target: String,
+    pub target: Code,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TermGoal {
     pub hypotheses: Vec<Hypothesis>,
-    pub target: String,
+    pub target: Code,
     pub range: Range<usize>,
 }
 
@@ -35,22 +74,64 @@ pub(in crate::dispatch) fn payload_bytes(answer: &Answer) -> Result<usize, &'sta
             .ok_or("interactive observation exceeds its payload budget")?;
         Ok(())
     }
-    fn context(total: &mut usize, hyps: &[Hypothesis], target: &str) -> Result<(), &'static str> {
+    fn info(total: &mut usize, info: &ExpressionInfo) -> Result<(), &'static str> {
+        add(total, 32)?;
+        if let Some(type_) = &info.type_ {
+            add(total, type_.len())?;
+        }
+        Ok(())
+    }
+    fn code(total: &mut usize, code: &Code) -> Result<(), &'static str> {
+        add(total, 96)?;
+        add(total, code.text.len())?;
+        if let Some(root) = &code.info {
+            if code.text.is_empty() {
+                return Err("interactive expression information has no expression");
+            }
+            info(total, root)?;
+        }
+        if code.subexpressions.len() > 4096 {
+            return Err("interactive code has too many subexpressions");
+        }
+        let mut previous_end = 0;
+        let mut positions = BTreeSet::new();
+        for subexpression in &code.subexpressions {
+            let mut root = subexpression.position;
+            while root >= 4 {
+                root /= 4;
+            }
+            if subexpression.range.start < previous_end
+                || subexpression.range.is_empty()
+                || code.text.get(subexpression.range.clone()).is_none()
+                || subexpression.position < 4
+                || root != 1
+                || !positions.insert(subexpression.position)
+            {
+                return Err("interactive code has invalid subexpression annotations");
+            }
+            previous_end = subexpression.range.end;
+            add(total, 32)?;
+            info(total, &subexpression.info)?;
+        }
+        Ok(())
+    }
+    fn context(total: &mut usize, hyps: &[Hypothesis], target: &Code) -> Result<(), &'static str> {
         if hyps.len() > 4096 {
             return Err("interactive observation has too many hypotheses");
         }
-        add(total, target.len())?;
+        code(total, target)?;
         let mut seen = BTreeSet::new();
         for hyp in hyps {
             if hyp.fvar_id.is_empty() || !seen.insert(&hyp.fvar_id) {
                 return Err("interactive observation has invalid local identities");
             }
             add(total, 64)?;
-            for text in [&hyp.name, &hyp.fvar_id, &hyp.type_] {
+            for text in [&hyp.name, &hyp.fvar_id] {
                 add(total, text.len())?;
             }
+            code(total, &hyp.type_)?;
             if let Some(value) = &hyp.value {
-                add(total, value.len())?;
+                code(total, value)?;
             }
         }
         Ok(())

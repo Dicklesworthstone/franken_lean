@@ -8,7 +8,9 @@ mod symbols;
 pub use completion::{
     CompletionLookupLimits, SourceCompletion, SourceCompletionItem, SourceCompletionKind,
 };
-pub use fln_elab::source::inspect::{ObservationKind, ObservedGoal, SourceObservation};
+pub use fln_elab::source::inspect::{
+    ExpressionInspector, ObservationKind, ObservedGoal, SourceObservation,
+};
 pub use fln_elab::source::scope::SourceScope;
 use modules::{
     SourceModuleCheckError, SourceModuleCheckLimits, SourceModuleSession, SourceModuleSessionCheck,

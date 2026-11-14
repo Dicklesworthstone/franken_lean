@@ -4,7 +4,7 @@
 //! certificates or executable Meta contexts; unimplemented procedures refuse.
 use super::*;
 use json::rpc::{self as params, WireFormat};
-use semantic::{Answer, Goal, Hypothesis, Query, QueryKind, TermGoal};
+use semantic::{Answer, Code, ExpressionInfo, Query, QueryKind};
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::sync::Arc;
@@ -33,11 +33,48 @@ struct Snapshot {
     version: i64,
     offset: usize,
     answer: Answer,
+    bytes: usize,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodeField {
+    Target,
+    HypothesisType(usize),
+    HypothesisValue(usize),
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CodeAddress {
+    goal: usize,
+    field: CodeField,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct InfoAddress {
+    code: CodeAddress,
+    subexpression: Option<usize>,
+}
+impl Snapshot {
+    fn code(&self, address: CodeAddress) -> Option<&Code> {
+        let (hypotheses, target) = match &self.answer {
+            Answer::InteractiveGoals { goals } => {
+                let goal = goals.get(address.goal)?;
+                (&goal.hypotheses, &goal.target)
+            }
+            Answer::InteractiveTermGoal(goal) if address.goal == 0 => {
+                (&goal.hypotheses, &goal.target)
+            }
+            _ => return None,
+        };
+        match address.field {
+            CodeField::Target => Some(target),
+            CodeField::HypothesisType(index) => Some(&hypotheses.get(index)?.type_),
+            CodeField::HypothesisValue(index) => hypotheses.get(index)?.value.as_ref(),
+        }
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReferenceKind {
     Context,
     Term,
+    Info(InfoAddress),
 }
 #[derive(Clone)]
 struct Reference {
@@ -71,8 +108,19 @@ impl Session {
         if self.references.len() >= MAX_REFERENCES {
             return Err(failed("RPC reference capacity exhausted"));
         }
-        let bytes = semantic::interactive::payload_bytes(&snapshot.answer)
-            .map_err(failed)?
+        // Every reference shares the same immutable answer. Charge its payload
+        // once, plus one bounded metadata row per distinct reference. A goal
+        // with many expression tags must not be charged as many full snapshots.
+        let payload = if self
+            .references
+            .values()
+            .any(|reference| Arc::ptr_eq(&reference.snapshot, snapshot))
+        {
+            0
+        } else {
+            snapshot.bytes
+        };
+        let bytes = payload
             .checked_add(128)
             .ok_or_else(|| failed("RPC reference accounting overflow"))?;
         let total = self
@@ -90,7 +138,7 @@ impl Session {
                 snapshot: snapshot.clone(),
                 kind,
                 count: 1,
-                bytes,
+                bytes: 128,
             },
         );
         self.bytes = total;
@@ -104,7 +152,50 @@ impl Session {
             reference.count -= 1;
         } else if let Some(reference) = self.references.remove(&id) {
             self.bytes -= reference.bytes;
+            if !self
+                .references
+                .values()
+                .any(|other| Arc::ptr_eq(&other.snapshot, &reference.snapshot))
+            {
+                self.bytes -= reference.snapshot.bytes;
+            }
         }
+    }
+
+    fn popup(&self, id: u64) -> Result<String> {
+        let reference = self
+            .references
+            .get(&id)
+            .ok_or_else(|| invalid("RPC expression reference is unknown or has been released"))?;
+        let ReferenceKind::Info(address) = reference.kind else {
+            return Err(invalid(
+                "RPC reference does not contain expression information",
+            ));
+        };
+        let code = reference
+            .snapshot
+            .code(address.code)
+            .ok_or_else(|| failed("retained RPC expression is unavailable"))?;
+        let (expression, info) = match address.subexpression {
+            None => (
+                code.text.as_str(),
+                code.info
+                    .as_ref()
+                    .ok_or_else(|| failed("retained RPC expression has no information"))?,
+            ),
+            Some(index) => {
+                let subexpression = code
+                    .subexpressions
+                    .get(index)
+                    .ok_or_else(|| failed("retained RPC subexpression is unavailable"))?;
+                let expression = code
+                    .text
+                    .get(subexpression.range.clone())
+                    .ok_or_else(|| failed("retained RPC expression range is invalid"))?;
+                (expression, &subexpression.info)
+            }
+        };
+        Ok(popup_json(expression, info))
     }
 }
 
@@ -261,6 +352,17 @@ impl Sessions {
             return Ok(result);
         }
         json::byte_offset(text, call.position).map_err(invalid)?;
+        if call.method == "Lean.Widget.InteractiveDiagnostics.infoToInteractive" {
+            let reference = params::reference(call.params, self.format).map_err(invalid)?;
+            let result = self
+                .session(call.session, &call.uri, Instant::now())?
+                .popup(reference)?;
+            if result.len() > MAX_RESPONSE_BYTES {
+                return Err(failed("RPC popup exceeds its wire budget"));
+            }
+            self.session(call.session, &call.uri, Instant::now())?;
+            return Ok(result);
+        }
         if call.method == "Lean.Widget.highlightMatches" {
             // Search the presentation already held by the client. This is not
             // another semantic query and must not elaborate the document or
@@ -326,11 +428,12 @@ impl Sessions {
         ) {
             return Err(failed("RPC provider returned a different query kind"));
         }
-        semantic::interactive::validate(&answer, query).map_err(failed)?;
+        let bytes = semantic::interactive::validate(&answer, query).map_err(failed)?;
         let snapshot = Arc::new(Snapshot {
             version: query.version,
             offset,
             answer,
+            bytes,
         });
         // Stage bounded reference metadata. Incomplete encoding or exhaustion
         // cannot leak partial objects or reuse a number already sent to a client.
@@ -349,45 +452,150 @@ impl Sessions {
 fn code(text: &str) -> String {
     format!("{{\"text\":{}}}", crate::json_string(text))
 }
-fn hypotheses(hyps: &[Hypothesis]) -> String {
-    hyps.iter()
-        .map(|hyp| {
-            let value = hyp
-                .value
-                .as_ref()
-                .map_or(String::new(), |value| format!(",\"val\":{}", code(value)));
-            format!(
-                "{{\"names\":[{}],\"fvarIds\":[{}],\"type\":{}{value}}}",
-                crate::json_string(&hyp.name),
-                crate::json_string(&hyp.fvar_id),
-                code(&hyp.type_)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-fn goal_json(goal: &Goal, context: &str) -> String {
-    let name = goal.user_name.as_ref().map_or(String::new(), |name| {
-        format!(",\"userName\":{}", crate::json_string(name))
-    });
+
+fn popup_json(expression: &str, info: &ExpressionInfo) -> String {
+    let type_ = info
+        .type_
+        .as_ref()
+        .map_or_else(|| "null".to_owned(), |type_| code(type_));
     format!(
-        "{{\"hyps\":[{}],\"type\":{},\"ctx\":{context},\"goalPrefix\":\"⊢ \",\"mvarId\":{}{name}}}",
-        hypotheses(&goal.hypotheses),
-        code(&goal.target),
-        crate::json_string(&goal.mvar_id)
+        "{{\"exprExplicit\":{},\"type\":{type_},\"doc\":null}}",
+        code(expression)
     )
 }
-fn term_json(goal: &TermGoal, context: &str, term: &str, query: Query<'_>) -> Result<String> {
-    let start = semantic::position(query.text, goal.range.start).map_err(failed)?;
-    let end = semantic::position(query.text, goal.range.end).map_err(failed)?;
+
+fn tagged(reference: &str, mut position: u64, contents: &str) -> String {
+    // Lean/SubExpr.lean encodes the path as a string because a bare Nat loses
+    // low bits when JavaScript decodes it as a float.
+    let mut coordinates = Vec::new();
+    while position >= 4 {
+        coordinates.push((b'0' + (position % 4) as u8) as char);
+        position /= 4;
+    }
+    let mut path = String::new();
+    if coordinates.is_empty() {
+        path.push('/');
+    } else {
+        for coordinate in coordinates.into_iter().rev() {
+            path.push('/');
+            path.push(coordinate);
+        }
+    }
+    format!(
+        "{{\"tag\":[{{\"info\":{reference},\"subexprPos\":{}}},{contents}]}}",
+        crate::json_string(&path)
+    )
+}
+
+fn interactive_code(
+    snapshot: &Arc<Snapshot>,
+    address: CodeAddress,
+    session: &mut Session,
+    format: WireFormat,
+) -> Result<String> {
+    let value = snapshot
+        .code(address)
+        .ok_or_else(|| failed("RPC expression address is unavailable"))?;
+    let mut parts = Vec::new();
+    let mut offset = 0;
+    for (index, subexpression) in value.subexpressions.iter().enumerate() {
+        if subexpression.range.start > offset {
+            parts.push(code(&value.text[offset..subexpression.range.start]));
+        }
+        let reference = format.reference(session.retain(
+            snapshot,
+            ReferenceKind::Info(InfoAddress {
+                code: address,
+                subexpression: Some(index),
+            }),
+        )?);
+        parts.push(tagged(
+            &reference,
+            subexpression.position,
+            &code(&value.text[subexpression.range.clone()]),
+        ));
+        offset = subexpression.range.end;
+    }
+    if offset < value.text.len() || parts.is_empty() {
+        parts.push(code(&value.text[offset..]));
+    }
+    let contents = if parts.len() == 1 {
+        parts
+            .pop()
+            .ok_or_else(|| failed("RPC expression encoding has no content"))?
+    } else {
+        format!("{{\"append\":[{}]}}", parts.join(","))
+    };
+    if value.info.is_some() {
+        let reference = format.reference(session.retain(
+            snapshot,
+            ReferenceKind::Info(InfoAddress {
+                code: address,
+                subexpression: None,
+            }),
+        )?);
+        Ok(tagged(&reference, 1, &contents))
+    } else {
+        Ok(contents)
+    }
+}
+
+fn goal_core(
+    snapshot: &Arc<Snapshot>,
+    goal: usize,
+    session: &mut Session,
+    format: WireFormat,
+) -> Result<String> {
+    let hyps = match &snapshot.answer {
+        Answer::InteractiveGoals { goals } => &goals[goal].hypotheses,
+        Answer::InteractiveTermGoal(goal) => &goal.hypotheses,
+        _ => return Err(failed("RPC snapshot is not a goal")),
+    };
+    let mut hypotheses = Vec::new();
+    for (index, hyp) in hyps.iter().enumerate() {
+        let type_ = interactive_code(
+            snapshot,
+            CodeAddress {
+                goal,
+                field: CodeField::HypothesisType(index),
+            },
+            session,
+            format,
+        )?;
+        let value = if hyp.value.is_some() {
+            format!(
+                ",\"val\":{}",
+                interactive_code(
+                    snapshot,
+                    CodeAddress {
+                        goal,
+                        field: CodeField::HypothesisValue(index),
+                    },
+                    session,
+                    format,
+                )?
+            )
+        } else {
+            String::new()
+        };
+        hypotheses.push(format!(
+            "{{\"names\":[{}],\"fvarIds\":[{}],\"type\":{type_}{value}}}",
+            crate::json_string(&hyp.name),
+            crate::json_string(&hyp.fvar_id),
+        ));
+    }
+    let target = interactive_code(
+        snapshot,
+        CodeAddress {
+            goal,
+            field: CodeField::Target,
+        },
+        session,
+        format,
+    )?;
     Ok(format!(
-        "{{\"hyps\":[{}],\"type\":{},\"ctx\":{context},\"term\":{term},\"range\":{{\"start\":{{\"line\":{},\"character\":{}}},\"end\":{{\"line\":{},\"character\":{}}}}}}}",
-        hypotheses(&goal.hypotheses),
-        code(&goal.target),
-        start.line,
-        start.character,
-        end.line,
-        end.character
+        "\"hyps\":[{}],\"type\":{target}",
+        hypotheses.join(",")
     ))
 }
 fn encode(
@@ -399,16 +607,29 @@ fn encode(
     match &snapshot.answer {
         Answer::InteractiveGoals { goals } => {
             let mut result = Vec::new();
-            for goal in goals {
+            for (index, goal) in goals.iter().enumerate() {
                 let context = format.reference(session.retain(snapshot, ReferenceKind::Context)?);
-                result.push(goal_json(goal, &context));
+                let core = goal_core(snapshot, index, session, format)?;
+                let name = goal.user_name.as_ref().map_or(String::new(), |name| {
+                    format!(",\"userName\":{}", crate::json_string(name))
+                });
+                result.push(format!(
+                    "{{{core},\"ctx\":{context},\"goalPrefix\":\"⊢ \",\"mvarId\":{}{name}}}",
+                    crate::json_string(&goal.mvar_id)
+                ));
             }
             Ok(format!("{{\"goals\":[{}]}}", result.join(",")))
         }
         Answer::InteractiveTermGoal(goal) => {
             let context = format.reference(session.retain(snapshot, ReferenceKind::Context)?);
             let term = format.reference(session.retain(snapshot, ReferenceKind::Term)?);
-            term_json(goal, &context, &term, query)
+            let core = goal_core(snapshot, 0, session, format)?;
+            let start = semantic::position(query.text, goal.range.start).map_err(failed)?;
+            let end = semantic::position(query.text, goal.range.end).map_err(failed)?;
+            Ok(format!(
+                "{{{core},\"ctx\":{context},\"term\":{term},\"range\":{{\"start\":{{\"line\":{},\"character\":{}}},\"end\":{{\"line\":{},\"character\":{}}}}}}}",
+                start.line, start.character, end.line, end.character
+            ))
         }
         _ => Err(failed("cannot encode this RPC result kind")),
     }

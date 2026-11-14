@@ -580,7 +580,12 @@ fn inspect_sources(
                 QueryKind::InteractiveGoals | QueryKind::InteractiveTermGoal
             ) =>
         {
-            Some(interactive::observe(goals, range, kind)?)
+            Some(interactive::observe(
+                goals,
+                range,
+                kind,
+                fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
+            )?)
         }
         Some(SourceObservation::Goals { range, goals }) => {
             if goals.len() > 256 {

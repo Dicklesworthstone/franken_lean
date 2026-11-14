@@ -8,7 +8,7 @@ mod symbols;
 pub use completion::{CompletionItem, CompletionItemKind};
 pub use symbols::DocumentSymbol;
 pub(super) mod interactive;
-pub use interactive::{Goal, Hypothesis, TermGoal};
+pub use interactive::{Code, ExpressionInfo, Goal, Hypothesis, SubexpressionInfo, TermGoal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryKind {

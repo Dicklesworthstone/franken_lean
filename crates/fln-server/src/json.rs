@@ -220,6 +220,7 @@ pub(super) enum RpcProcedure {
     Diagnostics,
     Highlight,
     Widgets,
+    InfoPopup,
 }
 
 impl RpcProcedure {
@@ -230,6 +231,7 @@ impl RpcProcedure {
             "Lean.Widget.getInteractiveDiagnostics" => Some(Self::Diagnostics),
             "Lean.Widget.highlightMatches" => Some(Self::Highlight),
             "Lean.Widget.getWidgets" => Some(Self::Widgets),
+            "Lean.Widget.InteractiveDiagnostics.infoToInteractive" => Some(Self::InfoPopup),
             _ => None,
         }
     }
@@ -275,6 +277,21 @@ impl RpcProcedure {
                 })
             }),
             Self::Highlight => rpc_tagged_text(root),
+            Self::InfoPopup => {
+                if !object_has_only_keys(root, &["type", "exprExplicit", "doc"]) {
+                    return false;
+                }
+                let optional_code = |key| match object_member(root, key) {
+                    RawField::Missing | RawField::Value("null") => true,
+                    value => rpc_code(value),
+                };
+                optional_code("type")
+                    && optional_code("exprExplicit")
+                    && match object_member(root, "doc") {
+                        RawField::Missing | RawField::Value("null") => true,
+                        value => matches!(decoded_string(value), DecodedField::Valid(_)),
+                    }
+            }
             Self::Widgets => {
                 if !object_has_only_keys(root, &["widgets"]) {
                     return false;
@@ -393,7 +410,7 @@ fn rpc_goal(value: RawField<'_>) -> bool {
         return false;
     };
     rpc_reference(object_member(value, "ctx"))
-        && rpc_tagged_text(object_member(value, "type"))
+        && rpc_code(object_member(value, "type"))
         && hyps.into_iter().all(|hyp| {
             let hyp = RawField::Value(hyp);
             let strings = |key| {
@@ -405,17 +422,50 @@ fn rpc_goal(value: RawField<'_>) -> bool {
                     .then_some(values.len())
             };
             matches!((strings("names"), strings("fvarIds")), (Some(names), Some(ids)) if names > 0 && names == ids)
-                && rpc_tagged_text(object_member(hyp, "type"))
+                && rpc_code(object_member(hyp, "type"))
                 && match object_member(hyp, "val") {
                     RawField::Missing => true,
-                    value => rpc_tagged_text(value),
+                    value => rpc_code(value),
                 }
         })
 }
 
-/// The native goals/diagnostics use text leaves. The native highlighter also
-/// emits append nodes and highlighted tags. Walk on the heap under a node bound.
 fn rpc_tagged_text(value: RawField<'_>) -> bool {
+    rpc_text_tree(value, false)
+}
+
+fn rpc_code(value: RawField<'_>) -> bool {
+    rpc_text_tree(value, true)
+}
+
+fn rpc_subexpression(value: RawField<'_>) -> bool {
+    if !object_has_only_keys(value, &["info", "subexprPos", "diffStatus"])
+        || !rpc_reference(object_member(value, "info"))
+    {
+        return false;
+    }
+    let DecodedField::Valid(position) = object_string_member(value, "subexprPos") else {
+        return false;
+    };
+    if position.len() > 64
+        || (position != "/"
+            && (!position.starts_with('/')
+                || !position[1..]
+                    .split('/')
+                    .all(|coordinate| matches!(coordinate, "0" | "1" | "2" | "3"))))
+    {
+        return false;
+    }
+    match object_member(value, "diffStatus") {
+        RawField::Missing | RawField::Value("null") => true,
+        value => matches!(decoded_string(value), DecodedField::Valid(status)
+            if matches!(status.as_str(), "wasChanged" | "willChange" | "wasDeleted" | "willDelete" | "wasInserted" | "willInsert")),
+    }
+}
+
+/// Goals use SubexprInfo tags; diagnostic search uses highlighted message tags.
+/// Keep the two native profiles distinct, walking on the heap under a node bound.
+fn rpc_text_tree(value: RawField<'_>, code: bool) -> bool {
     // Highlighting splits input leaves, so its output can contain more nodes
     // than the highlighter's input-node ceiling. The shortest TaggedText node
     // is {"text":""}; derive the walk ceiling from the actual wire budget.
@@ -450,9 +500,15 @@ fn rpc_tagged_text(value: RawField<'_>) -> bool {
                 let Some(pair) = array_elements(tag, 2) else {
                     return false;
                 };
-                if pair.len() != 2
-                    || !matches!(decoded_string(RawField::Value(pair[0])), DecodedField::Valid(tag) if tag == "highlighted")
-                {
+                if pair.len() != 2 {
+                    return false;
+                }
+                let valid = if code {
+                    rpc_subexpression(RawField::Value(pair[0]))
+                } else {
+                    matches!(decoded_string(RawField::Value(pair[0])), DecodedField::Valid(tag) if tag == "highlighted")
+                };
+                if !valid {
                     return false;
                 }
                 work.push(RawField::Value(pair[1]));
