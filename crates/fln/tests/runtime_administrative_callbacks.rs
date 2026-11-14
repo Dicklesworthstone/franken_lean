@@ -211,3 +211,151 @@ fn a_dynamic_flat_consumer_does_not_cast_a_genuinely_staged_callback() {
         assert_eq!(engine.logical_root(&options), root);
     }
 }
+
+fn recursive_staged_engine() -> Engine {
+    let source = format!(
+        r#"{SPEND}
+partial def stagedSpin (n : Nat) : Nat := stagedSpin n
+partial def stagedConsume (n : Nat) (callback : Nat -> Nat -> Nat) (state : Nat) : Nat :=
+  if Nat.beq n 0 then callback n state
+  else
+    let action : Nat -> Nat := callback n
+    let previous := stagedConsume (Nat.pred n) callback (Nat.add state 1)
+    Nat.add (action state) previous
+partial def stagedIgnore (n : Nat) (callback : Nat -> Nat -> Nat) (state : Nat) : Nat :=
+  let unused : Nat -> Nat := callback n
+  if Nat.beq n 0 then 42 else stagedIgnore (Nat.pred n) callback state
+partial def stagedUse (n : Nat) (callback : Nat -> Nat -> Nat) (state : Nat) : Nat :=
+  let action : Nat -> Nat := callback n
+  if Nat.beq n 0 then action state
+  else Nat.add (action state) (stagedUse (Nat.pred n) callback state)
+def stagedRun (offset : Nat) : Nat :=
+  stagedConsume 3 (let paid := Nat.add offset 0; fun n =>
+    let saved := Nat.add paid n; fun state => Nat.add saved state) 2
+"#
+    );
+    engine()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            fln::SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
+        )
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .unwrap()
+        .engine
+}
+
+fn staged_eval(engine: &Engine, source: &str, expected: &str) -> (u64, Vec<u8>) {
+    let options = KVMap::new();
+    let run = engine
+        .execute_source_definitions(&[source.as_bytes()], &options, limits())
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .unwrap();
+    let execution = run.executions.last().unwrap();
+    let steps = returned(&execution.exit, expected);
+    let replay = execute_flbc_artifact(
+        &execution.flbc_artifact,
+        &options,
+        FlbcExecutionLimits::default(),
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap();
+    assert_eq!(returned(&replay, expected), steps);
+    (steps, execution.flbc_artifact.clone())
+}
+
+#[test]
+fn computed_recursive_callbacks_share_their_producer_and_replay_exactly() {
+    let engine = recursive_staged_engine();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    for (source, expected) in [
+        ("#eval stagedRun 10", "60"),
+        ("#eval stagedRun 100", "420"),
+        (
+            "#eval let action : Nat -> Nat := stagedConsume 3 (let paid := Nat.add 9 1; fun n => let saved := Nat.add paid n; fun state => Nat.add saved state); Nat.add (action 2) (action 3)",
+            "124",
+        ),
+    ] {
+        assert_eq!(
+            staged_eval(&engine, source, expected),
+            staged_eval(&engine, source, expected),
+            "repeated source execution must produce identical steps and FLBC"
+        );
+    }
+    let once = staged_eval(&engine, "#eval spend 25", "25")
+        .0
+        .checked_sub(staged_eval(&engine, "#eval spend 0", "0").0)
+        .unwrap();
+    let source = |cost| {
+        format!(
+            "#eval stagedConsume 3 (let paid := spend {cost}; fun n => let saved := Nat.add paid n; fun state => Nat.add saved state) 2"
+        )
+    };
+    let idle = staged_eval(&engine, &source(0), "20").0;
+    let busy = staged_eval(&engine, &source(25), "120").0;
+    assert!(once > 25);
+    assert_eq!(busy.checked_sub(idle).unwrap(), once);
+    let mut bounded = limits();
+    bounded.vm.max_steps = idle;
+    for source in [
+        source(25),
+        "#eval stagedIgnore 0 (let paid := stagedSpin 0; fun n => let saved := Nat.add paid n; fun state => Nat.add saved state) 5".into(),
+    ] {
+        let stopped = engine
+            .execute_source_definitions(&[source.as_bytes()], &options, bounded)
+            .unwrap();
+        assert!(matches!(stopped, Outcome::Inconclusive(stop) if matches!(&stop.cause,
+            fln_core::outcome::InconclusiveCause::ResourceExhausted { usage }
+                if usage.reason == fln_core::diag::ResourceReason::ExecutionSteps
+                    && usage.allowed == idle && usage.observed == idle + 1)));
+    }
+    assert_eq!(staged_eval(&engine, &source(0), "20").0, idle);
+    assert_eq!(engine.logical_root(&options), root);
+}
+
+#[test]
+fn recursive_dead_source_lets_discard_stages_but_live_results_keep_them() {
+    let engine = recursive_staged_engine();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    let source = |consumer, count, producer| {
+        format!(
+            "#eval {consumer} {count} (fun n => let paid := {producer}; fun state => Nat.add paid state) 5"
+        )
+    };
+    let live = source("stagedUse", 0, "Nat.add n 1");
+    let finite_steps = staged_eval(&engine, &live, "6").0;
+    let mut bounded = limits();
+    bounded.vm.max_steps = 500;
+    for count in [0, 3] {
+        assert_eq!(
+            staged_eval(
+                &engine,
+                &source("stagedIgnore", count, "stagedSpin n"),
+                "42"
+            )
+            .0,
+            staged_eval(&engine, &source("stagedIgnore", count, "Nat.add n 1"), "42").0,
+            "a discarded source result must not execute either first-stage producer"
+        );
+        let stopped = engine
+            .execute_source_definitions(
+                &[source("stagedUse", count, "stagedSpin n").as_bytes()],
+                &options,
+                bounded,
+            )
+            .unwrap();
+        assert!(
+            matches!(stopped, Outcome::Inconclusive(stop) if matches!(&stop.cause,
+            fln_core::outcome::InconclusiveCause::ResourceExhausted { usage }
+                if usage.reason == fln_core::diag::ResourceReason::ExecutionSteps
+                    && usage.allowed == 500 && usage.observed == 501))
+        );
+    }
+    assert_eq!(staged_eval(&engine, &live, "6").0, finite_steps);
+    assert_eq!(engine.logical_root(&options), root);
+}

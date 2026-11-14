@@ -140,7 +140,7 @@ fn fully_bound_recursive_consumers_keep_dynamic_middle_callbacks_and_replay() {
 }
 
 #[test]
-fn ignored_callback_results_still_execute_their_prefix_in_fully_bound_consumers() {
+fn dead_callback_source_results_are_discarded_and_live_results_execute() {
     let engine = admit(pair(
         "fullStageSpin",
         arrow(nat_type()),
@@ -170,23 +170,83 @@ fn ignored_callback_results_still_execute_their_prefix_in_fully_bound_consumers(
             )))),
         ),
     );
+    let engine = extend(
+        engine,
+        pair(
+            "fullStageUse",
+            consumer_type(),
+            lambda(callback_parameter(lambda(nat::literal(0)))),
+            lambda(callback_parameter(lambda(Expr::let_e(
+                name("action"),
+                arrow(nat_type()),
+                Expr::app(b(1), b(2)),
+                choose(
+                    nat_type(),
+                    call("Nat.beq", [b(3), nat::literal(0)]),
+                    Expr::app(b(0), b(1)),
+                    call(
+                        "Nat.add",
+                        [
+                            Expr::app(b(0), b(1)),
+                            call(
+                                "fullStageUse._unsafe_rec",
+                                [call("Nat.pred", [b(3)]), b(2), b(1)],
+                            ),
+                        ],
+                    ),
+                ),
+                false,
+            )))),
+        ),
+    );
     let original = engine.logical_root(&KVMap::new());
     let mut bounded = limits();
     bounded.vm.max_steps = 500;
-    for source in [
-        b"#eval fullStageIgnore 0 (fun n => let paid := fullStageSpin n; fun state => Nat.add paid state) 5".as_slice(),
-        b"#eval fullStageIgnore 3 (fun n => let paid := fullStageSpin n; fun state => Nat.add paid state) 5".as_slice(),
-    ] {
-        assert!(matches!(
-            engine.execute_source_definitions(&[source], &KVMap::new(), bounded).unwrap(),
-            Outcome::Inconclusive(_)
-        ));
+    let run_dead = |count, producer: &str| {
+        let source = format!(
+            "#eval fullStageIgnore {count} (fun n => let paid := {producer}; fun state => Nat.add paid state) 5"
+        );
+        let batch = engine
+            .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), bounded)
+            .unwrap()
+            .into_complete()
+            .unwrap_or_else(|stop| panic!("{source}: {stop:?}"));
+        let VmExit::Returned(value) = &batch.executions.last().unwrap().exit else {
+            panic!("the discarded source callback must return 42");
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+            Some("42"),
+            "{source}"
+        );
+        value.usage.steps
+    };
+    for count in [0, 3] {
+        // The pin removes an unused pure source binding before discovering
+        // callback stages. Its first-stage producer must remain unexecuted;
+        // strict runtime operands have their separate regression below.
+        assert_eq!(
+            run_dead(count, "fullStageSpin n"),
+            run_dead(count, "Nat.add n 1"),
+            "an erased source callback result must not run its producer"
+        );
+        let source = format!(
+            "#eval fullStageUse {count} (fun n => let paid := fullStageSpin n; fun state => Nat.add paid state) 5"
+        );
+        let outcome = engine
+            .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), bounded)
+            .unwrap();
+        assert!(
+            matches!(outcome, Outcome::Inconclusive(_)),
+            "{source}: a live callback result must execute its diverging first stage"
+        );
         assert_eq!(engine.logical_root(&KVMap::new()), original);
     }
     returned(
         &engine,
-        b"#eval fullStageIgnore 3 (fun n => let paid := Nat.add n 1; fun state => Nat.add paid state) 5",
-        &["42"],
+        b"#eval fullStageIgnore 3 (fun n => let paid := Nat.add n 1; fun state => Nat.add paid state) 5\n\
+          #eval fullStageUse 0 (fun n => let paid := Nat.add n 1; fun state => Nat.add paid state) 5",
+        &["42", "6"],
     );
 }
 
