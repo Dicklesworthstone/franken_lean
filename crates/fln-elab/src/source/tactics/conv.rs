@@ -103,7 +103,7 @@ fn append_before(name: &Name, pre: &str) -> Name {
 
 /// What a conversion frame does with the goals its sequence leaves.
 #[derive(Clone)]
-pub(super) enum Finish {
+pub(super) enum Finish<'a> {
     /// `conv (at h)? => …` (`evalConv`): the goals left are closed by reflexivity (`convert`),
     /// then the goal's target (`replaceTargetEq` and `try with_reducible rfl`) or the hypothesis
     /// `local` (`replaceLocalDecl`) is replaced.
@@ -123,6 +123,12 @@ pub(super) enum Finish {
     /// `{ … }` and `· …` (`evalConvSeqBracketed`): `all_goals (try with_reducible rfl)`, then
     /// `closeUsingOrAdmit`'s requirement that no goal is left.
     Bracketed,
+    /// `case tag => cs`: run the selected conversion, close its remaining goals with
+    /// ordinary `rfl`, then select the next tag in source order.
+    Case {
+        remaining: &'a [Syntax],
+        body: &'a Syntax,
+    },
     /// `tactic => …` (`evalNestedTactic`): the goals left of shape `_ = ?m …` become conv goals
     /// again (`remarkAsConvGoal`).
     Tactic,
@@ -494,6 +500,39 @@ impl Context {
         };
         match short.as_str() {
             "conv" => self.start_conv(proof, goal, args),
+            "conv_<;>_" => {
+                let [left, separator, right] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(separator, "<;>", "conv sequencing separator")?;
+                self.start_goal_sequence(proof, goal, left, right)
+            }
+            "allGoals" | "focus" => {
+                let [keyword, sequence] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                let mode = if short == "allGoals" {
+                    control::Mode::All
+                } else {
+                    control::Mode::Focus
+                };
+                expect_atom(keyword, mode.keyword(), "conv goal-control keyword")?;
+                let body = self.conv_instructions(sequence)?;
+                self.start_goal_control_body(proof, goal, body, mode, None)
+            }
+            "case" => {
+                let [keyword, cases, arrow, sequence] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "case", "conv case keyword")?;
+                expect_atom(arrow, "=>", "conv case arrow")?;
+                self.start_conv_case(
+                    proof,
+                    goal,
+                    expect_null_args(cases, "conv case arguments")?,
+                    sequence,
+                )
+            }
             "convConvSeq" => {
                 let [keyword, arrow, sequence] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
@@ -640,6 +679,59 @@ impl Context {
         }
     }
 
+    /// The pin expands each `case` argument sequentially to an ordinary strict `case`,
+    /// with `conv' => cs; all_goals rfl` as its body (`Init/Conv.lean`). Selection and
+    /// inaccessible-name handling use the same helpers as ordinary tactic mode.
+    fn start_conv_case<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goal: ProofGoal,
+        cases: &'a [Syntax],
+        sequence: &'a Syntax,
+    ) -> Result<(), NatDefinitionElabError> {
+        let Some((case, rest)) = cases.split_first() else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        let remaining = match rest {
+            [] => rest,
+            [separator, remaining @ ..] if !remaining.is_empty() => {
+                expect_atom(separator, "|", "conv case separator")?;
+                remaining
+            }
+            _ => return Err(error(TacticError::MalformedScript)),
+        };
+        let [tag, names] = expect_node(
+            case,
+            &parser_kind(&["Tactic", "caseArg"]),
+            2,
+            "conv case argument",
+        )?
+        else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        let selected = self.case_goal(proof, goal, tag)?;
+        let was_conv = self.conv_goals.remove(&selected.id);
+        let selected = self.renamed_proof_goal(
+            proof,
+            selected,
+            expect_null_args(names, "conv case hypothesis names")?,
+        )?;
+        if was_conv {
+            self.conv_goals.insert(selected.id.clone());
+        }
+        self.goal_tags.remove(&selected.id);
+        let body = self.conv_instructions(sequence)?;
+        self.start_conv_frame(
+            proof,
+            vec![Work::Goal(selected)],
+            body,
+            Finish::Case {
+                remaining,
+                body: sequence,
+            },
+        )
+    }
+
     /// `conv (at h)? (in (occs)? p)? => code` (`evalConv`): `code` runs on the conv goal
     /// `target = ?rhs` (or `type of h = ?rhs`), after `pattern (occs)? p` when given.
     fn start_conv<'a>(
@@ -737,10 +829,47 @@ impl Context {
     pub(super) fn finish_conv<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
-        finish: Finish,
+        finish: Finish<'a>,
         pending: Vec<Work<'a>>,
     ) -> Result<(), NatDefinitionElabError> {
         match finish {
+            Finish::Case { remaining, body } => {
+                // Unlike bracketed conv, the macro uses ordinary `rfl`, not
+                // `try with_reducible rfl`. A non-reflexive side goal must fail.
+                for work in pending.into_iter().rev() {
+                    self.tick()?;
+                    match work {
+                        Work::Goal(goal) => {
+                            if self.txn.mvars.is_assigned(&goal.id) {
+                                continue;
+                            }
+                            self.txn.lctx = goal.lctx.clone();
+                            self.conv_goals.remove(&goal.id);
+                            self.rfl_proof_goal(goal)?;
+                        }
+                        Work::Close(goal, value) => self.close_proof_goal(goal, value)?,
+                        _ => return Err(error(TacticError::MalformedScript)),
+                    }
+                }
+                if remaining.is_empty() {
+                    return Ok(());
+                }
+                // Resume the suspended frontier as the ordinary worklist driver does,
+                // including closes introduced by renaming or dependent conversions.
+                while let Some(work) = proof.work.pop() {
+                    self.tick()?;
+                    match work {
+                        Work::Close(goal, value) => self.close_proof_goal(goal, value)?,
+                        Work::Goal(goal) => {
+                            if !self.txn.mvars.is_assigned(&goal.id) {
+                                return self.start_conv_case(proof, goal, remaining, body);
+                            }
+                        }
+                        _ => return Err(no_goals(remaining.first())),
+                    }
+                }
+                Err(no_goals(remaining.first()))
+            }
             Finish::Tactic => {
                 // `remarkAsConvGoal`.
                 for work in &pending {

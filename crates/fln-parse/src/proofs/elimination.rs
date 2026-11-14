@@ -307,7 +307,7 @@ fn any_control_word(tokens: &[LexedToken], at: usize) -> Option<(&'static str, &
     }
 }
 /// `case`'s `sepBy1(caseArg, " | ")`: each `caseArg` is `binderIdent (ppSpace binderIdent)*`.
-fn case_args(
+pub(super) fn case_args(
     leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],

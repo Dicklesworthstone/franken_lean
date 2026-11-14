@@ -98,7 +98,7 @@ pub(super) struct Frame<'a> {
     // continuation only over the resulting frontier, not over old siblings.
     after: Option<Vec<&'a Syntax>>,
     // A conversion-mode frame: what its sequence's end does with the goals it leaves.
-    conv: Option<Box<super::conv::Finish>>,
+    conv: Option<Box<super::conv::Finish<'a>>>,
     // An all-goals frame over only the first goals of its frontier: how many more it runs on.
     limit: Option<usize>,
     // A `case'` frame: the tag of the goal its current run started on, which a run leaving
@@ -423,7 +423,7 @@ impl Context {
         self.start_goal_control_body(proof, goal, left, Mode::Focus, Some(right))
     }
 
-    fn start_goal_control_body<'a>(
+    pub(super) fn start_goal_control_body<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
         goal: ProofGoal,
@@ -586,7 +586,7 @@ impl Context {
         proof: &mut ProofState<'a>,
         goals: Vec<Work<'a>>,
         body: Vec<&'a Syntax>,
-        finish: super::conv::Finish,
+        finish: super::conv::Finish<'a>,
     ) -> Result<(), NatDefinitionElabError> {
         let frame = Frame {
             mode: Mode::Focus,
@@ -761,14 +761,19 @@ impl Context {
     ) -> Result<(), NatDefinitionElabError> {
         while let Some(Syntax::Node { kind, args, .. }) = proof.instructions.get(proof.cursor) {
             self.tick()?;
-            if mode(kind) != Some(Mode::All) {
+            let conv = kind == &super::conv::conv_kind("allGoals");
+            if mode(kind) != Some(Mode::All) && !conv {
                 break;
             }
             let [keyword, sequence] = args.as_slice() else {
                 return Err(error(TacticError::MalformedScript));
             };
             expect_atom(keyword, "all_goals", "all-goals keyword")?;
-            self.proof_instructions(sequence)?;
+            if conv {
+                self.conv_instructions(sequence)?;
+            } else {
+                self.proof_instructions(sequence)?;
+            }
             proof.cursor += 1;
         }
         Ok(())

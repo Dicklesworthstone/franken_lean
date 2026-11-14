@@ -1293,3 +1293,312 @@ example (a : Nat) : a = a := by
         r#"invalid 'congr' conv tactic, application or implication expected"#,
     ),
 ];
+
+
+/// Goal combinators share the ordinary tactic controller: each maps only the original
+/// frontier, keeps siblings outside focus, and participates in transactional alternatives.
+/// The pinned binary judges each program again whenever it is installed.
+#[test]
+fn conv_goal_combinators_preserve_frontiers_and_rollback() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace("goal-controls");
+    for (name, body) in GOAL_CONTROL_ACCEPTED {
+        std::fs::write(root.join(name), format!("{GOAL_CONTROL_HEADER}{body}")).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!((code, stdout.as_str()), (0, ""), "{name}: {stdout}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 0, "{name}: {stdout}{stderr}");
+        assert_eq!(stdout, "", "{name}: {stderr}");
+    }
+}
+
+/// Selecting and renaming a case retains the conversion annotation, while clearing its
+/// case tag as the ordinary strict case tactic does.
+#[test]
+fn conv_cases_keep_goal_names_and_renamed_binder_displays() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace("case-display");
+    let name = "CaseDisplay.lean";
+    std::fs::write(
+        root.join(name),
+        format!("{GOAL_CONTROL_HEADER}{GOAL_CONTROL_DISPLAY}"),
+    )
+    .unwrap();
+    let expected = pinned(&lib, &root, name);
+    if let Some((code, stdout)) = &expected {
+        assert_eq!(*code, 0, "{name}: {stdout}");
+    }
+    let (code, stdout, stderr) = ours(&lib, &root, name);
+    assert_eq!(code, 0, "{name}: {stdout}{stderr}");
+    assert!(stdout.contains("case a\n"), "{stdout}");
+    assert!(stdout.contains("n : Nat\n"), "{stdout}");
+    assert!(stdout.contains("| P n\n"), "{stdout}");
+    if let Some((_, expected)) = expected {
+        assert_eq!(stdout, expected, "{name}: {stderr}");
+    }
+}
+
+/// Failure in one mapped goal fails the combinator; strict cases cannot discard side
+/// obligations, and a failed rewrite cannot turn an unproved equality into a theorem.
+#[test]
+fn conv_goal_combinators_preserve_failures_and_obligations() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace("goal-controls-refused");
+    for (name, body, native_message) in GOAL_CONTROL_REFUSED {
+        std::fs::write(root.join(name), format!("{GOAL_CONTROL_HEADER}{body}")).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!(code, 1, "{name}: the pin accepted: {stdout}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+        assert!(stderr.contains(native_message), "{name}: {stdout}{stderr}");
+        assert!(
+            !stderr.contains("unsupported tactic") && !stderr.contains("parse refused"),
+            "{name}: {stderr}"
+        );
+    }
+}
+
+const GOAL_CONTROL_HEADER: &str =
+    "prelude\nimport Init.Conv\nimport Init.Data.Nat.Basic\nimport Init.SimpLemmas\n";
+
+const GOAL_CONTROL_ACCEPTED: &[(&str, &str)] = &[
+    (
+        "Sequence.lean",
+        r#"example (a b : Nat) (h : a = b) : a + a = b + b := by
+  conv =>
+    lhs
+    congr <;> rw [h]
+"#,
+    ),
+    (
+        "AllGoals.lean",
+        r#"example (a b : Nat) (h : a = b) : a + a = b + b := by
+  conv =>
+    lhs
+    congr
+    all_goals rw [h]
+"#,
+    ),
+    (
+        "OriginalFrontier.lean",
+        r#"example (a b c d : Nat) (h : a = b) (k : c = d) :
+    (a + c) + (a + c) = (b + d) + (b + d) := by
+  conv =>
+    lhs
+    congr
+    all_goals congr
+    all_goals (first | rw [h] | rw [k])
+"#,
+    ),
+    (
+        "SequenceSiblings.lean",
+        r#"example (a b c : Nat) (h : a = b) : (a + a) + c = (b + b) + c := by
+  conv =>
+    lhs
+    congr
+    congr <;> rw [h]
+"#,
+    ),
+    (
+        "EmptyFrontier.lean",
+        r#"example (a : Nat) : a = a := by
+  conv =>
+    lhs
+    rfl <;> rw [notADeclaration]
+    all_goals rw [notADeclaration]
+"#,
+    ),
+    (
+        "Focus.lean",
+        r#"example (a b c d : Nat) (h : a = b) (k : c = d) : a + c = b + d := by
+  conv =>
+    lhs
+    congr
+    focus
+      rw [h]
+      rfl
+      all_goals rw [notADeclaration]
+    rw [k]
+"#,
+    ),
+    (
+        "CaseOrder.lean",
+        r#"def combine (left right : Nat) : Nat := left + right
+example (a b c d : Nat) (h : a = b) (k : c = d) :
+    combine a c = combine b d := by
+  conv =>
+    lhs
+    congr
+    case right => rw [k]
+    case left => rw [h]
+"#,
+    ),
+    (
+        "RepeatedCase.lean",
+        r#"example (a b : Nat) (h : a = b) : a + a = b + b := by
+  conv =>
+    lhs
+    congr
+    case a | a => rw [h]
+"#,
+    ),
+    (
+        "CaseList.lean",
+        r#"def combine (left right : Nat) : Nat := left + right
+example (a b c d : Nat) (h : a = b) (k : c = d) :
+    combine a c = combine b d := by
+  conv =>
+    lhs
+    congr
+    case right | left => first | rw [k] | rw [h]
+"#,
+    ),
+    (
+        "CaseReflexivity.lean",
+        r#"def combine (left right : Nat) : Nat := left + right
+example (a b c : Nat) (h : a = b) : combine a c = combine b c := by
+  conv =>
+    lhs
+    congr
+    case right => skip
+    case left => rw [h]
+"#,
+    ),
+    (
+        "RenamedBinder.lean",
+        r#"example (P Q : Nat → Prop) (h : ∀ n, P n = Q n) (hq : ∀ n, Q n) : ∀ n, P n := by
+  conv =>
+    intro
+    case _ n => rw [h n]
+  exact hq
+"#,
+    ),
+    (
+        "AllGoalsRollback.lean",
+        r#"example (a b c d : Nat) (h : a = b) (k : c = d) : a + c = b + d := by
+  conv =>
+    lhs
+    congr
+    first
+    | all_goals rw [h]
+    | all_goals (first | rw [h] | rw [k])
+"#,
+    ),
+    (
+        "CaseRollback.lean",
+        r#"def combine (left right : Nat) : Nat := left + right
+example (a b c d : Nat) (h : a = b) (k : c = d) :
+    combine a c = combine b d := by
+  conv =>
+    lhs
+    congr
+    first
+    | (case right | left => rw [k])
+    | (case left | right => first | rw [h] | rw [k])
+"#,
+    ),
+    (
+        "AllGoalsSequencePrecedence.lean",
+        r#"example (a b : Nat) (h : a = b) : (a + a) + (a + a) = (b + b) + (b + b) := by
+  conv =>
+    lhs
+    congr
+    all_goals congr <;> rw [h]
+"#,
+    ),
+    (
+        "SequenceAllGoalsPrecedence.lean",
+        r#"example (a b : Nat) (h : a = b) : a + a = b + b := by
+  conv =>
+    lhs
+    congr <;> all_goals rw [h]; rfl
+"#,
+    ),
+];
+
+const GOAL_CONTROL_DISPLAY: &str = r#"example (a b : Nat) (h : a = b) : a + a = b + b := by
+  conv =>
+    lhs
+    congr
+    trace_state
+    case a => rw [h]
+    trace_state
+    case a => rw [h]
+example (P Q : Nat → Prop) (h : ∀ n, P n = Q n) (hq : ∀ n, Q n) : ∀ n, P n := by
+  conv =>
+    intro
+    case _ n =>
+      trace_state
+      rw [h n]
+  exact hq
+"#;
+
+const GOAL_CONTROL_REFUSED: &[(&str, &str, &str)] = &[
+    (
+        "MappedFailure.lean",
+        r#"example (a b c : Nat) (h : a = b) : a + c = b + c := by
+  conv =>
+    lhs
+    congr
+    all_goals rw [h]
+"#,
+        "rewrite found no matching occurrence",
+    ),
+    (
+        "SequenceFailure.lean",
+        r#"example (a b c : Nat) (h : a = b) : a + c = b + c := by
+  conv =>
+    lhs
+    congr <;> rw [h]
+"#,
+        "rewrite found no matching occurrence",
+    ),
+    (
+        "MissingCase.lean",
+        r#"example (a : Nat) : a + a = a + a := by
+  conv =>
+    lhs
+    congr
+    case absent => skip
+"#,
+        "Case tag `absent` not found.",
+    ),
+    (
+        "TooManyCaseNames.lean",
+        r#"example (a : Nat) : a = a := by
+  conv =>
+    lhs
+    case _ extra => skip
+"#,
+        "too many variable names provided",
+    ),
+    (
+        "CaseSideObligation.lean",
+        r#"axiom guarded (x : Nat) : False → x = x
+example (a : Nat) : a = a := by
+  conv =>
+    lhs
+    case _ => apply guarded
+"#,
+        "apply conclusion does not match the goal",
+    ),
+    (
+        "UnprovedSibling.lean",
+        r#"def combine (left right : Nat) : Nat := left + right
+example (a b c d : Nat) (h : a = b) : combine a c = combine b d := by
+  conv =>
+    lhs
+    congr
+    case left => rw [h]
+"#,
+        "unsolved goals",
+    ),
+];

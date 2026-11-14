@@ -7,6 +7,7 @@ on:
       - 'crates/fln-lake/**'
       - 'crates/fln-cli/**'
       - 'crates/fln-parse/**'
+      - 'crates/fln-elab/**'
       - 'crates/fln/src/imported_macros/**'
       - 'crates/fln/src/ir.rs'
       - 'crates/fln/src/source_check/modules/artifacts/ir.rs'
@@ -128,6 +129,9 @@ jobs:
           printf '%s\n' "$ELAN_HOME/bin" >> "$GITHUB_PATH"
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Check conversion goal controls against the pinned Reference
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p fln-cli --test conv_mode --no-fail-fast -- --nocapture --test-threads=1
       - name: Check typed executable and library configurations
         if: ${{ !cancelled() }}
         run: |

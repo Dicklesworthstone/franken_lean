@@ -4,7 +4,8 @@
 //! `enter [n, @n, x, in p, …]`, `ext x …`, `intro x …`, `unfold f …`, `delta f …`, `rw [rules]`,
 //! `rewrite`, `simp`, `dsimp`, `apply e`, `change e`, `pattern (occs)? p`, `clear h …`,
 //! `tactic => tacs`, `first | … | …`, `try`, `repeat`, `fail_if_success`, a nested `conv => …`,
-//! `· convSeq`, `{ … }`, `( … )` and `calc`; any other is refused where it starts. A tactic
+//! `all_goals`, `focus`, `case`, `<;>`, `· convSeq`, `{ … }`, `( … )` and `calc`; any other is
+//! refused where it starts. A tactic
 //! ending in a sequence of its own takes the `;`-separated tactics after it, as the pin's
 //! `sepByIndent` does. Columns count codepoints. A `(conv| …)` quotation holds one of them.
 use super::*;
@@ -260,13 +261,14 @@ fn items(
     let base = column(view, tokens, range.start);
     let mut items = Vec::new();
     let mut item = range.start;
+    let mut owns_sequence = takes_sequence(tokens, item);
     let mut depth = 0usize;
     for at in range.start..=range.end {
         // A tactic ending in a sequence of its own (`conv => s`, `· s`, `try s`, `first | s`,
         // `tactic => t`, …) takes the `;`-separated tactics after it into that sequence.
         let boundary = at == range.end
             || depth == 0
-                && (symbol(tokens, at, ";") && !takes_sequence(tokens, item)
+                && (symbol(tokens, at, ";") && !owns_sequence
                     || at > item
                         && starts_line(view, tokens, at)
                         && column(view, tokens, at) == base);
@@ -281,7 +283,11 @@ fn items(
                     item = at;
                 }
             }
+            owns_sequence = takes_sequence(tokens, item);
             continue;
+        }
+        if depth == 0 && symbol(tokens, at, "<;>") && !owns_sequence {
+            owns_sequence = takes_sequence(tokens, at + 1);
         }
         if let TokenKind::Symbol(s) = &tokens[at].kind {
             match crate::canonical_bracket(s.as_str()) {
@@ -298,9 +304,17 @@ fn items(
 fn takes_sequence(tokens: &[LexedToken], at: usize) -> bool {
     symbol(tokens, at, "·")
         || symbol(tokens, at, ".")
-        || ["try", "repeat", "fail_if_success", "first"]
-            .iter()
-            .any(|keyword| word(tokens, at, keyword))
+        || [
+            "try",
+            "repeat",
+            "fail_if_success",
+            "first",
+            "all_goals",
+            "focus",
+            "case",
+        ]
+        .iter()
+        .any(|keyword| word(tokens, at, keyword))
         || ["conv", "tactic", "tactic'"]
             .iter()
             .any(|keyword| word(tokens, at, keyword) && symbol(tokens, at + 1, "=>"))
@@ -376,12 +390,20 @@ fn conv_tactic(
 ) -> Result<Syntax, NatDefinitionParseError> {
     let mut separators = Vec::new();
     let mut depth = 0usize;
+    let mut operand = range.start;
     for at in range.clone() {
+        // A sequence-taking operand owns every following tactic, including its `<;>`s.
+        if depth == 0 && takes_sequence(tokens, operand) {
+            break;
+        }
         if let TokenKind::Symbol(s) = &tokens[at].kind {
             match crate::canonical_bracket(s.as_str()) {
                 "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
                 ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
-                "<;>" if depth == 0 => separators.push(at),
+                "<;>" if depth == 0 => {
+                    separators.push(at);
+                    operand = at + 1;
+                }
                 _ => {}
             }
         }
@@ -641,6 +663,41 @@ fn conv_operand(
     }
     if word(tokens, start, "first") && symbol(tokens, start + 1, "|") {
         return first_operand(leaves, view, tokens, range, atom(start, "first")?);
+    }
+    // The goal-control macros use conv sequences, not ordinary tactic sequences.
+    for (keyword, kind) in [("all_goals", "allGoals"), ("focus", "focus")] {
+        if word(tokens, start, keyword) && range.len() > 1 {
+            return Ok(Syntax::node(
+                conv_kind(kind),
+                vec![
+                    atom(start, keyword)?,
+                    sequence(leaves, view, tokens, start + 1..range.end)?,
+                ],
+            ));
+        }
+    }
+    if word(tokens, start, "case") {
+        let arrow = (start + 1..range.end)
+            .find(|&at| symbol(tokens, at, "=>"))
+            .ok_or_else(|| refusal(view, tokens, start))?;
+        let cases = super::elimination::case_args(
+            leaves,
+            view,
+            tokens,
+            start + 1..arrow,
+            |at| {
+                binder_ident(leaves, tokens, at)?.ok_or_else(|| refusal(view, tokens, at))
+            },
+        )?;
+        return Ok(Syntax::node(
+            conv_kind("case"),
+            vec![
+                atom(start, "case")?,
+                null_node(cases),
+                leaves.leaf(arrow)?,
+                sequence(leaves, view, tokens, arrow + 1..range.end)?,
+            ],
+        ));
     }
     extended_operand(leaves, view, tokens, range)
 }
