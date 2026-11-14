@@ -229,18 +229,33 @@ pub(super) fn elaborate_record_scoped(
         context.with_auto_bound_implicits(&own, |context| {
             let parameters = context.bind_parameters(&signature[0])?;
             let explicit = optional_type_syntax(&signature[1])?
-                .map(|syntax| {
-                    let term = context.term(syntax, None)?;
-                    // Inspecting only the reduced Sort would discard invalid ascriptions
-                    // or unused let initializers. Check the original type before any
-                    // record-field locals enter the telescope. This publishes nothing.
-                    inductive::checked_type(context, term.value, budget)
-                })
+                .map(|syntax| context.term(syntax, None).map(|term| term.value))
                 .transpose()?;
             Ok((parameters, explicit))
         })?;
+    let auto_count = autos.len();
+    if auto_count > 0 {
+        context.resolve_instances(true)?;
+        context.flush(true)?;
+    }
     context.refuse_auto_bound_dependencies(&autos, &parameters)?;
     parameters.splice(0..0, autos);
+    if auto_count > 0 {
+        let result = explicit
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Expr::sort(Level::one()));
+        context.generalize_auto_bound_holes(&mut parameters, auto_count, &result)?;
+        for parameter in &mut parameters {
+            parameter.type_ = context.instantiate(&parameter.type_)?;
+        }
+    }
+    // Keep the original sort expression checked, including invalid ascriptions
+    // and unused let initializers, after its auto-bound telescope is closed and
+    // before any record fields enter the context. This publishes nothing.
+    let explicit = explicit
+        .map(|value| inductive::checked_type(&mut context, value, budget))
+        .transpose()?;
     let record_header = context.txn.lctx.clone();
     let mut inheritance = context.record_parents(&parts[3], name, is_class, budget)?;
     let mut labels = std::mem::take(&mut inheritance.labels);
@@ -431,10 +446,24 @@ pub(super) fn elaborate_record_scoped(
             let domain = context.type_term(annotation)?;
             Ok((arguments, domain))
         })?;
+        let auto_count = autos.len();
+        if auto_count > 0 {
+            context.resolve_instances(true)?;
+            context.flush(true)?;
+        }
         context.refuse_auto_bound_dependencies(&autos, &arguments)?;
         let mut arguments = arguments;
         arguments.splice(0..0, autos);
         let mut domain = context.expand_record_aliases(domain, &inheritance.aliases)?;
+        if auto_count > 0 {
+            // `elabFieldType` generalizes before elaborating a default. These
+            // binders belong to this field, never to the enclosing structure.
+            context.generalize_auto_bound_holes(&mut arguments, auto_count, &domain)?;
+            domain = context.instantiate(&domain)?;
+            for argument in &mut arguments {
+                argument.type_ = context.instantiate(&argument.type_)?;
+            }
+        }
         if let Some(syntax) = default {
             let recorded = context.deprecated_uses.len();
             context.infer_level_params = false;

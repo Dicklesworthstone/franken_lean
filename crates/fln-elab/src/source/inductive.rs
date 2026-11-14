@@ -495,8 +495,26 @@ fn header<'a>(
                 .transpose()?;
             Ok((parameters, annotation))
         })?;
+    let auto_count = autos.len();
+    if auto_count > 0 {
+        context.resolve_instances(true)?;
+        context.flush(true)?;
+    }
     context.refuse_auto_bound_dependencies(&autos, &parameters)?;
     parameters.splice(0..0, autos);
+    if auto_count > 0 {
+        // The pin closes `addAutoBoundImplicits` before checking the family
+        // type. A carrier left unknown by `a = b` becomes a parameter before
+        // `a` and `b`, rather than an unresolved hole in their domains.
+        let result = annotation
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Expr::sort(Level::one()));
+        context.generalize_auto_bound_holes(&mut parameters, auto_count, &result)?;
+        for parameter in &mut parameters {
+            parameter.type_ = context.instantiate(&parameter.type_)?;
+        }
+    }
     // ubs:ignore[rust.security.constant-time-compare] — these are public Lean binder names, not account credentials.
     if parameters.iter().any(|p| p.user_name == name) {
         return Err(invalid());
@@ -887,8 +905,10 @@ fn bodies(
                     .transpose()?;
                 Ok((fields, annotation))
             })?;
+        let auto_count = autos.len();
         context.refuse_auto_bound_dependencies(&autos, &fields)?;
         fields.splice(0..0, autos);
+        let mut checked_annotation = None;
         let mut result_indices = Vec::new();
         if let Some(annotation) = annotation {
             let annotation_context = context.txn.lctx.clone();
@@ -957,9 +977,7 @@ fn bodies(
                 .txn
                 .unify(&result_prefix, &family, UnificationBudget::new(kernel))
                 .map_err(|e| failure(SourceInferenceError::Unification(Box::new(e))))?;
-            // Later constructors can raise the family's universe. Keep the raw
-            // annotation and its original telescope until that universe is final.
-            annotations.push((annotation, annotation_context));
+            checked_annotation = Some((annotation, annotation_context));
         } else if !indices.is_empty() {
             // There is no determined result index to infer from an omitted
             // result signature. Never invent an index or silently add a field.
@@ -967,6 +985,27 @@ fn bodies(
         }
         context.resolve_instances(true)?;
         context.flush(true)?;
+        let previous_fields = fields.len();
+        if auto_count > 0 {
+            context.refuse_auto_bound_dependencies(&fields[..auto_count], &fields[auto_count..])?;
+            let result = checked_annotation
+                .as_ref()
+                .map(|(annotation, _)| annotation.clone())
+                .unwrap_or_else(|| family.clone());
+            context.generalize_auto_bound_holes(&mut fields, auto_count, &result)?;
+        }
+        if let Some((annotation, mut annotation_context)) = checked_annotation {
+            // Later constructors can raise the family's universe. Preserve the
+            // original annotation telescope, including new auto-bound carriers
+            // but excluding binders opened from the annotation itself.
+            let added = fields.len() - previous_fields;
+            if added > 0 {
+                let length = annotation_context.len() + added;
+                annotation_context = context.txn.lctx.clone();
+                annotation_context.truncate(length);
+            }
+            annotations.push((annotation, annotation_context));
+        }
         count = count
             .checked_add(fields.len())
             .and_then(|n| n.checked_add(1))

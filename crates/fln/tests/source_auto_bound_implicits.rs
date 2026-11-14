@@ -1,7 +1,8 @@
-//! Auto-bound implicits in a definition header, as the pin binds them (`withAutoBoundImplicit`,
-//! Lean/Elab/Term/TermElabM.lean:1932-1955; `checkValidAutoBoundImplicitName`,
-//! Lean/Elab/AutoBound.lean:31-63). Every program here was run through the pinned `lean`
-//! v4.32.0 first (2026-10-11), and each signature is its `#check @f`.
+//! Auto-bound implicits in source declaration headers (`withAutoBoundImplicit`,
+//! `addAutoBoundImplicits`, Lean/Elab/Term/TermElabM.lean:1932-2058).
+//! Earlier cases record their own pinned v4.32.0 observations below. The datatype-carrier
+//! cases exercise the vendored header rules through native admission; their separate
+//! Reference comparison runs only when the pinned binary is available.
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Name, SourceCheckLimits};
 use fln_core::expr::{BinderInfo, Expr, ExprNode};
@@ -463,4 +464,218 @@ fn variables_bind_and_a_field_cannot_fix_its_own_universe() {
     );
     assert_eq!(binders(&engine, "s", 1)[0].2, constant("Nat"));
     refused("structure P where\n  x : α\n");
+}
+
+
+// Derived from MutualInductive.elabHeadersAux, Inductive.elabCtors, and
+// Structure.elabFieldType at the vendored pin. Native admission runs these
+// unconditionally; the final test compares the same inputs with a live pin.
+const DATATYPE_CARRIERS: &str = r#"
+inductive AutoInd (h : a = b) : Prop where
+  | mk
+structure AutoStruct (h : a = b) : Type where
+  val : Nat
+class AutoClass (h : a = b) : Prop where
+  proof : a = a
+structure CarrierNames (α : Nat) (h : a = b) where
+  val : Nat
+example : AutoInd (a := (3 : Nat)) (b := 3) rfl := AutoInd.mk
+def autoStruct : AutoStruct (a := true) (b := true) rfl := { val := 9 }
+example : autoStruct.val = 9 := rfl
+"#;
+
+const CONSTRUCTOR_CARRIERS: &str = r#"
+inductive Packed (α : Type) (x : α) : Type 1 where
+  | mk (h : HEq a x) : Packed α x
+  | later (h : HEq a x) : (b : α) → Packed α x
+example : Packed Nat 7 := Packed.mk (a := 7) rfl
+example : Packed Bool true := Packed.later (a := true) rfl false
+"#;
+
+const FIELD_CARRIERS: &str = r#"
+structure FieldCarrier (α : Type) (x : α) : Type where
+  compare (h : HEq a x) : HEq a x := h
+def fieldCarrier : FieldCarrier Nat 7 := {}
+example : HEq (7 : Nat) 7 := fieldCarrier.compare (a := 7) rfl
+"#;
+
+const INVALID_CARRIERS: &[&str] = &[
+    "inductive Bad (A : Type) (x : A) (h : x = y) : Prop where\n  | mk\n",
+    "structure Bad (A : Type) (x : A) (h : x = y) where\n  val : Nat\n",
+    "inductive Bad : Type 1 where\n  | mk (A : Type) (x : A) (h : x = y) : Bad\n",
+    "structure Bad where\n  field (A : Type) (x : A) : x = y\n",
+    "set_option autoImplicit false\ninductive Bad (h : a = b) : Prop where\n  | mk\n",
+    "inductive Bad where\n  | mk (x)\n",
+    "structure Bad where\n  field (x) : Nat\n",
+    "structure Bad (h : a = b) : (let ignored : Nat := true; Type) where\n  val : Nat\n",
+];
+
+fn declaration_binder_count(engine: &Engine, name: &str) -> usize {
+    let info = engine
+        .environment()
+        .find(&Name::from_components(name.split('.')))
+        .unwrap();
+    let mut type_ = &info.constant_val().type_;
+    let mut count = 0;
+    while let ExprNode::ForallE { body, .. } = type_.node() {
+        count += 1;
+        type_ = body;
+    }
+    count
+}
+
+#[test]
+fn datatype_headers_generalize_auto_bound_carriers_before_their_values() {
+    let engine = checked(DATATYPE_CARRIERS);
+    for name in ["AutoInd", "AutoStruct", "AutoClass"] {
+        let found = binders(&engine, name, 4);
+        assert!(found[0].0.contains("._@."), "{name}: {found:?}");
+        assert!(matches!(found[0].2.node(), ExprNode::Sort { .. }));
+        assert_eq!((found[1].0.as_str(), found[2].0.as_str()), ("a", "b"));
+        assert_eq!(found[1].2, Expr::bvar(0).unwrap());
+        assert_eq!(found[2].2, Expr::bvar(1).unwrap());
+        assert_eq!(
+            found.iter().map(|(_, style, _)| *style).collect::<Vec<_>>(),
+            [
+                BinderInfo::Implicit,
+                BinderInfo::Implicit,
+                BinderInfo::Implicit,
+                BinderInfo::Default
+            ]
+        );
+        let info = engine
+            .environment()
+            .find(&Name::from_components([name]))
+            .unwrap();
+        assert_eq!(info.constant_val().level_params.len(), 1, "{name}");
+        assert_eq!(
+            found[0].2,
+            Expr::sort(fln_core::level::Level::param(
+                info.constant_val().level_params[0].clone()
+            ))
+        );
+        assert!(!info.constant_val().type_.has_expr_mvar());
+        assert!(!info.constant_val().type_.has_level_mvar());
+    }
+    // The fresh carrier is hygienic even when its preferred stem is already a
+    // written binder's name. It cannot resolve to the unrelated natural number.
+    let names = binders(&engine, "CarrierNames", 5);
+    assert!(names[0].0.contains("._@."));
+    assert_eq!(names[3].0, "α");
+    assert_eq!(names[3].2, constant("Nat"));
+}
+
+#[test]
+fn constructor_carriers_remain_inside_each_constructor_telescope() {
+    let engine = checked(CONSTRUCTOR_CARRIERS);
+    assert_eq!(declaration_binder_count(&engine, "Packed"), 2);
+    for name in ["Packed.mk", "Packed.later"] {
+        let found = binders(&engine, name, 5);
+        assert!(found[2].0.contains("._@."), "{name}: {found:?}");
+        assert_eq!(found[2].1, BinderInfo::Implicit);
+        assert_eq!(found[2].2, Expr::sort(fln_core::level::Level::one()));
+        assert_eq!(found[3].0, "a");
+        assert_eq!(found[3].1, BinderInfo::Implicit);
+        assert_eq!(found[3].2, Expr::bvar(0).unwrap());
+        assert_eq!(found[4].0, "h");
+        assert_eq!(found[4].1, BinderInfo::Default);
+    }
+}
+
+#[test]
+fn field_carriers_close_before_defaults_and_do_not_escape_the_record() {
+    let engine = checked(FIELD_CARRIERS);
+    assert_eq!(declaration_binder_count(&engine, "FieldCarrier"), 2);
+    let found = binders(&engine, "FieldCarrier.compare", 6);
+    assert!(found[3].0.contains("._@."), "{found:?}");
+    assert_eq!(found[3].1, BinderInfo::Implicit);
+    assert_eq!(found[3].2, Expr::sort(fln_core::level::Level::one()));
+    assert_eq!(found[4].0, "a");
+    assert_eq!(found[4].1, BinderInfo::Implicit);
+    assert_eq!(found[4].2, Expr::bvar(0).unwrap());
+    assert_eq!(found[5].0, "h");
+}
+
+#[test]
+fn auto_bound_carrier_generalization_does_not_rescue_invalid_headers() {
+    for source in INVALID_CARRIERS {
+        refused(source);
+    }
+}
+
+#[test]
+fn datatype_carrier_programs_match_the_installed_reference() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let library = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".elan/toolchains")
+                    .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+                    .join("lib/lean")
+            })
+        });
+    let reference = library
+        .and_then(|lib| {
+            let root = lib.parent()?.parent()?;
+            Some(root.join("bin").join(if cfg!(windows) {
+                "lean.exe"
+            } else {
+                "lean"
+            }))
+        })
+        .filter(|binary| binary.is_file());
+    let Some(reference) = reference else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "the pinned Reference binary is required"
+        );
+        eprintln!("SKIP: datatype carrier differential requires the pinned Reference binary");
+        return;
+    };
+    let identity = Command::new(&reference).arg("--githash").output().unwrap();
+    assert!(identity.status.success(), "{identity:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&identity.stdout).trim(),
+        fln::OLEAN_PIN_COMMIT,
+        "unexpected Reference identity"
+    );
+    let root = std::env::temp_dir().join(format!(
+        "fln-datatype-carriers-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    for (index, (source, accepted)) in [
+        DATATYPE_CARRIERS,
+        CONSTRUCTOR_CARRIERS,
+        FIELD_CARRIERS,
+    ]
+    .into_iter()
+    .map(|source| (source, true))
+    .chain(INVALID_CARRIERS.iter().copied().map(|source| (source, false)))
+    .enumerate()
+    {
+        let path = root.join(format!("case-{index}.lean"));
+        std::fs::write(&path, source).unwrap();
+        let result = Command::new(&reference)
+            .arg(&path)
+            .env_remove("LEAN_PATH")
+            .env_remove("LEAN_SYSROOT")
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.success(),
+            accepted,
+            "case {index}: {source}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 }
