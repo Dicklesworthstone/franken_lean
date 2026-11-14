@@ -126,7 +126,7 @@ impl Preparation<'_> {
     /// producer path, but do not run or substitute its runtime arguments.
     /// Arbitrary/dynamic factories stay unsupported. Static specialization is
     /// the ordinary checked, metered path, never guessed representation data.
-    fn computed_callback_is_staged(
+    pub(in crate::runtime) fn computed_callback_is_staged(
         &mut self,
         input: &Expr,
         expected: &Expr,

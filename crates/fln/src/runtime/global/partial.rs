@@ -135,13 +135,53 @@ impl Preparation<'_> {
         let producer = matches!(self.type_head(&type_)?.node(), ExprNode::ForallE { .. });
         if !producer {
             // Ordinary fully lambda-bound globals keep their flat ABI. Only a
-            // known callback can justify building a different recursive entry;
-            // neither runtime values nor captures enter its specialization key.
+            // known callback can justify building a different recursive entry.
+            // A strict producer can expose the same checked staged callback as
+            // a literal: recognize its interface without copying or evaluating
+            // its prefix. PartialCallPlan retains the operand's strict binding;
+            // neither runtime values nor captures enter the specialization key.
             let mut known_callback = false;
+            let mut computed_candidate = false;
             for argument in arguments {
                 if self.inert_callable(argument)?.is_some() {
                     known_callback = true;
                     break;
+                }
+                computed_candidate |= matches!(
+                    argument.node(),
+                    ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::MData { .. }
+                );
+            }
+            if !known_callback && computed_candidate {
+                let mut parameter_type = definition.base.type_.clone();
+                for argument in arguments {
+                    self.tick()?;
+                    let normal = self.type_head(&parameter_type)?;
+                    let ExprNode::ForallE {
+                        binder_type, body, ..
+                    } = normal.node()
+                    else {
+                        break;
+                    };
+                    // The entry below requires this same nondependent
+                    // telescope. Do not substitute runtime operands into
+                    // types merely to discover an ineligible callback.
+                    if binder_type.has_loose_bvars() || body.has_loose_bvars() {
+                        break;
+                    }
+                    if matches!(
+                        argument.node(),
+                        ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::MData { .. }
+                    ) && matches!(
+                        self.type_head(binder_type)?.node(),
+                        ExprNode::ForallE { .. }
+                    ) && !self.type_parameter(binder_type)?
+                        && self.computed_callback_is_staged(argument, binder_type)?
+                    {
+                        known_callback = true;
+                        break;
+                    }
+                    parameter_type = body.clone();
                 }
             }
             if !known_callback {
