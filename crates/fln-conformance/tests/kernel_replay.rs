@@ -20863,14 +20863,33 @@ fn prepare_chosen_module(
     inventory: &CorpusInventory,
     chosen: &str,
 ) -> Result<PreparedChosenModule, String> {
+    if !inventory.modules.contains_key(chosen) {
+        return Err(format!(
+            "chosen module {chosen} absent from its own closure"
+        ));
+    }
+    let mut closure = BTreeSet::new();
+    let mut queue = vec![chosen];
+    while let Some(name) = queue.pop() {
+        let Some(module) = inventory.modules.get(name) else {
+            continue;
+        };
+        for import in &module.imports {
+            if import.as_str() != name
+                && inventory.modules.contains_key(import)
+                && closure.insert(import.clone())
+            {
+                queue.push(import.as_str());
+            }
+        }
+    }
     let order = corpus_module_order(inventory)?;
-    let order_index = order
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (name.clone(), index))
-        .collect::<HashMap<_, _>>();
-    let mut states = BTreeMap::<String, CorpusFixtureState>::new();
+    let mut imported_context = ReferenceFixtureContext::new();
+    let mut collisions = Vec::new();
     for module_name in &order {
+        if module_name != chosen && !closure.contains(module_name) {
+            continue;
+        }
         let module = &inventory.modules[module_name];
         let decoded_module = decode_corpus_module(&module.path, &module.name)?;
         let current_hash = decoded_module.olean_hash;
@@ -20882,14 +20901,8 @@ fn prepare_chosen_module(
             ));
         }
         let (active_infos, _, _) = reference_active_rows(&infos);
-        let ReconstructedImportContext {
-            imported: imported_context,
-            closure,
-            faithful: context_faithful,
-            collisions,
-        } = reconstruct_import_context(module, inventory, &order_index, &states);
         if module_name == chosen {
-            if !context_faithful {
+            if !collisions.is_empty() {
                 return Err(format!(
                     "{chosen}: import context not faithfully representable ({} collisions)",
                     collisions.len()
@@ -20903,20 +20916,15 @@ fn prepare_chosen_module(
             );
             return Ok(PreparedChosenModule {
                 prep,
-                collision_count: collisions.len() as u64,
+                collision_count: 0,
             });
         }
-        let (context, _) =
+        let (next, merge) =
             extend_reference_fixture_environment(imported_context, &active_infos, &module.name)?;
-        states.insert(
-            module.name.clone(),
-            CorpusFixtureState {
-                closure,
-                context,
-                active_infos,
-                faithful: context_faithful,
-            },
-        );
+        imported_context = next;
+        if !merge.collisions.is_empty() {
+            collisions.push((module.name.clone(), merge.collisions));
+        }
     }
     Err(format!(
         "chosen module {chosen} absent from its own closure"
@@ -21146,6 +21154,38 @@ fn selected_real_module_resource_probe() {
         !matches!(verdict, Outcome::InternalFault(_)),
         "{chosen}:{selector}: an internal fault is never a resource observation"
     );
+    if std::env::var_os("FLN_CORPUS_PROBE_COUNCIL").is_some() {
+        let env = item.env.clone();
+        let decl = item.decl.clone();
+        let started = Instant::now();
+        let council = std::thread::Builder::new()
+            .name("fln-corpus-probe-council".to_string())
+            .stack_size(stack_bytes)
+            .spawn(move || {
+                let engine = fln::Engine::from_environment(env);
+                let limits = fln::EngineAdmissionLimits::new(budget);
+                engine.admit_declaration(decl, &fln::KVMap::new(), limits)
+            })
+            .expect("spawn council resource probe thread")
+            .join()
+            .expect("council resource probe thread must not panic");
+        let wall_ms = started.elapsed().as_millis();
+        match council {
+            Ok(Outcome::Complete(admitted)) => eprintln!(
+                "council_resource_probe module={chosen} declaration={selector} outcome=accepted checker={:?} wall_ms={wall_ms}",
+                admitted.checker
+            ),
+            Ok(Outcome::Inconclusive(reason)) => eprintln!(
+                "council_resource_probe module={chosen} declaration={selector} outcome=inconclusive:{reason:?} wall_ms={wall_ms}"
+            ),
+            Ok(Outcome::InternalFault(fault)) => {
+                panic!("{chosen}:{selector}: council internal fault: {fault:?}")
+            }
+            Err(error) => eprintln!(
+                "council_resource_probe module={chosen} declaration={selector} outcome=error:{error} wall_ms={wall_ms}"
+            ),
+        }
+    }
 }
 
 /// Check every admission unit of one provisioned Reference module in a single
