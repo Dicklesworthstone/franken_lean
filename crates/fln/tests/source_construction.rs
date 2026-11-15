@@ -149,6 +149,43 @@ fn apply_resolves_instances_inserted_by_its_written_arguments() {
         "{prefix}def chosen : Pick := by apply Pick.needs 0 (7 : Nat)\ntheorem checked : chosen = Pick.needs 0 (7 : Nat) := by rfl"
     ));
 }
+
+#[test]
+fn apply_retains_partial_applications_and_dependent_conclusions() {
+    check(
+        r#"theorem partialApplication (P Q : Prop) (f : P → Q) : P → Q := by apply f
+theorem dependentConclusion (A : Type) (P : A → Prop) (a : A)
+    (step : ∀ x, P x) : P a := by apply step
+"#,
+    );
+}
+
+#[test]
+fn apply_retains_alias_and_projection_conclusions() {
+    check(
+        r#"abbrev ApplyAliasEq (n : Nat) : Prop := n = n
+theorem aliasConclusion (n : Nat) (step : ∀ m, ApplyAliasEq m) : ApplyAliasEq n := by
+  apply step
+structure ApplyPredicates where
+  holds : Nat → Prop
+theorem projectionConclusion (pred : ApplyPredicates) (n : Nat)
+    (step : ∀ m, pred.holds m) : pred.holds n := by apply step
+"#,
+    );
+}
+
+#[test]
+fn apply_refuses_rigidly_different_conclusions_and_backtracks() {
+    let problem = run(&format!(
+        "{LOGIC} theorem bad (P Q : Prop) : Both P Q := by apply Either.left"
+    ))
+    .unwrap_err();
+    assert!(problem.contains("ApplyMismatch"), "{problem}");
+    check(&format!(
+        "{LOGIC} theorem recovered (P Q : Prop) (p : P) (q : Q) : Both P Q := by\n  first | apply Either.left | exact Both.intro p q"
+    ));
+}
+
 #[test]
 fn application_preserves_unrelated_pending_instances_in_surrounding_terms() {
     let prefix = "class Default (A : Type) where\n value : A\ninstance defaultNat : Default Nat := { value := 7 }\ndef getDefault {A : Type} [d : Default A] : A := d.value\ninductive Pick where\n | needs [Default Nat] : Pick\n | ready : Pick\ndef use {A : Type} (value : A) (pick : Pick) (hint : A) : Nat := 0\n";

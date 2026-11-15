@@ -2679,6 +2679,9 @@ impl Context {
         // `apply PSigma.Lex.right` of the default `decreasing_by` compared every `∀`-prefix of
         // the lemma with `x < x + 1`, unfolding the target each time.
         let target = self.whnf(&goal.target)?;
+        if self.apply_conclusion_has_distinct_head(&term.type_, &target)? {
+            return Err(error(TacticError::ApplyMismatch));
+        }
         let mut target_head = &target;
         while let ExprNode::App { f, .. } = target_head.node() {
             self.tick()?;

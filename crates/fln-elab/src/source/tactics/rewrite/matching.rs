@@ -138,6 +138,36 @@ impl Context {
         Ok(actual != expected)
     }
 
+    /// Reject an `apply` candidate only when its eventual conclusion and the
+    /// target have different, stable outer heads. Telescope variables cannot
+    /// change an admitted inductive head, so no premise holes are needed to
+    /// detect that mismatch. A function target may match a partial application;
+    /// aliases, projections and other uncertain conclusions need the solver.
+    pub(in crate::source::tactics) fn apply_conclusion_has_distinct_head(
+        &mut self,
+        type_: &Expr,
+        target: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let Some(target_head) = self.rigid_rewrite_type_head(target)? else {
+            return Ok(false);
+        };
+        if target_head == RigidTypeHead::Forall {
+            return Ok(false);
+        }
+        let mut conclusion = type_;
+        loop {
+            self.tick()?;
+            match conclusion.node() {
+                ExprNode::ForallE { body, .. } => conclusion = body,
+                ExprNode::MData { expr, .. } => conclusion = expr,
+                _ => break,
+            }
+        }
+        Ok(self
+            .rigid_rewrite_type_head(conclusion)?
+            .is_some_and(|head| head != target_head))
+    }
+
     /// Inspect the type skeleton after EXACTLY the supplied arguments. A bare
     /// constant or partial application can still be function-valued; stripping
     /// its entire telescope would falsely discard rewrites of that function.
