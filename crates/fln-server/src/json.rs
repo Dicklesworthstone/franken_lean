@@ -638,3 +638,95 @@ pub(super) fn document_symbols_result(value: &str) -> bool {
     }
     true
 }
+
+/// The native full/range semantic-token profile. Validate all five integers,
+/// the exact pin legend, monotonic nonoverlapping positions and bounded sums.
+pub(super) fn semantic_tokens_result(value: &str) -> bool {
+    if value.len() > 1024 * 1024 {
+        return false;
+    }
+    let root = RawField::Value(value);
+    if !object_has_only_keys(root, &["data"]) {
+        return false;
+    }
+    let RawField::Value(data) = object_member(root, "data") else {
+        return false;
+    };
+    let Some(data) = array_elements(data, 32_768 * 5) else {
+        return false;
+    };
+    if data.len() % 5 != 0 {
+        return false;
+    }
+    let mut previous = (0u32, 0u32, 0u32);
+    for token in data.chunks_exact(5) {
+        let mut fields = [0u32; 5];
+        for (field, value) in fields.iter_mut().zip(token) {
+            let Ok(value) = value.trim().parse::<u32>() else {
+                return false;
+            };
+            if value > i32::MAX as u32 {
+                return false;
+            }
+            *field = value;
+        }
+        let [delta_line, delta_start, length, kind, modifiers] = fields;
+        if length == 0 || kind >= 24 || modifiers >= 1 << 10 {
+            return false;
+        }
+        let Some(line) = previous
+            .0
+            .checked_add(delta_line)
+            .filter(|line| *line <= i32::MAX as u32)
+        else {
+            return false;
+        };
+        let start = if delta_line == 0 {
+            previous.1.checked_add(delta_start)
+        } else {
+            Some(delta_start)
+        };
+        let Some(start) = start else {
+            return false;
+        };
+        let Some(end) = start
+            .checked_add(length)
+            .filter(|end| *end <= i32::MAX as u32)
+        else {
+            return false;
+        };
+        if delta_line == 0 && start < previous.2 {
+            return false;
+        }
+        previous = (line, start, end);
+    }
+    true
+}
+
+#[cfg(test)]
+mod semantic_token_tests {
+    use super::semantic_tokens_result;
+
+    #[test]
+    fn semantic_token_contract_rejects_malformed_or_overlapping_data() {
+        for valid in [
+            r#"{"data":[]}"#,
+            r#"{"data":[0,0,3,0,0,0,4,5,2,0,1,0,5,23,0]}"#,
+        ] {
+            assert!(semantic_tokens_result(valid), "{valid}");
+        }
+        for invalid in [
+            r#"{}"#,
+            r#"{"data":[0,0,3,0]}"#,
+            r#"{"data":[0,0,0,0,0]}"#,
+            r#"{"data":[0,0,3,24,0]}"#,
+            r#"{"data":[0,0,3,0,1024]}"#,
+            r#"{"data":[0,0,3,0,0,0,2,2,0,0]}"#,
+            r#"{"data":[0,2147483647,1,0,0]}"#,
+            r#"{"data":[-1,0,3,0,0]}"#,
+            r#"{"data":[],"data":[]}"#,
+        ] {
+            assert!(!semantic_tokens_result(invalid), "{invalid}");
+        }
+    }
+}

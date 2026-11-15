@@ -5,6 +5,7 @@ use super::*;
 mod completion;
 mod navigation;
 mod symbols;
+mod tokens;
 pub use completion::{
     CompletionLookupLimits, SourceCompletion, SourceCompletionItem, SourceCompletionKind,
 };
@@ -19,6 +20,7 @@ pub use navigation::{
     DefinitionLookupLimits, SourceDeclarationLocation, SourceDefinition, SourceNavigationInspection,
 };
 pub use symbols::{DocumentSymbolLimits, SourceDocumentSymbol};
+pub use tokens::{SemanticTokenKind, SemanticTokenLimits, SourceSemanticToken};
 
 /// The prefix is checked; the observation is provisional elaboration state.
 /// In particular, `Goals { goals: [] }` is not a proof-checking certificate.

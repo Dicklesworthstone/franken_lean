@@ -372,7 +372,7 @@ impl SourceModuleSession {
 /// grammar must be checked against that dependency's own import closure, not
 /// the document and its unrelated sibling imports. The outer admission already
 /// validated this finite source graph; this walk only selects its exact subset.
-fn source_closure<'a>(
+pub(super) fn source_closure<'a>(
     inputs: &[SourceModuleInput<'a>],
     entry: &Name,
 ) -> Result<Vec<SourceModuleInput<'a>>, SourceModuleCheckError> {
@@ -417,7 +417,7 @@ fn source_closure<'a>(
         .collect())
 }
 
-fn observe_scope(
+pub(super) fn observe_scope(
     scopes: &mut super::super::scopes::Scopes,
     grammar: &mut SourceGrammar,
     control: ScopeCommand,
@@ -447,7 +447,7 @@ fn limit(resource: &'static str, limit: usize) -> SourceModuleCheckError {
     SourceModuleCheckError::Limit { resource, limit }
 }
 
-fn source_error(
+pub(super) fn source_error(
     module: &Name,
     command: usize,
     offset: usize,

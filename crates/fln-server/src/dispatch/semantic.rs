@@ -5,8 +5,10 @@ use std::ops::Range;
 mod completion;
 pub mod index;
 mod symbols;
+mod tokens;
 pub use completion::{CompletionItem, CompletionItemKind};
 pub use symbols::DocumentSymbol;
+pub use tokens::{SemanticToken, SemanticTokenKind};
 pub(super) mod interactive;
 pub use interactive::{
     Code, ExpressionInfo, Goal, Hypothesis, NavigationLocation, SubexpressionInfo, TermGoal,
@@ -22,6 +24,7 @@ pub enum QueryKind {
     Definition,
     Completion,
     DocumentSymbols,
+    SemanticTokens,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +73,10 @@ pub enum Answer {
     DocumentSymbols {
         symbols: Vec<DocumentSymbol>,
     },
+    /// Syntax and resolved native annotations over this exact accepted source.
+    SemanticTokens {
+        tokens: Vec<SemanticToken>,
+    },
 }
 
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
@@ -80,9 +87,17 @@ pub(super) fn initialize_response(id: &RequestId) -> String {
     // The pin's LeanServerCapabilities live under `experimental`; `lean` is
     // the client's offer (Lsp/Capabilities.lean and Server/Watchdog.lean).
     let response = wire::initialize_response(id);
-    response.replacen(
+    let response = response.replacen(
         "\"capabilities\":{",
         "\"capabilities\":{\"experimental\":{\"rpcProvider\":{\"rpcWireFormat\":\"v1\"}},\"hoverProvider\":true,\"definitionProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":{\"resolveProvider\":false,\"triggerCharacters\":[\".\"]},",
+        1,
+    );
+    response.replacen(
+        "\"capabilities\":{",
+        &format!(
+            "\"capabilities\":{{\"semanticTokensProvider\":{},",
+            tokens::capability()
+        ),
         1,
     )
 }
@@ -113,6 +128,9 @@ pub(super) fn position(text: &str, offset: usize) -> Result<json::Position, &'st
 
 fn result_json(answer: Answer, query: Query<'_>) -> Result<String, &'static str> {
     let result = match (query.kind, answer) {
+        (QueryKind::SemanticTokens, Answer::SemanticTokens { tokens }) => {
+            tokens::result(&tokens, query.text, None)?
+        }
         (QueryKind::DocumentSymbols, Answer::DocumentSymbols { symbols }) => {
             symbols::result(symbols, query)?
         }
@@ -262,6 +280,9 @@ pub(super) fn handle(
         "textDocument/definition" => QueryKind::Definition,
         "textDocument/completion" => QueryKind::Completion,
         "textDocument/documentSymbol" => QueryKind::DocumentSymbols,
+        "textDocument/semanticTokens/full" | "textDocument/semanticTokens/range" => {
+            QueryKind::SemanticTokens
+        }
         _ => return write_protocol_message(output, error_response(id, -32601, "method not found")),
     };
     let parsed = (|| {
@@ -271,14 +292,19 @@ pub(super) fn handle(
         if uri.is_empty() {
             return Err("semantic query URI is empty");
         }
-        let at = if kind == QueryKind::DocumentSymbols {
+        let at = if matches!(kind, QueryKind::DocumentSymbols | QueryKind::SemanticTokens) {
             None
         } else {
             Some(json::query_position(params)?)
         };
-        Ok((uri, at))
+        let range = if method == "textDocument/semanticTokens/range" {
+            Some(json::query_range(params)?)
+        } else {
+            None
+        };
+        Ok((uri, at, range))
     })();
-    let (uri, at) = match parsed {
+    let (uri, at, range) = match parsed {
         Ok(parsed) => parsed,
         Err(error) => return write_protocol_message(output, error_response(id, -32602, error)),
     };
@@ -300,6 +326,15 @@ pub(super) fn handle(
         Ok(offset) => offset,
         Err(error) => return write_protocol_message(output, error_response(id, -32602, error)),
     };
+    let range = match range
+        .map(|(start, end)| {
+            Ok::<_, &'static str>(json::byte_offset(text, start)?..json::byte_offset(text, end)?)
+        })
+        .transpose()
+    {
+        Ok(range) => range,
+        Err(error) => return write_protocol_message(output, error_response(id, -32602, error)),
+    };
     let query = Query {
         kind,
         uri: &uri,
@@ -310,7 +345,12 @@ pub(super) fn handle(
     let response = match checker.query(query, &sources) {
         Ok(None) => null_response(id),
         Ok(Some(answer)) => match validate_target_source(&answer, &sources)
-            .and_then(|()| result_json(answer, query))
+            .and_then(|()| match (query.kind, answer, range) {
+                (QueryKind::SemanticTokens, Answer::SemanticTokens { tokens }, range) => {
+                    tokens::result(&tokens, query.text, range)
+                }
+                (_, answer, _) => result_json(answer, query),
+            })
         {
             Ok(result) => format!(
                 "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{result}}}",

@@ -18,6 +18,45 @@ pub fn tree(source: &[u8]) -> Result<Option<Syntax>, DefinitionParseError> {
     scope_tree(source, &view, &tokens)
 }
 
+/// The original syntax of a scope command's head, retaining its `in` atom but
+/// leaving the nested command missing. Clients that replay lexical scopes must
+/// parse that command only after applying the head: `open scoped N in ...` can
+/// change the grammar of its body. No source bytes or identifiers are invented.
+pub fn head_tree(source: &[u8]) -> Result<Option<Syntax>, DefinitionParseError> {
+    let body = match super::parse(source)? {
+        Some(
+            ScopeCommand::OpenIn { body, .. }
+            | ScopeCommand::SetOptionIn { body, .. }
+            | ScopeCommand::In { body, .. },
+        ) => body,
+        _ => return tree(source),
+    };
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
+    let tokens = tokens(&view)?;
+    let Some((at, token)) = tokens
+        .iter()
+        .enumerate()
+        .take_while(|(_, token)| view.to_original(token.extent.end()).0 <= body)
+        .last()
+    else {
+        return Ok(None);
+    };
+    if !matches!(&token.kind, TokenKind::Symbol(word) if word == "in") {
+        return Ok(None);
+    }
+    let head_end = view.to_original(token.extent.start()).0;
+    let head = match tree(&source[..head_end])? {
+        Some(head) => head,
+        None => parse_source_command(&source[..head_end])?.syntax,
+    };
+    let leaves = Leaves::build(view.normalized(), &tokens)?;
+    Ok(Some(Syntax::node(
+        parser_kind(&["Command", "in"]),
+        vec![head, leaves.leaf(at)?, Syntax::Missing],
+    )))
+}
+
 /// The pin's tree for any command: a scope command's from [`tree`], every other command's from
 /// [`parse_source_command`].
 pub fn command_tree(source: &[u8]) -> Result<Syntax, DefinitionParseError> {
@@ -77,6 +116,10 @@ fn scope_tree(
         tokens.len()
     };
     let tree = match keyword.as_str() {
+        "#exit" if tokens.len() == 1 => {
+            let leaves = leaves()?;
+            node("exit", vec![leaves.leaf(0)?])
+        }
         "namespace" if tokens.len() == 2 && ident(1) => {
             let leaves = leaves()?;
             node("namespace", vec![leaves.leaf(0)?, leaves.leaf(1)?])

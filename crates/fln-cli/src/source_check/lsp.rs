@@ -22,6 +22,7 @@ mod dependencies;
 mod interactive;
 mod navigation;
 mod render;
+mod tokens;
 use fln::source_check::inspect::{ObservationKind, SourceObservation};
 use fln_server::dispatch::semantic::{Answer, Query, QueryKind};
 
@@ -552,6 +553,9 @@ fn inspect_sources(
         }
         QueryKind::DocumentSymbols => {
             return navigation::document_symbols(session, sources, &inputs);
+        }
+        QueryKind::SemanticTokens => {
+            return tokens::collect(session, sources, &inputs);
         }
         QueryKind::Completion => {
             return completion::complete(session, sources, &inputs, offset);

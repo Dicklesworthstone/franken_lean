@@ -109,6 +109,8 @@ fn known_method_contract(method: &str) -> Option<KnownMethodContract> {
         | "textDocument/completion"
         | "textDocument/definition"
         | "textDocument/documentSymbol"
+        | "textDocument/semanticTokens/full"
+        | "textDocument/semanticTokens/range"
         | "textDocument/hover"
         | "textDocument/waitForDiagnostics" => Some(request(KnownParamsContract::Object)),
         "shutdown" => Some(request(KnownParamsContract::OptionalEmpty)),

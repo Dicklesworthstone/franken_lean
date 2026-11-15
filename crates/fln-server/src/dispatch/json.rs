@@ -12,6 +12,21 @@ pub(super) fn query_position(params: RawField<'_>) -> Result<Position, &'static 
     edits::position(object_field(params, "position"))
 }
 
+pub(super) fn query_range(params: RawField<'_>) -> Result<(Position, Position), &'static str> {
+    let RawField::Value(params) = params_object(params) else {
+        return Err("range parameters require an object");
+    };
+    let RawField::Value(range) = object_field(params, "range") else {
+        return Err("semantic token range requires one range");
+    };
+    let start = edits::position(object_field(range, "start"))?;
+    let end = edits::position(object_field(range, "end"))?;
+    if start > end {
+        return Err("semantic token range is reversed");
+    }
+    Ok((start, end))
+}
+
 pub(super) use edits::content_changes_text_from;
 
 mod files;

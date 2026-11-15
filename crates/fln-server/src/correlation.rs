@@ -62,6 +62,7 @@ enum RequestContract {
     Completion,
     Definition,
     DocumentSymbols,
+    SemanticTokens,
     RpcConnect,
     RpcCall(crate::json::RpcProcedure),
     UnsupportedRpc,
@@ -79,6 +80,9 @@ impl RequestContract {
             "textDocument/completion" => Self::Completion,
             "textDocument/definition" => Self::Definition,
             "textDocument/documentSymbol" => Self::DocumentSymbols,
+            "textDocument/semanticTokens/full" | "textDocument/semanticTokens/range" => {
+                Self::SemanticTokens
+            }
             "$/lean/plainTermGoal" => Self::PlainTermGoal,
             "$/lean/rpc/connect" => Self::RpcConnect,
             "$/lean/rpc/call" => Self::UnsupportedRpc,
@@ -97,6 +101,7 @@ impl RequestContract {
             Self::Completion => "completion",
             Self::Definition => "definition",
             Self::DocumentSymbols => "document-symbols",
+            Self::SemanticTokens => "semantic-tokens",
             Self::RpcConnect => "rpc-connect",
             Self::RpcCall(_) => "rpc-call",
             Self::UnsupportedRpc => "unsupported-rpc",
@@ -596,7 +601,8 @@ fn classify_method_response(
             | RequestContract::Hover
             | RequestContract::Completion
             | RequestContract::Definition
-            | RequestContract::DocumentSymbols,
+            | RequestContract::DocumentSymbols
+            | RequestContract::SemanticTokens,
             ResponseShape::Result(value),
         ) if value.trim() == "null" => Ok(MethodResponseClass::NoInformationQueryResult),
         (RequestContract::PlainGoal, ResponseShape::Result(value))
@@ -632,13 +638,19 @@ fn classify_method_response(
         {
             Ok(MethodResponseClass::SemanticQueryResult)
         }
+        (RequestContract::SemanticTokens, ResponseShape::Result(value))
+            if crate::json::semantic_tokens_result(value) =>
+        {
+            Ok(MethodResponseClass::SemanticQueryResult)
+        }
         (
             RequestContract::PlainGoal
             | RequestContract::PlainTermGoal
             | RequestContract::Hover
             | RequestContract::Completion
             | RequestContract::Definition
-            | RequestContract::DocumentSymbols,
+            | RequestContract::DocumentSymbols
+            | RequestContract::SemanticTokens,
             ResponseShape::Error(-32602 | -32803 | -32800),
         ) => Ok(MethodResponseClass::SemanticQueryError),
         (
@@ -647,7 +659,8 @@ fn classify_method_response(
             | RequestContract::Hover
             | RequestContract::Completion
             | RequestContract::Definition
-            | RequestContract::DocumentSymbols,
+            | RequestContract::DocumentSymbols
+            | RequestContract::SemanticTokens,
             ResponseShape::Result(value),
         ) => mismatch(
             result_kind(value).to_owned(),
@@ -659,7 +672,8 @@ fn classify_method_response(
             | RequestContract::Hover
             | RequestContract::Completion
             | RequestContract::Definition
-            | RequestContract::DocumentSymbols,
+            | RequestContract::DocumentSymbols
+            | RequestContract::SemanticTokens,
             ResponseShape::Error(code),
         ) => mismatch(
             format!("error code {code}"),

@@ -129,6 +129,24 @@ pub fn keyword_offset(source: &[u8]) -> Option<BytePos> {
     word(&view, first, "mutual").then(|| view.to_original(first.extent.start()))
 }
 
+/// The complete command tree, including the original `mutual` and `end` atoms.
+/// Read-only editor consumers need these leaves as well as the members passed
+/// to the elaborator. All member positions share the group's normalized view.
+pub fn tree(source: &[u8]) -> Result<Option<Syntax>, DefinitionParseError> {
+    let Some(members) = parse(source)? else {
+        return Ok(None);
+    };
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
+    let tokens = tokens(&view)?;
+    let end = block_end(&view, &tokens, 0)?;
+    let leaves = Leaves::build(view.normalized(), &tokens)?;
+    Ok(Some(Syntax::node(
+        parser_kind(&["Command", "mutual"]),
+        vec![leaves.leaf(0)?, null_node(members), leaves.leaf(end)?],
+    )))
+}
+
 /// [`parse`], with each member's byte offset in `source`: a member's own positions are
 /// relative to its start, so this offset places them in the group.
 pub fn parse_with_offsets(
