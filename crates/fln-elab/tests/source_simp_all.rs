@@ -136,3 +136,87 @@ fn simp_all_does_not_accept_false_or_unfinished_proofs() {
         refused(source);
     }
 }
+
+#[test]
+fn simp_custom_dischargers_prove_conditional_premises_in_the_local_context() {
+    for discharger in [
+        "(discharger := exact h)",
+        "(disch := assumption)",
+        "(discharger := first | fail | exact h)",
+        "(discharger := simp only [h])",
+    ] {
+        accepted(&format!(
+            "theorem t (P : Prop) (h : P) (a b : Nat) (rule : P -> a = b) : a = b := by simp {discharger} only [rule]"
+        ));
+    }
+}
+
+#[test]
+fn simp_custom_dischargers_run_composed_tactics_and_close_every_goal() {
+    accepted(
+        "theorem t (P Q : Prop) (hp : P) (hq : Q) (a b : Nat) (rule : P ∧ Q -> a = b) : a = b := by simp (discharger := constructor <;> assumption) only [rule]",
+    );
+    accepted(
+        "theorem t (P : Prop) (a b : Nat) (rule : (P -> P) -> a = b) : a = b := by simp (discharger := intro hp; exact hp) only [rule]",
+    );
+    accepted(
+        "theorem t (a b : Nat) (rule : a = a -> a = b) : a = b := by simp (discharger := rfl) only [rule]",
+    );
+    refused(
+        "theorem t (P Q : Prop) (hp : P) (a b : Nat) (rule : P ∧ Q -> a = b) : a = b := by simp (discharger := constructor; exact hp) only [rule]",
+    );
+}
+
+#[test]
+fn simp_custom_dischargers_are_shared_by_hypotheses_and_simpa() {
+    accepted(
+        "theorem t (P : Prop) (Q : Nat -> Prop) (h : P) (a b : Nat) (rule : P -> a = b) (ha : Q a) : Q b := by simp (discharger := exact h) only [rule] at ha; exact ha",
+    );
+    accepted(
+        "theorem t (P : Prop) (Q : Nat -> Prop) (h : P) (a b : Nat) (rule : P -> a = b) (ha : Q a) : Q b := by simpa (discharger := exact h) only [rule] using ha",
+    );
+    accepted(
+        "theorem t (P : Prop) (h : P) (a b : Nat) (rule : P -> a = b) : a = b := by\n conv => lhs; simp (discharger := exact h) only [rule]\n rfl",
+    );
+    accepted(
+        "theorem t (P : Nat -> Prop) (h : ∀ n : Nat, P n) (f : Nat -> Nat) (rule : ∀ n : Nat, P n -> f n = n) : ∀ n : Nat, f n = n := by simp (discharger := apply h) only [rule]",
+    );
+}
+
+#[test]
+fn a_failing_custom_discharger_replaces_default_discharge_and_restores_state() {
+    // The selected proof normally discharges the condition, but a custom
+    // procedure owns that decision, even when it leaves the goal unchanged.
+    accepted(
+        "theorem t (P : Prop) (h : P) (a b : Nat) (rule : P -> a = b) : a = b := by simp only [rule, h]",
+    );
+    for tactic in ["fail", "skip", "exact 0"] {
+        refused(&format!(
+            "theorem t (P : Prop) (h : P) (a b : Nat) (rule : P -> a = b) : a = b := by simp (discharger := {tactic}) only [rule, h]"
+        ));
+    }
+    accepted(
+        "theorem t (P : Prop) (h : P) (a b : Nat) (rule : P -> a = b) : a = b := by\n try simp (discharger := clear h; fail) only [rule]\n exact rule h",
+    );
+    accepted(
+        "theorem t (P : Prop) (h : P) (a b : Nat) (rule : P -> a = b) : a = b := by\n try simp (discharger := have temporary : P := h; fail) only [rule]\n simp (discharger := exact h) only [rule]",
+    );
+}
+
+#[test]
+fn custom_dischargers_do_not_invent_premises_or_change_simp_all_and_dsimp() {
+    refused(
+        "theorem t (P Q : Prop) (h : Q) (a b : Nat) (rule : P -> a = b) : a = b := by simp (discharger := exact h) only [rule]",
+    );
+    refused(
+        "theorem t (P : Prop) (a b : Nat) (rule : P -> a = b) : a = b := by simp (discharger := assumption) only [rule]",
+    );
+    refused(
+        "theorem t (a b : Nat) (rule : Nat -> a = b) : a = b := by simp (discharger := exact 0) only [rule]",
+    );
+    for tactic in ["simp_all", "dsimp"] {
+        refused(&format!(
+            "theorem t (P : Prop) (h : P) : P := by {tactic} (discharger := exact h) only; exact h"
+        ));
+    }
+}

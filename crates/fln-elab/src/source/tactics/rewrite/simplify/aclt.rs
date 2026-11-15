@@ -303,6 +303,7 @@ impl Context {
         for rule in rules {
             let statement = match rule {
                 SimpRule::Arith
+                | SimpRule::Discharger(_)
                 | SimpRule::Ac
                 | SimpRule::Decide
                 | SimpRule::Conditional { .. }

@@ -260,11 +260,43 @@ fn visit(remaining: &mut usize, limit: usize) -> Result<(), UniverseInstantiatio
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UniverseStore {
     assignments: HashMap<LMVarId, Level>,
+    /// Temporary scopes may assign only universe holes allocated inside them.
+    /// Unlike the assignment map, this includes fresh, still-unassigned holes.
+    assignment_scope: Option<HashSet<LMVarId>>,
 }
 
 impl UniverseStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn restrict_assignments_to_new(&mut self) {
+        self.assignment_scope = Some(HashSet::new());
+    }
+
+    pub(crate) fn register_fresh(&mut self, id: LMVarId) {
+        if let Some(fresh) = &mut self.assignment_scope {
+            fresh.insert(id);
+        }
+    }
+
+    pub(crate) fn assignment_permitted(&self, id: &LMVarId) -> bool {
+        self.assignment_scope
+            .as_ref()
+            .is_none_or(|fresh| fresh.contains(id))
+    }
+
+    /// Executing elaboration respects its temporary scope. The raw assignment
+    /// operation remains available for constructing untrusted input stores.
+    pub(crate) fn assign_scoped(
+        &mut self,
+        id: LMVarId,
+        level: Level,
+    ) -> Result<Option<Level>, LMVarId> {
+        if !self.assignment_permitted(&id) {
+            return Err(id);
+        }
+        Ok(self.assign(id, level))
     }
 
     pub fn is_empty(&self) -> bool {

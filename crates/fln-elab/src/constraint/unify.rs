@@ -113,6 +113,7 @@ pub enum UnificationDeferred {
     EscapingLocal(MVarId),
     UnresolvedAssignmentType(MVarId),
     CyclicUniverse(LMVarId),
+    ReadOnlyUniverse(LMVarId),
     InvalidLocalContext,
     UnresolvedTypingConstraint(ConstraintId),
     InvalidTypingContext(ConstraintId),
@@ -742,7 +743,9 @@ impl Engine<'_> {
                 UnificationDeferred::OpaqueMetavariable(id.clone()),
             ));
         }
-        if declaration.depth > self.budget.max_metavar_depth {
+        if !self.work.mvars.assignment_permitted(id)
+            || declaration.depth > self.budget.max_metavar_depth
+        {
             return Err(UnificationError::Deferred(
                 UnificationDeferred::MetavariableDepth(id.clone()),
             ));
@@ -935,6 +938,7 @@ impl Engine<'_> {
             return Ok(false);
         };
         if declaration.kind == MetavarKind::SyntheticOpaque
+            || !self.work.mvars.assignment_permitted(id)
             || declaration.depth > self.budget.max_metavar_depth
             || declaration.delayed.is_some()
         {
@@ -1016,6 +1020,7 @@ impl Engine<'_> {
             return Ok(false);
         };
         if declaration.kind == MetavarKind::SyntheticOpaque
+            || !self.work.mvars.assignment_permitted(id)
             || declaration.depth > self.budget.max_metavar_depth
             || declaration.delayed.is_some()
         {
@@ -1136,11 +1141,26 @@ impl Engine<'_> {
                 continue;
             }
             match (left.view(), right.view()) {
-                (LevelView::MVar(id), _) | (_, LevelView::MVar(id)) => {
-                    let value = if matches!(left.view(), LevelView::MVar(found) if found == id) {
-                        &right
-                    } else {
-                        &left
+                (LevelView::MVar(_), _) | (_, LevelView::MVar(_)) => {
+                    // If one side belongs to an enclosing scope, the other
+                    // side may still be a fresh hole that can point to it.
+                    let (id, value) = match (left.view(), right.view()) {
+                        (LevelView::MVar(id), _)
+                            if self.work.universes.assignment_permitted(id) =>
+                        {
+                            (id, &right)
+                        }
+                        (_, LevelView::MVar(id))
+                            if self.work.universes.assignment_permitted(id) =>
+                        {
+                            (id, &left)
+                        }
+                        (LevelView::MVar(id), _) | (_, LevelView::MVar(id)) => {
+                            return Err(UnificationError::Deferred(
+                                UnificationDeferred::ReadOnlyUniverse(id.clone()),
+                            ));
+                        }
+                        _ => unreachable!("a universe metavariable was matched"),
                     };
                     let mut todo = vec![value];
                     let mut visited = HashSet::new();
@@ -1164,7 +1184,12 @@ impl Engine<'_> {
                         }
                     }
                     self.assignment_slot()?;
-                    self.work.universes.assign(id.clone(), value.clone());
+                    self.work
+                        .universes
+                        .assign_scoped(id.clone(), value.clone())
+                        .map_err(|id| {
+                            UnificationError::Deferred(UnificationDeferred::ReadOnlyUniverse(id))
+                        })?;
                     self.assigned_levels.push(id.clone());
                 }
                 (LevelView::Succ(a), LevelView::Succ(b)) => pending.push((a.clone(), b.clone())),

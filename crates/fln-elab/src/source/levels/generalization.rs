@@ -148,7 +148,7 @@ impl Context {
             assignments.push((id, name));
         }
         for (id, name) in assignments {
-            self.txn.universes.assign(id, Level::param(name.clone()));
+            self.assign_level(id, Level::param(name.clone()))?;
             self.level_params.push(name);
         }
         Ok(())

@@ -49,6 +49,7 @@ impl Context {
         if matches!(
             rule,
             SimpRule::Local(_)
+                | SimpRule::Discharger(_)
                 | SimpRule::Ac
                 | SimpRule::Arith
                 | SimpRule::Decide
@@ -99,6 +100,7 @@ impl Context {
             if bang { "simp_all!" } else { "simp_all" },
             "whole-context simplification keyword",
         )?;
+        expect_empty_null(discharger, "simp_all without a discharger")?;
         // The configuration is read, and `+arith` admitted, by the ordinary set parser.
         // Reuse the ordinary set parser without reparsing source or changing
         // the persistent registry. Its location slot is an empty null node.

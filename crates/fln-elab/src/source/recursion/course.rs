@@ -96,9 +96,7 @@ impl Context {
         for (index, hole) in holes.into_iter().enumerate() {
             self.tick()?;
             let parameter = Name::num(Name::from_components(["_fln_open_universe"]), index as u64);
-            self.txn
-                .universes
-                .assign(hole, Level::param(parameter.clone()));
+            self.assign_level(hole, Level::param(parameter.clone()))?;
             parameters.push(parameter);
         }
         Ok(parameters)

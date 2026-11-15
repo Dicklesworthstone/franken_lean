@@ -202,6 +202,7 @@ pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
                     outcome.as_ref(),
                     Outcome::Complete(Verdict::Rejected { .. })
                 ),
+                UnificationError::Metavariable(crate::mvar::MetavarError::ReadOnly { .. }) => true,
                 _ => false,
             }
         }

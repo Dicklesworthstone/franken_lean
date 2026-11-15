@@ -69,6 +69,7 @@ pub enum MetavarError {
     AlreadyAssigned { id: MVarId },
     OccursCheckFailed { id: MVarId },
     SyntheticOpaqueBlocked { id: MVarId },
+    ReadOnly { id: MVarId },
     NotDeclared { id: MVarId },
 }
 
@@ -90,6 +91,11 @@ impl std::fmt::Display for MetavarError {
                 "cannot assign synthetic opaque metavariable ?{} via standard unification",
                 id.0.to_display_string()
             ),
+            Self::ReadOnly { id } => write!(
+                f,
+                "cannot assign metavariable ?{} from an enclosing scope",
+                id.0.to_display_string()
+            ),
             Self::NotDeclared { id } => write!(
                 f,
                 "metavariable ?{} is not declared",
@@ -106,6 +112,9 @@ impl std::error::Error for MetavarError {}
 pub struct MetavarStore {
     decls: HashMap<MVarId, MetavarDecl>,
     assignments: HashMap<MVarId, MetavarAssignment>,
+    /// In a temporary metavariable scope, only declarations created inside it
+    /// are assignable. Checkpoints carry this permission set with their store.
+    assignment_scope: Option<HashSet<MVarId>>,
     /// Reverse edges from types, local contexts, assignment values and explicit reads.
     readers: HashMap<MVarId, HashSet<MVarId>>,
     /// The next index the unifier may use for a fresh local (`_fln_unify_local.N`).
@@ -222,6 +231,16 @@ fn apply_beta(f: &Expr, arguments: &[Expr]) -> Result<Expr, fln_core::expr::TooM
 impl MetavarStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn restrict_assignments_to_new(&mut self) {
+        self.assignment_scope = Some(HashSet::new());
+    }
+
+    pub(crate) fn assignment_permitted(&self, id: &MVarId) -> bool {
+        self.assignment_scope
+            .as_ref()
+            .is_none_or(|fresh| fresh.contains(id))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -356,6 +375,11 @@ impl MetavarStore {
         depth: u32,
         origin: Option<Name>,
     ) -> &MetavarDecl {
+        if !self.decls.contains_key(&id)
+            && let Some(fresh) = &mut self.assignment_scope
+        {
+            fresh.insert(id.clone());
+        }
         let mut read_mvars = self.collect_mvars(&type_);
         for local in lctx.decls() {
             read_mvars.extend(self.collect_mvars(&local.type_));
@@ -402,6 +426,9 @@ impl MetavarStore {
             .decls
             .get(&id)
             .ok_or_else(|| MetavarError::NotDeclared { id: id.clone() })?;
+        if !self.assignment_permitted(&id) {
+            return Err(MetavarError::ReadOnly { id });
+        }
         if decl.kind == MetavarKind::SyntheticOpaque
             && justification == AssignmentJustification::DirectDefEq
         {

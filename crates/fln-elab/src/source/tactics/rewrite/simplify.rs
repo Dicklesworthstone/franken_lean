@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use unfold::UnfoldResult;
 
 const MAX_SIMPLIFICATION_STEPS: usize = 256;
+const MAX_DISCHARGER_FRAMES: usize = 8;
 
 /// Registered names are resolved once by the attribute command. They must not
 /// be reparsed or captured by a same-named local or a later namespace scope.
@@ -43,6 +44,9 @@ pub(in crate::source) enum SimpRule<'a> {
     /// A wildcard selects a proof by local identity, not its display spelling.
     /// Location simplification remaps this identity when replacing the local.
     Local(FVarId),
+    /// A per-call proof procedure, never a rewrite candidate. The pin replaces
+    /// its default discharger when this syntax is present.
+    Discharger(&'a Syntax),
     /// The AC tactic's class-directed normalization. It is never part of the
     /// ordinary simp set and selects no user or registered simp theorems.
     Ac,
@@ -72,6 +76,7 @@ impl SimpRule<'_> {
             Self::Explicit(rule) => rule.reverse,
             Self::Global(rule) => rule.reverse,
             Self::Local(_)
+            | Self::Discharger(_)
             | Self::Ac
             | Self::Arith
             | Self::Decide
@@ -336,6 +341,9 @@ impl Context {
         rule: &SimpRule<'_>,
         target: &Expr,
     ) -> Result<bool, NatDefinitionElabError> {
+        if matches!(rule, SimpRule::Discharger(_)) {
+            return Ok(false);
+        }
         let Some(type_) = self.registered_simp_type(rule)? else {
             return Ok(true);
         };
@@ -353,6 +361,9 @@ impl Context {
         rule: &SimpRule<'_>,
         target: &Expr,
     ) -> Result<bool, NatDefinitionElabError> {
+        if matches!(rule, SimpRule::Discharger(_)) {
+            return Ok(false);
+        }
         let SimpRule::Global(entry) = rule else {
             return Ok(true);
         };
@@ -429,6 +440,9 @@ impl Context {
         index: Option<&SimpTargetIndex>,
         side: SimpKeySide,
     ) -> bool {
+        if matches!(rule, SimpRule::Discharger(_)) {
+            return false;
+        }
         if matches!(
             rule,
             SimpRule::Arith
@@ -810,6 +824,7 @@ impl Context {
             // Arithmetic normalization, decision and the procedures have no single proof term
             // to select.
             SimpRule::Arith
+            | SimpRule::Discharger(_)
             | SimpRule::Ac
             | SimpRule::Decide
             | SimpRule::Conditional { .. }
@@ -946,7 +961,12 @@ impl Context {
                 expected: "default simplification configuration",
             });
         }
-        expect_empty_null(discharger, "default simplification discharger")?;
+        let discharger = if dsimp {
+            expect_empty_null(discharger, "dsimp without a discharger")?;
+            None
+        } else {
+            self.simp_discharger(discharger)?
+        };
         if !simpa {
             let location = location.ok_or_else(|| error(TacticError::MalformedScript))?;
             self.rewrite_locations(location)?;
@@ -1008,7 +1028,59 @@ impl Context {
         {
             rules.push(SimpRule::Arith);
         }
+        if let Some(discharger) = discharger {
+            rules.push(SimpRule::Discharger(discharger));
+        }
         Ok((rules, config))
+    }
+
+    /// `mkDischargeWrapper` reads the tactic sequence in the fourth slot of
+    /// `Tactic.discharger`; both admitted spellings have exactly that shape.
+    fn simp_discharger<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+    ) -> Result<Option<&'a Syntax>, NatDefinitionElabError> {
+        let [discharger] = expect_null_args(syntax, "optional simp discharger")? else {
+            expect_empty_null(syntax, "optional simp discharger")?;
+            return Ok(None);
+        };
+        let [open, spelling, assign, body, close] = expect_node(
+            discharger,
+            &parser_kind(&["Tactic", "discharger"]),
+            5,
+            "simp discharger",
+        )?
+        else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(open, "(", "simp discharger opening")?;
+        expect_atom(assign, ":=", "simp discharger assignment")?;
+        expect_atom(close, ")", "simp discharger closing")?;
+        let [token] = expect_node(
+            spelling,
+            &Name::from_components(["patternIgnore"]),
+            1,
+            "simp discharger keyword",
+        )?
+        else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        let word = if token.kind() == Some(&Name::from_components(["token", "discharger"])) {
+            "discharger"
+        } else {
+            "disch"
+        };
+        let [keyword] = expect_node(
+            token,
+            &Name::from_components(["token", word]),
+            1,
+            "simp discharger keyword",
+        )?
+        else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(keyword, word, "simp discharger keyword")?;
+        Ok(Some(body))
     }
 
     /// The rules `simp_rules` selects, before `+arith`'s normalization joins them last.
@@ -1349,6 +1421,14 @@ impl Context {
         target: &Expr,
         rules: &[SimpRule<'_>],
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        if let Some(body) = rules.iter().find_map(|rule| match rule {
+            SimpRule::Discharger(body) => Some(*body),
+            _ => None,
+        }) {
+            // A custom discharger replaces `dischargeDefault?`. In particular,
+            // a failing custom script cannot fall back to selected simp facts.
+            return self.simp_tactic_discharge(body, target);
+        }
         let target = self.simp_premise_target(target, rules)?;
         if let Some(value) = self.simp_selected_proof(&target, rules)? {
             return Ok(Some(value));
@@ -1372,6 +1452,135 @@ impl Context {
             self.restore_simp_trial(original);
         }
         Ok(value)
+    }
+
+    /// The pin's `withNewMCtxDepth` makes enclosing metavariables rigid and
+    /// clears pending unification; `withSynthesize` handles only synthetic
+    /// obligations created by this callback. The discarded trial owns the scope.
+    fn start_simp_discharge_scope(&mut self) {
+        self.txn.mvars.restrict_assignments_to_new();
+        self.txn.universes.restrict_assignments_to_new();
+        self.equations.clear();
+        self.stalled_flush = None;
+        self.instance_goals.clear();
+        self.instance_origins.clear();
+        self.bound_metavars.clear();
+        self.postponed_eliminators.clear();
+        self.postponed_fields.clear();
+        self.postponed_coercions.clear();
+        self.postponed_application_errors.clear();
+        self.pending_source_arguments = false;
+    }
+
+    /// `tacticToDischarge` runs one fresh synthetic-opaque goal and retains no
+    /// temporary metavariables. Failed tactics leave the simplifier's semantic
+    /// state alone, but their work remains charged and resource stops propagate.
+    fn simp_tactic_discharge(
+        &mut self,
+        body: &Syntax,
+        target: &Expr,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        self.tick()?;
+        if self.simp_discharge_depth >= MAX_DISCHARGER_FRAMES {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        let mut trial = Box::new(self.rewrite_trial());
+        trial.simp_discharge_depth += 1;
+        trial.attempt_depth += 1;
+        trial.start_simp_discharge_scope();
+        let result = (|| {
+            trial
+                .txn
+                .budget
+                .enter_rec()
+                .map_err(|_| failure(SourceInferenceError::ResourceLimit))?;
+            let (root, goal) = trial.proof_goal(target.clone())?;
+            trial
+                .txn
+                .mvars
+                .set_kind(&goal.id, MetavarKind::SyntheticOpaque)
+                .map_err(|reason| {
+                    failure(SourceInferenceError::Unification(Box::new(
+                        UnificationError::Metavariable(reason),
+                    )))
+                })?;
+            trial.goal_tags.insert(
+                goal.id.clone(),
+                Name::from_components(["simp", "discharger"]),
+            );
+            let proof = ProofState {
+                extent: trial.observation_extent(body)?.map(Box::new),
+                saved: trial.txn.lctx.clone(),
+                target: target.clone(),
+                root,
+                instructions: trial.proof_instructions(body)?,
+                cursor: 0,
+                work: vec![Work::Goal(goal)],
+                controls: Vec::new(),
+                owned_frame: None,
+            };
+            let term = trial.run_decreasing_proof(body, proof)?;
+            let value = trial.instantiate(&term.value)?;
+            if value.has_expr_mvar() || value.has_level_mvar() {
+                return Ok(None);
+            }
+            // The pin runs a discharger under a fresh metavariable depth.
+            // It may solve its own goals, never one belonging to the enclosing
+            // simplification or an unrelated postponed source argument.
+            for id in self.txn.mvars.decls().keys() {
+                trial.tick()?;
+                if trial.txn.mvars.assignments().get(id) != self.txn.mvars.assignments().get(id) {
+                    return Ok(None);
+                }
+            }
+            // `withNewMCtxDepth` also forbids assigning enclosing universe
+            // metavariables, including ones that were previously unassigned.
+            // Every source level comes from `level` / `fresh_name`; only IDs
+            // allocated within this trial may acquire a new assignment.
+            for (id, original) in self.txn.universes.assignments() {
+                trial.tick()?;
+                if trial.txn.universes.get_assignment(id) != Some(original) {
+                    return Ok(None);
+                }
+            }
+            let assigned_levels: Vec<_> = trial.txn.universes.assignments().keys().cloned().collect();
+            for id in assigned_levels {
+                trial.tick()?;
+                if self.txn.universes.is_assigned(&id) {
+                    continue;
+                }
+                let fresh = matches!(id.0.leaf_view(), fln_core::name::LeafView::Num(index)
+                    if self.next <= index && index < trial.next)
+                    && !id.0.component_overflowed()
+                    && id.0.parent() == Name::from_components(["_fln_source"]);
+                if !fresh {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(value))
+        })();
+        self.charge_rewrite_trial(&trial);
+        match result {
+            Ok(Some(value)) => {
+                // `withoutModifyingElabMetaStateWithInfo` restores term/meta
+                // state, while checked auxiliary declarations and observations
+                // remain. The returned proof is fully instantiated above.
+                self.txn.env = trial.txn.env;
+                self.txn.messages = trial.txn.messages;
+                self.txn.info_tree = trial.txn.info_tree;
+                self.auxiliary_declarations = trial.auxiliary_declarations;
+                self.aux_lemma_cache = trial.aux_lemma_cache;
+                self.aux_names = trial.aux_names;
+                self.infos = trial.infos;
+                self.inspection = trial.inspection;
+                self.deprecated_uses = trial.deprecated_uses;
+                self.next = trial.next;
+                Ok(Some(value))
+            }
+            Ok(None) => Ok(None),
+            Err(problem) if backtrack::recoverable(&problem) => Ok(None),
+            Err(problem) => Err(problem),
+        }
     }
 
     /// Construct a premise proof using the selected equalities and definitions.
@@ -3453,5 +3662,302 @@ mod tests {
         assert!(!context.simp_node_admits(&rule("And.right"), &node).unwrap());
         let index = context.simp_target_index(&node).unwrap().unwrap();
         assert!(index.admits(&rule("And.left")));
+    }
+
+    fn discharger_body(parsed: &fln_parse::ParsedDefinition) -> &Syntax {
+        let mut pending = vec![parsed.syntax()];
+        while let Some(syntax) = pending.pop() {
+            if let Syntax::Node { kind, args, .. } = syntax {
+                if kind == &parser_kind(&["Tactic", "discharger"]) {
+                    return &args[3];
+                }
+                pending.extend(args);
+            }
+        }
+        panic!("parsed custom discharger");
+    }
+
+    fn discharger_context() -> (Context, Expr, Expr) {
+        let mut context = seeded_context();
+        let p = Expr::fvar(FVarId(n("P")));
+        let h = Expr::fvar(FVarId(n("h")));
+        context.txn.lctx.add_param(
+            FVarId(n("P")),
+            n("P"),
+            Expr::sort(Level::zero()),
+            BinderInfo::Default,
+        );
+        context
+            .txn
+            .lctx
+            .add_param(FVarId(n("h")), n("h"), p.clone(), BinderInfo::Default);
+        // A pre-existing goal must survive both success and failure unchanged.
+        context.proof_goal(p.clone()).unwrap();
+        (context, p, h)
+    }
+
+    #[test]
+    fn custom_dischargers_return_closed_evidence_without_retaining_temporary_goals() {
+        for tactic in ["exact h", "first | fail | exact h"] {
+            let parsed = fln_parse::parse_definition(
+                format!("theorem t : True := by simp (discharger := {tactic}) only").as_bytes(),
+            )
+            .unwrap();
+            let (mut context, target, expected) = discharger_context();
+            let mvars = context.txn.mvars.clone();
+            let locals = context.txn.lctx.clone();
+            let universes = context.txn.universes.assignments().clone();
+            let before = context.txn.budget.heartbeats_consumed;
+            let result = context
+                .simp_tactic_discharge(discharger_body(&parsed), &target)
+                .unwrap();
+            assert_eq!(result, Some(expected));
+            assert_eq!(context.txn.mvars, mvars);
+            assert_eq!(context.txn.lctx, locals);
+            assert_eq!(context.txn.universes.assignments(), &universes);
+            assert_eq!(context.txn.budget.current_rec_depth, 0);
+            assert_eq!(context.simp_discharge_depth, 0);
+            assert!(context.txn.budget.heartbeats_consumed > before);
+        }
+    }
+
+    #[test]
+    fn failed_custom_dischargers_discard_local_changes_without_refunding_work() {
+        for tactic in [
+            "skip",
+            "clear h; fail",
+            "have temporary : P := h; fail",
+            "exact h; fail",
+        ] {
+            let parsed = fln_parse::parse_definition(
+                format!("theorem t : True := by simp (discharger := {tactic}) only").as_bytes(),
+            )
+            .unwrap();
+            let (mut context, target, _) = discharger_context();
+            let original = context.clone();
+            assert_eq!(
+                context
+                    .simp_tactic_discharge(discharger_body(&parsed), &target)
+                    .unwrap(),
+                None,
+                "{tactic}"
+            );
+            assert_eq!(context.txn.mvars, original.txn.mvars);
+            assert_eq!(context.txn.lctx, original.txn.lctx);
+            assert_eq!(context.txn.env, original.txn.env);
+            assert_eq!(context.next, original.next);
+            assert!(
+                context.txn.budget.heartbeats_consumed > original.txn.budget.heartbeats_consumed
+            );
+        }
+    }
+
+    #[test]
+    fn custom_dischargers_cannot_assign_an_enclosing_unresolved_universe() {
+        for fallback in [false, true] {
+            let tactic = if fallback {
+                "first | exact consume A a | exact h"
+            } else {
+                "exact consume A a"
+            };
+            let parsed = fln_parse::parse_definition(
+                format!("theorem t : True := by simp (discharger := {tactic}) only").as_bytes(),
+            )
+            .unwrap();
+            let (mut context, target, evidence) = discharger_context();
+            let universe = context.level().unwrap();
+            let fln_core::level::LevelView::MVar(id) = universe.view() else {
+                panic!("fresh universe");
+            };
+            let id = id.clone();
+            let a_type = Expr::fvar(FVarId(n("A")));
+            for (name, type_) in [
+                ("A", Expr::sort(universe)),
+                ("a", a_type),
+                (
+                    "consume",
+                    pi(
+                        Expr::sort(Level::one()),
+                        pi(bvar(0), target.clone(), BinderInfo::Default),
+                        BinderInfo::Default,
+                    ),
+                ),
+            ] {
+                context
+                    .txn
+                    .lctx
+                    .add_param(FVarId(n(name)), n(name), type_, BinderInfo::Default);
+            }
+            let original = context.clone();
+            assert_eq!(
+                context
+                    .simp_tactic_discharge(discharger_body(&parsed), &target)
+                    .unwrap(),
+                fallback.then_some(evidence),
+                "the inadmissible first branch must fail before first chooses a result"
+            );
+            assert!(!context.txn.universes.is_assigned(&id));
+            assert_eq!(context.txn.universes, original.txn.universes);
+            assert_eq!(context.txn.mvars, original.txn.mvars);
+            assert_eq!(context.txn.lctx, original.txn.lctx);
+        }
+    }
+
+    #[test]
+    fn custom_dischargers_retry_without_assigning_enclosing_expression_holes() {
+        for fallback in [false, true] {
+            let tactic = if fallback {
+                "first | exact consume q | exact h"
+            } else {
+                "exact consume q"
+            };
+            let parsed = fln_parse::parse_definition(
+                format!("theorem t : True := by simp (discharger := {tactic}) only").as_bytes(),
+            )
+            .unwrap();
+            let (mut context, target, evidence) = discharger_context();
+            let unknown = context.hole(c("Nat")).unwrap();
+            let ExprNode::MVar { id } = unknown.node() else {
+                panic!("fresh expression hole");
+            };
+            let id = id.clone();
+            let predicate = Expr::fvar(FVarId(n("Q")));
+            for (name, type_) in [
+                ("Q", pi(c("Nat"), Expr::sort(Level::zero()), BinderInfo::Default)),
+                ("q", Expr::app(predicate.clone(), unknown)),
+                (
+                    "consume",
+                    pi(
+                        Expr::app(predicate, c("Nat.zero")),
+                        target.clone(),
+                        BinderInfo::Default,
+                    ),
+                ),
+            ] {
+                context
+                    .txn
+                    .lctx
+                    .add_param(FVarId(n(name)), n(name), type_, BinderInfo::Default);
+            }
+            let original = context.clone();
+            assert_eq!(
+                context
+                    .simp_tactic_discharge(discharger_body(&parsed), &target)
+                    .unwrap(),
+                fallback.then_some(evidence),
+            );
+            assert!(!context.txn.mvars.is_assigned(&id));
+            assert_eq!(context.txn.mvars, original.txn.mvars);
+            assert_eq!(context.txn.universes, original.txn.universes);
+            assert_eq!(context.txn.lctx, original.txn.lctx);
+        }
+    }
+
+    #[test]
+    fn custom_discharger_scopes_allow_fresh_universes_in_either_orientation() {
+        for reverse in [false, true] {
+            let (mut context, _, _) = discharger_context();
+            let outer = context.level().unwrap();
+            let fln_core::level::LevelView::MVar(outer_id) = outer.view() else {
+                panic!("outer universe");
+            };
+            let outer_id = outer_id.clone();
+            context.start_simp_discharge_scope();
+            let fresh = context.level().unwrap();
+            let fln_core::level::LevelView::MVar(fresh_id) = fresh.view() else {
+                panic!("fresh universe");
+            };
+            let fresh_id = fresh_id.clone();
+            let old_sort = Expr::sort(outer.clone());
+            let new_sort = Expr::sort(fresh);
+            let (left, right) = if reverse {
+                (&new_sort, &old_sort)
+            } else {
+                (&old_sort, &new_sort)
+            };
+            context
+                .txn
+                .unify(left, right, UnificationBudget::new(context.kernel))
+                .unwrap();
+            assert!(!context.txn.universes.is_assigned(&outer_id));
+            assert_eq!(context.txn.universes.get_assignment(&fresh_id), Some(&outer));
+        }
+    }
+
+    #[test]
+    fn custom_dischargers_leave_enclosing_pending_equations_suspended() {
+        let parsed = fln_parse::parse_definition(
+            b"theorem t : True := by simp (discharger := exact h) only",
+        )
+        .unwrap();
+        let (mut context, target, evidence) = discharger_context();
+        let unknown = context.hole(c("Nat")).unwrap();
+        let original_mvars = context.txn.mvars.clone();
+        context
+            .equations
+            .push(SourceEquation::inference(unknown.clone(), c("Nat.zero")));
+        assert_eq!(
+            context
+                .simp_tactic_discharge(discharger_body(&parsed), &target)
+                .unwrap(),
+            Some(evidence)
+        );
+        assert_eq!(context.txn.mvars, original_mvars);
+        assert_eq!(context.equations.len(), 1);
+        assert_eq!(context.equations[0].sides, (unknown, c("Nat.zero")));
+    }
+
+    #[test]
+    fn custom_discharger_budget_stops_are_typed_nonanswers_with_isolated_state() {
+        let parsed = fln_parse::parse_definition(
+            b"theorem t : True := by simp (discharger := exact h) only",
+        )
+        .unwrap();
+        let body = discharger_body(&parsed);
+        let (original, target, _) = discharger_context();
+        let mut completed = original.clone();
+        assert!(
+            completed
+                .simp_tactic_discharge(body, &target)
+                .unwrap()
+                .is_some()
+        );
+        let before = original.txn.budget.heartbeats_consumed;
+        let work = completed.txn.budget.heartbeats_consumed - before;
+        for allowance in [0, 1, work / 2, work - 1] {
+            let mut limited = original.clone();
+            limited.txn.budget.max_heartbeats = before + allowance;
+            let problem = limited
+                .simp_tactic_discharge(body, &target)
+                .expect_err("budget stop must not become an unavailable premise");
+            assert!(
+                matches!(
+                    &problem,
+                    NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)
+                ) || matches!(&problem, NatDefinitionElabError::Inference(SourceInferenceError::Unification(reason)) if matches!(reason.as_ref(), UnificationError::HeartbeatLimit)),
+                "{allowance}: {problem:?}"
+            );
+            assert!(!backtrack::recoverable(&problem));
+            assert_eq!(limited.txn.mvars, original.txn.mvars);
+            assert_eq!(limited.txn.lctx, original.txn.lctx);
+            assert_eq!(limited.txn.env, original.txn.env);
+            assert!(limited.txn.budget.heartbeats_consumed > before + allowance);
+        }
+        for host_limit in [false, true] {
+            let mut limited = original.clone();
+            if host_limit {
+                limited.simp_discharge_depth = MAX_DISCHARGER_FRAMES;
+            } else {
+                limited.txn.budget.max_rec_depth = 0;
+            }
+            let problem = limited.simp_tactic_discharge(body, &target).unwrap_err();
+            assert!(matches!(
+                problem,
+                NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)
+            ));
+            assert!(!backtrack::recoverable(&problem));
+            assert_eq!(limited.txn.mvars, original.txn.mvars);
+            assert_eq!(limited.txn.lctx, original.txn.lctx);
+        }
     }
 }

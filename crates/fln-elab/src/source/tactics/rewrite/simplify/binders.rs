@@ -31,6 +31,9 @@ impl Context {
         rule: &SimpRule<'_>,
         premises: &[SimpRule<'_>],
     ) -> Result<Option<(Typed, Expr, bool, SimpPlace)>, NatDefinitionElabError> {
+        if matches!(rule, SimpRule::Discharger(_)) {
+            return Ok(None);
+        }
         // A rewrite at a node is already chosen: one beneath a binder or by `+arith` comes later.
         let limited = self.simp_reach_limit.is_some();
         if matches!(rule, SimpRule::Ac) {

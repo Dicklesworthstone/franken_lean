@@ -728,6 +728,9 @@ struct Context {
     // their successful alternative. Outside speculation, ordinary final K1
     // admission retains its existing error boundary.
     attempt_depth: usize,
+    // Custom simp dischargers reenter the ordinary proof driver. Keep their
+    // host evaluator nesting bounded independently of the tactic worklist.
+    simp_discharge_depth: usize,
     // Host-owned generated trees nest only while their evaluator is alive.
     tactic_macro_depth: usize,
     // Term macro dispatch is active inside by proofs, including native tactics.
@@ -969,6 +972,7 @@ impl Context {
             source_scope: SourceScope::default(),
             diagnostic_declaration: None,
             attempt_depth: 0,
+            simp_discharge_depth: 0,
             tactic_macro_depth: 0,
             tactic_macro_terms: 0,
             application_syntax: pattern_typing::ApplicationSyntax::default(),
@@ -1091,7 +1095,18 @@ impl Context {
     }
 
     fn level(&mut self) -> Result<Level, NatDefinitionElabError> {
-        Ok(Level::mvar(LMVarId(self.fresh_name()?)))
+        let id = LMVarId(self.fresh_name()?);
+        self.txn.universes.register_fresh(id.clone());
+        Ok(Level::mvar(id))
+    }
+
+    fn assign_level(&mut self, id: LMVarId, level: Level) -> Result<(), NatDefinitionElabError> {
+        self.txn.universes.assign_scoped(id, level).map_err(|id| {
+            failure(SourceInferenceError::Unification(Box::new(
+                UnificationError::Deferred(UnificationDeferred::ReadOnlyUniverse(id)),
+            )))
+        })?;
+        Ok(())
     }
 
     fn type_expected(&mut self) -> Result<Expr, NatDefinitionElabError> {
@@ -6099,9 +6114,7 @@ impl Context {
         let mut parameters = Vec::with_capacity(order.len());
         for (index, id) in order.into_iter().enumerate() {
             let parameter = Name::str(Name::anonymous(), format!("u_{}", index + 1));
-            self.txn
-                .universes
-                .assign(id, Level::param(parameter.clone()));
+            self.assign_level(id, Level::param(parameter.clone()))?;
             parameters.push(parameter);
         }
         Ok(parameters)
