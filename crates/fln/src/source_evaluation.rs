@@ -46,6 +46,24 @@ pub(super) enum Entry {
     Evaluation,
 }
 
+pub(super) struct ElaboratedEvaluation {
+    pub declaration: Declaration,
+    pub presentation: Option<EvaluationResultPresentation>,
+    /// A private checked predecessor for this evaluation only. Source module
+    /// replay must not publish the derived helper or instance declarations.
+    pub deriving: Option<DeclarationBatchAdmission>,
+}
+
+impl ElaboratedEvaluation {
+    fn plain(declaration: Declaration, presentation: Option<EvaluationResultPresentation>) -> Self {
+        Self {
+            declaration,
+            presentation,
+            deriving: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct IoResultTypes {
     pub value: Expr,
@@ -199,7 +217,7 @@ pub(super) fn elaborate(
     options: &KVMap,
     limits: EngineExecutionLimits,
     presentation: EvaluationPresentation,
-) -> Result<Outcome<(Declaration, Option<EvaluationResultPresentation>)>, EngineExecutionError> {
+) -> Result<Outcome<ElaboratedEvaluation>, EngineExecutionError> {
     if presentation == EvaluationPresentation::Raw {
         return Ok(
             match source_records::elaboration_outcome(
@@ -211,7 +229,9 @@ pub(super) fn elaborate(
                     scope,
                 ),
             )? {
-                Outcome::Complete(declaration) => Outcome::Complete((declaration, None)),
+                Outcome::Complete(declaration) => {
+                    Outcome::Complete(ElaboratedEvaluation::plain(declaration, None))
+                }
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
             },
@@ -222,7 +242,7 @@ pub(super) fn elaborate(
     for (name, value) in scope.options.entries() {
         effective_scope.options.insert(name.clone(), value.clone());
     }
-    let prepared = match source_records::elaboration_outcome(
+    let mut prepared = match source_records::elaboration_outcome(
         fln_elab::source::evaluation::PreparedEvaluation::new(
             syntax,
             name,
@@ -241,58 +261,114 @@ pub(super) fn elaborate(
     // than letting an exposed world arrow infer a Reader instance. It validates
     // the original aliases before mapping can change their type spelling.
     if syntax.kind() == Some(&fln_parse_kind_guard()) {
-        return Ok(Outcome::Complete((
+        return Ok(Outcome::Complete(ElaboratedEvaluation::plain(
             prepared.into_raw(),
             Some(EvaluationResultPresentation::Guard),
         )));
     }
     let mut preparation = runtime::Preparation::new(engine.environment(), limits.ingress);
-    if let Some(action) = preparation
+    let action = preparation
         .evaluation_presentation_type(prepared.type_())
-        .map_err(EngineExecutionError::Ingress)?
-    {
-        use fln_elab::source::evaluation::PreparedIoEvaluation;
-        if presentation == EvaluationPresentation::PreferRaw
-            && preparation
-                .raw_evaluation_result_type(&action.value, true)
-                .map_err(EngineExecutionError::Ingress)?
-        {
-            return Ok(Outcome::Complete((prepared.into_raw(), None)));
-        }
-        return Ok(
-            match source_records::elaboration_outcome(
-                prepared.into_io_presentation(action.monad, action.value),
-            )? {
-                Outcome::Complete(PreparedIoEvaluation::Unit(declaration)) => {
-                    Outcome::Complete((declaration, Some(EvaluationResultPresentation::IoUnit)))
-                }
-                Outcome::Complete(PreparedIoEvaluation::Format(declaration)) => {
-                    Outcome::Complete((
-                        declaration,
-                        Some(EvaluationResultPresentation::IoFormat { width: 120 }),
-                    ))
-                }
-                Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
-                Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
-            },
-        );
-    }
+        .map_err(EngineExecutionError::Ingress)?;
+    let carrier = action
+        .as_ref()
+        .map_or_else(|| prepared.type_().clone(), |action| action.value.clone());
     if presentation == EvaluationPresentation::PreferRaw
         && preparation
-            .raw_evaluation_result_type(prepared.type_(), false)
+            .raw_evaluation_result_type(&carrier, action.is_some())
             .map_err(EngineExecutionError::Ingress)?
     {
-        return Ok(Outcome::Complete((prepared.into_raw(), None)));
+        return Ok(Outcome::Complete(ElaboratedEvaluation::plain(
+            prepared.into_raw(),
+            None,
+        )));
     }
-    Ok(
-        match source_records::elaboration_outcome(prepared.into_format())? {
-            Outcome::Complete(declaration) => Outcome::Complete((
-                declaration,
-                Some(EvaluationResultPresentation::Format { width: 120 }),
-            )),
-            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
-            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
-        },
+    let format = |prepared: &mut fln_elab::source::evaluation::PreparedEvaluation| {
+        use fln_elab::source::evaluation::PreparedIoEvaluation;
+        if let Some(action) = &action {
+            prepared
+                .io_presentation(action.monad.clone(), action.value.clone())
+                .map(|printed| match printed {
+                    PreparedIoEvaluation::Unit(declaration) => ElaboratedEvaluation::plain(
+                        declaration,
+                        Some(EvaluationResultPresentation::IoUnit),
+                    ),
+                    PreparedIoEvaluation::Format(declaration) => ElaboratedEvaluation::plain(
+                        declaration,
+                        Some(EvaluationResultPresentation::IoFormat { width: 120 }),
+                    ),
+                })
+        } else {
+            prepared.format().map(|declaration| {
+                ElaboratedEvaluation::plain(
+                    declaration,
+                    Some(EvaluationResultPresentation::Format { width: 120 }),
+                )
+            })
+        }
+    };
+    let missing = match format(&mut prepared) {
+        Ok(result) => return Ok(Outcome::Complete(result)),
+        Err(error) if missing_printer(&error) => error,
+        Err(error) => return source_records::elaboration_outcome(Err(error)),
+    };
+    let target =
+        match source_records::elaboration_outcome(prepared.automatic_deriving_target(&carrier))? {
+            Outcome::Complete(Some(target)) => target,
+            Outcome::Complete(None) => return source_records::elaboration_outcome(Err(missing)),
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+    let request = fln_elab::source::deriving::ExistingDeriving {
+        handlers: vec![Name::from_components(["_root_", "Repr"])],
+        targets: vec![target],
+        scope: effective_scope,
+    };
+    // The same generator, kernel/checker admission, instance registration and
+    // reducibility path as `deriving instance Repr for T`. Only this temporary
+    // successor sees it (`withoutModifyingEnv` in the pin's eval command).
+    let deriving = match engine.admit_existing_deriving(
+        &request,
+        None,
+        &request.scope.options,
+        limits.admission(),
+    ) {
+        Ok(Outcome::Complete(deriving)) => deriving,
+        Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
+        Ok(Outcome::InternalFault(fault)) => return Ok(Outcome::InternalFault(fault)),
+        Err(EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+            fln_elab::NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::Deriving(
+                    fln_elab::source::deriving::DerivingError::CannotDeriveRepr(_),
+                ),
+            ),
+        ))) => return source_records::elaboration_outcome(Err(missing)),
+        Err(error) => return Err(error),
+    };
+    match source_records::elaboration_outcome(
+        prepared.use_deriving_environment(deriving.engine.environment()),
+    )? {
+        Outcome::Complete(()) => {}
+        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+    }
+    // At most one deriving attempt. A recursive family uses the existing Repr
+    // handler, but missing printers for other field families cannot recurse
+    // into another fallback or hide a resource/internal failure.
+    source_records::elaboration_outcome(format(&mut prepared).map(|mut result| {
+        result.deriving = Some(deriving);
+        result
+    }))
+}
+
+fn missing_printer(error: &fln_elab::NatDefinitionElabError) -> bool {
+    matches!(
+        error,
+        fln_elab::NatDefinitionElabError::Inference(
+            fln_elab::source::SourceInferenceError::EvaluationPrinting(
+                fln_elab::source::evaluation::PrintingError::MissingPrinter
+            )
+        )
     )
 }
 

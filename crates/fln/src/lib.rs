@@ -4296,17 +4296,18 @@ impl Engine {
                     presentation,
                 )
                 .map(|outcome| {
-                    outcome.map_complete(|(declaration, presentation)| {
+                    outcome.map_complete(|evaluation| {
                         (
                             fln_elab::source::ElaboratedDeclaration {
-                                declaration,
+                                declaration: evaluation.declaration,
                                 auxiliary_declarations: Vec::new(),
                                 equation_info: None,
                                 local_functions: Vec::new(),
                                 irreducible: false,
                                 noncomputable: false,
                             },
-                            presentation,
+                            evaluation.presentation,
+                            evaluation.deriving,
                         )
                     })
                 })
@@ -4320,7 +4321,7 @@ impl Engine {
                 .map(|outcome| {
                     outcome.map_complete(|observed| {
                         traces = observed.traces;
-                        (observed.candidate, None)
+                        (observed.candidate, None, None)
                     })
                 })
             } else {
@@ -4343,7 +4344,7 @@ impl Engine {
                         });
                     }
                 })
-                .map(|outcome| outcome.map_complete(|declaration| (declaration, None)))
+                .map(|outcome| outcome.map_complete(|declaration| (declaration, None, None)))
             }
             .map_err(|error| {
                 batch_command_error(
@@ -4354,7 +4355,7 @@ impl Engine {
                     &scope,
                 )
             })?;
-            let (elaborated, evaluation_presentation) = match declaration {
+            let (elaborated, evaluation_presentation, evaluation_deriving) = match declaration {
                 Outcome::Complete(declaration) => declaration,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -4381,6 +4382,9 @@ impl Engine {
                     detail: "a noncomputable section declaration escaped its admission-only route",
                 });
             }
+            let evaluation_base = evaluation_deriving
+                .as_ref()
+                .map_or(&engine, |deriving| &deriving.engine);
             // `#eval` refuses an expression that depends on `sorry` before compiling or running it.
             // `#eval!` explicitly opts out of that check, retaining the same execution pipeline.
             // `#guard` evaluates through `evalExpr`, which has no such check
@@ -4395,7 +4399,7 @@ impl Engine {
                     Some(EvaluationResultPresentation::Guard)
                 )
                 && source_execution::evaluation_depends_on_sorry(
-                    &engine,
+                    evaluation_base,
                     std::iter::once(&declaration).chain(&local_functions),
                 )?
             {
@@ -4726,7 +4730,7 @@ impl Engine {
             } else {
                 None
             };
-            let invoked = engine.execute_definition_entry_with_helpers(
+            let invoked = evaluation_base.execute_definition_entry_with_helpers(
                 declaration,
                 &local_functions,
                 scoped_options.as_ref().unwrap_or(options),
@@ -4751,6 +4755,9 @@ impl Engine {
                     });
                 }
             };
+            if let Some(deriving) = evaluation_deriving {
+                execution.evaluation_auxiliaries = deriving.admissions;
+            }
             if let Some(finished) = captured {
                 evaluation_output_bytes = evaluation_output_bytes
                     .checked_add(finished.bytes.len())
@@ -6521,6 +6528,7 @@ impl Engine {
             flbc_artifact,
             exit,
             checker: admission.checker,
+            evaluation_auxiliaries: Vec::new(),
             local_functions: admission.admissions.into_iter().skip(1).collect(),
         }))
     }
@@ -7842,6 +7850,10 @@ pub struct DefinitionExecution {
     pub exit: VmExit,
     /// The independent checker observation that allowed the council to agree.
     pub checker: CheckerAgreement,
+    /// Checked printer helpers and dictionaries admitted before an automatic
+    /// `#eval` Repr fallback. Their successor belongs only to this execution;
+    /// source commands and module replay retain the original predecessor.
+    pub evaluation_auxiliaries: Vec<DeclarationAdmission>,
     /// Separate checked helper transitions, after the primary declaration.
     /// Empty for raw declaration execution; source APIs retain these receipts
     /// and the final engine only when the entire helper batch succeeds.

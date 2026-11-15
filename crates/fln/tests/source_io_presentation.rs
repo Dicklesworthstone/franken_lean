@@ -362,6 +362,71 @@ fn error_message(engine: &Engine, exit: &VmExit) -> String {
 }
 
 #[test]
+fn automatic_io_repr_is_checked_before_effects_and_retries_the_original_action_once() {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let Some(imported) = imported() else { return };
+            let engine = checked(
+                imported,
+                "structure AutoIoRecord where\n  flag : Bool\nstructure AutoIoOuter where\n  inner : IoMissingPrinter",
+            );
+            let options = KVMap::new();
+            let original = engine.logical_root(&options);
+            let directory = Directory::new("automatic-repr");
+            let output = directory.0.join("effects.txt");
+            std::fs::write(&output, b"").unwrap();
+            let action = |payload: &str, value: &str| {
+                format!(
+                    r#"#eval show IO {payload} from do
+  let h ← IO.FS.Handle.mk {} IO.FS.Mode.append
+  h.putStr "action\n"
+  return {value}"#,
+                    quoted(&output),
+                )
+            };
+            let source = action("AutoIoRecord", "AutoIoRecord.mk true");
+            let result = run(&engine, &source);
+            let execution = &result.batch.executions[0];
+            assert_format(execution, "{ flag := true }", None);
+            assert!(execution.evaluation_auxiliaries.len() >= 2);
+            assert_eq!(std::fs::read(&output).unwrap(), b"action\n");
+            assert_eq!(result.batch.engine.logical_root(&options), original);
+            let replayed = replay(execution);
+            assert_format(execution, "{ flag := true }", Some(&replayed));
+            assert_eq!(std::fs::read(&output).unwrap(), b"action\naction\n");
+
+            // One fallback cannot recursively derive a distinct field family.
+            // Failure occurs before opening the file or running any part of IO.
+            let failed = engine.execute_source_commands_with_presentation(
+                action("AutoIoOuter", "AutoIoOuter.mk IoMissingPrinter.mk").as_bytes(),
+                &options,
+                limits(),
+                EvaluationPresentation::Lean,
+            );
+            assert!(failed.is_err());
+            assert_eq!(std::fs::read(&output).unwrap(), b"action\naction\n");
+
+            let mut tiny = limits();
+            tiny.kernel.steps = 0;
+            let stopped = engine
+                .execute_source_commands_with_presentation(
+                    source.as_bytes(),
+                    &options,
+                    tiny,
+                    EvaluationPresentation::Lean,
+                )
+                .unwrap();
+            assert!(matches!(stopped, Outcome::Inconclusive(_)));
+            assert_eq!(std::fs::read(&output).unwrap(), b"action\naction\n");
+            assert_eq!(engine.logical_root(&options), original);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn admitted_io_printing_refuses_before_effects_and_skips_printers_on_exceptions() {
     use fln_elab::source::SourceInferenceError;
     use fln_elab::source::evaluation::PrintingError;
@@ -378,7 +443,7 @@ fn admitted_io_printing_refuses_before_effects_and_skips_printers_on_exceptions(
         let refused = |source: &str| engine.execute_source_commands_with_presentation(
             source.as_bytes(), &KVMap::new(), limits(), EvaluationPresentation::Lean,
         ).unwrap_err();
-        let missing = refused(&action("IoMissingPrinter", "IoMissingPrinter.mk"));
+        let missing = refused(&format!("set_option eval.derive.repr false in\n{}", action("IoMissingPrinter", "IoMissingPrinter.mk")));
         assert!(matches!(reason(&missing), SourceInferenceError::EvaluationPrinting(PrintingError::MissingPrinter)), "{missing:?}");
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged\n");
         let unresolved = refused(&action("Nat", "ioNeeds"));
@@ -488,7 +553,7 @@ fn admitted_io_printing_refuses_before_effects_and_skips_printers_on_exceptions(
             fln::EngineExecutionError::Ingress(fln::IngressError::UnsupportedNode { .. })));
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged\n");
         assert_eq!(foreign.logical_root(&KVMap::new()), foreign_root);
-        let failed_batch = refused("def IoMustNotEscape := 7\n#eval (pure 42 : IO Nat)\n#eval (pure IoMissingPrinter.mk : IO IoMissingPrinter)");
+        let failed_batch = refused("def IoMustNotEscape := 7\n#eval (pure 42 : IO Nat)\nset_option eval.derive.repr false in\n#eval (pure IoMissingPrinter.mk : IO IoMissingPrinter)");
         assert!(matches!(reason(&failed_batch), SourceInferenceError::EvaluationPrinting(PrintingError::MissingPrinter)));
         assert!(!engine.environment().contains(&name("IoMustNotEscape")));
         assert_eq!(engine.logical_root(&KVMap::new()), original);

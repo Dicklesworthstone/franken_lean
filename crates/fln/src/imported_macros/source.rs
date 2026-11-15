@@ -1856,7 +1856,7 @@ fn evaluate(
             &parsed.reconstruct_original(),
         )?);
         let name = crate::fresh_generated_command_name(engine.environment(), 0)?;
-        let (declaration, _) = match crate::source_evaluation::elaborate(
+        let evaluation = match crate::source_evaluation::elaborate(
             engine,
             parsed.syntax(),
             name,
@@ -1869,6 +1869,7 @@ fn evaluate(
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        let declaration = evaluation.declaration;
         if parsed.syntax().kind()
             != Some(&Name::from_components([
                 "Lean", "Parser", "Command", "evalBang",

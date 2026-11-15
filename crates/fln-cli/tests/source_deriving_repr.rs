@@ -150,14 +150,14 @@ fn installed_direct_record_evaluations_use_checked_printers_without_changing_raw
     // must withhold the entire report, including preceding valid evaluations.
     std::fs::write(
         &source,
-        format!("{program}\nstructure Bare where\n  value : Nat\n#eval Bare.mk 7\n"),
+        format!("{program}\nstructure Bare where\n  value : Nat\nset_option eval.derive.repr false in\n#eval Bare.mk 7\n"),
     )
     .unwrap();
     let failed = invoke("run", &source, &lib, &work);
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
     assert!(
-        String::from_utf8_lossy(&failed.stderr).contains("existing Repr or ToString"),
+        String::from_utf8_lossy(&failed.stderr).contains("could not synthesize a Repr or ToString"),
         "{failed:?}"
     );
     std::fs::write(&source, program).unwrap();
@@ -172,4 +172,111 @@ fn installed_direct_record_evaluations_use_checked_printers_without_changing_raw
             .1,
         report.split_once("\"declarationLogicalRoot\":").unwrap().1
     );
+}
+
+#[test]
+fn automatic_eval_repr_matches_the_pin_and_stays_private() {
+    let Some(lib) = pinned_lib() else { return };
+    let reference = lib
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join("bin/lean");
+    if !reference.is_file() {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "the pinned Reference executable is required",
+        );
+        eprintln!("SKIP: pinned Reference executable absent");
+        return;
+    }
+    let work = std::env::temp_dir().join(format!(
+        "fln-automatic-eval-repr-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::create_dir(&work).unwrap();
+    let header = "prelude\nimport Init.Data.Repr\nimport Init.Data.ToString.Basic\n";
+    let definitions = r#"
+structure AutoPoint where
+  x : Nat
+  y : Nat
+inductive AutoChain (A : Type) where
+  | nil
+  | cons (head : A) (tail : AutoChain A)
+inductive AutoVec (A : Type) : Nat → Type where
+  | nil : AutoVec A 0
+  | cons {n : Nat} (head : A) (tail : AutoVec A n) : AutoVec A (n + 1)
+inductive StringOnly where | mk
+instance : ToString StringOnly where
+  toString _ := "existing printer wins"
+"#;
+    let source = work.join("Accepted.lean");
+    std::fs::write(
+        &source,
+        format!(
+            "{header}{definitions}\n\
+             #eval AutoPoint.mk 3 4\n\
+             #eval AutoChain.cons 1 (AutoChain.cons 2 AutoChain.nil)\n\
+             #eval AutoVec.cons 7 AutoVec.nil\n\
+             #eval StringOnly.mk\n\
+             #eval AutoPoint.mk 5 6\n"
+        ),
+    )
+    .unwrap();
+    let pin = Command::new(&reference)
+        .arg("--threads=1")
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(pin.status.success(), "{pin:?}");
+    let run = |source: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_lean"))
+            .arg("--threads=1")
+            .arg(source)
+            .env("LEAN_PATH", &lib)
+            .env("FLN_IMPORT_REUSE_DIR", work.join("imports"))
+            .output()
+            .unwrap()
+    };
+    let ours = run(&source);
+    assert!(ours.status.success(), "{ours:?}");
+    assert_eq!(ours.stdout, pin.stdout);
+    assert_eq!(ours.stderr, pin.stderr);
+
+    // These failures distinguish a private one-shot fallback from installing
+    // a global instance, deriving every reachable field, or ignoring opt-out.
+    for (index, body) in [
+        "inductive PrivateRepr where | mk\n#eval PrivateRepr.mk\n#synth Repr PrivateRepr",
+        "structure Disabled where\n  value : Nat\nset_option eval.derive.repr false in\n#eval Disabled.mk 7",
+        "inductive NoFieldPrinter where | mk\nstructure Outer where\n  value : NoFieldPrinter\n#eval Outer.mk NoFieldPrinter.mk",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let source = work.join(format!("Refused{index}.lean"));
+        std::fs::write(&source, format!("{header}{body}\n")).unwrap();
+        let pin = Command::new(&reference)
+            .arg("--threads=1")
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert_eq!(pin.status.code(), Some(1), "{body}: {pin:?}");
+        let ours = run(&source);
+        // MissingPrinter retains the native capability classification (5),
+        // while a failed #synth is an elaboration failure (1). The pin uses 1
+        // for both; neither door may publish earlier evaluation output.
+        let expected_exit = if index == 0 { 1 } else { 5 };
+        assert_eq!(ours.status.code(), Some(expected_exit), "{body}: {ours:?}");
+        assert!(ours.stdout.is_empty(), "{body}: {ours:?}");
+        let diagnostic = String::from_utf8_lossy(&ours.stderr);
+        if index == 0 {
+            assert!(diagnostic.contains("Repr"), "{body}: {ours:?}");
+        } else {
+            assert!(
+                diagnostic.contains("could not synthesize a Repr or ToString instance"),
+                "{body}: {ours:?}",
+            );
+        }
+    }
 }

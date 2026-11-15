@@ -131,7 +131,7 @@ fn installed_runtime_evaluates_the_exposed_instance_body() {
     assert!(lean.stdout.is_empty());
     assert!(
         String::from_utf8_lossy(&lean.stderr)
-            .contains("#eval requires an existing Repr or ToString instance"),
+            .contains("#eval could not synthesize a Repr or ToString instance"),
         "{lean:?}"
     );
 }

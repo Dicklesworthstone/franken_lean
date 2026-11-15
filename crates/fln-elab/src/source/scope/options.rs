@@ -168,6 +168,13 @@ pub const ROWS: &[Row] = &[
     ),
     // Read by the elaborator's monad-lift coercion (`coercions/monad.rs`).
     row("autoLift", Bool(true), "Lean/Meta/Coe.lean:72", Honored),
+    // `#eval` may derive a checked Repr instance in its private evaluation world.
+    row(
+        "eval.derive.repr",
+        Bool(true),
+        "Lean/Elab/BuiltinEvalCommand.lean:34",
+        Honored,
+    ),
     // Read at command entry when isolating the presented evaluation's streams.
     row(
         "stderrAsMessages",

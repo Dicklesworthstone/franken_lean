@@ -3,6 +3,7 @@
 //! neither this candidate nor its selected dictionary grants admission.
 use super::*;
 use fln_core::options::DataValue;
+use fln_env::constants::ConstantInfo;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrintingError {
@@ -17,7 +18,7 @@ impl std::fmt::Display for PrintingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingPrinter => f.write_str(
-                "#eval requires an existing Repr or ToString instance; automatic printer derivation is not implemented",
+                "#eval could not synthesize a Repr or ToString instance for the result type",
             ),
             Self::MissingComponent(name) => write!(
                 f,
@@ -142,13 +143,14 @@ impl PreparedEvaluation {
 
     /// Use the pin's Init-level order: `repr value`, then
     /// `Std.Format.text (ToString.toString value)`. Each application retains
-    /// the original expression exactly once. Missing printers remain explicit
-    /// refusals; this does not silently derive or invent an instance.
-    pub fn into_format(mut self) -> Result<Declaration, NatDefinitionElabError> {
+    /// the original expression exactly once. A missing printer leaves the
+    /// original candidate and spent work available for one admitted deriving
+    /// attempt; no user expression has been executed.
+    pub fn format(&mut self) -> Result<Declaration, NatDefinitionElabError> {
         let result = self.format_value()?;
         self.context.check_compiled_recursors(&result)?;
         Ok(query_declaration(
-            self.name,
+            self.name.clone(),
             result,
             Vec::new(),
             self.safety,
@@ -160,8 +162,8 @@ impl PreparedEvaluation {
     /// exposed world-token arrow. This constructs ordinary `Functor.map` code;
     /// no action is executed during selection, and its original expression
     /// occurs exactly once in the resulting declaration.
-    pub fn into_io_presentation(
-        mut self,
+    pub fn io_presentation(
+        &mut self,
         monad: Expr,
         payload: Expr,
     ) -> Result<PreparedIoEvaluation, NatDefinitionElabError> {
@@ -193,7 +195,12 @@ impl PreparedEvaluation {
             if self.context.defeq_guarded(&payload, &unit.value)? {
                 // The pin's monadic Unit branch does not ask for any printer
                 // and ignores options that only affect a printed value.
-                return Ok(PreparedIoEvaluation::Unit(self.into_raw()));
+                return Ok(PreparedIoEvaluation::Unit(query_declaration(
+                    self.name.clone(),
+                    self.term.clone(),
+                    Vec::new(),
+                    self.safety,
+                )));
             }
         }
 
@@ -210,7 +217,14 @@ impl PreparedEvaluation {
             value: Expr::fvar(id.clone()),
             type_: payload.clone(),
         };
-        let printed = self.format_value()?;
+        let printed = self.format_value();
+        // A missing payload printer is resolved by the same single fallback
+        // as a pure result. Restore the action and local context even on that
+        // failure, so retrying cannot map the printer over its own temporary
+        // local or execute the action more than once.
+        self.context.txn.lctx = saved_locals;
+        self.term = original.clone();
+        let printed = printed?;
         let printer = Typed {
             value: Expr::lam(
                 Name::anonymous(),
@@ -231,9 +245,6 @@ impl PreparedEvaluation {
                 BinderInfo::Default,
             ),
         };
-        self.context.txn.lctx = saved_locals;
-        self.term = original.clone();
-
         let map_name = name("Functor.map");
         if !self.context.txn.env.contains(&map_name) {
             return Err(error(PrintingError::MissingComponent(map_name)));
@@ -259,11 +270,75 @@ impl PreparedEvaluation {
         self.context.flush(true)?;
         self.context.check_compiled_recursors(&result)?;
         Ok(PreparedIoEvaluation::Format(query_declaration(
-            self.name,
+            self.name.clone(),
             result,
             Vec::new(),
             self.safety,
         )))
+    }
+
+    /// The pin's `mkFormat` fallback derives only the outer inductive type;
+    /// missing printers of its fields are not recursively derived. The caller
+    /// must admit every generated helper and dictionary before retrying.
+    pub fn automatic_deriving_target(
+        &mut self,
+        carrier: &Expr,
+    ) -> Result<Option<deriving::DerivingTarget>, NatDefinitionElabError> {
+        if !self
+            .context
+            .txn
+            .options
+            .get_bool(&name("eval.derive.repr"), true)
+        {
+            return Ok(None);
+        }
+        // A prelude world may not contain even the Repr class. Derivation
+        // cannot manufacture its checked interface or borrow it from Init.
+        if !self.context.txn.env.contains(&name("Repr")) {
+            return Ok(None);
+        }
+        let carrier = self.context.whnf(carrier)?;
+        let mut head = &carrier;
+        while let ExprNode::App { f, .. } = head.node() {
+            self.context.tick()?;
+            head = f;
+        }
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(None);
+        };
+        if !matches!(
+            self.context.txn.env.find(name),
+            Some(ConstantInfo::Induct(_))
+        ) {
+            return Ok(None);
+        }
+        let structures = crate::records::imported::ImportedStructures::read(&self.context.txn.env)
+            .map_err(|reason| failure(SourceInferenceError::Record(reason)))?;
+        Ok(Some(deriving::DerivingTarget {
+            name: name.clone(),
+            is_record: structures.get(name).is_some(),
+        }))
+    }
+
+    /// Resume printer selection in the caller's checked successor. Keep the
+    /// original term, metavariables, options and spent work, including failed
+    /// printer searches. This does not admit the environment or any candidate.
+    pub fn use_deriving_environment(
+        &mut self,
+        environment: &Environment,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.context.txn.env = self
+            .context
+            .source_scope
+            .local_reducibility
+            .environment(environment)
+            .map_err(|reason| {
+                failure(SourceInferenceError::Unification(Box::new(
+                    UnificationError::Reducibility(reason),
+                )))
+            })?;
+        self.context.registry_cache = crate::instances::RegistryCache::default();
+        Ok(())
     }
 
     fn format_value(&mut self) -> Result<Typed, NatDefinitionElabError> {

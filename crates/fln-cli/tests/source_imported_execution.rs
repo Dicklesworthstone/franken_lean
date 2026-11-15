@@ -1878,7 +1878,7 @@ fn a_prelude_world_without_init_never_prints_an_eval() {
     assert!(
         refused
             .stderr
-            .contains("#eval requires an existing Repr or ToString instance"),
+            .contains("#eval could not synthesize a Repr or ToString instance"),
         "{refused:?}"
     );
 }

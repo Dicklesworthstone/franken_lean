@@ -118,6 +118,7 @@ fn checked_io_results_print_once_refuse_unprintable_actions_and_guard_their_outp
         format!(
             r#"{DEFINITIONS}inductive UnprintedIO where
   | value
+set_option eval.derive.repr false in
 #eval (show IO UnprintedIO from do
   IO.FS.writeFile {source_path} "must not write"
   let stream ← IO.getStdout
@@ -131,7 +132,7 @@ fn checked_io_results_print_once_refuse_unprintable_actions_and_guard_their_outp
     assert!(
         missing
             .stderr
-            .contains("requires an existing Repr or ToString instance"),
+            .contains("could not synthesize a Repr or ToString instance"),
         "{missing:?}"
     );
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserved");

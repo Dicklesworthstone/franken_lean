@@ -3,7 +3,7 @@
 use fln::source_check::modules::SourceModuleCheckLimits;
 use fln::source_check::modules::imported::{SourceOleanImport, SourceOleanImportLimits};
 use fln::{
-    Budget, Engine, EngineAdmissionLimits, Environment, KVMap, Name, OleanCheckLimits,
+    Budget, Declaration, Engine, EngineAdmissionLimits, Environment, KVMap, Name, OleanCheckLimits,
     OleanDecodeLimits, OleanFrontierJobs, OleanModuleInput, SourceCheckLimits, SourceModuleInput,
 };
 use fln_core::expr::{Expr, ExprNode};
@@ -1272,6 +1272,148 @@ def counted : Nat → Counted
 }
 
 #[test]
+fn evaluation_auto_derives_private_checked_printers_without_replacing_existing_instances() {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let Some(imported) = imported() else { return };
+            let engine = checked(
+                &imported.engine,
+                r#"
+structure AutoPoint where
+  x : Nat
+  y : Nat
+inductive AutoChain (A : Type) where
+  | nil
+  | cons (head : A) (tail : AutoChain A)
+inductive AutoVec (A : Type) : Nat → Type where
+  | nil : AutoVec A 0
+  | cons {n : Nat} (head : A) (tail : AutoVec A n) : AutoVec A (n + 1)
+inductive AutoStringOnly where | mk
+instance : ToString AutoStringOnly where
+  toString _ := "existing printer wins"
+def AutoAlias := AutoPoint
+"#,
+            );
+            let options = KVMap::new();
+            let original = engine.logical_root(&options);
+            let limits = fln::EngineExecutionLimits::for_user_program(admission().kernel);
+            let completed = engine
+                .execute_source_commands_with_presentation(
+                    br#"
+#eval AutoPoint.mk 3 4
+#eval AutoChain.cons 1 (AutoChain.cons 2 AutoChain.nil)
+#eval AutoVec.cons 7 AutoVec.nil
+#eval AutoStringOnly.mk
+#eval (show AutoAlias from AutoPoint.mk 5 6)
+#eval AutoPoint.mk 7 8
+"#,
+                    &options,
+                    limits,
+                    fln::EvaluationPresentation::Lean,
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            let expected = [
+                "{ x := 3, y := 4 }",
+                "AutoChain.cons 1 (AutoChain.cons 2 (AutoChain.nil))",
+                "AutoVec.cons 7 (AutoVec.nil)",
+                "existing printer wins",
+                "{ x := 5, y := 6 }",
+                "{ x := 7, y := 8 }",
+            ];
+            assert_eq!(completed.batch.executions.len(), expected.len());
+            for (index, (execution, expected)) in completed
+                .batch
+                .executions
+                .iter()
+                .zip(expected)
+                .enumerate()
+            {
+                assert_eq!(
+                    fln::source_format::render(execution, 120, Default::default()).unwrap(),
+                    expected,
+                );
+                if index == 3 {
+                    assert!(execution.evaluation_auxiliaries.is_empty());
+                } else {
+                    assert!(execution.evaluation_auxiliaries.len() >= 2);
+                    assert_eq!(
+                        execution.evaluation_auxiliaries[0].base_logical_root,
+                        original,
+                    );
+                    for helper in &execution.evaluation_auxiliaries {
+                        let Declaration::Defn(value) = &helper.declaration else {
+                            panic!("the Repr helper and dictionary are checked definitions");
+                        };
+                        assert!(execution.engine.environment().contains(&value.base.name));
+                        assert!(!completed.batch.engine.environment().contains(&value.base.name));
+                    }
+                }
+                // Printer definitions must be compiled into the retained artifact;
+                // replay has no elaborator or auto-derivation callback available.
+                let replay = fln::execute_flbc_artifact(
+                    &execution.flbc_artifact,
+                    &options,
+                    fln::FlbcExecutionLimits {
+                        codec: limits.flbc_codec,
+                        vm: limits.vm,
+                    },
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+                assert_eq!(
+                    fln::source_format::render_vm(
+                        execution.engine.environment(),
+                        &execution.runtime_type,
+                        &replay,
+                        120,
+                        Default::default(),
+                    )
+                    .unwrap(),
+                    expected,
+                );
+            }
+            assert!(completed.batch.source_admissions.is_empty());
+            assert_eq!(completed.batch.engine.logical_root(&options), original);
+            assert_eq!(engine.logical_root(&options), original);
+
+            // Deriving a result does not make it available to subsequent
+            // commands, even in the same source batch.
+            assert!(
+                engine
+                    .execute_source_commands_with_presentation(
+                        b"#eval AutoPoint.mk 1 2\n#synth Repr AutoPoint",
+                        &options,
+                        limits,
+                        fln::EvaluationPresentation::Lean,
+                    )
+                    .is_err()
+            );
+            let nested = checked(
+                &engine,
+                "inductive UnprintableField where | mk\nstructure Outer where\n  value : UnprintableField",
+            );
+            assert!(
+                nested
+                    .execute_source_commands_with_presentation(
+                        b"#eval Outer.mk UnprintableField.mk",
+                        &options,
+                        limits,
+                        fln::EvaluationPresentation::Lean,
+                    )
+                    .is_err(),
+                "automatic deriving must not recursively invent a field's printer",
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn lean_presentation_preserves_original_obligations_and_source_transactions() {
     use fln::source_check::modules::execution::SourceProgramLimits;
     use fln_elab::source::SourceInferenceError;
@@ -1305,7 +1447,7 @@ def needs [Need] : Bool := true
                 source, options, limits, fln::EvaluationPresentation::Lean,
             )
         };
-        let missing = run(b"#eval MissingPrinter.mk", &KVMap::new()).unwrap_err();
+        let missing = run(b"set_option eval.derive.repr false in\n#eval MissingPrinter.mk", &KVMap::new()).unwrap_err();
         assert!(matches!(reason(&missing), SourceInferenceError::EvaluationPrinting(
             PrintingError::MissingPrinter,
         )));
@@ -1319,7 +1461,7 @@ def needs [Need] : Bool := true
         assert!(matches!(reason(&width), SourceInferenceError::EvaluationPrinting(
             PrintingError::UnsupportedOption(option),
         ) if option == &name("format.width")));
-        assert!(run(b"#eval true\n#eval MissingPrinter.mk", &KVMap::new()).is_err());
+        assert!(run(b"#eval true\nset_option eval.derive.repr false in\n#eval MissingPrinter.mk", &KVMap::new()).is_err());
         assert_eq!(engine.logical_root(&KVMap::new()), original);
 
         // Receipts select instances in each actual module world and never
@@ -1355,7 +1497,7 @@ def needs [Need] : Bool := true
         let refusal = imported.execute_source_modules_with_presentation(
             &[SourceModuleInput {
                 name: &main,
-                source: b"prelude\nimport Init.Data.Repr\ninductive NoPrinter where | mk\n#eval NoPrinter.mk",
+                source: b"prelude\nimport Init.Data.Repr\ninductive NoPrinter where | mk\nset_option eval.derive.repr false in\n#eval NoPrinter.mk",
             }],
             &main, &KVMap::new(), SourceProgramLimits::new(limits), None,
             fln::EvaluationPresentation::Lean,
