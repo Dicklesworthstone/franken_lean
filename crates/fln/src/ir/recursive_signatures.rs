@@ -619,13 +619,16 @@ pub(super) fn parameters(
     logical: &Name,
     companion: &DefinitionVal,
     arity: usize,
-    environment: &crate::Environment,
+    executable_environment: &crate::Environment,
     ingress: fln_comp::ingress::IngressLimits,
     meter: &mut Budget,
 ) -> Result<Vec<bool>> {
     let mut analysis = Analysis {
         checks: SourceUses {
-            environment,
+            // These checks describe executable dependencies, including hidden
+            // imported operator bodies and their replacement journals. The
+            // caller retains the logical environment for source ABI carriers.
+            environment: executable_environment,
             arity,
             ingress,
             meter,

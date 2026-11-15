@@ -2,8 +2,9 @@
 //!
 //! FIR's `Constructor` carrier deliberately forgets the source family. Recover
 //! only facts proved by actual producers and calls: a case test is not evidence
-//! of exhaustiveness. Every parameter of an address-taken function stays unknown
-//! because an escaping closure can receive arguments outside this program.
+//! of exhaustiveness. A literal closure fixes its captured prefix; every slot
+//! left callable by any closure site stays unknown because an escaping closure
+//! can receive arguments outside this program.
 //!
 //! The monotone analysis visits every syntactic block, without guessing branch
 //! reachability. Bottom means no flow has arrived yet, not an impossible runtime
@@ -153,6 +154,14 @@ fn operation(
                 .len()
                 .checked_sub(captures.len())
                 .ok_or_else(|| invariant("constructor flow capture arity"))?;
+            for (index, argument) in captures.iter().enumerate() {
+                let argument = value(functions, caller, *argument, meter)?;
+                let parameter = functions
+                    .get_mut(target)
+                    .and_then(|function| function.values.get_mut(index))
+                    .ok_or_else(|| invariant("constructor flow capture parameter"))?;
+                *changed |= parameter.join(&argument, meter)?;
+            }
             let mut targets = Vec::new();
             targets
                 .try_reserve_exact(1)
@@ -189,13 +198,27 @@ fn operation(
                     let mut applied = Fact::Bottom;
                     for target in targets {
                         meter.charge(1)?;
-                        // Only a fully saturated literal target supplies a
-                        // result fact. Partial and staged overapplication keep
-                        // their existing unconstrained export behavior.
-                        if target.remaining != args.len() {
+                        // Partial application preserves the literal target and
+                        // its remaining arity. Application does not narrow the
+                        // target's inputs; full saturation uses its summary.
+                        // Overapplication can enter a returned closure, so it
+                        // grants no target or constructor evidence here.
+                        if target.remaining < args.len() {
                             return Ok(Fact::Unknown);
                         }
-                        let returned = result(functions, target.function, meter)?;
+                        let returned = if target.remaining == args.len() {
+                            result(functions, target.function, meter)?
+                        } else {
+                            let mut remaining = Vec::new();
+                            remaining
+                                .try_reserve_exact(1)
+                                .map_err(|_| CompileError::Allocation)?;
+                            remaining.push(Target {
+                                function: target.function,
+                                remaining: target.remaining - args.len(),
+                            });
+                            Fact::Closures(remaining)
+                        };
                         applied.join(&returned, meter)?;
                     }
                     Ok(applied)
@@ -215,21 +238,33 @@ pub(super) fn parameters(
     meter: &mut Budget,
 ) -> Result<Vec<Vec<ConstructorTags>>> {
     meter.charge(program.functions().len())?;
-    let mut exposed = Vec::new();
-    exposed
+    let mut exposed_from = Vec::new();
+    exposed_from
         .try_reserve_exact(program.functions().len())
         .map_err(|_| CompileError::Allocation)?;
-    exposed.resize(program.functions().len(), false);
-    *exposed
+    exposed_from.extend(
+        program
+            .functions()
+            .iter()
+            .map(|function| function.parameters.len()),
+    );
+    *exposed_from
         .get_mut(program.entry().get() as usize)
-        .ok_or_else(|| invariant("constructor flow entry"))? = true;
+        .ok_or_else(|| invariant("constructor flow entry"))? = 0;
     for function in program.functions() {
         for binding in function.blocks.iter().flat_map(|block| &block.bindings) {
             meter.charge(1)?;
-            if let fir::Operation::Closure { function, .. } = binding.operation {
-                *exposed
+            if let fir::Operation::Closure {
+                function, captures, ..
+            } = &binding.operation
+            {
+                // Different sites may capture different prefixes of the same
+                // target. Any slot exposed by even one site remains unknown,
+                // regardless of facts joined from the other sites' captures.
+                let exposed = exposed_from
                     .get_mut(function.get() as usize)
-                    .ok_or_else(|| invariant("constructor flow exposed target"))? = true;
+                    .ok_or_else(|| invariant("constructor flow exposed target"))?;
+                *exposed = (*exposed).min(captures.len());
             }
         }
     }
@@ -255,7 +290,7 @@ pub(super) fn parameters(
             .map_err(|_| CompileError::Allocation)?;
         values.resize_with(count, || Fact::Bottom);
         for (index, ty) in function.parameters.iter().enumerate() {
-            if exposed[function.id.get() as usize]
+            if index >= exposed_from[function.id.get() as usize]
                 || !matches!(ty, fir::ValueType::Constructor | fir::ValueType::Closure(_))
             {
                 values[index] = Fact::Unknown;

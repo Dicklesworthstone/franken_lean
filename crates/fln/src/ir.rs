@@ -2647,7 +2647,10 @@ fn checked_recursive_companion(
     logical: &Name,
     engine_limits: crate::EngineExecutionLimits,
     meter: &mut Budget,
-) -> std::result::Result<Option<fln_env::constants::DefinitionVal>, DefinitionCompileError> {
+) -> std::result::Result<
+    Option<(fln_env::constants::DefinitionVal, crate::Environment)>,
+    DefinitionCompileError,
+> {
     meter.charge(1).map_err(DefinitionCompileError::Ir)?;
     let mut ingress = engine_limits.ingress;
     ingress.max_nodes = ingress
@@ -2672,7 +2675,11 @@ fn checked_recursive_companion(
             "mutual recursive source exports",
         )));
     }
-    Ok(companion)
+    // ReduceArity's operation checks need the same complete, checked bodies
+    // that selected this companion. Public imported headers can deliberately
+    // hide those models. Reuse the already bounded overlay; never publish it
+    // into the logical source environment or weaken native model validation.
+    Ok(companion.map(|definition| (definition, runtime.environment)))
 }
 
 /// A module may omit only the exact checked companion of a logical declaration
@@ -2693,7 +2700,7 @@ pub(crate) fn is_checked_recursive_companion(
     let mut meter = Budget(limits.max_work);
     Ok(
         checked_recursive_companion(engine, &companion.parent(), engine_limits, &mut meter)?
-            .is_some_and(|definition| &definition.base.name == companion),
+            .is_some_and(|(definition, _)| &definition.base.name == companion),
     )
 }
 
@@ -2884,7 +2891,9 @@ pub(crate) fn compile_checked_source_definition(
         )));
     }
     let mut recursive_uses = None;
-    if let Some(companion) = checked_recursive_companion(engine, name, engine_limits, &mut meter)? {
+    if let Some((companion, executable_environment)) =
+        checked_recursive_companion(engine, name, engine_limits, &mut meter)?
+    {
         if noncomputable.contains(&companion.base.name) {
             return Err(DefinitionCompileError::Ir(unsupported(
                 "noncomputable recursive source companion",
@@ -2908,7 +2917,7 @@ pub(crate) fn compile_checked_source_definition(
                     name,
                     &companion,
                     arity,
-                    engine.environment(),
+                    &executable_environment,
                     engine_limits.ingress,
                     &mut meter,
                 )

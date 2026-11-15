@@ -220,6 +220,88 @@ partial def stringBool (s : String) : Bool := stringBool s
 }
 
 #[test]
+fn recursive_source_uses_keep_checked_hidden_operator_models_and_metadata_guards() {
+    use fln_env::constants::AxiomVal;
+    let private = checked(
+        r#"partial def hiddenAdd (n total : Nat) : Nat :=
+  if n == 0 then total else hiddenAdd (n - 1) (total + 2)
+partial def hiddenDrop (n ignored : Nat) : Nat :=
+  if n == 0 then 7 else hiddenDrop (n - 1) (ignored + 0)
+"#,
+    );
+    let hidden = name("Nat.add");
+    let mut public = crate::Environment::new();
+    for (label, declaration) in private.environment().constants() {
+        public = if label == &hidden {
+            assert!(matches!(declaration, ConstantInfo::Defn(_)));
+            public
+                .add_decl(ConstantInfo::Axiom(AxiomVal {
+                    base: declaration.constant_val().clone(),
+                    is_unsafe: false,
+                }))
+                .unwrap()
+        } else {
+            public
+                .with_entry(private.environment().entry(label).unwrap())
+                .unwrap()
+        };
+    }
+    for (journal, state) in private.environment().extensions() {
+        public = public.register_extension(state.descriptor.clone()).unwrap();
+        for entry in state.entries() {
+            public = public
+                .push_extension_entry(journal, std::sync::Arc::clone(&entry.payload))
+                .unwrap();
+        }
+    }
+    public = public.with_imported_metadata_validation(private.environment());
+    let engine = Engine::from_environment(public.clone())
+        .with_checked_runtime_imports(public.clone(), &private);
+    let options = KVMap::new();
+    let original = engine.logical_root(&options);
+    for (label, reduced) in [("hiddenAdd", false), ("hiddenDrop", true)] {
+        let module = export(&engine, label)
+            .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+            .into_complete()
+            .unwrap();
+        assert_eq!(
+            module
+                .decls
+                .iter()
+                .any(|decl| decl.name() == &Name::str(name(label), "_redArg")),
+            reduced
+        );
+        assert_eq!(engine.logical_root(&options), original);
+    }
+    assert!(matches!(
+        engine.environment().find(&hidden),
+        Some(ConstantInfo::Axiom(_))
+    ));
+    // A header alone never grants the complete operator contract, and a local
+    // executable replacement must remain visible through the checked overlay.
+    assert_unsupported(&Engine::from_environment(public.clone()), "hiddenAdd");
+    let replaced = fln_elab::implemented_by::register(&public, &hidden, &name("Nat.sub")).unwrap();
+    let replaced =
+        Engine::from_environment(replaced).with_checked_runtime_imports(public.clone(), &private);
+    assert_unsupported(&replaced, "hiddenAdd");
+    let mut bounded = execution_limits();
+    bounded.ingress.max_nodes = 0;
+    assert!(matches!(
+        compile_checked_source_definition(
+            &engine,
+            &name("hiddenAdd"),
+            &options,
+            bounded,
+            CompileLimits::default(),
+        ),
+        Err(DefinitionCompileError::Engine(
+            crate::EngineExecutionError::Ingress(IngressError::ResourceLimit { .. })
+        ))
+    ));
+    assert_eq!(engine.logical_root(&options), original);
+}
+
+#[test]
 fn source_recursion_exports_checked_enum_carriers_and_reduced_entries() {
     let engine = checked(ENUM_RECURSION);
     let before = engine.environment().clone();
