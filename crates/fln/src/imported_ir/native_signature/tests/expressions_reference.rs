@@ -6,7 +6,7 @@ use crate::imported_ir::EntryArgument;
 use std::path::PathBuf;
 use std::process::Command;
 
-const TARGETS: [&str; 12] = [
+const TARGETS: [&str; 16] = [
     "Lean.Expr.data",
     "Lean.Expr.mkData",
     "Lean.Expr.mkAppData",
@@ -16,6 +16,10 @@ const TARGETS: [&str; 12] = [
     "Lean.Expr.instantiate1",
     "Lean.Expr.instantiate",
     "Lean.Expr.instantiateRev",
+    "Lean.Expr.instantiateRange",
+    "Lean.Expr.instantiateRevRange",
+    "Lean.Expr.abstract",
+    "Lean.Expr.abstractRange",
     "Lean.Expr.replaceImpl",
     "Lean.Expr.findImpl?",
     "Lean.Expr.findExtImpl?",
@@ -250,6 +254,17 @@ fn live_pinned_expr_primitives_preserve_binders_arrays_data_and_boxed_calls() {
     }
     // Ordinary find still inspects the partial application skipped by findExt.
     cases.push(("findPartialApplication", vec![7]));
+    for captured in [0, 1] {
+        cases.push(("abstractBinders", vec![7, 0, 0, captured]));
+        for count in [0, 1, 2, 3, 4, 100, 1_u64 << 32, u64::MAX] {
+            cases.push(("abstractBinders", vec![7, count, 1, captured]));
+        }
+        for reverse in [0, 1] {
+            for (begin, end) in [(0, 0), (0, 4), (1, 3), (2, 4), (4, 4)] {
+                cases.push(("rangeOrder", vec![17, begin, end, reverse, captured]));
+            }
+        }
+    }
     let mut oracle_source = source.to_owned();
     for (entry, args) in &cases {
         oracle_source.push_str(&format!("\n#eval NativeExpr.{entry}"));
@@ -326,6 +341,110 @@ fn live_pinned_expr_primitives_preserve_binders_arrays_data_and_boxed_calls() {
             observed.contains(&format!("extern:{target}")),
             "{target} not linked by actual user IR"
         );
+    }
+}
+
+#[test]
+fn imported_expr_binder_primitives_link_execute_and_replay_without_toolchain_bodies() {
+    for abstract_target in ["Lean.Expr.abstract", "Lean.Expr.abstractRange"] {
+        for (instantiate_target, expected) in [
+            ("Lean.Expr.instantiateRange", "2917"),
+            ("Lean.Expr.instantiateRevRange", "1729"),
+        ] {
+            for captured in [false, true] {
+                let mut stmts = vec![
+                    num(1, 0),
+                    num(2, 1),
+                    num(3, 2),
+                    num(4, 3),
+                    call(5, "Lean.Expr.fvar._override", &[1]),
+                    call(6, "Lean.Expr.mvar._override", &[1]),
+                    call(7, "Lean.Expr.app._override", &[5, 6]),
+                    call(8, "Array.emptyWithCapacity", &[1]),
+                    call(9, "Array.push", &[8, 5]),
+                    call(10, "Array.push", &[9, 6]),
+                ];
+                let abstract_args = if abstract_target == "Lean.Expr.abstract" {
+                    vec![7, 10]
+                } else {
+                    vec![7, 3, 10]
+                };
+                if captured {
+                    stmts.extend([
+                        bind(
+                            11,
+                            IrExpr::Pap {
+                                function: name(abstract_target),
+                                args: abstract_args[..abstract_args.len() - 1]
+                                    .iter()
+                                    .copied()
+                                    .map(var)
+                                    .collect(),
+                            },
+                        ),
+                        bind(
+                            12,
+                            IrExpr::Ap {
+                                x: 11,
+                                args: vec![var(10)],
+                            },
+                        ),
+                    ]);
+                } else {
+                    stmts.push(call(12, abstract_target, &abstract_args));
+                }
+                stmts.extend([
+                    num(13, 17),
+                    num(14, 29),
+                    call(15, "Lean.Expr.bvar._override", &[13]),
+                    call(16, "Lean.Expr.bvar._override", &[14]),
+                    call(17, "Array.push", &[8, 5]), // Prefix is outside the selected range.
+                    call(18, "Array.push", &[17, 15]),
+                    call(19, "Array.push", &[18, 16]),
+                    call(20, "Array.push", &[19, 6]), // Suffix is outside the selected range.
+                ]);
+                if captured {
+                    stmts.extend([
+                        bind(
+                            21,
+                            IrExpr::Pap {
+                                function: name(instantiate_target),
+                                args: vec![var(12), var(2), var(4)],
+                            },
+                        ),
+                        bind(
+                            22,
+                            IrExpr::Ap {
+                                x: 21,
+                                args: vec![var(20)],
+                            },
+                        ),
+                    ]);
+                } else {
+                    stmts.push(call(22, instantiate_target, &[12, 2, 4, 20]));
+                }
+                stmts.extend([
+                    bind(23, IrExpr::Proj { i: 0, x: 22 }),
+                    bind(24, IrExpr::Proj { i: 1, x: 22 }),
+                    bind(25, IrExpr::Proj { i: 0, x: 23 }),
+                    bind(26, IrExpr::Proj { i: 0, x: 24 }),
+                    num(27, 100),
+                    call(28, "Nat.mul", &[25, 27]),
+                    call(29, "Nat.add", &[28, 26]),
+                ]);
+                let compiled = compile_declarations(vec![entry(stmts, 29)])
+                    .unwrap_or_else(|error| panic!("{abstract_target}, {instantiate_target}, captured={captured}: {error:?}"));
+                assert_nat(&compiled, expected);
+                for target in [abstract_target, instantiate_target] {
+                    assert!(
+                        compiled
+                            .native_externs()
+                            .contains(&format!("extern:{target}"))
+                    );
+                }
+                assert_eq!(compiled.reference_functions()[0].name, name("Arity.main"));
+            }
+        }
     }
 }
 

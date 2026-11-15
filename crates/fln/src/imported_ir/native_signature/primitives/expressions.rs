@@ -67,6 +67,40 @@ pub(super) fn review(row: &GeneratedExternRow) -> Option<Review> {
                 &[IrType::Object, IrType::Object],
                 &IrType::Object,
             ),
+            "extern:Lean.Expr.instantiateRange" => (
+                "Lean.Expr.instantiateRange",
+                "lean_expr_instantiate_range",
+                &[
+                    IrType::Object,
+                    IrType::TObject,
+                    IrType::TObject,
+                    IrType::Object,
+                ],
+                &IrType::Object,
+            ),
+            "extern:Lean.Expr.instantiateRevRange" => (
+                "Lean.Expr.instantiateRevRange",
+                "lean_expr_instantiate_rev_range",
+                &[
+                    IrType::Object,
+                    IrType::TObject,
+                    IrType::TObject,
+                    IrType::Object,
+                ],
+                &IrType::Object,
+            ),
+            "extern:Lean.Expr.abstract" => (
+                "Lean.Expr.abstract",
+                "lean_expr_abstract",
+                &[IrType::Object, IrType::Object],
+                &IrType::Object,
+            ),
+            "extern:Lean.Expr.abstractRange" => (
+                "Lean.Expr.abstractRange",
+                "lean_expr_abstract_range",
+                &[IrType::Object, IrType::TObject, IrType::Object],
+                &IrType::Object,
+            ),
             "extern:Lean.Expr.replaceImpl" => (
                 "Lean.Expr.replaceImpl",
                 "lean_replace_expr",

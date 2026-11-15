@@ -1,7 +1,7 @@
 use super::*;
 use crate::interpreter::{ExecutionLimits, VmExit, execute_function};
 use fln_comp::flbc::{self, ArgumentOwnership, CallableResultOwnership, ResultOwnership};
-use fln_core::expr::{BinderInfo, Literal, NatLit};
+use fln_core::expr::{BinderInfo, FVarId, Literal, MVarId, NatLit};
 use fln_core::name::Name;
 use fln_core::outcome::Outcome;
 
@@ -469,6 +469,316 @@ fn native_expr_substitution_orders_and_binder_depth_are_observable() {
         let result = call(row, &[closed.clone_ref(), Obj::mk_array(vec![])]);
         assert_eq!(result.identity_token(), closed.identity_token());
     }
+}
+
+#[test]
+fn native_expr_range_substitution_uses_only_the_selected_slice_in_both_orders() {
+    let body = Expr::lam(
+        Name::anonymous(),
+        bvar(0),
+        Expr::app(bvar(0), Expr::app(bvar(1), Expr::app(bvar(2), bvar(3)))),
+        BinderInfo::InstImplicit,
+    );
+    let carrier = object(body.clone());
+    let replacements = Obj::mk_array(vec![
+        object(literal(99)),
+        object(bvar(4)),
+        object(bvar(8)),
+        object(literal(77)),
+    ]);
+    for (row, first, second) in [
+        ("extern:Lean.Expr.instantiateRange", 4, 8),
+        ("extern:Lean.Expr.instantiateRevRange", 8, 4),
+    ] {
+        let result = call(
+            row,
+            &[
+                carrier.clone_ref(),
+                Obj::mk_nat(1),
+                Obj::mk_nat(3),
+                replacements.clone_ref(),
+            ],
+        );
+        assert_eq!(
+            expression(&result),
+            Expr::lam(
+                Name::anonymous(),
+                bvar(first),
+                Expr::app(
+                    bvar(0),
+                    Expr::app(bvar(first + 1), Expr::app(bvar(second + 1), bvar(1)))
+                ),
+                BinderInfo::InstImplicit,
+            )
+        );
+        let unchanged = call(
+            row,
+            &[
+                carrier.clone_ref(),
+                Obj::mk_nat(4),
+                Obj::mk_nat(4),
+                replacements.clone_ref(),
+            ],
+        );
+        assert_eq!(unchanged.identity_token(), carrier.identity_token());
+        for (begin, end) in [(3, 2), (0, 5), (5, 5)] {
+            assert!(matches!(
+                execute(
+                    row,
+                    &[
+                        carrier.clone_ref(),
+                        Obj::mk_nat(begin),
+                        Obj::mk_nat(end),
+                        replacements.clone_ref()
+                    ]
+                ),
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::ArrayIndexOutOfBounds { .. },
+                    ..
+                })
+            ));
+        }
+        for endpoints in [
+            [Obj::mk_mpz(&[0, 1], false), Obj::mk_nat(4)],
+            [Obj::mk_nat(0), Obj::mk_mpz(&[0, 1], false)],
+            [Obj::mk_mpz(&[1], true), Obj::mk_nat(4)],
+        ] {
+            assert!(matches!(
+                execute(
+                    row,
+                    &[
+                        carrier.clone_ref(),
+                        endpoints[0].clone_ref(),
+                        endpoints[1].clone_ref(),
+                        replacements.clone_ref()
+                    ]
+                ),
+                Outcome::Complete(VmExit::Refused { .. })
+            ));
+        }
+    }
+    assert_eq!(expression(&carrier), body);
+    assert_eq!(expression(&replacements.array_child(1)), bvar(4));
+}
+
+#[test]
+fn native_expr_abstract_distinguishes_variable_kinds_and_rightmost_duplicates() {
+    let id = Name::from_components(["same", "id"]);
+    let free = Expr::fvar(FVarId(id.clone()));
+    let meta = Expr::mvar(MVarId(id));
+    let other = Expr::fvar(FVarId(Name::from_components(["other"])));
+    let input = Expr::app(
+        Expr::app(free.clone(), meta.clone()),
+        Expr::app(other.clone(), bvar(7)),
+    );
+    let variables = Obj::mk_array(vec![
+        object(free.clone()),
+        object(bvar(11)), // Non-variables still occupy a position.
+        object(meta.clone()),
+        object(free.clone()),
+    ]);
+    let carrier = object(input.clone());
+    let whole = call(
+        "extern:Lean.Expr.abstract",
+        &[carrier.clone_ref(), variables.clone_ref()],
+    );
+    assert_eq!(
+        expression(&whole),
+        Expr::app(
+            Expr::app(bvar(0), bvar(1)),
+            Expr::app(other.clone(), bvar(7))
+        )
+    );
+    for (count, expected_free, expected_meta) in [
+        (0, free.clone(), meta.clone()),
+        (1, bvar(0), meta.clone()),
+        (2, bvar(1), meta.clone()),
+        (3, bvar(2), bvar(0)),
+        (4, bvar(0), bvar(1)),
+        (1_usize << 32, bvar(0), bvar(1)),
+    ] {
+        let result = call(
+            "extern:Lean.Expr.abstractRange",
+            &[
+                carrier.clone_ref(),
+                Obj::mk_nat(count),
+                variables.clone_ref(),
+            ],
+        );
+        assert_eq!(
+            expression(&result),
+            Expr::app(
+                Expr::app(expected_free, expected_meta),
+                Expr::app(other.clone(), bvar(7))
+            )
+        );
+        if count == 0 {
+            assert_eq!(result.identity_token(), carrier.identity_token());
+        }
+    }
+    assert_eq!(
+        expression(&call(
+            "extern:Lean.Expr.abstractRange",
+            &[
+                carrier.clone_ref(),
+                Obj::mk_mpz(&[0, 1], false),
+                variables.clone_ref()
+            ]
+        )),
+        expression(&whole)
+    );
+    assert_eq!(expression(&carrier), input);
+    assert_eq!(expression(&variables.array_child(0)), free);
+}
+
+#[test]
+fn native_expr_abstract_tracks_all_binders_and_preserves_unmodified_shared_fields() {
+    let free = Expr::fvar(FVarId(Name::from_components(["x"])));
+    let meta = Expr::mvar(MVarId(Name::from_components(["m"])));
+    let unchanged = Expr::app(literal(3), literal(5));
+    let shared = Expr::app(free.clone(), meta.clone());
+    let input = Expr::app(
+        shared.clone(),
+        Expr::lam(
+            Name::from_components(["lambda"]),
+            shared.clone(),
+            Expr::forall_e(
+                Name::anonymous(),
+                shared.clone(),
+                Expr::let_e(
+                    Name::from_components(["let"]),
+                    shared.clone(),
+                    unchanged,
+                    Expr::app(shared.clone(), shared),
+                    true,
+                ),
+                BinderInfo::StrictImplicit,
+            ),
+            BinderInfo::InstImplicit,
+        ),
+    );
+    let carrier = object(input);
+    let result = call(
+        "extern:Lean.Expr.abstract",
+        &[
+            carrier.clone_ref(),
+            Obj::mk_array(vec![object(free.clone()), object(meta.clone())]),
+        ],
+    );
+    let original_lambda = carrier.try_ctor_child(1).unwrap();
+    let lambda = result.try_ctor_child(1).unwrap();
+    assert_eq!(
+        result.try_ctor_child(0).unwrap().identity_token(),
+        lambda.try_ctor_child(1).unwrap().identity_token(),
+        "the same subtree at the same binder depth stays shared"
+    );
+    assert_eq!(
+        lambda.try_ctor_child(0).unwrap().identity_token(),
+        original_lambda.try_ctor_child(0).unwrap().identity_token(),
+        "binder names retain their original objects"
+    );
+    let forall = lambda.try_ctor_child(2).unwrap();
+    let let_expr = forall.try_ctor_child(2).unwrap();
+    let original_let = original_lambda
+        .try_ctor_child(2)
+        .unwrap()
+        .try_ctor_child(2)
+        .unwrap();
+    assert_eq!(
+        let_expr.try_ctor_child(2).unwrap().identity_token(),
+        original_let.try_ctor_child(2).unwrap().identity_token()
+    );
+    for (object, depth) in [
+        (result.try_ctor_child(0).unwrap(), 0),
+        (forall.try_ctor_child(1).unwrap(), 1),
+        (let_expr.try_ctor_child(1).unwrap(), 2),
+        (
+            let_expr
+                .try_ctor_child(3)
+                .unwrap()
+                .try_ctor_child(0)
+                .unwrap(),
+            3,
+        ),
+    ] {
+        assert_eq!(expression(&object), Expr::app(bvar(depth + 1), bvar(depth)));
+    }
+    let body = let_expr.try_ctor_child(3).unwrap();
+    assert_eq!(
+        body.try_ctor_child(0).unwrap().identity_token(),
+        body.try_ctor_child(1).unwrap().identity_token()
+    );
+    assert_eq!(
+        expression(&call(
+            "extern:Lean.Expr.instantiateRev",
+            &[result, Obj::mk_array(vec![object(free), object(meta)])]
+        )),
+        expression(&carrier),
+        "abstraction and reverse instantiation round-trip closed free/meta variables"
+    );
+}
+
+#[test]
+fn native_expr_abstract_rejects_malformed_operands_and_bounds_binder_contexts() {
+    let free = Expr::fvar(FVarId(Name::from_components(["x"])));
+    let carrier = object(free.clone());
+    for (row, args) in [
+        (
+            "extern:Lean.Expr.abstract",
+            vec![carrier.clone_ref(), Obj::mk_nat(0)],
+        ),
+        (
+            "extern:Lean.Expr.abstract",
+            vec![carrier.clone_ref(), Obj::mk_array(vec![Obj::mk_nat(0)])],
+        ),
+        (
+            "extern:Lean.Expr.abstractRange",
+            vec![
+                carrier.clone_ref(),
+                Obj::mk_mpz(&[1], true),
+                Obj::mk_array(vec![carrier.clone_ref()]),
+            ],
+        ),
+    ] {
+        assert!(matches!(
+            execute(row, &args),
+            Outcome::Complete(VmExit::Refused { .. })
+        ));
+    }
+    let root = object(Expr::app(
+        free.clone(),
+        Expr::lam(
+            Name::anonymous(),
+            literal(0),
+            free.clone(),
+            BinderInfo::Default,
+        ),
+    ));
+    let mut conversion = Conversion::new();
+    let checked = conversion.check_expr(&root).unwrap();
+    assert!(matches!(
+        abstract_variables(
+            &checked,
+            &[free],
+            &mut conversion,
+            &mut WorkBudget {
+                allowed: 5,
+                visited: 0
+            }
+        ),
+        Err(IntrinsicFailure::MirrorResource {
+            resource: "expression traversal nodes",
+            ..
+        })
+    ));
+    assert!(matches!(
+        Intrinsic::Abstract.invoke_bounded(
+            "extern:Lean.Expr.abstract",
+            &[carrier.clone_ref(), Obj::mk_array(vec![carrier])],
+            1
+        ),
+        Err(IntrinsicFailure::MirrorResource { .. })
+    ));
 }
 
 #[test]

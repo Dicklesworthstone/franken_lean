@@ -189,4 +189,36 @@ namespace NativeExpr
 @[noinline] def findPartialApplication (n : Nat) : Nat :=
   optionFingerprint (Expr.findImpl? partialApplication (searchTree n 0))
 
+@[noinline, nospecialize] def useSubstitution
+    (f : Array Expr → Expr) (xs : Array Expr) : Expr := f xs
+
+@[noinline] def abstractBinders (n count ranged captured : Nat) : Nat :=
+  let name := Name.num .anonymous n
+  let x := Expr.fvar ⟨name⟩
+  let m := Expr.mvar ⟨name⟩
+  let xs := #[x, Expr.bvar 11, m, x]
+  let e := Expr.lam name x
+    (.forallE .anonymous m
+      (.letE name x (.app m x)
+        (.mdata ⟨[(name, .ofNat n)]⟩ (.proj name 2 (.app (.bvar 0) (.app x m))))
+        true) .strictImplicit) .instImplicit
+  let result := if ranged == 0 then
+      if captured == 0 then e.abstract xs else useSubstitution e.abstract xs
+    else
+      if captured == 0 then e.abstractRange count xs
+      else useSubstitution (e.abstractRange count) xs
+  fingerprint result
+
+@[noinline] def rangeOrder (n beginIdx endIdx reverse captured : Nat) : Nat :=
+  let e := Expr.lam .anonymous (.bvar 0)
+    (.app (.bvar 0) (.app (.bvar 1) (.app (.bvar 2) (.bvar 3)))) .implicit
+  let xs := #[Expr.bvar 99, Expr.bvar n, Expr.bvar (n + 10), Expr.bvar 77]
+  let result := if reverse == 0 then
+      if captured == 0 then e.instantiateRange beginIdx endIdx xs
+      else useSubstitution (e.instantiateRange beginIdx endIdx) xs
+    else
+      if captured == 0 then e.instantiateRevRange beginIdx endIdx xs
+      else useSubstitution (e.instantiateRevRange beginIdx endIdx) xs
+  fingerprint result
+
 end NativeExpr
