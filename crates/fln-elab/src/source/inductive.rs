@@ -419,6 +419,20 @@ struct Header<'a> {
     ctors: &'a [Syntax],
 }
 
+/// The pin's source-level heuristic is independent of kernel validity. The
+/// bootstrap option permits an inductive's universe to range over both Prop
+/// and Type; it does not grant large elimination or apply to structures.
+fn check_resulting_universe(scope: &SourceScope, level: &Level) -> bool {
+    !level.has_mvar()
+        && (!scope.options.get_bool(
+            &Name::from_components(["bootstrap", "inductiveCheckResultingUniverse"]),
+            true,
+        ) || {
+            let level = level.normalize_fixpoint();
+            level.is_zero() || level.is_never_zero()
+        })
+}
+
 fn header<'a>(
     syntax: &'a Syntax,
     env: &Environment,
@@ -562,9 +576,7 @@ fn header<'a>(
     };
     context.txn.lctx = parameter_context;
     let provisional = explicit.clone().unwrap_or_else(Level::one);
-    if (!provisional.is_never_zero() && !provisional.normalize_fixpoint().is_zero())
-        || provisional.has_mvar()
-    {
+    if !check_resulting_universe(&scope, &provisional) {
         return Err(failure(SourceInferenceError::Inductive(
             InductiveError::UnsupportedSort,
         )));

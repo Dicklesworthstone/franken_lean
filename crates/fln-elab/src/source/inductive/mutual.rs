@@ -205,13 +205,10 @@ pub(in crate::source) fn elaborate_mutual(
     let mut explicit = None::<Level>;
     for h in &headers {
         if let Some(level) = &h.explicit {
-            let normalized = level.normalize_fixpoint();
-            // `checkResultingUniversePolymorphism` in the pin's source
-            // elaborator permits Prop or a definitely nonzero universe by
-            // default. Kernel-level generation also supports Sort u, but that
-            // does not enable the separate bootstrap option in source files.
-            if level.has_mvar()
-                || (!normalized.is_zero() && !normalized.is_never_zero())
+            // The bootstrap option changes only the source heuristic. All
+            // members still need the same result universe, and the mutual
+            // generator retains Prop-only elimination when it may be zero.
+            if !check_resulting_universe(scope, level)
                 || explicit
                     .as_ref()
                     .is_some_and(|other| other.normalize_fixpoint() != level.normalize_fixpoint())

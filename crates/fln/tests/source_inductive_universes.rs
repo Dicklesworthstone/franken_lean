@@ -240,3 +240,149 @@ fn universe_equality_cannot_hide_wrong_carriers_false_proofs_or_small_results() 
         .into_complete()
         .unwrap();
 }
+
+#[test]
+fn prelude_punit_bootstraps_from_an_empty_environment_with_the_pins_option() {
+    // Init/Prelude.lean uses precisely this option for its first inductive.
+    // Start without the source seed so PUnit cannot come from an imported world.
+    let base = Engine::from_environment(fln::Environment::new());
+    let root = base.logical_root(&KVMap::new());
+    let source = "universe u\n\
+        set_option bootstrap.inductiveCheckResultingUniverse false in\n\
+        inductive PUnit : Sort u where\n  | unit : PUnit\n\
+        def propUnit : PUnit.{0} := PUnit.unit\n\
+        def typeUnit : PUnit.{1} := PUnit.unit\n";
+    let checked = base
+        .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+        .unwrap_or_else(|error| panic!("Prelude PUnit bootstrap: {error:?}"))
+        .into_complete()
+        .expect("PUnit and both instantiations pass both checkers");
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    let environment = checked.engine.environment();
+    let family = environment.find(&Name::from_components(["PUnit"])).unwrap();
+    assert_eq!(
+        family.constant_val().level_params,
+        [Name::from_components(["u"])]
+    );
+    assert_eq!(
+        family.constant_val().type_,
+        fln_core::expr::Expr::sort(Level::param(Name::from_components(["u"])))
+    );
+    let fln_env::constants::ConstantInfo::Rec(rec) = environment
+        .find(&Name::from_components(["PUnit", "rec"]))
+        .unwrap()
+    else {
+        panic!("PUnit.rec must be a checked recursor");
+    };
+    assert_eq!(rec.base.level_params.len(), 2, "singleton eliminates large");
+    assert!(!rec.k, "Sort u is not syntactically Prop");
+}
+
+#[test]
+fn sort_polymorphic_inductives_keep_the_pins_elimination_restrictions() {
+    let source = "universe u\n\
+        set_option bootstrap.inductiveCheckResultingUniverse false\n\
+        inductive SortEmpty : Sort u\n\
+        inductive SortUnit : Sort u where | unit\n\
+        inductive SortChoice : Sort u where | left | right\n\
+        inductive SortBox (A : Sort u) : Sort u where | mk (value : A)\n";
+    let checked = Engine::with_source_seed(limits().admission)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+        .unwrap_or_else(|error| panic!("Sort-polymorphic families: {error:?}"))
+        .into_complete()
+        .expect("generated recursors pass both checking engines");
+    for (name, large) in [
+        ("SortEmpty", true),
+        ("SortUnit", true),
+        ("SortChoice", false),
+        ("SortBox", false),
+    ] {
+        let fln_env::constants::ConstantInfo::Rec(rec) = checked
+            .engine
+            .environment()
+            .find(&Name::from_components([name, "rec"]))
+            .unwrap()
+        else {
+            panic!("missing checked recursor for {name}");
+        };
+        assert_eq!(
+            rec.base.level_params.len(),
+            if large { 2 } else { 1 },
+            "{name}"
+        );
+        assert!(!rec.k, "Sort-polymorphic {name} cannot enable K reduction");
+        let mut telescope = &rec.base.type_;
+        for _ in 0..rec.num_params {
+            let ExprNode::ForallE { body, .. } = telescope.node() else {
+                panic!("{name} is missing a parameter");
+            };
+            telescope = body;
+        }
+        let ExprNode::ForallE { binder_type, .. } = telescope.node() else {
+            panic!("{name} is missing its motive");
+        };
+        let mut motive = binder_type;
+        while let ExprNode::ForallE { body, .. } = motive.node() {
+            motive = body;
+        }
+        let ExprNode::Sort { level } = motive.node() else {
+            panic!("{name}'s motive must end in a sort");
+        };
+        assert_eq!(
+            level,
+            &if large {
+                Level::param(rec.base.level_params[0].clone())
+            } else {
+                Level::zero()
+            },
+            "{name} elimination universe"
+        );
+    }
+    // A Type instantiation does not retroactively grant a polymorphic
+    // recursor large elimination: its motive was fixed when it was declared.
+    for source in [
+        "noncomputable def bad (x : SortChoice.{1}) : Nat := @SortChoice.rec (fun _ => Nat) 0 1 x",
+        "noncomputable def bad (x : SortBox.{1} Nat) : Nat := @SortBox.rec Nat (fun _ => Nat) (fun n => n) x",
+    ] {
+        assert!(
+            checked
+                .engine
+                .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "illegal large elimination accepted: {source}"
+        );
+    }
+}
+
+#[test]
+fn bootstrap_option_is_scoped_and_never_disables_structural_or_universe_checks() {
+    let base = Engine::with_source_seed(limits().admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "universe u\ninductive Bad : Sort u where | unit",
+        "universe u\nset_option bootstrap.inductiveCheckResultingUniverse true\ninductive Bad : Sort u where | unit",
+        "universe u\nset_option bootstrap.inductiveCheckResultingUniverse false in\ninductive Allowed : Sort u where | unit\ninductive Bad : Sort u where | unit",
+        "universe u\nsection\nset_option bootstrap.inductiveCheckResultingUniverse false\ninductive Allowed : Sort u where | unit\nend\ninductive Bad : Sort u where | unit",
+        "universe u\nset_option bootstrap.inductiveCheckResultingUniverse false\nset_option bootstrap.inductiveCheckResultingUniverse true\ninductive Bad : Sort u where | unit",
+        "universe u\nset_option bootstrap.inductiveCheckResultingUniverse false\nstructure Bad (A : Sort u) : Sort u where\n  value : A",
+        "universe u\nset_option bootstrap.inductiveCheckResultingUniverse false\ninductive Bad : Sort u where | mk (large : Type u)",
+        "universe u\nset_option bootstrap.inductiveCheckResultingUniverse false\ninductive Bad : Sort u where | mk (negative : Bad -> Nat)",
+        "set_option bootstrap.inductiveCheckResultingUniverse 0\ninductive Bad where | unit",
+    ] {
+        let result = base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits());
+        assert!(
+            !matches!(result, Ok(fln::Outcome::Complete(_))),
+            "invalid bootstrap source admitted: {source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root, "{source}");
+        assert!(!base.environment().contains(&Name::from_components(["Bad"])));
+    }
+    // Recovery uses the unchanged base and the option changes no ordinary data rules.
+    check("inductive Recovered : Type where | unit");
+}

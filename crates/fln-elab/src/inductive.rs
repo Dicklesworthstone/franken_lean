@@ -279,7 +279,7 @@ fn build_inductive(
         return Err(InductiveError::ResourceLimit);
     }
     let proposition = spec.result_level.normalize_fixpoint().is_zero();
-    if spec.result_level.has_mvar() || (!proposition && !spec.result_level.is_never_zero()) {
+    if spec.result_level.has_mvar() {
         return Err(InductiveError::UnsupportedSort);
     }
     if let Some(universes) = field_universes
@@ -291,11 +291,12 @@ fn build_inductive(
     {
         return Err(InductiveError::InvalidTelescope);
     }
-    // KR-700/701: data and empty predicates eliminate large. A singleton
-    // predicate does too iff every data field occurs verbatim in its indices.
-    // Proof fields need not appear there; an existential witness cannot be
-    // recovered merely because it occurs inside a compound index expression.
-    let large = if !proposition || spec.constructors.is_empty() {
+    // KR-700/701 (`elim_only_at_universe_zero`): a universe that MAY be Prop
+    // has the same elimination restrictions as Prop, even at a later Type
+    // instantiation. Empty families eliminate large; singleton families do
+    // iff every data field occurs verbatim in the indices. Proof fields need
+    // not appear there; compound index occurrences cannot expose a witness.
+    let large = if spec.result_level.is_never_zero() || spec.constructors.is_empty() {
         true
     } else if let [ctor] = spec.constructors.as_slice() {
         let mut allowed = true;

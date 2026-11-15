@@ -505,6 +505,50 @@ fn source_rejects_possibly_zero_result_universes_under_the_pins_default_options(
 }
 
 #[test]
+fn bootstrap_option_admits_mutual_sort_polymorphism_without_large_elimination() {
+    let e = engine();
+    let source = format!(
+        "set_option bootstrap.inductiveCheckResultingUniverse false\n{POSSIBLY_PROP}\
+        def carried (A : Sort u) (a : A) : Reach A := Reach.here a\n"
+    );
+    let checked = e
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap_or_else(|error| panic!("bootstrap mutual families: {error:?}"))
+        .into_complete()
+        .expect("both checking engines admit the mutual family and definition");
+    for name in ["Reach.rec", "Step.rec"] {
+        let Some(fln_env::constants::ConstantInfo::Rec(rec)) =
+            checked.engine.environment().find(&n(name))
+        else {
+            panic!("missing {name}");
+        };
+        assert_eq!(rec.base.level_params, [n("u")]);
+        assert_eq!(rec.num_motives, 2);
+        assert!(!rec.k);
+    }
+    let source = POSSIBLY_PROP.replacen(
+        "mutual",
+        "set_option bootstrap.inductiveCheckResultingUniverse false in\nmutual",
+        1,
+    );
+    check(&e, &source);
+    let restored = format!("{source}\ninductive Forbidden : Sort u where | unit");
+    assert!(
+        e.check_source_files(
+            &[restored.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .is_err(),
+        "a mutual command's local option leaked"
+    );
+}
+
+#[test]
 fn mutual_predicates_refuse_mixed_sorts_and_large_elimination_atomically() {
     let e = engine();
     let root = e.logical_root(&KVMap::new());

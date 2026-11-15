@@ -129,6 +129,15 @@ use Policy::*;
 /// The table, in one place. `maxRecDepth`'s default is `defaultMaxRecDepth`, 512
 /// (`Init/Prelude.lean`).
 pub const ROWS: &[Row] = &[
+    // Read by source inductive headers. This disables only the elaborator's
+    // Sort-polymorphism heuristic; constructor and recursor admission still
+    // run through both checkers, and structures keep their stricter rule.
+    row(
+        "bootstrap.inductiveCheckResultingUniverse",
+        Bool(true),
+        "Lean/Elab/MutualInductive.lean:57",
+        Honored,
+    ),
     // Read by source reducibility attributes; bypasses the pin's status validation.
     row(
         "allowUnsafeReducibility",
@@ -1046,6 +1055,7 @@ mod tests {
         assert_eq!(
             honored,
             [
+                "bootstrap.inductiveCheckResultingUniverse",
                 "allowUnsafeReducibility",
                 "simprocs",
                 "tactic.skipAssignedInstances",
