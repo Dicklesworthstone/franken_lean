@@ -2043,89 +2043,22 @@ impl Context {
             let goal = self.renamed_proof_goal(proof, goal, names)?;
             self.goal_tags.remove(&goal.id);
             self.start_goal_control(proof, goal, body, control::Mode::Solve)?;
-        } else if kind == &parser_kind(&["Tactic", "case"]) {
-            // `"case " sepBy1(caseArg, " | ") " => " tacticSeq` (`evalCase`, vendored
-            // src/Lean/Elab/Tactic/BuiltinTactic.lean): the goal the tag selects, renamed and
-            // untagged, must be closed by the body; the others keep their order.
+        } else if kind == &parser_kind(&["Tactic", "case"])
+            || kind == &parser_kind(&["Tactic", "case'"])
+        {
+            // Each tag selects and renames its own goal when its turn begins. `case`
+            // closes each selected goal; `case'` accumulates the remaining goals, keeping
+            // their order and restoring the selected tag when a run leaves one goal.
+            // See `evalCase` / `evalCase'` in Lean/Elab/Tactic/BuiltinTactic.lean.
+            let prime = kind == &parser_kind(&["Tactic", "case'"]);
+            let word = if prime { "case'" } else { "case" };
             let [keyword, cases, arrow, body] = args.as_slice() else {
                 return Err(error(TacticError::MalformedScript));
             };
-            expect_atom(keyword, "case", "case keyword")?;
+            expect_atom(keyword, word, "case keyword")?;
             expect_atom(arrow, "=>", "case arrow")?;
-            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "case"])?;
-            // The body runs once per `tag | tag`; only one tag is run here.
-            let [case] = expect_null_args(cases, "case arguments")? else {
-                return Err(error(TacticError::UnsupportedTactic(kind.clone())));
-            };
-            let [tag, names] = expect_node(
-                case,
-                &parser_kind(&["Tactic", "caseArg"]),
-                2,
-                "case argument",
-            )?
-            else {
-                return Err(error(TacticError::MalformedScript));
-            };
-            let names = expect_null_args(names, "case names")?;
-            let goal = self.case_goal(proof, goal, tag)?;
-            let goal = self.renamed_proof_goal(proof, goal, names)?;
-            self.goal_tags.remove(&goal.id);
-            self.start_goal_control(proof, goal, body, control::Mode::Solve)?;
-        } else if kind == &parser_kind(&["Tactic", "case'"]) {
-            // `"case' " sepBy1(caseArg, " | ") " => " tacticSeq` (`evalCase'`, vendored
-            // src/Lean/Elab/Tactic/BuiltinTactic.lean): for each tag in turn, the goal it
-            // selects among those no earlier tag took, renamed, runs the body alone, and a
-            // run leaving exactly one goal gives it that tag; what each run leaves comes
-            // first, in order, then the other goals. Unlike `case`, the body need not close
-            // its goal, and the tag is kept.
-            let [keyword, cases, arrow, body] = args.as_slice() else {
-                return Err(error(TacticError::MalformedScript));
-            };
-            expect_atom(keyword, "case'", "case' keyword")?;
-            expect_atom(arrow, "=>", "case' arrow")?;
-            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "case'"])?;
-            let mut tags = Vec::new();
-            for (index, case) in expect_null_args(cases, "case' arguments")?
-                .iter()
-                .enumerate()
-            {
-                if index % 2 == 1 {
-                    expect_atom(case, "|", "case' separator")?;
-                    continue;
-                }
-                let [tag, names] = expect_node(
-                    case,
-                    &parser_kind(&["Tactic", "caseArg"]),
-                    2,
-                    "case' argument",
-                )?
-                else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                tags.push((tag, expect_null_args(names, "case' names")?));
-            }
-            if let [(tag, names)] = tags.as_slice() {
-                let goal = self.case_goal(proof, goal, tag)?;
-                let goal = self.renamed_proof_goal(proof, goal, names)?;
-                self.start_case_prime_focus(proof, goal, body)?;
-            } else {
-                // The tags are selected first, as the runs do not change the other goals'
-                // tags; renaming would have to wait for each run, so names are refused.
-                if tags.is_empty() || tags.iter().any(|(_, names)| !names.is_empty()) {
-                    return Err(error(TacticError::UnsupportedTactic(kind.clone())));
-                }
-                let count = tags.len();
-                let goal = self.reorder_visible_goals(proof, goal, kind, |this, mut goals| {
-                    let mut selected = Vec::new();
-                    for (tag, _) in &tags {
-                        let index = this.case_tag_position(&goals, tag)?;
-                        selected.push(goals.remove(index));
-                    }
-                    selected.extend(goals);
-                    Ok(selected)
-                })?;
-                self.start_limited_all_goals(proof, goal, body, count)?;
-            }
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", word])?;
+            self.start_case_control(proof, goal, cases, body, prime)?;
         } else if kind == &parser_kind(&["Tactic", "rotateLeft"])
             || kind == &parser_kind(&["Tactic", "rotateRight"])
         {

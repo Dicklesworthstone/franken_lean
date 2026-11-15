@@ -68,6 +68,103 @@ fn all_goals_returns_new_goals_without_mapping_over_them_again() {
 }
 
 #[test]
+fn multi_case_runs_the_body_on_each_selected_goal() {
+    for selectors in ["left | right", "right | left", "_ | _"] {
+        check(&format!(
+            "{BOTH}theorem pair (P Q : Prop) (p : P) (q : Q) : Both P Q := by\n  constructor\n  case {selectors} => assumption"
+        ));
+    }
+    // Each run is strict: a later tactic cannot complete a case body that left a goal.
+    reject(&format!(
+        "{BOTH}theorem bad (P : Prop) : Both (P -> P) (P -> P) := by\n  constructor\n  case left | right => intro h\n  all_goals exact h"
+    ));
+    reject(&format!(
+        "{BOTH}theorem bad : Both (0 = 0) (0 = 1) := by\n  constructor\n  case left | right => rfl"
+    ));
+}
+
+#[test]
+fn multi_case_renames_each_constructor_context_independently() {
+    let choice = "inductive Choice where | a (n : Nat) | b (n : Nat)\n";
+    check(&format!(
+        "{choice}theorem same (x : Choice) : x = x := by\n  cases x\n  case a n | b n =>\n    guard_hyp n : Nat\n    rfl"
+    ));
+    check(&format!(
+        "{choice}theorem same (x : Choice) : x = x := by\n  cases x\n  case b m | a n => first | (guard_hyp m : Nat; rfl) | (guard_hyp n : Nat; rfl)"
+    ));
+    reject(&format!(
+        "{choice}theorem bad (x : Choice) : x = x := by\n  cases x\n  case a n | b n extra => rfl"
+    ));
+}
+
+#[test]
+fn multi_case_prime_retains_per_case_names_and_tags() {
+    check(
+        "inductive Choice where | a (n : Nat) | b (n : Nat)\ntheorem same (x : Choice) : x = x := by\n  cases x\n  case' b m | a n => skip\n  case a =>\n    guard_hyp n : Nat\n    fail_if_success guard_hyp m : Nat\n    rfl\n  case b =>\n    guard_hyp m : Nat\n    fail_if_success guard_hyp n : Nat\n    rfl",
+    );
+}
+
+#[test]
+fn multi_case_prime_returns_new_goals_in_selector_order() {
+    check(&format!(
+        "{BOTH}theorem pair : Both (forall n : Nat, n = n) (forall b : Bool, b = b) := by\n  constructor\n  case' right | left => intro x\n  guard_hyp x : Bool\n  rfl\n  guard_hyp x : Nat\n  rfl"
+    ));
+    // The wildcard selects the next unprocessed original goal, not the preceding run's
+    // newly introduced goal. A singleton result regains the original case tag.
+    check(&format!(
+        "{BOTH}theorem pair : Both (forall n : Nat, n = n) (forall b : Bool, b = b) := by\n  constructor\n  case' _ | _ => intro x\n  case right => guard_hyp x : Bool; rfl\n  case left => guard_hyp x : Nat; rfl"
+    ));
+}
+
+#[test]
+fn multi_case_prime_keeps_each_produced_frontier_before_unselected_siblings() {
+    check(&format!(
+        "{BOTH}theorem nested (P Q R : Prop) (p : P) (q : Q) (r : R) : Both (Both P Q) (Both R P) := by\n  constructor\n  case' right | left => constructor\n  exact r\n  exact p\n  exact p\n  exact q"
+    ));
+    check(&format!(
+        "{BOTH}theorem nested (P Q R : Prop) (p : P) (q : Q) (r : R) : Both (Both P Q) R := by\n  constructor\n  case' left => constructor\n  exact p\n  exact q\n  exact r"
+    ));
+}
+
+#[test]
+fn multi_case_selectors_cannot_revisit_a_finished_or_deferred_case() {
+    for word in ["case", "case'"] {
+        let body = if word == "case" { "exact p" } else { "skip" };
+        let source = format!(
+            "{BOTH}theorem bad (P : Prop) (p : P) : Both P P := by\n  constructor\n  {word} left | left => {body}\n  all_goals exact p"
+        );
+        let error = run(&source).expect_err("the first run removes the selected case");
+        assert!(error.contains("CaseTagNotFound"), "{source}\n{error}");
+    }
+}
+
+#[test]
+fn multi_case_selectors_observe_assignments_from_earlier_runs() {
+    // Reflexivity for `h` determines the witness `w`. Selecting `w` afterwards must fail,
+    // even though it was an unsolved goal when the whole case tactic began.
+    for word in ["case", "case'"] {
+        let source = format!(
+            "theorem bad : Exists (fun n : Nat => n = 0) := by\n  refine Exists.intro ?w ?h\n  {word} h | w => first | rfl | exact 0"
+        );
+        let error = run(&source).expect_err("a later tag cannot select an assigned goal");
+        assert!(error.contains("CaseTagNotFound"), "{source}\n{error}");
+    }
+    check(
+        "theorem witness : Exists (fun n : Nat => n = 0) := by\n  refine Exists.intro ?w ?h\n  case h => rfl",
+    );
+}
+
+#[test]
+fn failed_multi_case_attempt_restores_earlier_goal_assignments() {
+    check(&format!(
+        "{BOTH}theorem pair (P : Prop) (p : P) : Both P P := by\n  constructor\n  first\n  | case left | missing => exact p\n  | case right | left => exact p"
+    ));
+    check(
+        "inductive Choice where | a (n : Nat) | b (n : Nat)\ntheorem same (x : Choice) : x = x := by\n  cases x\n  first\n  | case a renamed | b renamed extra => rfl\n  | case a n | b n => guard_hyp n : Nat; rfl",
+    );
+}
+
+#[test]
 fn any_goals_preserves_failed_goals_and_maps_only_the_original_frontier() {
     // These programs were accepted by pinned Lean 4.32.0 on 2026-11-14.
     check(&format!(

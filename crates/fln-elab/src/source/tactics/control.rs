@@ -90,6 +90,12 @@ fn components(name: &Name) -> Vec<Name> {
 }
 
 #[derive(Clone)]
+struct Case<'a> {
+    tag: &'a Syntax,
+    names: &'a [Syntax],
+}
+
+#[derive(Clone)]
 pub(super) struct Frame<'a> {
     mode: Mode,
     body: Vec<&'a Syntax>,
@@ -111,6 +117,9 @@ pub(super) struct Frame<'a> {
     // A `case'` frame: the tag of the goal its current run started on, which a run leaving
     // exactly one goal gives that goal (`evalCase'`'s `g'.setTag mvarTag`).
     retag: Option<Option<Name>>,
+    // A case body runs once per selector. Select from the remaining original frontier
+    // after the previous body finishes: it may have assigned another goal indirectly.
+    cases: Option<std::collections::VecDeque<Case<'a>>>,
     // `any_goals` checks each original goal in its own transactional attempt.
     // A successful no-op counts; a failed run restores that goal and all its effects.
     attempt_pending: bool,
@@ -175,6 +184,15 @@ impl Context {
         goal: ProofGoal,
         tag: &Syntax,
     ) -> Result<ProofGoal, NatDefinitionElabError> {
+        proof.work.push(Work::Goal(goal));
+        self.take_case_goal(proof, tag)
+    }
+
+    fn take_case_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        tag: &Syntax,
+    ) -> Result<ProofGoal, NatDefinitionElabError> {
         let [tag] = expect_node(
             tag,
             &Name::from_components(["Lean", "binderIdent"]),
@@ -184,9 +202,9 @@ impl Context {
         else {
             return Err(error(TacticError::MalformedScript));
         };
-        let tag = match tag {
-            Syntax::Ident { val, .. } => val.erase_macro_scopes(),
-            hole if hole.kind() == Some(&parser_kind(&["Term", "hole"])) => return Ok(goal),
+        let wanted = match tag {
+            Syntax::Ident { val, .. } => Some(val.erase_macro_scopes()),
+            hole if hole.kind() == Some(&parser_kind(&["Term", "hole"])) => None,
             _ => return Err(error(TacticError::MalformedScript)),
         };
         let tag_of = |this: &Self, id: &MVarId| {
@@ -198,8 +216,9 @@ impl Context {
                     .unwrap_or_else(Name::anonymous),
             )
         };
-        // The main goal, then the frontier down to the first barrier; `None` is the main goal.
-        let mut visible = vec![(None, tag_of(self, &goal.id))];
+        // The original frontier down to the first barrier. Unfinished goals from earlier
+        // case' runs stay in the frame's deferred list, so cannot be selected again here.
+        let mut visible = Vec::new();
         for (index, work) in proof.work.iter().enumerate().rev() {
             self.tick()?;
             match work {
@@ -208,31 +227,103 @@ impl Context {
                 | Work::EndAttempt(_)
                 | Work::EndOptions(_) => break,
                 Work::Goal(other) if !self.txn.mvars.is_assigned(&other.id) => {
-                    visible.push((Some(index), tag_of(self, &other.id)));
+                    if wanted.is_none() {
+                        visible.push((index, Vec::new()));
+                        break;
+                    }
+                    visible.push((index, tag_of(self, &other.id)));
                 }
                 _ => {}
             }
         }
-        let wanted = components(&tag);
-        let found = visible
-            .iter()
-            .position(|(_, tags)| *tags == wanted)
-            .or_else(|| visible.iter().position(|(_, tags)| tags.ends_with(&wanted)))
-            .or_else(|| {
-                visible
-                    .iter()
-                    .position(|(_, tags)| tags.starts_with(&wanted))
-            })
-            .ok_or_else(|| error(TacticError::CaseTagNotFound(tag)))?;
-        let Some(index) = visible[found].0 else {
-            return Ok(goal);
+        let found = if let Some(tag) = wanted {
+            let wanted = components(&tag);
+            visible
+                .iter()
+                .position(|(_, tags)| *tags == wanted)
+                .or_else(|| visible.iter().position(|(_, tags)| tags.ends_with(&wanted)))
+                .or_else(|| {
+                    visible
+                        .iter()
+                        .position(|(_, tags)| tags.starts_with(&wanted))
+                })
+                .ok_or_else(|| error(TacticError::CaseTagNotFound(tag)))?
+        } else if visible.is_empty() {
+            return Err(no_goals(Some(tag)));
+        } else {
+            0
         };
-        let Work::Goal(selected) = proof.work.remove(index) else {
+        let Work::Goal(selected) = proof.work.remove(visible[found].0) else {
             return Err(error(TacticError::MalformedScript));
         };
-        // The main goal stays first among the goals that remain.
-        proof.work.push(Work::Goal(goal));
         Ok(selected)
+    }
+
+    /// `case` and `case'` share sequential tag selection and per-goal renaming. Keep
+    /// earlier case' results outside the selectable frontier until every selector has run.
+    pub(super) fn start_case_control<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goal: ProofGoal,
+        syntax: &'a Syntax,
+        body: &'a Syntax,
+        prime: bool,
+    ) -> Result<(), NatDefinitionElabError> {
+        let arguments = expect_null_args(syntax, "case arguments")?;
+        if arguments.is_empty() || arguments.len().is_multiple_of(2) {
+            return Err(error(TacticError::MalformedScript));
+        }
+        let mut cases = std::collections::VecDeque::new();
+        for (index, case) in arguments.iter().enumerate() {
+            self.tick()?;
+            if index % 2 == 1 {
+                expect_atom(case, "|", "case separator")?;
+                continue;
+            }
+            let [tag, names] = expect_node(
+                case,
+                &parser_kind(&["Tactic", "caseArg"]),
+                2,
+                "case argument",
+            )?
+            else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            cases.push_back(Case {
+                tag,
+                names: expect_null_args(names, "case names")?,
+            });
+        }
+        let first = cases.pop_front().expect("nonempty case arguments");
+        let goal = self.case_goal(proof, goal, first.tag)?;
+        let mode = if prime { Mode::Focus } else { Mode::Solve };
+        self.start_goal_control(proof, goal, body, mode)?;
+        proof.controls.last_mut().expect("new case frame").cases = Some(cases);
+        self.prepare_case_goal(proof, first.names)
+    }
+
+    fn prepare_case_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        names: &[Syntax],
+    ) -> Result<(), NatDefinitionElabError> {
+        let Some(Work::Goal(goal)) = proof.work.pop() else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        // Renaming's close belongs to this run, so a solved body assigns the original
+        // goal before the next selector observes the remaining metavariables.
+        let goal = self.renamed_proof_goal(proof, goal, names)?;
+        let frame = proof
+            .controls
+            .last_mut()
+            .ok_or_else(|| error(TacticError::MalformedScript))?;
+        if frame.mode == Mode::Solve {
+            self.goal_tags.remove(&goal.id);
+        } else {
+            frame.retag = Some(self.goal_tags.get(&goal.id).cloned());
+        }
+        proof.work.push(Work::Goal(goal));
+        Ok(())
     }
 
     /// Lexical scopes wrap the whole visible frontier, not just its main goal.
@@ -457,6 +548,7 @@ impl Context {
             elimination: None,
             limit: None,
             retag: None,
+            cases: None,
             attempt_pending: mode == Mode::Any,
             any_succeeded: false,
         };
@@ -519,20 +611,9 @@ impl Context {
         Ok(())
     }
 
-    /// `syntax`'s sequence run, in turn, on the main goal and the `count - 1` visible goals
+    /// `body` run, in turn, on the main goal and the `count - 1` visible goals
     /// after it, each with every other goal suspended, as `all_goals` runs its body; the goals
     /// each run leaves come first, in order, then the goals after those `count`.
-    pub(super) fn start_limited_all_goals<'a>(
-        &mut self,
-        proof: &mut ProofState<'a>,
-        goal: ProofGoal,
-        syntax: &'a Syntax,
-        count: usize,
-    ) -> Result<(), NatDefinitionElabError> {
-        let body = self.proof_instructions(syntax)?;
-        self.start_limited_all_goals_body(proof, goal, body, count)
-    }
-
     pub(super) fn start_limited_all_goals_body<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
@@ -551,18 +632,8 @@ impl Context {
         Ok(())
     }
 
-    /// `case'`'s run of `syntax` on `goal` alone, every other goal suspended as `focus` does:
+    /// `case'`'s run of `body` on `goal` alone, every other goal suspended as `focus` does:
     /// a run leaving exactly one goal gives it `goal`'s tag.
-    pub(super) fn start_case_prime_focus<'a>(
-        &mut self,
-        proof: &mut ProofState<'a>,
-        goal: ProofGoal,
-        syntax: &'a Syntax,
-    ) -> Result<(), NatDefinitionElabError> {
-        let body = self.proof_instructions(syntax)?;
-        self.start_case_prime_focus_body(proof, goal, body)
-    }
-
     pub(super) fn start_case_prime_focus_body<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
@@ -686,6 +757,7 @@ impl Context {
             elimination: None,
             limit: None,
             retag: None,
+            cases: None,
             attempt_pending: false,
             any_succeeded: false,
         };
@@ -803,6 +875,17 @@ impl Context {
         for work in pending.into_iter().rev() {
             self.tick()?;
             frame.deferred.push(work);
+        }
+        if let Some(case) = frame.cases.as_mut().and_then(|cases| cases.pop_front()) {
+            proof.work = std::mem::take(&mut frame.waiting);
+            let goal = self.take_case_goal(proof, case.tag)?;
+            frame.waiting = std::mem::take(&mut proof.work);
+            proof.instructions = frame.body.clone();
+            proof.cursor = 0;
+            proof.controls.push(frame);
+            proof.work.push(Work::EndControl(index));
+            proof.work.push(Work::Goal(goal));
+            return self.prepare_case_goal(proof, case.names);
         }
         if matches!(frame.mode, Mode::All | Mode::Any) {
             loop {
