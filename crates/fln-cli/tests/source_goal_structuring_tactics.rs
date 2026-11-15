@@ -11,8 +11,8 @@
 //! tries `assumption` (vendored `Lean/Meta/Tactic/Injection.lean:119-146`). Names for
 //! `injections` are refused, typed.
 //!
-//! Every program was run through the pinned `lean` v4.32.0 with the same header first
-//! (2026-10-25), and its output is compared with the pinned binary's again when that is present.
+//! Accepted programs are compared with the pinned `lean` v4.32.0 using the same header
+//! whenever the pinned binary is present, including wildcard alternatives and shared branch tactics.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,6 +90,64 @@ fn ours(lib: &Path, root: &Path, name: &str) -> (i32, String, String) {
 
 /// `(file, program, the pin's stdout)`: programs the pin accepts.
 const ACCEPTED: &[(&str, &str, &str)] = &[
+    (
+        "CasesWildcard.lean",
+        r#"prelude
+import Init.Core
+example (n : Nat) : n = n := by
+  cases n with
+  | succ k => rfl
+  | _ => rfl
+example (n : Nat) : n = n := by
+  induction n with
+  | zero | _ => rfl
+"#,
+        "",
+    ),
+    (
+        "CasesWithTactic.lean",
+        r#"prelude
+import Init.Core
+example (n : Nat) : n = n ∧ n = n := by
+  cases n with constructor
+  | _ => rfl
+example (n : Nat) : n = n := by
+  cases n with rfl
+example (n : Nat) : n = n := by
+  cases n with rfl
+  | _ => fail
+"#,
+        "",
+    ),
+    (
+        "InductionWithTactic.lean",
+        r#"prelude
+import Init.Core
+def zero (n : Nat) : Nat := match n with | .zero => 0 | .succ k => zero k
+example (n : Nat) : zero n = 0 := by
+  induction n with try rfl
+  | succ k ih => exact ih
+"#,
+        "",
+    ),
+    (
+        "CasesWithBacktracking.lean",
+        r#"prelude
+import Init.Core
+example (n : Nat) : n = n := by
+  first
+  | cases n with try skip
+    | zero => rfl
+    | succ k => fail
+  | rfl
+example (n : Nat) : n = n ∧ n = n := by
+  first
+  | cases n with constructor
+    | _ => fail
+  | constructor <;> rfl
+"#,
+        "",
+    ),
     (
         r#"AndIntros.lean"#,
         r#"prelude

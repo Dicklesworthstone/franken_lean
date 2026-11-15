@@ -21,30 +21,83 @@ fn check(source: &str) -> fln::SourceFileCheck {
         .into_complete()
         .unwrap()
 }
-/// `with tac` before the alternatives and a `_` alternative parse as the pin's `inductionAlts` and
-/// `Term.hole`; the elaborator models neither, so it refuses these files, which the pin accepts,
-/// rather than dropping the tactic or misnaming the alternative.
 #[test]
-fn a_with_tactic_and_a_wildcard_alternative_are_refused() {
-    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
-    let engine = Engine::with_source_seed(limits)
-        .unwrap()
-        .into_complete()
-        .unwrap();
+fn wildcard_alternatives_cover_only_the_remaining_constructors() {
+    for source in [
+        "theorem t (n : Nat) : n = n := by\n  cases n with\n  | _ => rfl\n",
+        "theorem t (n : Nat) : n = n := by\n  cases n with\n  | succ k => rfl\n  | _ => rfl\n",
+        "theorem t (n : Nat) : n = n := by\n  induction n with\n  | zero | _ => rfl\n",
+        "theorem t (b : Bool) : b = b := by cases b with | false => rfl | _ => rfl",
+    ] {
+        check(source);
+    }
+}
+
+#[test]
+fn with_tactics_transform_each_minor_before_its_alternative() {
     for source in [
         "theorem t (n : Nat) : n = n := by\n  cases n with try skip\n  | zero => rfl\n  | succ m => rfl\n",
-        "theorem t (n : Nat) : n = n := by\n  cases n with\n  | _ => rfl\n",
+        // Every minor is solved before a body is needed, including with no alternatives.
+        "theorem t (n : Nat) : n = n := by cases n with rfl",
+        "theorem t (n : Nat) : n = n := by cases n with rfl | _ => fail",
+        // The body must run independently on BOTH goals from each constructor application.
+        "theorem t (n : Nat) : n = n ∧ n = n := by\n  cases n with constructor\n  | _ => rfl\n",
+        // The omitted zero case is discharged; the succ case retains its induction hypothesis.
+        "def zero (n : Nat) : Nat := match n with | .zero => 0 | .succ k => zero k\ntheorem t (n : Nat) : zero n = 0 := by\n  induction n with try rfl\n  | succ k ih => exact ih\n",
+        // The pre-tactic is evaluated after named fields are introduced into the branch.
+        "structure Item where\n  value : Nat\ndef t (x : Item) : Nat := by\n  cases x with (have h := value)\n  | mk value => exact h\ntheorem t_ok : t (Item.mk 7) = 7 := by rfl\n",
     ] {
-        let result = engine.check_source_files(
-            &[source.as_bytes()],
-            &KVMap::new(),
-            SourceCheckLimits::new(limits),
-        );
-        assert!(
-            !matches!(result, Ok(fln::Outcome::Complete(_))),
-            "accepted {source}"
-        );
+        check(source);
     }
+}
+
+#[test]
+fn wildcard_and_with_tactics_reject_uncovered_invalid_and_unneeded_work() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "theorem bad (n : Nat) : n = 0 := by cases n with | _ => rfl",
+        "theorem bad (n : Nat) : n = 0 := by cases n with try rfl",
+        "theorem bad (n : Nat) : n = n := by cases n with skip | zero => rfl",
+        "theorem bad (n : Nat) : n = n := by cases n with | _ k => rfl",
+        "theorem bad (n : Nat) : n = n := by cases n with | _ => rfl | zero => rfl",
+        "theorem bad (n : Nat) : n = n := by cases n with | _ => rfl | _ => rfl",
+        "theorem bad (n : Nat) : n = n := by cases n with | zero => rfl | succ k => rfl | _ => rfl",
+        // A named body cannot be silently skipped when the pre-tactic closes its goal.
+        "theorem bad (n : Nat) : n = n := by cases n with rfl | zero => fail | _ => rfl",
+        // A wildcard does not give the zero branch the name bound in the succ branch.
+        "def bad (n : Nat) : Nat := by cases n with | succ k => exact k | _ => exact k",
+        "theorem bad (n : Nat) : n = n := by\n  cases n with (have h := k)\n  | zero => rfl\n  | succ k => rfl\n",
+        // A pre-tactic that splits the goal must not let a later outer tactic finish its body.
+        "theorem bad (n : Nat) : n = n ∧ n = n := by\n  cases n with constructor\n  | _ => skip\n  all_goals rfl",
+    ] {
+        let error = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err(source);
+        assert_eq!(
+            error.disposition(),
+            ("elaboration", false, 1),
+            "{source}: {error:?}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
+fn with_tactic_backtracking_restores_minor_goals_and_constructor_contexts() {
+    check(
+        "theorem t (n : Nat) : n = n := by\n  first\n  | cases n with try skip\n    | zero => rfl\n    | succ k => fail\n  | rfl",
+    );
+    check(
+        "theorem t (n : Nat) : n = n ∧ n = n := by\n  first\n  | cases n with constructor\n    | _ => fail\n  | constructor <;> rfl",
+    );
+    check(
+        "theorem t (n : Nat) : n = n := by\n  try (cases n with rfl | zero => fail | _ => rfl)\n  rfl",
+    );
 }
 
 #[test]
@@ -268,16 +321,22 @@ fn false_proofs_and_invalid_unused_terms_are_still_refused() {
 #[test]
 fn kernel_budget_exhaustion_is_not_an_induction_failure_or_success() {
     let base = engine();
-    let mut low = SourceCheckLimits::new(limits());
-    low.admission.kernel = low.admission.kernel.narrowed(0, 32);
-    let result = base.check_source_files(&[b"theorem self (n : Nat) : n = n := by induction n with | zero => rfl | succ k ih => rfl"], &KVMap::new(), low);
-    match result {
-        Ok(fln::Outcome::Inconclusive(_)) => {}
-        Err(error) => assert!(
-            matches!(error.disposition(), ("resource" | "inconclusive", false, 3)),
-            "{error:?}"
-        ),
-        other => panic!("expected a typed nonanswer: {other:?}"),
+    for source in [
+        "theorem self (n : Nat) : n = n := by induction n with | zero => rfl | succ k ih => rfl",
+        "theorem self (n : Nat) : n = n := by cases n with try skip | _ => rfl",
+        "theorem self (n : Nat) : n = n := by first | (cases n with rfl) | rfl",
+    ] {
+        let mut low = SourceCheckLimits::new(limits());
+        low.admission.kernel = low.admission.kernel.narrowed(0, 32);
+        let result = base.check_source_files(&[source.as_bytes()], &KVMap::new(), low);
+        match result {
+            Ok(fln::Outcome::Inconclusive(_)) => {}
+            Err(error) => assert!(
+                matches!(error.disposition(), ("resource" | "inconclusive", false, 3)),
+                "{source}: {error:?}"
+            ),
+            other => panic!("expected a typed nonanswer: {source}: {other:?}"),
+        }
     }
 }
 #[test]

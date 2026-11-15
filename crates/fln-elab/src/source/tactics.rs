@@ -659,6 +659,7 @@ enum Work<'a> {
     Goal(ProofGoal),
     Close(ProofGoal, Expr),
     Script(ProofGoal, Vec<&'a Syntax>),
+    EliminationPreTactic(ProofGoal, eliminate::PreTactic<'a>),
     Term(ProofGoal, &'a Syntax),
     EndScript(Vec<&'a Syntax>, usize),
 }
@@ -1449,6 +1450,10 @@ impl Context {
                     let cursor = std::mem::replace(&mut proof.cursor, 0);
                     proof.work.push(Work::EndScript(parent, cursor));
                     goal
+                }
+                Work::EliminationPreTactic(goal, pre_tactic) => {
+                    self.start_elimination_pre_tactic(proof, goal, pre_tactic)?;
+                    continue;
                 }
                 Work::EndScript(instructions, cursor) => {
                     self.skip_empty_goal_controls(proof)?;

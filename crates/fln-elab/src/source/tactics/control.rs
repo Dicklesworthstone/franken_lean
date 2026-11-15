@@ -103,6 +103,9 @@ pub(super) struct Frame<'a> {
     after: Option<Vec<&'a Syntax>>,
     // A conversion-mode frame: what its sequence's end does with the goals it leaves.
     conv: Option<Box<super::conv::Finish<'a>>>,
+    // The optional `cases`/`induction ... with tac` runs before each branch body. Its
+    // completion checks coverage and gives each new goal its own strict script.
+    elimination: Option<super::eliminate::PreTactic<'a>>,
     // An all-goals frame over only the first goals of its frontier: how many more it runs on.
     limit: Option<usize>,
     // A `case'` frame: the tag of the goal its current run started on, which a run leaving
@@ -451,6 +454,7 @@ impl Context {
             deferred: Vec::new(),
             after,
             conv: None,
+            elimination: None,
             limit: None,
             retag: None,
             attempt_pending: mode == Mode::Any,
@@ -460,6 +464,21 @@ impl Context {
         proof.controls.push(frame);
         proof.work.push(Work::EndControl(index));
         proof.work.push(Work::Goal(goal));
+        Ok(())
+    }
+
+    pub(super) fn start_elimination_pre_tactic<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goal: ProofGoal,
+        pre_tactic: super::eliminate::PreTactic<'a>,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.start_goal_control_body(proof, goal, vec![pre_tactic.syntax], Mode::Focus, None)?;
+        proof
+            .controls
+            .last_mut()
+            .expect("new elimination pre-tactic frame")
+            .elimination = Some(pre_tactic);
         Ok(())
     }
 
@@ -664,6 +683,7 @@ impl Context {
             deferred: Vec::new(),
             after: None,
             conv: Some(Box::new(finish)),
+            elimination: None,
             limit: None,
             retag: None,
             attempt_pending: false,
@@ -745,6 +765,12 @@ impl Context {
             proof.cursor = frame.cursor;
             proof.work = frame.waiting;
             return self.finish_conv(proof, *finish, pending);
+        }
+        if let Some(finish) = frame.elimination.take() {
+            proof.instructions = frame.instructions;
+            proof.cursor = frame.cursor;
+            proof.work = frame.waiting;
+            return self.finish_elimination_pre_tactic(proof, finish, pending);
         }
         if let Some(body) = frame.after.take()
             && !pending.is_empty()

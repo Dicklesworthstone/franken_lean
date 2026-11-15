@@ -20,6 +20,16 @@ struct Alternative<'a> {
     exact_fields: bool,
     whole: Option<Name>,
 }
+/// The pin runs the optional `with` tactic on one introduced minor premise, then runs its
+/// alternative on each remaining goal. A named alternative must still have work to do; a
+/// wildcard may cover a premise that this tactic closes (`ElimApp.applyAltStx`).
+#[derive(Clone, Copy)]
+pub(super) struct PreTactic<'a> {
+    pub(super) syntax: &'a Syntax,
+    body: Option<&'a Syntax>,
+    named: bool,
+    scoped: bool,
+}
 pub(super) enum EliminationSyntax<'a> {
     Tactic(&'a [Syntax]),
     Match(matching::MatchParts<'a>),
@@ -81,14 +91,15 @@ pub(super) fn target(
 
 /// The slots of a `cases`/`induction` tactic as the pin builds them (`Init/Tactics.lean`):
 /// `"cases" sepBy1(elimTarget, ", ") (" using " ident)? (inductionAlts)?`, and for `induction`
-/// also `("generalizing" term:max+)?` before the alternatives. One target, no `using` and no
-/// `with` tactic are read; the rest is refused.
+/// also `("generalizing" term:max+)?` before the alternatives. One target and the default
+/// eliminator are read; the optional `with` tactic retains its original syntax.
 pub(super) struct TacticParts<'a> {
     pub(super) target: &'a Syntax,
     /// The equation's name (`cases h : e`): an identifier or a `_` hole.
     pub(super) binder: Option<&'a Syntax>,
     pub(super) generalized: &'a [Syntax],
     pub(super) scoped: bool,
+    pub(super) pre_tactic: Option<&'a Syntax>,
     pub(super) rows: &'a [Syntax],
 }
 
@@ -158,29 +169,36 @@ pub(super) fn tactic_parts(
             _ => return Err(malformed()),
         },
     };
-    let (scoped, rows) = match expect_null_args(alternatives, "elimination alternatives")? {
-        [] => (false, &[][..]),
-        [alts] => {
-            let parts = expect_node(
-                alts,
-                &parser_kind(&["Tactic", "inductionAlts"]),
-                3,
-                "elimination alternatives",
-            )?;
-            expect_atom(&parts[0], "with", "elimination alternatives")?;
-            expect_empty_null(&parts[1], "no `with` tactic")?;
-            (
-                true,
-                expect_null_args(&parts[2], "elimination alternatives")?,
-            )
-        }
-        _ => return Err(malformed()),
-    };
+    let (scoped, pre_tactic, rows) =
+        match expect_null_args(alternatives, "elimination alternatives")? {
+            [] => (false, None, &[][..]),
+            [alts] => {
+                let parts = expect_node(
+                    alts,
+                    &parser_kind(&["Tactic", "inductionAlts"]),
+                    3,
+                    "elimination alternatives",
+                )?;
+                expect_atom(&parts[0], "with", "elimination alternatives")?;
+                let pre_tactic = match expect_null_args(&parts[1], "elimination pre-tactic")? {
+                    [] => None,
+                    [tactic] => Some(tactic),
+                    _ => return Err(malformed()),
+                };
+                (
+                    true,
+                    pre_tactic,
+                    expect_null_args(&parts[2], "elimination alternatives")?,
+                )
+            }
+            _ => return Err(malformed()),
+        };
     Ok(TacticParts {
         target: &parts[1],
         binder,
         generalized,
         scoped,
+        pre_tactic,
         rows,
     })
 }
@@ -771,7 +789,7 @@ impl Context {
         selected: Option<&FVarId>,
         equations: Option<&index_equations::IndexEquations>,
     ) -> Result<CaseBranches, NatDefinitionElabError> {
-        let (target_name, explicit, scoped, rows) = match input {
+        let (target_name, explicit, scoped, pre_tactic, rows) = match input {
             EliminationSyntax::Tactic(args) => {
                 let parts = tactic_parts(args, induction)?;
                 let name = match parts.target {
@@ -779,14 +797,22 @@ impl Context {
                     _ if selected.is_some() => Name::anonymous(),
                     _ => return Err(error(TacticError::EliminationLocal)),
                 };
-                (name, parts.generalized, parts.scoped, parts.rows)
+                (
+                    name,
+                    parts.generalized,
+                    parts.scoped,
+                    parts.pre_tactic,
+                    parts.rows,
+                )
             }
             EliminationSyntax::Match(_) | EliminationSyntax::RecursiveMatch(_) => {
-                (Name::anonymous(), &[][..], true, &[][..])
+                (Name::anonymous(), &[][..], true, None, &[][..])
             }
             EliminationSyntax::EmptyMatrix(_)
             | EliminationSyntax::RCases(_)
-            | EliminationSyntax::SplitMatch { .. } => (Name::anonymous(), &[][..], false, &[][..]),
+            | EliminationSyntax::SplitMatch { .. } => {
+                (Name::anonymous(), &[][..], false, None, &[][..])
+            }
         };
         self.resolve_instances(false)?;
         self.flush(false)?;
@@ -1207,6 +1233,11 @@ impl Context {
             }
             for lhs in sides {
                 self.tick()?;
+                // `checkAltNames` checks the expanded left-hand sides: a wildcard is the
+                // final alternative, including when it shares a body with named cases.
+                if fallback.is_some() {
+                    return Err(error(TacticError::EliminationCoverage));
+                }
                 let lhs = expect_node(
                     lhs,
                     &parser_kind(&["Tactic", "inductionAltLHS"]),
@@ -1214,6 +1245,19 @@ impl Context {
                     "alternative left-hand side",
                 )?;
                 expect_atom(&lhs[0], "|", "elimination alternative")?;
+                if lhs[1].kind() == Some(&parser_kind(&["Term", "hole"])) {
+                    if !expect_null_args(&lhs[2], "elimination binders")?.is_empty() {
+                        return Err(error(TacticError::EliminationArity));
+                    }
+                    fallback = Some(Alternative {
+                        names: Vec::new(),
+                        body: AlternativeBody::Script(body),
+                        explicit_fields: false,
+                        exact_fields: false,
+                        whole: None,
+                    });
+                    continue;
+                }
                 let constructor = expect_node(
                     &lhs[1],
                     &Name::from_components(["group"]),
@@ -1267,6 +1311,7 @@ impl Context {
             }
         }
         if scoped
+            && pre_tactic.is_none()
             && equations.is_none()
             && fallback.is_none()
             && scripts.len() != family.ctors.len()
@@ -1323,6 +1368,14 @@ impl Context {
             let (hole, branch) = self.proof_goal(minor.clone())?;
             let script = scripts.remove(&rule.ctor);
             let alternative = script.as_ref().or(fallback.as_ref());
+            if matches!(input, EliminationSyntax::Tactic(_))
+                && script.is_none()
+                && fallback.is_some()
+            {
+                // A tactic wildcard covers every remaining minor, even if index
+                // refinement or the pre-tactic subsequently closes that minor.
+                fallback_used = true;
+            }
             let mut hypotheses = Vec::new();
             let (branch, mut tracked) = self.elimination_branch(
                 branch,
@@ -1387,7 +1440,7 @@ impl Context {
                         )?;
                     }
                 }
-                if scoped && alternative.is_none() {
+                if scoped && pre_tactic.is_none() && alternative.is_none() {
                     return Err(error(TacticError::EliminationCoverage));
                 }
                 if script.is_none() && fallback.is_some() {
@@ -1399,12 +1452,32 @@ impl Context {
                         super::super::trace::append_tag(parent, minor_name),
                     );
                 }
-                proof.work.push(match alternative.map(|alt| alt.body) {
-                    Some(AlternativeBody::Script(syntax)) => {
-                        Work::Script(branch, self.proof_instructions(syntax)?)
+                let body = alternative.map(|alt| alt.body);
+                proof.work.push(if let Some(syntax) = pre_tactic {
+                    let body = match body {
+                        Some(AlternativeBody::Script(body)) => Some(body),
+                        None => None,
+                        Some(AlternativeBody::Term(_)) => {
+                            return Err(error(TacticError::MalformedScript));
+                        }
+                    };
+                    Work::EliminationPreTactic(
+                        branch,
+                        PreTactic {
+                            syntax,
+                            body,
+                            named: script.is_some(),
+                            scoped,
+                        },
+                    )
+                } else {
+                    match body {
+                        Some(AlternativeBody::Script(syntax)) => {
+                            Work::Script(branch, self.proof_instructions(syntax)?)
+                        }
+                        Some(AlternativeBody::Term(syntax)) => Work::Term(branch, syntax),
+                        None => Work::Goal(branch),
                     }
-                    Some(AlternativeBody::Term(syntax)) => Work::Term(branch, syntax),
-                    None => Work::Goal(branch),
                 });
             } else if script.is_some() {
                 // Do not silently erase an unreachable source body, including
@@ -1422,6 +1495,9 @@ impl Context {
             )?;
         }
         if fallback.is_some() && !fallback_used {
+            if matches!(input, EliminationSyntax::Tactic(_)) {
+                return Err(error(TacticError::EliminationCoverage));
+            }
             return Err(failure(SourceInferenceError::Match(
                 matching::MatchError::DuplicateConstructor,
             )));
@@ -1468,5 +1544,38 @@ impl Context {
             proof.work.extend(branch);
         }
         Ok(tracked_branches)
+    }
+
+    /// Resume after the focused pre-tactic, retaining its checked close actions and applying
+    /// the alternative independently to each goal it leaves (`evalTacticAt` / `evalAlt`).
+    /// The existing control frame isolates siblings and participates in tactic rollback.
+    pub(super) fn finish_elimination_pre_tactic<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        finish: PreTactic<'a>,
+        pending: Vec<Work<'a>>,
+    ) -> Result<(), NatDefinitionElabError> {
+        let has_goals = pending
+            .iter()
+            .any(|work| matches!(work, Work::Goal(goal) if !self.txn.mvars.is_assigned(&goal.id)));
+        if (!has_goals && finish.named) || (has_goals && finish.scoped && finish.body.is_none()) {
+            return Err(error(TacticError::EliminationCoverage));
+        }
+        for work in pending {
+            self.tick()?;
+            proof.work.push(match work {
+                Work::Goal(goal) => {
+                    if self.txn.mvars.is_assigned(&goal.id) {
+                        continue;
+                    }
+                    match finish.body {
+                        Some(body) => Work::Script(goal, self.proof_instructions(body)?),
+                        None => Work::Goal(goal),
+                    }
+                }
+                other => other,
+            });
+        }
+        Ok(())
     }
 }
