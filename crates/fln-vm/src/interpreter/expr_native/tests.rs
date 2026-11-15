@@ -82,7 +82,9 @@ fn program(row: &str) -> flbc::ValidatedProgram {
                 parameter_ownership: vec![ArgumentOwnership::Borrowed; usize::from(arity)],
                 result_ownership: if matches!(
                     row,
-                    "extern:Lean.Expr.equal" | "extern:Lean.Expr.hasLooseBVar"
+                    "extern:Lean.Expr.equal"
+                        | "extern:Lean.Expr.eqv"
+                        | "extern:Lean.Expr.hasLooseBVar"
                 ) {
                     CallableResultOwnership::Scalar
                 } else {
@@ -882,6 +884,223 @@ fn native_expr_strict_equality_keeps_binder_names_and_annotations() {
             usize::from(expected)
         );
     }
+}
+
+#[test]
+fn native_expr_lower_preserves_binder_contexts_metadata_and_shared_carriers() {
+    use fln_core::options::{DataValue, KVMap};
+    let name = Name::from_components(["retained"]);
+    let metadata = KVMap::from_entries(vec![(name.clone(), DataValue::OfNat(9))]);
+    let shared = Expr::app(bvar(2), bvar(4));
+    let unchanged = Expr::mdata(metadata, Expr::proj(name.clone(), 7, shared.clone()));
+    let root = Expr::app(
+        shared.clone(),
+        Expr::lam(
+            name.clone(),
+            shared.clone(),
+            Expr::forall_e(
+                name.clone(),
+                shared.clone(),
+                Expr::let_e(name.clone(), shared, literal(8), unchanged.clone(), true),
+                BinderInfo::StrictImplicit,
+            ),
+            BinderInfo::InstImplicit,
+        ),
+    );
+    let carrier = object(root.clone());
+    let lowered = call(
+        "extern:Lean.Expr.lowerLooseBVars",
+        &[carrier.clone_ref(), Obj::mk_nat(2), Obj::mk_nat(1)],
+    );
+    let outer = Expr::app(bvar(1), bvar(3));
+    let inner = Expr::app(bvar(2), bvar(3));
+    assert_eq!(
+        expression(&lowered),
+        Expr::app(
+            outer.clone(),
+            Expr::lam(
+                name.clone(),
+                outer,
+                Expr::forall_e(
+                    name.clone(),
+                    inner.clone(),
+                    Expr::let_e(name, inner, literal(8), unchanged, true),
+                    BinderInfo::StrictImplicit,
+                ),
+                BinderInfo::InstImplicit,
+            ),
+        )
+    );
+    let lambda = lowered.try_ctor_child(1).unwrap();
+    assert_eq!(
+        lowered.try_ctor_child(0).unwrap().identity_token(),
+        lambda.try_ctor_child(1).unwrap().identity_token(),
+        "equal binder contexts retain shared transformed carriers"
+    );
+    let original_lambda = carrier.try_ctor_child(1).unwrap();
+    assert_eq!(
+        lambda.try_ctor_child(0).unwrap().identity_token(),
+        original_lambda.try_ctor_child(0).unwrap().identity_token(),
+        "lowering retains binder names"
+    );
+    let original_let = original_lambda
+        .try_ctor_child(2)
+        .unwrap()
+        .try_ctor_child(2)
+        .unwrap();
+    let lowered_let = lambda.try_ctor_child(2).unwrap().try_ctor_child(2).unwrap();
+    assert_eq!(
+        lowered_let.try_ctor_child(3).unwrap().identity_token(),
+        original_let.try_ctor_child(3).unwrap().identity_token(),
+        "a subtree below the local cutoff retains metadata and projection identity"
+    );
+    assert_eq!(expression(&carrier), root);
+}
+
+#[test]
+fn native_expr_lower_observes_full_scalar_guard_and_validates_noops() {
+    let carrier = object(bvar(2));
+    for (cutoff, amount) in [
+        (Obj::mk_nat(0), Obj::mk_nat(1)),
+        (Obj::mk_nat(2), Obj::mk_nat(0)),
+        (Obj::mk_nat(3), Obj::mk_nat(2)),
+        (Obj::mk_nat(1), Obj::mk_nat(1_usize << 32)),
+        (Obj::mk_mpz(&[0, 1], false), Obj::mk_nat(1)),
+        (Obj::mk_nat(3), Obj::mk_mpz(&[0, 1], false)),
+    ] {
+        let result = call(
+            "extern:Lean.Expr.lowerLooseBVars",
+            &[carrier.clone_ref(), cutoff, amount],
+        );
+        assert_eq!(result.identity_token(), carrier.identity_token());
+    }
+    for (cutoff, amount, expected) in [
+        (2, 1, 1),
+        (2, 2, 0),
+        ((1_usize << 32) + 1, 2, 0),
+        ((1_usize << 32) + 2, (1_usize << 32) + 1, 1),
+    ] {
+        assert_eq!(
+            expression(&call(
+                "extern:Lean.Expr.lowerLooseBVars",
+                &[
+                    carrier.clone_ref(),
+                    Obj::mk_nat(cutoff),
+                    Obj::mk_nat(amount)
+                ],
+            )),
+            bvar(expected)
+        );
+    }
+    for args in [
+        vec![Obj::mk_nat(0), Obj::mk_nat(0), Obj::mk_nat(0)],
+        vec![carrier.clone_ref(), Obj::mk_mpz(&[1], true), Obj::mk_nat(0)],
+        vec![carrier.clone_ref(), Obj::mk_nat(0), Obj::mk_mpz(&[1], true)],
+    ] {
+        assert!(matches!(
+            execute("extern:Lean.Expr.lowerLooseBVars", &args),
+            Outcome::Complete(VmExit::Refused { .. })
+        ));
+    }
+    let shared = bvar(2);
+    let root = object(Expr::app(
+        shared.clone(),
+        Expr::lam(Name::anonymous(), literal(0), shared, BinderInfo::Default),
+    ));
+    let mut conversion = Conversion::new();
+    let checked = conversion.check_expr(&root).unwrap();
+    assert!(matches!(
+        lower_loose_bvars(
+            &checked,
+            1,
+            1,
+            &mut conversion,
+            &mut WorkBudget {
+                allowed: 4,
+                visited: 0
+            }
+        ),
+        Err(IntrinsicFailure::MirrorResource {
+            resource: "expression traversal nodes",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn native_expr_alpha_equivalence_ignores_only_binder_names_and_annotations() {
+    use fln_core::options::{DataValue, KVMap};
+    let x = Name::from_components(["x"]);
+    let y = Name::from_components(["y"]);
+    let left = Expr::lam(x.clone(), literal(0), bvar(0), BinderInfo::Default);
+    let right = Expr::lam(y.clone(), literal(0), bvar(0), BinderInfo::Implicit);
+    let metadata = |value| KVMap::from_entries(vec![(x.clone(), DataValue::OfNat(value))]);
+    for (left, right, expected) in [
+        (left.clone(), right.clone(), true),
+        (
+            Expr::app(left.clone(), left.clone()),
+            Expr::app(right.clone(), right.clone()),
+            true,
+        ),
+        (
+            Expr::forall_e(x.clone(), literal(0), bvar(0), BinderInfo::Default),
+            Expr::forall_e(y.clone(), literal(0), bvar(0), BinderInfo::InstImplicit),
+            true,
+        ),
+        (
+            left.clone(),
+            Expr::forall_e(y.clone(), literal(0), bvar(0), BinderInfo::Default),
+            false,
+        ),
+        (
+            Expr::let_e(x.clone(), literal(0), literal(1), bvar(0), false),
+            Expr::let_e(y.clone(), literal(0), literal(1), bvar(0), false),
+            true,
+        ),
+        (
+            Expr::let_e(x.clone(), literal(0), literal(1), bvar(0), false),
+            Expr::let_e(y, literal(0), literal(1), bvar(0), true),
+            false,
+        ),
+        (
+            Expr::mdata(metadata(1), left.clone()),
+            Expr::mdata(metadata(1), right.clone()),
+            true,
+        ),
+        (
+            Expr::mdata(metadata(1), left.clone()),
+            Expr::mdata(metadata(2), right),
+            false,
+        ),
+        (
+            left,
+            Expr::lam(x, literal(0), bvar(1), BinderInfo::Default),
+            false,
+        ),
+        (Expr::sort(Level::zero()), Expr::sort(Level::one()), false),
+    ] {
+        let args = [object(left), object(right)];
+        assert_eq!(
+            call("extern:Lean.Expr.eqv", &args).unbox(),
+            usize::from(expected)
+        );
+        assert_eq!(call("extern:Lean.Expr.equal", &args).unbox(), 0);
+    }
+    assert!(matches!(
+        execute(
+            "extern:Lean.Expr.eqv",
+            &[object(literal(0)), Obj::mk_nat(0)]
+        ),
+        Outcome::Complete(VmExit::Refused { .. })
+    ));
+    assert!(matches!(
+        Intrinsic::Eqv.invoke_bounded(
+            "extern:Lean.Expr.eqv",
+            &[object(literal(0)), object(literal(0))],
+            1
+        ),
+        Err(IntrinsicFailure::MirrorResource { .. })
+    ));
 }
 
 #[test]

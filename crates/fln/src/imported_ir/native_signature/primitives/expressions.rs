@@ -37,6 +37,12 @@ pub(super) fn review(row: &GeneratedExternRow) -> Option<Review> {
                 &[IrType::Object, IrType::Object],
                 &IrType::UInt8,
             ),
+            "extern:Lean.Expr.eqv" => (
+                "Lean.Expr.eqv",
+                "lean_expr_eqv",
+                &[IrType::Object, IrType::Object],
+                &IrType::UInt8,
+            ),
             "extern:Lean.Expr.hasLooseBVar" => (
                 "Lean.Expr.hasLooseBVar",
                 "lean_expr_has_loose_bvar",
@@ -46,6 +52,12 @@ pub(super) fn review(row: &GeneratedExternRow) -> Option<Review> {
             "extern:Lean.Expr.liftLooseBVars" => (
                 "Lean.Expr.liftLooseBVars",
                 "lean_expr_lift_loose_bvars",
+                &[IrType::Object, IrType::TObject, IrType::TObject],
+                &IrType::Object,
+            ),
+            "extern:Lean.Expr.lowerLooseBVars" => (
+                "Lean.Expr.lowerLooseBVars",
+                "lean_expr_lower_loose_bvars",
                 &[IrType::Object, IrType::TObject, IrType::TObject],
                 &IrType::Object,
             ),

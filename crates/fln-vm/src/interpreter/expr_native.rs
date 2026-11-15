@@ -27,8 +27,10 @@ pub(super) enum Intrinsic {
     MkData,
     MkAppData,
     Equal,
+    Eqv,
     HasLooseBVar,
     LiftLooseBVars,
+    LowerLooseBVars,
     Instantiate1,
     Instantiate,
     InstantiateRev,
@@ -57,8 +59,10 @@ impl Intrinsic {
             "extern:Lean.Expr.mkData" => Self::MkData,
             "extern:Lean.Expr.mkAppData" => Self::MkAppData,
             "extern:Lean.Expr.equal" => Self::Equal,
+            "extern:Lean.Expr.eqv" => Self::Eqv,
             "extern:Lean.Expr.hasLooseBVar" => Self::HasLooseBVar,
             "extern:Lean.Expr.liftLooseBVars" => Self::LiftLooseBVars,
+            "extern:Lean.Expr.lowerLooseBVars" => Self::LowerLooseBVars,
             "extern:Lean.Expr.instantiate1" => Self::Instantiate1,
             "extern:Lean.Expr.instantiate" => Self::Instantiate,
             "extern:Lean.Expr.instantiateRev" => Self::InstantiateRev,
@@ -99,7 +103,7 @@ impl Intrinsic {
         let arity = match self {
             Self::Data | Self::BVar | Self::FVar | Self::MVar | Self::Sort | Self::Lit => 1,
             Self::MkData => 7,
-            Self::LiftLooseBVars | Self::AbstractRange | Self::Proj => 3,
+            Self::LiftLooseBVars | Self::LowerLooseBVars | Self::AbstractRange | Self::Proj => 3,
             Self::Lam | Self::Forall | Self::InstantiateRange | Self::InstantiateRevRange => 4,
             Self::Let => 5,
             _ => 2,
@@ -202,13 +206,16 @@ impl Intrinsic {
                 // borrowed-arguments/owned-result rule of the other Expr rows.
                 Ok(IntrinsicResult::scalar(wide(expr.data().0)))
             }
-            Self::Equal => {
+            Self::Equal | Self::Eqv => {
                 let left = operands.expr(&args[0])?;
                 let right = operands.expr(&args[1])?;
                 check_equality_pairs(&left, &right, &mut work)?;
-                Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(
-                    left == right,
-                ))))
+                let equal = if self == Self::Eqv {
+                    left.is_alpha_equiv(&right)
+                } else {
+                    left == right
+                };
+                Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(equal))))
             }
             Self::HasLooseBVar => {
                 let expr = operands.expr(&args[0])?;
@@ -233,6 +240,25 @@ impl Intrinsic {
                 }
                 let result = expr.lift_loose(cutoff, amount).map_err(bound_vars)?;
                 operands.result(&expr, &args[0], result)
+            }
+            Self::LowerLooseBVars => {
+                let root = operands
+                    .conversion
+                    .check_expr(&args[0])
+                    .map_err(conversion_error)?;
+                let cutoff = small_nat_u32(&args[1], "Expr.lowerLooseBVars", 1)?;
+                let amount = small_nat_u32(&args[2], "Expr.lowerLooseBVars", 2)?;
+                let (Some(cutoff), Some(amount)) = (cutoff, amount) else {
+                    return Ok(IntrinsicResult::owned(args[0].clone_ref()));
+                };
+                // The C boundary compares the full tagged Nat words before
+                // narrowing to unsigned. Moving this guard after narrowing
+                // changes valid large-scalar calls at the pinned boundary.
+                if args[1].unbox() < args[2].unbox() {
+                    return Ok(IntrinsicResult::owned(args[0].clone_ref()));
+                }
+                lower_loose_bvars(&root, cutoff, amount, &mut operands.conversion, &mut work)
+                    .map(IntrinsicResult::owned)
             }
             Self::Instantiate1
             | Self::Instantiate
@@ -443,6 +469,36 @@ fn substitution_range(
     Ok(begin..end)
 }
 
+fn lower_loose_bvars(
+    root: &CheckedExpr,
+    cutoff: u32,
+    amount: u32,
+    conversion: &mut Conversion,
+    budget: &mut WorkBudget,
+) -> Result<Obj, IntrinsicFailure> {
+    if amount == 0 || cutoff >= root.expression().loose_bvar_range() {
+        return Ok(root.object().clone_ref());
+    }
+    replace_binders(root, conversion, budget, |current, depth, conversion| {
+        let Some(cutoff) = cutoff.checked_add(depth) else {
+            return Ok(Some(current.clone()));
+        };
+        if cutoff >= current.expression().loose_bvar_range() {
+            return Ok(Some(current.clone()));
+        }
+        if let ExprNode::BVar { idx } = current.expression().node() {
+            // After the pin's scalar-word guard, narrowing to C unsigned can
+            // wrap cutoff below amount. Its Nat subtraction still saturates.
+            let index = idx.saturating_sub(amount);
+            return conversion
+                .construct_expr(ExprConstructor::BVar, vec![Obj::mk_nat(index as usize)])
+                .map(Some)
+                .map_err(conversion_error);
+        }
+        Ok(None)
+    })
+}
+
 /// The pin abstracts both free and meta variables by their ids, with the
 /// rightmost duplicate winning. Other array entries still occupy a binder
 /// position. Use checked reconstruction to retain unchanged object identity,
@@ -464,6 +520,42 @@ fn abstract_variables(
         return Ok(root.object().clone_ref());
     }
 
+    replace_binders(root, conversion, budget, |current, depth, conversion| {
+        let expr = current.expression();
+        if !expr.has_fvar() && !expr.has_expr_mvar() {
+            return Ok(Some(current.clone()));
+        }
+        if let Some(variable) = variable_key(expr) {
+            let result = if let Some(index) = indices.get(&variable) {
+                let index = index.saturating_add(depth as usize);
+                if index >= MAX_LOOSE_BVAR_RANGE as usize {
+                    return Err(range_exhausted((index as u64).saturating_add(1)));
+                }
+                conversion
+                    .construct_expr(ExprConstructor::BVar, vec![Obj::mk_nat(index)])
+                    .map_err(conversion_error)?
+            } else {
+                current.clone()
+            };
+            return Ok(Some(result));
+        }
+        Ok(None)
+    })
+}
+
+/// A checked, iterative replacement walk shared by binder operations. The
+/// binder depth is part of each memo key: one carrier may occur both inside
+/// and outside a binder, where it has different substitution semantics.
+fn replace_binders(
+    root: &CheckedExpr,
+    conversion: &mut Conversion,
+    budget: &mut WorkBudget,
+    mut replace: impl FnMut(
+        &CheckedExpr,
+        u32,
+        &mut Conversion,
+    ) -> Result<Option<CheckedExpr>, IntrinsicFailure>,
+) -> Result<Obj, IntrinsicFailure> {
     // Keep root alive until the traversal finishes: memo keys are identities
     // of its original carriers, never identities of transient replacements.
     let root_key = (root.object().identity_token(), 0);
@@ -476,23 +568,7 @@ fn abstract_variables(
         }
         if !exit {
             budget.visit()?;
-            let expr = current.expression();
-            if !expr.has_fvar() && !expr.has_expr_mvar() {
-                done.insert(key, current);
-                continue;
-            }
-            if let Some(variable) = variable_key(expr) {
-                let result = if let Some(index) = indices.get(&variable) {
-                    let index = index.saturating_add(depth as usize);
-                    if index >= MAX_LOOSE_BVAR_RANGE as usize {
-                        return Err(range_exhausted((index as u64).saturating_add(1)));
-                    }
-                    conversion
-                        .construct_expr(ExprConstructor::BVar, vec![Obj::mk_nat(index)])
-                        .map_err(conversion_error)?
-                } else {
-                    current
-                };
+            if let Some(result) = replace(&current, depth, conversion)? {
                 done.insert(key, result);
                 continue;
             }

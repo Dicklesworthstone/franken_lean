@@ -18,6 +18,7 @@ namespace NativeExpr
 @[noinline, nospecialize] def useTransform (f : Expr → Expr) (e : Expr) : Expr := f e
 @[noinline, nospecialize] def usePredicate (f : Expr → Bool) (e : Expr) : Bool := f e
 @[noinline, nospecialize] def useData (f : Expr → UInt64) (e : Expr) : UInt64 := f e
+@[noinline, nospecialize] def useLower (f : Nat → Nat → Expr) (s d : Nat) : Expr := f s d
 
 @[noinline] def single (n : Nat) : Nat :=
   let e := Expr.lam .anonymous (.bvar 0) (.app (.bvar 0) (.bvar 1)) .default
@@ -39,6 +40,14 @@ namespace NativeExpr
   | .forallE _ t (.app f a) _ => index t * 10000 + index f * 100 + index a
   | _ => 9999999
 
+@[noinline] def lower (s d captured : Nat) : Nat :=
+  let e := Expr.forallE .anonymous (.bvar 2) (.app (.bvar 0) (.bvar 4)) .implicit
+  let lowered := if captured == 0 then e.lowerLooseBVars s d
+    else useLower (Expr.lowerLooseBVars e) s d
+  match lowered with
+  | .forallE _ t (.app f a) _ => index t * 10000 + index f * 100 + index a
+  | _ => 9999999
+
 @[noinline] def contains (i : Nat) : Nat :=
   let e := Expr.letE .anonymous (.bvar 0) (.bvar 2) (.app (.bvar 0) (.bvar 2)) false
   if Expr.hasLooseBVar e i then 1 else 0
@@ -47,6 +56,27 @@ namespace NativeExpr
   let e := Expr.lam .anonymous (.bvar 0) (.bvar 1) .default
   let other := if mode == 0 then e else Expr.lam .anonymous (.bvar 0) (.bvar 1) .implicit
   if usePredicate (Expr.equal e) other then 1 else 0
+
+@[noinline] def alphaEquality (mode : Nat) : Nat :=
+  let x := Name.num .anonymous 1
+  let y := Name.num .anonymous 2
+  let left := Expr.lam x (.sort .zero) (.bvar 0) .default
+  let right := Expr.lam y (.sort .zero) (.bvar 0) .implicit
+  let pair := match mode with
+    | 0 => (left, right)
+    | 1 => (Expr.forallE x (.sort .zero) (.bvar 0) .default,
+            Expr.forallE y (.sort .zero) (.bvar 0) .instImplicit)
+    | 2 => (Expr.letE x (.sort .zero) (.bvar 1) (.bvar 0) false,
+            Expr.letE y (.sort .zero) (.bvar 1) (.bvar 0) false)
+    | 3 => (Expr.letE x (.sort .zero) (.bvar 1) (.bvar 0) false,
+            Expr.letE y (.sort .zero) (.bvar 1) (.bvar 0) true)
+    | 4 => (Expr.mdata ⟨[(x, .ofNat 7)]⟩ left, Expr.mdata ⟨[(x, .ofNat 7)]⟩ right)
+    | 5 => (Expr.mdata ⟨[(x, .ofNat 7)]⟩ left, Expr.mdata ⟨[(x, .ofNat 8)]⟩ right)
+    | 6 => (left, Expr.forallE y (.sort .zero) (.bvar 0) .default)
+    | 7 => (left, Expr.lam x (.sort .zero) (.bvar 1) .default)
+    | 8 => (Expr.app left left, Expr.app right right)
+    | _ => (Expr.const x [.zero], Expr.const x [.succ .zero])
+  if usePredicate (Expr.eqv pair.1) pair.2 then 1 else 0
 
 @[noinline] def data (n : Nat) : Nat :=
   (useData Expr.data (Expr.app (.bvar n) (.bvar (n + 1)))).toNat

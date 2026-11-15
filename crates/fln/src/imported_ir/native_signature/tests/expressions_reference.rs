@@ -6,13 +6,15 @@ use crate::imported_ir::EntryArgument;
 use std::path::PathBuf;
 use std::process::Command;
 
-const TARGETS: [&str; 16] = [
+const TARGETS: [&str; 18] = [
     "Lean.Expr.data",
     "Lean.Expr.mkData",
     "Lean.Expr.mkAppData",
     "Lean.Expr.equal",
+    "Lean.Expr.eqv",
     "Lean.Expr.hasLooseBVar",
     "Lean.Expr.liftLooseBVars",
+    "Lean.Expr.lowerLooseBVars",
     "Lean.Expr.instantiate1",
     "Lean.Expr.instantiate",
     "Lean.Expr.instantiateRev",
@@ -72,7 +74,12 @@ fn live_pinned_expr_primitives_preserve_binders_arrays_data_and_boxed_calls() {
     std::fs::write(dir.join("NativeExprModule.lean"), source).unwrap();
     let generated = Command::new(&reference)
         .current_dir(&dir)
-        .args(["-o", "NativeExprModule.olean", "NativeExprModule.lean"])
+        .args([
+            "-j1",
+            "-o",
+            "NativeExprModule.olean",
+            "NativeExprModule.lean",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -214,6 +221,27 @@ fn live_pinned_expr_primitives_preserve_binders_arrays_data_and_boxed_calls() {
             vec![0x1234_5678_9abc_def0, 0xfedc_ba98_7654_3210],
         ),
     ];
+    for captured in [0, 1] {
+        for (cutoff, amount) in [
+            (0, 0),
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (2, 2),
+            (4, 1),
+            (1_u64 << 32, 1),
+            ((1_u64 << 32) + 1, 2),
+            ((1_u64 << 32) + 2, (1_u64 << 32) + 1),
+            (1, 1_u64 << 32),
+            (u64::MAX, 1),
+            (2, u64::MAX),
+        ] {
+            cases.push(("lower", vec![cutoff, amount, captured]));
+        }
+    }
+    for mode in 0..10 {
+        cases.push(("alphaEquality", vec![mode]));
+    }
     for entry in ["replaceDirect", "replaceCaptured"] {
         for (value, mode) in [(0, 0), (7, 0), (7, 1), (65_536, 0)] {
             cases.push((entry, vec![value, mode]));
@@ -275,6 +303,7 @@ fn live_pinned_expr_primitives_preserve_binders_arrays_data_and_boxed_calls() {
     std::fs::write(dir.join("Oracle.lean"), oracle_source).unwrap();
     let oracle = Command::new(&reference)
         .current_dir(&dir)
+        .arg("-j1")
         .arg("Oracle.lean")
         .output()
         .unwrap();
