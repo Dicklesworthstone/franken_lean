@@ -5,12 +5,22 @@
 //! a parameter, while `x + 1` is not; `x * 0` no longer reads x at all. Keep a
 //! small, normalized expression DAG for these primitive bodies and collect the
 //! same uses. This is metadata analysis, never evaluation of a recursive body.
+//! The same normalized body also supplies the pin's borrowed-parameter ABI:
+//! consuming calls propagate ownership backwards, while owned arguments of
+//! self tail calls propagate it forwards to preserve those tail calls.
 //! Unknown calls, dependent carriers and ambiguous effectful simplifications
 //! refuse instead of inventing a reduced calling convention.
 
 use super::*;
 use fln_core::expr::{Expr, ExprNode, Literal, NatLit};
 use fln_env::constants::{ConstantInfo, DefinitionSafety, DefinitionVal};
+
+pub(super) struct Parameters {
+    pub used: Vec<bool>,
+    /// None preserves the existing owned export when the normalized DAG has
+    /// lost occurrence information needed to infer the pin's ownership ABI.
+    pub owned: Option<Vec<bool>>,
+}
 
 struct Analysis<'a, 'b> {
     checks: SourceUses<'a, 'b>,
@@ -596,6 +606,159 @@ impl Analysis<'_, '_> {
         Ok(used)
     }
 
+    fn own_argument(&mut self, value: &Expr, owned: &mut [bool]) -> Result<bool> {
+        self.checks.meter.charge(1)?;
+        match value.node() {
+            ExprNode::BVar { idx } => {
+                *owned
+                    .get_mut(*idx as usize)
+                    .ok_or_else(|| invariant("recursive ownership source slot"))? = true;
+                Ok(true)
+            }
+            // Every residual application in this subset is a nonnullary
+            // function call. Its result is already owned independently of
+            // whether the compiler shares identical applications.
+            ExprNode::App { .. } => Ok(true),
+            // Owning a literal can affect a later tail call only if the pin
+            // shares its let binding. The expression DAG does not establish
+            // that occurrence identity, so retain the previous owned ABI.
+            ExprNode::Lit { .. } | ExprNode::Const { .. } => Ok(false),
+            _ => Err(invariant("normalized recursive ownership argument")),
+        }
+    }
+
+    fn argument_is_owned(&mut self, value: &Expr, owned: &[bool]) -> Result<bool> {
+        self.checks.meter.charge(1)?;
+        match value.node() {
+            ExprNode::BVar { idx } => owned
+                .get(*idx as usize)
+                .copied()
+                .ok_or_else(|| invariant("recursive ownership source slot")),
+            ExprNode::App { .. } => Ok(true),
+            ExprNode::Lit { .. } | ExprNode::Const { .. } => Ok(false),
+            _ => Err(invariant("normalized recursive ownership argument")),
+        }
+    }
+
+    /// Return false when exact borrowing needs occurrence/CSE provenance that
+    /// is absent from this DAG. That is not a license to mark an input borrowed.
+    fn ownership_step(
+        &mut self,
+        value: &Expr,
+        tail: bool,
+        retained: &[bool],
+        owned: &mut [bool],
+        depth: usize,
+    ) -> Result<bool> {
+        if depth >= 128 {
+            return Err(CompileError::Limit);
+        }
+        self.checks.meter.charge(1)?;
+        if !matches!(value.node(), ExprNode::App { .. }) {
+            return Ok(true);
+        }
+        let (head, arguments) = self.spine(value)?;
+        if named(&head, "_fln_recursive_source_case") {
+            let [condition, no, yes] = arguments.as_slice() else {
+                return Err(invariant("recursive ownership case arity"));
+            };
+            return Ok(
+                self.ownership_step(condition, false, retained, owned, depth + 1)?
+                    && self.ownership_step(no, tail, retained, owned, depth + 1)?
+                    && self.ownership_step(yes, tail, retained, owned, depth + 1)?,
+            );
+        }
+        let recursive =
+            matches!(head.node(), ExprNode::Const { name, .. } if name == self.companion);
+        if recursive {
+            if arguments.len() != owned.len() || retained.len() != owned.len() {
+                return Err(invariant("recursive ownership call arity"));
+            }
+            for (index, argument) in arguments.iter().enumerate() {
+                if !retained[index] {
+                    continue;
+                }
+                if !self.ownership_step(argument, false, retained, owned, depth + 1)? {
+                    return Ok(false);
+                }
+                if owned[index] && !self.own_argument(argument, owned)? {
+                    return Ok(false);
+                }
+                // InferBorrow.preserveTailCall only propagates forwards at
+                // an actual self tail call, never at a nested recursive call.
+                if tail && self.argument_is_owned(argument, owned)? {
+                    owned[index] = true;
+                }
+            }
+            return Ok(true);
+        }
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Err(invariant("recursive ownership callee"));
+        };
+        let operation =
+            primitive(name).ok_or_else(|| invariant("validated recursive ownership operation"))?;
+        self.checks
+            .meter
+            .charge(fln_vm::extern_table_generated::EXTERN_ROWS.len())?;
+        let row = fln_vm::extern_table_generated::EXTERN_ROWS
+            .iter()
+            .find(|row| row.name == operation)
+            .ok_or_else(|| invariant("recursive ownership native row"))?;
+        self.checks.meter.charge(row.ownership.len())?;
+        let contract = fln_vm::extern_row::Ownership::parse(row.ownership)
+            .map_err(|_| invariant("recursive native ownership contract"))?;
+        let policies = contract
+            .argument_ownership(arguments.len())
+            .map_err(|_| invariant("recursive native argument ownership"))?;
+        for (argument, policy) in arguments.iter().zip(policies) {
+            if !self.ownership_step(argument, false, retained, owned, depth + 1)? {
+                return Ok(false);
+            }
+            match policy {
+                fln_vm::extern_row::ArgumentOwnership::Borrowed
+                | fln_vm::extern_row::ArgumentOwnership::Scalar => {}
+                fln_vm::extern_row::ArgumentOwnership::Owned => {
+                    if !self.own_argument(argument, owned)? {
+                        return Ok(false);
+                    }
+                }
+                fln_vm::extern_row::ArgumentOwnership::Unique => {
+                    return Err(unsupported("recursive source unique ownership"));
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn ownership(&mut self, value: &Expr, used: &[bool]) -> Result<Option<Vec<bool>>> {
+        self.checks.meter.charge(used.len().saturating_mul(2))?;
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(used.len())
+            .map_err(|_| CompileError::Allocation)?;
+        owned.resize(used.len(), false);
+        let mut retained = Vec::new();
+        retained
+            .try_reserve_exact(used.len())
+            .map_err(|_| CompileError::Allocation)?;
+        let used_count = used.iter().filter(|used| **used).count();
+        // ReduceArity precedes InferBorrow. An entirely unused telescope is
+        // retained by the pin, as it is by the existing source export path.
+        retained.extend(used.iter().map(|used| *used || used_count == 0));
+        loop {
+            self.checks.meter.charge(owned.len().saturating_mul(2))?;
+            let before = owned.iter().filter(|owned| **owned).count();
+            if !self.ownership_step(value, true, &retained, &mut owned, 0)? {
+                return Ok(None);
+            }
+            // Facts only move from borrowed to owned. At most arity additions
+            // are possible; each complete pass is charged to the work budget.
+            if owned.iter().filter(|owned| **owned).count() == before {
+                return Ok(Some(owned));
+            }
+        }
+    }
+
     fn contains(&mut self, value: &Expr, searched: &Expr) -> Result<bool> {
         let mut pending = vec![value];
         let mut seen = std::collections::HashSet::new();
@@ -622,7 +785,7 @@ pub(super) fn parameters(
     executable_environment: &crate::Environment,
     ingress: fln_comp::ingress::IngressLimits,
     meter: &mut Budget,
-) -> Result<Vec<bool>> {
+) -> Result<Parameters> {
     let mut analysis = Analysis {
         checks: SourceUses {
             // These checks describe executable dependencies, including hidden
@@ -657,5 +820,7 @@ pub(super) fn parameters(
         body = next;
     }
     let value = analysis.value(body, &mut locals, 0)?;
-    analysis.uses(&value)
+    let used = analysis.uses(&value)?;
+    let owned = analysis.ownership(&value, &used)?;
+    Ok(Parameters { used, owned })
 }

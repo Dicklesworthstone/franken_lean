@@ -241,7 +241,7 @@ fn native_ir_facets_export_checked_recursive_primitive_definitions() {
                 } if name.to_display_string() == label => Some((
                     params
                         .iter()
-                        .map(|param| param.ty.clone())
+                        .map(|param| (param.ty.clone(), param.borrow))
                         .collect::<Vec<_>>(),
                     result.clone(),
                 )),

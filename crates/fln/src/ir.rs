@@ -1288,6 +1288,9 @@ struct SourceSignature {
     params: Vec<IrParam>,
     result: IrType,
     reduced: Option<Vec<ReducedArgument>>,
+    /// Exact inference is currently available for the checked recursive
+    /// primitive/enum profile. Other exports retain their owned adapters.
+    inferred_borrowing: bool,
     /// The public layout at each canonical constructor ordinal, collected
     /// through the complete source signature, including callback types.
     constructor_fields: Vec<u16>,
@@ -2251,7 +2254,7 @@ fn source_carrier(
 fn source_signature(
     definition: &fln_env::constants::DefinitionVal,
     erasures: &[bool],
-    parameter_uses: Option<&[bool]>,
+    recursive_parameters: Option<&recursive_signatures::Parameters>,
     environment: &crate::Environment,
     ingress: fln_comp::ingress::IngressLimits,
     meter: &mut Budget,
@@ -2277,6 +2280,16 @@ fn source_signature(
                 } else {
                     source_carrier(binder_type, environment, &mut constructor_fields, meter)?
                 };
+                let borrow = if let Some(owned) =
+                    recursive_parameters.and_then(|parameters| parameters.owned.as_ref())
+                {
+                    let owned = *owned
+                        .get(params.len())
+                        .ok_or_else(|| invariant("recursive source ownership arity"))?;
+                    !owned && matches!(carrier, IrType::Object | IrType::TObject)
+                } else {
+                    false
+                };
                 let mut parameter = binder_type;
                 while let ExprNode::MData { expr, .. } = parameter.node() {
                     meter.charge(1)?;
@@ -2295,7 +2308,7 @@ fn source_signature(
                     .map_err(|_| CompileError::Allocation)?;
                 params.push(IrParam {
                     x: params.len() as u64 + 1,
-                    borrow: false,
+                    borrow,
                     ty: carrier,
                 });
                 ty = body;
@@ -2311,7 +2324,8 @@ fn source_signature(
     // no strictly smaller nonempty form. Avoid imposing a reduction analysis
     // on unary enum matches that cannot need a reduced entry.
     let reduced = if params.len() > 1 {
-        let mut used = if let Some(used) = parameter_uses {
+        let mut used = if let Some(parameters) = recursive_parameters {
+            let used = &parameters.used;
             if used.len() != params.len() {
                 return Err(invariant("recursive source use arity"));
             }
@@ -2376,8 +2390,24 @@ fn source_signature(
         params,
         result,
         reduced,
+        inferred_borrowing: recursive_parameters
+            .is_some_and(|parameters| parameters.owned.is_some()),
         constructor_fields,
     })
+}
+
+/// ExplicitBoxing.requiresBoxedVersion at the pin: scalar values, borrowed
+/// parameters and void slots need an owned object bridge, as do over-wide
+/// closures. The checked source path refuses extern implementations. UInt8 is
+/// the only scalar admitted by this source profile; Tagged is already boxed.
+fn requires_source_boxed(params: &[IrParam], result: &IrType, inferred: bool) -> bool {
+    (!params.is_empty()
+        && (!inferred
+            || *result == IrType::UInt8
+            || params
+                .iter()
+                .any(|param| param.borrow || matches!(param.ty, IrType::UInt8 | IrType::Void))))
+        || params.len() > fln_rt::abi::CLOSURE_MAX_ARGS
 }
 
 fn export_source(
@@ -2413,6 +2443,19 @@ fn export_source(
         // directions; the internal FIR program remains entirely boxed.
         let mut args = Vec::new();
         for p in &signature.params {
+            if p.borrow {
+                // The source ABI lends this object, while closure application
+                // consumes every operand. Donate one retained owner without
+                // releasing the caller's borrowed reference.
+                meter.charge(1)?;
+                stmts.try_reserve(1).map_err(|_| CompileError::Allocation)?;
+                stmts.push(IrStmt::Inc {
+                    x: p.x,
+                    n: 1,
+                    checked: true,
+                    persistent: false,
+                });
+            }
             args.push(if p.ty == IrType::Erased {
                 IrArg::Erased
             } else if p.ty == IrType::UInt8 {
@@ -2469,7 +2512,11 @@ fn export_source(
     declarations
         .try_reserve_exact(4)
         .map_err(|_| CompileError::Allocation)?;
-    if !signature.params.is_empty() {
+    if requires_source_boxed(
+        &signature.params,
+        &signature.result,
+        signature.inferred_borrowing,
+    ) {
         declarations.push(boxed_wrapper(&public, meter)?);
     }
     declarations.push(public);
@@ -2560,7 +2607,12 @@ fn export_source(
             },
             sorry_dep: None,
         };
-        declarations.push(boxed_wrapper(&adapter, meter)?);
+        let IrDecl::Function { params, result, .. } = &adapter else {
+            return Err(invariant("reduced source function"));
+        };
+        if requires_source_boxed(params, result, signature.inferred_borrowing) {
+            declarations.push(boxed_wrapper(&adapter, meter)?);
+        }
         declarations.push(adapter);
     }
     Ok(declarations)
@@ -2890,7 +2942,7 @@ pub(crate) fn compile_checked_source_definition(
             "source export with an executable replacement or extern",
         )));
     }
-    let mut recursive_uses = None;
+    let mut recursive_parameters = None;
     if let Some((companion, executable_environment)) =
         checked_recursive_companion(engine, name, engine_limits, &mut meter)?
     {
@@ -2912,7 +2964,7 @@ pub(crate) fn compile_checked_source_definition(
         // several slots, the wrapper's syntactic uses are not the companion's:
         // unchanged self-call arguments are ignored by the pin's ReduceArity.
         if arity > 1 {
-            recursive_uses = Some(
+            recursive_parameters = Some(
                 recursive_signatures::parameters(
                     name,
                     &companion,
@@ -2938,7 +2990,7 @@ pub(crate) fn compile_checked_source_definition(
     let signature = source_signature(
         &definition,
         &erasures,
-        recursive_uses.as_deref(),
+        recursive_parameters.as_ref(),
         engine.environment(),
         ingress,
         &mut meter,

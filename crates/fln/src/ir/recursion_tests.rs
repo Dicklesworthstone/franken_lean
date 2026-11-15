@@ -330,6 +330,15 @@ fn source_recursion_exports_checked_enum_carriers_and_reduced_entries() {
             "{label}"
         );
         assert_eq!(*result, returned, "{label}");
+        assert!(params.iter().all(|param| !param.borrow), "{label}");
+        assert_eq!(
+            module
+                .decls
+                .iter()
+                .any(|decl| decl.name() == &Name::str(entry.clone(), "_boxed")),
+            label != "dropSingle",
+            "source boxing for {label}"
+        );
         let helper = Name::str(entry, "_redArg");
         let actual = module.decls.iter().find_map(|decl| match decl {
             IrDecl::Function {
@@ -350,6 +359,12 @@ fn source_recursion_exports_checked_enum_carriers_and_reduced_entries() {
             actual,
             reduced.then(|| (vec![IrType::TObject], IrType::TObject)),
             "{label}"
+        );
+        assert!(
+            module
+                .decls
+                .iter()
+                .all(|decl| { decl.name() != &Name::str(helper.clone(), "_boxed") })
         );
         assert!(
             module
@@ -476,32 +491,78 @@ partial def spinBoth (a b : Nat) : Nat := spinBoth a b
     // These masks match the pinned compiler's reduceArity pass. In particular,
     // changed/permuted recursive arguments count, unchanged same-slot arguments
     // do not, and the pin preserves the telescope when no parameters are used.
-    for (label, arity, reduced) in [
-        ("accumulator", 2, None),
-        ("dropSecond", 2, Some(1)),
-        ("swap", 3, None),
-        ("flags", 3, Some(2)),
-        ("identityArg", 2, Some(1)),
-        ("changedArg", 2, None),
-        ("erasedProduct", 2, Some(1)),
-        ("subSelf", 2, None),
-        ("eqSelf", 2, None),
-        ("leSelf", 2, None),
-        ("branchFact", 2, Some(1)),
-        ("identityBool", 2, Some(1)),
-        ("spinBoth", 2, None),
+    for (label, arity, reduced, borrowed, boxed, reduced_boxed) in [
+        ("accumulator", 2, None, &[][..], false, false),
+        ("dropSecond", 2, Some(1), &[1][..], true, false),
+        ("swap", 3, None, &[1, 2][..], true, false),
+        ("flags", 3, Some(2), &[][..], true, true),
+        ("identityArg", 2, Some(1), &[1][..], true, false),
+        ("changedArg", 2, None, &[][..], false, false),
+        ("erasedProduct", 2, Some(1), &[1][..], true, false),
+        ("subSelf", 2, None, &[][..], false, false),
+        ("eqSelf", 2, None, &[0, 1][..], true, false),
+        ("leSelf", 2, None, &[0, 1][..], true, false),
+        ("branchFact", 2, Some(1), &[0][..], true, true),
+        ("identityBool", 2, Some(1), &[][..], true, false),
+        ("spinBoth", 2, None, &[0, 1][..], true, false),
     ] {
         let entry = name(label);
         let module = export(&engine, label)
             .unwrap_or_else(|error| panic!("{label}: {error:?}"))
             .into_complete()
             .unwrap();
-        let Some(IrDecl::Function { params, result, .. }) =
-            module.decls.iter().find(|decl| decl.name() == &entry)
+        let Some(IrDecl::Function {
+            params,
+            result,
+            body,
+            ..
+        }) = module.decls.iter().find(|decl| decl.name() == &entry)
         else {
             panic!("missing recursive exported function {label}")
         };
         assert_eq!(params.len(), arity, "{label}");
+        assert_eq!(
+            params
+                .iter()
+                .enumerate()
+                .filter_map(|(index, param)| param.borrow.then_some(index))
+                .collect::<Vec<_>>(),
+            borrowed,
+            "borrowed source ABI for {label}"
+        );
+        for &index in borrowed {
+            assert!(
+                body.stmts.iter().any(|statement| matches!(
+                    statement,
+                    IrStmt::Inc { x, n: 1, checked: true, persistent: false }
+                        if *x == params[index].x
+                )),
+                "borrowed closure operand needs an owned donation: {label}"
+            );
+        }
+        let boxed_entry = Name::str(entry.clone(), "_boxed");
+        assert_eq!(
+            module.decls.iter().any(|decl| decl.name() == &boxed_entry),
+            boxed,
+            "boxed source ABI for {label}"
+        );
+        if boxed {
+            let Some(IrDecl::Function { body, .. }) =
+                module.decls.iter().find(|decl| decl.name() == &boxed_entry)
+            else {
+                panic!("missing boxed source entry")
+            };
+            for &index in borrowed {
+                assert!(
+                    body.stmts.iter().any(|statement| matches!(
+                        statement,
+                        IrStmt::Dec { x, n: 1, checked: true, persistent: false }
+                            if *x == params[index].x
+                    )),
+                    "boxed entry must release the owner's borrow: {label}"
+                );
+            }
+        }
         assert_eq!(
             *result,
             if label == "flags" {
@@ -517,6 +578,14 @@ partial def spinBoth (a b : Nat) : Nat := spinBoth a b
             _ => None,
         });
         assert_eq!(actual, reduced, "{label}");
+        assert_eq!(
+            module
+                .decls
+                .iter()
+                .any(|decl| decl.name() == &Name::str(helper.clone(), "_boxed")),
+            reduced_boxed,
+            "boxed reduced ABI for {label}"
+        );
         assert!(
             module
                 .decls
@@ -527,6 +596,59 @@ partial def spinBoth (a b : Nat) : Nat := spinBoth a b
             engine.environment().find(&entry),
             Some(ConstantInfo::Opaque(value)) if !value.is_unsafe
         ));
+        assert_eq!(engine.environment(), &before);
+    }
+}
+
+#[test]
+fn recursive_ownership_distinguishes_tail_calls_and_reaches_a_fixed_point() {
+    let engine = checked(
+        r#"partial def spreadOwnership (n left right : Nat) : Nat :=
+  if n == 0 then left else spreadOwnership (n - 1) right (left + 2)
+partial def nestedCall (n value : Nat) : Nat :=
+  if n == 0 then value else nestedCall (n - 1) value + 2
+partial def consumingText (n : Nat) (left right : String) : String :=
+  if n == 0 then left else consumingText (n - 1) (left ++ right) right
+partial def persistentText (n : Nat) (text : String) : String :=
+  if n == 0 then text else persistentText (n - 1) ("prefix" ++ text)
+"#,
+    );
+    let before = engine.environment().clone();
+    for (label, borrowed, boxed) in [
+        ("spreadOwnership", &[][..], false),
+        ("nestedCall", &[0, 1][..], true),
+        ("consumingText", &[2][..], true),
+        // The normalized DAG cannot prove whether a consumed literal shares
+        // its binding with another occurrence. Keep the prior owned adapter.
+        ("persistentText", &[][..], true),
+    ] {
+        let module = export(&engine, label)
+            .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+            .into_complete()
+            .unwrap();
+        let entry = name(label);
+        let Some(IrDecl::Function { params, .. }) =
+            module.decls.iter().find(|decl| decl.name() == &entry)
+        else {
+            panic!("missing recursive ownership entry")
+        };
+        assert_eq!(
+            params
+                .iter()
+                .enumerate()
+                .filter_map(|(index, param)| param.borrow.then_some(index))
+                .collect::<Vec<_>>(),
+            borrowed,
+            "{label}"
+        );
+        assert_eq!(
+            module
+                .decls
+                .iter()
+                .any(|decl| decl.name() == &Name::str(entry.clone(), "_boxed")),
+            boxed,
+            "{label}"
+        );
         assert_eq!(engine.environment(), &before);
     }
 }

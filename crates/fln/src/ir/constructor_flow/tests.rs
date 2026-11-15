@@ -316,6 +316,7 @@ fn compile(program: &fir::ValidatedProgram) -> Result<()> {
         params: vec![],
         result: IrType::TObject,
         reduced: None,
+        inferred_borrowing: false,
         constructor_fields: vec![0; 3],
     };
     let module = compile_module(
