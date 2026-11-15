@@ -126,6 +126,9 @@ mod tests {
     fn named_rewrite_locations_preserve_comments_unicode_and_rule_terms() {
         for source in [
             "theorem t : True := by rw [h] at hx",
+            "theorem t : True := by symm at hx",
+            "theorem t : True := by symm at hx |-",
+            "theorem t : True := by\r\n  symm /- goal -/ at «h.x» ⊢\r\n  assumption",
             "theorem t : True := by rw [h] at ⊢",
             "theorem t : True := by rewrite [h] at hx |-",
             "theorem t : True := by simp only [h] at ⊢ hx",
@@ -144,6 +147,7 @@ mod tests {
     fn wildcard_locations_are_lossless_and_distinct_from_escaped_names() {
         for source in [
             "theorem t : True := by rw [h] at *",
+            "theorem t : True := by symm at *",
             "theorem t : True := by rewrite [← h, k] at *",
             "theorem t : True := by simp at *",
             "theorem t : True := by simp only [h] at *",
@@ -159,6 +163,10 @@ mod tests {
     fn malformed_locations_are_not_ignored() {
         for tail in [
             "rw [h] at",
+            "symm at",
+            "symm hx",
+            "symm at * hx",
+            "symm at hx, hy",
             "rw [h] at 3",
             "rw [h] «at» hx",
             "rw [h] at ⊢ 3",

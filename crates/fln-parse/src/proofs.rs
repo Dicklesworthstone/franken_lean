@@ -536,8 +536,12 @@ fn local_tactic(
     let start = range.start;
     let mut args = vec![atom];
     match keyword {
-        "symm" if range.end == start + 1 => {
-            args.push(null_node(Vec::new()));
+        "symm" => {
+            let (body, location) = locations::split(leaves, view, tokens, range)?;
+            if body.end != start + 1 {
+                return Err(refusal(view, tokens, start + 1));
+            }
+            args.push(location);
         }
         "revert" if range.end > start + 1 => {
             let mut names = Vec::new();
