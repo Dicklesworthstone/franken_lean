@@ -1,7 +1,7 @@
 //! Source -> native instance search -> both ordinary checking engines.
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Name, Outcome, SourceCheckLimits};
-use fln_core::expr::{Expr, ExprNode};
+use fln_core::expr::{BinderInfo, Expr, ExprNode};
 use fln_env::constants::ConstantInfo;
 
 fn n(s: &str) -> Name {
@@ -281,6 +281,103 @@ fn nonclasses_and_missing_instances_are_visible_refusals() {
         assert_eq!(before, base.logical_root(&KVMap::new()));
     }
 }
+#[test]
+fn prelude_instance_primitives_bootstrap_without_a_source_seed() {
+    let base = Engine::from_environment(fln::Environment::new());
+    // These are the two declarations in Init/Prelude.lean that use this
+    // option, before any class has been declared.
+    let result = checked(
+        &base,
+        "universe u\n\
+         set_option checkBinderAnnotations false in\n\
+         abbrev inferInstance {α : Sort u} [i : α] : α := i\n\
+         set_option checkBinderAnnotations false in\n\
+         abbrev «inferInstanceAs» (α : Sort u) [i : α] : α := i\n\
+         def explicit {α : Sort u} (x : α) : α := @inferInstance α x\n\
+         def explicitAs {α : Sort u} (x : α) : α := @inferInstanceAs α x\n",
+    );
+    for (name, first_style) in [
+        ("inferInstance", BinderInfo::Implicit),
+        ("inferInstanceAs", BinderInfo::Default),
+    ] {
+        let Some(ConstantInfo::Defn(def)) = result.environment().find(&n(name)) else {
+            panic!("missing Prelude primitive {name}");
+        };
+        assert_eq!(def.base.level_params, [n("u")]);
+        let ExprNode::ForallE {
+            binder_info, body, ..
+        } = def.base.type_.node()
+        else {
+            panic!("{name} is missing its type parameter");
+        };
+        assert_eq!(*binder_info, first_style);
+        assert!(
+            matches!(body.node(), ExprNode::ForallE { binder_info: BinderInfo::InstImplicit, .. }),
+            "{name} must retain its instance binder"
+        );
+    }
+}
+
+#[test]
+fn disabled_binder_checks_preserve_nonclass_and_parametric_instance_binders() {
+    let base = engine();
+    for source in [
+        "def arbitrary [n : Nat] : Nat := n\ntheorem value : @arbitrary 7 = 7 := rfl",
+        "def arbitrary := fun [n : Nat] => n\ntheorem value : @arbitrary 7 = 7 := rfl",
+        "def arbitrary : forall [n : Nat], Nat := fun [n : Nat] => n\ntheorem value : @arbitrary 7 = 7 := rfl",
+        "def arbitrary [f : Nat -> Inhabited Nat] : Nat := (f 7).default\ntheorem value : @arbitrary (fun n => Inhabited.mk n) = 7 := rfl",
+        "section\nvariable [n : Nat]\ndef arbitrary : Nat := n\nend\ntheorem value : @arbitrary 7 = 7 := rfl",
+    ] {
+        // The same source must reject under the default. This includes both
+        // checks guarded by the pin's option: class membership and forward
+        // dependencies of parametric instance arguments.
+        let error = base
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .expect_err("instance binder annotations must be checked by default");
+        assert_eq!(
+            error.disposition(),
+            ("elaboration", false, 1),
+            "{source}\n{error:?}"
+        );
+        checked(
+            &base,
+            &format!("set_option checkBinderAnnotations false\n{source}"),
+        );
+    }
+}
+
+#[test]
+fn binder_annotation_option_restores_scopes_and_preserves_type_checking() {
+    let base = engine();
+    checked(
+        &base,
+        "def localTerm := (set_option checkBinderAnnotations false in fun [n : Nat] => n)\n\
+         theorem localTerm_value : @localTerm 7 = 7 := rfl",
+    );
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "set_option checkBinderAnnotations true\ndef rejected [n : Nat] : Nat := n",
+        "set_option checkBinderAnnotations false in\ndef allowed [n : Nat] : Nat := n\ndef rejected [n : Nat] : Nat := n",
+        "section\nset_option checkBinderAnnotations false\ndef allowed [n : Nat] : Nat := n\nend\ndef rejected [n : Nat] : Nat := n",
+        "set_option checkBinderAnnotations false\nset_option checkBinderAnnotations true\ndef rejected [n : Nat] : Nat := n",
+        "set_option checkBinderAnnotations false\ndef rejected := set_option checkBinderAnnotations true in fun [n : Nat] => n",
+        "def rejected := let allowed := (set_option checkBinderAnnotations false in fun [n : Nat] => n); fun [n : Nat] => n",
+        "set_option checkBinderAnnotations false\ndef rejected [n : Nat] : Bool := n",
+        "set_option checkBinderAnnotations 0\ndef rejected [n : Nat] : Nat := n",
+    ] {
+        let error = base
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .expect_err("the option cannot escape its scope or bypass type checking");
+        assert_eq!(
+            error.disposition(),
+            ("elaboration", false, 1),
+            "{source}\n{error:?}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(!base.environment().contains(&n("rejected")));
+    }
+}
+
 #[test]
 fn registered_globals_are_priority_ordered_and_snapshot_local() {
     let base = checked(

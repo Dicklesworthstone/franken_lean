@@ -138,6 +138,13 @@ pub const ROWS: &[Row] = &[
         "Lean/Elab/MutualInductive.lean:57",
         Honored,
     ),
+    // Read by every declaration, term and section instance-binder validator.
+    row(
+        "checkBinderAnnotations",
+        Bool(true),
+        "Lean/Elab/Binders.lean:193",
+        Honored,
+    ),
     // Read by source reducibility attributes; bypasses the pin's status validation.
     row(
         "allowUnsafeReducibility",
@@ -1056,6 +1063,7 @@ mod tests {
             honored,
             [
                 "bootstrap.inductiveCheckResultingUniverse",
+                "checkBinderAnnotations",
                 "allowUnsafeReducibility",
                 "simprocs",
                 "tactic.skipAssignedInstances",

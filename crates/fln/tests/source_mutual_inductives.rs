@@ -537,15 +537,14 @@ fn bootstrap_option_admits_mutual_sort_polymorphism_without_large_elimination() 
     );
     check(&e, &source);
     let restored = format!("{source}\ninductive Forbidden : Sort u where | unit");
-    assert!(
-        e.check_source_files(
+    let error = e
+        .check_source_files(
             &[restored.as_bytes()],
             &KVMap::new(),
             SourceCheckLimits::new(limits()),
         )
-        .is_err(),
-        "a mutual command's local option leaked"
-    );
+        .expect_err("a mutual command's local option must not leak");
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
 }
 
 #[test]

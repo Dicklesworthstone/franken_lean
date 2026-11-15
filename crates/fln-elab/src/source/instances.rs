@@ -722,13 +722,20 @@ impl Context {
         )))
     }
 
-    /// Same annotation rule as the supported portion of Term.ElabBinders:
-    /// instance binders must end in a registered class, and non-instance
+    /// The pin's `checkBinderAnnotations` gates both annotation checks
+    /// (Lean/Elab/Binders.lean): the target must be a class, and non-instance
     /// parameters of parametric local instances must have forward dependencies.
     pub(super) fn validate_instance_binder(
         &mut self,
         domain: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
+        if !self
+            .txn
+            .options
+            .get_bool(&Name::from_components(["checkBinderAnnotations"]), true)
+        {
+            return Ok(());
+        }
         let registry = self
             .registry_cache
             .read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)

@@ -347,13 +347,11 @@ fn sort_polymorphic_inductives_keep_the_pins_elimination_restrictions() {
         "noncomputable def bad (x : SortChoice.{1}) : Nat := @SortChoice.rec (fun _ => Nat) 0 1 x",
         "noncomputable def bad (x : SortBox.{1} Nat) : Nat := @SortBox.rec Nat (fun _ => Nat) (fun n => n) x",
     ] {
-        assert!(
-            checked
-                .engine
-                .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
-                .is_err(),
-            "illegal large elimination accepted: {source}"
-        );
+        let error = checked
+            .engine
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .expect_err("the universe-polymorphic recursor cannot eliminate into Type");
+        assert_eq!(error.disposition().2, 1, "{source}\n{error:?}");
     }
 }
 
@@ -375,11 +373,10 @@ fn bootstrap_option_is_scoped_and_never_disables_structural_or_universe_checks()
         "universe u\nset_option bootstrap.inductiveCheckResultingUniverse false\ninductive Bad : Sort u where | mk (negative : Bad -> Nat)",
         "set_option bootstrap.inductiveCheckResultingUniverse 0\ninductive Bad where | unit",
     ] {
-        let result = base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits());
-        assert!(
-            !matches!(result, Ok(fln::Outcome::Complete(_))),
-            "invalid bootstrap source admitted: {source}"
-        );
+        let error = base
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .expect_err("invalid bootstrap source must be rejected");
+        assert_eq!(error.disposition().2, 1, "{source}\n{error:?}");
         assert_eq!(base.logical_root(&KVMap::new()), root, "{source}");
         assert!(!base.environment().contains(&Name::from_components(["Bad"])));
     }
