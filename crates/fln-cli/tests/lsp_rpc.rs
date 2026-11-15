@@ -62,6 +62,28 @@ fn expression_reference<'a>(value: &'a str, expression: &str, key: &str) -> &'a 
         .next()
         .unwrap()
 }
+fn expression_code<'a>(value: &'a str, expression: &str) -> &'a str {
+    let marker = format!(r#","subexprPos":"/"}},{{"text":{}}}]}}"#, quote(expression));
+    let prefix = value
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("missing tagged expression {expression}: {value}"))
+        .0;
+    let start = prefix
+        .rfind(r#"{"tag":[{"info":"#)
+        .unwrap_or_else(|| panic!("missing expression tree: {value}"));
+    &value[start..prefix.len() + marker.len()]
+}
+fn highlight_call(id: &str, session: &str, query: &str, message: &str) -> String {
+    request(
+        id,
+        "$/lean/rpc/call",
+        &format!(
+            r#"{{"sessionId":{},"method":"Lean.Widget.highlightMatches","params":{{"query":{},"msg":{message}}},"textDocument":{{"uri":"{URI}"}},"position":{{"line":0,"character":0}}}}"#,
+            quote(session),
+            quote(query)
+        ),
+    )
+}
 fn info_call(id: &str, session: &str, key: &str, reference: &str) -> String {
     request(
         id,
@@ -574,18 +596,13 @@ fn diagnostic_highlighting_uses_the_live_pinned_wire_shape_and_session_guards() 
             r#"{"append":[{"text":""},{"append":[]},{"text":"😀"}]}"#,
         ),
         ("a", r#"{"text":"A"}"#, r#"{"text":"A"}"#),
+        (
+            "x",
+            r#"{"tag":[{"expr":{"text":"x"}},{"text":""}]}"#,
+            r#"{"tag":[{"expr":{"tag":["highlighted",{"text":"x"}]}},{"text":""}]}"#,
+        ),
     ];
-    let search = |id: &str, session: &str, query: &str, message: &str| {
-        request(
-            id,
-            "$/lean/rpc/call",
-            &format!(
-                r#"{{"sessionId":{},"method":"Lean.Widget.highlightMatches","params":{{"query":{},"msg":{message}}},"textDocument":{{"uri":"{URI}"}},"position":{{"line":0,"character":0}}}}"#,
-                quote(session),
-                quote(query)
-            ),
-        )
-    };
+    let search = highlight_call;
     for (binary, args) in [
         (env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
         (env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
@@ -608,7 +625,7 @@ fn diagnostic_highlighting_uses_the_live_pinned_wire_shape_and_session_guards() 
                     "embedded",
                     &session,
                     "x",
-                    r#"{"tag":[{"expr":{"text":"x"}},{"text":""}]}"#,
+                    r#"{"tag":[{"goal":{}},{"text":""}]}"#,
                 ),
             );
             assert!(unsupported.contains("\"code\":-32803"), "{unsupported}");
@@ -624,6 +641,79 @@ fn diagnostic_highlighting_uses_the_live_pinned_wire_shape_and_session_guards() 
             let recovered = client.exchange(
                 "recovered",
                 &search("recovered", &session, "x", r#"{"text":"x"}"#),
+            );
+            assert!(
+                recovered.contains(r#""result":{"tag":["highlighted",{"text":"x"}]}"#),
+                "{recovered}"
+            );
+            client.finish();
+        }
+    }
+}
+
+#[test]
+fn rich_diagnostic_search_keeps_native_expression_hovers_alive_after_release() {
+    for (binary, args) in [
+        (env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        (env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        for (format, key) in [("v0", "p"), ("v1", "__rpcref")] {
+            let mut client = Client::start(binary, args, format);
+            client.open(SOURCE);
+            let session = client.connect("connect");
+            let goals = client.exchange(
+                "goals",
+                &call("goals", &session, "Lean.Widget.getInteractiveGoals", 1, 2),
+            );
+            // Send the actual CodeWithInfos returned by native elaboration.
+            // Its reference is neither guessed nor supplied by a fake provider.
+            let code = expression_code(&goals, "P");
+            let info = extract_string(code, key);
+            let message = format!(
+                r#"{{"append":[{{"text":"before "}},{{"tag":[{{"expr":{code}}},{{"text":""}}]}},{{"text":" after"}}]}}"#
+            );
+            let highlighted = client.exchange(
+                "highlight",
+                &highlight_call("highlight", &session, "P", &message),
+            );
+            let expected_code = code.replacen(
+                r#"{"text":"P"}"#,
+                r#"{"tag":["highlighted",{"text":"P"}]}"#,
+                1,
+            );
+            assert!(highlighted.contains(&expected_code), "{highlighted}");
+            assert!(
+                highlighted.contains(r#""result":{"append":["#),
+                "{highlighted}"
+            );
+            let release = format!(
+                r#"{{"uri":"{URI}","sessionId":"{session}","refs":[{{"{key}":"{info}"}}]}}"#
+            );
+            client.send(&notification("$/lean/rpc/release", &release));
+            let retained = client.exchange(
+                "highlight-popup",
+                &info_call("highlight-popup", &session, key, info),
+            );
+            assert!(
+                retained.contains(r#""exprExplicit":{"text":"P"}"#),
+                "{retained}"
+            );
+            assert!(retained.contains(r#""type":{"text":"Prop"}"#), "{retained}");
+
+            client.send(&notification("$/lean/rpc/release", &release));
+            let released = client.exchange(
+                "released-popup",
+                &info_call("released-popup", &session, key, info),
+            );
+            assert!(released.contains(r#""code":-32602"#), "{released}");
+            let invalid = client.exchange(
+                "released-highlight",
+                &highlight_call("released-highlight", &session, "P", &message),
+            );
+            assert!(invalid.contains(r#""code":-32602"#), "{invalid}");
+            let recovered = client.exchange(
+                "recovered-highlight",
+                &highlight_call("recovered-highlight", &session, "x", r#"{"text":"x"}"#),
             );
             assert!(
                 recovered.contains(r#""result":{"tag":["highlighted",{"text":"x"}]}"#),

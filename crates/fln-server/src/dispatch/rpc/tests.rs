@@ -627,6 +627,122 @@ fn highlight_call(session: u64, uri: &str, params: &str) -> String {
     )
 }
 
+fn search_message(
+    sessions: &mut Sessions,
+    id: u64,
+    params: &str,
+    docs: &DocumentSession,
+    provider: &mut Provider,
+) -> Result<String> {
+    sessions.execute(
+        "$/lean/rpc/call",
+        RawField::Value(&highlight_call(id, URI, params)),
+        docs,
+        provider,
+    )
+}
+
+fn root_info_reference(sessions: &Sessions, id: u64) -> u64 {
+    sessions.sessions[&id]
+        .references
+        .iter()
+        .find_map(|(id, reference)| {
+            (reference.kind
+                == ReferenceKind::Info(InfoAddress {
+                    code: CodeAddress {
+                        goal: 0,
+                        field: CodeField::Target,
+                    },
+                    subexpression: None,
+                }))
+            .then_some(*id)
+        })
+        .unwrap()
+}
+
+#[test]
+fn message_search_retains_each_expression_occurrence_until_its_own_release() {
+    for format in [WireFormat::V0, WireFormat::V1] {
+        let mut sessions = Sessions {
+            format,
+            ..Sessions::default()
+        };
+        let id = sessions.create(URI.into(), Instant::now()).unwrap();
+        let docs = documents();
+        let mut provider = Provider {
+            result: Some(annotated_answer()),
+            ..Provider::new()
+        };
+        execute(&mut sessions, id, &docs, &mut provider).unwrap();
+        let root = root_info_reference(&sessions, id);
+        let reference = format.reference(root);
+        let expression = tagged(&reference, 1, &code("(f β)"));
+        let embed = format!(r#"{{"tag":[{{"expr":{expression}}},{{"text":""}}]}}"#);
+        let message = format!(r#"{{"append":[{embed},{embed}]}}"#);
+        let session = &sessions.sessions[&id];
+        let retained = (
+            session.references.len(),
+            session.bytes,
+            session.next_reference,
+        );
+        for (index, query) in ["β", ""].into_iter().enumerate() {
+            let params = format!(
+                r#"{{"query":{},"msg":{message}}}"#,
+                crate::json_string(query)
+            );
+            let result = search_message(&mut sessions, id, &params, &docs, &mut provider).unwrap();
+            assert_eq!(result.matches(&format!(r#""info":{reference}"#)).count(), 2);
+            if query.is_empty() {
+                assert_eq!(result, message);
+            } else {
+                assert_eq!(
+                    result
+                        .matches(r#""tag":["highlighted",{"text":"β"}]"#)
+                        .count(),
+                    2
+                );
+            }
+            assert_eq!(
+                sessions.sessions[&id].references[&root].count,
+                1 + 2 * (index + 1)
+            );
+            let session = &sessions.sessions[&id];
+            assert_eq!(
+                (
+                    session.references.len(),
+                    session.bytes,
+                    session.next_reference
+                ),
+                retained
+            );
+        }
+        assert_eq!(
+            provider.calls, 1,
+            "highlighting must reuse retained native metadata"
+        );
+        // Release the original presentation, then each highlighted occurrence.
+        // A reference is invalidated only when the final copy is released.
+        for _ in 0..4 {
+            sessions.sessions.get_mut(&id).unwrap().release(root);
+            assert_eq!(
+                popup(&mut sessions, id, &reference, &docs, &mut provider).unwrap(),
+                r#"{"exprExplicit":{"text":"(f β)"},"type":{"text":"P"},"doc":null}"#
+            );
+        }
+        sessions.sessions.get_mut(&id).unwrap().release(root);
+        assert!(matches!(
+            popup(&mut sessions, id, &reference, &docs, &mut provider),
+            Err((-32602, _))
+        ));
+        let refs: Vec<_> = sessions.sessions[&id].references.keys().copied().collect();
+        for reference in refs {
+            sessions.sessions.get_mut(&id).unwrap().release(reference);
+        }
+        assert!(sessions.sessions[&id].references.is_empty());
+        assert_eq!(sessions.sessions[&id].bytes, 0);
+    }
+}
+
 #[test]
 fn message_search_uses_client_presentations_without_querying_or_retaining_objects() {
     for format in [WireFormat::V0, WireFormat::V1] {
@@ -667,6 +783,133 @@ fn message_search_uses_client_presentations_without_querying_or_retaining_object
 }
 
 #[test]
+fn message_search_rejects_dead_or_wrong_refs_and_rolls_back_late_failures() {
+    for format in [WireFormat::V0, WireFormat::V1] {
+        let mut sessions = Sessions {
+            format,
+            ..Sessions::default()
+        };
+        let id = sessions.create(URI.into(), Instant::now()).unwrap();
+        let docs = documents();
+        let mut provider = Provider {
+            result: Some(annotated_answer()),
+            ..Provider::new()
+        };
+        execute(&mut sessions, id, &docs, &mut provider).unwrap();
+        let root = root_info_reference(&sessions, id);
+        let dead = sessions.sessions[&id]
+            .references
+            .iter()
+            .find_map(|(id, reference)| {
+                matches!(reference.kind, ReferenceKind::Info(address) if address.subexpression.is_some())
+                    .then_some(*id)
+            })
+            .unwrap();
+        sessions.sessions.get_mut(&id).unwrap().release(dead);
+        let embed = |reference: &str| {
+            let expression = tagged(reference, 1, &code("(f β)"));
+            format!(r#"{{"tag":[{{"expr":{expression}}},{{"text":""}}]}}"#)
+        };
+        let valid = embed(&format.reference(root));
+        let other = if format == WireFormat::V0 {
+            WireFormat::V1
+        } else {
+            WireFormat::V0
+        };
+        let session = &sessions.sessions[&id];
+        let retained = (
+            session.references.len(),
+            session.bytes,
+            session.next_reference,
+        );
+        for reference in [
+            format.reference(0),
+            format.reference(dead),
+            format.reference(u64::MAX),
+            other.reference(root),
+        ] {
+            let bad = embed(&reference);
+            let params = format!(r#"{{"query":"","msg":{{"append":[{valid},{bad}]}}}}"#);
+            assert!(
+                matches!(
+                    search_message(&mut sessions, id, &params, &docs, &mut provider),
+                    Err((-32602, _))
+                ),
+                "{reference}"
+            );
+            let session = &sessions.sessions[&id];
+            assert_eq!(
+                (
+                    session.references.len(),
+                    session.bytes,
+                    session.next_reference
+                ),
+                retained
+            );
+            assert_eq!(session.references[&root].count, 1);
+        }
+        let foreign = sessions.create(URI.into(), Instant::now()).unwrap();
+        let params = format!(r#"{{"query":"","msg":{valid}}}"#);
+        assert!(matches!(
+            search_message(&mut sessions, foreign, &params, &docs, &mut provider),
+            Err((-32602, _))
+        ));
+        assert!(sessions.sessions[&foreign].references.is_empty());
+
+        let exhausted = format!(
+            r#"{{"query":"x","msg":{{"append":[{valid},{{"text":"{}"}}]}}}}"#,
+            "x".repeat(30000)
+        );
+        let error =
+            search_message(&mut sessions, id, &exhausted, &docs, &mut provider).unwrap_err();
+        assert_eq!(error.0, REQUEST_FAILED_CODE);
+        assert!(error.1.contains("wire budget"));
+        assert_eq!(sessions.sessions[&id].references[&root].count, 1);
+
+        sessions
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .references
+            .get_mut(&root)
+            .unwrap()
+            .count = usize::MAX - 1;
+        let exhausted = format!(r#"{{"query":"","msg":{{"append":[{valid},{valid}]}}}}"#);
+        let error =
+            search_message(&mut sessions, id, &exhausted, &docs, &mut provider).unwrap_err();
+        assert_eq!(error.0, REQUEST_FAILED_CODE);
+        assert!(error.1.contains("reference count"));
+        assert_eq!(
+            sessions.sessions[&id].references[&root].count,
+            usize::MAX - 1
+        );
+        sessions
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .references
+            .get_mut(&root)
+            .unwrap()
+            .count = 1;
+        assert_eq!(
+            search_message(&mut sessions, id, &params, &docs, &mut provider).unwrap(),
+            valid
+        );
+        assert_eq!(sessions.sessions[&id].references[&root].count, 2);
+        let session = &sessions.sessions[&id];
+        assert_eq!(
+            (
+                session.references.len(),
+                session.bytes,
+                session.next_reference
+            ),
+            retained
+        );
+        assert_eq!(provider.calls, 1);
+    }
+}
+
+#[test]
 fn message_search_reports_invalid_params_separately_from_unsupported_embeddings() {
     let mut sessions = Sessions::default();
     let id = sessions.create(URI.into(), Instant::now()).unwrap();
@@ -676,7 +919,7 @@ fn message_search_reports_invalid_params_separately_from_unsupported_embeddings(
         (r#"{"query":false,"msg":{"text":"x"}}"#, -32602),
         (r#"{"query":"x","msg":{"text":"x","text":"y"}}"#, -32602),
         (
-            r#"{"query":"x","msg":{"tag":[{"expr":{"text":"x"}},{"text":""}]}}"#,
+            r#"{"query":"x","msg":{"tag":[{"goal":{}},{"text":""}]}}"#,
             REQUEST_FAILED_CODE,
         ),
     ] {

@@ -28,6 +28,13 @@ fn failed(message: &str) -> (i32, String) {
 fn outdated() -> (i32, String) {
     (RECONNECT, "Outdated RPC session".to_owned())
 }
+fn highlight_error(error: params::highlight::Error) -> (i32, String) {
+    match error {
+        params::highlight::Error::Invalid(message) => invalid(message),
+        params::highlight::Error::Unsupported(message)
+        | params::highlight::Error::Limit(message) => failed(message),
+    }
+}
 
 struct Snapshot {
     version: i64,
@@ -160,6 +167,21 @@ impl Session {
                 self.bytes -= reference.snapshot.bytes;
             }
         }
+    }
+
+    fn retain_expression(&mut self, id: u64) -> Result<()> {
+        // Decoding an InfoWithCtx requires an existing expression reference,
+        // not a goal context, a client-invented identity or a released snapshot.
+        self.expression(id)?;
+        let reference = self
+            .references
+            .get_mut(&id)
+            .ok_or_else(|| invalid("RPC expression reference is unknown or has been released"))?;
+        reference.count = reference
+            .count
+            .checked_add(1)
+            .ok_or_else(|| failed("RPC reference count exhausted"))?;
+        Ok(())
     }
 
     fn expression(&self, id: u64) -> Result<(&str, &ExpressionInfo)> {
@@ -399,19 +421,23 @@ impl Sessions {
         }
         if call.method == "Lean.Widget.highlightMatches" {
             // Search the presentation already held by the client. This is not
-            // another semantic query and must not elaborate the document or
-            // allocate references to fictitious expression/trace objects.
-            let result =
-                params::highlight::response(call.params, MAX_RESPONSE_BYTES).map_err(|error| {
-                    match error {
-                        params::highlight::Error::Invalid(message) => invalid(message),
-                        params::highlight::Error::Unsupported(message)
-                        | params::highlight::Error::Limit(message) => failed(message),
-                    }
-                })?;
-            // As with goals, bounded processing cannot revive an expired
-            // session. Nothing has been published if this final check fails.
-            self.session(call.session, &call.uri, Instant::now())?;
+            // another semantic query. Re-encoding an expression retains its
+            // existing InfoWithCtx once per occurrence, so releasing the input
+            // cannot invalidate a hover in the highlighted presentation.
+            let request = params::highlight::Request::decode(call.params, self.format)
+                .map_err(highlight_error)?;
+            let mut staged = self
+                .session(call.session, &call.uri, Instant::now())?
+                .clone();
+            for reference in request.references() {
+                staged.retain_expression(reference)?;
+            }
+            let result = request
+                .response(MAX_RESPONSE_BYTES)
+                .map_err(highlight_error)?;
+            // Invalid later references, output exhaustion and session expiry
+            // publish neither a partial result nor partial reference counts.
+            *self.session(call.session, &call.uri, Instant::now())? = staged;
             return Ok(result);
         }
         if call.method == "Lean.Widget.getWidgets" {

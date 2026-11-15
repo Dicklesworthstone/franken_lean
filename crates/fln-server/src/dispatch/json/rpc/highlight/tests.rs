@@ -1,5 +1,9 @@
 use super::*;
 
+fn response(value: RawField<'_>, limit: usize) -> Result<String> {
+    Request::decode(value, WireFormat::V0)?.response(limit)
+}
+
 fn request(query: &str, message: &str) -> String {
     format!(
         r#"{{"query":{},"msg":{message}}}"#,
@@ -161,18 +165,140 @@ fn malformed_or_ambiguous_inputs_are_not_successful_empty_searches() {
 }
 
 #[test]
-fn embedded_objects_refuse_atomically_instead_of_being_copied_as_trusted_refs() {
+fn unsupported_objects_refuse_instead_of_being_copied_as_trusted_refs() {
     for tag in [
-        r#"{"expr":{"text":"x"}}"#,
         r#"{"goal":{}}"#,
+        r#"{"widget":[{}, {"text":"x"}]}"#,
         r#"{"trace":[0,"class",{"text":"x"},true,{"lazy":{"p":"0"}}]}"#,
-        r#""highlighted""#,
     ] {
         let message = format!(r#"{{"append":[{{"text":"x"}},{{"tag":[{tag},{{"text":""}}]}}]}}"#);
         assert!(matches!(
             response(RawField::Value(&request("x", &message)), MAX_INPUT_BYTES),
             Err(Error::Unsupported(_))
         ));
+    }
+}
+
+#[test]
+fn expression_search_crosses_code_and_message_nodes_and_preserves_info_tags() {
+    for format in [WireFormat::V0, WireFormat::V1] {
+        let outer = format!(
+            r#"{{"info":{},"subexprPos":"/0","diffStatus":"willChange"}}"#,
+            format.reference(17)
+        );
+        let inner = format!(r#"{{"info":{},"subexprPos":"/0/1"}}"#, format.reference(19));
+        let message = format!(
+            r#"{{"append":[{{"text":"before α"}},{{"tag":[{{"expr":{{"tag":[{outer},{{"append":[{{"text":"β"}},{{"tag":[{inner},{{"text":"γ"}}]}}]}}]}}}},{{"text":""}}]}},{{"text":"δ after"}}]}}"#
+        );
+        let input = request("αβγδ", &message);
+        let decoded = Request::decode(RawField::Value(&input), format).unwrap();
+        let mut references: Vec<_> = decoded.references().collect();
+        references.sort_unstable();
+        assert_eq!(references, [17, 19]);
+        let expected = format!(
+            r#"{{"append":[{{"append":[{{"text":"before "}},{{"tag":["highlighted",{{"text":"α"}}]}}]}},{{"tag":[{{"expr":{{"tag":[{outer},{{"append":[{{"tag":["highlighted",{{"text":"β"}}]}},{{"tag":[{inner},{{"tag":["highlighted",{{"text":"γ"}}]}}]}}]}}]}}}},{{"text":""}}]}},{{"append":[{{"tag":["highlighted",{{"text":"δ"}}]}},{{"text":" after"}}]}}]}}"#
+        );
+        assert_eq!(decoded.response(MAX_INPUT_BYTES).unwrap(), expected);
+        assert_eq!(parse_value_end(&expected, 0, 0), Some(expected.len()));
+        for query in ["", "missing"] {
+            let input = request(query, &message);
+            let decoded = Request::decode(RawField::Value(&input), format).unwrap();
+            assert_eq!(decoded.response(MAX_INPUT_BYTES).unwrap(), message);
+            assert_eq!(decoded.references().count(), 2);
+        }
+    }
+}
+
+#[test]
+fn expression_tags_preserve_the_pins_fallback_search_and_render_order() {
+    let message = r#"{"append":[{"tag":[{"expr":{"text":"ab"}},{"text":"XX"}]},{"text":"cd"}]}"#;
+    // rewrite replaces the entire message tag for discovery ("abcd"), but
+    // rendering advances through its fallback too ("abXXcd").
+    assert_eq!(
+        highlight("bc", message),
+        r#"{"append":[{"tag":[{"expr":{"append":[{"text":"a"},{"tag":["highlighted",{"text":"b"}]}]}},{"append":[{"tag":["highlighted",{"text":"X"}]},{"text":"X"}]}]},{"text":"cd"}]}"#
+    );
+    assert_eq!(highlight("XX", message), message);
+
+    // The pin leaves invalid raw UTF-8 positions unspecified. A client-created
+    // fallback can cause one; reject it without slicing at a non-boundary.
+    let input = request(
+        "cd",
+        r#"{"append":[{"tag":[{"expr":{"text":"a"}},{"text":"😀"}]},{"text":"bcd"}]}"#,
+    );
+    assert!(matches!(
+        response(RawField::Value(&input), MAX_INPUT_BYTES),
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[test]
+fn expression_metadata_is_validated_and_reencoded_without_trusting_raw_fields() {
+    let position = format!("/{}", vec!["3"; 40].join("/"));
+    let message = format!(
+        r#"{{"tag":[{{"expr":{{"tag":[{{"info":{{"p":"00017"}},"subexprPos":"{position}","diffStatus":null,"ignored":{{"p":"999"}}}},{{"text":"x"}}]}}}},{{"text":""}}]}}"#
+    );
+    let input = request("x", &message);
+    let decoded = Request::decode(RawField::Value(&input), WireFormat::V0).unwrap();
+    assert_eq!(decoded.references().collect::<Vec<_>>(), [17]);
+    assert_eq!(
+        decoded.response(MAX_INPUT_BYTES).unwrap(),
+        format!(
+            r#"{{"tag":[{{"expr":{{"tag":[{{"info":{{"p":"17"}},"subexprPos":"{position}"}},{{"tag":["highlighted",{{"text":"x"}}]}}]}}}},{{"text":""}}]}}"#
+        )
+    );
+    for metadata in [
+        r#""highlighted""#,
+        r#"{}"#,
+        r#"{"info":{"p":"17"}}"#,
+        r#"{"info":{"p":"17"},"subexprPos":""}"#,
+        r#"{"info":{"p":"17"},"subexprPos":"0"}"#,
+        r#"{"info":{"p":"17"},"subexprPos":"/4"}"#,
+        r#"{"info":{"p":"17"},"subexprPos":"/0/"}"#,
+        r#"{"info":{"p":"17"},"subexprPos":"/00"}"#,
+        r#"{"info":{"p":"17"},"subexprPos":"/","subexprPo\u0073":"/1"}"#,
+        r#"{"info":{"p":"17"},"in\u0066o":{"p":"18"},"subexprPos":"/"}"#,
+        r#"{"info":{"p":"17"},"subexprPos":"/","diffStatus":"unknown"}"#,
+        r#"{"info":{"p":"17"},"subexprPos":"/","diffStatus":false}"#,
+        r#"{"info":{"p":"17"},"subexprPos":"/","diffStatus":null,"diffStatus":null}"#,
+        r#"{"info":{"p":17},"subexprPos":"/"}"#,
+        r#"{"info":{"p":"17","p":"18"},"subexprPos":"/"}"#,
+        r#"{"info":{"__rpcref":"17"},"subexprPos":"/"}"#,
+        r#"{"info":{"p":"17","__rpcref":"17"},"subexprPos":"/"}"#,
+    ] {
+        let message = format!(
+            r#"{{"tag":[{{"expr":{{"tag":[{metadata},{{"text":"x"}}]}}}},{{"text":""}}]}}"#
+        );
+        assert!(
+            matches!(
+                response(RawField::Value(&request("", &message)), MAX_INPUT_BYTES),
+                Err(Error::Invalid(_))
+            ),
+            "{metadata}"
+        );
+    }
+}
+
+#[test]
+fn malformed_expression_tags_do_not_become_valid_empty_matches() {
+    for message in [
+        r#"{"tag":{}}"#,
+        r#"{"tag":[]}"#,
+        r#"{"tag":[{"expr":{"text":"x"}}]}"#,
+        r#"{"tag":[{"expr":{"text":"x"}},{"text":""},{"text":""}]}"#,
+        r#"{"tag":["highlighted",{"text":"x"}]}"#,
+        r#"{"tag":[{"unknown":{}},{"text":"x"}]}"#,
+        r#"{"tag":[{"expr":{"text":"x"},"expr":{"text":"y"}},{"text":""}]}"#,
+        r#"{"tag":[{"expr":null},{"text":""}]}"#,
+        r#"{"tag":[{"expr":{"text":"x"}},null]}"#,
+    ] {
+        assert!(
+            matches!(
+                response(RawField::Value(&request("", message)), MAX_INPUT_BYTES),
+                Err(Error::Invalid(_))
+            ),
+            "{message}"
+        );
     }
 }
 

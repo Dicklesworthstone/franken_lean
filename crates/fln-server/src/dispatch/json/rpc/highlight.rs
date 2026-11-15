@@ -1,12 +1,13 @@
-//! Literal search over the reference-free diagnostic presentations emitted by
-//! this server. Contract: Lean/Server/FileWorker/WidgetRequests.lean,
+//! Literal search over interactive diagnostic presentations and expressions.
+//! Contract: Lean/Server/FileWorker/WidgetRequests.lean,
 //! `highlightTaggedText` and `highlightStringMatches?` at the locked Reference.
 //!
 //! Keep the original append tree: matches can cross text nodes, and the pin's
 //! treatment of overlapping matches is node-sensitive. Flattening the result
 //! or replacing KMP by non-overlapping `str::match_indices` changes that wire
-//! behavior. Embedded expressions, goals, widgets and traces need real RPC
-//! objects; this implementation refuses them rather than inventing references.
+//! behavior. Expression tags are decoded and re-encoded structurally; the caller
+//! validates and retains their live InfoWithCtx references before publishing.
+//! Goals, widgets and traces still require their own retained object contracts.
 use super::*;
 use std::ops::Range;
 
@@ -39,15 +40,78 @@ fn push<T>(values: &mut Vec<T>, value: T, limit: usize) -> Result<()> {
     Ok(())
 }
 
+struct SubexprInfo {
+    reference: u64,
+    position: String,
+    diff_status: Option<&'static str>,
+}
+
+impl SubexprInfo {
+    fn decode(raw: &str, format: WireFormat) -> Result<Self> {
+        let raw = object(RawField::Value(raw)).map_err(Error::Invalid)?;
+        let reference = reference(object_field(raw, "info"), format).map_err(Error::Invalid)?;
+        let position = string(RawField::Value(raw), "subexprPos").map_err(Error::Invalid)?;
+        // Lean.SubExpr.Pos uses slash-separated base-four coordinates. It is a
+        // Nat in Lean, so preserve long paths without narrowing them to u64.
+        if position != "/"
+            && (!position.starts_with('/')
+                || !position[1..]
+                    .split('/')
+                    .all(|coordinate| matches!(coordinate, "0" | "1" | "2" | "3")))
+        {
+            return Err(Error::Invalid(
+                "RPC highlight has an invalid subexpression position",
+            ));
+        }
+        let diff_status = match object_field(raw, "diffStatus") {
+            RawField::Missing | RawField::Value("null") => None,
+            field => {
+                let DecodedField::Valid(status) = decoded_string(field) else {
+                    return Err(Error::Invalid(
+                        "RPC highlight has an invalid expression diff status",
+                    ));
+                };
+                Some(match status.as_str() {
+                    "wasChanged" => "wasChanged",
+                    "willChange" => "willChange",
+                    "wasDeleted" => "wasDeleted",
+                    "willDelete" => "willDelete",
+                    "wasInserted" => "wasInserted",
+                    "willInsert" => "willInsert",
+                    _ => {
+                        return Err(Error::Invalid(
+                            "RPC highlight has an unknown expression diff status",
+                        ));
+                    }
+                })
+            }
+        };
+        Ok(Self {
+            reference,
+            position,
+            diff_status,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Tree {
+    Message,
+    Code,
+}
+
 // A flat arena avoids recursive traversal and recursive destruction of a
-// client-supplied append tree. Text spans refer to one bounded UTF-8 buffer.
+// client-supplied tagged tree. Text spans refer to one bounded UTF-8 buffer.
 enum Node {
     Text(Range<usize>),
     Append(Vec<usize>),
+    Expression { code: usize, child: usize },
+    Info { info: SubexprInfo, child: usize },
 }
 struct Message {
     nodes: Vec<Node>,
     text: String,
+    search_text: String,
     root: usize,
 }
 
@@ -88,7 +152,9 @@ fn constructor(raw: &str) -> Result<(String, &str)> {
 fn children(raw: &str) -> Result<Vec<&str>> {
     let bytes = raw.as_bytes();
     if bytes.first() != Some(&b'[') {
-        return Err(Error::Invalid("RPC highlight append requires an array"));
+        return Err(Error::Invalid(
+            "RPC highlight constructor requires an array",
+        ));
     }
     let mut cursor = skip_ws(bytes, 1);
     let mut result = Vec::new();
@@ -97,34 +163,45 @@ fn children(raw: &str) -> Result<Vec<&str>> {
     }
     loop {
         let end = parse_value_end(raw, cursor, 0).ok_or(Error::Invalid(
-            "RPC highlight append contains a malformed child",
+            "RPC highlight constructor contains a malformed child",
         ))?;
         push(&mut result, &raw[cursor..end], MAX_NODES)?;
         cursor = skip_ws(bytes, end);
         match bytes.get(cursor) {
             Some(b']') if skip_ws(bytes, cursor + 1) == bytes.len() => return Ok(result),
             Some(b',') => cursor = skip_ws(bytes, cursor + 1),
-            _ => return Err(Error::Invalid("RPC highlight append is malformed")),
+            _ => {
+                return Err(Error::Invalid(
+                    "RPC highlight constructor array is malformed",
+                ));
+            }
         }
     }
 }
 
 impl Message {
-    fn decode(raw: &str) -> Result<Self> {
+    fn decode(raw: &str, format: WireFormat) -> Result<Self> {
         enum Work<'a> {
-            Read(&'a str, usize),
+            Read(&'a str, usize, Tree, bool),
             Append(usize),
+            Expression,
+            Info(SubexprInfo),
         }
         let mut nodes = Vec::new();
         let mut text = String::new();
+        let mut search_text = String::new();
         let mut work = Vec::new();
         let mut values = Vec::new();
         let mut visits = 0usize;
         let mut scanned = 0usize;
-        push(&mut work, Work::Read(raw, 0), 2 * MAX_NODES)?;
+        push(
+            &mut work,
+            Work::Read(raw, 0, Tree::Message, true),
+            2 * MAX_NODES,
+        )?;
         while let Some(task) = work.pop() {
             match task {
-                Work::Read(raw, depth) => {
+                Work::Read(raw, depth, tree, searchable) => {
                     visits += 1;
                     if visits > MAX_NODES || depth > MAX_DEPTH {
                         return Err(Error::Limit("RPC highlight message exceeds its tree limit"));
@@ -148,6 +225,12 @@ impl Message {
                                 Error::Limit("RPC highlight text allocation failed")
                             })?;
                             text.push_str(&value);
+                            if searchable {
+                                search_text.try_reserve(value.len()).map_err(|_| {
+                                    Error::Limit("RPC highlight search text allocation failed")
+                                })?;
+                                search_text.push_str(&value);
+                            }
                             let index = nodes.len();
                             push(&mut nodes, Node::Text(start..end), MAX_NODES)?;
                             push(&mut values, index, MAX_NODES)?;
@@ -156,13 +239,62 @@ impl Message {
                             let children = children(value)?;
                             push(&mut work, Work::Append(children.len()), 2 * MAX_NODES)?;
                             for child in children.into_iter().rev() {
-                                push(&mut work, Work::Read(child, depth + 1), 2 * MAX_NODES)?;
+                                push(
+                                    &mut work,
+                                    Work::Read(child, depth + 1, tree, searchable),
+                                    2 * MAX_NODES,
+                                )?;
                             }
                         }
                         "tag" => {
-                            return Err(Error::Unsupported(
-                                "RPC highlight of embedded expressions, goals, widgets or traces is not implemented",
-                            ));
+                            let parts = children(value)?;
+                            let [tag, child] = parts.as_slice() else {
+                                return Err(Error::Invalid(
+                                    "RPC highlight tag requires two arguments",
+                                ));
+                            };
+                            match tree {
+                                Tree::Message => {
+                                    let (kind, code) = constructor(tag)?;
+                                    match kind.as_str() {
+                                        "expr" => {}
+                                        "goal" | "widget" | "trace" => {
+                                            return Err(Error::Unsupported(
+                                                "RPC highlight of embedded goals, widgets or traces is not implemented",
+                                            ));
+                                        }
+                                        _ => {
+                                            return Err(Error::Invalid(
+                                                "unknown RPC highlight message embedding",
+                                            ));
+                                        }
+                                    }
+                                    push(&mut work, Work::Expression, 2 * MAX_NODES)?;
+                                    // findTaggedTextMatches replaces the entire message tag
+                                    // with code.stripTags. Its fallback child is omitted from
+                                    // discovery, but highlightTaggedText.go still visits that
+                                    // child after the code while advancing its byte offset.
+                                    push(
+                                        &mut work,
+                                        Work::Read(child, depth + 1, Tree::Message, false),
+                                        2 * MAX_NODES,
+                                    )?;
+                                    push(
+                                        &mut work,
+                                        Work::Read(code, depth + 1, Tree::Code, searchable),
+                                        2 * MAX_NODES,
+                                    )?;
+                                }
+                                Tree::Code => {
+                                    let info = SubexprInfo::decode(tag, format)?;
+                                    push(&mut work, Work::Info(info), 2 * MAX_NODES)?;
+                                    push(
+                                        &mut work,
+                                        Work::Read(child, depth + 1, Tree::Code, searchable),
+                                        2 * MAX_NODES,
+                                    )?;
+                                }
+                            }
                         }
                         _ => {
                             return Err(Error::Invalid(
@@ -181,6 +313,25 @@ impl Message {
                     push(&mut nodes, Node::Append(children), MAX_NODES)?;
                     push(&mut values, index, MAX_NODES)?;
                 }
+                Work::Expression => {
+                    let child = values
+                        .pop()
+                        .ok_or(Error::Invalid("RPC highlight expression has no child"))?;
+                    let code = values
+                        .pop()
+                        .ok_or(Error::Invalid("RPC highlight expression has no code"))?;
+                    let index = nodes.len();
+                    push(&mut nodes, Node::Expression { code, child }, MAX_NODES)?;
+                    push(&mut values, index, MAX_NODES)?;
+                }
+                Work::Info(info) => {
+                    let child = values
+                        .pop()
+                        .ok_or(Error::Invalid("RPC highlight expression info has no child"))?;
+                    let index = nodes.len();
+                    push(&mut nodes, Node::Info { info, child }, MAX_NODES)?;
+                    push(&mut values, index, MAX_NODES)?;
+                }
             }
         }
         if values.len() != 1 {
@@ -189,6 +340,7 @@ impl Message {
         Ok(Self {
             nodes,
             text,
+            search_text,
             root: values[0],
         })
     }
@@ -299,6 +451,18 @@ impl Writer {
         }
         Ok(())
     }
+
+    fn info(&mut self, info: &SubexprInfo, format: WireFormat) -> Result<()> {
+        self.push("{\"info\":")?;
+        self.push(&format.reference(info.reference))?;
+        self.push(",\"subexprPos\":")?;
+        self.quoted(&info.position)?;
+        if let Some(status) = info.diff_status {
+            self.push(",\"diffStatus\":")?;
+            self.quoted(status)?;
+        }
+        self.push("}")
+    }
 }
 
 // Clip each global match to this leaf. In particular, do not merge overlapping
@@ -322,7 +486,10 @@ fn pieces(
             break;
         }
         if cursor < start {
-            emit(false, &text[cursor..start])?;
+            let part = text.get(cursor..start).ok_or(Error::Invalid(
+                "RPC highlight match splits a UTF-8 character",
+            ))?;
+            emit(false, part)?;
         }
         let end = (global_start + query_bytes).saturating_sub(offset);
         let part = text.get(start..end.min(text.len())).ok_or(Error::Invalid(
@@ -335,16 +502,24 @@ fn pieces(
     if !any_match {
         emit(false, text)?;
     } else if cursor < text.len() {
-        emit(false, &text[cursor..])?;
+        let part = text.get(cursor..).ok_or(Error::Invalid(
+            "RPC highlight match splits a UTF-8 character",
+        ))?;
+        emit(false, part)?;
     }
     Ok(())
 }
 
-fn render(message: &Message, query: &str, matches: &[usize], limit: usize) -> Result<String> {
+fn render(
+    message: &Message,
+    query: &str,
+    matches: &[usize],
+    format: WireFormat,
+    limit: usize,
+) -> Result<String> {
     enum Work {
         Node(usize),
-        Comma,
-        EndAppend,
+        Syntax(&'static str),
     }
     let mut writer = Writer {
         output: String::new(),
@@ -355,18 +530,31 @@ fn render(message: &Message, query: &str, matches: &[usize], limit: usize) -> Re
     push(&mut work, Work::Node(message.root), 2 * MAX_NODES)?;
     while let Some(task) = work.pop() {
         match task {
-            Work::Comma => writer.push(",")?,
-            Work::EndAppend => writer.push("]}")?,
+            Work::Syntax(syntax) => writer.push(syntax)?,
             Work::Node(index) => match &message.nodes[index] {
                 Node::Append(children) => {
                     writer.push("{\"append\":[")?;
-                    push(&mut work, Work::EndAppend, 2 * MAX_NODES)?;
+                    push(&mut work, Work::Syntax("]}"), 2 * MAX_NODES)?;
                     for (position, &child) in children.iter().enumerate().rev() {
                         push(&mut work, Work::Node(child), 2 * MAX_NODES)?;
                         if position != 0 {
-                            push(&mut work, Work::Comma, 2 * MAX_NODES)?;
+                            push(&mut work, Work::Syntax(","), 2 * MAX_NODES)?;
                         }
                     }
+                }
+                Node::Expression { code, child } => {
+                    writer.push("{\"tag\":[{\"expr\":")?;
+                    push(&mut work, Work::Syntax("]}"), 2 * MAX_NODES)?;
+                    push(&mut work, Work::Node(*child), 2 * MAX_NODES)?;
+                    push(&mut work, Work::Syntax("},"), 2 * MAX_NODES)?;
+                    push(&mut work, Work::Node(*code), 2 * MAX_NODES)?;
+                }
+                Node::Info { info, child } => {
+                    writer.push("{\"tag\":[")?;
+                    writer.info(info, format)?;
+                    writer.push(",")?;
+                    push(&mut work, Work::Syntax("]}"), 2 * MAX_NODES)?;
+                    push(&mut work, Work::Node(*child), 2 * MAX_NODES)?;
                 }
                 Node::Text(span) => {
                     let text = &message.text[span.clone()];
@@ -408,26 +596,50 @@ fn render(message: &Message, query: &str, matches: &[usize], limit: usize) -> Re
     Ok(writer.output)
 }
 
-pub(in crate::dispatch) fn response(value: RawField<'_>, limit: usize) -> Result<String> {
-    let RawField::Value(raw) = value else {
-        return Err(Error::Invalid("RPC highlight requires one params object"));
-    };
-    if raw.len() > MAX_INPUT_BYTES {
-        return Err(Error::Limit("RPC highlight request exceeds its byte limit"));
+pub(in crate::dispatch) struct Request {
+    query: String,
+    message: Message,
+    format: WireFormat,
+}
+
+impl Request {
+    pub(in crate::dispatch) fn decode(value: RawField<'_>, format: WireFormat) -> Result<Self> {
+        let RawField::Value(raw) = value else {
+            return Err(Error::Invalid("RPC highlight requires one params object"));
+        };
+        if raw.len() > MAX_INPUT_BYTES {
+            return Err(Error::Limit("RPC highlight request exceeds its byte limit"));
+        }
+        let raw = object(value).map_err(Error::Invalid)?;
+        let DecodedField::Valid(query) = decoded_string_field(value, "query") else {
+            return Err(Error::Invalid("RPC highlight requires one query string"));
+        };
+        if query.len() > MAX_QUERY_BYTES {
+            return Err(Error::Limit("RPC highlight query exceeds its byte limit"));
+        }
+        let RawField::Value(message) = object_field(raw, "msg") else {
+            return Err(Error::Invalid("RPC highlight requires one message"));
+        };
+        Ok(Self {
+            query,
+            message: Message::decode(message, format)?,
+            format,
+        })
     }
-    let raw = object(value).map_err(Error::Invalid)?;
-    let DecodedField::Valid(query) = decoded_string_field(value, "query") else {
-        return Err(Error::Invalid("RPC highlight requires one query string"));
-    };
-    if query.len() > MAX_QUERY_BYTES {
-        return Err(Error::Limit("RPC highlight query exceeds its byte limit"));
+
+    // Every occurrence will be encoded once in the response, including nested
+    // and repeated tags. The session must retain each one, even for no matches.
+    pub(in crate::dispatch) fn references(&self) -> impl Iterator<Item = u64> + '_ {
+        self.message.nodes.iter().filter_map(|node| match node {
+            Node::Info { info, .. } => Some(info.reference),
+            _ => None,
+        })
     }
-    let RawField::Value(message) = object_field(raw, "msg") else {
-        return Err(Error::Invalid("RPC highlight requires one message"));
-    };
-    let message = Message::decode(message)?;
-    let matches = match_positions(&query, &message.text)?;
-    render(&message, &query, &matches, limit)
+
+    pub(in crate::dispatch) fn response(&self, limit: usize) -> Result<String> {
+        let matches = match_positions(&self.query, &self.message.search_text)?;
+        render(&self.message, &self.query, &matches, self.format, limit)
+    }
 }
 
 #[cfg(test)]
