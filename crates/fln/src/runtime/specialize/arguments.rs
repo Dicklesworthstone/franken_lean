@@ -316,7 +316,27 @@ impl Preparation<'_> {
         )?;
         let value =
             self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
-        let prepared = self.specialize_arguments(type_, value, args)?;
+        let canonical = if args.first().is_some_and(closed)
+            && self.phantom_first_type_parameter(&definition, levels, &type_, &value)?
+        {
+            let mut canonical = Vec::new();
+            for (index, argument) in args.iter().enumerate() {
+                self.tick()?;
+                reserve(&mut canonical, self.limits.max_application_args)?;
+                canonical.push(if index == 0 {
+                    Expr::const_(name("Nat"), vec![])
+                } else {
+                    argument.clone()
+                });
+            }
+            Some(canonical)
+        } else {
+            None
+        };
+        // Use the same representative in the body, telescope and cache key.
+        // Runtime arguments retain their exact original values and positions.
+        let prepared =
+            self.specialize_arguments(type_, value, canonical.as_deref().unwrap_or(args))?;
         // An earlier universe or dictionary specialization can still contain
         // an open motive, exposed later by a checked local type binding. Allow
         // another specialization only when a new static argument is removed.

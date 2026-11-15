@@ -9,6 +9,7 @@ mod arguments;
 mod heads;
 mod imported_lists;
 mod imported_nat;
+mod phantom;
 mod pure;
 mod scope;
 
@@ -35,6 +36,7 @@ pub(super) struct Store {
     normalized_definitions: HashMap<Name, NormalizedDefinition>,
     pure: pure::Store,
     heads: heads::Store,
+    phantom: phantom::Store,
     pub(super) index_types: super::indexed::cache::Store,
     pub(super) receiver_queries: super::projections::query::Store,
     factory_values: HashMap<Expr, Expr>,
