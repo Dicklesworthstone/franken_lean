@@ -1,4 +1,4 @@
-//! Primary artifacts may retain unsafe bodies whose checked helpers are private.
+//! Primary artifacts may retain proofs and unsafe bodies checked with private data.
 //! Real three-part codec inputs exercise admission and the source projection.
 use super::*;
 use crate::source_check::modules::imported::{
@@ -6,7 +6,7 @@ use crate::source_check::modules::imported::{
 };
 use fln_core::expr::{Expr, Literal, NatLit};
 use fln_core::level::Level;
-use fln_env::constants::{ConstantVal, DefinitionVal, ReducibilityHints};
+use fln_env::constants::{AxiomVal, ConstantVal, DefinitionVal, ReducibilityHints, TheoremVal};
 use fln_olean::format;
 use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_module};
 
@@ -281,4 +281,113 @@ fn missing_or_changed_private_implementations_never_create_a_public_receipt() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn checked_exported_proofs_still_require_the_primary_independent_reading() {
+    let theorem = ConstantInfo::Thm(TheoremVal {
+        base: ConstantVal {
+            name: name("witness"),
+            level_params: Vec::new(),
+            type_: constant(name("True")),
+        },
+        value: constant(name("True.intro")),
+        all: vec![name("witness")],
+    });
+    let mut receipt = receipt(
+        std::slice::from_ref(&theorem),
+        std::slice::from_ref(&theorem),
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap();
+    let public = receipt
+        .contexts
+        .modules
+        .get_mut(&name("Implementations"))
+        .unwrap()
+        .public
+        .as_mut()
+        .unwrap();
+    Arc::make_mut(&mut public.decoded).independent = crate::IndependentReading::Read(Vec::new());
+    let error = project(&receipt).unwrap_err();
+    assert!(
+        matches!(&error, SourceModuleCheckError::ImportDeclarations { error, .. }
+            if matches!(error.as_ref(), OleanCheckError::IndependentReadingDiffers { name: actual, .. }
+                if actual == &name("witness"))),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn checked_exported_proofs_cannot_publish_a_private_statement() {
+    let proposition = definition(
+        private("Proposition"),
+        Expr::sort(Level::zero()),
+        constant(name("True")),
+        DefinitionSafety::Safe,
+    );
+    let theorem = ConstantInfo::Thm(TheoremVal {
+        base: ConstantVal {
+            name: name("witness"),
+            level_params: Vec::new(),
+            type_: constant(private("Proposition")),
+        },
+        value: constant(name("True.intro")),
+        all: vec![name("witness")],
+    });
+    let receipt = receipt(
+        std::slice::from_ref(&theorem),
+        &[proposition, theorem.clone()],
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap();
+    missing(
+        project(&receipt).unwrap_err(),
+        &name("witness"),
+        &private("Proposition"),
+    );
+}
+
+#[test]
+fn checked_exported_proofs_keep_private_proof_and_axiom_dependencies_visible() {
+    let base = ConstantVal {
+        name: private("assumption"),
+        level_params: Vec::new(),
+        type_: constant(name("True")),
+    };
+    for dependency in [
+        ConstantInfo::Axiom(AxiomVal {
+            base: base.clone(),
+            is_unsafe: false,
+        }),
+        ConstantInfo::Thm(TheoremVal {
+            base,
+            value: constant(name("True.intro")),
+            all: vec![private("assumption")],
+        }),
+    ] {
+        let theorem = ConstantInfo::Thm(TheoremVal {
+            base: ConstantVal {
+                name: name("witness"),
+                level_params: Vec::new(),
+                type_: constant(name("True")),
+            },
+            value: constant(private("assumption")),
+            all: vec![name("witness")],
+        });
+        let receipt = receipt(
+            std::slice::from_ref(&theorem),
+            &[dependency, theorem.clone()],
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+        missing(
+            project(&receipt).unwrap_err(),
+            &name("witness"),
+            &private("assumption"),
+        );
+    }
 }

@@ -658,14 +658,17 @@ impl ImportContexts {
     }
 
     /// The pin can export an unsafe implementation body while keeping its
-    /// compiler-generated dependencies in the private companion. Those exact
-    /// bodies have already passed admission with their complete dependency
-    /// closure. Project only their checked entries, never their private helpers.
-    /// Their types must still be closed in the selected public world.
+    /// compiler-generated dependencies in the private companion. It can also
+    /// export a theorem whose proof needed to unfold a definition that the
+    /// primary artifact presents only as a header. Those exact bodies already
+    /// passed admission with their complete dependency closure. Project their
+    /// checked entries without publishing the hidden definitions or helpers.
+    /// Their types must still be closed in the selected public world. Theorem
+    /// proof references must also stay visible, preserving dependency tracing.
     ///
     /// The caller subsequently checks the unmodified primary artifact. Its
     /// ordinary already-present path verifies the independent primary reading;
-    /// real exported headers and all safe bodies retain ordinary admission.
+    /// real exported headers and safe definition bodies retain ordinary admission.
     fn project_checked_implementations(
         &self,
         name: &Name,
@@ -682,12 +685,13 @@ impl ImportContexts {
             .collect();
         let mut presentations = 0;
         for constant in &public.decoded.constants {
-            let ConstantInfo::Defn(definition) = constant else {
-                continue;
+            let (type_, proof) = match constant {
+                ConstantInfo::Defn(definition) if definition.safety != DefinitionSafety::Safe => {
+                    (&definition.base.type_, None)
+                }
+                ConstantInfo::Thm(theorem) => (&theorem.base.type_, Some(&theorem.value)),
+                _ => continue,
             };
-            if definition.safety == DefinitionSafety::Safe {
-                continue;
-            }
             let entry = self
                 .declarations
                 .environment()
@@ -698,27 +702,29 @@ impl ImportContexts {
                 })?;
             let mut references = BTreeSet::new();
             let before = presentations;
-            crate::collect_constant_references(
-                &definition.base.type_,
-                &mut references,
-                &mut presentations,
-                limits.max_dependency_presentations,
-            )
-            .map_err(|error| match error {
-                fln_admission::ConstantReferenceCollectionError::PresentationLimit {
-                    limit,
-                    ..
-                } => SourceModuleCheckError::Limit {
-                    resource: "exported implementation type dependencies",
-                    limit,
-                },
-                fln_admission::ConstantReferenceCollectionError::AllocationFailure { .. } => {
-                    unavailable(
+            for expression in std::iter::once(type_).chain(proof) {
+                crate::collect_constant_references(
+                    expression,
+                    &mut references,
+                    &mut presentations,
+                    limits.max_dependency_presentations,
+                )
+                .map_err(|error| match error {
+                    fln_admission::ConstantReferenceCollectionError::PresentationLimit {
+                        limit,
+                        ..
+                    } => SourceModuleCheckError::Limit {
+                        resource: "exported implementation dependencies",
+                        limit,
+                    },
+                    fln_admission::ConstantReferenceCollectionError::AllocationFailure {
+                        ..
+                    } => unavailable(
                         name,
                         "exported implementation dependency allocation refused",
-                    )
-                }
-            })?;
+                    ),
+                })?;
+            }
             meter.work(presentations - before)?;
             references.retain(|dependency| {
                 !names.contains(dependency) && !engine.environment().contains(dependency)

@@ -824,6 +824,197 @@ fn module_system_artifacts_preserve_private_proofs_and_require_their_companions(
 }
 
 #[test]
+fn exported_equation_proofs_reuse_checked_bodies_without_unhiding_definitions() {
+    use fln::ConstantInfo;
+    use fln_env::constants::{AxiomVal, ConstantVal, TheoremVal};
+    use fln_olean::format;
+    use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, encode_module};
+
+    let initial = Engine::with_source_seed(limits().source.admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let options = KVMap::new();
+    let initial_root = initial.logical_root(&options);
+    let checked = initial
+        .check_source_files(
+            &[b"def HiddenCarrier : Type := Nat\ntheorem carrierEquation : HiddenCarrier = Nat := rfl\n"],
+            &options,
+            limits().source,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let implementation = checked
+        .engine
+        .environment()
+        .find(&n("HiddenCarrier"))
+        .unwrap()
+        .clone();
+    let theorem = checked
+        .engine
+        .environment()
+        .find(&n("carrierEquation"))
+        .unwrap()
+        .clone();
+    assert!(matches!(implementation, ConstantInfo::Defn(_)));
+    assert!(matches!(theorem, ConstantInfo::Thm(_)));
+    let header = ConstantInfo::Axiom(AxiomVal {
+        base: implementation.constant_val().clone(),
+        is_unsafe: false,
+    });
+    let import = |public: &[ConstantInfo], complete: &[ConstantInfo]| {
+        let parts: Vec<_> = [public, public, complete]
+            .into_iter()
+            .enumerate()
+            .map(|(index, constants)| {
+                encode_module(
+                    ModuleWriteInput {
+                        is_module: true,
+                        imports: &[],
+                        constants,
+                        extra_const_names: &[],
+                    },
+                    OleanWriteHeader {
+                        version: format::OLEAN_ACCEPTED_VERSIONS[0],
+                        flags: 1,
+                        lean_version: format::PIN_TAG.strip_prefix('v').unwrap(),
+                        githash: format::PIN_COMMIT,
+                        base_addr: (1_u64 << 40) + ((index as u64) << 30),
+                    },
+                    OleanWriteBudget::default(),
+                )
+                .unwrap()
+                .bytes
+            })
+            .collect();
+        let module = n("Headers");
+        initial.import_olean_modules_for_source(
+            &[OleanModuleInput {
+                name: &module,
+                artifact: &parts[0],
+                server_artifact: Some(&parts[1]),
+                private_artifact: Some(&parts[2]),
+            }],
+            std::slice::from_ref(&module),
+            &options,
+            SourceOleanImportLimits::new(OleanCheckLimits::new(
+                8 << 20,
+                limits().source.admission.kernel,
+            )),
+        )
+    };
+    let public = [header, theorem.clone()];
+    let complete = [implementation.clone(), theorem.clone()];
+    let receipt = import(&public, &complete).unwrap().into_complete().unwrap();
+    let receipt_root = receipt.engine.logical_root(&options);
+    let main = n("Main");
+    let consume = |source: &[u8]| {
+        receipt.check_source_modules(
+            &[SourceModuleInput {
+                name: &main,
+                source,
+            }],
+            &main,
+            &options,
+            limits(),
+            None,
+        )
+    };
+    let result = consume(b"module\nprelude\npublic import Headers\npublic theorem useEquation : HiddenCarrier = Nat := carrierEquation\n")
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(matches!(
+        result
+            .checked
+            .engine
+            .environment()
+            .find(&n("HiddenCarrier")),
+        Some(ConstantInfo::Axiom(_))
+    ));
+    assert_eq!(
+        result.checked.engine.environment().find(theorem.name()),
+        Some(&theorem)
+    );
+    assert!(
+        consume(b"module\nprelude\npublic import Headers\npublic theorem cannotUnfold : HiddenCarrier = Nat := rfl\n")
+            .is_err()
+    );
+
+    // An exact private proof is required, not just matching declaration names
+    // and types. The private implementation must itself pass the council too.
+    let mut different_proof = theorem.clone();
+    let ConstantInfo::Thm(proof) = &mut different_proof else {
+        unreachable!()
+    };
+    proof.value = fln::Expr::const_(n("True.intro"), Vec::new());
+    assert!(matches!(
+        import(&[public[0].clone(), different_proof], &complete),
+        Err(SourceOleanImportError::Metadata { declaration, .. })
+            if declaration == n("carrierEquation")
+    ));
+    let mut different_implementation = implementation;
+    let ConstantInfo::Defn(definition) = &mut different_implementation else {
+        unreachable!()
+    };
+    definition.value = fln::Expr::const_(n("Bool"), Vec::new());
+    assert!(matches!(
+        import(&public, &[different_implementation, theorem]),
+        Err(SourceOleanImportError::Check(_))
+    ));
+
+    // Reusing a proof must not make its private assumptions disappear from
+    // dependency inspection. Public theorem types and proof references remain
+    // in the selected public world even when admission used hidden bodies.
+    let assumption_name = private("Headers", "assumption");
+    let assumption = ConstantInfo::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: assumption_name.clone(),
+            level_params: Vec::new(),
+            type_: fln::Expr::const_(n("True"), Vec::new()),
+        },
+        is_unsafe: false,
+    });
+    let dependent = ConstantInfo::Thm(TheoremVal {
+        base: ConstantVal {
+            name: n("dependentProof"),
+            level_params: Vec::new(),
+            type_: fln::Expr::const_(n("True"), Vec::new()),
+        },
+        value: fln::Expr::const_(assumption_name.clone(), Vec::new()),
+        all: vec![n("dependentProof")],
+    });
+    let hidden = import(
+        std::slice::from_ref(&dependent),
+        &[assumption, dependent.clone()],
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap();
+    let error = hidden
+        .check_source_modules(
+            &[SourceModuleInput {
+                name: &main,
+                source: b"module\nprelude\npublic import Headers\n",
+            }],
+            &main,
+            &options,
+            limits(),
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&error, SourceModuleCheckError::ImportDeclarations { error, .. }
+        if matches!(error.as_ref(), OleanCheckError::MissingConstants { declaration, names }
+            if declaration == &n("dependentProof")
+                && names.as_slice() == std::slice::from_ref(&assumption_name)))
+    );
+    assert_eq!(receipt.engine.logical_root(&options), receipt_root);
+    assert_eq!(initial.logical_root(&options), initial_root);
+}
+
+#[test]
 fn module_without_prelude_requires_its_real_implicit_init_dependency() {
     let initial = Engine::builder().build_empty();
     let main = "module\ndef use.{u} {A : Sort u} (x : A) : A := identity x";
