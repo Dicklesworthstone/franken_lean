@@ -90,9 +90,15 @@ use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_m
 /// recursor application vs projections vs constructor eta — without dumping
 /// full proof terms. Fuel-bounded recursion, safe on real Reference terms.
 fn shape(e: &Expr, fuel: usize) -> String {
-    if fuel == 0 {
+    let mut nodes = 256_usize;
+    shape_bounded(e, fuel, &mut nodes)
+}
+
+fn shape_bounded(e: &Expr, fuel: usize, nodes: &mut usize) -> String {
+    if fuel == 0 || *nodes == 0 {
         return "…".to_string();
     }
+    *nodes -= 1;
     match e.node() {
         ExprNode::BVar { idx } => format!("#{idx}"),
         ExprNode::FVar { .. } => "fvar".to_string(),
@@ -108,10 +114,14 @@ fn shape(e: &Expr, fuel: usize) -> String {
                 head = next;
             }
             args.reverse();
-            let mut out = format!("({}", shape(&head, fuel - 1));
+            let mut out = format!("({}", shape_bounded(&head, fuel - 1, nodes));
             for arg in &args {
+                if *nodes == 0 {
+                    out.push_str(" …");
+                    break;
+                }
                 out.push(' ');
-                out.push_str(&shape(arg, fuel - 1));
+                out.push_str(&shape_bounded(arg, fuel - 1, nodes));
             }
             out.push(')');
             out
@@ -120,18 +130,20 @@ fn shape(e: &Expr, fuel: usize) -> String {
             binder_type, body, ..
         } => format!(
             "(fun (_ : {}) => {})",
-            shape(binder_type, fuel - 1),
-            shape(body, fuel - 1)
+            shape_bounded(binder_type, fuel - 1, nodes),
+            shape_bounded(body, fuel - 1, nodes)
         ),
         ExprNode::ForallE {
             binder_type, body, ..
         } => format!(
             "(forall (_ : {}), {})",
-            shape(binder_type, fuel - 1),
-            shape(body, fuel - 1)
+            shape_bounded(binder_type, fuel - 1, nodes),
+            shape_bounded(body, fuel - 1, nodes)
         ),
-        ExprNode::LetE { body, .. } => format!("(let _ := ..; {})", shape(body, fuel - 1)),
-        ExprNode::MData { expr, .. } => shape(expr, fuel),
+        ExprNode::LetE { body, .. } => {
+            format!("(let _ := ..; {})", shape_bounded(body, fuel - 1, nodes))
+        }
+        ExprNode::MData { expr, .. } => shape_bounded(expr, fuel, nodes),
         ExprNode::Proj {
             struct_name,
             idx,
@@ -140,7 +152,7 @@ fn shape(e: &Expr, fuel: usize) -> String {
             "({}.{} {})",
             struct_name.to_display_string(),
             idx,
-            shape(expr, fuel - 1)
+            shape_bounded(expr, fuel - 1, nodes)
         ),
         ExprNode::Lit { .. } => "lit".to_string(),
     }
@@ -21163,7 +21175,12 @@ fn selected_real_module_resource_probe() {
             .stack_size(stack_bytes)
             .spawn(move || {
                 let engine = fln::Engine::from_environment(env);
-                let limits = fln::EngineAdmissionLimits::new(budget);
+                let mut limits = fln::EngineAdmissionLimits::new(budget);
+                if let Ok(raw) = std::env::var("FLN_CORPUS_PROBE_COUNCIL_STEPS") {
+                    limits.checker.admission.inference.max_steps = raw
+                        .parse::<u64>()
+                        .expect("FLN_CORPUS_PROBE_COUNCIL_STEPS must be a base-10 step count");
+                }
                 engine.admit_declaration(decl, &fln::KVMap::new(), limits)
             })
             .expect("spawn council resource probe thread")

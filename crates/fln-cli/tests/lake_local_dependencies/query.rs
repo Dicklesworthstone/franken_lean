@@ -1,4 +1,5 @@
 //! Native query results share the checked build and publication path.
+#![forbid(unsafe_code)]
 
 use super::*;
 

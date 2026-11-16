@@ -1,4 +1,5 @@
 //! Installed `lake env` consumes real package outputs and preserves child I/O.
+#![forbid(unsafe_code)]
 
 use super::*;
 use std::collections::BTreeMap;

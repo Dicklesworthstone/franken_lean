@@ -1769,13 +1769,15 @@ pub(crate) fn proof_conversion_with(
         && (probe.steps >= 5_000 || result.is_err())
     {
         eprintln!(
-            "PROOF_CONV_PROFILE steps={} polls={} budget={} ok={:?} left_nodes={} right_nodes={} locals={} {:?}",
+            "PROOF_CONV_PROFILE steps={} polls={} budget={} ok={:?} left_nodes={} right_nodes={} left_head={:?} right_head={:?} locals={} {:?}",
             probe.steps,
             probe.polls,
             probe.budget.max_steps,
             result.as_ref().ok(),
             left.nodes().len(),
             right.nodes().len(),
+            head_constant(left),
+            head_constant(right),
             context.locals().len(),
             probe.profile,
         );
