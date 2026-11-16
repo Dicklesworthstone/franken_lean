@@ -999,7 +999,7 @@ impl Context {
         right: &Expr,
         mut budget: UnificationBudget,
     ) -> Result<bool, NatDefinitionElabError> {
-        // `with_reducible` and its siblings cap the tactic's own comparisons too.
+        // Transparency scopes also govern the tactic's ordinary comparisons.
         if self.tactic_transparency.is_some() {
             budget.transparency = self.ambient_transparency(budget.transparency);
             budget.offset_constraints = true;
@@ -2632,14 +2632,15 @@ impl Context {
         loop {
             self.tick()?;
             let mut budget = UnificationBudget::new(self.kernel);
-            if self
-                .well_founded
-                .as_ref()
-                .is_some_and(|state| state.proving)
+            if self.tactic_transparency == Some(UnificationTransparency::SafeDefinitions)
+                || self
+                    .well_founded
+                    .as_ref()
+                    .is_some_and(|state| state.proving)
             {
-                // WF obligations retain ordinary conversion after clean_wf;
-                // selected relation dictionaries must match constructor
-                // conclusions without opening irreducible definitions.
+                // An explicit all scope applies to apply's own conversion.
+                // WF obligations also retain ordinary conversion after clean_wf;
+                // outside an all scope their irreducible definitions stay closed.
                 budget.transparency = UnificationTransparency::Default;
             }
             let premise_left =

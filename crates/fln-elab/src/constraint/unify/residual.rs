@@ -475,7 +475,10 @@ mod tests {
             .unwrap();
         assert_eq!(report.residual_metavariables, vec![outer.clone()]);
         assert!(report.kernel_checks > 0);
-        assert_eq!(txn.mvars.get_assigned_expr(&fresh), Some(&Expr::fvar(value)));
+        assert_eq!(
+            txn.mvars.get_assigned_expr(&fresh),
+            Some(&Expr::fvar(value))
+        );
         assert!(!txn.mvars.is_assigned(&outer));
         assert!(!txn.mvars.assignment_permitted(&outer));
         assert!(txn.mvars.assignment_permitted(&fresh));

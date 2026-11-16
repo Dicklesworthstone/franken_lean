@@ -1763,12 +1763,12 @@ impl Context {
         result.map(|report| assert!(report.awakened.is_empty(), "private source queue"))
     }
 
-    /// The transparency an ordinary elaboration or tactic query asking for `requested` runs
-    /// at: the ambient transparency `with_reducible`, `with_reducible_and_instances` and
-    /// `with_unfolding_none` set (`withReducible`, `withReducibleAndInstances` and
-    /// `withTransparency .none`, vendored src/Lean/Elab/Tactic/BuiltinTactic.lean) caps it.
-    /// Queries that fix their own transparency (instance selection at `instances`, `rw`'s
-    /// occurrence query, `simp`'s matching) do not ask through this.
+    /// Apply the current tactic scope to an ordinary elaboration or tactic query.
+    /// The reducible/instances/none scopes cap unfolding; `with_unfolding_all` raises
+    /// an ordinary `Default` request to `SafeDefinitions` (the pin's `withTransparency
+    /// .all`, vendored src/Lean/Elab/Tactic/ElabTerm.lean). Explicitly narrower requests
+    /// keep their own mode, including the simplifier's reducible closer. Instance
+    /// selection and rewrite matching also retain their own transparency.
     pub(in crate::source) fn ambient_transparency(
         &self,
         requested: UnificationTransparency,
@@ -1781,12 +1781,17 @@ impl Context {
             UnificationTransparency::SafeDefinitions => 4,
         };
         match self.tactic_transparency {
+            Some(UnificationTransparency::SafeDefinitions)
+                if requested == UnificationTransparency::Default =>
+            {
+                UnificationTransparency::SafeDefinitions
+            }
             Some(cap) if rank(cap) < rank(requested) => cap,
             _ => requested,
         }
     }
 
-    /// An ordinary query's budget at `requested` capped by [`Self::ambient_transparency`].
+    /// An ordinary query's budget at the mode selected by [`Self::ambient_transparency`].
     /// Under a cap the pin's `isDefEq` still compares Nat offsets and literals before
     /// reducing (`isDefEqOffsetNat`, vendored Lean/Meta/ExprDefEq.lean), which this engine
     /// otherwise reaches by unfolding `Nat.add` at default transparency.

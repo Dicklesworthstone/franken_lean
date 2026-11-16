@@ -1,14 +1,14 @@
-//! `with_reducible`, `with_reducible_and_instances` and `with_unfolding_none` through the
-//! installed drop-in `lean`, over `prelude` and `Init.Core`. The pin's `withReducible` &c.
+//! `with_reducible`, `with_reducible_and_instances`, `with_unfolding_all` and
+//! `with_unfolding_none` through the installed drop-in `lean`, over pinned prelude imports. The pin's `withReducible` &c.
 //! (vendored `Lean/Elab/Tactic/BuiltinTactic.lean`, syntax in `Init/Tactics.lean:358-376`) run
 //! their sequence on every goal with the transparency set: ordinary elaboration and the tactics'
-//! own comparisons unfold reducible definitions only, instances too, or nothing, while instance
+//! own comparisons unfold reducible definitions, instances, all safe definitions, or nothing; instance
 //! selection keeps its own `instances` transparency and an inner scope replaces an outer one.
 //! Nat offsets still meet at reducible transparency (`isDefEqOffsetNat`). Also `rfl` on an `Iff`,
 //! the pin's latest `rfl` rule `exact Iff.rfl` (vendored `Init/Core.lean:1042`).
 //!
-//! Every program was run through the pinned `lean` v4.32.0 with the same header first
-//! (2026-10-25), and its output is compared with the pinned binary's again when that is present.
+//! The original `ACCEPTED`/`REFUSED` corpus was run through pinned `lean` v4.32.0
+//! (2026-10-25). Every case below compares its result with the pinned binary when present.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -316,5 +316,106 @@ fn transparency_scopes_refuse_what_the_pin_does_not_unfold() {
                 .ends_with(&format!("refused source: {reason}")),
             "{name}: {stderr}"
         );
+    }
+}
+
+#[test]
+fn unfolding_all_scopes_match_the_pin_and_restore_the_outer_mode() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace("all");
+    let header = "prelude\nimport Init.SimpLemmas\n\
+                  @[irreducible] def hiddenNat : Nat := 7\n\
+                  @[irreducible] def hiddenProp : Prop := True\n";
+    let cases = [
+        (
+            "AllAccepted.lean",
+            r#"example : hiddenNat = 7 := by with_unfolding_all rfl
+example (h : hiddenProp) : True := by with_unfolding_all exact h
+example (h : hiddenProp) : True := by with_unfolding_all assumption
+example (h : hiddenProp) : True := by with_unfolding_all apply h
+example : hiddenProp := by with_unfolding_all apply True.intro
+example : hiddenNat = 7 := by
+  with_unfolding_none (with_unfolding_all rfl)
+example : hiddenNat = 7 := by
+  with_reducible (with_unfolding_all rfl)
+example : hiddenNat = 7 ∧ hiddenNat = 7 := by
+  constructor
+  with_unfolding_all all_goals rfl
+example : hiddenNat = 7 := by
+  with_unfolding_all
+    first
+    | with_unfolding_none rfl
+    | rfl
+"#,
+            true,
+        ),
+        (
+            "AllKeepsSimpTransparency.lean",
+            "example : hiddenNat = 7 := by with_unfolding_all simp only []\n",
+            false,
+        ),
+        (
+            "AllThenNone.lean",
+            "example : hiddenNat = 7 := by with_unfolding_all (with_unfolding_none rfl)\n",
+            false,
+        ),
+        (
+            "AllThenReducible.lean",
+            "example : hiddenNat = 7 := by with_unfolding_all (with_reducible rfl)\n",
+            false,
+        ),
+        (
+            "AllThenReducibleApply.lean",
+            "example (h : hiddenProp) : True := by\n  \
+             with_unfolding_all (with_reducible apply h)\n",
+            false,
+        ),
+        (
+            "AllScopeRestores.lean",
+            "example : hiddenNat = 7 := by\n  with_unfolding_all skip\n  rfl\n",
+            false,
+        ),
+        (
+            "AllSiblingScopeRestores.lean",
+            "example : hiddenNat = 7 ∧ hiddenNat = 7 := by\n  constructor\n  \
+             with_unfolding_all skip\n  all_goals rfl\n",
+            false,
+        ),
+        (
+            "AllFailureRestores.lean",
+            "example : hiddenNat = 7 := by\n  first\n  \
+             | with_unfolding_all exact True.intro\n  | rfl\n",
+            false,
+        ),
+        (
+            "AllWrongResult.lean",
+            "example : hiddenNat = 8 := by with_unfolding_all rfl\n",
+            false,
+        ),
+        (
+            "AllOpaqueRefused.lean",
+            "opaque sealedNat : Nat := 7\n\
+             example : sealedNat = 7 := by with_unfolding_all rfl\n",
+            false,
+        ),
+    ];
+    for (name, body, accepted) in cases {
+        let expected_code = if accepted { 0 } else { 1 };
+        std::fs::write(root.join(name), format!("{header}{body}")).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!(code, expected_code, "{name}: the pin moved: {stdout}");
+            if accepted {
+                assert!(stdout.is_empty(), "{name}: {stdout}");
+            }
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, expected_code, "{name}: {stdout}{stderr}");
+        if accepted {
+            assert!(stdout.is_empty(), "{name}: {stdout}{stderr}");
+        } else {
+            assert!(stderr.contains("refused"), "{name}: {stderr}");
+        }
     }
 }

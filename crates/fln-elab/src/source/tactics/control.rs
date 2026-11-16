@@ -64,6 +64,11 @@ fn transparency_scope(
             UnificationTransparency::Instances,
         ),
         (
+            "with_unfolding_all",
+            "withUnfoldingAll",
+            UnificationTransparency::SafeDefinitions,
+        ),
+        (
             "with_unfolding_none",
             "withUnfoldingNone",
             UnificationTransparency::None,
