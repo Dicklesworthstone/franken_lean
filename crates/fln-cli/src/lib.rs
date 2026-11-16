@@ -356,9 +356,15 @@ const USAGE: &str = concat!(
     "and exits 0 only when every module is accepted. --progress also streams\n",
     "JSON lines to stderr: \"started\" as a module goes to the council, and\n",
     "\"decided\" with its row once every earlier row exists. --jobs N checks up to\n",
-    "N modules at once, each against its own import closure. A host-memory\n",
-    "refusal during concurrent checking is retried once with no other module\n",
-    "check in flight, under the same limits; its row records both attempts.\n",
+    "N modules at once, each against its own import closure, holding back new\n",
+    "concurrent dispatches when current RSS plus the closure's decoded byte\n",
+    "estimate exceeds the host or address-space limit (FLN_FRONTIER_MAX_MEMORY_BYTES\n",
+    "or ulimit -v). A host-memory refusal during concurrent checking is retried\n",
+    "once with no other module check in flight, under the same limits; its row\n",
+    "records both attempts, so only a module refused alone settles as\n",
+    "memory-inconclusive. Every row records its closure estimate, error, and\n",
+    "peak bytes across K1's environment delta, the checker, decoded .olean\n",
+    "images, and admitted entries, and the summary prints the top 20 rows by peak.\n",
     "The initial decoder also retries concurrent memory refusals once, after\n",
     "joining its workers, and finishes unstarted decodes serially. Its rows\n",
     "record separate decodeAttempts; a decoded artifact still needs council\n",
@@ -9657,6 +9663,7 @@ struct FrontierRowFields {
     blocked_by: String,
     memory_retry: Option<(u128, BoundedText)>,
     decode_memory_retry: Option<FrontierDecodeRetryFields>,
+    memory: fln::OleanFrontierMemoryAttribution,
 }
 
 struct FrontierDecodeRetryFields {
@@ -9668,16 +9675,44 @@ struct FrontierDecodeRetryFields {
 }
 
 impl FrontierRowFields {
+    fn attempt_number(&self) -> u8 {
+        if self.memory_retry.is_some() || self.decode_memory_retry.is_some() {
+            2
+        } else {
+            1
+        }
+    }
+
+    fn memory_json_object(&self) -> String {
+        format!(
+            concat!(
+                "{{\"estimatedBytes\":{},\"peakBytes\":{},\"estimateErrorBytes\":{},",
+                "\"estimateDirection\":{},\"k1EnvironmentDeltaBytes\":{},\"checkerBytes\":{},",
+                "\"decodedOleanBytes\":{},\"admittedEntriesBytes\":{},\"admissionDeferrals\":{}}}"
+            ),
+            self.memory.estimated_bytes,
+            self.memory.peak_bytes,
+            self.memory.estimate_error_bytes,
+            json_string(self.memory.estimate_direction.as_str()),
+            self.memory.k1_environment_delta_bytes,
+            self.memory.checker_bytes,
+            self.memory.decoded_olean_bytes,
+            self.memory.admitted_entries_bytes,
+            self.memory.admission_deferrals,
+        )
+    }
+
     fn json_members(&self) -> String {
         let mut members = format!(
             concat!(
                 "\"module\":{},\"verdict\":{},\"declarations\":{},\"elapsedMs\":{},",
-                "\"detail\":{},\"detailTruncated\":{},\"blockedBy\":{}"
+                "\"attempt\":{},\"detail\":{},\"detailTruncated\":{},\"blockedBy\":{},\"memory\":{}"
             ),
             json_string(&self.module),
             json_string(self.verdict),
             self.count,
             self.elapsed_ms,
+            self.attempt_number(),
             json_string(self.detail.text()),
             self.detail.truncated(),
             if self.blocked_by.is_empty() {
@@ -9685,6 +9720,7 @@ impl FrontierRowFields {
             } else {
                 json_string(&self.blocked_by)
             },
+            self.memory_json_object(),
         );
         if let Some((first_elapsed_ms, first_refusal)) = &self.memory_retry {
             members.push_str(&format!(
@@ -9775,12 +9811,14 @@ fn frontier_row_fields(row: &fln::OleanFrontierRow) -> FrontierRowFields {
                 retry_error: BoundedText::new(retry_error),
             }
         }),
+        memory: row.memory,
     }
 }
 
 fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> MultiplexerOutput {
     let (mut accepted, mut failed, mut inconclusive, mut faulted, mut blocked) = (0, 0, 0, 0, 0);
     let mut declarations = 0_usize;
+    let mut rendered_fields = Vec::with_capacity(frontier.rows.len());
     let mut rows = Vec::with_capacity(frontier.rows.len());
     let mut lines = Vec::new();
     for row in &frontier.rows {
@@ -9813,6 +9851,20 @@ fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> Mul
             }
             other => format!("  {other:<13} {module}: {}", detail.text()),
         });
+        lines.push(format!(
+            "    memory: attempt={} wall={} ms estimate={} B peak={} B error={} ({}) (k1Delta={} B, checker={} B, decodedOlean={} B, admittedEntries={} B, deferrals={})",
+            fields.attempt_number(),
+            elapsed_ms,
+            fields.memory.estimated_bytes,
+            fields.memory.peak_bytes,
+            fields.memory.estimate_error_bytes,
+            fields.memory.estimate_direction.as_str(),
+            fields.memory.k1_environment_delta_bytes,
+            fields.memory.checker_bytes,
+            fields.memory.decoded_olean_bytes,
+            fields.memory.admitted_entries_bytes,
+            fields.memory.admission_deferrals,
+        ));
         if let Some((first_elapsed_ms, first_refusal)) = &fields.memory_retry {
             lines.push(format!(
                 "    isolated retry after host-memory refusal in {first_elapsed_ms} ms: {}",
@@ -9837,6 +9889,50 @@ fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> Mul
                 ),
             });
         }
+        rendered_fields.push(fields);
+    }
+    let mut ranked: Vec<usize> = (0..rendered_fields.len()).collect();
+    ranked.sort_by(|left, right| {
+        rendered_fields[*right]
+            .memory
+            .peak_bytes
+            .cmp(&rendered_fields[*left].memory.peak_bytes)
+            .then_with(|| left.cmp(right))
+    });
+    ranked.truncate(20);
+    let top_memory_json: Vec<String> = ranked
+        .iter()
+        .map(|&index| {
+            let fields = &rendered_fields[index];
+            format!(
+                "{{\"module\":{},\"verdict\":{},\"attempt\":{},\"elapsedMs\":{},\"memory\":{}}}",
+                json_string(&fields.module),
+                json_string(fields.verdict),
+                fields.attempt_number(),
+                fields.elapsed_ms,
+                fields.memory_json_object(),
+            )
+        })
+        .collect();
+    if !ranked.is_empty() {
+        lines.push("top memory rows (up to 20 by peak bytes):".to_owned());
+        for (rank, &index) in ranked.iter().enumerate() {
+            let fields = &rendered_fields[index];
+            lines.push(format!(
+                "  {:>2}. {} ({}, attempt {}, {} ms): peak={} B estimate={} B (k1Delta={} B, checker={} B, decodedOlean={} B, admittedEntries={} B)",
+                rank + 1,
+                fields.module,
+                fields.verdict,
+                fields.attempt_number(),
+                fields.elapsed_ms,
+                fields.memory.peak_bytes,
+                fields.memory.estimated_bytes,
+                fields.memory.k1_environment_delta_bytes,
+                fields.memory.checker_bytes,
+                fields.memory.decoded_olean_bytes,
+                fields.memory.admitted_entries_bytes,
+            ));
+        }
     }
     let total = frontier.rows.len();
     let exit_code = if faulted > 0 {
@@ -9856,7 +9952,7 @@ fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> Mul
             concat!(
                 "{{\"schema\":{},\"outcome\":{},\"authority\":true,\"trust\":\"recheck\",\"modules\":{},",
                 "\"accepted\":{},\"failed\":{},\"inconclusive\":{},\"internalFault\":{},",
-                "\"blocked\":{},\"acceptedDeclarations\":{},\"rows\":[{}]}}\n"
+                "\"blocked\":{},\"acceptedDeclarations\":{},\"topMemoryRows\":[{}],\"rows\":[{}]}}\n"
             ),
             json_string(CHECK_OLEAN_FRONTIER_SCHEMA),
             json_string(if exit_code == 0 {
@@ -9871,6 +9967,7 @@ fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> Mul
             faulted,
             blocked,
             declarations,
+            top_memory_json.join(","),
             rows.join(","),
         )
     } else {
@@ -16995,6 +17092,9 @@ mod tests {
                 first_elapsed: std::time::Duration::from_millis(10),
             }),
             decode_memory_retry: None,
+            memory: fln::OleanFrontierMemoryAttribution::from_components(
+                1024, 200, 500, 400, 150, 1,
+            ),
         };
         for (verdict, expected_exit, expected_count) in [
             (
@@ -17109,6 +17209,7 @@ mod tests {
                         retry_elapsed: std::time::Duration::from_millis(20),
                         retry_result,
                     }),
+                    memory: fln::OleanFrontierMemoryAttribution::default(),
                 }],
             };
             let output = super::render_check_olean_frontier(&frontier, true);
@@ -17146,6 +17247,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn check_olean_frontier_renders_top_twenty_memory_rows_and_conserves_counts() {
+        let mut rows = Vec::new();
+        for index in 0..25_u64 {
+            let retried = index == 24;
+            rows.push(fln::OleanFrontierRow {
+                name: fln::Name::from_components([format!("Mod{index:02}").as_str()]),
+                verdict: if index == 3 {
+                    fln::OleanModuleVerdict::Inconclusive(
+                        fln::Inconclusive::dependency_unavailable("host memory: solo refusal"),
+                    )
+                } else {
+                    fln::OleanModuleVerdict::Accepted { declarations: 1 }
+                },
+                elapsed: std::time::Duration::from_millis(10 + index),
+                memory_retry: retried.then(|| fln::OleanFrontierMemoryRetry {
+                    first_refusal: fln::Inconclusive::dependency_unavailable(
+                        "host memory: concurrent refusal",
+                    ),
+                    first_elapsed: std::time::Duration::from_millis(4),
+                }),
+                decode_memory_retry: None,
+                memory: fln::OleanFrontierMemoryAttribution::from_components(
+                    (index + 1) * 500,
+                    (index + 1) * 100,
+                    (index + 1) * 200,
+                    (index + 1) * 300,
+                    (index + 1) * 400,
+                    u64::from(retried),
+                ),
+            });
+        }
+        let frontier = fln::OleanFrontier {
+            engine: Ok(fln::Engine::from_environment(fln::Environment::new())),
+            rows,
+        };
+        let json_out = super::render_check_olean_frontier(&frontier, true);
+        assert_eq!(json_out.exit_code, 3);
+        assert!(json_out.stdout.contains("\"modules\":25"));
+        assert!(json_out.stdout.contains("\"accepted\":24"));
+        assert!(json_out.stdout.contains("\"inconclusive\":1"));
+        assert_eq!(
+            json_out.stdout.matches("\"topMemoryRows\":[").count(),
+            1,
+            "{}",
+            json_out.stdout
+        );
+        let top_section = json_out
+            .stdout
+            .split("\"topMemoryRows\":[")
+            .nth(1)
+            .and_then(|rest| rest.split("],\"rows\":[").next())
+            .expect("topMemoryRows slice");
+        // Exactly 20 entries: Mod24 (peak 25,000) down to Mod05 (peak 6,000); Mod00..Mod04 excluded.
+        assert_eq!(top_section.matches("\"module\":\"Mod").count(), 20);
+        assert!(
+            top_section.starts_with("{\"module\":\"Mod24\",\"verdict\":\"accepted\",\"attempt\":2")
+        );
+        assert!(top_section.contains("\"module\":\"Mod05\""));
+        assert!(!top_section.contains("\"module\":\"Mod04\""));
+
+        let human_out = super::render_check_olean_frontier(&frontier, false);
+        assert_eq!(human_out.exit_code, 3);
+        assert!(
+            human_out
+                .stdout
+                .contains("top memory rows (up to 20 by peak bytes):")
+        );
+        assert!(
+            human_out
+                .stdout
+                .contains("1. Mod24 (accepted, attempt 2, 34 ms): peak=25000 B estimate=12500 B")
+        );
+        assert!(human_out.stdout.contains("20. Mod05 (accepted, attempt 1"));
+        assert!(!human_out.stdout.contains("21. Mod04"));
     }
 
     #[test]

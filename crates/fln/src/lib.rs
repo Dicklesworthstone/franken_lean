@@ -178,11 +178,13 @@ use fln_admission::{
 };
 pub use fln_admission::{
     CheckedOleanModule, CheckerAgreement, CheckerExecutionLimits, DecodedOlean,
-    EngineAdmissionError, EngineAdmissionLimits, HostAllocationFailure, IndependentReading,
-    OleanCheckError, OleanCheckLimits, OleanCheckedDeclaration, OleanCompanionPart,
-    OleanDecodeError, OleanDecodeLimits, OleanDecodeMemoryRetry, OleanFrontierEvent,
-    OleanFrontierJobs, OleanFrontierMemoryRetry, OleanFrontierRow, OleanModuleInput,
-    OleanModulePart, OleanModuleVerdict, decode_olean_artifact, decode_olean_module_artifacts,
+    EngineAdmissionError, EngineAdmissionLimits, FrontierEstimateDirection, FrontierMemorySample,
+    FrontierMemorySource, FrontierRunHooks, HostAllocationFailure, HostProcessMemorySource,
+    IndependentReading, OleanCheckError, OleanCheckLimits, OleanCheckedDeclaration,
+    OleanCompanionPart, OleanDecodeError, OleanDecodeLimits, OleanDecodeMemoryRetry,
+    OleanFrontierEvent, OleanFrontierJobs, OleanFrontierMemoryAttribution,
+    OleanFrontierMemoryRetry, OleanFrontierRow, OleanModuleInput, OleanModulePart,
+    OleanModuleVerdict, decode_olean_artifact, decode_olean_module_artifacts,
     install_host_allocation_failure_hook, olean_module_imports,
 };
 // Council internals that `fln`'s own unit tests still drive through an `Engine`.
@@ -2177,6 +2179,20 @@ impl Engine {
     ) -> Result<OleanFrontier, OleanCheckError> {
         self.admitted()
             .check_olean_frontier_using(modules, limits, jobs, on_event, check, decode)
+            .map(|frontier| frontier.map_engine(|engine| self.with_admitted(engine)))
+    }
+
+    #[cfg(test)]
+    fn check_olean_frontier_using_with_memory(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+        hooks: FrontierRunHooks<'_>,
+    ) -> Result<OleanFrontier, OleanCheckError> {
+        self.admitted()
+            .check_olean_frontier_using_with_memory(modules, limits, jobs, on_event, hooks)
             .map(|frontier| frontier.map_engine(|engine| self.with_admitted(engine)))
     }
 
@@ -11939,6 +11955,7 @@ mod tests {
                                 engine: None,
                                 elapsed: started.elapsed(),
                                 retained: None,
+                                memory: super::OleanFrontierMemoryAttribution::default(),
                             };
                         }
                         drop(job);
@@ -12110,6 +12127,200 @@ mod tests {
     #[test]
     fn frontier_memory_retry_does_not_repeat_a_refusal_that_was_already_alone() {
         run_frontier_memory_retry(MemoryRetryControl::Accept, 1);
+    }
+
+    #[test]
+    fn frontier_admission_control_never_exceeds_synthetic_estimate_limit_and_populates_component_peaks()
+     {
+        use super::{
+            FrontierEstimateDirection, FrontierMemorySample, FrontierMemorySource,
+            OleanModuleVerdict,
+        };
+        use std::sync::Mutex;
+
+        struct SyntheticTable {
+            rss_bytes: u64,
+            limit_bytes: u64,
+            estimates: [u64; 5],
+        }
+
+        impl FrontierMemorySource for SyntheticTable {
+            fn sample(&self) -> FrontierMemorySample {
+                FrontierMemorySample {
+                    rss_bytes: self.rss_bytes,
+                    limit_bytes: Some(self.limit_bytes),
+                }
+            }
+
+            fn estimate_bytes(&self, index: usize, closure_decoded_bytes: u64) -> u64 {
+                assert!(
+                    closure_decoded_bytes > 0,
+                    "closure decoded estimate must be positive for valid module {index}"
+                );
+                self.estimates[index]
+            }
+        }
+
+        let module = |name: &str, constants: &[ConstantInfo], imports: &[&str]| {
+            (
+                fixture_name(name),
+                olean_with_imports(constants, &fixture_imports(imports)),
+            )
+        };
+        // A -> {B (60), C (60), E (25), Huge (150)} under rss=10, limit=100.
+        // B and C (10 + 60 + 60 = 130 > 100) must never run concurrently;
+        // B and E (10 + 60 + 25 = 95 <= 100) may overlap; Huge (150 > 100)
+        // waits until in_flight == 0 and then runs alone without deadlocking.
+        let set = [
+            module(
+                "Fixture.A",
+                &[
+                    fixture_axiom("Fixture.P", Expr::sort(Level::zero())),
+                    fixture_axiom("Fixture.p", fixture_constant("Fixture.P")),
+                ],
+                &[],
+            ),
+            module(
+                "Fixture.B",
+                &[fixture_theorem("Fixture.b", fixture_constant("Fixture.p"))],
+                &["Fixture.A"],
+            ),
+            module(
+                "Fixture.C",
+                &[fixture_theorem("Fixture.c", fixture_constant("Fixture.p"))],
+                &["Fixture.A"],
+            ),
+            module(
+                "Fixture.E",
+                &[fixture_theorem("Fixture.e", fixture_constant("Fixture.p"))],
+                &["Fixture.A"],
+            ),
+            module(
+                "Fixture.Huge",
+                &[fixture_theorem(
+                    "Fixture.huge",
+                    fixture_constant("Fixture.p"),
+                )],
+                &["Fixture.A"],
+            ),
+        ];
+        let table = SyntheticTable {
+            rss_bytes: 10,
+            limit_bytes: 100,
+            estimates: [20, 60, 60, 25, 150],
+        };
+        let inputs: Vec<OleanModuleInput<'_>> = set
+            .iter()
+            .map(|(name, artifact)| OleanModuleInput {
+                name,
+                artifact,
+                server_artifact: None,
+                private_artifact: None,
+            })
+            .collect();
+        let limits = OleanCheckLimits::new(set.iter().map(|(_, b)| b.len()).sum(), test_budget());
+        let engine = Engine::from_environment(Environment::new());
+        let options = KVMap::new();
+        let in_flight = Mutex::new(Vec::<usize>::new());
+        let max_concurrency = std::sync::atomic::AtomicUsize::new(0);
+
+        let frontier = engine
+            .check_olean_frontier_using_with_memory(
+                &inputs,
+                limits,
+                fixture_jobs(4),
+                &mut |_| {},
+                super::FrontierRunHooks {
+                    check: &|job| {
+                        {
+                            let mut active = in_flight.lock().expect("active lock");
+                            active.push(job.index);
+                            let count = active.len();
+                            max_concurrency.fetch_max(count, std::sync::atomic::Ordering::SeqCst);
+                            if count > 1 {
+                                let committed: u64 = active
+                                    .iter()
+                                    .map(|idx| table.estimates[*idx])
+                                    .fold(table.rss_bytes, u64::saturating_add);
+                                assert!(
+                                    committed <= table.limit_bytes,
+                                    "concurrent jobs {active:?} exceeded synthetic limit: {committed} > {}",
+                                    table.limit_bytes
+                                );
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        let done = engine.frontier_check_module(job, &options, limits);
+                        in_flight
+                            .lock()
+                            .expect("active lock")
+                            .retain(|idx| *idx != done.index);
+                        done
+                    },
+                    decode: &|index| {
+                        super::decode_olean_module_input_with(
+                            &inputs[index],
+                            limits,
+                            super::CheckerReading::Read,
+                        )
+                    },
+                    memory: &table,
+                },
+            )
+            .expect("frontier completes without stalling");
+
+        assert_eq!(frontier.rows.len(), 5);
+        assert!(
+            max_concurrency.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "B (60) and E (25) fit together under rss=10, limit=100"
+        );
+        for row in &frontier.rows {
+            assert!(
+                matches!(row.verdict, OleanModuleVerdict::Accepted { .. }),
+                "{row:?}"
+            );
+            let m = row.memory;
+            assert!(m.decoded_olean_bytes > 0, "{row:?}");
+            assert!(m.k1_environment_delta_bytes > 0, "{row:?}");
+            assert!(m.checker_bytes > 0, "{row:?}");
+            assert!(m.admitted_entries_bytes > 0, "{row:?}");
+            assert_eq!(
+                m.peak_bytes,
+                m.k1_environment_delta_bytes
+                    + m.checker_bytes
+                    + m.decoded_olean_bytes
+                    + m.admitted_entries_bytes
+            );
+            assert_eq!(
+                m.estimate_error_bytes,
+                m.peak_bytes.abs_diff(m.estimated_bytes)
+            );
+            assert_eq!(
+                m.estimate_direction,
+                if m.estimated_bytes > m.peak_bytes {
+                    FrontierEstimateDirection::Over
+                } else if m.estimated_bytes < m.peak_bytes {
+                    FrontierEstimateDirection::Under
+                } else {
+                    FrontierEstimateDirection::Exact
+                }
+            );
+        }
+        let by_name = |target: &str| {
+            frontier
+                .rows
+                .iter()
+                .find(|row| row.name == fixture_name(target))
+                .expect("row present")
+        };
+        assert!(
+            by_name("Fixture.C").memory.admission_deferrals >= 1,
+            "C (60) must wait while B (60) is running"
+        );
+        assert!(
+            by_name("Fixture.Huge").memory.admission_deferrals >= 1,
+            "Huge (150) must wait until in_flight == 0"
+        );
     }
 
     #[test]
@@ -18715,6 +18926,7 @@ mod tests {
                     engine: None,
                     elapsed: std::time::Duration::ZERO,
                     retained: None,
+                    memory: super::OleanFrontierMemoryAttribution::default(),
                 }
             });
             assert_eq!(done.index, 7);

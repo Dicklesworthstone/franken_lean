@@ -1191,6 +1191,7 @@ pub fn frontier_guarded(
             engine: None,
             elapsed: started.elapsed(),
             retained: retain.then_some(FrontierRetained::Failed(error)),
+            memory: OleanFrontierMemoryAttribution::default(),
         }
     })
 }
@@ -1227,6 +1228,204 @@ pub enum OleanModuleVerdict {
     Blocked { by: Name },
 }
 
+/// Direction of a frontier row's closure-decoded memory estimate relative to
+/// the observed four-component peak (`fln-frontier-rows-depend-on-jobs-2g96`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrontierEstimateDirection {
+    Over,
+    Under,
+    #[default]
+    Exact,
+}
+
+impl FrontierEstimateDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Over => "over",
+            Self::Under => "under",
+            Self::Exact => "exact",
+        }
+    }
+}
+
+/// Per-row memory estimate and peak component attribution for a frontier module
+/// (bead `fln-frontier-rows-depend-on-jobs-2g96`).
+///
+/// The four component peaks and the closure-decoded estimate depend only on the
+/// module and its import closure; `admission_deferrals` counts how many times
+/// concurrent dispatch held the module back while host/committed RSS plus
+/// `estimated_bytes` exceeded the memory ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OleanFrontierMemoryAttribution {
+    /// Closure's decoded `.olean` byte size used by admission control.
+    pub estimated_bytes: u64,
+    /// Sum of the four observed component peaks for this module's check.
+    pub peak_bytes: u64,
+    /// Non-negative magnitude `peak_bytes.abs_diff(estimated_bytes)`.
+    pub estimate_error_bytes: u64,
+    /// Whether `estimated_bytes` overestimated, underestimated, or matched `peak_bytes`.
+    pub estimate_direction: FrontierEstimateDirection,
+    /// Peak bytes held by K1's environment delta above the module's base import engine.
+    pub k1_environment_delta_bytes: u64,
+    /// Peak bytes held by the independent checker's environment delta and candidate arenas.
+    pub checker_bytes: u64,
+    /// Peak bytes held by this module's decoded `.olean` image and checker reading map.
+    pub decoded_olean_bytes: u64,
+    /// Bytes retained in [`FrontierAccepted::admitted`] for downstream importers.
+    pub admitted_entries_bytes: u64,
+    /// Dispatch turns deferred by admission control while other modules were in flight.
+    pub admission_deferrals: u64,
+}
+
+impl OleanFrontierMemoryAttribution {
+    pub fn from_components(
+        estimated_bytes: u64,
+        k1_environment_delta_bytes: u64,
+        checker_bytes: u64,
+        decoded_olean_bytes: u64,
+        admitted_entries_bytes: u64,
+        admission_deferrals: u64,
+    ) -> Self {
+        let peak_bytes = k1_environment_delta_bytes
+            .saturating_add(checker_bytes)
+            .saturating_add(decoded_olean_bytes)
+            .saturating_add(admitted_entries_bytes);
+        let estimate_direction = match estimated_bytes.cmp(&peak_bytes) {
+            std::cmp::Ordering::Greater => FrontierEstimateDirection::Over,
+            std::cmp::Ordering::Less => FrontierEstimateDirection::Under,
+            std::cmp::Ordering::Equal => FrontierEstimateDirection::Exact,
+        };
+        Self {
+            estimated_bytes,
+            peak_bytes,
+            estimate_error_bytes: peak_bytes.abs_diff(estimated_bytes),
+            estimate_direction,
+            k1_environment_delta_bytes,
+            checker_bytes,
+            decoded_olean_bytes,
+            admitted_entries_bytes,
+            admission_deferrals,
+        }
+    }
+
+    fn with_schedule_context(self, estimated_bytes: u64, admission_deferrals: u64) -> Self {
+        Self::from_components(
+            estimated_bytes,
+            self.k1_environment_delta_bytes,
+            self.checker_bytes,
+            self.decoded_olean_bytes,
+            self.admitted_entries_bytes,
+            admission_deferrals,
+        )
+    }
+}
+
+/// Host-memory snapshot consulted before dispatching concurrent frontier jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrontierMemorySample {
+    pub rss_bytes: u64,
+    pub limit_bytes: Option<u64>,
+}
+
+/// Pluggable host-memory meter and per-module estimate source for frontier
+/// scheduling (`fln-frontier-rows-depend-on-jobs-2g96`).
+pub trait FrontierMemorySource: Sync {
+    fn sample(&self) -> FrontierMemorySample;
+
+    fn estimate_bytes(&self, index: usize, closure_decoded_bytes: u64) -> u64 {
+        let _ = index;
+        closure_decoded_bytes
+    }
+}
+
+/// Production host-memory source reading `/proc/self/{status,limits}` and
+/// `/proc/meminfo` on Linux, honoring an optional `FLN_FRONTIER_MAX_MEMORY_BYTES`
+/// ceiling override.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostProcessMemorySource;
+
+impl FrontierMemorySource for HostProcessMemorySource {
+    fn sample(&self) -> FrontierMemorySample {
+        let override_limit = std::env::var("FLN_FRONTIER_MAX_MEMORY_BYTES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|limit| *limit > 0);
+        #[cfg(target_os = "linux")]
+        {
+            let (rss_bytes, vm_size_bytes) = linux_proc_self_memory_bytes();
+            let limit_bytes = override_limit
+                .or_else(|| linux_address_space_headroom_bytes(rss_bytes, vm_size_bytes))
+                .or_else(linux_mem_total_bytes);
+            FrontierMemorySample {
+                rss_bytes,
+                limit_bytes,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            FrontierMemorySample {
+                rss_bytes: 0,
+                limit_bytes: override_limit,
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_kb_line(line: &str, prefix: &str) -> Option<u64> {
+    let rest = line.strip_prefix(prefix)?.trim();
+    let digits = rest.split_whitespace().next()?;
+    digits.parse::<u64>().ok()?.checked_mul(1024)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_self_memory_bytes() -> (u64, u64) {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return (0, 0);
+    };
+    let mut rss = 0_u64;
+    let mut vm_size = 0_u64;
+    for line in status.lines() {
+        if let Some(bytes) = parse_proc_kb_line(line, "VmRSS:") {
+            rss = bytes;
+        } else if let Some(bytes) = parse_proc_kb_line(line, "VmSize:") {
+            vm_size = bytes;
+        }
+    }
+    (rss, vm_size)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_address_space_headroom_bytes(rss_bytes: u64, vm_size_bytes: u64) -> Option<u64> {
+    let limits = std::fs::read_to_string("/proc/self/limits").ok()?;
+    for line in limits.lines() {
+        if let Some(rest) = line.strip_prefix("Max address space") {
+            let soft = rest.split_whitespace().next()?;
+            if soft == "unlimited" {
+                return None;
+            }
+            let max_as = soft.parse::<u64>().ok()?;
+            // Non-resident virtual mappings (worker stacks, mapped code) already
+            // count against `RLIMIT_AS`, so subtract `vm_size - rss` to convert
+            // `Max address space` into an effective RSS ceiling.
+            let non_resident = vm_size_bytes.saturating_sub(rss_bytes);
+            return Some(max_as.saturating_sub(non_resident));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mem_total_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(bytes) = parse_proc_kb_line(line, "MemTotal:") {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
 /// One row of a frontier run. `elapsed` is operational wall time, never part of any
 /// logical identity.
 #[derive(Debug)]
@@ -1245,6 +1444,8 @@ pub struct OleanFrontierRow {
     /// the council: its result here does not imply this row was accepted.
     /// Decode times are separate from the checking time in `elapsed`.
     pub decode_memory_retry: Option<OleanDecodeMemoryRetry>,
+    /// Closure-decoded estimate and four-component memory peak attribution.
+    pub memory: OleanFrontierMemoryAttribution,
 }
 
 /// The first attempt of a module checked again in isolation. Its final attempt
@@ -1408,6 +1609,8 @@ pub struct FrontierDone {
     pub elapsed: std::time::Duration,
     /// Present only for a [`FrontierJob::retain`] job that completed or failed.
     pub retained: Option<FrontierRetained>,
+    /// Component memory peaks observed during this module's check.
+    pub memory: OleanFrontierMemoryAttribution,
 }
 
 /// A retaining frontier job's own record: what the serial result is reassembled
@@ -2971,6 +3174,13 @@ pub fn plan_olean_declarations(
     })
 }
 
+/// Pluggable worker callbacks and host-memory meter for frontier scheduling.
+pub struct FrontierRunHooks<'a> {
+    pub check: &'a (dyn Fn(FrontierJob) -> FrontierDone + Sync),
+    pub decode: &'a (dyn Fn(usize) -> Result<DecodedOlean, OleanCheckError> + Sync),
+    pub memory: &'a (dyn FrontierMemorySource + Sync),
+}
+
 impl Admitted {
     /// Decode and atomically check every declaration in one standalone
     /// pinned-format `.olean`.
@@ -3243,6 +3453,36 @@ impl Admitted {
         check: &(dyn Fn(FrontierJob) -> FrontierDone + Sync),
         decode: &(dyn Fn(usize) -> Result<DecodedOlean, OleanCheckError> + Sync),
     ) -> Result<OleanFrontier, OleanCheckError> {
+        self.check_olean_frontier_using_with_memory(
+            modules,
+            limits,
+            jobs,
+            on_event,
+            FrontierRunHooks {
+                check,
+                decode,
+                memory: &HostProcessMemorySource,
+            },
+        )
+    }
+
+    /// [`Admitted::check_olean_frontier_using`] with an explicit
+    /// [`FrontierMemorySource`], so unit tests can prove admission control never
+    /// dispatches past a synthetic estimate ceiling while production consults
+    /// live host RSS and address-space limits.
+    pub fn check_olean_frontier_using_with_memory(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+        hooks: FrontierRunHooks<'_>,
+    ) -> Result<OleanFrontier, OleanCheckError> {
+        let FrontierRunHooks {
+            check,
+            decode,
+            memory,
+        } = hooks;
         let owners = olean_module_owners(modules, limits)?;
         let mut decode_memory_retries = Vec::new();
         decode_memory_retries
@@ -3346,6 +3586,22 @@ impl Admitted {
             closure.insert(*index);
             closures[*index] = std::sync::Arc::new(closure);
         }
+        let module_decoded_bytes: Vec<u64> = decoded
+            .iter()
+            .map(|entry| match entry {
+                Some(Ok(artifact)) => decoded_olean_image_bytes(artifact),
+                _ => 0,
+            })
+            .collect();
+        let estimated_bytes: Vec<u64> = (0..count)
+            .map(|index| {
+                let closure_decoded = closures[index]
+                    .iter()
+                    .map(|member| module_decoded_bytes[*member])
+                    .fold(0_u64, u64::saturating_add);
+                memory.estimate_bytes(index, closure_decoded)
+            })
+            .collect();
 
         // A row waits here from its decision until every earlier row has left.
         let mut pending_rows: Vec<Option<OleanFrontierRow>> = (0..count).map(|_| None).collect();
@@ -3398,6 +3654,7 @@ impl Admitted {
                         engine: None,
                         elapsed: started.elapsed(),
                         retained: None,
+                        memory: OleanFrontierMemoryAttribution::default(),
                     },
                 }
             })
@@ -3435,6 +3692,9 @@ impl Admitted {
 
             let mut running = vec![false; count];
             let mut in_flight = 0_usize;
+            let mut in_flight_estimated_bytes = 0_u64;
+            let mut idle_rss_bytes = memory.sample().rss_bytes;
+            let mut admission_deferrals = vec![0_u64; count];
             let mut overlapped = vec![false; count];
             let mut retry_imports: Vec<Option<FrontierRetryImports>> = vec![None; count];
             let mut memory_retries: Vec<Option<OleanFrontierMemoryRetry>> =
@@ -3454,31 +3714,36 @@ impl Admitted {
                         });
                     }
                 };
-            let record =
-                |done: FrontierDone,
-                 running: &mut Vec<bool>,
-                 decided: &mut Vec<bool>,
-                 accepted: &mut Vec<Option<std::sync::Arc<FrontierAccepted>>>,
-                 engines: &mut FrontierEngines,
-                 pending_rows: &mut Vec<Option<OleanFrontierRow>>,
-                 memory_retry: Option<OleanFrontierMemoryRetry>,
-                 decode_memory_retry: Option<OleanDecodeMemoryRetry>| {
-                    running[done.index] = false;
-                    decided[done.index] = true;
-                    accepted[done.index] = done.accepted.map(std::sync::Arc::new);
-                    engines.keep(done.index, done.engine);
-                    pending_rows[done.index] = Some(OleanFrontierRow {
-                        name: modules[done.index].name.clone(),
-                        verdict: done.verdict,
-                        elapsed: done.elapsed.saturating_add(
-                            memory_retry
-                                .as_ref()
-                                .map_or(std::time::Duration::ZERO, |retry| retry.first_elapsed),
-                        ),
-                        memory_retry,
-                        decode_memory_retry,
-                    });
-                };
+            let record = |done: FrontierDone,
+                          running: &mut Vec<bool>,
+                          decided: &mut Vec<bool>,
+                          accepted: &mut Vec<Option<std::sync::Arc<FrontierAccepted>>>,
+                          engines: &mut FrontierEngines,
+                          pending_rows: &mut Vec<Option<OleanFrontierRow>>,
+                          memory_retry: Option<OleanFrontierMemoryRetry>,
+                          decode_memory_retry: Option<OleanDecodeMemoryRetry>,
+                          admission_deferrals: &[u64]| {
+                let row_index = done.index;
+                running[row_index] = false;
+                decided[row_index] = true;
+                accepted[row_index] = done.accepted.map(std::sync::Arc::new);
+                engines.keep(row_index, done.engine);
+                pending_rows[row_index] = Some(OleanFrontierRow {
+                    name: modules[row_index].name.clone(),
+                    verdict: done.verdict,
+                    elapsed: done.elapsed.saturating_add(
+                        memory_retry
+                            .as_ref()
+                            .map_or(std::time::Duration::ZERO, |retry| retry.first_elapsed),
+                    ),
+                    memory_retry,
+                    decode_memory_retry,
+                    memory: done.memory.with_schedule_context(
+                        estimated_bytes[row_index],
+                        admission_deferrals[row_index],
+                    ),
+                });
+            };
             loop {
                 // Decide every module that needs no council, and collect the ready.
                 let mut ready = Vec::new();
@@ -3530,6 +3795,14 @@ impl Admitted {
                         elapsed: std::time::Duration::ZERO,
                         memory_retry: None,
                         decode_memory_retry: decode_memory_retries[index].take(),
+                        memory: OleanFrontierMemoryAttribution::from_components(
+                            estimated_bytes[index],
+                            0,
+                            0,
+                            module_decoded_bytes[index],
+                            0,
+                            admission_deferrals[index],
+                        ),
                     });
                     on_event(OleanFrontierEvent::Settled {
                         position: position[index] + 1,
@@ -3576,9 +3849,11 @@ impl Admitted {
                         module: modules[index].name,
                         previous,
                     });
+                    idle_rss_bytes = memory.sample().rss_bytes;
                     running[index] = true;
                     isolated_running = Some(index);
                     in_flight = 1;
+                    in_flight_estimated_bytes = estimated_bytes[index];
                     job_sender
                         .send(FrontierWork {
                             index,
@@ -3599,6 +3874,19 @@ impl Admitted {
                 {
                     if in_flight >= threads {
                         break;
+                    }
+                    let sample = memory.sample();
+                    if in_flight == 0 {
+                        idle_rss_bytes = sample.rss_bytes;
+                    } else if let Some(limit_bytes) = sample.limit_bytes {
+                        let committed_bytes = sample
+                            .rss_bytes
+                            .max(idle_rss_bytes.saturating_add(in_flight_estimated_bytes));
+                        if committed_bytes.saturating_add(estimated_bytes[index]) > limit_bytes {
+                            admission_deferrals[index] =
+                                admission_deferrals[index].saturating_add(1);
+                            continue;
+                        }
                     }
                     let Some(Ok(artifact)) = decoded[index].take() else {
                         return Err(OleanCheckError::InternalInvariant {
@@ -3627,6 +3915,8 @@ impl Admitted {
                     }
                     running[index] = true;
                     in_flight += 1;
+                    in_flight_estimated_bytes =
+                        in_flight_estimated_bytes.saturating_add(estimated_bytes[index]);
                     dispatched += 1;
                     let job = FrontierJob {
                         index,
@@ -3642,6 +3932,8 @@ impl Admitted {
                         // so the events keep the one-at-a-time order.
                         let done = check(job);
                         in_flight -= 1;
+                        in_flight_estimated_bytes =
+                            in_flight_estimated_bytes.saturating_sub(estimated_bytes[done.index]);
                         let index = done.index;
                         record(
                             done,
@@ -3652,6 +3944,7 @@ impl Admitted {
                             &mut pending_rows,
                             None,
                             decode_memory_retries[index].take(),
+                            &admission_deferrals,
                         );
                         settle(index, &pending_rows, on_event);
                         break;
@@ -3698,6 +3991,8 @@ impl Admitted {
                         })?;
                 in_flight -= 1;
                 let index = done.index;
+                in_flight_estimated_bytes =
+                    in_flight_estimated_bytes.saturating_sub(estimated_bytes[index]);
                 if done.host_memory_refusal && overlapped[index] && memory_retries[index].is_none()
                 {
                     let OleanModuleVerdict::Inconclusive(first_refusal) = done.verdict else {
@@ -3728,6 +4023,7 @@ impl Admitted {
                     &mut pending_rows,
                     memory_retries[index].take(),
                     decode_memory_retries[index].take(),
+                    &admission_deferrals,
                 );
                 settle(index, &pending_rows, on_event);
             }
@@ -4227,9 +4523,12 @@ impl Admitted {
     ) -> FrontierDone {
         let index = job.index;
         let retain = job.retain;
+        let decoded_bytes = decoded_olean_image_bytes(&job.artifact);
+        let closure_delta_bytes = frontier_closure_merge_delta_bytes(&job);
         let finish = |verdict: OleanModuleVerdict,
                       accepted: Option<(FrontierAccepted, Admitted)>,
-                      retained: Option<FrontierRetained>| {
+                      retained: Option<FrontierRetained>,
+                      memory: OleanFrontierMemoryAttribution| {
             let (accepted, engine) = accepted.unzip();
             FrontierDone {
                 index,
@@ -4239,21 +4538,40 @@ impl Admitted {
                 engine,
                 elapsed: started.elapsed(),
                 retained,
+                memory,
             }
         };
-        let failed = |error: OleanCheckError| {
+        let failed = |error: OleanCheckError, k1_delta: u64, checker_bytes: u64| {
             let host_memory_refusal = olean_host_memory_refusal(&error);
             let retained = retain.then(|| FrontierRetained::Failed(error.clone()));
-            let mut done = finish(frontier_error_verdict(error), None, retained);
+            let mut done = finish(
+                frontier_error_verdict(error),
+                None,
+                retained,
+                OleanFrontierMemoryAttribution::from_components(
+                    0,
+                    k1_delta,
+                    checker_bytes,
+                    decoded_bytes,
+                    0,
+                    0,
+                ),
+            );
             done.host_memory_refusal = host_memory_refusal;
             done
         };
         let engine = match self.frontier_closure_engine(&job) {
             Ok(engine) => engine,
-            Err(error) => return failed(error),
+            Err(error) => return failed(error, closure_delta_bytes, 0),
         };
         let start = engine.environment.clone();
-        match engine.check_decoded_olean_unrooted(job.artifact, options, limits) {
+        let mut checker_bytes = 0_u64;
+        match engine.check_decoded_olean_unrooted_measured(
+            job.artifact,
+            options,
+            limits,
+            &mut checker_bytes,
+        ) {
             Ok(Outcome::Complete(checked)) => {
                 let declarations = checked.declarations.len();
                 let admitted: Vec<EnvironmentEntry> = checked
@@ -4263,6 +4581,10 @@ impl Admitted {
                     .filter(|info| !start.contains(info.name()))
                     .filter_map(|info| checked.engine.environment.entry(info.name()))
                     .collect();
+                let admitted_bytes = environment_entries_bytes(&admitted);
+                let k1_delta_bytes = closure_delta_bytes.saturating_add(
+                    admitted_bytes.saturating_add((admitted.len() as u64).saturating_mul(64)),
+                );
                 let mut engine = checked.engine;
                 let mut imported = (*engine.imported_modules).clone();
                 imported.insert(job.name.clone());
@@ -4290,15 +4612,43 @@ impl Admitted {
                         engine,
                     )),
                     retained,
+                    OleanFrontierMemoryAttribution::from_components(
+                        0,
+                        k1_delta_bytes,
+                        checker_bytes,
+                        decoded_bytes,
+                        admitted_bytes,
+                        0,
+                    ),
                 )
             }
-            Ok(Outcome::Inconclusive(reason)) => {
-                finish(OleanModuleVerdict::Inconclusive(reason), None, None)
-            }
-            Ok(Outcome::InternalFault(fault)) => {
-                finish(OleanModuleVerdict::InternalFault(fault), None, None)
-            }
-            Err(error) => failed(error),
+            Ok(Outcome::Inconclusive(reason)) => finish(
+                OleanModuleVerdict::Inconclusive(reason),
+                None,
+                None,
+                OleanFrontierMemoryAttribution::from_components(
+                    0,
+                    closure_delta_bytes,
+                    checker_bytes,
+                    decoded_bytes,
+                    0,
+                    0,
+                ),
+            ),
+            Ok(Outcome::InternalFault(fault)) => finish(
+                OleanModuleVerdict::InternalFault(fault),
+                None,
+                None,
+                OleanFrontierMemoryAttribution::from_components(
+                    0,
+                    closure_delta_bytes,
+                    checker_bytes,
+                    decoded_bytes,
+                    0,
+                    0,
+                ),
+            ),
+            Err(error) => failed(error, closure_delta_bytes, checker_bytes),
         }
     }
 
@@ -4570,6 +4920,17 @@ impl Admitted {
         options: &KVMap,
         limits: OleanCheckLimits,
     ) -> Result<Outcome<UnrootedOlean>, OleanCheckError> {
+        let mut checker_bytes = 0_u64;
+        self.check_decoded_olean_unrooted_measured(decoded, options, limits, &mut checker_bytes)
+    }
+
+    fn check_decoded_olean_unrooted_measured(
+        &self,
+        decoded: DecodedOlean,
+        options: &KVMap,
+        limits: OleanCheckLimits,
+        checker_bytes: &mut u64,
+    ) -> Result<Outcome<UnrootedOlean>, OleanCheckError> {
         let plan = plan_olean_declarations(&self.environment, &decoded.constants, limits)?;
         // The checker seat judges each declaration against its own reading of the
         // artifact (bead `franken_lean-z8j.1.14`); without one it has no
@@ -4604,11 +4965,12 @@ impl Admitted {
                 .into_iter()
                 .map(|(name, checker)| OleanCheckedDeclaration { name, checker })
                 .collect();
-            match self.recheck_subsumed_repeats(
+            match self.recheck_subsumed_repeats_measured(
                 plan.subsumed,
                 options,
                 limits.admission,
                 reading,
+                checker_bytes,
             )? {
                 Outcome::Complete(rechecked) => checked.extend(rechecked),
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -4638,7 +5000,13 @@ impl Admitted {
             declarations.push(unit.declaration.clone());
         }
         let (engine, checkers) = match self
-            .admit_declarations_unrooted(&declarations, options, limits.admission, reading)
+            .admit_declarations_unrooted_measured(
+                &declarations,
+                options,
+                limits.admission,
+                reading,
+                checker_bytes,
+            )
             .map_err(OleanCheckError::Admission)?
         {
             Outcome::Complete(admitted) => admitted,
@@ -4673,7 +5041,13 @@ impl Admitted {
         for (name, checker) in plan.already_present {
             checked.push(OleanCheckedDeclaration { name, checker });
         }
-        match engine.recheck_subsumed_repeats(plan.subsumed, options, limits.admission, reading)? {
+        match engine.recheck_subsumed_repeats_measured(
+            plan.subsumed,
+            options,
+            limits.admission,
+            reading,
+            checker_bytes,
+        )? {
             Outcome::Complete(rechecked) => checked.extend(rechecked),
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -4710,6 +5084,24 @@ impl Admitted {
         limits: EngineAdmissionLimits,
         reading: ReadingCheck<'_>,
     ) -> Result<Outcome<Vec<OleanCheckedDeclaration>>, OleanCheckError> {
+        let mut checker_bytes = 0_u64;
+        self.recheck_subsumed_repeats_measured(
+            repeats,
+            options,
+            limits,
+            reading,
+            &mut checker_bytes,
+        )
+    }
+
+    fn recheck_subsumed_repeats_measured(
+        &self,
+        repeats: Vec<ConstantInfo>,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        reading: ReadingCheck<'_>,
+        checker_bytes: &mut u64,
+    ) -> Result<Outcome<Vec<OleanCheckedDeclaration>>, OleanCheckError> {
         let mut checked = Vec::new();
         for repeat in repeats {
             let name = repeat.name().clone();
@@ -4738,18 +5130,34 @@ impl Admitted {
                         ReadingCheck::Artifact(_) => ReadingCheck::Settled(objection.as_ref()),
                         other => other,
                     };
+                    let mut repeat_retained = 0_u64;
+                    let mut repeat_transient = 0_u64;
                     match self
-                        .admit_declaration_unrooted(
+                        .admit_declaration_unrooted_measured(
                             Declaration::Thm(theorem),
                             options,
                             limits,
                             reading,
+                            &mut repeat_retained,
+                            &mut repeat_transient,
                         )
                         .map_err(OleanCheckError::Admission)?
                     {
-                        Outcome::Complete(admission) => admission.checker,
-                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                        Outcome::Complete(admission) => {
+                            *checker_bytes = (*checker_bytes)
+                                .max(repeat_retained.saturating_add(repeat_transient));
+                            admission.checker
+                        }
+                        Outcome::Inconclusive(reason) => {
+                            *checker_bytes = (*checker_bytes)
+                                .max(repeat_retained.saturating_add(repeat_transient));
+                            return Ok(Outcome::Inconclusive(reason));
+                        }
+                        Outcome::InternalFault(fault) => {
+                            *checker_bytes = (*checker_bytes)
+                                .max(repeat_retained.saturating_add(repeat_transient));
+                            return Ok(Outcome::InternalFault(fault));
+                        }
                     }
                 }
                 ConstantInfo::Axiom(_) => {
@@ -4836,6 +5244,27 @@ impl Admitted {
         limits: EngineAdmissionLimits,
         reading: ReadingCheck<'_>,
     ) -> Result<Outcome<UnrootedAdmission>, EngineAdmissionError> {
+        let mut retained = 0_u64;
+        let mut transient = 0_u64;
+        self.admit_declaration_unrooted_measured(
+            declaration,
+            options,
+            limits,
+            reading,
+            &mut retained,
+            &mut transient,
+        )
+    }
+
+    fn admit_declaration_unrooted_measured(
+        &self,
+        declaration: Declaration,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        reading: ReadingCheck<'_>,
+        retained_checker_bytes: &mut u64,
+        transient_checker_bytes: &mut u64,
+    ) -> Result<Outcome<UnrootedAdmission>, EngineAdmissionError> {
         if !matches!(
             declaration,
             Declaration::Axiom(_)
@@ -4858,6 +5287,9 @@ impl Admitted {
             limits.checker,
             reading,
         );
+        *retained_checker_bytes =
+            retained_checker_bytes.saturating_add(checker_review.retained_delta_bytes);
+        *transient_checker_bytes = (*transient_checker_bytes).max(checker_review.candidate_bytes);
         let admitted = match admit(&self.environment, declaration.clone(), limits.kernel) {
             Outcome::Complete(admitted) => admitted,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -4871,6 +5303,12 @@ impl Admitted {
             // A halt with no disagreement is a non-answer about the declaration
             // (FL-INV-07); only a disagreement is evidence against it.
             CouncilOutcome::Halted(halt) if halt.is_purely_resource() => {
+                if let Some((resource, requested)) = checker_review.allocation_failure {
+                    return Err(EngineAdmissionError::AllocationFailure {
+                        resource,
+                        requested,
+                    });
+                }
                 return Err(EngineAdmissionError::CouncilNoAnswer {
                     summary: halt.summary(),
                 });
@@ -4955,6 +5393,24 @@ impl Admitted {
         limits: EngineAdmissionLimits,
         reading: ReadingCheck<'_>,
     ) -> Result<Outcome<(Admitted, Vec<CheckerAgreement>)>, EngineAdmissionError> {
+        let mut checker_bytes = 0_u64;
+        self.admit_declarations_unrooted_measured(
+            declarations,
+            options,
+            limits,
+            reading,
+            &mut checker_bytes,
+        )
+    }
+
+    fn admit_declarations_unrooted_measured(
+        &self,
+        declarations: &[Declaration],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        reading: ReadingCheck<'_>,
+        checker_bytes: &mut u64,
+    ) -> Result<Outcome<(Admitted, Vec<CheckerAgreement>)>, EngineAdmissionError> {
         if declarations.is_empty() {
             return Err(EngineAdmissionError::EmptyBatch);
         }
@@ -4966,22 +5422,38 @@ impl Admitted {
                 requested: declarations.len(),
             })?;
         let mut engine = self.clone();
+        let mut retained = 0_u64;
+        let mut transient = 0_u64;
         for (index, declaration) in declarations.iter().cloned().enumerate() {
-            let admitted =
-                match engine.admit_declaration_unrooted(declaration, options, limits, reading) {
-                    Ok(Outcome::Complete(admitted)) => admitted,
-                    Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
-                    Ok(Outcome::InternalFault(fault)) => return Ok(Outcome::InternalFault(fault)),
-                    Err(error) => {
-                        return Err(EngineAdmissionError::BatchDeclaration {
-                            index,
-                            error: Box::new(error),
-                        });
-                    }
-                };
+            let admitted = match engine.admit_declaration_unrooted_measured(
+                declaration,
+                options,
+                limits,
+                reading,
+                &mut retained,
+                &mut transient,
+            ) {
+                Ok(Outcome::Complete(admitted)) => admitted,
+                Ok(Outcome::Inconclusive(reason)) => {
+                    *checker_bytes = (*checker_bytes).max(retained.saturating_add(transient));
+                    return Ok(Outcome::Inconclusive(reason));
+                }
+                Ok(Outcome::InternalFault(fault)) => {
+                    *checker_bytes = (*checker_bytes).max(retained.saturating_add(transient));
+                    return Ok(Outcome::InternalFault(fault));
+                }
+                Err(error) => {
+                    *checker_bytes = (*checker_bytes).max(retained.saturating_add(transient));
+                    return Err(EngineAdmissionError::BatchDeclaration {
+                        index,
+                        error: Box::new(error),
+                    });
+                }
+            };
             engine = admitted.engine;
             checkers.push(admitted.checker);
         }
+        *checker_bytes = (*checker_bytes).max(retained.saturating_add(transient));
         Ok(Outcome::Complete((engine, checkers)))
     }
 }
@@ -5003,6 +5475,9 @@ struct CheckerReview {
     council: Council,
     agreement: Option<CheckerAgreement>,
     successor_environment: Option<CheckerConstantEnvironment>,
+    retained_delta_bytes: u64,
+    candidate_bytes: u64,
+    allocation_failure: Option<(&'static str, usize)>,
 }
 
 impl CheckerReview {
@@ -5022,11 +5497,76 @@ impl CheckerReview {
             )]),
             agreement,
             successor_environment,
+            retained_delta_bytes: 0,
+            candidate_bytes: 0,
+            allocation_failure: None,
         }
+    }
+
+    fn with_memory(mut self, retained_delta_bytes: u64, candidate_bytes: u64) -> Self {
+        self.retained_delta_bytes = retained_delta_bytes;
+        self.candidate_bytes = candidate_bytes;
+        self
     }
 
     fn no_answer(reason: String) -> Self {
         Self::from_seat(SeatVerdict::NoAnswer { reason }, None, None)
+    }
+
+    fn allocation_failure(resource: &'static str, requested: usize, reason: String) -> Self {
+        let mut review = Self::no_answer(reason);
+        review.allocation_failure = Some((resource, requested));
+        review
+    }
+}
+
+fn checker_defeq_stop_allocation_failure(
+    stop: &fln_checker::defeq::DefEqStop,
+) -> Option<(&'static str, usize)> {
+    use fln_checker::defeq::DefEqStop;
+    use fln_checker::nat_reduce::NatReductionStop;
+    use fln_checker::numeric::NatStop;
+
+    match stop {
+        DefEqStop::NatReduction { stop, .. } => match stop {
+            NatReductionStop::AllocationFailed { requested, .. } => Some((
+                "fln-checker Nat reduction buffer",
+                usize::try_from(*requested).unwrap_or(usize::MAX),
+            )),
+            NatReductionStop::Numeric {
+                stop:
+                    NatStop::AllocationFailed {
+                        requested_limbs, ..
+                    },
+                ..
+            } => Some((
+                "fln-checker Nat limb buffer",
+                usize::try_from(*requested_limbs)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn checker_admission_stop_allocation_failure(
+    stop: &fln_checker::admit::AdmissionStop,
+) -> Option<(&'static str, usize)> {
+    use fln_checker::admit::AdmissionStop;
+    use fln_checker::infer::InferenceStop;
+
+    match stop {
+        AdmissionStop::BodyConversion { stop, .. } => checker_defeq_stop_allocation_failure(stop),
+        AdmissionStop::DeclaredTypeInference { stop, .. }
+        | AdmissionStop::BodyTypeInference { stop, .. } => match stop.as_ref() {
+            InferenceStop::DefEq { stop, .. } | InferenceStop::LetValueDefEq { stop, .. } => {
+                checker_defeq_stop_allocation_failure(stop)
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -5522,12 +6062,237 @@ fn checker_base_entry(
 /// projection the aggregate environment budget bounds the whole closure; with
 /// one, the constants added here are counted against `max_constants` because
 /// each `extend` bounds only its own entry.
+fn name_footprint_bytes(name: &Name) -> u64 {
+    let mut total = 0_u64;
+    let mut current = name.clone();
+    while !current.is_anonymous() {
+        total = total.saturating_add(std::mem::size_of::<Name>() as u64);
+        if let fln_core::name::LeafView::Str(text) = current.leaf_view() {
+            total = total.saturating_add(text.len() as u64);
+        }
+        current = current.parent();
+    }
+    total
+}
+
+fn expr_dag_footprint_bytes(root: &Expr, seen: &mut std::collections::HashSet<usize>) -> u64 {
+    let mut total = 0_u64;
+    let mut stack = vec![root];
+    while let Some(expr) = stack.pop() {
+        if !seen.insert(std::ptr::from_ref(expr.node()).addr()) {
+            continue;
+        }
+        total = total.saturating_add((std::mem::size_of::<ExprNode>() + 16) as u64);
+        match expr.node() {
+            ExprNode::Const { name, levels } => {
+                total = total
+                    .saturating_add(name_footprint_bytes(name))
+                    .saturating_add(
+                        (levels.len() * std::mem::size_of::<fln_core::level::Level>()) as u64,
+                    );
+            }
+            ExprNode::App { f, a } => {
+                stack.push(f);
+                stack.push(a);
+            }
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            }
+            | ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            } => {
+                total = total.saturating_add(name_footprint_bytes(binder_name));
+                stack.push(binder_type);
+                stack.push(body);
+            }
+            ExprNode::LetE {
+                decl_name,
+                type_,
+                value,
+                body,
+                ..
+            } => {
+                total = total.saturating_add(name_footprint_bytes(decl_name));
+                stack.push(type_);
+                stack.push(value);
+                stack.push(body);
+            }
+            ExprNode::Lit { literal } => match literal {
+                fln_core::expr::Literal::Nat(nat) => {
+                    total = total.saturating_add((nat.limbs_le().len() * 8) as u64);
+                }
+                fln_core::expr::Literal::Str(text) => {
+                    total = total.saturating_add(text.len() as u64);
+                }
+            },
+            ExprNode::MData { expr, .. } => stack.push(expr),
+            ExprNode::Proj {
+                struct_name, expr, ..
+            } => {
+                total = total.saturating_add(name_footprint_bytes(struct_name));
+                stack.push(expr);
+            }
+            ExprNode::BVar { .. }
+            | ExprNode::FVar { .. }
+            | ExprNode::MVar { .. }
+            | ExprNode::Sort { .. } => {}
+        }
+    }
+    total
+}
+
+fn constant_info_footprint_bytes(
+    info: &ConstantInfo,
+    seen: &mut std::collections::HashSet<usize>,
+) -> u64 {
+    let base = info.constant_val();
+    let mut total = (std::mem::size_of::<ConstantInfo>() as u64)
+        .saturating_add(name_footprint_bytes(&base.name))
+        .saturating_add(
+            base.level_params
+                .iter()
+                .map(name_footprint_bytes)
+                .fold(0_u64, u64::saturating_add),
+        )
+        .saturating_add(expr_dag_footprint_bytes(&base.type_, seen));
+    match info {
+        ConstantInfo::Defn(value) => {
+            total = total.saturating_add(expr_dag_footprint_bytes(&value.value, seen));
+        }
+        ConstantInfo::Thm(value) => {
+            total = total.saturating_add(expr_dag_footprint_bytes(&value.value, seen));
+        }
+        ConstantInfo::Opaque(value) => {
+            total = total.saturating_add(expr_dag_footprint_bytes(&value.value, seen));
+        }
+        ConstantInfo::Rec(value) => {
+            for rule in &value.rules {
+                total = total
+                    .saturating_add(name_footprint_bytes(&rule.ctor))
+                    .saturating_add(expr_dag_footprint_bytes(&rule.rhs, seen));
+            }
+        }
+        ConstantInfo::Axiom(_)
+        | ConstantInfo::Quot(_)
+        | ConstantInfo::Induct(_)
+        | ConstantInfo::Ctor(_) => {}
+    }
+    total
+}
+
+fn decoded_olean_image_bytes(decoded: &DecodedOlean) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    let mut total = std::mem::size_of::<DecodedOlean>() as u64;
+    for import in &decoded.module.imports {
+        total = total
+            .saturating_add(std::mem::size_of_val(import) as u64)
+            .saturating_add(name_footprint_bytes(&import.module));
+    }
+    for name in &decoded.module.const_names {
+        total = total.saturating_add((std::mem::size_of::<String>() + name.capacity()) as u64);
+    }
+    total = total.saturating_add(
+        decoded
+            .module
+            .extra_const_names
+            .saturating_mul(std::mem::size_of::<Name>() as u64),
+    );
+    for info in &decoded.constants {
+        total = total.saturating_add(constant_info_footprint_bytes(info, &mut seen));
+    }
+    match &decoded.independent {
+        IndependentReading::Read(entries) => {
+            let entry_size = std::mem::size_of::<(CheckerName, fln_hash::domain::Digest)>() as u64;
+            // Account for both the reading vector and the `ArtifactReadings` hash table.
+            total = total.saturating_add((entries.len() as u64).saturating_mul(entry_size * 2));
+        }
+        IndependentReading::Unread(reason) => {
+            total = total.saturating_add(reason.capacity() as u64);
+        }
+    }
+    total
+}
+
+fn environment_entries_bytes(entries: &[EnvironmentEntry]) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    let mut total = std::mem::size_of_val(entries) as u64;
+    for entry in entries {
+        total = total.saturating_add(constant_info_footprint_bytes(
+            entry.declaration(),
+            &mut seen,
+        ));
+    }
+    total
+}
+
+fn frontier_closure_merge_delta_bytes(job: &FrontierJob) -> u64 {
+    let Some(base) = &job.base else {
+        return 0;
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0_u64;
+    for module in &job.closure {
+        if base.closure.contains(&module.index) {
+            continue;
+        }
+        for entry in &module.admitted {
+            total = total
+                .saturating_add(constant_info_footprint_bytes(
+                    entry.declaration(),
+                    &mut seen,
+                ))
+                .saturating_add(64);
+        }
+    }
+    total
+}
+
+fn checker_wire_expr_bytes(
+    expr: &fln_checker::wire::WireExpr,
+    seen_slices: &mut std::collections::HashSet<usize>,
+) -> u64 {
+    let mut total = 0_u64;
+    if !expr.nodes().is_empty() && seen_slices.insert(expr.nodes().as_ptr().addr()) {
+        total = total.saturating_add((std::mem::size_of_val(expr.nodes()) + 24) as u64);
+    }
+    if !expr.levels().is_empty() && seen_slices.insert(expr.levels().as_ptr().addr()) {
+        total = total.saturating_add((std::mem::size_of_val(expr.levels()) + 24) as u64);
+    }
+    total
+}
+
+fn checker_entries_bytes(entries: &[CheckerConstantEntry]) -> u64 {
+    let mut seen_slices = std::collections::HashSet::new();
+    let mut total = 0_u64;
+    for entry in entries {
+        let decl = entry.declaration();
+        total = total
+            .saturating_add((std::mem::size_of::<CheckerConstantEntry>() + 64) as u64)
+            .saturating_add(checker_wire_expr_bytes(decl.type_(), &mut seen_slices));
+        if let Some(body) = decl.body_value() {
+            total = total.saturating_add(checker_wire_expr_bytes(body, &mut seen_slices));
+        }
+        if let Some(rec) = decl.recursor_metadata() {
+            for rule in rec.rules() {
+                total = total.saturating_add(checker_wire_expr_bytes(rule.rhs(), &mut seen_slices));
+            }
+        }
+    }
+    total
+}
+
 fn checker_environment_covering(
     environment: &Environment,
     retained: Option<&CheckerConstantEnvironment>,
     roots: &[&Expr],
     limits: CheckerExecutionLimits,
-) -> Result<CheckerConstantEnvironment, String> {
+) -> Result<(CheckerConstantEnvironment, u64), String> {
     let mut seen = std::collections::HashSet::new();
     let mut pending = Vec::new();
     for root in roots {
@@ -5557,6 +6322,7 @@ fn checker_environment_covering(
         entries.push(checker_base_entry(info, limits.decode)?);
         queue_base_dependencies(info, &mut seen, &mut pending);
     }
+    let covered_bytes = checker_entries_bytes(&entries);
     let outcome = match retained {
         None => CheckerConstantEnvironment::build(entries, limits.environment),
         Some(retained) => {
@@ -5573,15 +6339,15 @@ fn checker_environment_covering(
                     CheckerEnvironmentOutcome::Complete { environment, .. } => {
                         projected = environment;
                     }
-                    other => return checker_projection_failure(other),
+                    other => return checker_projection_failure(other).map(|e| (e, covered_bytes)),
                 }
             }
-            return Ok(projected);
+            return Ok((projected, covered_bytes));
         }
     };
     match outcome {
-        CheckerEnvironmentOutcome::Complete { environment, .. } => Ok(environment),
-        other => checker_projection_failure(other),
+        CheckerEnvironmentOutcome::Complete { environment, .. } => Ok((environment, covered_bytes)),
+        other => checker_projection_failure(other).map(|e| (e, covered_bytes)),
     }
 }
 
@@ -5628,21 +6394,23 @@ fn review_mutual_with_independent_checker(
             }
         }
     }
+    let candidate_bytes = checker_entries_bytes(&candidates);
     if let Some(review) = reading_review(&candidates, reading) {
-        return review;
+        return review.with_memory(0, candidate_bytes);
     }
 
     let roots: Vec<&Expr> = definitions
         .iter()
         .flat_map(|definition| [&definition.base.type_, &definition.value])
         .collect();
-    let environment =
+    let (environment, covered_bytes) =
         match checker_environment_covering(environment, retained_environment, &roots, limits) {
-            Ok(environment) => environment,
+            Ok(covered) => covered,
             Err(detail) => {
                 return CheckerReview::no_answer(format!(
                     "base projection into fln-checker failed: {detail}"
-                ));
+                ))
+                .with_memory(0, candidate_bytes);
             }
         };
 
@@ -5663,22 +6431,29 @@ fn review_mutual_with_independent_checker(
                     CheckerEnvironmentOutcome::Refused { refusal, .. } => {
                         return CheckerReview::no_answer(format!(
                             "fln-checker refused mutual member {member:?} retention: {refusal:?}"
-                        ));
+                        ))
+                        .with_memory(covered_bytes, candidate_bytes);
                     }
                     CheckerEnvironmentOutcome::Inconclusive(stop) => {
                         return CheckerReview::no_answer(format!(
                             "fln-checker could not retain mutual member {member:?}: {stop:?}"
-                        ));
+                        ))
+                        .with_memory(covered_bytes, candidate_bytes);
                     }
                     CheckerEnvironmentOutcome::InternalFault { fault, .. } => {
                         return CheckerReview::no_answer(format!(
                             "fln-checker hit an internal fault while retaining mutual member \
                              {member:?}: {fault:?}"
-                        ));
+                        ))
+                        .with_memory(covered_bytes, candidate_bytes);
                     }
                 }
             }
             CheckerReview::from_seat(SeatVerdict::Agrees, Some(agreement), Some(successor))
+                .with_memory(
+                    covered_bytes.saturating_add(candidate_bytes),
+                    candidate_bytes,
+                )
         }
         CheckerBlockVerdict::Rejected(rejection) => CheckerReview::from_seat(
             SeatVerdict::Disagrees {
@@ -5686,23 +6461,28 @@ fn review_mutual_with_independent_checker(
             },
             None,
             None,
-        ),
+        )
+        .with_memory(covered_bytes, candidate_bytes),
         CheckerBlockVerdict::MemberRejected { member, rejection } => CheckerReview::from_seat(
             SeatVerdict::Disagrees {
                 detail: format!("fln-checker rejected mutual member {member:?}: {rejection:?}"),
             },
             None,
             None,
-        ),
+        )
+        .with_memory(covered_bytes, candidate_bytes),
         CheckerBlockVerdict::MemberDeferred { member, deferred } => CheckerReview::no_answer(
             format!("fln-checker deferred mutual member {member:?}: {deferred:?}"),
-        ),
+        )
+        .with_memory(covered_bytes, candidate_bytes),
         CheckerBlockVerdict::MemberInconclusive { member, stop } => CheckerReview::no_answer(
             format!("fln-checker exhausted or was cancelled on mutual member {member:?}: {stop:?}"),
-        ),
+        )
+        .with_memory(covered_bytes, candidate_bytes),
         CheckerBlockVerdict::MemberFault { member, fault } => CheckerReview::no_answer(format!(
             "fln-checker hit an internal fault on mutual member {member:?}: {fault:?}"
-        )),
+        ))
+        .with_memory(covered_bytes, candidate_bytes),
     }
 }
 
@@ -5730,21 +6510,23 @@ fn review_quotient_with_independent_checker(
             }
         }
     }
+    let candidate_bytes = checker_entries_bytes(&candidates);
     if let Some(review) = reading_review(&candidates, reading) {
-        return review;
+        return review.with_memory(0, candidate_bytes);
     }
 
     let roots: Vec<&Expr> = declarations
         .iter()
         .map(|declaration| &declaration.base.type_)
         .collect();
-    let environment =
+    let (environment, covered_bytes) =
         match checker_environment_covering(environment, retained_environment, &roots, limits) {
-            Ok(environment) => environment,
+            Ok(covered) => covered,
             Err(detail) => {
                 return CheckerReview::no_answer(format!(
                     "base projection into fln-checker failed: {detail}"
-                ));
+                ))
+                .with_memory(0, candidate_bytes);
             }
         };
 
@@ -5765,22 +6547,29 @@ fn review_quotient_with_independent_checker(
                     CheckerEnvironmentOutcome::Refused { refusal, .. } => {
                         return CheckerReview::no_answer(format!(
                             "fln-checker refused quotient member {member:?} retention: {refusal:?}"
-                        ));
+                        ))
+                        .with_memory(covered_bytes, candidate_bytes);
                     }
                     CheckerEnvironmentOutcome::Inconclusive(stop) => {
                         return CheckerReview::no_answer(format!(
                             "fln-checker could not retain quotient member {member:?}: {stop:?}"
-                        ));
+                        ))
+                        .with_memory(covered_bytes, candidate_bytes);
                     }
                     CheckerEnvironmentOutcome::InternalFault { fault, .. } => {
                         return CheckerReview::no_answer(format!(
                             "fln-checker faulted while retaining quotient member {member:?}: \
                              {fault:?}"
-                        ));
+                        ))
+                        .with_memory(covered_bytes, candidate_bytes);
                     }
                 }
             }
             CheckerReview::from_seat(SeatVerdict::Agrees, Some(agreement), Some(successor))
+                .with_memory(
+                    covered_bytes.saturating_add(candidate_bytes),
+                    candidate_bytes,
+                )
         }
         CheckerQuotientVerdict::Rejected(rejection) => CheckerReview::from_seat(
             SeatVerdict::Disagrees {
@@ -5788,13 +6577,16 @@ fn review_quotient_with_independent_checker(
             },
             None,
             None,
-        ),
+        )
+        .with_memory(covered_bytes, candidate_bytes),
         CheckerQuotientVerdict::Inconclusive(stop) => CheckerReview::no_answer(format!(
             "fln-checker exhausted or was cancelled during quotient initialization: {stop:?}"
-        )),
+        ))
+        .with_memory(covered_bytes, candidate_bytes),
         CheckerQuotientVerdict::InternalFault(fault) => CheckerReview::no_answer(format!(
             "fln-checker faulted during quotient initialization: {fault:?}"
-        )),
+        ))
+        .with_memory(covered_bytes, candidate_bytes),
     }
 }
 
@@ -5846,8 +6638,9 @@ fn review_inductive_with_independent_checker(
             }
         }
     }
+    let candidate_bytes = checker_entries_bytes(&candidates);
     if let Some(review) = reading_review(&candidates, reading) {
-        return review;
+        return review.with_memory(0, candidate_bytes);
     }
 
     let mut roots: Vec<&Expr> = block
@@ -5865,13 +6658,14 @@ fn review_inductive_with_independent_checker(
         roots.push(&recursor.base.type_);
         roots.extend(recursor.rules.iter().map(|rule| &rule.rhs));
     }
-    let environment =
+    let (environment, covered_bytes) =
         match checker_environment_covering(environment, retained_environment, &roots, limits) {
-            Ok(environment) => environment,
+            Ok(covered) => covered,
             Err(detail) => {
                 return CheckerReview::no_answer(format!(
                     "base projection into fln-checker failed: {detail}"
-                ));
+                ))
+                .with_memory(0, candidate_bytes);
             }
         };
 
@@ -5897,22 +6691,29 @@ fn review_inductive_with_independent_checker(
                     CheckerEnvironmentOutcome::Refused { refusal, .. } => {
                         return CheckerReview::no_answer(format!(
                             "fln-checker refused inductive member {member:?} retention: {refusal:?}"
-                        ));
+                        ))
+                        .with_memory(covered_bytes, candidate_bytes);
                     }
                     CheckerEnvironmentOutcome::Inconclusive(stop) => {
                         return CheckerReview::no_answer(format!(
                             "fln-checker could not retain inductive member {member:?}: {stop:?}"
-                        ));
+                        ))
+                        .with_memory(covered_bytes, candidate_bytes);
                     }
                     CheckerEnvironmentOutcome::InternalFault { fault, .. } => {
                         return CheckerReview::no_answer(format!(
                             "fln-checker faulted while retaining inductive member {member:?}: \
                              {fault:?}"
-                        ));
+                        ))
+                        .with_memory(covered_bytes, candidate_bytes);
                     }
                 }
             }
             CheckerReview::from_seat(SeatVerdict::Agrees, Some(agreement), Some(successor))
+                .with_memory(
+                    covered_bytes.saturating_add(candidate_bytes),
+                    candidate_bytes,
+                )
         }
         CheckerInductiveVerdict::Rejected(rejection) => CheckerReview::from_seat(
             SeatVerdict::Disagrees {
@@ -5920,7 +6721,8 @@ fn review_inductive_with_independent_checker(
             },
             None,
             None,
-        ),
+        )
+        .with_memory(covered_bytes, candidate_bytes),
         CheckerInductiveVerdict::Deferred(limit) => {
             let names = block
                 .types
@@ -5931,13 +6733,16 @@ fn review_inductive_with_independent_checker(
             CheckerReview::no_answer(format!(
                 "fln-checker does not yet decide this inductive shape of [{names}]: {limit:?}"
             ))
+            .with_memory(covered_bytes, candidate_bytes)
         }
         CheckerInductiveVerdict::Inconclusive(stop) => CheckerReview::no_answer(format!(
             "fln-checker exhausted or was cancelled during inductive admission: {stop:?}"
-        )),
+        ))
+        .with_memory(covered_bytes, candidate_bytes),
         CheckerInductiveVerdict::InternalFault(fault) => CheckerReview::no_answer(format!(
             "fln-checker faulted during inductive admission: {fault:?}"
-        )),
+        ))
+        .with_memory(covered_bytes, candidate_bytes),
     }
 }
 
@@ -6004,8 +6809,9 @@ fn review_with_independent_checker(
             ));
         }
     };
+    let candidate_bytes = checker_entries_bytes(std::slice::from_ref(&candidate));
     if let Some(review) = reading_review(std::slice::from_ref(&candidate), reading) {
-        return review;
+        return review.with_memory(0, candidate_bytes);
     }
     let roots: Vec<&Expr> = match declaration {
         Declaration::Axiom(axiom) => vec![&axiom.base.type_],
@@ -6014,15 +6820,25 @@ fn review_with_independent_checker(
         Declaration::Opaque(opaque) => vec![&opaque.base.type_, &opaque.value],
         _ => Vec::new(),
     };
-    let environment =
+    let (environment, covered_bytes) =
         match checker_environment_covering(environment, retained_environment, &roots, limits) {
-            Ok(environment) => environment,
+            Ok(covered) => covered,
             Err(detail) => {
                 return CheckerReview::no_answer(format!(
                     "base projection into fln-checker failed: {detail}"
-                ));
+                ))
+                .with_memory(0, candidate_bytes);
             }
         };
+    let retained_candidate_bytes = match declaration {
+        Declaration::Thm(_) | Declaration::Opaque(_) => {
+            // Retained base entries drop theorem/opaque bodies; only header type stays.
+            let mut seen = std::collections::HashSet::new();
+            (std::mem::size_of::<CheckerConstantEntry>() + 64) as u64
+                + checker_wire_expr_bytes(candidate.declaration().type_(), &mut seen)
+        }
+        _ => candidate_bytes,
+    };
 
     match fln_checker::admit::admit(&environment, &candidate, limits.admission) {
         CheckerVerdict::Admitted(admission) => {
@@ -6036,17 +6852,24 @@ fn review_with_independent_checker(
                     ..
                 } => {
                     CheckerReview::from_seat(SeatVerdict::Agrees, Some(agreement), Some(successor))
+                        .with_memory(
+                            covered_bytes.saturating_add(retained_candidate_bytes),
+                            candidate_bytes,
+                        )
                 }
                 CheckerEnvironmentOutcome::Refused { refusal, .. } => CheckerReview::no_answer(
                     format!("fln-checker refused candidate retention: {refusal:?}"),
-                ),
+                )
+                .with_memory(covered_bytes, candidate_bytes),
                 CheckerEnvironmentOutcome::Inconclusive(stop) => CheckerReview::no_answer(format!(
                     "fln-checker could not retain the candidate: {stop:?}"
-                )),
+                ))
+                .with_memory(covered_bytes, candidate_bytes),
                 CheckerEnvironmentOutcome::InternalFault { fault, .. } => {
                     CheckerReview::no_answer(format!(
                         "fln-checker hit an internal fault while retaining the candidate: {fault:?}"
                     ))
+                    .with_memory(covered_bytes, candidate_bytes)
                 }
             }
         }
@@ -6056,15 +6879,25 @@ fn review_with_independent_checker(
             },
             None,
             None,
-        ),
+        )
+        .with_memory(covered_bytes, candidate_bytes),
         CheckerVerdict::Deferred(requirement) => CheckerReview::no_answer(format!(
             "fln-checker deferred the declaration: {requirement:?}"
-        )),
+        ))
+        .with_memory(covered_bytes, candidate_bytes),
         CheckerVerdict::Inconclusive(stop) => {
-            CheckerReview::no_answer(format!("fln-checker exhausted or was cancelled: {stop:?}"))
+            let reason = format!("fln-checker exhausted or was cancelled: {stop:?}");
+            let review = match checker_admission_stop_allocation_failure(&stop) {
+                Some((resource, requested)) => {
+                    CheckerReview::allocation_failure(resource, requested, reason)
+                }
+                None => CheckerReview::no_answer(reason),
+            };
+            review.with_memory(covered_bytes, candidate_bytes)
         }
         CheckerVerdict::InternalFault(fault) => {
             CheckerReview::no_answer(format!("fln-checker hit an internal fault: {fault:?}"))
+                .with_memory(covered_bytes, candidate_bytes)
         }
     }
 }
