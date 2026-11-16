@@ -164,6 +164,8 @@ edge fln-ledger -> fln-core        # content-addressed records reference declara
 edge fln-ledger -> fln-hash        # CAS keys, logical roots, and epoch digests (§13.1, rank 15 -> 1)
 edge fln-trace -> fln-core         # proof-graph nodes reference declaration Name and Position (§15, rank 18 -> 0)
 edge fln-lake -> fln-core          # build targets reference declaration Name for root modules (§13.3, rank 16 -> 0)
+edge fln-lake -> fln-hash          # D2 Git executable content identity and dependency resolution provenance (§13.3)
+edge fln-lake -> fln-unsafe-abi    # owned process-group cancellation for bounded optional Git jobs (D2; no admission authority)
 edge fln-hound -> fln-core         # candidate cards reference Name and Expr for statements and queries (§16.1, rank 20 -> 0)
 edge fln-mcp -> fln-core           # proof-state snapshots reference Expr and Name for goals and hypotheses (§16.3, rank 20 -> 0)
 edge fln-doc -> fln-core           # documentation pages reference declaration Name (§16.2, rank 20 -> 0)

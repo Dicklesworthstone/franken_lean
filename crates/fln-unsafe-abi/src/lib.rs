@@ -79,6 +79,7 @@ mod layout;
 mod libm_symbols;
 mod membrane;
 mod object;
+pub mod process;
 pub mod rc;
 pub mod shadow;
 mod stdio;

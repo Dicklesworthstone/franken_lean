@@ -25,6 +25,7 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -34,10 +35,15 @@ jobs:
           channel=$(sed -n 's/^channel = "\([^" ]*\)".*/\1/p' rust-toolchain.toml)
           test -n "$channel"
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+      - name: Check Git cancellation and transactional dependency resolution
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-unsafe-abi --lib process::tests -- --test-threads=1
+          cargo test --locked -p fln-lake --all-targets --no-fail-fast
       - name: Check real command outcomes and nonpublication
         run: |
           set -euo pipefail
-          cargo test --locked -p fln-lake -p fln-cli --lib --test lake_config_and_actions --test lake_integrity --test lake_local_dependencies --test lake_module_build --test lake_module_records --test build_explain --test cli_personalities_and_verbs --no-fail-fast
+          cargo test --locked -p fln-cli --lib --test lake_integrity --test lake_local_dependencies --test lake_module_build --test lake_module_records --test build_explain --test cli_personalities_and_verbs --no-fail-fast
           cargo clippy --locked -p fln-lake -p fln-cli --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
 

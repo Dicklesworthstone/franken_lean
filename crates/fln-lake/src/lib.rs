@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 
 use fln_core::name::Name;
 
+mod git;
+
 // ---------------------------------------------------------------------------
 // §13.3 — lakefile configuration
 // ---------------------------------------------------------------------------
@@ -2689,6 +2691,10 @@ pub enum LakeFetchError {
     CapabilityDenied(String),
     /// I/O error during fetch.
     Io(String),
+    /// A bounded subprocess or input budget was exhausted.
+    Resource(String),
+    /// An invalid selector or conflicting checkout was refused.
+    InvalidInput(String),
     /// Git command failed.
     GitFailed { command: String, stderr: String },
     /// Discovery error.
@@ -2700,6 +2706,8 @@ impl fmt::Display for LakeFetchError {
         match self {
             Self::CapabilityDenied(msg) => write!(f, "error: {msg}"),
             Self::Io(msg) => write!(f, "error during dependency fetch: {msg}"),
+            Self::Resource(msg) => write!(f, "dependency fetch resource limit: {msg}"),
+            Self::InvalidInput(msg) => write!(f, "invalid dependency fetch: {msg}"),
             Self::GitFailed { command, stderr } => {
                 write!(f, "error: git command '{command}' failed:\n{stderr}")
             }
@@ -2710,65 +2718,21 @@ impl fmt::Display for LakeFetchError {
 
 impl std::error::Error for LakeFetchError {}
 
-/// Check if the system `git` tool is available under Rule D2.
+/// Check whether Git and process-group cancellation are available under Rule D2.
 pub fn is_git_available() -> bool {
-    std::process::Command::new("git")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    git::executable().is_ok()
 }
 
-/// Fetch a git dependency into `.lake/packages/<name>` using the D2 subprocess protocol.
+/// Fetch and verify a detached Git checkout before atomically publishing it.
+///
+/// The subprocess environment, output, deadline and process group are bounded.
+/// A failed clone or revision lookup never replaces an existing package. Existing
+/// detached checkouts at the selected commit are retained, including local edits.
 pub fn fetch_git_dependency(
     packages_dir: &Path,
     name: &str,
     url: &str,
     rev: Option<&str>,
 ) -> Result<PathBuf, LakeFetchError> {
-    if !is_git_available() {
-        return Err(LakeFetchError::CapabilityDenied(format!(
-            "external tool 'git' is not available for dependency fetching. \
-             Alternative: configure ATP CAS cache synchronization or download \
-             package '{name}' into {} manually (Rule D2)",
-            packages_dir.join(name).display()
-        )));
-    }
-
-    fs::create_dir_all(packages_dir).map_err(|e| LakeFetchError::Io(e.to_string()))?;
-    let pkg_dest = packages_dir.join(name);
-
-    if !pkg_dest.exists() {
-        // Clone with argv-only invocation, no shell
-        let mut clone_cmd = std::process::Command::new("git");
-        clone_cmd.args(["clone", "--quiet", url, pkg_dest.to_str().unwrap_or(name)]);
-        let output = clone_cmd
-            .output()
-            .map_err(|e| LakeFetchError::Io(e.to_string()))?;
-        if !output.status.success() {
-            return Err(LakeFetchError::GitFailed {
-                command: format!("git clone {url} {}", pkg_dest.display()),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
-        }
-    }
-
-    if let Some(revision) = rev {
-        let mut checkout_cmd = std::process::Command::new("git");
-        checkout_cmd.current_dir(&pkg_dest);
-        checkout_cmd.args(["checkout", "--quiet", revision]);
-        let output = checkout_cmd
-            .output()
-            .map_err(|e| LakeFetchError::Io(e.to_string()))?;
-        if !output.status.success() {
-            return Err(LakeFetchError::GitFailed {
-                command: format!("git checkout {revision}"),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
-        }
-    }
-
-    Ok(pkg_dest)
+    git::fetch(packages_dir, name, url, rev)
 }
