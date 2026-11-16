@@ -16,6 +16,8 @@ mod higher_order;
 #[path = "admit/propositions.rs"]
 mod propositions;
 
+#[path = "admit/closed_subterm_origins.rs"]
+mod closed_subterm_origins;
 #[path = "admit/function_eta.rs"]
 mod function_eta;
 #[path = "admit/identical_unfolding.rs"]

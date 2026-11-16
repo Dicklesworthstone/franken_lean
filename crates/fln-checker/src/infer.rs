@@ -25,8 +25,10 @@ use crate::instantiate::{
 };
 use crate::term::{
     TermBudget, TermFacts, TermFault, TermInput, TermLimit, TermOutcome, TermStop,
-    abstract_free_telescope_with, copy_compact_subterm_with, copy_subterm_with, inspect_nodes_with,
-    inspect_with, open_bound_telescope_with, substitute_bound_subterms_with, substitute_free_with,
+    abstract_free_telescope_with, copy_compact_subterm_with,
+    copy_compact_subterm_with_closed_origins, copy_subterm_with, inspect_nodes_with, inspect_with,
+    open_bound_telescope_with, open_bound_telescope_with_closed_origins,
+    substitute_bound_subterms_with, substitute_free_with,
 };
 use crate::whnf::{
     FreeBinding, ProjectionRule, WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal,
@@ -1058,13 +1060,13 @@ fn materialize_halted(halt: MaterializeHalt) -> TermOutcome<WireExpr> {
     }
 }
 
-fn map_materialization(
-    outcome: TermOutcome<WireExpr>,
+fn map_materialization<T>(
+    outcome: TermOutcome<T>,
     phase: InferencePhase,
     progress: InferenceProgress,
-) -> Result<WireExpr, LeafHalt> {
+) -> Result<T, LeafHalt> {
     match outcome {
-        TermOutcome::Complete(term) => Ok(term),
+        TermOutcome::Complete(value) => Ok(value),
         TermOutcome::Inconclusive(stop) => Err(LeafHalt::stop(InferenceStop::Materialization {
             phase,
             stop,
@@ -1658,6 +1660,7 @@ struct ProjectionState {
 struct LetPending {
     declared_type: Arc<WireExpr>,
     value: Arc<WireExpr>,
+    value_origins: Vec<Option<TermReference>>,
     local_name: WireName,
     local_reference: TermReference,
 }
@@ -2321,6 +2324,7 @@ struct InferenceEngine<'a> {
     control: &'a mut Control,
     cancelled: &'a mut dyn FnMut() -> bool,
     generated: Vec<Arc<WireExpr>>,
+    generated_origins: Vec<Option<Vec<Option<TermReference>>>>,
     scoped_locals: BTreeMap<WireName, Arc<WireExpr>>,
     reserved_names: Option<BTreeSet<WireName>>,
     next_local_identity: u64,
@@ -2434,10 +2438,36 @@ impl<'a> InferenceEngine<'a> {
         let generation = self.generated.len();
         let root = term.root();
         self.generated.push(term);
+        self.generated_origins.push(None);
         TermReference {
             source: ArenaSource::Generated(generation),
             root,
         }
+    }
+
+    fn store_generated_with_origins(
+        &mut self,
+        term: Arc<WireExpr>,
+        origins: Vec<Option<TermReference>>,
+    ) -> TermReference {
+        let generation = self.generated.len();
+        let root = term.root();
+        self.generated.push(term);
+        self.generated_origins.push(Some(origins));
+        TermReference {
+            source: ArenaSource::Generated(generation),
+            root,
+        }
+    }
+
+    fn canonical_origin(&self, reference: TermReference) -> TermReference {
+        if let ArenaSource::Generated(generation) = reference.source
+            && let Some(Some(origins)) = self.generated_origins.get(generation)
+            && let Some(Some(origin)) = origins.get(reference.root.index())
+        {
+            return *origin;
+        }
+        reference
     }
 
     fn materialize_free_reference(&mut self, name: &WireName) -> Result<TermReference, LeafHalt> {
@@ -2454,10 +2484,10 @@ impl<'a> InferenceEngine<'a> {
         reference: TermReference,
         binders: &[TelescopeBinder],
         phase: InferencePhase,
-    ) -> Result<WireExpr, LeafHalt> {
+    ) -> Result<(WireExpr, Vec<Option<TermReference>>), LeafHalt> {
         let source = inference_arena(self.input, &self.generated, reference.source)?;
-        let result = map_materialization(
-            copy_compact_subterm_with(
+        let (result, copy_origins) = map_materialization(
+            copy_compact_subterm_with_closed_origins(
                 source,
                 reference.root,
                 self.control.budget.materialization,
@@ -2494,7 +2524,18 @@ impl<'a> InferenceEngine<'a> {
         }
 
         if needed == 0 {
-            return Ok(result);
+            let origins = copy_origins
+                .into_iter()
+                .map(|maybe_id| {
+                    maybe_id.map(|orig_id| {
+                        self.canonical_origin(TermReference {
+                            source: reference.source,
+                            root: orig_id,
+                        })
+                    })
+                })
+                .collect();
+            return Ok((result, origins));
         }
 
         // These locals were materialized from exactly their local_name when
@@ -2521,8 +2562,8 @@ impl<'a> InferenceEngine<'a> {
             debug_assert_eq!(name, &binder.local_name);
             names.push(name);
         }
-        map_materialization(
-            open_bound_telescope_with(
+        let (opened, open_origins) = map_materialization(
+            open_bound_telescope_with_closed_origins(
                 &result,
                 &names,
                 self.control.budget.materialization,
@@ -2530,7 +2571,21 @@ impl<'a> InferenceEngine<'a> {
             ),
             phase,
             self.control.progress,
-        )
+        )?;
+        let origins = open_origins
+            .into_iter()
+            .map(|maybe_mid| {
+                maybe_mid
+                    .and_then(|mid_id| copy_origins.get(mid_id.index()).copied().flatten())
+                    .map(|orig_id| {
+                        self.canonical_origin(TermReference {
+                            source: reference.source,
+                            root: orig_id,
+                        })
+                    })
+            })
+            .collect();
+        Ok((opened, origins))
     }
 
     fn install_telescope_binder(
@@ -2589,12 +2644,11 @@ impl<'a> InferenceEngine<'a> {
             self.control
                 .step(self.cancelled, phase, source.domain.root.index())
                 .map_err(LeafHalt::stop)?;
-            let domain = Arc::new(self.materialize_telescope_subterm(
-                source.domain,
-                &state.binders,
-                phase,
-            )?);
-            let domain_reference = self.store_generated(Arc::clone(&domain));
+            let (domain, domain_origins) =
+                self.materialize_telescope_subterm(source.domain, &state.binders, phase)?;
+            let domain = Arc::new(domain);
+            let domain_reference =
+                self.store_generated_with_origins(Arc::clone(&domain), domain_origins);
             let local_name = self.fresh_local_name()?;
             let local_reference = self.materialize_free_reference(&local_name)?;
 
@@ -2618,9 +2672,9 @@ impl<'a> InferenceEngine<'a> {
         self.control
             .step(self.cancelled, phase, state.body.root.index())
             .map_err(LeafHalt::stop)?;
-        let body =
-            Arc::new(self.materialize_telescope_subterm(state.body, &state.binders, phase)?);
-        let reference = self.store_generated(body);
+        let (body, body_origins) =
+            self.materialize_telescope_subterm(state.body, &state.binders, phase)?;
+        let reference = self.store_generated_with_origins(Arc::new(body), body_origins);
         state.kind.record_body_query(&mut self.control.progress);
         Ok(TelescopeSchedule::Query {
             continuation: Continuation::TelescopeBody { state },
@@ -2640,7 +2694,7 @@ impl<'a> InferenceEngine<'a> {
         reference: TermReference,
         binders: &[LetBinder],
         phase: InferencePhase,
-    ) -> Result<WireExpr, LeafHalt> {
+    ) -> Result<(WireExpr, Vec<Option<TermReference>>), LeafHalt> {
         let carriers: Vec<TelescopeBinder> = binders
             .iter()
             .map(|binder| TelescopeBinder {
@@ -2712,17 +2766,20 @@ impl<'a> InferenceEngine<'a> {
                     declared_reference.root.index(),
                 )
                 .map_err(LeafHalt::stop)?;
-            let declared_type = Arc::new(self.materialize_let_subterm(
+            let (declared_type, declared_origins) = self.materialize_let_subterm(
                 declared_reference,
                 &state.binders,
                 InferencePhase::LetDeclaredType,
-            )?);
-            let value = Arc::new(self.materialize_let_subterm(
+            )?;
+            let declared_type = Arc::new(declared_type);
+            let (value, value_origins) = self.materialize_let_subterm(
                 value_reference,
                 &state.binders,
                 InferencePhase::LetValue,
-            )?);
-            let query = self.store_generated(Arc::clone(&declared_type));
+            )?;
+            let value = Arc::new(value);
+            let query =
+                self.store_generated_with_origins(Arc::clone(&declared_type), declared_origins);
             let local_name = self.fresh_local_name()?;
             let local_reference = self.materialize_free_reference(&local_name)?;
             if state.pending.is_some() {
@@ -2731,6 +2788,7 @@ impl<'a> InferenceEngine<'a> {
             state.pending = Some(LetPending {
                 declared_type,
                 value,
+                value_origins,
                 local_name,
                 local_reference,
             });
@@ -2747,12 +2805,9 @@ impl<'a> InferenceEngine<'a> {
                 state.body.root.index(),
             )
             .map_err(LeafHalt::stop)?;
-        let body = Arc::new(self.materialize_let_subterm(
-            state.body,
-            &state.binders,
-            InferencePhase::LetBody,
-        )?);
-        let reference = self.store_generated(body);
+        let (body, body_origins) =
+            self.materialize_let_subterm(state.body, &state.binders, InferencePhase::LetBody)?;
+        let reference = self.store_generated_with_origins(Arc::new(body), body_origins);
         Ok(TelescopeSchedule::Query {
             continuation: Continuation::LetBody { state },
             reference,
@@ -2795,7 +2850,7 @@ impl<'a> InferenceEngine<'a> {
     #[inline(never)]
     fn after_let_declared_type(
         &mut self,
-        state: Box<LetState>,
+        mut state: Box<LetState>,
         declared_type_type: &WireExpr,
     ) -> Result<TermReference, LeafHalt> {
         self.ensure_sort(
@@ -2803,11 +2858,17 @@ impl<'a> InferenceEngine<'a> {
             declared_type_type,
             false,
         )?;
-        let pending = state
-            .pending
-            .as_ref()
-            .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
-        let query = self.store_generated(Arc::clone(&pending.value));
+        let (value, value_origins) = {
+            let pending = state
+                .pending
+                .as_mut()
+                .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+            (
+                Arc::clone(&pending.value),
+                std::mem::take(&mut pending.value_origins),
+            )
+        };
+        let query = self.store_generated_with_origins(value, value_origins);
         self.continuations.push(Continuation::LetValue { state });
         Ok(query)
     }
@@ -3640,13 +3701,7 @@ impl<'a> InferenceEngine<'a> {
             InferencePhase::ApplicationTerm,
             self.control.progress,
         )?;
-        let generation = self.generated.len();
-        let root = term.root();
-        self.generated.push(Arc::new(term));
-        Ok(TermReference {
-            source: ArenaSource::Generated(generation),
-            root,
-        })
+        Ok(self.store_generated(Arc::new(term)))
     }
 
     fn materialize_function_subterm(
@@ -4112,10 +4167,13 @@ impl<'a> InferenceEngine<'a> {
     /// Infer `reference` directly, or schedule the subterm it needs first.
     #[inline(never)]
     fn begin(&mut self, reference: TermReference) -> Result<Advance, LeafHalt> {
-        if let Some(type_) = self.inferred_types.get(&reference) {
+        let canonical = self.canonical_origin(reference);
+        if let Some(type_) = self.inferred_types.get(&canonical) {
             return Ok(Advance::Inferred(type_.clone()));
         }
-        self.continuations.push(Continuation::Record { reference });
+        self.continuations.push(Continuation::Record {
+            reference: canonical,
+        });
         let facts = self.facts_of(reference.source)?;
         Ok(
             match dispatch_reference(
@@ -4322,6 +4380,7 @@ fn infer_policy(
         control: &mut control,
         cancelled,
         generated: Vec::new(),
+        generated_origins: Vec::new(),
         scoped_locals: BTreeMap::new(),
         reserved_names: None,
         next_local_identity: 0,

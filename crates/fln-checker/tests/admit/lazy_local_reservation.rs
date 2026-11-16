@@ -161,7 +161,7 @@ fn binder_free_proof_conversions_do_not_rescan_large_let_values() {
         chain = app(c("useQ"), [c("c0"), app(c("mkQ"), [c("c0")]), chain]);
     }
     let body = let_in("big", c("T"), big, chain);
-    let candidate = definition("many_domain_checks", decoded(&ty()), decoded(&body));
+    let candidate = definition("many_domain_checks", decoded(&prop()), decoded(&body));
     let verdict = admit(&env, &candidate, budget());
     assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
 }
@@ -176,7 +176,7 @@ fn distinct_value_under_large_let_context_is_still_not_admitted() {
         chain = app(c("useQ"), [c("c0"), app(c("mkQ"), [arg]), chain]);
     }
     let body = let_in("big", c("T"), big, chain);
-    let candidate = definition("bad_domain_check", decoded(&ty()), decoded(&body));
+    let candidate = definition("bad_domain_check", decoded(&prop()), decoded(&body));
     let verdict = admit(&env, &candidate, budget());
     assert!(
         matches!(
@@ -192,7 +192,7 @@ fn binder_opening_proof_conversion_under_large_let_context_still_admits() {
     let env = environment();
     let big = comb_tree(10);
     let body = let_in("big", c("T"), big, app(c("useQF"), [c("mkQF")]));
-    let candidate = definition("binder_domain_check", decoded(&ty()), decoded(&body));
+    let candidate = definition("binder_domain_check", decoded(&prop()), decoded(&body));
     let verdict = admit(&env, &candidate, budget());
     assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
 }

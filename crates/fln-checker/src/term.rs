@@ -602,6 +602,9 @@ type ScopeMemo = std::collections::HashMap<
     std::hash::BuildHasherDefault<KeyHasher>,
 >;
 
+/// Per-output-node subject `ExprId` for closed (`external == 0`) subterms.
+pub(crate) type ClosedOrigins = Vec<Option<ExprId>>;
+
 /// Past this many subject nodes a pure copy keys its visits in the map, so its
 /// table never costs more than the arena it indexes could.
 const DENSE_COPY_MAX_NODES: usize = 1 << 22;
@@ -672,6 +675,7 @@ struct Transformer<'a, 'c> {
     /// as the original input node.
     memo: Visited,
     scopes: Option<ScopeMemo>,
+    closed_origins: Option<ClosedOrigins>,
     /// An opened local is free at every binder depth. Share its emitted node
     /// across distinct bound occurrences, as single-binder substitution shares
     /// its replacement. Unused telescope positions need no cache entry.
@@ -1520,7 +1524,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
         Ok(())
     }
 
-    fn run(mut self, root_mode: Mode) -> Result<WireExpr, Halt> {
+    fn run(mut self, root_mode: Mode) -> Result<(WireExpr, Option<ClosedOrigins>), Halt> {
         self.tasks.push(Task::Visit {
             input: TermInput::Subject,
             id: self.subject_root,
@@ -1549,6 +1553,21 @@ impl<'a, 'c> Transformer<'a, 'c> {
                     if self.canonical_mode(key.0, key.1, key.2) == Mode::Copy {
                         self.memo.insert((key.0, key.1, Mode::Copy), done);
                     }
+                    if key.0 == TermInput::Subject
+                        && self
+                            .scopes
+                            .as_ref()
+                            .and_then(|memo| memo.get(&(key.0, key.1)))
+                            .is_some_and(|scope| scope.external == 0)
+                        && let Some(origins) = self.closed_origins.as_mut()
+                    {
+                        if origins.len() <= done.index() {
+                            origins.resize(done.index() + 1, None);
+                        }
+                        if origins[done.index()].is_none() {
+                            origins[done.index()] = Some(key.1);
+                        }
+                    }
                 }
             }
         }
@@ -1558,7 +1577,15 @@ impl<'a, 'c> Transformer<'a, 'c> {
             }));
         }
         let root = self.values.pop().expect("length checked");
-        Ok(WireExpr::from_parts(self.nodes, self.levels, root))
+        if let Some(origins) = self.closed_origins.as_mut()
+            && origins.len() < self.nodes.len()
+        {
+            origins.resize(self.nodes.len(), None);
+        }
+        Ok((
+            WireExpr::from_parts(self.nodes, self.levels, root),
+            self.closed_origins,
+        ))
     }
 }
 
@@ -1634,9 +1661,42 @@ fn transform_subterms_with(
             && matches!(plan.operation, Operation::Raise)
             && matches!(plan.root_mode, Mode::Rewrite { .. })))
         .then(ScopeMemo::default),
+        closed_origins: None,
         opened_names: BTreeMap::new(),
     };
-    outcome(transformer.run(plan.root_mode))
+    outcome(transformer.run(plan.root_mode).map(|(term, _)| term))
+}
+
+fn transform_subterms_with_closed_origins(
+    subject: &WireExpr,
+    subject_root: ExprId,
+    plan: TransformPlan<'_>,
+    budget: TermBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> TermOutcome<(WireExpr, ClosedOrigins)> {
+    let transformer = Transformer {
+        subject,
+        subject_root,
+        replacement: plan.replacement,
+        operation: plan.operation,
+        control: Control::new(budget, cancelled),
+        nodes: Vec::new(),
+        levels: Vec::new(),
+        level_maps: [None, None],
+        compact_level_maps: [CompactLevelMap::default(), CompactLevelMap::default()],
+        compact_levels: plan.compact_levels,
+        values: Vec::new(),
+        tasks: Vec::new(),
+        memo: Visited::for_plan(&plan, subject_root),
+        scopes: Some(ScopeMemo::default()),
+        closed_origins: Some(Vec::new()),
+        opened_names: BTreeMap::new(),
+    };
+    outcome(
+        transformer
+            .run(plan.root_mode)
+            .map(|(term, origins)| (term, origins.unwrap_or_default())),
+    )
 }
 
 pub(crate) fn copy_subterm_with(
@@ -1666,6 +1726,26 @@ pub(crate) fn copy_compact_subterm_with(
     cancelled: &mut dyn FnMut() -> bool,
 ) -> TermOutcome<WireExpr> {
     transform_subterms_with(
+        term,
+        root,
+        TransformPlan {
+            replacement: None,
+            operation: Operation::Raise,
+            root_mode: Mode::Rewrite { scope: 0 },
+            compact_levels: true,
+        },
+        budget,
+        cancelled,
+    )
+}
+
+pub(crate) fn copy_compact_subterm_with_closed_origins(
+    term: &WireExpr,
+    root: ExprId,
+    budget: TermBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> TermOutcome<(WireExpr, ClosedOrigins)> {
+    transform_subterms_with_closed_origins(
         term,
         root,
         TransformPlan {
@@ -1780,6 +1860,26 @@ pub(crate) fn open_bound_telescope_with(
         None,
         Operation::OpenMany { names },
         Mode::Rewrite { scope: 0 },
+        budget,
+        cancelled,
+    )
+}
+
+pub(crate) fn open_bound_telescope_with_closed_origins(
+    term: &WireExpr,
+    names: &[&WireName],
+    budget: TermBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> TermOutcome<(WireExpr, ClosedOrigins)> {
+    transform_subterms_with_closed_origins(
+        term,
+        term.root(),
+        TransformPlan {
+            replacement: None,
+            operation: Operation::OpenMany { names },
+            root_mode: Mode::Rewrite { scope: 0 },
+            compact_levels: true,
+        },
         budget,
         cancelled,
     )
