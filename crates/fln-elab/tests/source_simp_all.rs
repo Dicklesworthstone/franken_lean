@@ -168,6 +168,19 @@ fn simp_custom_dischargers_run_composed_tactics_and_close_every_goal() {
 }
 
 #[test]
+fn simp_discharges_quantified_propositions_without_guessing_function_data() {
+    accepted(
+        "theorem t (P : Nat -> Prop) (h : ∀ n : Nat, P n) (a b : Nat) (rule : (∀ n : Nat, P n) -> a = b) : a = b := by simp (discharger := intro n; exact h n) only [rule]",
+    );
+    accepted(
+        "theorem t (P : Nat -> Prop) (h : ∀ n : Nat, P n) (a b : Nat) (rule : (∀ n : Nat, P n) -> a = b) : a = b := by simp only [rule, h]",
+    );
+    refused(
+        "theorem t (a b : Nat) (rule : (Nat -> Nat) -> a = b) : a = b := by simp (discharger := intro n; exact n) only [rule]",
+    );
+}
+
+#[test]
 fn simp_custom_dischargers_are_shared_by_hypotheses_and_simpa() {
     accepted(
         "theorem t (P : Prop) (Q : Nat -> Prop) (h : P) (a b : Nat) (rule : P -> a = b) (ha : Q a) : Q b := by simp (discharger := exact h) only [rule] at ha; exact ha",

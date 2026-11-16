@@ -384,7 +384,9 @@ impl Context {
                 let universe = self.whnf(&universe)?;
                 // Data parameters are inferred by the occurrence match, never
                 // guessed from a value mentioned in the selected simp set.
-                if !matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
+                // Reconstructed forall sorts retain raw imax levels. The pin's
+                // isProp tests whether that level is always zero, not its shape.
+                if !matches!(universe.node(), ExprNode::Sort { level } if level.is_always_zero()) {
                     continue;
                 }
                 let value = self.simp_discharge_premise(id, &target, selected_rules)?;
@@ -602,7 +604,8 @@ impl Context {
                 // rule's premise without itself being an equality rewrite.
                 if inside_out && let Some(universe) = template.known_type(&rule.type_)? {
                     let universe = template.whnf(&universe)?;
-                    if matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
+                    if matches!(universe.node(), ExprNode::Sort { level } if level.is_always_zero())
+                    {
                         self.charge_rewrite_trial(&template);
                         return Ok(None);
                     }
@@ -927,7 +930,7 @@ impl Context {
                         let target = trial.instantiate(&declaration.type_)?;
                         if let Some(universe) = trial.known_type(&target)? {
                             let universe = trial.whnf(&universe)?;
-                            if matches!(universe.node(), ExprNode::Sort { level } if level.is_zero())
+                            if matches!(universe.node(), ExprNode::Sort { level } if level.is_always_zero())
                             {
                                 trial
                                     .txn

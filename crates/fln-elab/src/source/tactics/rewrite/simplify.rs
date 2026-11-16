@@ -152,7 +152,7 @@ impl Context {
         };
         let sort = self.whnf(&sort)?;
         Ok(
-            matches!(sort.node(), ExprNode::Sort { level } if level.is_zero())
+            matches!(sort.node(), ExprNode::Sort { level } if level.is_always_zero())
                 .then(|| binder_type.clone()),
         )
     }
@@ -1400,7 +1400,7 @@ impl Context {
                 continue;
             };
             let universe = self.whnf(&universe)?;
-            if !matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
+            if !matches!(universe.node(), ExprNode::Sort { level } if level.is_always_zero()) {
                 continue;
             }
             let mut budget = UnificationBudget::new(self.kernel);
