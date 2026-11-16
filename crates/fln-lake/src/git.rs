@@ -70,7 +70,7 @@ fn directory(path: &Path, create: bool) -> Result<PathBuf, LakeFetchError> {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => {
                 return Err(invalid(format!(
-                    "Git package parent is not a real directory: {}",
+                    "Git package parent is not a real directory (refusing symlink): {}",
                     cursor.display()
                 )));
             }
@@ -412,7 +412,7 @@ pub(super) fn full_revision(revision: &str) -> bool {
     matches!(revision.len(), 40 | 64) && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn source_url(cwd: &Path, url: &str) -> Result<OsString, LakeFetchError> {
+pub(super) fn source_url(cwd: &Path, url: &str) -> Result<OsString, LakeFetchError> {
     if url.is_empty() || url.len() > MAX_ARGUMENT || url.chars().any(char::is_control) {
         return Err(invalid("empty, oversized or control-bearing Git URL"));
     }
@@ -581,6 +581,41 @@ impl Transaction {
         Ok(())
     }
 
+    /// Translate a final package location to the private checkout while resolving.
+    pub fn materialized_directory(&self, path: &Path) -> PathBuf {
+        for (stage, destination) in &self.pending {
+            if let Ok(relative) = path.strip_prefix(destination) {
+                return stage.join(relative);
+            }
+        }
+        path.to_path_buf()
+    }
+
+    /// Keep private staging names out of path entries written to the manifest.
+    pub fn published_directory(&self, path: &Path) -> PathBuf {
+        for (stage, destination) in &self.pending {
+            if let Ok(relative) = path.strip_prefix(stage) {
+                return destination.join(relative);
+            }
+        }
+        path.to_path_buf()
+    }
+
+    pub fn rollback(&mut self) -> Result<(), LakeFetchError> {
+        while self.promoted > 0 {
+            let (stage, destination) = &self.pending[self.promoted - 1];
+            fs::rename(destination, stage).map_err(|error| {
+                LakeFetchError::Io(format!(
+                    "cannot roll back {} to private recovery {}: {error}",
+                    destination.display(),
+                    stage.display(),
+                ))
+            })?;
+            self.promoted -= 1;
+        }
+        Ok(())
+    }
+
     pub fn commit(&mut self) {
         self.committed = true;
     }
@@ -589,10 +624,9 @@ impl Transaction {
 impl Drop for Transaction {
     fn drop(&mut self) {
         if !self.committed {
-            for (stage, destination) in self.pending[..self.promoted].iter().rev() {
-                // Preserve partial work privately if later publication fails.
-                let _ = fs::rename(destination, stage);
-            }
+            // Normal error paths report rollback errors explicitly. Drop remains
+            // a final best-effort recovery for an unwinding caller.
+            let _ = self.rollback();
         }
     }
 }
@@ -799,5 +833,267 @@ mod tests {
                 .unwrap(),
             "true"
         );
+    }
+    fn commit_all(repo: &Path, runner: &mut Runner) -> String {
+        runner.text(repo, "fixture-add", &["add", "."]).unwrap();
+        runner
+            .text(
+                repo,
+                "fixture-commit",
+                &[
+                    "-c",
+                    "user.name=Lake Test",
+                    "-c",
+                    "user.email=lake-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "next",
+                ],
+            )
+            .unwrap();
+        runner
+            .text(repo, "fixture-head", &["rev-parse", "HEAD"])
+            .unwrap()
+    }
+
+    fn root_package(root: &Path, contents: &str) -> PathBuf {
+        let project = root.join("project");
+        private_directory(&project).unwrap();
+        fs::write(project.join("lakefile.toml"), contents).unwrap();
+        project
+    }
+
+    #[test]
+    fn update_materializes_git_subdirectories_and_internal_path_dependencies() {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return;
+        }
+        let (root, mut runner) = fixture("update-subdir");
+        let (repo, _) = repository(&root, &mut runner);
+        private_directory(&repo.join("sub")).unwrap();
+        private_directory(&repo.join("sub/leaf")).unwrap();
+        fs::write(
+            repo.join("sub/lakefile.toml"),
+            "name = \"dependency\"\n[[require]]\nname = \"leaf\"\npath = \"leaf\"\n",
+        )
+        .unwrap();
+        fs::write(repo.join("sub/leaf/lakefile.toml"), "name = \"leaf\"\n").unwrap();
+        let commit = commit_all(&repo, &mut runner);
+        runner.text(&repo, "fixture-tag", &["tag", "stable"]).unwrap();
+        let project = root_package(
+            &root,
+            &format!(
+                "name = \"root\"\n[[require]]\nname = \"dependency\"\ngit = {}\nrev = \"stable\"\nsubDir = \"sub\"\n",
+                manifest_quote(repo.to_str().unwrap()),
+            ),
+        );
+        let manifest = crate::update_manifest(&project).unwrap();
+        assert_eq!(manifest.packages.len(), 2);
+        let dependency = &manifest.packages[0];
+        assert_eq!(dependency.entry_type, "git");
+        assert_eq!(dependency.rev.as_deref(), Some(commit.as_str()));
+        assert_eq!(dependency.input_rev.as_deref(), Some("stable"));
+        assert_eq!(dependency.subdir.as_deref(), Some("sub"));
+        assert!(dependency.dir.is_none());
+        assert_eq!(
+            manifest.packages[1].dir.as_deref(),
+            Some(Path::new(".lake/packages/dependency/sub/leaf"))
+        );
+        let checkout = project.join(".lake/packages/dependency");
+        assert_eq!(
+            fs::read_to_string(checkout.join(".git/HEAD")).unwrap(),
+            format!("{commit}\n")
+        );
+        assert!(checkout.join("sub/leaf/lakefile.toml").is_file());
+        let bytes = fs::read_to_string(project.join("lake-manifest.json")).unwrap();
+        assert!(!bytes.contains(".fln-git-"));
+        let reloaded = crate::Manifest::parse_json(&bytes).unwrap();
+        assert_eq!(reloaded.packages, manifest.packages);
+        let repeated = crate::update_manifest(&project).unwrap();
+        assert_eq!(repeated.packages, manifest.packages);
+    }
+
+    #[test]
+    fn update_keeps_old_manifest_and_all_public_checkouts_on_resolution_failure() {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return;
+        }
+        let (root, mut runner) = fixture("update-failure");
+        let (repo, _) = repository(&root, &mut runner);
+        let source = manifest_quote(repo.to_str().unwrap());
+        let project = root_package(
+            &root,
+            &format!(
+                "name = \"root\"\n[[require]]\nname = \"bad\"\ngit = {source}\nrev = \"missing\"\n[[require]]\nname = \"good\"\ngit = {source}\nrev = \"release\"\n",
+            ),
+        );
+        crate::Manifest::new("previous").save_to_dir(&project).unwrap();
+        let before = fs::read(project.join("lake-manifest.json")).unwrap();
+        let error = crate::update_manifest(&project).unwrap_err();
+        assert!(error.to_string().contains("bad"), "{error}");
+        assert_eq!(
+            fs::read(project.join("lake-manifest.json")).unwrap(),
+            before
+        );
+        assert!(!project.join(".lake/packages/good").exists());
+        assert!(!project.join(".lake/packages/bad").exists());
+        assert_eq!(
+            fs::read_to_string(repo.join("value.txt")).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[test]
+    fn update_rechecks_inputs_after_checked_git_configuration_loading() {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return;
+        }
+        let (root, mut runner) = fixture("update-input-race");
+        let (repo, _) = repository(&root, &mut runner);
+        fs::write(repo.join("lakefile.lean"), "import Lake\n").unwrap();
+        commit_all(&repo, &mut runner);
+        let project = root_package(
+            &root,
+            &format!(
+                "name = \"root\"\n[[require]]\nname = \"dependency\"\ngit = {}\n",
+                manifest_quote(repo.to_str().unwrap()),
+            ),
+        );
+        crate::Manifest::new("previous").save_to_dir(&project).unwrap();
+        let before = fs::read(project.join("lake-manifest.json")).unwrap();
+        let error = crate::update_manifest_with_lean::<crate::LakeUpdateError>(
+            &project,
+            |_, bytes| {
+                assert_eq!(bytes, b"import Lake\n");
+                fs::write(project.join("lakefile.toml"), "name = \"changed\"\n").unwrap();
+                let mut config = crate::LakeConfig::parse_toml("name = \"dependency\"\n").unwrap();
+                config.format = crate::LakeConfigFormat::Lean;
+                Ok(config)
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("changed during"), "{error}");
+        assert_eq!(
+            fs::read(project.join("lake-manifest.json")).unwrap(),
+            before
+        );
+        assert!(!project.join(".lake/packages/dependency").exists());
+        assert_eq!(
+            fs::read_to_string(project.join("lakefile.toml")).unwrap(),
+            "name = \"changed\"\n"
+        );
+    }
+
+    #[test]
+    fn inherited_git_commits_are_immutable_and_direct_requirements_win() {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return;
+        }
+        let (root, mut runner) = fixture("update-locks");
+        let (repo, old_commit) = repository(&root, &mut runner);
+        fs::write(repo.join("value.txt"), "new upstream\n").unwrap();
+        let new_commit = commit_all(&repo, &mut runner);
+        runner.text(&repo, "fixture-tag", &["tag", "latest"]).unwrap();
+        let holder = root.join("holder");
+        private_directory(&holder).unwrap();
+        fs::write(
+            holder.join("lakefile.toml"),
+            format!(
+                "name = \"holder\"\n[[require]]\nname = \"dependency\"\ngit = {}\nrev = \"latest\"\n",
+                manifest_quote(repo.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        let mut inherited = crate::Manifest::new("holder");
+        inherited.packages.push(crate::ManifestPackageEntry {
+            name: "dependency".to_owned(),
+            scope: String::new(),
+            entry_type: "git".to_owned(),
+            dir: None,
+            url: Some(repo.to_str().unwrap().to_owned()),
+            rev: Some(old_commit.clone()),
+            input_rev: Some("release".to_owned()),
+            subdir: None,
+            inherited: false,
+            config_file: "lakefile.toml".to_owned(),
+            manifest_file: Some(PathBuf::from("lake-manifest.json")),
+        });
+        inherited.save_to_dir(&holder).unwrap();
+        let project = root_package(
+            &root,
+            "name = \"root\"\n[[require]]\nname = \"holder\"\npath = \"../holder\"\n",
+        );
+        let manifest = crate::update_manifest(&project).unwrap();
+        let locked = manifest
+            .packages
+            .iter()
+            .find(|entry| entry.name == "dependency")
+            .unwrap();
+        assert_eq!(locked.rev.as_deref(), Some(old_commit.as_str()));
+        assert!(locked.inherited);
+        assert_eq!(
+            fs::read_to_string(project.join(".lake/packages/dependency/value.txt")).unwrap(),
+            "original\n"
+        );
+        // A different workspace avoids changing a preexisting checkout while
+        // proving that an inherited lock cannot override a direct requirement.
+        let second = root.join("direct");
+        private_directory(&second).unwrap();
+        fs::write(
+            second.join("lakefile.toml"),
+            format!(
+                "name = \"root\"\n[[require]]\nname = \"dependency\"\ngit = {}\nrev = \"latest\"\n[[require]]\nname = \"holder\"\npath = \"../holder\"\n",
+                manifest_quote(repo.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        let manifest = crate::update_manifest(&second).unwrap();
+        let direct = manifest
+            .packages
+            .iter()
+            .find(|entry| entry.name == "dependency")
+            .unwrap();
+        assert_eq!(direct.rev.as_deref(), Some(new_commit.as_str()));
+        assert!(!direct.inherited);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_rejects_symlinked_package_parents_and_checkout_configuration() {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return;
+        }
+        use std::os::unix::fs::symlink;
+
+        let (root, mut runner) = fixture("update-symlink");
+        let (repo, _) = repository(&root, &mut runner);
+        fs::rename(repo.join("lakefile.toml"), repo.join("actual.toml")).unwrap();
+        symlink("actual.toml", repo.join("lakefile.toml")).unwrap();
+        commit_all(&repo, &mut runner);
+        let project = root_package(
+            &root,
+            &format!(
+                "name = \"root\"\n[[require]]\nname = \"dependency\"\ngit = {}\n",
+                manifest_quote(repo.to_str().unwrap()),
+            ),
+        );
+        let error = crate::update_manifest(&project).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(!project.join("lake-manifest.json").exists());
+        assert!(!project.join(".lake/packages/dependency").exists());
+
+        let other = root.join("unsafe-parent");
+        private_directory(&other).unwrap();
+        fs::write(
+            other.join("lakefile.toml"),
+            fs::read(project.join("lakefile.toml")).unwrap(),
+        )
+        .unwrap();
+        symlink(&root, other.join(".lake")).unwrap();
+        let error = crate::update_manifest(&other).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(!other.join("lake-manifest.json").exists());
+        assert!(!root.join("packages").exists());
     }
 }

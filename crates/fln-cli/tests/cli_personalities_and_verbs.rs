@@ -733,12 +733,12 @@ fn lake_commands_without_an_implementation_say_so() {
     }
 
     // `upgrade` is the pin's alias for `update` (`Lake/CLI/Main.lean:1264`),
-    // never an unknown command, and names `lake upgrade` when dependency
-    // fetching is unavailable.
+    // never an unknown command, and names `lake upgrade` when the selected
+    // SSH transport is unavailable.
     let temp = TempDir::new("lake-upgrade-alias");
     std::fs::write(
         temp.0.join("lakefile.toml"),
-        "name = \"probe\"\n\n[[require]]\nname = \"dep\"\ngit = \"https://example.invalid/dep\"\n",
+        "name = \"probe\"\n\n[[require]]\nname = \"dep\"\ngit = \"ssh://example.invalid/dep\"\n",
     )
     .unwrap();
     let upgrade = Command::new(env!("CARGO_BIN_EXE_lake"))
@@ -1067,16 +1067,15 @@ defaultTargets = ["my_project"]
 
 [[require]]
 name = "batteries"
-git = "https://github.com/leanprover-community/batteries.git"
+git = "ssh://example.invalid/batteries.git"
 rev = "v4.32.0"
 "#;
     std::fs::create_dir_all(&pkg_dir).unwrap();
     std::fs::write(pkg_dir.join("lakefile.toml"), toml_content).unwrap();
 
-    // 1. lake update with a requirement: nothing can fetch it, so the answer
-    // is the typed not-implemented exit and NO manifest. This step used to
-    // assert exit 0 and a manifest naming "batteries", which the binary wrote
-    // by copying the requested rev (bead fln-front-door-residuals-0f6x).
+    // 1. SSH transport has no granted subprocess capability: refuse it with
+    // the typed unavailable exit and no manifest. Supported local Git fetches
+    // are exercised below; a requested tag is never a resolved commit.
     let update_output = Command::new(env!("CARGO_BIN_EXE_lake"))
         .args(["--dir", pkg_dir.to_str().unwrap(), "update"])
         .output()
@@ -1207,6 +1206,143 @@ rev = "v4.32.0"
     assert_eq!(exe_empty.status.code(), Some(1));
     let exe_empty_stderr = String::from_utf8(exe_empty.stderr).expect("utf8 stderr");
     assert!(exe_empty_stderr.contains("error: no such file or directory"));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn lake_personality_update_materializes_git_and_preserves_failed_transactions() {
+    let guard = TempDir::new("lake-update-git");
+    // macOS's temp path can contain /var or /tmp symlinks. Give the product
+    // the physical test root so its nonsymlink-parent policy is exercised.
+    let root = std::fs::canonicalize(&guard.0).unwrap();
+    let upstream = root.join("upstream");
+    let project = root.join("project");
+    let hooks = root.join("hooks");
+    for directory in [&upstream, &project, &hooks] {
+        std::fs::create_dir(directory).unwrap();
+    }
+    let git_config = root.join("gitconfig");
+    std::fs::write(&git_config, "").unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let git = |arguments: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(&upstream)
+            .env_clear()
+            .env("PATH", &path)
+            .env("HOME", &root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &git_config)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args([
+                "-c",
+                "user.name=Lake CLI Test",
+                "-c",
+                "user.email=lake-cli@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "-c",
+                "core.fsmonitor=false",
+            ])
+            .arg("-c")
+            .arg(format!("core.hooksPath={}", hooks.display()))
+            .args(arguments)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run real fixture Git");
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&[
+        "init",
+        "--quiet",
+        "--object-format=sha1",
+        "--initial-branch=main",
+        "--template=",
+    ]);
+    std::fs::write(upstream.join("lakefile.toml"), "name = \"dependency\"\n").unwrap();
+    std::fs::write(upstream.join("payload.txt"), "materialized from Git\n").unwrap();
+    git(&["add", "--", "."]);
+    git(&["commit", "--quiet", "-m", "dependency fixture"]);
+    let commit = git(&["rev-parse", "--verify", "HEAD"]);
+    assert_eq!(commit.len(), 40);
+    assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    git(&["tag", "fixture-release"]);
+
+    // The URL is relative to the requiring package, not the CLI's cwd.
+    let config = r#"name = "consumer"
+
+[[require]]
+name = "dependency"
+git = "../upstream"
+rev = "fixture-release"
+"#;
+    std::fs::write(project.join("lakefile.toml"), config).unwrap();
+    let update = || {
+        Command::new(env!("CARGO_BIN_EXE_lake"))
+            .current_dir(&root)
+            .arg("--dir")
+            .arg(&project)
+            .args(["--json", "update"])
+            .output()
+            .expect("run installed lake update")
+    };
+    let success = update();
+    assert!(
+        success.status.success(),
+        "lake update: {}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    let json = String::from_utf8(success.stdout).unwrap();
+    assert!(json.contains("\"schema\":\"fln.lake-update/1\""), "{json}");
+    assert!(json.contains("\"packages_count\":1"), "{json}");
+
+    let checkout = project.join(".lake/packages/dependency");
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("payload.txt")).unwrap(),
+        "materialized from Git\n"
+    );
+    let head = std::fs::read(checkout.join(".git/HEAD")).unwrap();
+    assert_eq!(head, format!("{commit}\n").as_bytes());
+    let manifest_path = project.join("lake-manifest.json");
+    let manifest_before = std::fs::read(&manifest_path).unwrap();
+    let manifest =
+        fln_lake::Manifest::parse_json(std::str::from_utf8(&manifest_before).unwrap()).unwrap();
+    assert_eq!(manifest.packages.len(), 1);
+    let package = &manifest.packages[0];
+    assert_eq!(package.name, "dependency");
+    assert_eq!(package.entry_type, "git");
+    assert_eq!(package.rev.as_deref(), Some(commit.as_str()));
+    assert_eq!(package.input_rev.as_deref(), Some("fixture-release"));
+
+    // A later dependency failure must preserve both the published lockfile
+    // and local edits in its existing checkout.
+    std::fs::write(checkout.join("payload.txt"), "local checkout edit\n").unwrap();
+    std::fs::write(
+        project.join("lakefile.toml"),
+        format!(
+            "{config}\n[[require]]\nname = \"broken\"\ngit = \"../upstream\"\nrev = \"missing-revision\"\n"
+        ),
+    )
+    .unwrap();
+    let failure = update();
+    assert_eq!(
+        failure.status.code(),
+        Some(1),
+        "lake update failure: {}",
+        String::from_utf8_lossy(&failure.stderr)
+    );
+    assert!(failure.stdout.is_empty());
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest_before);
+    assert_eq!(std::fs::read(checkout.join(".git/HEAD")).unwrap(), head);
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("payload.txt")).unwrap(),
+        "local checkout edit\n"
+    );
+    assert!(!project.join(".lake/packages/broken").exists());
 }
 
 #[test]

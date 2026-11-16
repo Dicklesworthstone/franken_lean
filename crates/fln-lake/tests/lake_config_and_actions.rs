@@ -263,20 +263,19 @@ defaultTargets = ["math_project"]
 
 [[require]]
 name = "mathlib"
-git = "https://github.com/leanprover-community/mathlib4.git"
+git = "ssh://example.invalid/mathlib.git"
 rev = "v4.32.0"
 "#;
     std::fs::write(dir.join("lakefile.toml"), toml).unwrap();
 
-    // A requirement can only be resolved by fetching it. Nothing fetches, so
-    // `update_manifest` must refuse and write nothing. It used to copy the
-    // requested `rev` ("v4.32.0", a tag) into the resolved `rev` and return Ok
-    // (bead fln-front-door-residuals-0f6x); this test asserted that.
+    // A transport outside the supported capability cannot synthesize a lock by
+    // copying the requested tag into the resolved commit field.
     match fln_lake::update_manifest(&dir) {
-        Err(fln_lake::LakeUpdateError::DependencyResolutionUnavailable { requirements }) => {
-            assert_eq!(requirements, vec!["mathlib".to_owned()]);
+        Err(fln_lake::LakeUpdateError::Unsupported(detail)) => {
+            assert!(detail.contains("mathlib"), "{detail}");
+            assert!(detail.contains("transport"), "{detail}");
         }
-        other => panic!("a requirement must be refused, not resolved by copy: {other:?}"),
+        other => panic!("unsupported transport must not synthesize a lock: {other:?}"),
     }
     assert!(
         !dir.join("lake-manifest.json").exists(),
@@ -1121,7 +1120,7 @@ fn local_update_discovery_failures_preserve_every_existing_file() {
             "remote",
             concat!(
                 "name = \"root\"\n",
-                "[[require]]\nname = \"remote\"\ngit = \"https://example.invalid/repo\"\n",
+                "[[require]]\nname = \"remote\"\ngit = \"ssh://example.invalid/repo\"\n",
                 "[[require]]\nname = \"good\"\npath = \"../good\"\n",
             ),
             "name = \"good\"\n",

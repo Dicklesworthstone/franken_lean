@@ -1250,11 +1250,9 @@ pub enum LakeUpdateError {
     Discovery(LakeDiscoveryError),
     Io(String),
     Parse(String),
-    /// A selected remote requirement needs materialization and a resolved
-    /// commit. Fetching is not implemented (the D2 subprocess protocol, bead
-    /// `fln-7k0`), so no manifest is written. Local path requirements resolve
-    /// without fetching; a requested remote revision is never copied into a
-    /// resolved `rev` as a substitute for materialization.
+    /// A requirement has no supported source or combines incompatible source
+    /// settings. Git requirements are materialized and verified before their
+    /// resolved commit can be written to the manifest.
     DependencyResolutionUnavailable {
         requirements: Vec<String>,
     },
@@ -1973,15 +1971,16 @@ impl Manifest {
     }
 }
 
-/// Resolve the bounded local TOML dependency graph and publish its manifest.
+/// Resolve a bounded TOML dependency graph and publish its manifest.
 ///
 /// This is a bare update: the root's previous selection is replaced from its
 /// current requirements. Direct requirements win before dependency manifests
 /// are inherited, and the remaining graph follows the pin's reverse
-/// breadth-first order (Lake/Load/Resolve.lean). No dependency is modified.
-/// Git fetching, executable configuration, custom selectors and toolchain
-/// changes remain explicit unavailable outcomes. Every input is rechecked
-/// before the one atomic root-manifest publication.
+/// breadth-first order (Lake/Load/Resolve.lean). Git dependencies are staged at
+/// verified detached commits; every configuration input is rechecked before
+/// publishing checkouts and the atomic root manifest. A later failure rolls
+/// published checkouts back into the retained private job directory.
+/// Custom selectors and toolchain changes remain explicit unavailable outcomes.
 pub fn update_manifest(dir: &Path) -> Result<Manifest, LakeUpdateError> {
     update_manifest_with_lean(dir, |root, _| {
         Err(LakeUpdateError::Unsupported(format!(
@@ -1991,7 +1990,7 @@ pub fn update_manifest(dir: &Path) -> Result<Manifest, LakeUpdateError> {
     })
 }
 
-/// Resolve local Lean/TOML packages using the caller's checked Lean loader.
+/// Resolve local and Git Lean/TOML packages using the caller's checked Lean loader.
 ///
 /// `load_lean` receives the canonical package directory and the exact bounded
 /// `lakefile.lean` bytes already retained in this update's input snapshot. It
@@ -2058,17 +2057,20 @@ where
     }
     let mut manifest = Manifest::new(&config.name);
     let mut locked = BTreeMap::new();
+    let mut git_transaction = None;
     // Reserve ALL direct names before importing any child's manifest. Without
     // this phase a child's lock could override a later direct requirement.
     for requirement in config.requires.iter().rev() {
-        let path = requirement.path.as_ref().ok_or_else(|| {
-            LakeUpdateError::DependencyResolutionUnavailable {
-                requirements: vec![requirement.name.clone()],
-            }
-        })?;
-        locked
-            .entry(requirement.name.clone())
-            .or_insert_with(|| local_update_entry(requirement.name.clone(), path.clone(), false));
+        if !locked.contains_key(&requirement.name) {
+            let entry = update_requirement_entry(
+                &root,
+                Path::new("."),
+                requirement,
+                false,
+                None,
+            )?;
+            locked.insert(requirement.name.clone(), entry);
+        }
     }
     let mut selected = BTreeMap::from([(config.name.clone(), 0usize)]);
     let mut packages = vec![LocalUpdatePackage {
@@ -2100,23 +2102,14 @@ where
             let mut entry = if let Some(entry) = locked.get(&requirement.name) {
                 entry.clone()
             } else {
-                let path = requirement.path.as_ref().ok_or_else(|| {
-                    LakeUpdateError::DependencyResolutionUnavailable {
-                        requirements: vec![requirement.name.clone()],
-                    }
-                })?;
-                local_update_entry(
-                    requirement.name.clone(),
-                    packages[next].relative.join(path),
+                update_requirement_entry(
+                    &root,
+                    &packages[next].relative,
+                    requirement,
                     true,
-                )
+                    git_transaction.as_ref(),
+                )?
             };
-            if entry.entry_type != "path" {
-                return Err(LakeUpdateError::DependencyResolutionUnavailable {
-                    requirements: vec![entry.name.clone()],
-                }
-                .into());
-            }
             if !matches!(
                 entry.config_file.as_str(),
                 "lakefile" | "lakefile.toml" | "lakefile.lean"
@@ -2131,11 +2124,82 @@ where
                 ))
                 .into());
             }
-            let path = entry.dir.as_deref().ok_or_else(|| {
-                LakeUpdateError::Parse(format!("path dependency {} has no directory", entry.name))
-            })?;
-            let directory = update_dependency_directory(&root, path)?;
-            let relative = relative_update_directory(&root, &directory)?;
+            let directory = match entry.entry_type.as_str() {
+                "path" => {
+                    let path = entry.dir.as_deref().ok_or_else(|| {
+                        LakeUpdateError::Parse(format!(
+                            "path dependency {} has no directory",
+                            entry.name,
+                        ))
+                    })?;
+                    update_dependency_directory(&root, path, git_transaction.as_ref())?
+                }
+                "git" => {
+                    let subdir = update_git_subdir(entry.subdir.as_deref())?;
+                    let url = entry.url.as_deref().ok_or_else(|| {
+                        LakeUpdateError::Parse(format!(
+                            "Git dependency {} has no URL",
+                            entry.name,
+                        ))
+                    })?;
+                    let url = update_git_url(
+                        &root,
+                        Path::new("."),
+                        url,
+                        git_transaction.as_ref(),
+                    )?;
+                    entry.url = Some(url.clone());
+                    if entry.rev.as_deref().is_some_and(|rev| !git::full_revision(rev)) {
+                        return Err(LakeUpdateError::Parse(format!(
+                            "locked Git dependency {} lacks a full commit revision",
+                            entry.name,
+                        ))
+                        .into());
+                    }
+                    if git_transaction.is_none() {
+                        git_transaction = Some(
+                            git::Transaction::new(&root.join(".lake/packages"))
+                                .map_err(|error| update_git_error(&entry.name, error))?,
+                        );
+                    }
+                    let transaction = git_transaction.as_mut().expect("initialized above");
+                    let fetch_url = if url.contains("://") {
+                        url.clone()
+                    } else {
+                        transaction
+                            .materialized_directory(Path::new(&url))
+                            .to_str()
+                            .ok_or_else(|| {
+                                LakeUpdateError::Unsupported(
+                                    "Git source paths must be UTF-8".to_owned(),
+                                )
+                            })?
+                            .to_owned()
+                    };
+                    let prepared = transaction
+                        .prepare(
+                            &entry.name,
+                            &fetch_url,
+                            entry.rev.as_deref().or(entry.input_rev.as_deref()),
+                            &root,
+                        )
+                        .map_err(|error| update_git_error(&entry.name, error))?;
+                    entry.rev = Some(prepared.revision);
+                    entry.dir = None;
+                    update_dependency_directory(&prepared.directory, &subdir, None)?
+                }
+                _ => {
+                    return Err(LakeUpdateError::DependencyResolutionUnavailable {
+                        requirements: vec![entry.name.clone()],
+                    }
+                    .into());
+                }
+            };
+            let published = git_transaction.as_ref().map_or_else(
+                || directory.clone(),
+                |transaction| transaction.published_directory(&directory),
+            );
+            let relative = relative_update_directory(&root, &published)?;
             let (config, dependency_toolchain, config_file) = update_package_configuration(
                 &directory,
                 &entry.config_file,
@@ -2145,11 +2209,13 @@ where
             )?;
             if next == 0 && dependency_toolchain.is_some() && dependency_toolchain != toolchain {
                 return Err(LakeUpdateError::Unsupported(format!(
-                    "dependency {} requires toolchain selection; local manifest updates do not change lean-toolchain",
+                    "dependency {} requires toolchain selection; manifest updates do not change lean-toolchain",
                     entry.name,
                 )).into());
             }
-            entry.dir = Some(relative.clone());
+            if entry.entry_type == "path" {
+                entry.dir = Some(relative.clone());
+            }
             entry.config_file = config_file.to_owned();
             entry.manifest_file = Some(PathBuf::from("lake-manifest.json"));
             locked.insert(entry.name.clone(), entry.clone());
@@ -2174,6 +2240,26 @@ where
                     inherited_entry.inherited = true;
                     if let Some(path) = inherited_entry.dir.take() {
                         inherited_entry.dir = Some(relative.join(path));
+                    }
+                    if inherited_entry.entry_type == "git"
+                        && let Some(url) = inherited_entry.url.as_deref()
+                        && !url.contains("://")
+                        && !url.contains("::")
+                        && !(url.contains('@') && url.contains(':'))
+                        && !Path::new(url).is_absolute()
+                    {
+                        // Preserve the declaring package's base without resolving
+                        // unused lock entries or exposing private staging names.
+                        let path = root.join(&relative).join(url);
+                        inherited_entry.url = Some(
+                            path.to_str()
+                                .ok_or_else(|| {
+                                    LakeUpdateError::Unsupported(
+                                        "Git source paths must be UTF-8".to_owned(),
+                                    )
+                                })?
+                                .to_owned(),
+                        );
                     }
                     locked.insert(inherited_entry.name.clone(), inherited_entry);
                 }
@@ -2217,9 +2303,25 @@ where
         .into_iter()
         .filter_map(|package| package.entry)
         .collect();
-    manifest
-        .save_to_dir(&root)
-        .map_err(|error| LakeUpdateError::Io(error.to_string()))?;
+    if let Some(transaction) = &mut git_transaction
+        && let Err(error) = transaction.promote()
+    {
+        return Err(update_git_rollback(
+            update_git_error("package publication", error),
+            &mut git_transaction,
+        )
+        .into());
+    }
+    if let Err(error) = manifest.save_to_dir(&root) {
+        return Err(update_git_rollback(
+            LakeUpdateError::Io(error.to_string()),
+            &mut git_transaction,
+        )
+        .into());
+    }
+    if let Some(transaction) = &mut git_transaction {
+        transaction.commit();
+    }
     Ok(manifest)
 }
 
@@ -2254,6 +2356,137 @@ fn local_update_entry(name: String, dir: PathBuf, inherited: bool) -> ManifestPa
         config_file: "lakefile".to_owned(),
         manifest_file: Some(PathBuf::from("lake-manifest.json")),
     }
+}
+
+fn update_git_error(name: &str, error: LakeFetchError) -> LakeUpdateError {
+    match error {
+        LakeFetchError::Resource(detail) => LakeUpdateError::Resource(format!("{name}: {detail}")),
+        LakeFetchError::InvalidInput(detail) => LakeUpdateError::Parse(format!("{name}: {detail}")),
+        LakeFetchError::CapabilityDenied(detail) => {
+            LakeUpdateError::Unsupported(format!("{name}: {detail}"))
+        }
+        other => LakeUpdateError::Io(format!("{name}: {other}")),
+    }
+}
+
+fn update_git_rollback(
+    original: LakeUpdateError,
+    transaction: &mut Option<git::Transaction>,
+) -> LakeUpdateError {
+    if let Some(transaction) = transaction
+        && let Err(rollback) = transaction.rollback()
+    {
+        return LakeUpdateError::Io(format!(
+            "{original}; checkout rollback also failed: {rollback}",
+        ));
+    }
+    original
+}
+
+fn update_git_subdir(subdir: Option<&str>) -> Result<PathBuf, LakeUpdateError> {
+    let text = subdir.unwrap_or(".");
+    let path = PathBuf::from(text);
+    if path.components().count() > 128 {
+        return Err(LakeUpdateError::Resource(
+            "Git subDir exceeds 128 components".to_owned(),
+        ));
+    }
+    if text.contains('\\')
+        || text.chars().any(char::is_control)
+        || path.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(LakeUpdateError::Parse(
+            "Git subDir must stay inside its checkout".to_owned(),
+        ));
+    }
+    Ok(path)
+}
+
+fn update_git_url(
+    root: &Path,
+    relative: &Path,
+    url: &str,
+    transaction: Option<&git::Transaction>,
+) -> Result<String, LakeUpdateError> {
+    if url.is_empty() || url.chars().any(char::is_control) {
+        return Err(LakeUpdateError::Parse(
+            "Git URL is empty or contains control characters".to_owned(),
+        ));
+    }
+    if url.len() > 16 * 1024 {
+        return Err(LakeUpdateError::Resource(
+            "Git URL exceeds 16 KiB".to_owned(),
+        ));
+    }
+    if url.contains("://") || url.contains("::") || url.contains('@') && url.contains(':') {
+        return git::source_url(root, url)
+            .map_err(|error| update_git_error("Git URL", error))?
+            .into_string()
+            .map_err(|_| LakeUpdateError::Unsupported("Git URLs must be UTF-8".to_owned()));
+    }
+    let directory = update_dependency_directory(root, &relative.join(url), transaction)?;
+    let published = transaction.map_or_else(
+        || directory.clone(),
+        |transaction| transaction.published_directory(&directory),
+    );
+    published
+        .into_os_string()
+        .into_string()
+        .map_err(|_| LakeUpdateError::Unsupported("Git source paths must be UTF-8".to_owned()))
+}
+
+fn update_requirement_entry(
+    root: &Path,
+    relative: &Path,
+    requirement: &LakeRequire,
+    inherited: bool,
+    transaction: Option<&git::Transaction>,
+) -> Result<ManifestPackageEntry, LakeUpdateError> {
+    if let Some(path) = &requirement.path {
+        return Ok(local_update_entry(
+            requirement.name.clone(),
+            relative.join(path),
+            inherited,
+        ));
+    }
+    let url = requirement.url.as_deref().ok_or_else(|| {
+        LakeUpdateError::DependencyResolutionUnavailable {
+            requirements: vec![requirement.name.clone()],
+        }
+    })?;
+    update_git_subdir(requirement.subdir.as_deref())?;
+    let url = update_git_url(root, relative, url, transaction).map_err(|error| {
+        let name = &requirement.name;
+        match error {
+            LakeUpdateError::Resource(detail) => {
+                LakeUpdateError::Resource(format!("{name}: {detail}"))
+            }
+            LakeUpdateError::Unsupported(detail) => {
+                LakeUpdateError::Unsupported(format!("{name}: {detail}"))
+            }
+            LakeUpdateError::Parse(detail) => LakeUpdateError::Parse(format!("{name}: {detail}")),
+            LakeUpdateError::Io(detail) => LakeUpdateError::Io(format!("{name}: {detail}")),
+            other => other,
+        }
+    })?;
+    Ok(ManifestPackageEntry {
+        name: requirement.name.clone(),
+        scope: String::new(),
+        entry_type: "git".to_owned(),
+        dir: None,
+        url: Some(url),
+        rev: None,
+        input_rev: requirement.rev.clone(),
+        subdir: requirement.subdir.clone(),
+        inherited,
+        config_file: "lakefile".to_owned(),
+        manifest_file: Some(PathBuf::from("lake-manifest.json")),
+    })
 }
 
 fn parse_update_manifest(bytes: &[u8]) -> Result<Manifest, LakeUpdateError> {
@@ -2476,10 +2709,11 @@ fn validate_update_requirements(config: &LakeConfig) -> Result<(), LakeUpdateErr
         .requires
         .iter()
         .filter(|requirement| {
-            requirement.path.is_none()
-                || requirement.url.is_some()
-                || requirement.rev.is_some()
-                || requirement.subdir.is_some()
+            match (&requirement.path, &requirement.url) {
+                (Some(_), None) => requirement.rev.is_some() || requirement.subdir.is_some(),
+                (None, Some(_)) => false,
+                _ => true,
+            }
         })
         .map(|requirement| requirement.name.clone())
         .collect();
@@ -2492,7 +2726,11 @@ fn validate_update_requirements(config: &LakeConfig) -> Result<(), LakeUpdateErr
 }
 
 /// Inspect every component BEFORE normalizing away parent components.
-fn update_dependency_directory(root: &Path, path: &Path) -> Result<PathBuf, LakeUpdateError> {
+fn update_dependency_directory(
+    root: &Path,
+    path: &Path,
+    transaction: Option<&git::Transaction>,
+) -> Result<PathBuf, LakeUpdateError> {
     use std::path::Component;
 
     if path.components().count() > 128 {
@@ -2515,7 +2753,11 @@ fn update_dependency_directory(root: &Path, path: &Path) -> Result<PathBuf, Lake
             }
             Component::Normal(part) => cursor.push(part),
         }
-        let metadata = fs::symlink_metadata(&cursor)
+        let materialized = transaction.map_or_else(
+            || cursor.clone(),
+            |transaction| transaction.materialized_directory(&cursor),
+        );
+        let metadata = fs::symlink_metadata(&materialized)
             .map_err(|error| LakeUpdateError::Io(format!("{}: {error}", cursor.display())))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(LakeUpdateError::Parse(format!(
@@ -2524,7 +2766,11 @@ fn update_dependency_directory(root: &Path, path: &Path) -> Result<PathBuf, Lake
             )));
         }
     }
-    fs::canonicalize(&cursor)
+    let materialized = transaction.map_or_else(
+        || cursor.clone(),
+        |transaction| transaction.materialized_directory(&cursor),
+    );
+    fs::canonicalize(&materialized)
         .map_err(|error| LakeUpdateError::Io(format!("{}: {error}", cursor.display())))
 }
 
