@@ -185,7 +185,14 @@ mod tests {
             range: 0..3,
             kind: SemanticTokenKind::Keyword,
         };
-        for range in [1..2, 5..6, 6..7, 7..10, 7..7, 8..7] {
+        for range in [
+            1..2,
+            5..6,
+            6..7,
+            7..10,
+            7..7,
+            std::ops::Range { start: 8, end: 7 },
+        ] {
             assert!(
                 result(
                     &[

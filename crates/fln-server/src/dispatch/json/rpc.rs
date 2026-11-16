@@ -199,6 +199,44 @@ pub(in crate::dispatch) fn go_to(
     Ok((kind, reference(object_field(raw, "info"), format)?))
 }
 
+pub(in crate::dispatch) fn widget_source(
+    value: RawField<'_>,
+) -> Result<(u64, Position), &'static str> {
+    let raw = object(value)?;
+    let hash = integer(object_field(raw, "hash"))?;
+    let pos_field = object_field(raw, "pos");
+    object(pos_field)?;
+    let pos = position(pos_field)?;
+    Ok((hash, pos))
+}
+
+pub(in crate::dispatch) fn msg_to_interactive(
+    value: RawField<'_>,
+    format: WireFormat,
+) -> Result<(u64, usize), &'static str> {
+    let raw = object(value)?;
+    let msg = reference(object_field(raw, "msg"), format)?;
+    let RawField::Value(indent_raw) = object_field(raw, "indent") else {
+        return Err("RPC msgToInteractive requires an unambiguous natural indent");
+    };
+    let indent_raw = indent_raw.trim();
+    if indent_raw.is_empty()
+        || indent_raw.len() > 20
+        || !indent_raw.bytes().all(|byte| byte.is_ascii_digit())
+        || (indent_raw.len() > 1 && indent_raw.starts_with('0'))
+    {
+        return Err("RPC msgToInteractive indent must be a JSON natural number");
+    }
+    let indent_u64: u64 = indent_raw
+        .parse()
+        .map_err(|_| "RPC msgToInteractive indent exceeds UInt64")?;
+    let indent = usize::try_from(indent_u64)
+        .ok()
+        .filter(|&indent| indent <= 4096)
+        .ok_or("RPC msgToInteractive indent exceeds its bound")?;
+    Ok((msg, indent))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +333,45 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn widget_source_and_msg_to_interactive_enforce_pinned_parameter_shapes() {
+        let (hash, pos) = widget_source(RawField::Value(
+            r#"{"hash":"18446744073709551615","pos":{"line":2,"character":4}}"#,
+        ))
+        .unwrap();
+        assert_eq!(hash, u64::MAX);
+        assert_eq!((pos.line, pos.character), (2, 4));
+        for bad in [
+            r#"{"hash":12345,"pos":{"line":0,"character":0}}"#,
+            r#"{"hash":"12345","ha\u0073h":"1","pos":{"line":0,"character":0}}"#,
+            r#"{"hash":"12345","pos":null}"#,
+            r#"{"hash":"12345"}"#,
+        ] {
+            assert!(widget_source(RawField::Value(bad)).is_err(), "{bad}");
+        }
+        for format in [WireFormat::V0, WireFormat::V1] {
+            let valid = format!(r#"{{"msg":{},"indent":4}}"#, format.reference(42));
+            assert_eq!(
+                msg_to_interactive(RawField::Value(&valid), format),
+                Ok((42, 4))
+            );
+            for bad in [
+                format!(r#"{{"msg":{},"indent":"4"}}"#, format.reference(42)),
+                format!(r#"{{"msg":{},"indent":-1}}"#, format.reference(42)),
+                format!(r#"{{"msg":{},"indent":01}}"#, format.reference(42)),
+                format!(r#"{{"msg":{},"indent":5000}}"#, format.reference(42)),
+                format!(
+                    r#"{{"msg":{},"indent":0,"in\u0064ent":1}}"#,
+                    format.reference(42)
+                ),
+            ] {
+                assert!(
+                    msg_to_interactive(RawField::Value(&bad), format).is_err(),
+                    "{bad}"
+                );
+            }
+        }
     }
 }

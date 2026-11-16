@@ -220,7 +220,10 @@ pub(super) enum RpcProcedure {
     Diagnostics,
     Highlight,
     Widgets,
+    WidgetSource,
     InfoPopup,
+    MsgToInteractive,
+    LazyTraceChildren,
     GoToLocation,
 }
 
@@ -232,7 +235,10 @@ impl RpcProcedure {
             "Lean.Widget.getInteractiveDiagnostics" => Some(Self::Diagnostics),
             "Lean.Widget.highlightMatches" => Some(Self::Highlight),
             "Lean.Widget.getWidgets" => Some(Self::Widgets),
+            "Lean.Widget.getWidgetSource" => Some(Self::WidgetSource),
             "Lean.Widget.InteractiveDiagnostics.infoToInteractive" => Some(Self::InfoPopup),
+            "Lean.Widget.InteractiveDiagnostics.msgToInteractive" => Some(Self::MsgToInteractive),
+            "Lean.Widget.lazyTraceChildrenToInteractive" => Some(Self::LazyTraceChildren),
             "Lean.Widget.getGoToLocation" => Some(Self::GoToLocation),
             _ => None,
         }
@@ -325,6 +331,16 @@ impl RpcProcedure {
                 array_elements(widgets, 256)
                     .is_some_and(|widgets| widgets.into_iter().all(rpc_panel_widget))
             }
+            Self::WidgetSource => {
+                object_has_only_keys(root, &["sourcetext"])
+                    && matches!(
+                        object_string_member(root, "sourcetext"),
+                        DecodedField::Valid(_)
+                    )
+            }
+            Self::MsgToInteractive => rpc_tagged_text(root),
+            Self::LazyTraceChildren => array_elements(value, 4096)
+                .is_some_and(|items| items.into_iter().all(|item| rpc_tagged_text(RawField::Value(item)))),
         }
     }
 }

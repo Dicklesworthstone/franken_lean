@@ -104,7 +104,9 @@ fn tokens(messages: &[String], id: usize) -> Vec<[u32; 4]> {
     };
     assert_eq!(data.len() % 5, 0);
     let mut last = (0, 0);
-    data.chunks_exact(5)
+    data.as_chunks::<5>()
+        .0
+        .iter()
         .map(|token| {
             last.0 += token[0];
             last.1 = if token[0] == 0 {

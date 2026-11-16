@@ -1755,6 +1755,58 @@ mod tests {
         assert_eq!(stats.server.error_responses, 1);
         assert_eq!(stats.unknown_method_not_found_errors, 1);
     }
+
+    #[test]
+    fn widget_source_msg_and_lazy_trace_rpc_contracts_validate_results_and_refuse_not_found() {
+        let client = framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"ws","method":"$/lean/rpc/call","params":{"method":"Lean.Widget.getWidgetSource","params":{"hash":"1","pos":{"line":0,"character":0}}}}"#,
+            r#"{"jsonrpc":"2.0","id":"msg","method":"$/lean/rpc/call","params":{"method":"Lean.Widget.InteractiveDiagnostics.msgToInteractive","params":{"msg":{"p":"0"},"indent":2}}}"#,
+            r#"{"jsonrpc":"2.0","id":"lazy","method":"$/lean/rpc/call","params":{"method":"Lean.Widget.lazyTraceChildrenToInteractive","params":{"p":"1"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ]);
+        let valid_server = framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"ws","result":{"sourcetext":"export default () => null"}}"#,
+            r#"{"jsonrpc":"2.0","id":"msg","result":{"text":"indented"}}"#,
+            r#"{"jsonrpc":"2.0","id":"lazy","result":[{"text":"child"}]}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+        ]);
+        let stats = correlate_transcripts(&client, &valid_server).unwrap();
+        assert_eq!(stats.rpc_call_results, 3);
+
+        let typed_refusal_server = framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"ws","error":{"code":-32602,"message":"No widget module with hash 1 registered"}}"#,
+            r#"{"jsonrpc":"2.0","id":"msg","error":{"code":-32602,"message":"RPC reference '0' is not valid"}}"#,
+            r#"{"jsonrpc":"2.0","id":"lazy","error":{"code":-32602,"message":"RPC reference '1' is not valid"}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+        ]);
+        let stats = correlate_transcripts(&client, &typed_refusal_server).unwrap();
+        assert_eq!(stats.rpc_errors, 3);
+
+        // Returning -32601 MethodNotFound or a malformed payload for any of the 10
+        // builtin procedures must be rejected by the correlator.
+        for bad_ws in [
+            r#"{"jsonrpc":"2.0","id":"ws","error":{"code":-32601,"message":"not implemented"}}"#,
+            r#"{"jsonrpc":"2.0","id":"ws","result":{"sourcetext":123}}"#,
+            r#"{"jsonrpc":"2.0","id":"ws","result":{"sourcetext":"ok","extra":true}}"#,
+        ] {
+            let bad_server = framed(&[
+                r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
+                bad_ws,
+                r#"{"jsonrpc":"2.0","id":"msg","result":{"text":"indented"}}"#,
+                r#"{"jsonrpc":"2.0","id":"lazy","result":[{"text":"child"}]}"#,
+                r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+            ]);
+            assert!(
+                correlate_transcripts(&client, &bad_server).is_err(),
+                "{bad_ws}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -782,3 +782,79 @@ fn get_widgets_returns_empty_panel_list_and_enforces_bare_position_and_session_g
         }
     }
 }
+
+#[test]
+fn remaining_builtin_infoview_procedures_never_return_method_not_found_and_match_pinned_refusals() {
+    let rpc_call = |id: &str, session: &str, method: &str, params: &str| {
+        request(
+            id,
+            "$/lean/rpc/call",
+            &format!(
+                r#"{{"sessionId":{},"method":{},"params":{params},"textDocument":{{"uri":"{URI}"}},"position":{{"line":1,"character":2}}}}"#,
+                quote(session),
+                quote(method),
+            ),
+        )
+    };
+    for (binary, args) in [
+        (env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        (env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        for (format, key) in [("v0", "p"), ("v1", "__rpcref")] {
+            let mut client = Client::start(binary, args, format);
+            client.open(SOURCE);
+            let session = client.connect("connect");
+            let goals = client.exchange(
+                "goals",
+                &call("goals", &session, "Lean.Widget.getInteractiveGoals", 1, 2),
+            );
+            let info = expression_reference(&goals, "P", key).to_owned();
+
+            let ws = client.exchange(
+                "ws",
+                &rpc_call(
+                    "ws",
+                    &session,
+                    "Lean.Widget.getWidgetSource",
+                    r#"{"hash":"12345","pos":{"line":0,"character":0}}"#,
+                ),
+            );
+            assert!(ws.contains("\"code\":-32602"), "{ws}");
+            assert!(
+                ws.contains("No widget module with hash 12345 registered"),
+                "{ws}"
+            );
+
+            let msg_type_mismatch = client.exchange(
+                "msg-mismatch",
+                &rpc_call(
+                    "msg-mismatch",
+                    &session,
+                    "Lean.Widget.InteractiveDiagnostics.msgToInteractive",
+                    &format!(r#"{{"msg":{{"{key}":"{info}"}},"indent":0}}"#),
+                ),
+            );
+            assert!(
+                msg_type_mismatch.contains("\"code\":-32602")
+                    && msg_type_mismatch.contains("expected 'Lean.MessageData'"),
+                "{msg_type_mismatch}"
+            );
+
+            let lazy_type_mismatch = client.exchange(
+                "lazy-mismatch",
+                &rpc_call(
+                    "lazy-mismatch",
+                    &session,
+                    "Lean.Widget.lazyTraceChildrenToInteractive",
+                    &format!(r#"{{"{key}":"{info}"}}"#),
+                ),
+            );
+            assert!(
+                lazy_type_mismatch.contains("\"code\":-32602")
+                    && lazy_type_mismatch.contains("expected 'Lean.Widget.LazyTraceChildren'"),
+                "{lazy_type_mismatch}"
+            );
+            client.finish();
+        }
+    }
+}

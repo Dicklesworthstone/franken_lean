@@ -1188,3 +1188,153 @@ fn widgets_query_validates_bare_positions_and_preserves_session_guards() {
         ));
     }
 }
+
+#[test]
+fn widget_source_msg_to_interactive_and_lazy_trace_children_obey_pinned_contracts() {
+    let call_with = |session: u64, method: &str, params: &str| {
+        format!(
+            r#"{{"textDocument":{{"uri":"{URI}"}},"position":{{"line":0,"character":0}},"sessionId":"{session}","method":"{method}","params":{params}}}"#
+        )
+    };
+    for format in [WireFormat::V0, WireFormat::V1] {
+        let mut sessions = Sessions {
+            format,
+            ..Sessions::default()
+        };
+        let id = sessions.create(URI.into(), Instant::now()).unwrap();
+        let mut docs = DocumentSession::new();
+        docs.open(URI.into(), 1, "😀\ndef x := 1\n".into()).unwrap();
+        let mut provider = Provider {
+            result: Some(annotated_answer()),
+            ..Provider::new()
+        };
+        execute(&mut sessions, id, &docs, &mut provider).unwrap();
+
+        // 1. getWidgetSource: valid pos + string hash -> -32602 "No widget module with hash ... registered"
+        let ws = call_with(
+            id,
+            "Lean.Widget.getWidgetSource",
+            r#"{"hash":"12345","pos":{"line":1,"character":2}}"#,
+        );
+        assert_eq!(
+            sessions.execute(
+                "$/lean/rpc/call",
+                RawField::Value(&ws),
+                &docs,
+                &mut provider
+            ),
+            Err((
+                -32602,
+                "No widget module with hash 12345 registered".to_owned()
+            ))
+        );
+        // Invalid UTF-16 surrogate position or numeric hash -> -32602
+        for bad_ws in [
+            r#"{"hash":12345,"pos":{"line":0,"character":0}}"#,
+            r#"{"hash":"12345","pos":{"line":0,"character":1}}"#,
+        ] {
+            let input = call_with(id, "Lean.Widget.getWidgetSource", bad_ws);
+            assert!(
+                matches!(
+                    sessions.execute(
+                        "$/lean/rpc/call",
+                        RawField::Value(&input),
+                        &docs,
+                        &mut provider
+                    ),
+                    Err((-32602, _))
+                ),
+                "{bad_ws}"
+            );
+        }
+
+        // 2. msgToInteractive & lazyTraceChildrenToInteractive:
+        // Unknown reference or wrong ReferenceKind (`InfoWithCtx` ref 0) -> -32602
+        let wrong_msg = call_with(
+            id,
+            "Lean.Widget.InteractiveDiagnostics.msgToInteractive",
+            &format!(r#"{{"msg":{},"indent":2}}"#, format.reference(0)),
+        );
+        let (_, detail) = sessions
+            .execute(
+                "$/lean/rpc/call",
+                RawField::Value(&wrong_msg),
+                &docs,
+                &mut provider,
+            )
+            .unwrap_err();
+        assert!(detail.contains("expected 'Lean.MessageData'"), "{detail}");
+
+        let unknown_msg = call_with(
+            id,
+            "Lean.Widget.InteractiveDiagnostics.msgToInteractive",
+            &format!(r#"{{"msg":{},"indent":0}}"#, format.reference(999_999)),
+        );
+        assert!(matches!(
+            sessions.execute(
+                "$/lean/rpc/call",
+                RawField::Value(&unknown_msg),
+                &docs,
+                &mut provider
+            ),
+            Err((-32602, _))
+        ));
+
+        let wrong_lazy = call_with(
+            id,
+            "Lean.Widget.lazyTraceChildrenToInteractive",
+            &format.reference(0),
+        );
+        let (_, detail) = sessions
+            .execute(
+                "$/lean/rpc/call",
+                RawField::Value(&wrong_lazy),
+                &docs,
+                &mut provider,
+            )
+            .unwrap_err();
+        assert!(
+            detail.contains("expected 'Lean.Widget.LazyTraceChildren'"),
+            "{detail}"
+        );
+
+        let unknown_lazy = call_with(
+            id,
+            "Lean.Widget.lazyTraceChildrenToInteractive",
+            &format.reference(999_999),
+        );
+        let (code, detail) = sessions
+            .execute(
+                "$/lean/rpc/call",
+                RawField::Value(&unknown_lazy),
+                &docs,
+                &mut provider,
+            )
+            .unwrap_err();
+        assert_eq!(code, -32602);
+        assert!(
+            detail.contains("RPC reference '999999' is not valid"),
+            "{detail}"
+        );
+
+        // Unnegotiated wire format key (`v0` vs `v1`) is refused as -32602.
+        let other = match format {
+            WireFormat::V0 => WireFormat::V1,
+            WireFormat::V1 => WireFormat::V0,
+        };
+        let wrong_format_lazy = call_with(
+            id,
+            "Lean.Widget.lazyTraceChildrenToInteractive",
+            &other.reference(0),
+        );
+        assert!(matches!(
+            sessions.execute(
+                "$/lean/rpc/call",
+                RawField::Value(&wrong_format_lazy),
+                &docs,
+                &mut provider
+            ),
+            Err((-32602, _))
+        ));
+    }
+}

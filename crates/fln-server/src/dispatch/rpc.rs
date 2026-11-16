@@ -225,6 +225,30 @@ impl Session {
         Ok(popup_json(expression, info))
     }
 
+    fn interactive_message(&self, id: u64, _indent: usize) -> Result<String> {
+        // Native diagnostics emit plain `TaggedText` (`{"text":...}`) directly
+        // without allocating opaque `MessageData` RPC references. An unknown ID
+        // is refused as an invalid reference; an existing goal/expression ID is
+        // refused as a `WithRpcRef` type mismatch, matching `Lean.Server.Rpc`.
+        if self.references.contains_key(&id) {
+            Err(invalid(&format!(
+                "RPC call type mismatch in reference '{id}': expected 'Lean.MessageData'"
+            )))
+        } else {
+            Err(invalid(&format!("RPC reference '{id}' is not valid")))
+        }
+    }
+
+    fn lazy_trace_children(&self, id: u64) -> Result<String> {
+        if self.references.contains_key(&id) {
+            Err(invalid(&format!(
+                "RPC call type mismatch in reference '{id}': expected 'Lean.Widget.LazyTraceChildren'"
+            )))
+        } else {
+            Err(invalid(&format!("RPC reference '{id}' is not valid")))
+        }
+    }
+
     fn go_to(&self, id: u64, kind: params::GoToKind) -> Result<String> {
         let (_, info) = self.expression(id)?;
         let locations = match kind {
@@ -450,6 +474,35 @@ impl Sessions {
             json::byte_offset(text, position).map_err(invalid)?;
             self.session(call.session, &call.uri, Instant::now())?;
             return Ok("{\"widgets\":[]}".to_owned());
+        }
+        if call.method == "Lean.Widget.getWidgetSource" {
+            // Pinned contract (`Lean/Widget/UserWidget.lean:95-124`): `getWidgetSource`
+            // decodes `{ hash : UInt64, pos : Lean.Lsp.Position }`, validates `pos`
+            // against the open document, and refuses unregistered hashes with `-32602`
+            // (`"No widget module with hash <hash> registered"`).
+            let (hash, position) = params::widget_source(call.params).map_err(invalid)?;
+            json::byte_offset(text, position).map_err(invalid)?;
+            self.session(call.session, &call.uri, Instant::now())?;
+            return Err(invalid(&format!(
+                "No widget module with hash {hash} registered"
+            )));
+        }
+        if call.method == "Lean.Widget.InteractiveDiagnostics.msgToInteractive" {
+            let (reference, indent) =
+                params::msg_to_interactive(call.params, self.format).map_err(invalid)?;
+            let result = self
+                .session(call.session, &call.uri, Instant::now())?
+                .interactive_message(reference, indent)?;
+            self.session(call.session, &call.uri, Instant::now())?;
+            return Ok(result);
+        }
+        if call.method == "Lean.Widget.lazyTraceChildrenToInteractive" {
+            let reference = params::reference(call.params, self.format).map_err(invalid)?;
+            let result = self
+                .session(call.session, &call.uri, Instant::now())?
+                .lazy_trace_children(reference)?;
+            self.session(call.session, &call.uri, Instant::now())?;
+            return Ok(result);
         }
         let kind = match call.method.as_str() {
             "Lean.Widget.getInteractiveGoals" => QueryKind::InteractiveGoals,
