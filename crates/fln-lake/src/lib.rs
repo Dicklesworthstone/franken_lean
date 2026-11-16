@@ -2177,7 +2177,7 @@ where
                             .to_owned()
                     };
                     let prepared = transaction
-                        .prepare(
+                        .prepare_update(
                             &entry.name,
                             &fetch_url,
                             entry.rev.as_deref().or(entry.input_rev.as_deref()),

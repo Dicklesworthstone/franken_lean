@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 const MAX_OUTPUT: u64 = 1024 * 1024;
 const MAX_EXECUTABLE: u64 = 64 * 1024 * 1024;
+const MAX_INDEX: u64 = 64 * 1024 * 1024;
 const MAX_ARGUMENT: usize = 16 * 1024;
 const DEADLINE: Duration = Duration::from_secs(120);
 static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
@@ -129,6 +130,24 @@ fn read_bounded(path: &Path, bound: u64) -> Result<Vec<u8>, LakeFetchError> {
     Ok(bytes)
 }
 
+fn capture_prefix(path: &Path) -> Result<(Vec<u8>, u64), LakeFetchError> {
+    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(invalid("Git output capture is not a regular nonsymlink file"));
+    }
+    let file = File::open(path).map_err(io_error)?;
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(invalid("Git output capture is not a regular file"));
+    }
+    let length = metadata.len();
+    let mut bytes = Vec::new();
+    file.take(MAX_OUTPUT)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    Ok((bytes, length))
+}
+
 fn executable_digest(path: &Path) -> Result<Digest, LakeFetchError> {
     let file = File::open(path).map_err(io_error)?;
     let metadata = file.metadata().map_err(io_error)?;
@@ -190,9 +209,13 @@ pub(super) fn executable() -> Result<PathBuf, LakeFetchError> {
 
 fn redacted(text: &str) -> String {
     if let Some((scheme, address)) = text.split_once("://") {
-        let address = address.split_once('@').map_or(address, |(_, rest)| rest);
         let address = address.split(['?', '#']).next().unwrap_or(address);
-        return format!("{scheme}://{address}");
+        let boundary = address.find('/').unwrap_or(address.len());
+        let (authority, path) = address.split_at(boundary);
+        let authority = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        return format!("{scheme}://{authority}{path}");
     }
     text.to_owned()
 }
@@ -227,6 +250,16 @@ impl Runner {
         label: &str,
         arguments: &[OsString],
     ) -> Result<Vec<u8>, LakeFetchError> {
+        self.run_with_index(cwd, label, arguments, None)
+    }
+
+    fn run_with_index(
+        &mut self,
+        cwd: &Path,
+        label: &str,
+        arguments: &[OsString],
+        input_index: Option<&Path>,
+    ) -> Result<Vec<u8>, LakeFetchError> {
         if arguments.len() > 128
             || arguments
                 .iter()
@@ -234,11 +267,22 @@ impl Runner {
         {
             return Err(resource("Git argument budget exceeded"));
         }
+        if arguments.iter().any(|argument| argument.to_str().is_none()) {
+            return Err(invalid(
+                "Git arguments must be UTF-8 for exact job provenance",
+            ));
+        }
         if executable_digest(&self.executable)? != self.digest {
             return Err(invalid(
                 "Git executable changed during dependency resolution",
             ));
         }
+        let input_index_digest = input_index
+            .map(|path| {
+                read_bounded(path, MAX_INDEX)
+                    .map(|bytes| hash(Domain::ArtifactProduct, &bytes).to_hex())
+            })
+            .transpose()?;
         let index = self.sequence;
         self.sequence += 1;
         let stdout_path = self.job.join(format!("{index}.stdout"));
@@ -272,6 +316,9 @@ impl Runner {
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        if let Some(index) = input_index {
+            command.env("GIT_INDEX_FILE", index);
+        }
         // Preserve explicit proxy routing without recording credential-bearing values.
         for key in [
             "HTTP_PROXY",
@@ -313,34 +360,26 @@ impl Runner {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        let capture = |path: &Path| match read_bounded(path, MAX_OUTPUT) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(LakeFetchError::Resource(_)) => Ok(None),
-            Err(error) => Err(error),
-        };
-        let (stdout, stderr) = match (capture(&stdout_path)?, capture(&stderr_path)?) {
-            (Some(stdout), Some(stderr))
-                if (stdout.len() + stderr.len()) as u64 <= MAX_OUTPUT =>
-            {
-                (stdout, stderr)
-            }
-            _ => {
-                stopped = Some("output-limit");
-                (Vec::new(), Vec::new())
-            }
-        };
+        let (stdout, stdout_bytes) = capture_prefix(&stdout_path)?;
+        let (stderr, stderr_bytes) = capture_prefix(&stderr_path)?;
+        if stdout_bytes.saturating_add(stderr_bytes) > MAX_OUTPUT {
+            stopped = Some("output-limit");
+        }
         let args = arguments
             .iter()
             .map(|argument| manifest_quote(&redacted(&argument.to_string_lossy())))
             .collect::<Vec<_>>()
             .join(",");
         let receipt = format!(
-            "{{\"schema\":\"fln.git-job/1\",\"command\":{},\"executable\":{},\"executable_digest\":{},\"argv\":[{args}],\"pid\":{pid},\"exit\":{},\"stop\":{},\"stdout_digest\":{},\"stderr_digest\":{}}}\n",
+            "{{\"schema\":\"fln.git-job/1\",\"command\":{},\"executable\":{},\"executable_digest\":{},\"argv\":[{args}],\"input_index_digest\":{},\"pid\":{pid},\"exit\":{},\"stop\":{},\"stdout_bytes\":{stdout_bytes},\"stderr_bytes\":{stderr_bytes},\"stdout_hashed_bytes\":{},\"stderr_hashed_bytes\":{},\"stdout_prefix_digest\":{},\"stderr_prefix_digest\":{}}}\n",
             manifest_quote(label),
             manifest_quote(&self.executable.to_string_lossy()),
             manifest_quote(&self.digest.to_hex()),
+            input_index_digest.as_deref().map_or("null".to_owned(), manifest_quote),
             status.code().map_or("null".to_owned(), |code| code.to_string()),
             stopped.map_or("null".to_owned(), manifest_quote),
+            stdout.len(),
+            stderr.len(),
             manifest_quote(&hash(Domain::OperationalMeta, &stdout).to_hex()),
             manifest_quote(&hash(Domain::OperationalMeta, &stderr).to_hex()),
         );
@@ -439,12 +478,158 @@ pub(super) struct Prepared {
     pub revision: String,
 }
 
+struct PreviousCheckout {
+    revision: String,
+    recovery: PathBuf,
+    moved: bool,
+}
+
+struct PendingCheckout {
+    stage: PathBuf,
+    destination: PathBuf,
+    revision: String,
+    previous: Option<PreviousCheckout>,
+    installed: bool,
+}
+
 pub(super) struct Transaction {
     packages: PathBuf,
     runner: Runner,
-    pending: Vec<(PathBuf, PathBuf)>,
-    promoted: usize,
+    pending: Vec<PendingCheckout>,
+    reused: Vec<(PathBuf, String)>,
     committed: bool,
+}
+
+fn checkout_revision(checkout: &Path) -> Result<String, LakeFetchError> {
+    let git = directory(&checkout.join(".git"), false)?;
+    let bytes = read_bounded(&git.join("HEAD"), 4096)?;
+    let revision = std::str::from_utf8(&bytes)
+        .map_err(|_| invalid("existing Git HEAD is not UTF-8"))?
+        .trim();
+    if !full_revision(revision) {
+        return Err(invalid(
+            "existing Git checkout must have a full detached HEAD; no files were changed",
+        ));
+    }
+    Ok(revision.to_owned())
+}
+
+/// Compare the old worktree using the new clone's isolated config and index.
+/// Reading the existing checkout's Git config could execute filters or helpers.
+fn check_existing_worktree(
+    runner: &mut Runner,
+    stage: &Path,
+    destination: &Path,
+    old_revision: &str,
+    new_revision: &str,
+) -> Result<(), LakeFetchError> {
+    if checkout_revision(destination)? != old_revision {
+        return Err(invalid(
+            "existing Git HEAD changed during dependency resolution",
+        ));
+    }
+    // The existing index can contain staged edits absent from the worktree.
+    // Copy its bounded bytes into the private job and let Git read that index
+    // with the fresh clone's config, never the old checkout's config. A split
+    // index whose shared file is unavailable fails without changing either tree.
+    let index = read_bounded(&destination.join(".git/index"), MAX_INDEX)?;
+    let private_index = runner.job.join(format!("old-index-{}", runner.sequence));
+    create_capture(&private_index)?
+        .write_all(&index)
+        .map_err(io_error)?;
+    let prefix = vec![
+        OsString::from("--git-dir"),
+        stage.join(".git").into_os_string(),
+        OsString::from("--work-tree"),
+        destination.to_path_buf().into_os_string(),
+    ];
+    let mut cached_args = prefix.clone();
+    cached_args.extend(
+        [
+            "diff-index",
+            "--cached",
+            "--raw",
+            "--no-ext-diff",
+            "--no-textconv",
+            old_revision,
+            "--",
+        ]
+        .iter()
+        .map(OsString::from),
+    );
+    if !runner
+        .run_with_index(
+            stage,
+            "check-existing-index",
+            &cached_args,
+            Some(&private_index),
+        )?
+        .is_empty()
+    {
+        return Err(invalid(
+            "existing Git checkout has staged changes; no files were changed",
+        ));
+    }
+    runner.text(stage, "index-old-tree", &["read-tree", old_revision])?;
+    let entries = runner.text(stage, "inspect-old-tree", &["ls-files", "--stage"])?;
+    if entries.lines().any(|line| line.starts_with("160000 ")) {
+        return Err(LakeFetchError::CapabilityDenied(
+            "replacing a checkout containing Git submodules requires explicit submodule support"
+                .to_owned(),
+        ));
+    }
+    let mut refresh_args = prefix.clone();
+    refresh_args.extend(
+        ["update-index", "--really-refresh"]
+            .iter()
+            .map(OsString::from),
+    );
+    match runner.run(stage, "refresh-old-worktree", &refresh_args) {
+        Ok(_) => {}
+        Err(LakeFetchError::GitFailed { .. }) => {
+            return Err(invalid(
+                "existing Git checkout has modified files; no files were changed",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    // diff-files compares the old index directly with the old worktree. Status
+    // would also compare that index with the fresh clone's newer HEAD and would
+    // incorrectly reject every revision change as staged modifications.
+    let mut worktree_args = prefix.clone();
+    worktree_args.extend(
+        ["diff-files", "--raw", "--no-ext-diff", "--no-textconv", "--"]
+            .iter()
+            .map(OsString::from),
+    );
+    let mut other_args = prefix.clone();
+    other_args.extend(
+        ["ls-files", "--others", "--exclude-standard"]
+            .iter()
+            .map(OsString::from),
+    );
+    let mut ignored_args = prefix;
+    ignored_args.extend(
+        ["ls-files", "--others", "--ignored", "--exclude-standard"]
+            .iter()
+            .map(OsString::from),
+    );
+    let changed = !runner
+        .run(stage, "check-existing-worktree", &worktree_args)?
+        .is_empty();
+    let untracked = !runner
+        .run(stage, "check-existing-untracked", &other_args)?
+        .is_empty();
+    let ignored = !runner
+        .run(stage, "check-existing-ignored", &ignored_args)?
+        .is_empty();
+    runner.text(stage, "restore-new-index", &["read-tree", new_revision])?;
+    if changed || untracked || ignored {
+        return Err(invalid(
+            "existing Git checkout has modified, untracked, or ignored files; no files were changed",
+        ));
+    }
+    Ok(())
 }
 
 impl Transaction {
@@ -455,7 +640,7 @@ impl Transaction {
             packages,
             runner,
             pending: Vec::new(),
-            promoted: 0,
+            reused: Vec::new(),
             committed: false,
         })
     }
@@ -467,9 +652,35 @@ impl Transaction {
         revision: Option<&str>,
         cwd: &Path,
     ) -> Result<Prepared, LakeFetchError> {
+        self.prepare_inner(name, url, revision, cwd, false)
+    }
+
+    pub fn prepare_update(
+        &mut self,
+        name: &str,
+        url: &str,
+        revision: Option<&str>,
+        cwd: &Path,
+    ) -> Result<Prepared, LakeFetchError> {
+        self.prepare_inner(name, url, revision, cwd, true)
+    }
+
+    fn prepare_inner(
+        &mut self,
+        name: &str,
+        url: &str,
+        revision: Option<&str>,
+        cwd: &Path,
+        replace_clean: bool,
+    ) -> Result<Prepared, LakeFetchError> {
         let component = package_directory(name)?;
         let destination = self.packages.join(component);
-        if self.pending.iter().any(|(_, path)| path == &destination) {
+        if self
+            .pending
+            .iter()
+            .any(|pending| pending.destination == destination)
+            || self.reused.iter().any(|(path, _)| path == &destination)
+        {
             return Err(invalid("Git package was selected twice"));
         }
         let url = source_url(cwd, url)?;
@@ -495,7 +706,10 @@ impl Transaction {
             url,
             stage.clone().into_os_string(),
         ];
-        self.runner.run(&self.packages, "clone", &args)?;
+        // Clone outside any workspace repository so its local configuration
+        // cannot add include files, filters, or transport rewrites.
+        let job = self.runner.job.clone();
+        self.runner.run(&job, "clone", &args)?;
         let resolved = self.runner.text(
             &stage,
             "resolve-commit",
@@ -529,31 +743,55 @@ impl Transaction {
             "checkout",
             &["checkout", "--quiet", "--detach", &commit, "--"],
         )?;
-        if self.runner.text(&stage, "verify-head", &["rev-parse", "--verify", "HEAD"])? != commit {
-            return Err(invalid("detached Git HEAD differs from its resolved commit"));
+        if self
+            .runner
+            .text(&stage, "verify-head", &["rev-parse", "--verify", "HEAD"])?
+            != commit
+        {
+            return Err(invalid(
+                "detached Git HEAD differs from its resolved commit",
+            ));
         }
-        // A preexisting checkout is never changed by a fetch. Transactional
-        // manifest updates handle revision replacements separately.
-        match fs::symlink_metadata(&destination) {
+        let previous = match fs::symlink_metadata(&destination) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                let git = directory(&destination.join(".git"), false)?;
-                let head = read_bounded(&git.join("HEAD"), 4096)?;
-                if std::str::from_utf8(&head).ok().map(str::trim) != Some(commit.as_str()) {
+                let old_revision = checkout_revision(&destination)?;
+                if old_revision == commit {
+                    self.reused.push((destination.clone(), commit.clone()));
+                    return Ok(Prepared {
+                        directory: destination.clone(),
+                        destination,
+                        revision: commit,
+                    });
+                }
+                if !replace_clean {
                     return Err(invalid(
                         "existing Git checkout is not at the requested detached commit; no files were changed",
                     ));
                 }
-                return Ok(Prepared {
-                    directory: destination.clone(),
-                    destination,
-                    revision: commit,
-                });
+                check_existing_worktree(
+                    &mut self.runner,
+                    &stage,
+                    &destination,
+                    &old_revision,
+                    &commit,
+                )?;
+                Some(PreviousCheckout {
+                    revision: old_revision,
+                    recovery: self.runner.job.join(format!("previous-{}", self.pending.len())),
+                    moved: false,
+                })
             }
             Ok(_) => return Err(invalid("Git package destination is not a real directory")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(io_error(error)),
-        }
-        self.pending.push((stage.clone(), destination.clone()));
+        };
+        self.pending.push(PendingCheckout {
+            stage: stage.clone(),
+            destination: destination.clone(),
+            revision: commit.clone(),
+            previous,
+            installed: false,
+        });
         Ok(Prepared {
             directory: stage,
             destination,
@@ -562,30 +800,55 @@ impl Transaction {
     }
 
     pub fn promote(&mut self) -> Result<(), LakeFetchError> {
-        for (_, destination) in &self.pending {
-            match fs::symlink_metadata(destination) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(io_error(error)),
-                Ok(_) => {
-                    return Err(invalid(
-                        "Git destination appeared during dependency resolution",
-                    ));
+        for (destination, revision) in &self.reused {
+            if checkout_revision(destination)? != *revision {
+                return Err(invalid("reused Git HEAD changed during dependency resolution"));
+            }
+        }
+        for pending in &self.pending {
+            directory(
+                pending.destination.parent().expect("package has a parent"),
+                false,
+            )?;
+            if checkout_revision(&pending.stage)? != pending.revision {
+                return Err(invalid("staged Git HEAD changed during dependency resolution"));
+            }
+            if let Some(previous) = &pending.previous {
+                check_existing_worktree(
+                    &mut self.runner,
+                    &pending.stage,
+                    &pending.destination,
+                    &previous.revision,
+                    &pending.revision,
+                )?;
+            } else {
+                match fs::symlink_metadata(&pending.destination) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(io_error(error)),
+                    Ok(_) => {
+                        return Err(invalid(
+                            "Git destination appeared during dependency resolution",
+                        ));
+                    }
                 }
             }
-            directory(destination.parent().expect("package has a parent"), false)?;
         }
-        for (stage, destination) in &self.pending {
-            fs::rename(stage, destination).map_err(io_error)?;
-            self.promoted += 1;
+        for pending in &mut self.pending {
+            if let Some(previous) = &mut pending.previous {
+                fs::rename(&pending.destination, &previous.recovery).map_err(io_error)?;
+                previous.moved = true;
+            }
+            fs::rename(&pending.stage, &pending.destination).map_err(io_error)?;
+            pending.installed = true;
         }
         Ok(())
     }
 
     /// Translate a final package location to the private checkout while resolving.
     pub fn materialized_directory(&self, path: &Path) -> PathBuf {
-        for (stage, destination) in &self.pending {
-            if let Ok(relative) = path.strip_prefix(destination) {
-                return stage.join(relative);
+        for pending in &self.pending {
+            if let Ok(relative) = path.strip_prefix(&pending.destination) {
+                return pending.stage.join(relative);
             }
         }
         path.to_path_buf()
@@ -593,25 +856,38 @@ impl Transaction {
 
     /// Keep private staging names out of path entries written to the manifest.
     pub fn published_directory(&self, path: &Path) -> PathBuf {
-        for (stage, destination) in &self.pending {
-            if let Ok(relative) = path.strip_prefix(stage) {
-                return destination.join(relative);
+        for pending in &self.pending {
+            if let Ok(relative) = path.strip_prefix(&pending.stage) {
+                return pending.destination.join(relative);
             }
         }
         path.to_path_buf()
     }
 
     pub fn rollback(&mut self) -> Result<(), LakeFetchError> {
-        while self.promoted > 0 {
-            let (stage, destination) = &self.pending[self.promoted - 1];
-            fs::rename(destination, stage).map_err(|error| {
-                LakeFetchError::Io(format!(
-                    "cannot roll back {} to private recovery {}: {error}",
-                    destination.display(),
-                    stage.display(),
-                ))
-            })?;
-            self.promoted -= 1;
+        for pending in self.pending.iter_mut().rev() {
+            if pending.installed {
+                fs::rename(&pending.destination, &pending.stage).map_err(|error| {
+                    LakeFetchError::Io(format!(
+                        "cannot roll back {} to private recovery {}: {error}",
+                        pending.destination.display(),
+                        pending.stage.display(),
+                    ))
+                })?;
+                pending.installed = false;
+            }
+            if let Some(previous) = &mut pending.previous
+                && previous.moved
+            {
+                fs::rename(&previous.recovery, &pending.destination).map_err(|error| {
+                    LakeFetchError::Io(format!(
+                        "cannot restore previous checkout {} from {}: {error}",
+                        pending.destination.display(),
+                        previous.recovery.display(),
+                    ))
+                })?;
+                previous.moved = false;
+            }
         }
         Ok(())
     }
@@ -643,7 +919,14 @@ pub(super) fn fetch(
     if !full_revision(&prepared.revision) || !prepared.directory.is_dir() {
         return Err(invalid("prepared Git checkout lost its verified identity"));
     }
-    transaction.promote()?;
+    if let Err(error) = transaction.promote() {
+        if let Err(rollback) = transaction.rollback() {
+            return Err(LakeFetchError::Io(format!(
+                "{error}; checkout rollback also failed: {rollback}",
+            )));
+        }
+        return Err(error);
+    }
     transaction.commit();
     Ok(prepared.destination)
 }
@@ -1095,5 +1378,174 @@ mod tests {
         assert!(error.to_string().contains("symlink"), "{error}");
         assert!(!other.join("lake-manifest.json").exists());
         assert!(!root.join("packages").exists());
+    }
+    #[test]
+    fn update_replaces_clean_revisions_and_preserves_dirty_checkout_and_manifest() {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return;
+        }
+        let (root, mut runner) = fixture("update-revisions");
+        let (repo, old_commit) = repository(&root, &mut runner);
+        let project = root_package(
+            &root,
+            &format!(
+                "name = \"root\"\n[[require]]\nname = \"dependency\"\ngit = {}\nrev = \"release\"\n",
+                manifest_quote(repo.to_str().unwrap()),
+            ),
+        );
+        crate::update_manifest(&project).unwrap();
+        let checkout = project.join(".lake/packages/dependency");
+        let git_config = checkout.join(".git/config");
+        let config = fs::read_to_string(&git_config).unwrap();
+        // An ambient helper in the old checkout must not be consulted while
+        // deciding whether replacement is safe.
+        fs::write(
+            &git_config,
+            format!("{config}\n[core]\n\tfsmonitor = definitely-missing-fsmonitor\n"),
+        )
+        .unwrap();
+        fs::write(repo.join("value.txt"), "next release\n").unwrap();
+        let new_commit = commit_all(&repo, &mut runner);
+        runner.text(&repo, "fixture-tag", &["tag", "next"]).unwrap();
+        fs::write(
+            project.join("lakefile.toml"),
+            format!(
+                "name = \"root\"\n[[require]]\nname = \"dependency\"\ngit = {}\nrev = \"next\"\n",
+                manifest_quote(repo.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        let manifest = crate::update_manifest(&project).unwrap();
+        assert_eq!(
+            manifest.packages[0].rev.as_deref(),
+            Some(new_commit.as_str())
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join("value.txt")).unwrap(),
+            "next release\n"
+        );
+        assert_eq!(checkout_revision(&checkout).unwrap(), new_commit);
+        let before = fs::read(project.join("lake-manifest.json")).unwrap();
+        fs::write(checkout.join("value.txt"), "user edit\n").unwrap();
+        fs::write(
+            project.join("lakefile.toml"),
+            format!(
+                "name = \"root\"\n[[require]]\nname = \"dependency\"\ngit = {}\nrev = {}\n",
+                manifest_quote(repo.to_str().unwrap()),
+                manifest_quote(&old_commit),
+            ),
+        )
+        .unwrap();
+        let error = crate::update_manifest(&project).unwrap_err();
+        assert!(error.to_string().contains("modified"), "{error}");
+        assert_eq!(
+            fs::read(project.join("lake-manifest.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join("value.txt")).unwrap(),
+            "user edit\n"
+        );
+        assert_eq!(checkout_revision(&checkout).unwrap(), new_commit);
+    }
+
+    #[test]
+    fn replacing_checkout_rolls_back_and_detects_edits_before_publication() {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return;
+        }
+        let (root, mut runner) = fixture("replace-rollback");
+        let (repo, old_commit) = repository(&root, &mut runner);
+        let packages = root.join("packages");
+        let checkout = fetch(
+            &packages,
+            "dependency",
+            repo.to_str().unwrap(),
+            Some("release"),
+        )
+        .unwrap();
+        fs::write(repo.join("value.txt"), "new tree\n").unwrap();
+        let new_commit = commit_all(&repo, &mut runner);
+        {
+            let mut transaction = Transaction::new(&packages).unwrap();
+            transaction
+                .prepare_update(
+                    "dependency",
+                    repo.to_str().unwrap(),
+                    Some(&new_commit),
+                    &root,
+                )
+                .unwrap();
+            transaction.promote().unwrap();
+            assert_eq!(checkout_revision(&checkout).unwrap(), new_commit);
+            transaction.rollback().unwrap();
+            assert_eq!(checkout_revision(&checkout).unwrap(), old_commit);
+            assert_eq!(
+                fs::read_to_string(checkout.join("value.txt")).unwrap(),
+                "original\n"
+            );
+        }
+        let mut transaction = Transaction::new(&packages).unwrap();
+        transaction
+            .prepare_update(
+                "dependency",
+                repo.to_str().unwrap(),
+                Some(&new_commit),
+                &root,
+            )
+            .unwrap();
+        fs::write(checkout.join("late.txt"), "edit after preparation\n").unwrap();
+        let error = transaction.promote().unwrap_err();
+        assert!(error.to_string().contains("untracked"), "{error}");
+        transaction.rollback().unwrap();
+        assert_eq!(checkout_revision(&checkout).unwrap(), old_commit);
+        assert_eq!(
+            fs::read_to_string(checkout.join("late.txt")).unwrap(),
+            "edit after preparation\n"
+        );
+    }
+    #[test]
+    fn replacement_refuses_staged_only_changes_without_touching_the_existing_index() {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return;
+        }
+        let (root, mut runner) = fixture("replace-staged");
+        let (repo, old_commit) = repository(&root, &mut runner);
+        let packages = root.join("packages");
+        let checkout = fetch(
+            &packages,
+            "dependency",
+            repo.to_str().unwrap(),
+            Some("release"),
+        )
+        .unwrap();
+        fs::write(repo.join("value.txt"), "new release\n").unwrap();
+        let next = commit_all(&repo, &mut runner);
+        fs::write(checkout.join("value.txt"), "staged edit\n").unwrap();
+        runner
+            .text(&checkout, "fixture-stage-edit", &["add", "value.txt"])
+            .unwrap();
+        fs::write(checkout.join("value.txt"), "original\n").unwrap();
+        let original_index = fs::read(checkout.join(".git/index")).unwrap();
+        let mut transaction = Transaction::new(&packages).unwrap();
+        let error = match transaction.prepare_update(
+            "dependency",
+            repo.to_str().unwrap(),
+            Some(&next),
+            &root,
+        ) {
+            Ok(_) => panic!("staged-only edit must prevent replacement"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("staged"), "{error}");
+        assert_eq!(checkout_revision(&checkout).unwrap(), old_commit);
+        assert_eq!(
+            fs::read(checkout.join(".git/index")).unwrap(),
+            original_index
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join("value.txt")).unwrap(),
+            "original\n"
+        );
     }
 }
