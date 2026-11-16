@@ -8,6 +8,8 @@ on:
       - 'crates/fln/src/runtime.rs'
       - 'crates/fln/src/lib.rs'
       - 'crates/fln-comp/src/**'
+      - 'crates/fln-elab/src/source/recursion/**'
+      - 'crates/fln/tests/source_mutual_ordinary.rs'
       - 'crates/fln/tests/runtime_mutual_indexed.rs'
       - 'crates/fln-cli/tests/source_mutual_indexed.rs'
       - 'examples/native_mutual_indexed.lean'
@@ -25,6 +27,7 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -37,6 +40,7 @@ jobs:
       - name: Check peer indices, strictness, layout guards and independent replay
         run: |
           set -euo pipefail
+          cargo test --locked -p fln --test source_mutual_ordinary
           cargo test --locked -p fln --test runtime_mutual_function_children
           cargo test --locked -p fln-cli --test source_mutual_function_children
           cargo test --locked -p fln --lib --test runtime_mutual_indexed --test runtime_mutual_recursion --test runtime_mutual_data --test runtime_indexed_data --test runtime_indexed_function_children --test runtime_impossible_patterns --test runtime_staged_closures --test runtime_proof_data --test runtime_equality_transport

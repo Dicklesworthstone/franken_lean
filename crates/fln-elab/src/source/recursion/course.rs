@@ -479,19 +479,45 @@ impl Context {
         requested: &[Expr],
     ) -> Result<Expr, NatDefinitionElabError> {
         let (head, mut args) = self.course_spine(&below.type_)?;
-        let expected_head = Name::str(family.clone(), "below");
-        let Some(ConstantInfo::Induct(info)) = self.txn.env.find(family) else {
+        let ExprNode::Const { name, .. } = head.node() else {
             return Err(error(RecursionError::NotDecreasing));
         };
-        let motives = info.all.len().saturating_add(info.num_nested as usize);
-        if !matches!(head.node(), ExprNode::Const { name, .. } if name == &expected_head)
-            || info.all.len() != 1
-            || args.len() != parameters + motives + requested.len()
+        let owner = name.parent();
+        if name != &Name::str(owner.clone(), "below") {
+            return Err(error(RecursionError::NotDecreasing));
+        }
+        let Some(ConstantInfo::Induct(dictionary_family)) = self.txn.env.find(&owner) else {
+            return Err(error(RecursionError::NotDecreasing));
+        };
+        let Some(ConstantInfo::Induct(target_family)) = self.txn.env.find(family) else {
+            return Err(error(RecursionError::NotDecreasing));
+        };
+        let Some(target) = dictionary_family
+            .all
+            .iter()
+            .position(|candidate| candidate == family)
+        else {
+            return Err(error(RecursionError::NotDecreasing));
+        };
+        let motives = dictionary_family
+            .all
+            .len()
+            .saturating_add(dictionary_family.num_nested as usize);
+        if dictionary_family.all != target_family.all
+            || dictionary_family.num_params as usize != parameters
+            || target_family.num_params as usize != parameters
+            || args.len() != parameters + motives + dictionary_family.num_indices as usize + 1
+            || requested.len() != target_family.num_indices as usize + 1
         {
             return Err(error(RecursionError::NotDecreasing));
         }
+        // The available dictionary belongs to the caller's family. Its entries can
+        // contain results for any sibling; mark the callee's motive, not the caller's.
+        // Keep every sibling's actual motive in place and compare the requested
+        // indices and major exactly, so equal result types cannot identify a child.
+        let motive = parameters + target;
         let motive_type = self
-            .known_type(&args[parameters])?
+            .known_type(&args[motive])?
             .ok_or_else(|| error(RecursionError::NotDecreasing))?;
         let saved = self.txn.lctx.clone();
         let canary = FVarId(self.fresh_name()?);
@@ -501,7 +527,7 @@ impl Context {
             motive_type,
             BinderInfo::Default,
         );
-        args[parameters] = Expr::fvar(canary.clone());
+        args[motive] = Expr::fvar(canary.clone());
         let dictionary = args.into_iter().fold(head, Expr::app);
         // Entries are compared generically over any universe the declaration has yet to
         // generalize; the rigid stand-ins never outlive this search.

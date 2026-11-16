@@ -64,6 +64,193 @@ inductive MutualVec (A : Type u) : Nat -> Type u where
  | cons (n : Nat) : A -> MutualVec A n -> MutualVec A (Nat.succ n)
 "#;
 
+const MUTUAL_FOREST: &str = r#"
+mutual
+ inductive FamilyTree where
+  | leaf : Nat -> FamilyTree
+  | node : FamilyForest -> FamilyTree
+ inductive FamilyForest where
+  | nil : FamilyForest
+  | cons : FamilyTree -> FamilyForest -> FamilyForest
+end
+"#;
+
+#[test]
+fn mutual_structural_crosses_mutually_inductive_families() {
+    for hint in ["", "\n termination_by structural value"] {
+        let source = format!(
+            r#"{MUTUAL_FOREST}
+mutual
+ def treeSize (value : FamilyTree) : Nat := match value with
+  | .leaf _ => 1
+  | .node children => forestSize children + 1
+{hint}
+ def forestSize (value : FamilyForest) : Nat := match value with
+  | .nil => 0
+  | .cons child rest => treeSize child + forestSize rest
+{hint}
+end
+example : treeSize (.node (.cons (.leaf 7) (.cons (.node .nil) .nil))) = 3 := rfl
+example : forestSize (.cons (.leaf 7) (.cons (.node .nil) .nil)) = 2 := rfl
+example (children : FamilyForest) : treeSize (.node children) = forestSize children + 1 := rfl
+example (child : FamilyTree) (rest : FamilyForest) :
+ forestSize (.cons child rest) = treeSize child + forestSize rest := rfl
+"#
+        );
+        let base = check_below(&source);
+        run(
+            &base,
+            "#eval treeSize (.node (.cons (.leaf 7) (.cons (.node .nil) .nil)))",
+            "3",
+        );
+        run(
+            &base,
+            "#eval forestSize (.cons (.leaf 7) (.cons (.node .nil) .nil))",
+            "2",
+        );
+        for label in ["treeSize", "forestSize"] {
+            let Some(fln_env::constants::ConstantInfo::Defn(definition)) =
+                base.environment().find(&name(label))
+            else {
+                panic!("checked structurally recursive definition");
+            };
+            assert_eq!(definition.safety, fln_env::constants::DefinitionSafety::Safe);
+            assert_ne!(
+                definition.hints,
+                fln_env::constants::ReducibilityHints::Opaque
+            );
+        }
+    }
+}
+
+#[test]
+fn mutual_structural_packs_members_within_their_own_polymorphic_family() {
+    let base = check_below(
+        r#"
+mutual
+ inductive PolyTree (A : Type u) where
+  | leaf : A -> PolyTree A
+  | node : PolyForest A -> PolyTree A
+ inductive PolyForest (A : Type u) where
+  | nil : PolyForest A
+  | cons : PolyTree A -> PolyForest A -> PolyForest A
+end
+mutual
+ def treeLeft.{u} {A : Type u} (value : PolyTree A) : Nat := match value with
+  | .leaf _ => 1
+  | .node children => forestWeight children + 1
+ termination_by structural value
+ def forestWeight.{u} {A : Type u} (value : PolyForest A) : Nat := match value with
+  | .nil => 0
+  | .cons child rest => treeLeft child + treeRight child + forestWeight rest
+ termination_by structural value
+ def treeRight.{u} {A : Type u} (value : PolyTree A) : Nat := match value with
+  | .leaf _ => 2
+  | .node children => forestWeight children + 2
+ termination_by structural value
+end
+example : treeLeft (.node (.cons (.leaf 7) .nil)) = 4 := rfl
+example : treeRight (.node (.cons (.leaf 7) .nil)) = 5 := rfl
+example : forestWeight (.cons (.leaf 7) .nil) = 3 := rfl
+example (A : Type u) (child : PolyTree A) (rest : PolyForest A) :
+ forestWeight (.cons child rest) = treeLeft child + treeRight child + forestWeight rest := rfl
+"#,
+    );
+    run(&base, "#eval treeLeft (.node (.cons (.leaf 7) .nil))", "4");
+    run(&base, "#eval treeRight (.node (.cons (.leaf 7) .nil))", "5");
+    run(&base, "#eval forestWeight (.cons (.leaf 7) .nil)", "3");
+}
+
+#[test]
+fn mutual_structural_keeps_descendants_through_an_unused_sibling_motive() {
+    let source = format!(
+        r#"{MUTUAL_FOREST}
+mutual
+ def leftDepth (value : FamilyTree) : Nat := match value with
+  | .leaf _ => 1
+  | .node children => match children with
+    | .nil => 0
+    | .cons child _ => rightDepth child + 1
+ termination_by structural value
+ def rightDepth (value : FamilyTree) : Nat := match value with
+  | .leaf _ => 2
+  | .node children => match children with
+    | .nil => 0
+    | .cons child _ => leftDepth child + 1
+ termination_by structural value
+end
+example : leftDepth (.node (.cons (.leaf 7) .nil)) = 3 := rfl
+example : rightDepth (.node (.cons (.leaf 7) .nil)) = 2 := rfl
+"#
+    );
+    let base = check_below(&source);
+    run(&base, "#eval leftDepth (.node (.cons (.leaf 7) .nil))", "3");
+    run(&base, "#eval rightDepth (.node (.cons (.leaf 7) .nil))", "2");
+}
+
+#[test]
+fn mutual_structural_sibling_dictionaries_do_not_hide_nondecreasing_calls() {
+    let (base, limits) = below_engine();
+    let root = base.logical_root(&KVMap::new());
+    for definition in [
+        r#"
+mutual
+ def badTree (value : FamilyTree) : Nat := match value with
+  | .leaf _ => 0
+  | .node children => badForest children
+ termination_by structural value
+ def badForest (value : FamilyForest) : Nat := badTree (.node value)
+ termination_by structural value
+end
+"#,
+        r#"
+mutual
+ def badTree (fallback : FamilyTree) (value : FamilyTree) : Nat := match value with
+  | .leaf _ => 0
+  | .node children => badForest fallback children
+ termination_by structural value
+ def badForest (fallback : FamilyTree) (value : FamilyForest) : Nat :=
+  badTree fallback fallback
+ termination_by structural value
+end
+"#,
+        r#"
+mutual
+ def badTree (value : FamilyTree) : Nat := match value with
+  | .leaf _ => 0
+  | .node children => let invalid : Bool := badForest children; 0
+ termination_by structural value
+ def badForest (value : FamilyForest) : Nat := match value with
+  | .nil => 0
+  | .cons child rest => badTree child + badForest rest
+ termination_by structural value
+end
+"#,
+    ] {
+        let source = format!("{MUTUAL_FOREST}\n{definition}");
+        oracle(&source, false);
+        assert!(
+            base.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .is_err(),
+            "invalid mutual-family recursion must not be admitted: {source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        for label in [
+            "FamilyTree",
+            "FamilyForest",
+            "badTree",
+            "badForest",
+            "badTree._mutual",
+        ] {
+            assert!(!base.environment().contains(&name(label)));
+        }
+    }
+}
+
 #[test]
 fn mutual_structural_generalizes_implicit_indices_and_dependent_results() {
     let source = format!(
