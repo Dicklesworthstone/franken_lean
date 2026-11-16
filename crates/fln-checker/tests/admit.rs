@@ -28,6 +28,8 @@ mod k_gate_lazy_conversion;
 mod k_gate_proof_irrelevance;
 #[path = "admit/k_like.rs"]
 mod k_like;
+#[path = "admit/lazy_local_reservation.rs"]
+mod lazy_local_reservation;
 #[path = "admit/quotient_computation.rs"]
 mod quotient_computation;
 #[path = "admit/recursor_conversion.rs"]

@@ -21,6 +21,7 @@ enum Taken {
     Eta(bool),
 }
 
+#[derive(Debug)]
 pub(crate) enum ProofConversionOutcome {
     Complete { equal: bool, polls: u64 },
     Halted(Box<InferenceOutcome>),
@@ -51,7 +52,11 @@ struct Probe<'a> {
     polls: u64,
     cancelled: &'a mut dyn FnMut() -> bool,
     stop: Option<InferenceStop>,
-    reserved: BTreeSet<WireName>,
+    root_left: &'a WireExpr,
+    root_right: &'a WireExpr,
+    root_context: &'a InferenceContext,
+    reserved: Option<BTreeSet<WireName>>,
+    unreserved_nested: Vec<(WireExpr, WireExpr)>,
     next: u64,
     /// Pairs whose congruence attempt failed. Like the pin's `failed_before`,
     /// it only stops the attempt being repeated; the pair itself takes the
@@ -333,13 +338,47 @@ impl Probe<'_> {
     fn reserve(&mut self, term: &WireExpr) -> Result<()> {
         for node in term.nodes() {
             self.tick()?;
-            if let ExprNode::Free { name } = node {
-                self.reserved.insert(name.clone());
+            if let ExprNode::Free { name } = node
+                && let Some(reserved) = self.reserved.as_mut()
+            {
+                reserved.insert(name.clone());
             }
         }
         Ok(())
     }
+    /// Seed `self.reserved` lazily on the first fresh-local request, mirroring
+    /// `InferenceEngine::initialize_reserved_names`. Proof-conversion calls
+    /// that discharge by congruence, proof irrelevance, unit-like conversion,
+    /// or WHNF without opening a binder or eta local never synthesize a fresh
+    /// name and must not rescan large `let`-bound local bodies (`local.value()`)
+    /// on every `compare_domain` deferral (`colimitLimitToLimitColimit_surjective`).
+    fn ensure_reserved(&mut self) -> Result<()> {
+        if self.reserved.is_some() {
+            return Ok(());
+        }
+        let before_reserve = self.steps;
+        self.reserved = Some(BTreeSet::new());
+        self.reserve(self.root_left)?;
+        self.reserve(self.root_right)?;
+        for local in self.root_context.locals() {
+            self.tick()?;
+            if let Some(reserved) = self.reserved.as_mut() {
+                reserved.insert(local.name().clone());
+            }
+            self.reserve(local.type_())?;
+            if let Some(value) = local.value() {
+                self.reserve(value)?;
+            }
+        }
+        for (nested_left, nested_right) in std::mem::take(&mut self.unreserved_nested) {
+            self.reserve(&nested_left)?;
+            self.reserve(&nested_right)?;
+        }
+        self.profile.reserve_steps += self.steps.saturating_sub(before_reserve);
+        Ok(())
+    }
     fn local(&mut self) -> Result<(WireName, WireExpr)> {
+        self.ensure_reserved()?;
         loop {
             self.tick()?;
             let name = WireName::from_parts(vec![
@@ -353,7 +392,11 @@ impl Probe<'_> {
                 .next
                 .checked_add(1)
                 .ok_or_else(|| self.fault(InferenceFault::FreshLocalIdentityExhausted))?;
-            if self.reserved.insert(name.clone()) {
+            if self
+                .reserved
+                .as_mut()
+                .is_some_and(|reserved| reserved.insert(name.clone()))
+            {
                 let local = self.free_local(&name)?;
                 return Ok((name, local));
             }
@@ -1205,18 +1248,16 @@ impl Probe<'_> {
             },
         }
         self.profile.runs += 1;
-        let before_reserve = self.steps;
-        self.reserve(left)?;
-        self.reserve(right)?;
-        for local in context.locals() {
-            self.tick()?;
-            self.reserved.insert(local.name().clone());
-            self.reserve(local.type_())?;
-            if let Some(value) = local.value() {
-                self.reserve(value)?;
+        if !root_deferred {
+            if self.reserved.is_some() {
+                let before_reserve = self.steps;
+                self.reserve(left)?;
+                self.reserve(right)?;
+                self.profile.reserve_steps += self.steps.saturating_sub(before_reserve);
+            } else {
+                self.unreserved_nested.push((left.clone(), right.clone()));
             }
         }
-        self.profile.reserve_steps += self.steps.saturating_sub(before_reserve);
         let mut work = vec![Work::Pair(left.clone(), right.clone(), context.clone())];
         let mut skip_untyped = root_deferred;
         // Every task is an obligation of one conjunction: the run succeeds only
@@ -1757,7 +1798,11 @@ pub(crate) fn proof_conversion_with(
         polls: 0,
         cancelled,
         stop: None,
-        reserved: BTreeSet::new(),
+        root_left: left,
+        root_right: right,
+        root_context: context,
+        reserved: None,
+        unreserved_nested: Vec::new(),
         next: 0,
         incongruent: PairSet::default(),
         answers: PairAnswers::default(),
@@ -1843,6 +1888,135 @@ mod tests {
             opened.get(bucket, Taken::Binders, &lambda, &other),
             None,
             "the task kind is part of the key"
+        );
+    }
+
+    #[test]
+    fn lazy_reservation_prevents_variable_capture_from_terms_and_let_local_values() {
+        let colliding = WireName::from_parts(vec![
+            NamePart::Text("_fln_proof_conversion".into()),
+            NamePart::Numeric {
+                value: 0,
+                overflowed: false,
+            },
+        ]);
+        let binder = WireName::from_parts(vec![NamePart::Text("x".into())]);
+        let let_name = WireName::from_parts(vec![NamePart::Text("let_k".into())]);
+        let sort0 = WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: crate::wire::LevelId::from_index(0).expect("level 0"),
+            }],
+            vec![crate::wire::LevelNode::Zero],
+            ExprId::from_index(0).expect("expr 0"),
+        );
+        let free_colliding = WireExpr::from_parts(
+            vec![ExprNode::Free {
+                name: colliding.clone(),
+            }],
+            Vec::new(),
+            ExprId::from_index(0).expect("expr 0"),
+        );
+        // `fun x : Prop => _fln_proof_conversion.0` must NOT equal `fun x : Prop => x`.
+        let lam_const_free = WireExpr::from_parts(
+            vec![
+                ExprNode::Sort {
+                    level: crate::wire::LevelId::from_index(0).expect("level 0"),
+                },
+                ExprNode::Free { name: colliding },
+                ExprNode::Lambda {
+                    binder_name: binder.clone(),
+                    binder_type: ExprId::from_index(0).expect("domain"),
+                    body: ExprId::from_index(1).expect("free body"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            vec![crate::wire::LevelNode::Zero],
+            ExprId::from_index(2).expect("lambda root"),
+        );
+        // `fun x : Prop => let_k`, where `let_k := _fln_proof_conversion.0`,
+        // must ALSO NOT equal `fun x : Prop => x` after `let_k` unfolds.
+        let lam_let_ref = WireExpr::from_parts(
+            vec![
+                ExprNode::Sort {
+                    level: crate::wire::LevelId::from_index(0).expect("level 0"),
+                },
+                ExprNode::Free {
+                    name: let_name.clone(),
+                },
+                ExprNode::Lambda {
+                    binder_name: binder.clone(),
+                    binder_type: ExprId::from_index(0).expect("domain"),
+                    body: ExprId::from_index(1).expect("let body"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            vec![crate::wire::LevelNode::Zero],
+            ExprId::from_index(2).expect("lambda root"),
+        );
+        let lam_identity = WireExpr::from_parts(
+            vec![
+                ExprNode::Sort {
+                    level: crate::wire::LevelId::from_index(0).expect("level 0"),
+                },
+                ExprNode::Bound { index: 0 },
+                ExprNode::Lambda {
+                    binder_name: binder,
+                    binder_type: ExprId::from_index(0).expect("domain"),
+                    body: ExprId::from_index(1).expect("bound body"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            vec![crate::wire::LevelNode::Zero],
+            ExprId::from_index(2).expect("lambda root"),
+        );
+        let constants = match crate::environment::ConstantEnvironment::build(
+            Vec::new(),
+            crate::environment::EnvironmentBudget::unlimited(),
+        ) {
+            crate::environment::EnvironmentOutcome::Complete { environment, .. } => environment,
+            other => panic!("empty constant environment must build: {other:?}"),
+        };
+        let context = InferenceContext::new(
+            vec![LocalDeclaration::definition(
+                let_name,
+                sort0,
+                free_colliding,
+            )],
+            Vec::new(),
+            constants,
+        )
+        .expect("context with let local must build");
+
+        let direct = proof_conversion_with(
+            &lam_const_free,
+            &lam_identity,
+            &context,
+            InferenceMode::InferOnly,
+            InferenceBudget::unlimited(),
+            &mut || false,
+        );
+        assert!(
+            matches!(
+                direct,
+                ProofConversionOutcome::Complete { equal: false, .. }
+            ),
+            "direct free-name collision would capture the binder local: {direct:?}"
+        );
+
+        let via_let = proof_conversion_with(
+            &lam_let_ref,
+            &lam_identity,
+            &context,
+            InferenceMode::InferOnly,
+            InferenceBudget::unlimited(),
+            &mut || false,
+        );
+        assert!(
+            matches!(
+                via_let,
+                ProofConversionOutcome::Complete { equal: false, .. }
+            ),
+            "let-value free-name collision would capture the binder local after zeta: {via_let:?}"
         );
     }
 }

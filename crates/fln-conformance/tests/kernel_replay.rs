@@ -158,18 +158,23 @@ fn shape_bounded(e: &Expr, fuel: usize, nodes: &mut usize) -> String {
     }
 }
 
-/// Collect every `Const` name reachable in a term. Iterative: real Reference
-/// proofs are deep enough to overflow a recursive walk.
+/// Collect every `Const` name reachable in a term. Iterative and DAG-memoized:
+/// real Reference proofs are deep enough to overflow a recursive walk and share
+/// subterms exponentially (`colimitLimitToLimitColimit_surjective`).
 fn const_refs(expr: &Expr, out: &mut HashSet<Name>) {
-    let mut stack = vec![expr.clone()];
+    let mut stack = vec![expr];
+    let mut seen = HashSet::<*const ExprNode>::new();
     while let Some(e) = stack.pop() {
+        if !seen.insert(std::ptr::from_ref(e.node())) {
+            continue;
+        }
         match e.node() {
             ExprNode::Const { name, .. } => {
                 out.insert(name.clone());
             }
             ExprNode::App { f, a } => {
-                stack.push(f.clone());
-                stack.push(a.clone());
+                stack.push(f);
+                stack.push(a);
             }
             ExprNode::Lam {
                 binder_type, body, ..
@@ -177,21 +182,35 @@ fn const_refs(expr: &Expr, out: &mut HashSet<Name>) {
             | ExprNode::ForallE {
                 binder_type, body, ..
             } => {
-                stack.push(binder_type.clone());
-                stack.push(body.clone());
+                stack.push(binder_type);
+                stack.push(body);
             }
             ExprNode::LetE {
                 type_, value, body, ..
             } => {
-                stack.push(type_.clone());
-                stack.push(value.clone());
-                stack.push(body.clone());
+                stack.push(type_);
+                stack.push(value);
+                stack.push(body);
             }
-            ExprNode::MData { expr, .. } => stack.push(expr.clone()),
-            ExprNode::Proj { expr, .. } => stack.push(expr.clone()),
+            ExprNode::MData { expr, .. } => stack.push(expr),
+            ExprNode::Proj { expr, .. } => stack.push(expr),
             _ => {}
         }
     }
+}
+
+#[test]
+fn const_refs_visits_shared_dag_nodes_once() {
+    let leaf = Expr::const_(Name::from_components(["DagLeaf"]), vec![]);
+    let mut dag = leaf;
+    for _ in 0..64 {
+        dag = Expr::app(dag.clone(), dag);
+    }
+    let mut names = HashSet::new();
+    const_refs(&dag, &mut names);
+    assert_eq!(names.len(), 1);
+    assert!(names.contains(&Name::from_components(["DagLeaf"])));
+    assert!(shape(&dag, 12).len() < 8192);
 }
 
 /// The constants a declaration depends on: every `Const` in its type and
