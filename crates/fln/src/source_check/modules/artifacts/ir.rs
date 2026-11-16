@@ -194,16 +194,16 @@ impl SourceModuleArtifact {
                     refuse(&input.name, "invalid noncomputable metadata")
                 }
             })?;
-        let auxiliary_recursors =
-            fln_elab::aux_recursors::AuxRecursors::read(input.engine.environment()).map_err(
-                |error| {
-                    if matches!(error, fln_elab::aux_recursors::AuxRecursorError::Limit) {
-                        limit("auxiliary-recursor metadata")
-                    } else {
-                        refuse(&input.name, "invalid auxiliary-recursor metadata")
-                    }
-                },
-            )?;
+        let auxiliary_recursors = fln_elab::aux_recursors::AuxRecursors::read(
+            input.engine.environment(),
+        )
+        .map_err(|error| {
+            if matches!(error, fln_elab::aux_recursors::AuxRecursorError::Limit) {
+                limit("auxiliary-recursor metadata")
+            } else {
+                refuse(&input.name, "invalid auxiliary-recursor metadata")
+            }
+        })?;
         let mut module = IrModule::default();
         let mut names = std::collections::BTreeSet::new();
         let public_names: BTreeSet<_> = input

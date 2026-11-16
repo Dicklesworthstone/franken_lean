@@ -126,15 +126,11 @@ fn symmetry_keeps_proof_dependent_hypotheses_and_targets_valid() {
 
 #[test]
 fn wildcard_symmetry_skips_nonrelations_but_requires_progress() {
-    check(
-        "theorem allLocations (x y : Nat) (h : x = y) : y = x := by symm at *; symm; exact h",
-    );
+    check("theorem allLocations (x y : Nat) (h : x = y) : y = x := by symm at *; symm; exact h");
     check(
         "theorem nonrelationalGoal (P : Prop) (p : P) (x y : Nat) (h : x = y) : P := by symm at *; have backward : y = x := h; exact p",
     );
-    check(
-        "theorem noProgress (P : Prop) (p : P) : P := by fail_if_success symm at *; exact p",
-    );
+    check("theorem noProgress (P : Prop) (p : P) : P := by fail_if_success symm at *; exact p");
     check("theorem targetOnly (x : Nat) : x = x := by symm at *; rfl");
     check(
         "theorem shadowed (x y : Nat) (h : x = y) (h : True) : y = x := by symm at *; symm; rename_i backward; exact backward",
@@ -146,9 +142,7 @@ fn wildcard_symmetry_skips_nonrelations_but_requires_progress() {
 
 #[test]
 fn failed_symmetry_locations_roll_back_and_cannot_admit_false_proofs() {
-    check(
-        "theorem restore (x y : Nat) (h : x = y) : x = y := by try (symm at h x); exact h",
-    );
+    check("theorem restore (x y : Nat) (h : x = y) : x = y := by try (symm at h x); exact h");
     check(
         "theorem restoreGoal (x y : Nat) (h : x = y) : x = y := by first | (symm at h; exact h) | exact h",
     );

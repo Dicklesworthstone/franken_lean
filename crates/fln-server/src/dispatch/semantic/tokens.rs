@@ -40,7 +40,7 @@ pub(super) fn payload_bytes(tokens: &[SemanticToken]) -> Result<usize, &'static 
     if tokens.len() > MAX_TOKENS {
         return Err("semantic tokens exceed their count budget");
     }
-    Ok(tokens.len() * std::mem::size_of::<SemanticToken>())
+    Ok(std::mem::size_of_val(tokens))
 }
 
 /// Scan monotonically across the source rather than rescanning every token's

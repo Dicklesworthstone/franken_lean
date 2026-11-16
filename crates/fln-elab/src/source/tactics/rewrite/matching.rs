@@ -247,13 +247,13 @@ impl Context {
         self.rigid_rewrite_type_head(result_head)
     }
 
-    pub(super) fn rewrite_trial(&self) -> Self {
+    pub(in crate::source::tactics) fn rewrite_trial(&self) -> Self {
         self.clone()
     }
 
     /// Retain the cost of unsuccessful alternatives without retaining their
     /// semantic state. Every trial begins at the already charged parent budget.
-    pub(super) fn charge_rewrite_trial(&mut self, trial: &Self) {
+    pub(in crate::source::tactics) fn charge_rewrite_trial(&mut self, trial: &Self) {
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
     }
 

@@ -98,7 +98,9 @@ fn tokens(messages: &[String], id: usize) -> Vec<[u32; 4]> {
     let data: Vec<u32> = if data.is_empty() {
         Vec::new()
     } else {
-        data.split(',').map(|field| field.parse().unwrap()).collect()
+        data.split(',')
+            .map(|field| field.parse().unwrap())
+            .collect()
     };
     assert_eq!(data.len() % 5, 0);
     let mut last = (0, 0);

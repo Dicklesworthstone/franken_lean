@@ -344,14 +344,14 @@ pub(super) fn handle(
     };
     let response = match checker.query(query, &sources) {
         Ok(None) => null_response(id),
-        Ok(Some(answer)) => match validate_target_source(&answer, &sources)
-            .and_then(|()| match (query.kind, answer, range) {
+        Ok(Some(answer)) => match validate_target_source(&answer, &sources).and_then(|()| {
+            match (query.kind, answer, range) {
                 (QueryKind::SemanticTokens, Answer::SemanticTokens { tokens }, range) => {
                     tokens::result(&tokens, query.text, range)
                 }
                 (_, answer, _) => result_json(answer, query),
-            })
-        {
+            }
+        }) {
             Ok(result) => format!(
                 "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{result}}}",
                 id.as_json()

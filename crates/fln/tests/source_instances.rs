@@ -312,7 +312,13 @@ fn prelude_instance_primitives_bootstrap_without_a_source_seed() {
         };
         assert_eq!(*binder_info, first_style);
         assert!(
-            matches!(body.node(), ExprNode::ForallE { binder_info: BinderInfo::InstImplicit, .. }),
+            matches!(
+                body.node(),
+                ExprNode::ForallE {
+                    binder_info: BinderInfo::InstImplicit,
+                    ..
+                }
+            ),
             "{name} must retain its instance binder"
         );
     }

@@ -1543,7 +1543,8 @@ impl Context {
                     return Ok(None);
                 }
             }
-            let assigned_levels: Vec<_> = trial.txn.universes.assignments().keys().cloned().collect();
+            let assigned_levels: Vec<_> =
+                trial.txn.universes.assignments().keys().cloned().collect();
             for id in assigned_levels {
                 trial.tick()?;
                 if self.txn.universes.is_assigned(&id) {
@@ -3823,7 +3824,10 @@ mod tests {
             let id = id.clone();
             let predicate = Expr::fvar(FVarId(n("Q")));
             for (name, type_) in [
-                ("Q", pi(c("Nat"), Expr::sort(Level::zero()), BinderInfo::Default)),
+                (
+                    "Q",
+                    pi(c("Nat"), Expr::sort(Level::zero()), BinderInfo::Default),
+                ),
                 ("q", Expr::app(predicate.clone(), unknown)),
                 (
                     "consume",
@@ -3880,7 +3884,10 @@ mod tests {
                 .unify(left, right, UnificationBudget::new(context.kernel))
                 .unwrap();
             assert!(!context.txn.universes.is_assigned(&outer_id));
-            assert_eq!(context.txn.universes.get_assignment(&fresh_id), Some(&outer));
+            assert_eq!(
+                context.txn.universes.get_assignment(&fresh_id),
+                Some(&outer)
+            );
         }
     }
 

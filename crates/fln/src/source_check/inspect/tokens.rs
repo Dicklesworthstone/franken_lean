@@ -312,7 +312,8 @@ impl Collector {
         view: &SourceView,
         base: usize,
     ) -> Result<(), SourceModuleCheckError> {
-        let (Some(start), Some(end)) = (syntax.info().pos(true), syntax.info().end_pos(true)) else {
+        let (Some(start), Some(end)) = (syntax.info().pos(true), syntax.info().end_pos(true))
+        else {
             return Ok(());
         };
         if start.0 >= end.0 {

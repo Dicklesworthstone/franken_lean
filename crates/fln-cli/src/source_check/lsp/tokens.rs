@@ -18,7 +18,9 @@ pub(super) fn collect(
     {
         fln::Outcome::Complete(tokens) => tokens,
         fln::Outcome::Inconclusive(reason) => {
-            return Err(format!("native semantic tokens were inconclusive: {reason:?}"));
+            return Err(format!(
+                "native semantic tokens were inconclusive: {reason:?}"
+            ));
         }
         fln::Outcome::InternalFault(reason) => {
             return Err(format!("native semantic tokens fault: {reason:?}"));
