@@ -4,6 +4,7 @@ use super::*;
 
 mod abbreviations;
 mod precedence;
+mod shared_heads;
 mod tactics;
 
 fn name(label: &str) -> Name {
@@ -892,7 +893,7 @@ fn unsupported_aliases_contextual_checks_and_nested_shapes_never_install() {
 }
 
 #[test]
-fn overlapping_inactive_scopes_are_refused_before_they_can_change_a_parse() {
+fn incompatible_inactive_scopes_are_refused_before_they_can_change_a_parse() {
     let mut file = grammar();
     file.import_artifact(&ImportedSyntaxModule {
         entries: vec![
@@ -905,7 +906,21 @@ fn overlapping_inactive_scopes_are_refused_before_they_can_change_a_parse() {
         file.import_artifact(&ImportedSyntaxModule {
             entries: vec![
                 token("mustNotLeak!", None),
-                leading("Library.second", "sameHead!", Some("Second"))
+                // A suffix after a term cannot safely distinguish this parser
+                // from the first one's complete, shorter reading.
+                parser(
+                    "Library.second",
+                    "term",
+                    Some("Second"),
+                    Descr::Node {
+                        kind: name("Library.second"),
+                        prec: LEAD_PREC,
+                        body: Box::new(sequence(
+                            symbol("sameHead!"),
+                            sequence(Descr::Cat(name("term"), MAX_PREC), symbol(")")),
+                        )),
+                    },
+                )
             ],
         }),
         Err("overlapping artifact parser productions")

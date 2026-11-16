@@ -196,6 +196,15 @@ fn unselected_fixture_with_parser(
     with_dependency: bool,
     operand: Option<OperandParser>,
 ) -> (SourceOleanImport, Vec<IrModule>) {
+    unselected_fixture_with_parsers(fault, with_dependency, operand, false)
+}
+
+fn unselected_fixture_with_parsers(
+    fault: Fault,
+    with_dependency: bool,
+    operand: Option<OperandParser>,
+    shared_head: bool,
+) -> (SourceOleanImport, Vec<IrModule>) {
     let mut constants = Vec::new();
     for declaration in crate::imported_parsers::fixture_declarations() {
         match declaration {
@@ -243,6 +252,16 @@ fn unselected_fixture_with_parser(
             descriptor("SourceLibrary.scopedChoice", "scopedChoice!", false),
         ),
     ]);
+    if shared_head {
+        constants.push(definition(
+            "SourceLibrary.alternateParser",
+            constant(wire::PARSER_DESCR_TYPE),
+            operand.map_or_else(
+                || descriptor("SourceLibrary.alternate", "choose!", false),
+                |parser| operand_descriptor("SourceLibrary.alternate", "choose!", parser),
+            ),
+        ));
+    }
     let mut macro_body = natural(0);
     for binder in ["state", "context", "syntax"] {
         macro_body = Expr::lam(
@@ -263,6 +282,14 @@ fn unselected_fixture_with_parser(
         "choose!",
         None,
     );
+    if shared_head {
+        rows.extend(parser_rows(
+            "SourceLibrary.alternate",
+            "SourceLibrary.alternateParser",
+            "choose!",
+            None,
+        ));
+    }
     if operand.is_some_and(|parser| parser.terminated) {
         rows.push(scope(
             Obj::mk_ctor(wire::PARSER_ENTRY_TOKEN, vec![Obj::mk_string("done!")], &[]),
@@ -300,15 +327,23 @@ fn unselected_fixture_with_parser(
             ));
         }
     }
+    let mut registrations = vec![
+        ("SourceLibrary.choose", "SourceLibrary.chooseMacro", None),
+        (
+            "SourceLibrary.scopedChoice",
+            "SourceLibrary.chooseMacro",
+            Some("SourceScoped"),
+        ),
+    ];
+    if shared_head {
+        registrations.push((
+            "SourceLibrary.alternate",
+            "SourceLibrary.diagnostic",
+            None,
+        ));
+    }
     batches::artifact_import_fixture_with_parser_dependency(
-        &[
-            ("SourceLibrary.choose", "SourceLibrary.chooseMacro", None),
-            (
-                "SourceLibrary.scopedChoice",
-                "SourceLibrary.chooseMacro",
-                Some("SourceScoped"),
-            ),
-        ],
+        &registrations,
         &constants,
         &rows,
         &[selecting_function("SourceLibrary.chooseMacro", 1)],
@@ -415,6 +450,91 @@ fn artifact_syntax_without_local_declaration_expands_and_kernel_checks_values_an
     assert_eq!(false_proof.attempts.len(), 1);
     assert!(false_proof.states.is_none());
     assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn shared_artifact_heads_reach_transactional_macro_choices_and_kernel_admission() {
+    for (leading, minimum) in [(1022, 1024), (60, 65)] {
+        let (mut imported, code) = unselected_fixture_with_parsers(
+            Fault::None,
+            false,
+            Some(OperandParser {
+                leading,
+                minimum,
+                terminated: false,
+            }),
+            true,
+        );
+        imported
+            .enable_imported_syntax(&[name("SourceLibrary")], ParserRegistryLimits::default())
+            .unwrap();
+        let before = imported.engine.logical_root(&KVMap::new());
+        let report = check(
+            &imported,
+            &code,
+            &[
+                (
+                    "Main",
+                    "prelude\nimport Forward\n\
+                     def chosen : Nat := choose! 42\n\
+                     theorem chosen_ok : chosen = 42 := by rfl",
+                ),
+                ("Forward", "prelude\nimport SourceLibrary"),
+            ],
+            MacroTreeLimits::default(),
+            None,
+        );
+        let checked = succeeded(&report);
+        assert_declared_value(&checked.checked.engine, "chosen", 42);
+        assert!(
+            checked
+                .checked
+                .engine
+                .environment()
+                .contains(&name("chosen_ok"))
+        );
+        // Both parsers came from the checked artifact and survived reexport.
+        // The newest interpretation reports a macro diagnostic; only its own
+        // elaboration trial fails, and the older interpretation proves 42.
+        for declaration in ["SourceLibrary.diagnostic", "SourceLibrary.chooseMacro"] {
+            assert!(
+                report
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.declaration == name(declaration)),
+                "{report:?}"
+            );
+        }
+        assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+        assert!(!imported.engine.environment().contains(&name("chosen")));
+
+        for source in [
+            "prelude\nimport Forward\ndef prefix : Nat := 7\n\
+             def malformed : Nat := choose!",
+            "prelude\nimport Forward\ndef chosen : Nat := choose! 42\n\
+             theorem false_equation : chosen = 43 := by rfl",
+        ] {
+            let rejected = check(
+                &imported,
+                &code,
+                &[
+                    ("Main", source),
+                    ("Forward", "prelude\nimport SourceLibrary"),
+                ],
+                MacroTreeLimits::default(),
+                None,
+            );
+            assert!(
+                matches!(rejected.outcome, Outcome::Complete(Err(_))),
+                "{rejected:?}"
+            );
+            assert!(rejected.states.is_none());
+            assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+            for declaration in ["prefix", "chosen", "false_equation"] {
+                assert!(!imported.engine.environment().contains(&name(declaration)));
+            }
+        }
+    }
 }
 
 #[test]

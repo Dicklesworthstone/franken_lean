@@ -94,17 +94,157 @@ impl ArtifactGrammar {
     }
 }
 
-/// A missing first-token set is a primitive production (for example `num` in
-/// a custom category). It cannot coexist with another leading production in
-/// this bounded adapter: their possible overlap has not been established.
+/// Leading-term routes whose competing declarations can share one head.
+#[derive(Clone, Copy)]
+enum TermDispatch<'a> {
+    Description { precedence: u32, body: &'a Descr },
+    Prefix { precedence: u32, operand: u32 },
+}
+
+/// The scalar prefix stack reads one common operand. General leading terms
+/// instead run their descriptions independently. Mixing those routes would
+/// let the prefix stack hide a longer description.
+fn term_dispatch(declaration: &SyntaxDecl) -> Option<TermDispatch<'_>> {
+    if !declaration.leading
+        || declaration.category.as_ref() != Some(&Name::from_components(["term"]))
+    {
+        return None;
+    }
+    let Descr::Node { kind, prec, body } = &declaration.descr else {
+        return None;
+    };
+    // Category quotations have a separate reader.
+    if *kind == Name::from_components(["Lean", "Parser", "Term", "quot"]) {
+        return None;
+    }
+    if let Descr::Binary(alias, left, right) = body.as_ref()
+        && simple(alias).as_deref() == Some("andthen")
+        && matches!(left.as_ref(), Descr::Symbol(_))
+        && let Descr::Cat(category, minimum) = right.as_ref()
+        && simple(category).as_deref() == Some("term")
+        && *minimum < 256
+    {
+        return Some(TermDispatch::Prefix {
+            precedence: *prec,
+            operand: *minimum,
+        });
+    }
+    (*prec >= LEAD_PREC && (ends_with_atom(body, 0) || ends_with_term(body, 0)))
+        .then_some(TermDispatch::Description {
+            precedence: *prec,
+            body,
+        })
+}
+
+/// Account for structural equality and prefix inspection before comparing
+/// descriptors. Shared-head admission uses the same bounded work allowance
+/// as descriptor validation, including candidates inherited from earlier imports.
+fn charge_comparison(descr: &Descr, remaining: &mut usize) -> Result<(), &'static str> {
+    let mut pending = vec![(descr, 0)];
+    while let Some((descr, depth)) = pending.pop() {
+        if depth > MAX_DESCR_DEPTH {
+            return Err("artifact parser description depth past the budget");
+        }
+        charge(remaining)?;
+        match descr {
+            Descr::Unary(_, body)
+            | Descr::Node { body, .. }
+            | Descr::TrailingNode { body, .. }
+            | Descr::NodeWithAntiquot(_, _, body) => pending.push((body, depth + 1)),
+            Descr::Binary(_, left, right) => {
+                pending.push((right, depth + 1));
+                pending.push((left, depth + 1));
+            }
+            Descr::SepBy { item, parser, .. } => {
+                pending.push((parser, depth + 1));
+                pending.push((item, depth + 1));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Collect only mandatory initial literals. The result says whether the
+/// entire description was literal: a delimiter after a term is not an initial
+/// discriminator. Optional, alternative and antiquotation readers stop this walk.
+fn literal_prefix<'a>(descr: &'a Descr, prefix: &mut Vec<Vec<&'a str>>) -> bool {
+    match descr {
+        Descr::Symbol(token) => {
+            prefix.push(vec![token.trim()]);
+            true
+        }
+        Descr::UnicodeSymbol(token, ascii, _) => {
+            prefix.push(vec![token.trim(), ascii.trim()]);
+            true
+        }
+        Descr::Node { body, .. } => literal_prefix(body, prefix),
+        Descr::Binary(alias, left, right) if simple(alias).as_deref() == Some("andthen") => {
+            literal_prefix(left, prefix) && literal_prefix(right, prefix)
+        }
+        _ => false,
+    }
+}
+
+fn compatible_dispatch(
+    left: TermDispatch<'_>,
+    right: TermDispatch<'_>,
+    remaining: &mut usize,
+) -> Result<bool, &'static str> {
+    charge(remaining)?;
+    match (left, right) {
+        (
+            TermDispatch::Prefix {
+                precedence: left,
+                operand: left_operand,
+            },
+            TermDispatch::Prefix {
+                precedence: right,
+                operand: right_operand,
+            },
+        ) => Ok(left == right && left_operand == right_operand),
+        (
+            TermDispatch::Description {
+                precedence: left_precedence,
+                body: left,
+            },
+            TermDispatch::Description {
+                precedence: right_precedence,
+                body: right,
+            },
+        ) if left_precedence == right_precedence => {
+            charge_comparison(left, remaining)?;
+            charge_comparison(right, remaining)?;
+            if left == right {
+                return Ok(true);
+            }
+            let mut left_prefix = Vec::new();
+            let mut right_prefix = Vec::new();
+            literal_prefix(left, &mut left_prefix);
+            literal_prefix(right, &mut right_prefix);
+            // A successful candidate consumes the distinguishing token, so a
+            // sibling's mismatch there cannot outrank it by error progress.
+            // Prefix-related descriptions do not have this guarantee.
+            Ok(left_prefix.iter().zip(&right_prefix).any(|(left, right)| {
+                left.iter().all(|token| !right.contains(token))
+            }))
+        }
+        _ => Ok(false),
+    }
+}
+
+type HeadDispatches<'a> = BTreeMap<String, Vec<Option<TermDispatch<'a>>>>;
+
+/// A primitive production without a first-token set cannot coexist with
+/// another leading production: their possible overlap is not established.
 #[derive(Default)]
-struct Heads {
-    tokens: BTreeMap<(Name, bool), BTreeSet<String>>,
+struct Heads<'a> {
+    tokens: BTreeMap<(Name, bool), HeadDispatches<'a>>,
     primitive: BTreeSet<(Name, bool)>,
 }
 
-impl Heads {
-    fn existing(&mut self, declaration: &SyntaxDecl) {
+impl<'a> Heads<'a> {
+    fn existing(&mut self, declaration: &'a SyntaxDecl) {
         let Some(category) = &declaration.category else {
             return;
         };
@@ -117,11 +257,20 @@ impl Heads {
         if tokens.is_empty() {
             self.primitive.insert(key);
         } else {
-            self.tokens.entry(key).or_default().extend(tokens);
+            let dispatch = term_dispatch(declaration);
+            let occupied = self.tokens.entry(key).or_default();
+            for token in tokens {
+                occupied.entry(token).or_default().push(dispatch);
+            }
         }
     }
 
-    fn add(&mut self, declaration: &SyntaxDecl, tokens: Vec<String>) -> Result<(), &'static str> {
+    fn add(
+        &mut self,
+        declaration: &'a SyntaxDecl,
+        tokens: Vec<String>,
+        remaining: &mut usize,
+    ) -> Result<(), &'static str> {
         let category = declaration
             .category
             .as_ref()
@@ -141,10 +290,22 @@ impl Heads {
             self.primitive.insert(key);
         } else {
             let occupied = self.tokens.entry(key).or_default();
-            if tokens.iter().any(|token| occupied.contains(token)) {
-                return Err("overlapping artifact parser productions");
+            let dispatch = term_dispatch(declaration);
+            for token in &tokens {
+                if let Some(previous) = occupied.get(token) {
+                    for previous in previous {
+                        let (Some(previous), Some(dispatch)) = (*previous, dispatch) else {
+                            return Err("overlapping artifact parser productions");
+                        };
+                        if !compatible_dispatch(previous, dispatch, remaining)? {
+                            return Err("overlapping artifact parser productions");
+                        }
+                    }
+                }
             }
-            occupied.extend(tokens);
+            for token in tokens {
+                occupied.entry(token).or_default().push(dispatch);
+            }
         }
         Ok(())
     }
@@ -155,13 +316,16 @@ impl FileGrammar {
     /// beginning of a file. A refusal leaves the grammar and its caches intact.
     ///
     /// The supported subset is data-only descriptions with native aliases,
-    /// disjoint reserved first tokens, leading `term` syntax with an atom or term
+    /// reserved first tokens, leading `term` syntax with an atom or term
     /// endpoint, simple Pratt prefixes, ordinary symbol/term infix syntax, and
     /// leading/trailing custom-category syntax.
     /// A lone primitive production (such as `num`) is supported in a custom
     /// category. Term operands admit every minimum through `max`; intermediate
     /// minima use the scalar Pratt parser's application and operator boundaries.
-    /// Unknown closures/aliases, scoped categories, ambiguous heads,
+    /// Leading terms with equal precedence may share identical bodies or
+    /// disjoint mandatory literal prefixes. Simple prefixes must share both
+    /// binding powers. Priority and tied readings follow native dispatch.
+    /// Unknown closures/aliases, scoped categories, unproved shared heads,
     /// contextual column checks and unsupported precedence forms are refused.
     /// The exact category quotation shape emitted by `declare_syntax_cat` uses
     /// the native quotation parser, with its original envelope and captures.
@@ -263,7 +427,7 @@ impl FileGrammar {
                     }
                     let (first, quotation) =
                         registration(declaration, &categories, &mut remaining)?;
-                    occupied.add(declaration, first)?;
+                    occupied.add(declaration, first, &mut remaining)?;
                     if let Some(category) = quotation {
                         if self
                             .native_categories
