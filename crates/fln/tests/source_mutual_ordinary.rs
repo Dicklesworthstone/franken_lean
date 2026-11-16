@@ -166,6 +166,114 @@ example (f : Nat -> Nat) (n : Nat) :
 }
 
 #[test]
+fn mutual_structural_generalizes_heterogeneous_argument_types() {
+    for hint in ["", "\n termination_by structural n"] {
+        let source = format!(
+            r#"
+mutual
+ def heterogeneousLeft {{f : Nat -> Nat}} (n : Nat) : Nat := match n with
+  | 0 => f 0
+  | k+1 => heterogeneousRight (f 1) k{hint}
+ def heterogeneousRight (acc n : Nat) : Nat := match n with
+  | 0 => acc
+  | k+1 => heterogeneousLeft (f := fun x => acc+x+2) k{hint}
+end
+example : heterogeneousLeft (f := fun x => x+10) 3 = 14 := rfl
+example : heterogeneousRight 10 3 = 15 := rfl
+example (f : Nat -> Nat) (n : Nat) :
+ heterogeneousLeft (f := f) (n+1) = heterogeneousRight (f 1) n := rfl
+example (acc n : Nat) :
+ heterogeneousRight acc (n+1) = heterogeneousLeft (f := fun x => acc+x+2) n := rfl
+"#
+        );
+        let base = check(&source);
+        run(&base, "#eval heterogeneousLeft (f := fun x => x+10) 3", "14");
+        run(&base, "#eval heterogeneousRight 10 3", "15");
+    }
+}
+
+#[test]
+fn mutual_structural_generalizes_each_members_dependent_telescope() {
+    let source = format!(
+        "{MUTUAL_VEC}\n{}",
+        r#"
+mutual
+ def dependentBeforeLeft.{u} {A : Type u} {n : Nat} (seed : Nat) (_h : seed = seed) (xs : MutualVec A n) : Nat := match xs with
+  | .nil => seed
+  | .cons _ _ tail => dependentBeforeRight (fun x => seed+x+1) rfl tail
+ termination_by structural xs
+ def dependentBeforeRight.{u} {A : Type u} {n : Nat} (f : Nat -> Nat) (_h : f = f) (xs : MutualVec A n) : Nat := match xs with
+  | .nil => f 0
+  | .cons _ _ tail => dependentBeforeLeft (f 2) rfl tail
+ termination_by structural xs
+end
+example : dependentBeforeLeft 10 rfl (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil))) = 14 := rfl
+example : dependentBeforeRight (fun x => x+10) rfl (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil))) = 15 := rfl
+example (A : Type u) (n seed : Nat) (a : A) (tail : MutualVec A n) :
+ dependentBeforeLeft seed rfl (.cons n a tail) = dependentBeforeRight (fun x => seed+x+1) rfl tail := rfl
+example (A : Type u) (n : Nat) (f : Nat -> Nat) (a : A) (tail : MutualVec A n) :
+ dependentBeforeRight f rfl (.cons n a tail) = dependentBeforeLeft (f 2) rfl tail := rfl
+"#
+    );
+    let base = check_below(&source);
+    run(
+        &base,
+        "#eval dependentBeforeLeft 10 rfl (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil)))",
+        "14",
+    );
+    run(
+        &base,
+        "#eval dependentBeforeRight (fun x => x+10) rfl (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil)))",
+        "15",
+    );
+}
+
+#[test]
+fn mutual_structural_heterogeneous_arguments_preserve_termination_and_typing() {
+    let (base, limits) = engine();
+    let root = base.logical_root(&KVMap::new());
+    for body in [
+        "badHeterogeneousRight (f 1) (k+1)",
+        "let unused := badHeterogeneousRight (f 1) (k+1); badHeterogeneousRight (f 1) k",
+        "let invalid : Bool := f 0; badHeterogeneousRight (f 1) k",
+        "badHeterogeneousRight f k",
+    ] {
+        let source = format!(
+            r#"
+mutual
+ def badHeterogeneousLeft (f : Nat -> Nat) (n : Nat) : Nat := match n with
+  | 0 => f 0
+  | k+1 => {body}
+ termination_by structural n
+ def badHeterogeneousRight (acc n : Nat) : Nat := match n with
+  | 0 => acc
+  | k+1 => badHeterogeneousLeft (fun x => acc+x+2) k
+ termination_by structural n
+end
+"#
+        );
+        oracle(&source, false);
+        assert!(
+            base.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .is_err(),
+            "invalid heterogeneous component must not be admitted: {source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        for label in [
+            "badHeterogeneousLeft",
+            "badHeterogeneousRight",
+            "badHeterogeneousLeft._mutual",
+        ] {
+            assert!(!base.environment().contains(&name(label)));
+        }
+    }
+}
+
+#[test]
 fn mutual_structural_generalizes_dependent_arguments_between_reordered_indices() {
     let base = check_below(
         r#"

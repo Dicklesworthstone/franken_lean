@@ -23,7 +23,8 @@ pub(in crate::source) struct StructuralPlan {
     /// They occupy the varying prefix before the major, but need not occur in that order.
     indices: Vec<usize>,
     /// Other arguments between the fixed prefix and major, in source order. Each
-    /// product component quantifies them so recursive calls may supply new values.
+    /// product component quantifies its own telescope at these positions so recursive
+    /// calls may supply new values and different members may use different argument types.
     generalized: Vec<usize>,
     family: Name,
     family_parameters: usize,
@@ -207,7 +208,8 @@ impl Context {
     /// Construct a shared motive over one inductive family. Independent local indices may
     /// occur between the common fixed prefix and the major; the motive abstracts them in
     /// family order. Other arguments in that prefix are quantified inside each component,
-    /// whose result type and trailing argument telescope may differ between members.
+    /// whose generalized arguments, result type and trailing argument telescope may
+    /// differ between members.
     pub(in crate::source) fn mutual_structural_plan(
         &mut self,
         names: Vec<Name>,
@@ -279,10 +281,6 @@ impl Context {
             let generalized_positions: Vec<_> = (fixed..decreasing)
                 .filter(|position| !index_positions.contains(position))
                 .collect();
-            let generalized: Vec<_> = generalized_positions
-                .iter()
-                .map(|&position| prefix_locals[position].clone())
-                .collect();
             // Family parameters and index domains live outside the component's
             // generalized arguments. Check this reordered telescope before closing
             // it, so a dependency cannot escape its binder into the shared motive.
@@ -323,18 +321,45 @@ impl Context {
             let mut components = Vec::new();
             for type_ in &types {
                 let mut remainder = type_.clone();
-                for local in &prefix_locals {
+                let mut generalized = Vec::new();
+                for (position, local) in prefix_locals.iter().enumerate() {
                     self.tick()?;
                     let ExprNode::ForallE {
-                        binder_type, body, ..
+                        binder_name,
+                        binder_type,
+                        body,
+                        binder_info,
                     } = remainder.node()
                     else {
                         return Err(unsupported("one common structural prefix"));
                     };
-                    if !self.defeq_guarded(binder_type, &local.type_)? {
-                        return Err(unsupported("structural prefix parameters of the same type"));
-                    }
-                    remainder = self.substitute(body, &Expr::fvar(local.id.clone()))?;
+                    let argument = if generalized_positions.contains(&position) {
+                        // Only the fixed parameters and family indices belong to the
+                        // shared recursor telescope. Open each component's other
+                        // binders independently: their domains may differ, and a later
+                        // domain must refer to this member's preceding arguments.
+                        let id = FVarId(self.fresh_name()?);
+                        generalized.push(
+                            self.txn
+                                .lctx
+                                .add_param(
+                                    id.clone(),
+                                    binder_name.clone(),
+                                    binder_type.clone(),
+                                    *binder_info,
+                                )
+                                .clone(),
+                        );
+                        Expr::fvar(id)
+                    } else {
+                        if !self.defeq_guarded(binder_type, &local.type_)? {
+                            return Err(unsupported(
+                                "shared structural prefix parameters of the same type",
+                            ));
+                        }
+                        Expr::fvar(local.id.clone())
+                    };
+                    remainder = self.substitute(body, &argument)?;
                 }
                 let ExprNode::ForallE {
                     binder_type, body, ..
