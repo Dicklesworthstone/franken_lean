@@ -155,8 +155,9 @@ impl FileGrammar {
     /// beginning of a file. A refusal leaves the grammar and its caches intact.
     ///
     /// The supported subset is data-only descriptions with native aliases,
-    /// disjoint reserved first tokens, atom-bounded leading `term` syntax, ordinary
-    /// symbol/term infix syntax, and leading/trailing custom-category syntax.
+    /// disjoint reserved first tokens, leading `term` syntax with an atom or term
+    /// endpoint, simple Pratt prefixes, ordinary symbol/term infix syntax, and
+    /// leading/trailing custom-category syntax.
     /// A lone primitive production (such as `num`) is supported in a custom
     /// category. Term operands admit every minimum through `max`; intermediate
     /// minima use the scalar Pratt parser's application and operator boundaries.
@@ -429,8 +430,8 @@ fn registration(
                 return Err("unsupported artifact leading-node precedence or kind");
             }
             check_root_kind(kind)?;
-            if term && (*prec < LEAD_PREC || !ends_with_atom(body, 0)) {
-                return Err("artifact term parser is not an atom-bounded leading production");
+            if term && !leading_term_supported(*prec, body) {
+                return Err("artifact term parser is not a supported leading production");
             }
             let first = heads(body, 0);
             if term && first.iter().any(|token| token.starts_with("`(")) {
@@ -512,6 +513,22 @@ fn registration(
         return Err("artifact parser production can succeed without consuming input");
     }
     Ok((first, None))
+}
+
+/// Match the two executable leading-term routes in `ActiveGrammar::new`.
+/// General descriptions at `lead` or above use `Run`, whose final term obeys
+/// its own minimum precedence and the enclosing delimiter. Lower-precedence
+/// nodes must have the exact simple-prefix shape handled by the Pratt stack;
+/// a compound parser at that precedence would otherwise install no dispatch.
+fn leading_term_supported(precedence: u32, body: &Descr) -> bool {
+    if precedence >= LEAD_PREC && (ends_with_atom(body, 0) || ends_with_term(body, 0)) {
+        return true;
+    }
+    matches!(body, Descr::Binary(alias, left, right)
+        if simple(alias).as_deref() == Some("andthen")
+            && matches!(left.as_ref(), Descr::Symbol(_))
+            && matches!(right.as_ref(), Descr::Cat(category, minimum)
+                if simple(category).as_deref() == Some("term") && *minimum < 256))
 }
 
 /// `Lean.Elab.Command.declareSyntaxCatQuotParser` in the pinned Syntax.lean

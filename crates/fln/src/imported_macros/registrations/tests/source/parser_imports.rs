@@ -84,28 +84,35 @@ fn descriptor(kind: &str, token: &str, unsupported: bool) -> Expr {
     )
 }
 
-fn bounded_descriptor(kind: &str, token: &str, precedence: u32) -> Expr {
+#[derive(Clone, Copy)]
+struct OperandParser {
+    leading: u32,
+    minimum: u32,
+    terminated: bool,
+}
+
+fn operand_descriptor(kind: &str, token: &str, parser: OperandParser) -> Expr {
     let sequence = |left, right| {
         apply(
             "Lean.ParserDescr.binary",
             [literal_name("andthen"), left, right],
         )
     };
+    let operand = apply(
+        "Lean.ParserDescr.cat",
+        [literal_name("term"), natural(u64::from(parser.minimum))],
+    );
+    let operand = if parser.terminated {
+        sequence(operand, apply("Lean.ParserDescr.symbol", [string("done!")]))
+    } else {
+        operand
+    };
     apply(
         "Lean.ParserDescr.node",
         [
             literal_name(kind),
-            natural(1022),
-            sequence(
-                apply("Lean.ParserDescr.symbol", [string(token)]),
-                sequence(
-                    apply(
-                        "Lean.ParserDescr.cat",
-                        [literal_name("term"), natural(u64::from(precedence))],
-                    ),
-                    apply("Lean.ParserDescr.symbol", [string("done!")]),
-                ),
-            ),
+            natural(u64::from(parser.leading)),
+            sequence(apply("Lean.ParserDescr.symbol", [string(token)]), operand),
         ],
     )
 }
@@ -173,6 +180,22 @@ fn unselected_fixture_with_operand(
     with_dependency: bool,
     operand_precedence: Option<u32>,
 ) -> (SourceOleanImport, Vec<IrModule>) {
+    unselected_fixture_with_parser(
+        fault,
+        with_dependency,
+        operand_precedence.map(|minimum| OperandParser {
+            leading: 1022,
+            minimum,
+            terminated: true,
+        }),
+    )
+}
+
+fn unselected_fixture_with_parser(
+    fault: Fault,
+    with_dependency: bool,
+    operand: Option<OperandParser>,
+) -> (SourceOleanImport, Vec<IrModule>) {
     let mut constants = Vec::new();
     for declaration in crate::imported_parsers::fixture_declarations() {
         match declaration {
@@ -209,9 +232,9 @@ fn unselected_fixture_with_operand(
         definition(
             "SourceLibrary.chooseParser",
             constant(wire::PARSER_DESCR_TYPE),
-            operand_precedence.map_or_else(
+            operand.map_or_else(
                 || descriptor("SourceLibrary.choose", "choose!", false),
-                |precedence| bounded_descriptor("SourceLibrary.choose", "choose!", precedence),
+                |parser| operand_descriptor("SourceLibrary.choose", "choose!", parser),
             ),
         ),
         definition(
@@ -240,7 +263,7 @@ fn unselected_fixture_with_operand(
         "choose!",
         None,
     );
-    if operand_precedence.is_some() {
+    if operand.is_some_and(|parser| parser.terminated) {
         rows.push(scope(
             Obj::mk_ctor(wire::PARSER_ENTRY_TOKEN, vec![Obj::mk_string("done!")], &[]),
             None,
@@ -455,6 +478,76 @@ fn artifact_operand_precedence_survives_codec_admission_reexport_and_macro_expan
             assert!(rejected.states.is_none());
             assert!(!imported.engine.environment().contains(&name("prefix")));
             assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+        }
+    }
+}
+
+#[test]
+fn artifact_open_ended_terms_survive_admission_reexport_and_macro_execution() {
+    for (leading, minimum) in [(1022, 0), (1022, 65), (60, 65)] {
+        let (mut imported, code) = unselected_fixture_with_parser(
+            Fault::None,
+            false,
+            Some(OperandParser {
+                leading,
+                minimum,
+                terminated: false,
+            }),
+        );
+        imported
+            .enable_imported_syntax(&[name("SourceLibrary")], ParserRegistryLimits::default())
+            .unwrap();
+        let before = imported.engine.logical_root(&KVMap::new());
+        let report = check(
+            &imported,
+            &code,
+            &[
+                (
+                    "Main",
+                    "prelude\nimport Forward\n\
+                     def chosen : Nat := choose! 7 + 42\n\
+                     theorem chosen_ok : chosen = 42 := by rfl",
+                ),
+                ("Forward", "prelude\nimport SourceLibrary"),
+            ],
+            MacroTreeLimits::default(),
+            None,
+        );
+        // The imported choose! macro returns its complete operand, then the
+        // independent '+' macro selects 42. The resulting theorem still goes
+        // through ordinary elaboration and kernel/checker admission.
+        let checked = succeeded(&report);
+        assert_declared_value(&checked.checked.engine, "chosen", 42);
+        assert!(
+            checked
+                .checked
+                .engine
+                .environment()
+                .contains(&name("chosen_ok"))
+        );
+        assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+        assert!(!imported.engine.environment().contains(&name("chosen")));
+
+        for source in [
+            "prelude\nimport SourceLibrary\ndef prefix : Nat := 7\n\
+             def malformed : Nat := choose!",
+            "prelude\nimport SourceLibrary\ndef chosen : Nat := choose! 7 + 42\n\
+             theorem false_equation : chosen = 43 := by rfl",
+        ] {
+            let rejected = check(
+                &imported,
+                &code,
+                &[("Main", source)],
+                MacroTreeLimits::default(),
+                None,
+            );
+            assert!(
+                matches!(rejected.outcome, Outcome::Complete(Err(_))),
+                "{rejected:?}"
+            );
+            assert!(rejected.states.is_none());
+            assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+            assert!(!imported.engine.environment().contains(&name("prefix")));
         }
     }
 }

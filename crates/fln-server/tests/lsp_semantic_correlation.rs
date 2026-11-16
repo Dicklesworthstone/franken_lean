@@ -382,7 +382,8 @@ impl fln_server::dispatch::WorkspaceChecker for Native {
             QueryKind::Goals
             | QueryKind::Hover
             | QueryKind::InteractiveGoals
-            | QueryKind::InteractiveTermGoal => return Ok(None),
+            | QueryKind::InteractiveTermGoal
+            | QueryKind::SemanticTokens => return Ok(None),
         }))
     }
     fn check(

@@ -308,3 +308,153 @@ fn an_operator_separator_is_available_only_when_the_operand_does_not_consume_it(
     // that operand even though the surrounding category asks for term:81.
     assert!(parse(&file, "def result := split! - a ^ b done!").is_err());
 }
+
+fn add_open_body(file: &mut FileGrammar, leading: u32, minimum: u32, binder: bool) {
+    let operand = Descr::Cat(name("term"), minimum);
+    let body = if binder {
+        sequence(Descr::Const(name("ident")), sequence(symbol("=>"), operand))
+    } else {
+        operand
+    };
+    file.import_artifact(&ImportedSyntaxModule {
+        entries: vec![
+            token("body!", None),
+            parser(
+                "Library.body",
+                "term",
+                None,
+                Descr::Node {
+                    kind: name("Library.body"),
+                    prec: leading,
+                    body: Box::new(sequence(symbol("body!"), body)),
+                },
+            ),
+        ],
+    })
+    .unwrap();
+}
+
+#[test]
+fn imported_open_ended_terms_keep_their_full_body_and_enclosing_delimiters() {
+    let mut file = at_precedence(0);
+    add_open_body(&mut file, LEAD_PREC, 0, true);
+    for (expression, expected) in [
+        ("body! x => f x + 1 * 2", "term_+_"),
+        ("body! x => fun y => f x y", "Lean.Parser.Term.fun"),
+        ("body! x => let y := x; y + 1", "Lean.Parser.Term.let"),
+        ("body! x => body! y => x + y", "Library.body"),
+    ] {
+        let parsed = operand(&file, expression);
+        kind(&parsed, "Library.body");
+        kind(&node(&parsed, "Library.body")[3], expected);
+    }
+    let parenthesized = operand(&file, "(body! x => x) + 1");
+    kind(&parenthesized, "term_+_");
+    kind(
+        &node(&parenthesized, "term_+_")[0],
+        "Lean.Parser.Term.paren",
+    );
+    assert!(contains(&parenthesized, "Library.body"));
+    kind(&operand(&file, "f (body! x => x)"), "Lean.Parser.Term.app");
+    for expression in [
+        "body! x =>",
+        "body! => x",
+        "body! x => x +",
+        "f body! x => x",
+    ] {
+        let source = format!("def result := bounded! [{expression}]");
+        assert!(parse(&file, &source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn imported_open_ended_operand_minima_leave_lower_precedence_suffixes_outside() {
+    let mut file = at_precedence(0);
+    add_open_body(&mut file, LEAD_PREC, 66, true);
+    let parsed = operand(&file, "body! x => f x * y + z");
+    kind(&parsed, "term_+_");
+    let body = &node(&parsed, "term_+_")[0];
+    kind(body, "Library.body");
+    kind(&node(body, "Library.body")[3], "term_*_");
+
+    let nested = operand(&file, "body! x => (f x + y) * z");
+    kind(&nested, "Library.body");
+    kind(&node(&nested, "Library.body")[3], "term_*_");
+    assert!(contains(&nested, "term_+_"));
+
+    // An inner prefix owns its operand precedence, independently of term:66.
+    let negative = operand(&file, "body! x => - a ^ b + c");
+    kind(&negative, "term_+_");
+    let body = &node(&negative, "term_+_")[0];
+    kind(&node(body, "Library.body")[3], "term-_");
+    assert!(contains(body, "term_^_"));
+}
+
+#[test]
+fn imported_simple_prefixes_honor_both_leading_and_operand_precedence() {
+    let mut file = at_precedence(65);
+    add_open_body(&mut file, 60, 75, false);
+    let direct = parse(&file, "def result := body! a ^ b").unwrap();
+    kind(&node(&direct, "Library.body")[1], "term_^_");
+    assert!(
+        parse(&file, "def result := bounded! [body! x]").is_err(),
+        "a leading node at 60 cannot enter a term:65 operand"
+    );
+    kind(&operand(&file, "(body! x)"), "Lean.Parser.Term.paren");
+
+    let mut file = at_precedence(0);
+    add_open_body(&mut file, 90, 75, false);
+    let parsed = operand(&file, "body! a ^ b * c + d");
+    kind(&parsed, "term_+_");
+    let product = &node(&parsed, "term_+_")[0];
+    kind(product, "term_*_");
+    let body = &node(product, "term_*_")[0];
+    kind(body, "Library.body");
+    kind(&node(body, "Library.body")[1], "term_^_");
+
+    // The simple-prefix dispatch stores the operand minimum as u8. The
+    // highest representable minimum still admits application (precedence 1023).
+    let mut file = at_precedence(0);
+    add_open_body(&mut file, 90, 255, false);
+    kind(
+        &node(&operand(&file, "body! f x"), "Library.body")[1],
+        "Lean.Parser.Term.app",
+    );
+}
+
+#[test]
+fn unsupported_low_precedence_leading_shapes_leave_no_partial_import() {
+    for body in [
+        sequence(
+            symbol("badBody!"),
+            sequence(Descr::Const(name("ident")), Descr::Cat(name("term"), 0)),
+        ),
+        sequence(symbol("badBody!"), symbol("done!")),
+        sequence(symbol("badBody!"), Descr::Cat(name("term"), 256)),
+    ] {
+        let mut file = grammar();
+        let error = file
+            .import_artifact(&ImportedSyntaxModule {
+                entries: vec![
+                    token("badBody!", None),
+                    parser(
+                        "Library.badBody",
+                        "term",
+                        None,
+                        Descr::Node {
+                            kind: name("Library.badBody"),
+                            prec: 60,
+                            body: Box::new(body),
+                        },
+                    ),
+                ],
+            })
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "artifact term parser is not a supported leading production"
+        );
+        assert!(!file.grammar().table().contains("badBody!"));
+        assert!(file.artifact.imported.is_empty());
+    }
+}
