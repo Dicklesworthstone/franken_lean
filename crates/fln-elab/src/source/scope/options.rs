@@ -1039,6 +1039,8 @@ mod tests {
         // conditional pre-steps with the ordinary ite_true theorem erased.
         // `tactic.skipAssignedInstances`: matching/instance_args.rs;
         // source_simp_instance_matching exercises both values.
+        // `eval.derive.repr`: evaluation.rs; source_deriving_repr exercises
+        // private instance derivation and its explicit opt-out.
         // `stderrAsMessages`: presented `#eval` stream capture (`fln`, lib.rs);
         // `presented_evaluations_do_not_escape_their_command_streams` sets it false.
         // `stderrAsMessages`: the source executor's stderr routing (`fln`, `lib.rs`);
@@ -1075,6 +1077,7 @@ mod tests {
                 "simprocs",
                 "tactic.skipAssignedInstances",
                 "autoLift",
+                "eval.derive.repr",
                 "stderrAsMessages",
                 "maxHeartbeats",
                 "synthInstance.maxSize",

@@ -259,7 +259,7 @@ impl Engine<'_> {
         let mut tasks: Vec<_> = roots.into_iter().rev().map(Task::Enter).collect();
         let mut visiting = HashSet::new();
         let mut finished = HashSet::new();
-        let mut validation_store = self.work.mvars.clone();
+        let mut validation_store = self.work.mvars.clone_for_validation();
         let mut telescope = LocalContext::new();
         let mut residuals = Vec::new();
         while let Some(task) = tasks.pop() {
@@ -445,6 +445,52 @@ mod tests {
         assert_eq!(report.residual_metavariables, vec![t.clone(), b.clone()]);
         assert!(!txn.mvars.is_assigned(&t));
         assert!(!txn.mvars.is_assigned(&b));
+    }
+
+    #[test]
+    fn read_only_residuals_can_be_abstracted_without_becoming_assignable() {
+        let mut txn = transaction();
+        let outer = declare(
+            &mut txn,
+            "outer",
+            Expr::sort(Level::one()),
+            MetavarKind::Natural,
+        );
+        let value = local(&mut txn, "value", Expr::mvar(outer.clone()));
+        txn.mvars.restrict_assignments_to_new();
+        let fresh = declare(
+            &mut txn,
+            "fresh",
+            Expr::mvar(outer.clone()),
+            MetavarKind::Natural,
+        );
+        let before_lctx = txn.lctx.clone();
+        let before_env = txn.env.clone();
+        let report = txn
+            .unify(
+                &Expr::mvar(fresh.clone()),
+                &Expr::fvar(value.clone()),
+                budget(),
+            )
+            .unwrap();
+        assert_eq!(report.residual_metavariables, vec![outer.clone()]);
+        assert!(report.kernel_checks > 0);
+        assert_eq!(txn.mvars.get_assigned_expr(&fresh), Some(&Expr::fvar(value)));
+        assert!(!txn.mvars.is_assigned(&outer));
+        assert!(!txn.mvars.assignment_permitted(&outer));
+        assert!(txn.mvars.assignment_permitted(&fresh));
+        assert_eq!(txn.lctx, before_lctx);
+        assert_eq!(txn.env, before_env);
+
+        // Closing the successful obligation cannot grant a subsequent real
+        // unification permission to specialize the enclosing type hole.
+        let before = txn.mvars.clone();
+        assert!(matches!(
+            txn.unify(&Expr::mvar(outer.clone()), &nat(), budget()),
+            Err(UnificationError::Deferred(UnificationDeferred::MetavariableDepth(id)))
+                if id == outer
+        ));
+        assert_eq!(txn.mvars, before);
     }
 
     #[test]

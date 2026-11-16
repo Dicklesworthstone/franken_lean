@@ -3948,7 +3948,21 @@ mod tests {
             assert_eq!(limited.txn.mvars, original.txn.mvars);
             assert_eq!(limited.txn.lctx, original.txn.lctx);
             assert_eq!(limited.txn.env, original.txn.env);
-            assert!(limited.txn.budget.heartbeats_consumed > before + allowance);
+            match &problem {
+                NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit) => {
+                    // The source meter increments before checking its bound.
+                    assert!(limited.txn.budget.heartbeats_consumed > before + allowance);
+                }
+                NatDefinitionElabError::Inference(SourceInferenceError::Unification(reason))
+                    if matches!(reason.as_ref(), UnificationError::HeartbeatLimit) =>
+                {
+                    // The unifier checks before executing its next step. It
+                    // consumes exactly the remaining allowance, not a phantom
+                    // step beyond it; the enclosing callback retains it all.
+                    assert_eq!(limited.txn.budget.heartbeats_consumed, before + allowance);
+                }
+                _ => unreachable!("resource family checked above"),
+            }
         }
         for host_limit in [false, true] {
             let mut limited = original.clone();

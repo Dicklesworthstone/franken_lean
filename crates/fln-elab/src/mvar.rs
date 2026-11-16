@@ -237,6 +237,16 @@ impl MetavarStore {
         self.assignment_scope = Some(HashSet::new());
     }
 
+    /// A private substitution store for closing residual metavariables into
+    /// universally quantified kernel obligations. Its assignments are temporary
+    /// bound-local substitutions, not elaboration solutions; never publish this
+    /// copy back into a transaction. The original store retains its scope.
+    pub(crate) fn clone_for_validation(&self) -> Self {
+        let mut copy = self.clone();
+        copy.assignment_scope = None;
+        copy
+    }
+
     pub(crate) fn assignment_permitted(&self, id: &MVarId) -> bool {
         self.assignment_scope
             .as_ref()
