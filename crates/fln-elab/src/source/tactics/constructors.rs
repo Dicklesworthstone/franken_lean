@@ -385,7 +385,7 @@ impl Context {
 
     /// Transport a supplied proof, not a fabricated equality, through a type
     /// family. The equality witness binder stays explicit even when unused.
-    fn equality_transport(
+    pub(super) fn equality_transport(
         &mut self,
         equality: &Typed,
         codomain: &Expr,

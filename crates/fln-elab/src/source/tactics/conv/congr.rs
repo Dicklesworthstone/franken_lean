@@ -1003,10 +1003,7 @@ impl Context {
         hole: Expr,
     ) -> Result<Expr, NatDefinitionElabError> {
         let target = self.instantiate(&goal.target)?;
-        Ok(app(
-            self.conv_constant(&["id"], vec![Level::zero()])?,
-            [target, hole],
-        ))
+        Ok(Expr::app(conv_identity(target), hole))
     }
 
     /// `arg i`, `arg @i`, `lhs` (`arg -2`) and `rhs` (`arg -1`) (`Conv.evalArg`).

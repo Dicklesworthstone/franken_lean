@@ -4,10 +4,11 @@
 //! A conv goal is an ordinary goal `lhs = ?rhs`, `?rhs` a fresh metavariable, recorded in
 //! [`Context::conv_goals`] so a goal display shows it as `| lhs` (the pin's `mkLHSGoalRaw`
 //! annotation). Each conv tactic replaces the main conv goal by goals that close it with an
-//! equality proof built from checked lemmas (`Eq.trans`, `congrArg`, `congrFun`, the generated
-//! congruence theorem of `mkCongrSimpCore?`, `funext`, `forall_congr`, …); when the block ends,
-//! the goals left are closed by reflexivity and the original goal is replaced through `Eq.mpr`
-//! (or the hypothesis through `Eq.mp`). Every term goes through ordinary admission.
+//! equality proof built from ordinary Eq.rec transports and checked lemmas for advanced
+//! navigation (`congrFun`, the generated congruence theorem of `mkCongrSimpCore?`, `funext`,
+//! `forall_congr`, …); when the block ends, the goals left are closed by reflexivity and the
+//! original target or hypothesis is transported through its equality proof. Basic rewrites
+//! need no named Prelude congruence or cast helpers. Every term goes through ordinary admission.
 //!
 //! A goal under a binder the tactic entered (`ext`, `arg` on a `∀`, `pattern` under a `fun`)
 //! lives in a context extending its parent's. Its parent's proof and right-hand side abstract
@@ -33,6 +34,16 @@ pub(super) fn is_conv_kind(kind: &Name) -> bool {
 
 fn app<const N: usize>(head: Expr, args: [Expr; N]) -> Expr {
     args.into_iter().fold(head, Expr::app)
+}
+
+/// Retain an expected type with an ordinary lambda rather than a Prelude `id`.
+fn conv_identity(domain: Expr) -> Expr {
+    Expr::lam(
+        Name::anonymous(),
+        domain,
+        Expr::bvar(0).expect("fixed identity binder"),
+        BinderInfo::Default,
+    )
 }
 
 /// `e.isAppOf c`.
@@ -261,7 +272,7 @@ impl Context {
     }
 
     /// `Meta.mkEqTrans h₁ h₂` for `h₁ : a = b` and `h₂ : b = c`.
-    fn conv_eq_trans(
+    pub(super) fn conv_eq_trans(
         &mut self,
         level: &Level,
         alpha: &Expr,
@@ -275,17 +286,28 @@ impl Context {
         if is_app_of(&second, &["Eq", "refl"]) {
             return Ok(first);
         }
-        Ok(app(
-            self.conv_constant(&["Eq", "trans"], vec![level.clone()])?,
-            [
-                alpha.clone(),
-                a.clone(),
-                b.clone(),
-                c.clone(),
-                first,
-                second,
-            ],
-        ))
+        let endpoint = self.equality_local(alpha.clone())?;
+        let conclusion = equality::equation(
+            level.clone(),
+            alpha.clone(),
+            a.clone(),
+            Expr::fvar(endpoint.id.clone()),
+        );
+        let motive = self.close_equality_binder(&endpoint, conclusion, true)?;
+        self.equality_transport(
+            &Typed {
+                value: second,
+                type_: equality::equation(
+                    level.clone(),
+                    alpha.clone(),
+                    b.clone(),
+                    c.clone(),
+                ),
+            },
+            &motive,
+            first,
+            Level::zero(),
+        )
     }
 
     /// `Meta.mkEqRefl a`.
@@ -341,10 +363,7 @@ impl Context {
         let old_target = equality::equation(level.clone(), alpha.clone(), lhs, rhs.clone());
         let target = equality::equation(level, alpha, lhs_new, rhs);
         let (hole, next) = self.conv_successor(&goal, target)?;
-        let value = app(
-            self.conv_constant(&["id"], vec![Level::zero()])?,
-            [old_target, hole],
-        );
+        let value = Expr::app(conv_identity(old_target), hole);
         self.conv_goals.remove(&goal.id);
         self.conv_close(goal, value)?;
         Ok(next)
@@ -1026,6 +1045,16 @@ impl Context {
                 let equality = self.instantiate(&Expr::mvar(root))?;
                 self.txn.lctx = goal.lctx.clone();
                 let level = self.conv_level(&lhs)?;
+                let type_equality = Typed {
+                    value: equality,
+                    type_: equality::equation(
+                        Level::succ(level.clone())
+                            .map_err(|_| failure(SourceInferenceError::Scope))?,
+                        Expr::sort(level.clone()),
+                        lhs.clone(),
+                        rhs.clone(),
+                    ),
+                };
                 match local {
                     None => {
                         // `replaceTargetEq` and `try with_reducible rfl`.
@@ -1036,21 +1065,24 @@ impl Context {
                             }
                             (hole, next)
                         };
-                        let statement = equality::equation(
-                            Level::succ(level.clone())
-                                .map_err(|_| failure(SourceInferenceError::Scope))?,
-                            Expr::sort(level.clone()),
+                        // Transport (fun T => T -> lhs) along lhs = rhs,
+                        // starting with the identity at lhs. Applying the
+                        // result to the new proof retains the original equality.
+                        let endpoint = self.equality_local(Expr::sort(level.clone()))?;
+                        let codomain = Expr::forall_e(
+                            Name::anonymous(),
+                            Expr::fvar(endpoint.id.clone()),
                             lhs.clone(),
-                            rhs.clone(),
+                            BinderInfo::Default,
                         );
-                        let hint = app(
-                            self.conv_constant(&["id"], vec![Level::zero()])?,
-                            [statement, equality],
-                        );
-                        let value = app(
-                            self.conv_constant(&["Eq", "mpr"], vec![level])?,
-                            [lhs, rhs, hint, hole],
-                        );
+                        let codomain = self.close_equality_binder(&endpoint, codomain, true)?;
+                        let transport = self.equality_transport(
+                            &type_equality,
+                            &codomain,
+                            conv_identity(lhs),
+                            level,
+                        )?;
+                        let value = Expr::app(transport, hole);
                         // The goal's own binders close once the new goal is solved.
                         proof.work.push(Work::Close(goal, value));
                         if !self.conv_try_reducible_rfl(&next)? {
@@ -1065,10 +1097,18 @@ impl Context {
                             .find(&local)
                             .cloned()
                             .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-                        let value = app(
-                            self.conv_constant(&["Eq", "mp"], vec![level])?,
-                            [lhs, rhs.clone(), equality, Expr::fvar(local)],
-                        );
+                        let endpoint = self.equality_local(Expr::sort(level.clone()))?;
+                        let codomain = self.close_equality_binder(
+                            &endpoint,
+                            Expr::fvar(endpoint.id.clone()),
+                            true,
+                        )?;
+                        let value = self.equality_transport(
+                            &type_equality,
+                            &codomain,
+                            Expr::fvar(local),
+                            level,
+                        )?;
                         let (next, parent, child) = self.replace_rewritten_hypothesis(
                             goal,
                             &declaration,

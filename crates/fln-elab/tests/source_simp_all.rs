@@ -189,6 +189,11 @@ fn simp_custom_dischargers_are_shared_by_hypotheses_and_simpa() {
         "theorem t (P : Prop) (Q : Nat -> Prop) (h : P) (a b : Nat) (rule : P -> a = b) (ha : Q a) : Q b := by simpa (discharger := exact h) only [rule] using ha",
     );
     accepted(
+        "theorem t (P : Prop) (h : P) (a b : Nat) (rule : P -> a = b) : a = b := by\n conv => lhs; simp (discharger := exact h) only [rule]",
+    );
+    // Like the pinned Lean conv elaborator, conv closes a reflexive target.
+    // A following tactic must therefore be rejected as having no goals.
+    refused(
         "theorem t (P : Prop) (h : P) (a b : Nat) (rule : P -> a = b) : a = b := by\n conv => lhs; simp (discharger := exact h) only [rule]\n rfl",
     );
     accepted(

@@ -424,7 +424,10 @@ impl Context {
 
     /// `target` with `occurrence` (an instance of the side `evidence` rewrites, its right side
     /// when `reverse`) replaced by the other side, and `congrArg (fun _a => …) h : target =
-    /// target'`, `h` the evidence (`Eq.symm` of it when `reverse`). With `kabstract`, every
+    /// target'`, `h` the evidence reversed by equality induction when `reverse`.
+    /// The congruence is built through the shared Eq.rec proof constructor, so
+    /// the native source seed needs no separately named Prelude helper.
+    /// With `kabstract`, every
     /// instance of `occurrence` is abstracted as `rw` abstracts it
     /// ([`Self::rewrite_kabstract`]; the pin's conv `rewrite` is the same `MVarId.rewrite`,
     /// Lean/Meta/Tactic/Rewrite.lean:47); otherwise only its exact copies, as simp's step.
@@ -451,16 +454,9 @@ impl Context {
             return Err(error(TacticError::ExpectedEquality));
         }
         let (replacement, equation) = if reverse {
-            let symm = Name::from_components(["Eq", "symm"]);
-            if !self.txn.env.contains(&symm) {
-                return Err(failure(SourceInferenceError::UnknownConstant(symm)));
-            }
             (
                 from.clone(),
-                app(
-                    Expr::const_(symm, vec![u.clone()]),
-                    [alpha.clone(), from, to, value],
-                ),
+                self.symmetric_equality(&u, &alpha, &from, &to, value)?,
             )
         } else {
             (to, value)
@@ -490,21 +486,22 @@ impl Context {
             value: target_type.clone(),
             type_: sort,
         })?;
-        let congr = Name::from_components(["congrArg"]);
-        if !self.txn.env.contains(&congr) {
-            return Err(failure(SourceInferenceError::UnknownConstant(congr)));
-        }
         let motive = Expr::lam(
             Name::from_components(["_a"]),
             alpha.clone(),
             abstracted,
             BinderInfo::Default,
         );
-        let proof = app(
-            Expr::const_(congr, vec![u, v]),
-            [alpha, target_type, pattern, replacement, motive, equation],
-        );
-        Ok((next, proof))
+        let proof = self.selector_congruence(
+            &Typed {
+                value: equation,
+                type_: equality::equation(u, alpha, pattern, replacement),
+            },
+            &target_type,
+            &v,
+            &motive,
+        )?;
+        Ok((next, proof.value))
     }
 
     /// `rw [f]` for a definition `f`: its equation theorems in order, the first that

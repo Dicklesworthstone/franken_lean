@@ -1857,20 +1857,13 @@ impl Context {
                             value: alpha.clone(),
                             type_: sort,
                         })?;
-                        let trans = Name::from_components(["Eq", "trans"]);
-                        if !self.txn.env.contains(&trans) {
-                            return Err(failure(SourceInferenceError::UnknownConstant(trans)));
-                        }
-                        [
-                            alpha,
-                            original.clone(),
-                            current.clone(),
-                            next.clone(),
+                        self.conv_eq_trans(
+                            &level,
+                            &alpha,
+                            [&original, &current, &next],
                             previous,
                             step,
-                        ]
-                        .into_iter()
-                        .fold(Expr::const_(trans, vec![level]), Expr::app)
+                        )?
                     }
                 });
             }
