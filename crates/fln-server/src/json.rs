@@ -659,7 +659,7 @@ pub(super) fn semantic_tokens_result(value: &str) -> bool {
         return false;
     }
     let mut previous = (0u32, 0u32, 0u32);
-    for token in data.chunks_exact(5) {
+    for token in data.as_chunks::<5>().0 {
         let mut fields = [0u32; 5];
         for (field, value) in fields.iter_mut().zip(token) {
             let Ok(value) = value.trim().parse::<u32>() else {

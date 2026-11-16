@@ -12,6 +12,11 @@ const SEQUENCING_OWNERS: [(&str, &str); 3] = [
     ("term_*>_", "_aux_Init_Notation___macroRules_term_*>__1"),
 ];
 
+const LAZY_OPERATOR_OWNERS: [(&str, &str); 2] = [
+    ("term_<|>_", "_aux_Init_Notation___macroRules_term_<|>__1"),
+    ("term_>>_", "_aux_Init_Notation___macroRules_term_>>__1"),
+];
+
 const CONDITIONAL_OWNERS: [(&str, &str, &str); 2] = [
     (
         "boolIfThenElse",
@@ -80,6 +85,15 @@ fn pinned_sequencing_registry_binds_authority_and_serves_recursive_user_macros()
     quotation_registry_controls(
         "Init.Notation",
         &SEQUENCING_OWNERS.map(|(kind, owner)| (kind, owner, "app")),
+        operator_input,
+    );
+}
+
+#[test]
+fn pinned_lazy_operator_registry_binds_authority_and_serves_recursive_user_macros() {
+    quotation_registry_controls(
+        "Init.Notation",
+        &LAZY_OPERATOR_OWNERS.map(|(kind, owner)| (kind, owner, "binop_lazy")),
         operator_input,
     );
 }
@@ -419,6 +433,14 @@ theorem sequenceDirections_value : Eq (some 7 <* some 11 *> some 13) (some 13) :
 theorem sequenceLeft_none : Eq (some 7 <* (none : Option Nat)) none := rfl
 theorem sequenceRight_none : Eq ((none : Option Nat) *> some 7) none := rfl
 theorem sequenceShadow_value : Eq (sequenceShadow Nat 99 (some 7) (some 11)) (some 11) := rfl
+def lazyOrElse (x y : Option Nat) : Option Nat := x <|> y
+def lazyAndThen {α : Type} [AndThen α] (x y : α) : α := x >> y
+theorem lazyOrElse_thunk (x y : Option Nat) :
+    Eq (lazyOrElse x y) (HOrElse.hOrElse x (fun _ : Unit => y)) := rfl
+theorem lazyAndThen_thunk {α : Type} [AndThen α] (x y : α) :
+    Eq (lazyAndThen x y) (HAndThen.hAndThen x (fun _ : Unit => y)) := rfl
+theorem lazyOrElse_some : Eq (lazyOrElse (some 7) (some 11)) (some 7) := rfl
+theorem lazyOrElse_none : Eq (lazyOrElse none (some 11)) (some 11) := rfl
 def operatorArithmetic (n : Nat) : Nat := (n + 3) * 5 - 2
 def operatorDivision (n : Nat) : Nat := n / 3 + n % 3
 def operatorPower (n : Nat) : Nat := 2 ^ n
@@ -580,6 +602,13 @@ theorem conditionalPatternShadow_none : Eq (conditionalPatternShadow none 11) 11
             vec![&name(owner)]
         );
     }
+    for (kind, owner) in LAZY_OPERATOR_OWNERS {
+        assert_eq!(
+            registry.declarations(&name(kind)).collect::<Vec<_>>(),
+            vec![&name(owner)],
+            "the complete journal must retain the lazy operator owner: {kind}"
+        );
+    }
     for (kind, owner, _) in CONDITIONAL_OWNERS {
         assert_eq!(
             registry.declarations(&name(kind)).collect::<Vec<_>>(),
@@ -628,7 +657,7 @@ theorem conditionalPatternShadow_none : Eq (conditionalPatternShadow none 11) 11
     assert!(report.state.is_some());
     assert_eq!(
         (checked.files, checked.commands, checked.theorems),
-        (1, 67, 28)
+        (1, 73, 32)
     );
     for (_, owner) in SEQUENCING_OWNERS {
         assert!(report.attempts.iter().any(|attempt| {
@@ -639,6 +668,19 @@ theorem conditionalPatternShadow_none : Eq (conditionalPatternShadow none 11) 11
                     .any(|id| id == &format!("mirror:{owner}"))
                 && attempt.reference_functions.is_empty()
         }));
+    }
+    for (kind, owner) in LAZY_OPERATOR_OWNERS {
+        assert!(
+            report.attempts.iter().any(|attempt| {
+                attempt.declaration == name(owner)
+                    && attempt
+                        .native_functions
+                        .iter()
+                        .any(|id| id == &format!("mirror:{owner}"))
+                    && attempt.reference_functions.is_empty()
+            }),
+            "native lazy operator was not exercised: {kind}"
+        );
     }
     for (kind, owner, _) in CONDITIONAL_OWNERS {
         assert!(
@@ -699,6 +741,8 @@ theorem conditionalPatternShadow_none : Eq (conditionalPatternShadow none 11) 11
         "sequenceLeft",
         "sequenceRight",
         "sequenceShadow",
+        "lazyOrElse",
+        "lazyAndThen",
         "operatorArithmetic",
         "operatorDivision",
         "operatorPower",
@@ -773,6 +817,14 @@ theorem conditionalPatternShadow_none : Eq (conditionalPatternShadow none 11) 11
         (
             "wrongResult",
             "theorem wrongResult : Eq (some 7 *> some 11) (some 7) := rfl",
+        ),
+        (
+            "wrongOrElseResult",
+            "theorem wrongOrElseResult : Eq (lazyOrElse (some 7) (some 11)) (some 11) := rfl",
+        ),
+        (
+            "wrongAndThenResult",
+            "theorem wrongAndThenResult {α : Type} [AndThen α] (x y : α) : Eq (lazyAndThen x y) x := rfl",
         ),
         (
             "wrongOperatorType",

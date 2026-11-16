@@ -51,6 +51,8 @@ pub(super) enum NativeTacticMacro {
     SeqRight,
     BoolIf,
     IfLet,
+    LazyOrElse,
+    LazyAndThen,
     BitOr,
     BitXor,
     BitAnd,
@@ -88,7 +90,7 @@ impl NativeTacticMacro {
     // Exact registrations from REFERENCE_GRAMMAR_CENSUS.txt, not spellings
     // inferred from a caller's syntax kind. The partition and checked module
     // owner remain mandatory before any candidate receives native execution.
-    const ALL: [Self; 48] = [
+    const ALL: [Self; 50] = [
         Self::ApplyRfl,
         Self::EqRefl,
         Self::ExactHEq,
@@ -111,6 +113,8 @@ impl NativeTacticMacro {
         Self::SeqRight,
         Self::BoolIf,
         Self::IfLet,
+        Self::LazyOrElse,
+        Self::LazyAndThen,
         Self::BitOr,
         Self::BitXor,
         Self::BitAnd,
@@ -160,6 +164,8 @@ impl NativeTacticMacro {
             | Self::SeqRight
             | Self::BoolIf
             | Self::IfLet
+            | Self::LazyOrElse
+            | Self::LazyAndThen
             | Self::BitOr
             | Self::BitXor
             | Self::BitAnd
@@ -246,6 +252,8 @@ impl NativeTacticMacro {
             Self::SeqRight => "_aux_Init_Notation___macroRules_term_*>__1",
             Self::BoolIf => "_aux_Init_Notation___macroRules_boolIfThenElse_1",
             Self::IfLet => "_aux_Init_Notation___macroRules_termIfLet_1",
+            Self::LazyOrElse => "_aux_Init_Notation___macroRules_term_<|>__1",
+            Self::LazyAndThen => "_aux_Init_Notation___macroRules_term_>>__1",
             Self::BitOr => "_aux_Init_Notation___macroRules_term_|||__2",
             Self::BitXor => "_aux_Init_Notation___macroRules_term_^^^__2",
             Self::BitAnd => "_aux_Init_Notation___macroRules_term_&&&__2",
@@ -331,6 +339,8 @@ impl NativeTacticMacro {
             Self::SeqRight => "mirror:_aux_Init_Notation___macroRules_term_*>__1",
             Self::BoolIf => "mirror:_aux_Init_Notation___macroRules_boolIfThenElse_1",
             Self::IfLet => "mirror:_aux_Init_Notation___macroRules_termIfLet_1",
+            Self::LazyOrElse => "mirror:_aux_Init_Notation___macroRules_term_<|>__1",
+            Self::LazyAndThen => "mirror:_aux_Init_Notation___macroRules_term_>>__1",
             Self::BitOr => "mirror:_aux_Init_Notation___macroRules_term_|||__2",
             Self::BitXor => "mirror:_aux_Init_Notation___macroRules_term_^^^__2",
             Self::BitAnd => "mirror:_aux_Init_Notation___macroRules_term_&&&__2",
@@ -381,6 +391,8 @@ impl NativeTacticMacro {
             Self::SeqRight => "term_*>_",
             Self::BoolIf => "boolIfThenElse",
             Self::IfLet => "termIfLet",
+            Self::LazyOrElse => "term_<|>_",
+            Self::LazyAndThen => "term_>>_",
             Self::BitOr => "term_|||_",
             Self::BitXor => "term_^^^_",
             Self::BitAnd => "term_&&&_",
@@ -757,7 +769,9 @@ impl NativeTacticMacro {
                     ],
                 )
             }
-            Self::BitOr
+            Self::LazyOrElse
+            | Self::LazyAndThen
+            | Self::BitOr
             | Self::BitXor
             | Self::BitAnd
             | Self::Add
@@ -777,10 +791,13 @@ impl NativeTacticMacro {
             | Self::Ge
             | Self::Eq
             | Self::BEq => {
-                // Init.Notation replaces the earlier infix-generated macro
-                // with an expression-tree quotation. The helper kind matters:
+                // Init.Notation quotes expression-tree helpers directly for lazy
+                // operators and replaces earlier infix macros for arithmetic.
+                // The helper kind matters:
                 // it controls coercion propagation and relation elaboration.
                 let (helper, constant) = match self {
+                    Self::LazyOrElse => ("binop_lazy", "HOrElse.hOrElse"),
+                    Self::LazyAndThen => ("binop_lazy", "HAndThen.hAndThen"),
                     Self::BitOr => ("binop", "HOr.hOr"),
                     Self::BitXor => ("binop", "HXor.hXor"),
                     Self::BitAnd => ("binop", "HAnd.hAnd"),

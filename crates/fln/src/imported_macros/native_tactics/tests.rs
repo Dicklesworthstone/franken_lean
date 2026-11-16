@@ -1760,7 +1760,9 @@ meta def notationCandidates : List (Macro × Name) :=
     );
 }
 
-const OPERATOR_CANDIDATES: [NativeTacticMacro; 20] = [
+const OPERATOR_CANDIDATES: [NativeTacticMacro; 22] = [
+    NativeTacticMacro::LazyOrElse,
+    NativeTacticMacro::LazyAndThen,
     NativeTacticMacro::BitOr,
     NativeTacticMacro::BitXor,
     NativeTacticMacro::BitAnd,
@@ -1812,6 +1814,8 @@ fn operator_inputs(candidate: NativeTacticMacro) -> Vec<Syntax> {
 #[test]
 fn native_operator_quotes_keep_coercion_helpers_and_capture_positions() {
     for (candidate, helper) in [
+        (NativeTacticMacro::LazyOrElse, "binop_lazy"),
+        (NativeTacticMacro::LazyAndThen, "binop_lazy"),
         (NativeTacticMacro::Add, "binop"),
         (NativeTacticMacro::Pow, "rightact"),
         (NativeTacticMacro::SMul, "leftact"),
@@ -1856,7 +1860,9 @@ fn native_operator_quotes_keep_coercion_helpers_and_capture_positions() {
 fn live_pinned_operator_candidates_match_complete_quotations_and_state() {
     let oracle = r#"
 meta def notationCandidates : List (Macro × Name) :=
-  [(«_aux_Init_Notation___macroRules_term_|||__2», `«term_|||_»),
+  [(«_aux_Init_Notation___macroRules_term_<|>__1», `«term_<|>_»),
+   («_aux_Init_Notation___macroRules_term_>>__1», `«term_>>_»),
+   («_aux_Init_Notation___macroRules_term_|||__2», `«term_|||_»),
    («_aux_Init_Notation___macroRules_term_^^^__2», `«term_^^^_»),
    («_aux_Init_Notation___macroRules_term_&&&__2», `«term_&&&_»),
    («_aux_Init_Notation___macroRules_term_+__2», `«term_+_»),
