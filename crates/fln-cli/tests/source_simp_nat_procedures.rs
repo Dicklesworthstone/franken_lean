@@ -188,6 +188,43 @@ fn an_ascribed_numeral_equation_closes_as_at_the_pin() {
     );
 }
 
+/// The offset converter must read the frontend's retained type ascriptions even
+/// when congruence reaches arithmetic below an arbitrary function application.
+#[test]
+fn ascribed_arithmetic_beneath_an_application_closes_as_at_the_pin() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    accepted(
+        &lib,
+        &root,
+        "UnderApplication",
+        &[
+            "example (f : Nat → Nat) : f ((2 : Nat) + 2) = f 4 := by simp only []\n\
+             example (f : Nat → Nat) : f ((10 : Nat) - 3) = f 7 := by simp only []\n\
+             example (f : Nat → Nat) : f ((3 : Nat) * 7) = f 21 := by simp only []\n\
+             example (f : Nat → Nat) : f ((17 : Nat) / 3) = f 5 := by simp only []\n\
+             example (f : Nat → Nat) : f ((17 : Nat) % 3) = f 2 := by simp only []\n\
+             example (f : Nat → Nat) : f (((3 : Nat) : Nat) * 7) = f 21 := by simp only []\n\
+             example (f : Nat → Nat) : \
+             f ((10 - 3) * ((8 : Nat) / 2) + 17 % 3) = f 30 := by simp only []\n",
+        ],
+    );
+    refused(
+        &lib,
+        &root,
+        "UnderApplicationRefused",
+        &[
+            "example (f : Nat → Nat) : f ((3 : Nat) * 7) = f 22 := by simp only []\n",
+            "example (f : Nat → Nat) (operation : Mul Nat) : \
+             f (@Mul.mul Nat operation (3 : Nat) 7) = f 21 := by simp only []\n",
+            "abbrev two : Nat := 2\nexample (f : Nat → Nat) : \
+             f ((two : Nat) * 3) = f 6 := by simp only []\n",
+        ],
+    );
+}
+
 const ENUMERATION: &str = "inductive T where\n  | one\n  | two\n\n";
 
 /// `reduceCtorEq`: an equation between two different constructors, read through literals, `Nat`

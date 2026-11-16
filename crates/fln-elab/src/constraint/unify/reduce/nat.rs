@@ -1034,6 +1034,22 @@ impl Engine<'_> {
             while let ExprNode::MData { expr, .. } = stripped.node() {
                 stripped = expr;
             }
+            if let ExprNode::LetE {
+                decl_name,
+                value,
+                body,
+                ..
+            } = stripped.node()
+                && decl_name.is_anonymous()
+                && matches!(body.node(), ExprNode::BVar { idx: 0 })
+            {
+                // The frontend retains a type ascription as an anonymous identity
+                // let; the pin passes its value directly to `evalNat`. Requeue only
+                // that wrapper, retaining the structural boundary for ordinary lets,
+                // definitions and noncanonical arithmetic dictionaries.
+                frames.push(ClassFrame::Visit(value.clone()));
+                continue;
+            }
             if let ExprNode::Lit {
                 literal: Literal::Nat(value),
             } = stripped.node()

@@ -131,6 +131,10 @@ jobs:
           cargo test --locked --no-fail-fast -p fln \
             --test source_notation --test source_module_grammar -- --nocapture \
             2>&1 | tee target/imported-ir-reference/macro-construction-source.log || status=1
+          cargo test --locked -p fln --test source_simp_offsets -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/simp-offsets.log || status=1
+          cargo test --locked -p fln-cli --test source_simp_nat_procedures -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/simp-nat-procedures.log || status=1
           cargo test --locked -p fln --test source_mutual_well_founded \
             inferred_ -- --nocapture \
             2>&1 | tee target/imported-ir-reference/mutual-inference.log || status=1

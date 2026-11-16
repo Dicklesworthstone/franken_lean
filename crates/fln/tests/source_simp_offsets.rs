@@ -132,3 +132,33 @@ fn offsets_do_not_change_heterogeneous_or_multiplication_completion() {
         ));
     }
 }
+
+#[test]
+fn ascribed_literal_arithmetic_closes_beneath_an_arbitrary_application() {
+    for equation in [
+        "f ((2 : Nat) + 2) = f 4",
+        "f ((10 : Nat) - 3) = f 7",
+        "f ((3 : Nat) * 7) = f 21",
+        "f ((17 : Nat) / 3) = f 5",
+        "f ((17 : Nat) % 3) = f 2",
+        "f (((3 : Nat) : Nat) * 7) = f 21",
+        "f ((10 - 3) * ((8 : Nat) / 2) + 17 % 3) = f 30",
+    ] {
+        accepted(&format!(
+            "theorem t (f : Nat → Nat) : {equation} := by simp only []\n"
+        ));
+    }
+}
+
+#[test]
+fn ascribed_arithmetic_keeps_results_instances_and_transparency_distinct() {
+    for source in [
+        "theorem t (f : Nat → Nat) : f ((3 : Nat) * 7) = f 22 := by simp only []",
+        "theorem t (f : Nat → Nat) (operation : Mul Nat) : \
+         f (@Mul.mul Nat operation (3 : Nat) 7) = f 21 := by simp only []",
+        "abbrev two : Nat := 2\ntheorem t (f : Nat → Nat) : \
+         f ((two : Nat) * 3) = f 6 := by simp only []",
+    ] {
+        refused(source);
+    }
+}

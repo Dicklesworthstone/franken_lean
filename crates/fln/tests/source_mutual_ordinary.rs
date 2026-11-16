@@ -187,7 +187,11 @@ example (acc n : Nat) :
 "#
         );
         let base = check(&source);
-        run(&base, "#eval heterogeneousLeft (f := fun x => x+10) 3", "14");
+        run(
+            &base,
+            "#eval heterogeneousLeft (f := fun x => x+10) 3",
+            "14",
+        );
         run(&base, "#eval heterogeneousRight 10 3", "15");
     }
 }
