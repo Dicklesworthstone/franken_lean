@@ -486,10 +486,10 @@ pub(super) fn run(
                 Ok(inputs) => inputs,
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
-            if macro_inputs.is_none() {
-                if let Err(error) = loaded.preflight(limits) {
-                    return failed(error.class, &error.detail, error.authority, json, error.exit);
-                }
+            if macro_inputs.is_none()
+                && let Err(error) = loaded.preflight(limits)
+            {
+                return failed(error.class, &error.detail, error.authority, json, error.exit);
             }
             let (engine, mut olean_base) = match loaded.base_engine(seed, jobs, posture) {
                 Ok(base) => base,

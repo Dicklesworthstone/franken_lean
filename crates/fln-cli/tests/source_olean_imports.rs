@@ -164,6 +164,92 @@ fn unparseable_source_is_refused_before_its_init_closure_is_admitted() {
     assert!(stderr.contains("parse refused source"), "{stderr}");
 }
 
+#[test]
+fn lean_refuses_unparseable_source_before_admitting_its_init_closure() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    // Even when `LEAN_PATH` holds zero `.olean` files, both `fln check-source`
+    // and drop-in `lean` refuse `import Init` + unparseable body with a parse
+    // error before attempting to read `Init.olean` from disk (bead
+    // `fln-parse-before-imports-j8p6`).
+    let empty_lean_path =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("j8p6_empty_lean_path");
+    std::fs::create_dir_all(&empty_lean_path).expect("create empty LEAN_PATH");
+    for (label, binary, args) in [
+        (
+            "fln check-source",
+            env!("CARGO_BIN_EXE_fln"),
+            vec!["check-source", "--json"],
+        ),
+        ("lean", env!("CARGO_BIN_EXE_lean"), Vec::new()),
+    ] {
+        let started = Instant::now();
+        let output = Command::new(binary)
+            .args(&args)
+            .arg(fixture("unparseable"))
+            .env("LEAN_PATH", &empty_lean_path)
+            .output()
+            .unwrap_or_else(|error| panic!("run {label}: {error}"));
+        let elapsed = started.elapsed();
+        let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{label} stdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(stdout.is_empty(), "{label}: {stdout}");
+        assert!(
+            stderr.contains("parse refused source") || stderr.contains(":2:1: error:"),
+            "{label} read .olean before parsing: {stderr}"
+        );
+        assert!(
+            !stderr.contains("neither a source file"),
+            "{label} touched LEAN_PATH before parsing: {stderr}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "{label} took {elapsed:?} refusing unparseable source"
+        );
+    }
+
+    if std::env::var_os("LEAN_PATH").is_some() || !pinned_prelude_present() {
+        eprintln!("SKIP: pinned Reference lib/lean absent or LEAN_PATH overrides it");
+        return;
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(fixture("unparseable"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run drop-in lean");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while child.try_wait().expect("poll drop-in lean").is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "no verdict within 120 s: drop-in lean admitted Init before parsing the source body"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().expect("collect drop-in lean");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("parse refused source") || stderr.contains(":2:1: error:"),
+        "{stderr}"
+    );
+}
+
 fn check_source_with(
     jobs: &str,
     entry: &std::path::Path,
@@ -1838,12 +1924,7 @@ fn default_door_imported_macro_choices_are_transactional() {
     assert!(run.stderr.is_empty(), "{run:?}");
     let report = String::from_utf8(run.stdout).unwrap();
     assert_imported_macro_execution(&report);
-    for value in [29] {
-        assert!(
-            report.contains(&format!("\"kind\":\"nat\",\"value\":{value}")),
-            "{report}"
-        );
-    }
+    assert!(report.contains("\"kind\":\"nat\",\"value\":29"), "{report}");
 
     // Successful alternatives do not license selecting an arbitrary reading.
     let ambiguous = concat!(

@@ -396,7 +396,7 @@ fn run_loaded(
             let Inputs::Modules { names, sources } = &loaded.inputs else {
                 return None;
             };
-            let explicit_world = ordinary_lean || !loaded.oleans.is_empty()
+            let explicit_world = ordinary_lean || loaded.has_external_imports()
                 || sources.iter().any(|source| {
                     parse_source_header(source).is_ok_and(|header| header.prelude || header.module_system)
                 });
@@ -747,8 +747,8 @@ fn prepare_publication<'a>(
                 &current_image
             }
         };
-        let imports: Vec<_> = loaded
-            .oleans
+        let oleans = loaded.oleans()?;
+        let imports: Vec<_> = oleans
             .iter()
             .map(|import| {
                 let [exported, server, private] = &import.parts;

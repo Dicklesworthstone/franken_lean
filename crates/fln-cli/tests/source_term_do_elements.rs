@@ -248,8 +248,176 @@ fn term_position_do_elements_and_bare_returns_are_the_pins_blocks() {
         assert_eq!(pinned.unwrap_or(0), 0, "{name}: the pinned lean refuses it");
     }
     for (name, program) in REFUSED {
-        let (code, _, pinned) = check(&lib, &root, name, program);
+        let (code, stderr, pinned) = check(&lib, &root, name, program);
         assert_ne!(code, 0, "{name}: accepted {program}");
         assert_ne!(pinned.unwrap_or(1), 0, "{name}: the pinned lean accepts it");
+        match *name {
+            "do_pure_lets_at_nat"
+            | "do_pure_let_at_bool"
+            | "do_at_application_of_a_value"
+            | "do_at_alias_of_nat" => {
+                assert!(
+                    stderr.contains(
+                        "invalid `do` notation, expected type is not a monad application"
+                    ),
+                    "{name}: expected non-monad diagnostic, got:\n{stderr}"
+                );
+            }
+            "do_at_list" | "do_bare_list" => {
+                assert!(
+                    !stderr.contains("not a monad application"),
+                    "{name}: List Nat must pass monad extraction and fail at Pure List:\n{stderr}"
+                );
+                assert!(
+                    stderr.contains("native instance search") || stderr.contains("Pure List"),
+                    "{name}: expected missing Pure List instance refusal, got:\n{stderr}"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Self-contained `prelude` regression for `fln-do-expected-type-not-monad-false-accept-7aub`
+/// that executes on every CI host without requiring `~/.elan`:
+/// - non-monad expected types (`Nat` from upstream `elab_fail/770.lean`, `Bool`, value-indexed
+///   `Fin`, and `def N := Nat`) fail at `extractMonadInfo` before reading statements;
+/// - `Id Nat` and step-wise `abbrev Act := MyIO Nat` / `def Act := MyIO Nat` (backed by a
+///   state-function monad `MyStateM`) stop at the first `m α` without unfolding through to `->`;
+/// - `List Nat` passes `extractMonadInfo` and fails at the later `Pure List` synthesis stage.
+#[test]
+fn do_expected_type_monad_extraction_distinguishes_non_monad_from_missing_pure_without_reference_lib()
+ {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("do_expected_type_7aub_prelude");
+    std::fs::create_dir_all(&dir).expect("create 7aub prelude dir");
+    let shared_monads = "\
+inductive MyFin : Nat -> Type where
+  | mk : (v : Nat) -> MyFin v
+class Pure (f : Type -> Type) : Type 1 where
+  pure : {α : Type} -> α -> f α
+class Bind (f : Type -> Type) : Type 1 where
+  bind : {α β : Type} -> f α -> (α -> f β) -> f β
+abbrev Id (α : Type) : Type := α
+instance : Pure Id where
+  pure x := x
+instance : Bind Id where
+  bind x k := k x
+def MyStateM (σ α : Type) : Type := σ -> α
+instance (σ : Type) : Pure (MyStateM σ) where
+  pure a := fun _ => a
+instance (σ : Type) : Bind (MyStateM σ) where
+  bind m k := fun s => k (m s) s
+abbrev MyIO : Type -> Type := MyStateM Nat
+";
+    let lean_prelude_prefix = format!(
+        "\
+prelude
+inductive Bool : Type where
+  | false : Bool
+  | true : Bool
+inductive Nat : Type where
+  | zero : Nat
+  | succ : Nat -> Nat
+inductive List (α : Type) : Type where
+  | nil : List α
+  | cons : α -> List α -> List α
+{shared_monads}"
+    );
+    let cases: &[(&str, &str, bool, &str)] = &[
+        (
+            "770_nat",
+            "def u (x : Nat) : Nat := do\n  let y := x\n  y\n",
+            false,
+            "invalid `do` notation, expected type is not a monad application",
+        ),
+        (
+            "bool_let",
+            "def b : Bool := do\n  let y := Bool.true\n  y\n",
+            false,
+            "invalid `do` notation, expected type is not a monad application",
+        ),
+        (
+            "fin_value_arg",
+            "def f : MyFin (Nat.succ Nat.zero) := do\n  let y := MyFin.mk (Nat.succ Nat.zero)\n  y\n",
+            false,
+            "invalid `do` notation, expected type is not a monad application",
+        ),
+        (
+            "alias_of_nat",
+            "def N := Nat\ndef n (x : Nat) : N := do\n  let y := x\n  y\n",
+            false,
+            "invalid `do` notation, expected type is not a monad application",
+        ),
+        (
+            "list_missing_pure",
+            "def l (xs : List Nat) : List Nat := do\n  let y := xs\n  y\n",
+            false,
+            "native instance search",
+        ),
+        (
+            "id_accepted",
+            "def v (x : Nat) : Id Nat := do\n  let y := x\n  Pure.pure y\n",
+            true,
+            "",
+        ),
+        (
+            "abbrev_state_monad_accepted",
+            "abbrev Act := MyIO Nat\ndef a (x : Nat) : Act := do\n  let y := x\n  Pure.pure y\n",
+            true,
+            "",
+        ),
+        (
+            "def_state_monad_accepted",
+            "def Act := MyIO Nat\ndef a (x : Nat) : Act := do\n  let y := x\n  Pure.pure y\n",
+            true,
+            "",
+        ),
+    ];
+
+    for (name, body, expected_ok, expected_err) in cases {
+        for (door, bin, args, prefix) in [
+            (
+                "fln check-source",
+                env!("CARGO_BIN_EXE_fln"),
+                vec!["check-source"],
+                shared_monads,
+            ),
+            (
+                "lean",
+                env!("CARGO_BIN_EXE_lean"),
+                Vec::new(),
+                lean_prelude_prefix.as_str(),
+            ),
+        ] {
+            let entry = dir.join(format!("Case_{}_{name}.lean", door.replace(' ', "_")));
+            std::fs::write(&entry, format!("{prefix}{body}")).expect("write case");
+            let out = Command::new(bin)
+                .args(&args)
+                .arg(&entry)
+                .output()
+                .expect("run source door");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if *expected_ok {
+                assert!(
+                    out.status.success(),
+                    "{door} rejected valid case {name}:\n{stderr}"
+                );
+            } else {
+                assert!(
+                    !out.status.success(),
+                    "{door} falsely accepted {name}:\n{body}"
+                );
+                assert!(
+                    stderr.contains(expected_err),
+                    "{door} on {name}: expected {expected_err:?}, got:\n{stderr}"
+                );
+                if *name == "list_missing_pure" {
+                    assert!(
+                        !stderr.contains("not a monad application"),
+                        "{door} on {name} failed at extraction instead of Pure List:\n{stderr}"
+                    );
+                }
+            }
+        }
     }
 }

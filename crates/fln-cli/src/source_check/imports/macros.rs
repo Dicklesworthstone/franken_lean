@@ -399,6 +399,24 @@ fn owned_ancestor(owners: &BTreeSet<&Name>, name: &Name) -> bool {
     }
 }
 
+pub(in crate::source_check) fn roots_may_provide_user_extensions(
+    roots: &[Name],
+) -> Result<bool, Failure> {
+    if roots.is_empty() {
+        return Ok(false);
+    }
+    let search = super::olean_search_path();
+    for root in roots {
+        if super::find_olean(&search, root)?.is_none() {
+            return Ok(false);
+        }
+    }
+    if !super::search_has_non_toolchain_olean(&search) {
+        return Ok(false);
+    }
+    Ok(Config::discover()?.is_some())
+}
+
 impl Loaded {
     pub(in crate::source_check) fn resolve_macros(
         &self,
@@ -423,15 +441,18 @@ impl Loaded {
         if let Some(config) = config {
             return self.prepare_artifact_macros(config).map(Some);
         }
-        if self.oleans.is_empty() {
+        if !self.has_external_imports() || !roots_may_provide_user_extensions(&self.olean_roots)? {
             return Ok(None);
         }
         let Some(mut config) = Config::discover()? else {
             return Ok(None);
         };
         let partition = config.verified_partition()?;
-        let inputs: Vec<_> = self
-            .oleans
+        let oleans = self.oleans()?;
+        if oleans.is_empty() {
+            return Ok(None);
+        }
+        let inputs: Vec<_> = oleans
             .iter()
             .map(|import| {
                 let [exported, server, private] = &import.parts;
@@ -466,7 +487,7 @@ impl Loaded {
         &self,
         config: &Config,
     ) -> Result<Prepared, Failure> {
-        if !matches!(&self.inputs, Inputs::Modules { .. }) || self.oleans.is_empty() {
+        if !matches!(&self.inputs, Inputs::Modules { .. }) || self.oleans()?.is_empty() {
             return Err(Failure::input(
                 "--imported-macros requires one source entry with an external .olean import",
             ));
@@ -481,7 +502,7 @@ impl Loaded {
         &self,
         config: &Config,
     ) -> Result<Prepared, Failure> {
-        if self.oleans.is_empty() {
+        if self.oleans()?.is_empty() {
             return Err(Failure::input(
                 "imported macros require an external .olean import",
             ));
@@ -497,7 +518,7 @@ impl Loaded {
         let mut modules = Vec::new();
         let mut names = Vec::new();
         let mut total = 0usize;
-        for artifact in &self.oleans {
+        for artifact in self.oleans()? {
             let path = artifact.artifact_path.with_extension("ir");
             let metadata = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,

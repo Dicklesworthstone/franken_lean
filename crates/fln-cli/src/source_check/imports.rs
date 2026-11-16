@@ -46,6 +46,7 @@ pub(super) struct OleanBase {
     pub(super) report: ImportPostureReport,
 }
 
+#[derive(Debug)]
 pub(super) struct Failure {
     pub(super) class: &'static str,
     pub(super) detail: String,
@@ -97,14 +98,34 @@ enum Inputs {
 pub(super) struct Loaded {
     inputs: Inputs,
     pub(super) total_bytes: usize,
-    oleans: Vec<OleanImport>,
+    source_root: PathBuf,
+    oleans: std::sync::OnceLock<Vec<OleanImport>>,
     olean_roots: Vec<Name>,
 }
 impl Loaded {
+    pub(super) fn has_external_imports(&self) -> bool {
+        !self.olean_roots.is_empty()
+    }
+
+    pub(super) fn oleans(&self) -> Result<&[OleanImport], Failure> {
+        if let Some(oleans) = self.oleans.get() {
+            return Ok(oleans);
+        }
+        let loaded = if self.olean_roots.is_empty() {
+            Vec::new()
+        } else {
+            load_olean_closure(&self.olean_roots, &self.source_root)?
+        };
+        let _ = self.oleans.set(loaded);
+        Ok(self.oleans.get().map_or(&[], Vec::as_slice))
+    }
+
     /// Whether the `.olean` closure holds `module`. Every module here is reached from the
     /// entry, so this is the entry's world.
     pub(super) fn reaches(&self, module: &Name) -> bool {
-        self.oleans.iter().any(|olean| &olean.name == module)
+        self.oleans
+            .get()
+            .is_some_and(|oleans| oleans.iter().any(|olean| &olean.name == module))
     }
 
     /// The base engine source is checked against: the council-admitted
@@ -117,7 +138,8 @@ impl Loaded {
         jobs: std::num::NonZeroUsize,
         posture: ImportPosture,
     ) -> Result<(fln::Engine, Option<OleanBase>), Failure> {
-        if self.oleans.is_empty() {
+        let oleans = self.oleans()?;
+        if oleans.is_empty() {
             if matches!(&self.inputs, Inputs::Modules { sources, .. }
                 if sources.iter().any(|source| parse_source_header(source).is_ok_and(|header| header.module_system)))
             {
@@ -125,8 +147,7 @@ impl Loaded {
             }
             return seed().map(|engine| (engine, None));
         }
-        let inputs: Vec<fln::OleanModuleInput<'_>> = self
-            .oleans
+        let inputs: Vec<fln::OleanModuleInput<'_>> = oleans
             .iter()
             .map(|import| {
                 let [exported, server, private] = &import.parts;
@@ -379,7 +400,8 @@ fn load_with_implicit_init(
         return Ok(Loaded {
             inputs: Inputs::Files(sources),
             total_bytes,
-            oleans: Vec::new(),
+            source_root: PathBuf::new(),
+            oleans: std::sync::OnceLock::from(Vec::new()),
             olean_roots: Vec::new(),
         });
     }
@@ -490,17 +512,14 @@ fn load_with_implicit_init(
         cursor += 1;
     }
     // Discovery order is breadth-first filesystem work, not Lean import order.
-    // Resolve external roots by walking the source headers left-to-right first.
+    // Resolve external roots by walking the source headers left-to-right first;
+    // reading `.olean` bytes waits until preflight or user-macro discovery needs them.
     let olean_roots = metadata::ordered_roots(&source_imports, &names[..1]);
-    let oleans = if olean_roots.is_empty() {
-        Vec::new()
-    } else {
-        load_olean_closure(&olean_roots, &root)?
-    };
     Ok(Loaded {
         inputs: Inputs::Modules { names, sources },
         total_bytes,
-        oleans,
+        source_root: root,
+        oleans: std::sync::OnceLock::new(),
         olean_roots,
     })
 }
@@ -554,15 +573,11 @@ fn load_package(
         }
     }
     let olean_roots = metadata::ordered_roots(&source_imports, &names[..1]);
-    let oleans = if olean_roots.is_empty() {
-        Vec::new()
-    } else {
-        load_olean_closure(&olean_roots, root)?
-    };
     Ok(Loaded {
         inputs: Inputs::Modules { names, sources },
         total_bytes,
-        oleans,
+        source_root: root.to_path_buf(),
+        oleans: std::sync::OnceLock::new(),
         olean_roots,
     })
 }
@@ -613,16 +628,7 @@ fn module_file(root: &Path, name: &Name, extension: &str) -> Result<(PathBuf, bo
     }
 }
 
-/// `LEAN_PATH` entries, else the pinned toolchain's `lib/lean`.
-fn olean_search_path() -> Vec<PathBuf> {
-    if let Some(value) = std::env::var_os("LEAN_PATH") {
-        let entries: Vec<PathBuf> = std::env::split_paths(&value)
-            .filter(|entry| !entry.as_os_str().is_empty())
-            .collect();
-        if !entries.is_empty() {
-            return entries;
-        }
-    }
+fn default_toolchain_olean_dir() -> Option<PathBuf> {
     std::env::var_os("ELAN_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".elan")))
@@ -632,11 +638,69 @@ fn olean_search_path() -> Vec<PathBuf> {
                 .join("lib")
                 .join("lean")
         })
-        .into_iter()
-        .collect()
 }
 
-fn find_olean(search: &[PathBuf], name: &Name) -> Result<Option<PathBuf>, Failure> {
+/// `LEAN_PATH` entries, else the pinned toolchain's `lib/lean`.
+pub(super) fn olean_search_path() -> Vec<PathBuf> {
+    if let Some(value) = std::env::var_os("LEAN_PATH") {
+        let entries: Vec<PathBuf> = std::env::split_paths(&value)
+            .filter(|entry| !entry.as_os_str().is_empty())
+            .collect();
+        if !entries.is_empty() {
+            return entries;
+        }
+    }
+    default_toolchain_olean_dir().into_iter().collect()
+}
+
+pub(super) fn search_has_non_toolchain_olean(search: &[PathBuf]) -> bool {
+    const MAX_SCAN_ENTRIES: usize = 4096;
+    let toolchain = default_toolchain_olean_dir();
+    let toolchain_canon = toolchain
+        .as_ref()
+        .and_then(|dir| std::fs::canonicalize(dir).ok());
+    let mut budget = MAX_SCAN_ENTRIES;
+    for root in search {
+        if toolchain.as_ref() == Some(root) {
+            continue;
+        }
+        let Ok(canon) = std::fs::canonicalize(root) else {
+            continue;
+        };
+        if toolchain_canon.as_ref() == Some(&canon) {
+            continue;
+        }
+        let mut stack = vec![canon];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(dir) = stack.pop() {
+            if !seen.insert(dir.clone()) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                if budget == 0 {
+                    return true;
+                }
+                budget -= 1;
+                let Ok(entry) = entry else {
+                    return true;
+                };
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "olean") && path.is_file() {
+                    return true;
+                }
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    stack.push(path);
+                }
+            }
+        }
+    }
+    false
+}
+
+pub(super) fn find_olean(search: &[PathBuf], name: &Name) -> Result<Option<PathBuf>, Failure> {
     for root in search {
         let (path, present) = module_file(root, name, "olean")?;
         if present && path.is_file() {
@@ -723,7 +787,8 @@ pub(super) fn load_build_base(
     let loaded = Loaded {
         inputs: Inputs::Files(Vec::new()),
         total_bytes: 0,
-        oleans: load_olean_closure(roots, source_root)?,
+        source_root: source_root.to_path_buf(),
+        oleans: std::sync::OnceLock::from(load_olean_closure(roots, source_root)?),
         olean_roots: roots.to_vec(),
     };
     loaded
@@ -757,17 +822,27 @@ pub(super) fn load_module_build_base(
     config: Option<&macros::Config>,
     preflight_native: impl FnOnce() -> Result<(), Failure>,
 ) -> Result<ModuleBuildBase, Failure> {
+    let mut preflight_native = Some(preflight_native);
+    if config.is_none()
+        && !macros::roots_may_provide_user_extensions(roots)?
+        && let Some(preflight) = preflight_native.take()
+    {
+        preflight()?;
+    }
     let loaded = Loaded {
         inputs: Inputs::Files(Vec::new()),
         total_bytes: 0,
-        oleans: load_olean_closure(roots, source_root)?,
+        source_root: source_root.to_path_buf(),
+        oleans: std::sync::OnceLock::from(load_olean_closure(roots, source_root)?),
         olean_roots: roots.to_vec(),
     };
     // Capture code beside the selected artifacts before admission. No later
     // search-path lookup can substitute a different module's executable bytes.
     let prepared = loaded.resolve_artifact_macros(config)?;
-    if prepared.is_none() {
-        preflight_native()?;
+    if prepared.is_none()
+        && let Some(preflight) = preflight_native.take()
+    {
+        preflight()?;
     }
     let (_, base) = loaded.base_engine(
         || Ok(fln::Engine::from_environment(fln::Environment::new())),
@@ -809,7 +884,9 @@ impl EditorWorld {
     pub(in crate::source_check) fn artifact_bytes(&self) -> usize {
         self.loaded
             .oleans
-            .iter()
+            .get()
+            .into_iter()
+            .flatten()
             .flat_map(|module| &module.parts)
             .map(Vec::len)
             .sum()
@@ -844,7 +921,8 @@ impl EditorWorld {
             loaded: Loaded {
                 inputs: Inputs::Files(Vec::new()),
                 total_bytes: 0,
-                oleans,
+                source_root: root.to_path_buf(),
+                oleans: std::sync::OnceLock::from(oleans),
                 olean_roots: roots.to_vec(),
             },
         })
@@ -1078,19 +1156,23 @@ mod tests {
             4096,
         )
         .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
-        let Inputs::Modules { names, sources } = loaded.inputs else {
+        let Inputs::Modules {
+            ref names,
+            ref sources,
+        } = loaded.inputs
+        else {
             panic!("main needs a module graph");
         };
         assert_eq!(
-            names,
+            *names,
             [
                 Name::from_components(["Main"]),
                 Name::from_components(["Init"])
             ]
         );
-        assert_eq!(sources, [source.clone(), init.clone()]);
+        assert_eq!(*sources, [source.clone(), init.clone()]);
         assert_eq!(loaded.total_bytes, source.len() + init.len());
-        assert!(loaded.oleans.is_empty());
+        assert!(loaded.oleans().unwrap().is_empty());
         assert!(matches!(
             load(
                 std::slice::from_ref(&path),
