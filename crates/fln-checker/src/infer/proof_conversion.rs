@@ -45,6 +45,8 @@ struct Probe<'a> {
     incongruent: PairSet,
     /// The untyped converter's answers in this run (`PairAnswers`).
     answers: PairAnswers,
+    /// Types already inferred in this run (`InferredTypes`).
+    inferred: InferredTypes,
     /// The local each binder and eta task opened (`OpenedLocals`).
     opened: OpenedLocals,
 }
@@ -107,6 +109,72 @@ impl OpenedLocals {
         ));
         self.nodes += nodes;
     }
+}
+
+/// Inferred types already obtained in one run (`m_infer_type` in the vendored
+/// `type_checker.cpp`).
+///
+/// Every local name in one `Probe` run has a unique declaration (`root_context`
+/// locals are fixed, and `OpenedLocals` binds each fresh name to one `domain`),
+/// and every query runs under the same `self.budget` and `InferOnly` mode.
+/// When every `Free` variable occurring in `term` is bound in `context`, the
+/// inferred type is identical across contexts of this run. Stops and faults are
+/// never recorded.
+#[derive(Default)]
+struct InferredTypes {
+    current: InferredTypeTable,
+    previous: InferredTypeTable,
+}
+#[derive(Default)]
+struct InferredTypeTable {
+    buckets: std::collections::HashMap<u64, Vec<(WireExpr, Option<WireExpr>)>>,
+    nodes: usize,
+}
+impl InferredTypeTable {
+    fn get(&self, fingerprint: u64, term: &WireExpr) -> Option<Option<WireExpr>> {
+        self.buckets
+            .get(&fingerprint)?
+            .iter()
+            .find(|(stored, _)| stored == term)
+            .map(|(_, answer)| answer.clone())
+    }
+}
+impl InferredTypes {
+    const MAX_GENERATION_NODES: usize = 1 << 20;
+    const MAX_BUCKET: usize = 8;
+    fn fingerprint(term: &WireExpr) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        term.hash(&mut hasher);
+        hasher.finish()
+    }
+    fn get(&self, fingerprint: u64, term: &WireExpr) -> Option<Option<WireExpr>> {
+        self.current
+            .get(fingerprint, term)
+            .or_else(|| self.previous.get(fingerprint, term))
+    }
+    fn insert(&mut self, fingerprint: u64, term: &WireExpr, answer: Option<WireExpr>) {
+        let answer_nodes = answer.as_ref().map_or(0, |ty| ty.nodes().len());
+        let nodes = term.nodes().len().saturating_add(answer_nodes);
+        if nodes > Self::MAX_GENERATION_NODES {
+            return;
+        }
+        if self.current.nodes.saturating_add(nodes) > Self::MAX_GENERATION_NODES {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        let bucket = self.current.buckets.entry(fingerprint).or_default();
+        if bucket.len() < Self::MAX_BUCKET && !bucket.iter().any(|(stored, _)| stored == term) {
+            bucket.push((term.clone(), answer));
+            self.current.nodes += nodes;
+        }
+    }
+}
+
+fn all_free_locals_in_context(term: &WireExpr, context: &InferenceContext) -> bool {
+    term.nodes().iter().all(|node| match node {
+        ExprNode::Free { name } => context.local(name).is_some(),
+        _ => true,
+    })
 }
 /// A set of term pairs, looked up without copying the terms.
 #[derive(Default)]
@@ -416,29 +484,32 @@ impl Probe<'_> {
                 (name, local)
             }
         };
-        let mut locals = context.locals().to_vec();
-        locals.push(LocalDeclaration::assumption(name.clone(), domain));
-        let context = InferenceContext::new_with_projection_rules(
-            locals,
-            context.level_parameters().to_vec(),
-            context.projection_rules().to_vec(),
-            context.constants().clone(),
-        )
-        .map_err(|_| self.fault(InferenceFault::ScopedLocalCollision { name: name.clone() }))?
-        .admitting(context.scope());
+        let context = context
+            .push_assumption(name.clone(), domain)
+            .map_err(|_| self.fault(InferenceFault::ScopedLocalCollision { name: name.clone() }))?;
         Ok((name, local, context))
     }
     fn infer(&mut self, term: &WireExpr, context: &InferenceContext) -> Result<Option<WireExpr>> {
+        let scoped = all_free_locals_in_context(term, context);
+        let fingerprint = InferredTypes::fingerprint(term);
+        if scoped && let Some(cached) = self.inferred.get(fingerprint, term) {
+            self.tick()?;
+            return Ok(cached);
+        }
         let budget = self.budget;
         let mode = InferenceMode::InferOnly;
         let result =
             infer_without_proof_conversion(term, context, mode, budget, &mut || self.poll());
         self.check_stop()?;
-        match result {
-            InferenceOutcome::Complete(result) => Ok(Some(result.type_)),
-            InferenceOutcome::Refused { .. } | InferenceOutcome::Deferred { .. } => Ok(None),
-            halt => Err(Box::new(halt)),
+        let answer = match result {
+            InferenceOutcome::Complete(result) => Some(result.type_),
+            InferenceOutcome::Refused { .. } | InferenceOutcome::Deferred { .. } => None,
+            halt => return Err(Box::new(halt)),
+        };
+        if scoped {
+            self.inferred.insert(fingerprint, term, answer.clone());
         }
+        Ok(answer)
     }
     fn whnf(&mut self, term: &WireExpr, context: &InferenceContext) -> Result<Option<WireExpr>> {
         let budget = self.budget.whnf;
@@ -1764,6 +1835,7 @@ pub(crate) fn proof_conversion_with(
         next: 0,
         incongruent: PairSet::default(),
         answers: PairAnswers::default(),
+        inferred: InferredTypes::default(),
         opened: OpenedLocals::default(),
     };
     match probe.run(left, right, context, true) {

@@ -250,6 +250,37 @@ impl InferenceContext {
     pub fn reduction(&self) -> &WhnfContext {
         &self.reduction
     }
+
+    /// Extend this context with a fresh assumption (`value: None`) while
+    /// sharing `self.reduction` (and therefore its `WhnfMemo`, `free_bindings`,
+    /// `projection_rules`, `constants`, and `scope`) in `O(1)`, matching the
+    /// pin's checker-lifetime `m_whnf` (`vendor/lean4-src/src/kernel/type_checker.cpp`)
+    /// when opening binders in the typed conversion lane.
+    pub(crate) fn push_assumption(
+        &self,
+        name: WireName,
+        type_: WireExpr,
+    ) -> Result<InferenceContext, InferenceContextRefusal> {
+        if let Some(&first) = self.local_indexes.get(&name) {
+            return Err(InferenceContextRefusal::DuplicateLocal {
+                name,
+                first,
+                second: self.locals.len(),
+            });
+        }
+        let second = self.locals.len();
+        let mut locals = (*self.locals).clone();
+        locals.push(LocalDeclaration::assumption(name.clone(), type_));
+        let mut local_indexes = (*self.local_indexes).clone();
+        local_indexes.insert(name, second);
+        Ok(InferenceContext {
+            locals: Arc::new(locals),
+            local_indexes: Arc::new(local_indexes),
+            level_parameters: Arc::clone(&self.level_parameters),
+            level_parameter_set: Arc::clone(&self.level_parameter_set),
+            reduction: Arc::clone(&self.reduction),
+        })
+    }
 }
 
 /// `InferOnly` omits admission-only quarantine checks. Constant arity remains

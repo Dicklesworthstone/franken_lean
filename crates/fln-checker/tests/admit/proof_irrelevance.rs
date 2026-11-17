@@ -1170,3 +1170,194 @@ fn the_typed_lane_unfolds_lazily_to_a_shared_regular_head() {
         "`R q ≟ R p` closes by congruence before `R` unfolds: {verdict:?}"
     );
 }
+
+/// Opening binders in `Probe::open_local` shares the parent `WhnfContext`'s
+/// `WhnfMemo` (`InferenceContext::push_assumption`) and caches `Probe::infer`
+/// results (`InferredTypes`), matching the pin's checker-lifetime `m_whnf` and
+/// `m_infer_type` (`vendor/lean4-src/src/kernel/type_checker.cpp`; bead
+/// `fln-checker-associator-time-y8wc`).
+#[test]
+fn the_typed_lane_shares_whnf_and_inferred_types_across_opened_binders() {
+    use fln_checker::defeq::{DefEqOutcome, def_eq_with};
+    use fln_checker::whnf::WhnfContext;
+    const WRAPS: usize = 160;
+    const SCOPES: usize = 12;
+    let bound = Expr::bvar(0).expect("bound variable");
+    let tower = (0..WRAPS).fold(bound.clone(), |inner, _| app(c("idA"), [inner]));
+    let env = environment_of(vec![
+        entry("A", Expr::sort(Level::one())),
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("q", c("P")),
+        entry("a", c("A")),
+        entry("k", pi(c("P"), c("A"))),
+        entry("combine", pi(c("A"), pi(c("A"), c("A")))),
+        entry("pairFn", pi(pi(c("A"), c("A")), pi(c("A"), c("A")))),
+        entry("T", pi(c("A"), Expr::sort(Level::one()))),
+        definition(
+            "idA",
+            decoded(&pi(c("A"), c("A"))),
+            decoded(&lam(c("A"), bound)),
+        ),
+        definition(
+            "slow",
+            decoded(&pi(c("A"), c("A"))),
+            decoded(&lam(c("A"), tower)),
+        ),
+    ]);
+
+    let one_walk_polls = Cell::new(0_u64);
+    let slow_p = app(c("slow"), [app(c("k"), [c("p")])]);
+    let k_q = app(c("k"), [c("q")]);
+    let walk_outcome = def_eq_with(
+        &decoded(&k_q),
+        &decoded(&slow_p),
+        &WhnfContext::new(Vec::new(), Vec::new(), env.clone()),
+        DefEqBudget::unlimited(),
+        || {
+            one_walk_polls.set(one_walk_polls.get() + 1);
+            false
+        },
+    );
+    assert!(matches!(walk_outcome, DefEqOutcome::Deferred { .. }));
+    let one_walk = one_walk_polls.get();
+
+    // Build `SCOPES` distinct `fun x : A_i => combine_i x <side>` arguments so
+    // `OpenedLocals` opens `SCOPES` distinct fresh locals and `PairAnswers`
+    // sees a distinct pair `(combine_i x_i (k q), combine_i x_i (slow p))` in
+    // every scope, while the shared `WhnfMemo` normalizes `slow (k p)` once.
+    let mut left_chain = c("a");
+    let mut right_chain = c("a");
+    let x0 = Expr::bvar(0).expect("binder bvar");
+    let mut scope_entries = vec![
+        entry("A", Expr::sort(Level::one())),
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("q", c("P")),
+        entry("a", c("A")),
+        entry("k", pi(c("P"), c("A"))),
+        entry("combine", pi(c("A"), pi(c("A"), c("A")))),
+        entry("T", pi(c("A"), Expr::sort(Level::one()))),
+        definition(
+            "idA",
+            decoded(&pi(c("A"), c("A"))),
+            decoded(&lam(c("A"), Expr::bvar(0).expect("bound"))),
+        ),
+        definition(
+            "slow",
+            decoded(&pi(c("A"), c("A"))),
+            decoded(&lam(
+                c("A"),
+                (0..WRAPS).fold(Expr::bvar(0).expect("bound"), |inner, _| {
+                    app(c("idA"), [inner])
+                }),
+            )),
+        ),
+    ];
+    for idx in 0..SCOPES {
+        let ai = format!("A{idx}");
+        let ci = format!("combine{idx}");
+        let pfi = format!("pairFn{idx}");
+        scope_entries.push(entry(&ai, Expr::sort(Level::one())));
+        scope_entries.push(entry(&ci, pi(c(&ai), pi(c("A"), c("A")))));
+        scope_entries.push(entry(&pfi, pi(pi(c(&ai), c("A")), pi(c("A"), c("A")))));
+        let lam_l = lam(c(&ai), app(c(&ci), [x0.clone(), k_q.clone()]));
+        let lam_r = lam(c(&ai), app(c(&ci), [x0.clone(), slow_p.clone()]));
+        left_chain = app(c(&pfi), [lam_l, left_chain]);
+        right_chain = app(c(&pfi), [lam_r, right_chain]);
+    }
+    scope_entries.push(entry("w", app(c("T"), [left_chain])));
+    let env_with_witness = environment_of(scope_entries);
+
+    let polls = Cell::new(0_u64);
+    let verdict = admit_with(
+        &env_with_witness,
+        &candidate("d_binders", app(c("T"), [right_chain]), c("w")),
+        AdmissionBudget::unlimited(),
+        || {
+            polls.set(polls.get() + 1);
+            false
+        },
+    );
+    assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
+    let shared_polls = polls.get();
+    // Without shared `WhnfMemo` across `open_local`, each of the 12 binder
+    // scopes re-normalizes `slow (k p)` from scratch (> 12 * one_walk polls).
+    // With `push_assumption` preserving `Arc<WhnfContext>`, admission stays
+    // well below 5 single-walk budgets.
+    assert!(
+        shared_polls < 5 * one_walk,
+        "admission across {SCOPES} binder scopes polled {shared_polls} times \
+         (one walk = {one_walk}): binder scopes failed to share WhnfMemo"
+    );
+
+    // Second check: a large non-Prop spine repeated across `SCOPES` distinct
+    // binder scopes whose conversion defers untyped (`k q` vs `k p`), forcing
+    // `Probe` to inspect `proof_type`, `unit_like_obligation`, `structure_eta`
+    // and `function_eta` on the same closed `heavy_spine` in every scope.
+    let heavy_spine = (0..120).fold(c("a"), |acc, _| app(c("combine"), [c("a"), acc]));
+    let mut heavy_left = c("a");
+    let mut heavy_right = c("a");
+    let mut heavy_entries = vec![
+        entry("A", Expr::sort(Level::one())),
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("q", c("P")),
+        entry("a", c("A")),
+        entry("k", pi(c("P"), c("A"))),
+        entry("combine", pi(c("A"), pi(c("A"), c("A")))),
+        entry("T", pi(c("A"), Expr::sort(Level::one()))),
+    ];
+    for idx in 0..SCOPES {
+        let ai = format!("HA{idx}");
+        let ci = format!("hcombine{idx}");
+        let pfi = format!("hpairFn{idx}");
+        heavy_entries.push(entry(&ai, Expr::sort(Level::one())));
+        heavy_entries.push(entry(&ci, pi(c(&ai), pi(c("A"), c("A")))));
+        heavy_entries.push(entry(&pfi, pi(pi(c(&ai), c("A")), pi(c("A"), c("A")))));
+        let lam_l = lam(
+            c(&ai),
+            app(
+                c(&ci),
+                [
+                    x0.clone(),
+                    app(c("combine"), [heavy_spine.clone(), k_q.clone()]),
+                ],
+            ),
+        );
+        let lam_r = lam(
+            c(&ai),
+            app(
+                c(&ci),
+                [
+                    x0.clone(),
+                    app(c("combine"), [heavy_spine.clone(), app(c("k"), [c("p")])]),
+                ],
+            ),
+        );
+        heavy_left = app(c(&pfi), [lam_l, heavy_left]);
+        heavy_right = app(c(&pfi), [lam_r, heavy_right]);
+    }
+    heavy_entries.push(entry("w_heavy", app(c("T"), [heavy_left])));
+    let env_heavy = environment_of(heavy_entries);
+    let heavy_polls = Cell::new(0_u64);
+    let heavy_verdict = admit_with(
+        &env_heavy,
+        &candidate("d_heavy", app(c("T"), [heavy_right]), c("w_heavy")),
+        AdmissionBudget::unlimited(),
+        || {
+            heavy_polls.set(heavy_polls.get() + 1);
+            false
+        },
+    );
+    assert!(
+        matches!(heavy_verdict, Verdict::Admitted(_)),
+        "{heavy_verdict:?}"
+    );
+    assert!(
+        heavy_polls.get() < 450_000,
+        "repeated non-Prop spine across {SCOPES} scopes polled {} times; \
+         expected InferredTypes memo to avoid re-inferring heavy_spine",
+        heavy_polls.get()
+    );
+}
