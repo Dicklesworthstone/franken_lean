@@ -53,6 +53,8 @@ const HYPOTHESES: &[&str] = &[
     "example (h : (3:Nat) < 4) (k : (4:Nat) < 5) : (3:Nat) < 5 :=\n  calc\n    _ < 4 := h\n    _ < _ := k\n",
     "example (a : Nat) (h : a < 4) (k : 4 < 5) : a < 5 :=\n  calc\n    _ < 4 := h\n    (4 : Nat) < 5 := k\n",
     "example (a : Nat) (h : a < 4) (k : 4 < 5) : a < 5 :=\n  calc\n    _ < 4 := h\n    _ < (5 : Nat) := k\n",
+    "theorem c_succ_step : 3 < 5 :=\n  calc\n    _ < 4 := Nat.lt_succ_self 3\n    _ < _ := by decide\n",
+    "theorem c_inferred :=\n  calc\n    _ < 4 := Nat.lt_succ_self 3\n    _ < 5 := by decide\n",
 ];
 
 fn pinned_lib() -> Option<PathBuf> {
@@ -170,4 +172,60 @@ fn calc_steps_proved_by_hypotheses_fix_their_numerals() {
         let (code, stdout, stderr) = ours(&lib, &root, &entry);
         assert_eq!((code, stdout.as_str()), (0, ""), "{program}: {stderr}");
     }
+}
+
+/// Import-free coverage so worker gates without a Reference `.elan` install still exercise
+/// both `defer_calculation_proof` (a `by` step whose endpoint only the outer goal fixes) and
+/// `try_shared_head_congruence` with `synthPending` (an earlier argument fixing the carrier of a
+/// pending class projection in a later argument).
+#[test]
+fn calc_deferred_tactics_and_congruence_pending_synthesis_work_without_imports() {
+    const ACCEPTED_PRELUDE: &str = r#"prelude
+inductive Nat where
+  | zero : Nat
+  | succ : Nat → Nat
+inductive Eq {α : Type} : α → α → Prop where
+  | refl (a : α) : Eq a a
+class Base (α : Type) where
+  one : α
+instance : Base Nat where
+  one := Nat.succ Nat.zero
+class Rel (α : Type) where
+  rel : α → α → Prop
+instance : Rel Nat where
+  rel x y := Eq (Nat.succ x) y
+def Holds (α : Type) [Rel α] (x y : α) : Prop :=
+  Rel.rel x y
+theorem step01 : Holds Nat Nat.zero (Nat.succ Nat.zero) :=
+  Eq.refl (Nat.succ Nat.zero)
+theorem deferredEq : Eq Nat.zero Nat.zero :=
+  calc
+    _ = Nat.zero := by exact Eq.refl Nat.zero
+    _ = _ := by exact Eq.refl Nat.zero
+theorem congruencePending : Holds Nat Nat.zero (Nat.succ Nat.zero) :=
+  let check {α : Type} [Rel α] [Base α] {x : α} (h : Holds α x Base.one) := h
+  check step01
+"#;
+    const REFUSED_PRELUDE: &str = r#"prelude
+inductive Nat where
+  | zero : Nat
+  | succ : Nat → Nat
+inductive Eq {α : Type} : α → α → Prop where
+  | refl (a : α) : Eq a a
+theorem wrongDeferredEq : Eq Nat.zero (Nat.succ Nat.zero) :=
+  calc
+    _ = Nat.zero := by exact Eq.refl Nat.zero
+    _ = _ := by exact Eq.refl Nat.zero
+"#;
+    let root = workspace();
+    let ok_path = root.join("AcceptedPrelude.lean");
+    std::fs::write(&ok_path, ACCEPTED_PRELUDE).unwrap();
+    let (code, stdout, stderr) = ours(&root, &root, &ok_path);
+    assert_eq!((code, stdout.as_str(), stderr.as_str()), (0, "", ""));
+
+    let bad_path = root.join("RefusedPrelude.lean");
+    std::fs::write(&bad_path, REFUSED_PRELUDE).unwrap();
+    let (code, _, stderr) = ours(&root, &root, &bad_path);
+    assert_ne!(code, 0, "accepted wrong deferred calc proof");
+    assert!(stderr.contains("refused"), "{stderr}");
 }

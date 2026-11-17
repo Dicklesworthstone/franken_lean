@@ -92,7 +92,7 @@ impl Engine<'_> {
                     (function.clone(), f.clone(), locals.clone()),
                 ];
                 let outer = std::mem::replace(&mut self.first_order_trial, true);
-                let trial = self.try_congruence_equations(&equations, true);
+                let trial = self.try_congruence_equations(&equations, true, false);
                 self.first_order_trial = outer;
                 if matches!(trial?, CongruenceResult::Solved) {
                     return Ok(true);

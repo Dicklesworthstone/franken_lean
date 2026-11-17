@@ -52,6 +52,23 @@ impl<'a> PendingState<'a> {
         }
     }
 
+    pub(super) fn take_for_subtrial(&mut self) -> Self {
+        Self {
+            owner: self.owner.take(),
+            remaining: self.remaining.saturating_sub(self.spent),
+            spent: 0,
+            generation: None,
+            declined: HashSet::new(),
+        }
+    }
+
+    pub(super) fn restore_from_subtrial(&mut self, subtrial: &mut Self) {
+        if let Some(owner) = subtrial.owner.take() {
+            self.owner = Some(owner);
+        }
+        self.spent = self.spent.saturating_add(subtrial.spent);
+    }
+
     pub(super) fn spent(&self) -> u64 {
         self.spent
     }
@@ -176,7 +193,7 @@ impl Engine<'_> {
         let Some(blocker) = self.reduction_blocker(neutral, locals)? else {
             return Ok(false);
         };
-        match self.try_congruence_equations(children, false)? {
+        match self.try_congruence_equations(children, false, false)? {
             super::application_congruence::CongruenceResult::Solved => Ok(true),
             super::application_congruence::CongruenceResult::Refused {
                 made_assignments: true,

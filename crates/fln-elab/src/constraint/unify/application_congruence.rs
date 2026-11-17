@@ -91,7 +91,7 @@ impl Engine<'_> {
         // to; a refused trial must cost what the pin's failing `isDefEqArgs` costs.
         let fail_fast = self.budget.transparency == UnificationTransparency::Instances;
         Ok(matches!(
-            self.try_congruence_equations(&equations, fail_fast)?,
+            self.try_congruence_equations(&equations, fail_fast, true)?,
             CongruenceResult::Solved
         ))
     }
@@ -112,6 +112,7 @@ impl Engine<'_> {
         &mut self,
         equations: &[Equation],
         fail_fast: bool,
+        allow_pending: bool,
     ) -> Result<CongruenceResult, UnificationError> {
         // Account for copying the mutable stores and per-batch identities.
         // Immutable environment/registry data are shared; syntax facts start
@@ -127,6 +128,12 @@ impl Engine<'_> {
         {
             self.meter.node()?;
         }
+        let generation = self.generation();
+        let pending = if allow_pending {
+            self.pending.take_for_subtrial()
+        } else {
+            pending::PendingState::new(None, u64::MAX)
+        };
         let mut trial = Engine {
             work: self.work.clone(),
             budget: self.budget,
@@ -151,17 +158,19 @@ impl Engine<'_> {
             nat_literals_valid: self.nat_literals_valid,
             nat_sub_model_valid: self.nat_sub_model_valid,
             projection_registry: self.projection_registry.clone(),
-            // A speculative argument guess cannot invoke an external owner:
-            // its side effects are not part of this transaction's checkpoint.
-            // If synthesis is needed, delta/fixed-point solving retains the
-            // outer owner and can ask it against the surviving equations.
-            pending: pending::PendingState::new(None, u64::MAX),
+            // Same-head definition congruence mirrors the pin's `checkpointDefEq`
+            // around `isDefEqArgs` (`Lean/Meta/ExprDefEq.lean:1510-1512`), where
+            // `synthPending` can discharge an instance hole whose carrier an earlier
+            // argument just fixed (e.g. `Nat.succ 3 =?= @OfNat.ofNat ?α 4 ?inst`
+            // after `?α := Nat`). Record-eta and first-order trials pass
+            // `allow_pending = false` so failed probes do not pre-ask the owner.
+            pending,
             congruence_depth: self.congruence_depth + 1,
             first_order_trial: self.first_order_trial,
             fail_fast: self.fail_fast || fail_fast,
         };
-        let generation = self.generation();
         let result = trial.solve(equations, &[], &[]);
+        self.pending.restore_from_subtrial(&mut trial.pending);
         self.work.nat_sub_model_cache = trial.work.nat_sub_model_cache.clone();
         let made_assignments = trial.generation() != generation;
         // Failed speculation consumes real work. Never reset cancellation,
