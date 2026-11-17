@@ -5789,6 +5789,11 @@ struct MathlibCorpusReceipt {
     source_modules: u64,
     oleans: u64,
     olean_bytes: u64,
+    dependency_oleans: Option<u64>,
+    dependency_olean_bytes: Option<u64>,
+    toolchain_oleans: Option<u64>,
+    toolchain_olean_bytes: Option<u64>,
+    corpus_inventory_sha256: Option<String>,
 }
 
 impl MathlibCorpusReceipt {
@@ -5809,6 +5814,13 @@ impl MathlibCorpusReceipt {
             assert_string_terminator(key, rest, end)?;
             Ok(value.to_string())
         }
+        fn optional_text(row: &str, key: &str) -> Result<Option<String>, String> {
+            let needle = format!("\"{key}\":\"");
+            if !row.contains(&needle) {
+                return Ok(None);
+            }
+            text(row, key).map(Some)
+        }
         fn number(row: &str, key: &str) -> Result<u64, String> {
             let needle = format!("\"{key}\":");
             assert_field_once(row, key, &needle)?;
@@ -5825,6 +5837,13 @@ impl MathlibCorpusReceipt {
                 .parse()
                 .map_err(|_| format!("field `{key}` is not a u64"))
         }
+        fn optional_number(row: &str, key: &str) -> Result<Option<u64>, String> {
+            let needle = format!("\"{key}\":");
+            if !row.contains(&needle) {
+                return Ok(None);
+            }
+            number(row, key).map(Some)
+        }
         let row = row.trim();
         let schema = text(row, "schema")?;
         if schema != "fln-mathlib-corpus/1" {
@@ -5839,6 +5858,11 @@ impl MathlibCorpusReceipt {
             source_modules: number(row, "source_modules")?,
             oleans: number(row, "oleans")?,
             olean_bytes: number(row, "olean_bytes")?,
+            dependency_oleans: optional_number(row, "dependency_oleans")?,
+            dependency_olean_bytes: optional_number(row, "dependency_olean_bytes")?,
+            toolchain_oleans: optional_number(row, "toolchain_oleans")?,
+            toolchain_olean_bytes: optional_number(row, "toolchain_olean_bytes")?,
+            corpus_inventory_sha256: optional_text(row, "corpus_inventory_sha256")?,
         })
     }
 
@@ -5894,6 +5918,38 @@ impl MathlibCorpusReceipt {
                 self.olean_bytes, self.oleans
             ));
         }
+        if let Some(dep_oleans) = self.dependency_oleans
+            && dep_oleans == 0
+        {
+            return Err("dependency_oleans must be nonzero for the Mathlib closure".to_string());
+        }
+        if let (Some(dep_oleans), Some(dep_bytes)) =
+            (self.dependency_oleans, self.dependency_olean_bytes)
+            && dep_bytes < dep_oleans
+        {
+            return Err("dependency_olean_bytes is smaller than dependency_oleans".to_string());
+        }
+        if let Some(tc_oleans) = self.toolchain_oleans
+            && tc_oleans == 0
+        {
+            return Err("toolchain_oleans must be nonzero for the Reference pin".to_string());
+        }
+        if let (Some(tc_oleans), Some(tc_bytes)) =
+            (self.toolchain_oleans, self.toolchain_olean_bytes)
+            && tc_bytes < tc_oleans
+        {
+            return Err("toolchain_olean_bytes is smaller than toolchain_oleans".to_string());
+        }
+        if let Some(digest) = &self.corpus_inventory_sha256
+            && (digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        {
+            return Err(format!(
+                "corpus_inventory_sha256 `{digest}` is not 64 lowercase hex digits"
+            ));
+        }
         Ok(())
     }
 
@@ -5947,6 +6003,14 @@ fn the_mathlib_corpus_receipt_is_retained_and_bound_to_the_current_pin() {
     receipt
         .validate(suite_lock_corpus_row(), &pin)
         .unwrap_or_else(|reason| panic!("{}: {reason}", path.display()));
+    assert!(
+        receipt.dependency_oleans.is_some()
+            && receipt.dependency_olean_bytes.is_some()
+            && receipt.toolchain_oleans.is_some()
+            && receipt.toolchain_olean_bytes.is_some()
+            && receipt.corpus_inventory_sha256.is_some(),
+        "retained receipt must bind dependency, toolchain, and inventory digest fields: {receipt:?}"
+    );
 }
 
 #[test]
@@ -5991,6 +6055,29 @@ fn a_tampered_mathlib_corpus_receipt_is_refused() {
             retained.replacen(&commit, &format!("{commit},{commit}"), 1),
             "more than once",
         ),
+        (
+            retained.replace(
+                &format!(
+                    "\"dependency_oleans\":{}",
+                    receipt.dependency_oleans.expect("dependency_oleans")
+                ),
+                "\"dependency_oleans\":0",
+            ),
+            "dependency_oleans",
+        ),
+        (
+            retained.replace(
+                &format!(
+                    "\"corpus_inventory_sha256\":\"{}\"",
+                    receipt
+                        .corpus_inventory_sha256
+                        .as_deref()
+                        .expect("corpus_inventory_sha256")
+                ),
+                "\"corpus_inventory_sha256\":\"bad\"",
+            ),
+            "corpus_inventory_sha256",
+        ),
     ];
     for (tampered, expected) in cases {
         assert_ne!(
@@ -6027,6 +6114,11 @@ fn a_materialized_root_that_disagrees_with_its_receipt_is_refused() {
         source_modules: 3,
         oleans: 3,
         olean_bytes: 3,
+        dependency_oleans: None,
+        dependency_olean_bytes: None,
+        toolchain_oleans: None,
+        toolchain_olean_bytes: None,
+        corpus_inventory_sha256: None,
     };
     let row = |receipt: &MathlibCorpusReceipt| {
         format!(

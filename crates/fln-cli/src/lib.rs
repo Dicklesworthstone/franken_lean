@@ -10373,6 +10373,7 @@ fn render_doctor(json: bool) -> MultiplexerOutput {
         }),
     }
     checks.push(doctor_reference_toolchain(reference_tag));
+    checks.push(doctor_mathlib_corpus(corpus_commit, reference_tag));
     checks.push(doctor_path_tool("cc", "optional D2 tool for --backend c"));
     checks.push(doctor_path_tool(
         "git",
@@ -10657,6 +10658,109 @@ fn doctor_reference_toolchain(tag: &str) -> DoctorCheck {
                 root.display()
             )
         },
+    }
+}
+
+/// The Mathlib Corpus is Tribunal measurement/differential apparatus (bead
+/// `franken_lean-z8j.1.15`), never a product runtime dependency: absence is
+/// reported as `missing`, while a present-but-tampered or mismatched root is
+/// surfaced as `misprovisioned`.
+fn doctor_mathlib_corpus(corpus_commit: &str, reference_tag: &str) -> DoctorCheck {
+    let name = "mathlib_corpus";
+    let root = std::env::var_os("FLN_MATHLIB_CORPUS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/data/tmp/mathlib4-corpus"));
+    let misprovisioned = |reason: String| DoctorCheck {
+        name,
+        required: false,
+        status: "misprovisioned",
+        detail: format!("{}: {reason}", root.display()),
+    };
+    let meta = match std::fs::symlink_metadata(&root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return DoctorCheck {
+                name,
+                required: false,
+                status: "missing",
+                detail: format!(
+                    "{} not found (override with FLN_MATHLIB_CORPUS); corpus-dependent Tribunal rigs will skip",
+                    root.display()
+                ),
+            };
+        }
+        Err(error) => return misprovisioned(format!("cannot inspect corpus root: {error}")),
+        Ok(meta) => meta,
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return misprovisioned("must be a real directory, not a symlink or file".to_owned());
+    }
+    let expected_toolchain = format!("leanprover/lean4:{reference_tag}");
+    match std::fs::read_to_string(root.join("lean-toolchain")) {
+        Ok(contents) if contents.trim() == expected_toolchain => {}
+        Ok(contents) => {
+            return misprovisioned(format!(
+                "lean-toolchain `{}` != `{expected_toolchain}`",
+                contents.trim()
+            ));
+        }
+        Err(error) => return misprovisioned(format!("cannot read lean-toolchain: {error}")),
+    }
+    let library = root.join(".lake/build/lib/lean/Mathlib");
+    match std::fs::symlink_metadata(&library) {
+        Ok(lib_meta) if !lib_meta.file_type().is_symlink() && lib_meta.is_dir() => {}
+        Ok(_) => {
+            return misprovisioned(
+                "built .lake/build/lib/lean/Mathlib must be a real directory".to_owned(),
+            );
+        }
+        Err(error) => {
+            return misprovisioned(format!(
+                "missing built .lake/build/lib/lean/Mathlib: {error}"
+            ));
+        }
+    }
+    let receipt_path = root.join(".fln-corpus-receipt.json");
+    match std::fs::symlink_metadata(&receipt_path) {
+        Ok(r_meta) if !r_meta.file_type().is_symlink() && r_meta.is_file() => {}
+        Ok(_) => {
+            return misprovisioned(
+                ".fln-corpus-receipt.json must be a regular file, not a symlink".to_owned(),
+            );
+        }
+        Err(error) => {
+            return misprovisioned(format!("missing .fln-corpus-receipt.json: {error}"));
+        }
+    }
+    let receipt = match std::fs::read_to_string(&receipt_path) {
+        Ok(text) => text,
+        Err(error) => {
+            return misprovisioned(format!("cannot read .fln-corpus-receipt.json: {error}"));
+        }
+    };
+    for required_fragment in [
+        "\"schema\":\"fln-mathlib-corpus/1\"".to_owned(),
+        format!("\"corpus_commit\":\"{corpus_commit}\""),
+        format!("\"reference_tag\":\"{reference_tag}\""),
+    ] {
+        if !receipt.contains(&required_fragment) {
+            return misprovisioned(format!("receipt does not match `{required_fragment}`"));
+        }
+    }
+    let protected = root.join(".sbh-protect").is_file()
+        || root
+            .parent()
+            .is_some_and(|parent| parent.join(".sbh-protect").is_file());
+    if !protected {
+        return misprovisioned("missing .sbh-protect scratch-reclamation marker".to_owned());
+    }
+    DoctorCheck {
+        name,
+        required: false,
+        status: "ok",
+        detail: format!(
+            "{} (commit {corpus_commit}, reference {reference_tag}; Tribunal corpus only, never a product dependency)",
+            root.display()
+        ),
     }
 }
 

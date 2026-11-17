@@ -135,6 +135,87 @@ fn doctor_reports_a_missing_reference_toolchain_without_failing() {
 }
 
 #[test]
+fn doctor_reports_present_missing_and_tampered_mathlib_corpus() {
+    let crate_dir = fln_core::checked_manifest_dir!();
+    let run_with_corpus = |corpus: &std::path::Path| -> (i32, String) {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["doctor", "--json"])
+            .current_dir(&crate_dir)
+            .env("FLN_MATHLIB_CORPUS", corpus)
+            .output()
+            .expect("run fln doctor --json with FLN_MATHLIB_CORPUS");
+        (
+            output.status.code().expect("exit code"),
+            String::from_utf8(output.stdout).expect("utf8 stdout"),
+        )
+    };
+
+    // 1. Missing root: informational `missing`, exit 0.
+    let missing_dir = TempDir::new("doctor-corpus-missing");
+    let absent = missing_dir.0.join("does-not-exist");
+    let (code, stdout) = run_with_corpus(&absent);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.contains("{\"name\":\"mathlib_corpus\",\"required\":false,\"status\":\"missing\""),
+        "{stdout}"
+    );
+
+    // 2. Valid provisioned root matching SUITE.lock + `.sbh-protect`: `ok`.
+    let lock = std::fs::read_to_string(fln_core::checked_workspace_root!().join("SUITE.lock"))
+        .expect("read SUITE.lock");
+    let corpus_commit = lock
+        .lines()
+        .find(|line| line.starts_with("corpus "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|token| token.strip_prefix("commit="))
+        })
+        .expect("corpus commit");
+    let reference_tag = lock
+        .lines()
+        .find(|line| line.starts_with("reference "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|token| token.strip_prefix("tag="))
+        })
+        .expect("reference tag");
+
+    let valid = TempDir::new("doctor-corpus-valid");
+    std::fs::create_dir_all(valid.0.join(".lake/build/lib/lean/Mathlib")).unwrap();
+    std::fs::write(
+        valid.0.join("lean-toolchain"),
+        format!("leanprover/lean4:{reference_tag}\n"),
+    )
+    .unwrap();
+    std::fs::write(valid.0.join(".sbh-protect"), "").unwrap();
+    let valid_receipt = format!(
+        "{{\"schema\":\"fln-mathlib-corpus/1\",\"corpus_commit\":\"{corpus_commit}\",\"reference_tag\":\"{reference_tag}\"}}\n"
+    );
+    std::fs::write(valid.0.join(".fln-corpus-receipt.json"), &valid_receipt).unwrap();
+    let (code, stdout) = run_with_corpus(&valid.0);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.contains("{\"name\":\"mathlib_corpus\",\"required\":false,\"status\":\"ok\""),
+        "{stdout}"
+    );
+
+    // 3. Tampered receipt commit: surfaced as `misprovisioned`, never `ok` or `missing`.
+    std::fs::write(
+        valid.0.join(".fln-corpus-receipt.json"),
+        valid_receipt.replace(corpus_commit, "0000000000000000000000000000000000000000"),
+    )
+    .unwrap();
+    let (code, stdout) = run_with_corpus(&valid.0);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.contains(
+            "{\"name\":\"mathlib_corpus\",\"required\":false,\"status\":\"misprovisioned\""
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn unimplemented_verbs_exit_five_with_a_typed_notice() {
     for (args, expected_gate) in [
         (vec!["serve-mcp"], "G6"),
