@@ -264,6 +264,22 @@ inductive Same (x : Token) : Token → Prop where
   | refl : Same x x
 theorem delayed_correct (left right : Token) : Same (delayed left right) right :=
   @Same.refl right
+structure Pair where
+  fst : Token
+  snd : Token
+inductive Box where
+  | some (value : Token)
+class Coe (α : Type) (β : Type) where
+  coe : α → β
+instance : Coe Token Box where
+  coe := Box.some
+def callCoerced (pair : Pair) : Box :=
+  let getSecond (x : _) := x.snd
+  Coe.coe (getSecond pair)
+inductive SameBox (x : Box) : Box → Prop where
+  | refl : SameBox x x
+theorem callCoerced_correct (pair : Pair) : SameBox (callCoerced pair) (Box.some pair.snd) :=
+  @SameBox.refl (Box.some pair.snd)
 "#;
     let root = workspace();
     std::fs::write(root.join("delayed.lean"), SOURCE).unwrap();

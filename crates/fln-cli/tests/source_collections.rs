@@ -144,17 +144,78 @@ fn installed_collection_execution_exports_and_replays_native_bytecode() {
     assert_eq!(std::fs::read_to_string(path).unwrap(), program);
 }
 
+fn pinned_lib() -> Option<PathBuf> {
+    let lib = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".elan/toolchains")
+                    .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+                    .join("lib/lean")
+            })
+        })
+        .filter(|lib| lib.join("Init.olean").is_file());
+    assert!(
+        lib.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "the pinned Reference library is required"
+    );
+    if lib.is_none() {
+        eprintln!(
+            "SKIP: pinned Reference lib/lean absent for implicit-Init lean personality check"
+        );
+    }
+    lib
+}
+
 #[test]
 fn lean_personality_executes_owned_collection_payloads() {
+    // Unconditional import-free check so hosts without `~/.elan` still exercise
+    // owned String/Bool collection payloads end-to-end through the native engine.
+    let seed_program = "#eval List.foldl String.append \"\" (List.cons \"hello\" (List.cons \" world\" List.nil))\n";
+    let seed_path = file(seed_program);
+    let seed_out = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json"])
+        .arg(&seed_path)
+        .output()
+        .unwrap();
+    assert!(seed_out.status.success(), "{seed_out:?}");
+    assert!(seed_out.stderr.is_empty());
+    assert!(
+        String::from_utf8_lossy(&seed_out.stdout).contains("\"finalValue\":\"hello world\""),
+        "{seed_out:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&seed_path).unwrap(), seed_program);
+
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
     let program = "#eval List.foldl (fun (acc s : String) => acc ++ s) \"\" [\"hello\", \" world\"]\n#eval List.length [true, false]\n";
     let path = file(program);
+    let records = path.parent().unwrap().join("records");
     let output = Command::new(env!("CARGO_BIN_EXE_lean"))
         .arg(&path)
+        .env("LEAN_PATH", &lib)
+        .env("FLN_IMPORT_REUSE_DIR", &records)
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
     assert!(output.stderr.is_empty());
     assert_eq!(output.stdout, b"\"hello world\"\n2\n");
+    if let Some(pinned_lean) = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|exe| exe.is_file())
+    {
+        let ref_out = Command::new(pinned_lean)
+            .arg(&path)
+            .env("LEAN_PATH", &lib)
+            .output()
+            .unwrap();
+        assert!(ref_out.status.success(), "{ref_out:?}");
+        assert_eq!(output.stdout, ref_out.stdout);
+    }
     assert_eq!(std::fs::read_to_string(path).unwrap(), program);
 }
 
