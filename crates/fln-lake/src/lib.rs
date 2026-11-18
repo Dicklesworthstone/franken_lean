@@ -1262,7 +1262,12 @@ impl fmt::Display for LakeUpdateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Resource(resource) => write!(f, "Lake update resource limit: {resource}"),
-            Self::Unsupported(detail) => write!(f, "unsupported Lake update: {detail}"),
+            Self::Unsupported(detail) => {
+                write!(
+                    f,
+                    "unsupported Lake update: {detail}; no manifest was written"
+                )
+            }
             Self::Discovery(e) => write!(f, "error discovering Lake configuration: {e}"),
             Self::Io(msg) => write!(f, "I/O error updating Lake manifest: {msg}"),
             Self::Parse(msg) => write!(f, "error parsing Lake manifest: {msg}"),
@@ -2062,13 +2067,7 @@ where
     // this phase a child's lock could override a later direct requirement.
     for requirement in config.requires.iter().rev() {
         if !locked.contains_key(&requirement.name) {
-            let entry = update_requirement_entry(
-                &root,
-                Path::new("."),
-                requirement,
-                false,
-                None,
-            )?;
+            let entry = update_requirement_entry(&root, Path::new("."), requirement, false, None)?;
             locked.insert(requirement.name.clone(), entry);
         }
     }
@@ -2137,19 +2136,15 @@ where
                 "git" => {
                     let subdir = update_git_subdir(entry.subdir.as_deref())?;
                     let url = entry.url.as_deref().ok_or_else(|| {
-                        LakeUpdateError::Parse(format!(
-                            "Git dependency {} has no URL",
-                            entry.name,
-                        ))
+                        LakeUpdateError::Parse(format!("Git dependency {} has no URL", entry.name,))
                     })?;
-                    let url = update_git_url(
-                        &root,
-                        Path::new("."),
-                        url,
-                        git_transaction.as_ref(),
-                    )?;
+                    let url = update_git_url(&root, Path::new("."), url, git_transaction.as_ref())?;
                     entry.url = Some(url.clone());
-                    if entry.rev.as_deref().is_some_and(|rev| !git::full_revision(rev)) {
+                    if entry
+                        .rev
+                        .as_deref()
+                        .is_some_and(|rev| !git::full_revision(rev))
+                    {
                         return Err(LakeUpdateError::Parse(format!(
                             "locked Git dependency {} lacks a full commit revision",
                             entry.name,
@@ -2708,12 +2703,10 @@ fn validate_update_requirements(config: &LakeConfig) -> Result<(), LakeUpdateErr
     let unavailable: Vec<_> = config
         .requires
         .iter()
-        .filter(|requirement| {
-            match (&requirement.path, &requirement.url) {
-                (Some(_), None) => requirement.rev.is_some() || requirement.subdir.is_some(),
-                (None, Some(_)) => false,
-                _ => true,
-            }
+        .filter(|requirement| match (&requirement.path, &requirement.url) {
+            (Some(_), None) => requirement.rev.is_some() || requirement.subdir.is_some(),
+            (None, Some(_)) => false,
+            _ => true,
         })
         .map(|requirement| requirement.name.clone())
         .collect();

@@ -190,7 +190,7 @@ fn lean_personality_executes_owned_collection_payloads() {
     let Some(lib) = pinned_lib() else {
         return;
     };
-    let program = "#eval List.foldl (fun (acc s : String) => acc ++ s) \"\" [\"hello\", \" world\"]\n#eval List.length [true, false]\n";
+    let program = "prelude\nimport Init.Data.Repr\nimport Init.Data.List.Basic\nimport Init.Data.String.Basic\n#eval List.foldl (fun (acc s : String) => acc ++ s) \"\" [\"hello\", \" world\"]\n#eval List.length [true, false]\n";
     let path = file(program);
     let records = path.parent().unwrap().join("records");
     let output = Command::new(env!("CARGO_BIN_EXE_lean"))

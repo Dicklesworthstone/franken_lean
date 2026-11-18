@@ -1396,6 +1396,16 @@ impl Context {
             }
             let selected = self.selected_simp_term(rule)?;
             let type_ = self.simp_premise_target(&selected.type_, rules)?;
+            let reduced =
+                self.whnf_with_transparency(&type_, UnificationTransparency::Abbreviations, false)?;
+            // `SimpTheorems.preprocess` telescopes leading `∀`/implication binders into rule
+            // parameters or side-condition premises and rewrites negated propositions to `False`,
+            // never registering the unstripped statement as `statement = True`.
+            if matches!(reduced.node(), ExprNode::ForallE { .. })
+                || self.simp_negated_proposition(&reduced)?.is_some()
+            {
+                continue;
+            }
             let Some(universe) = self.known_type(&type_)? else {
                 continue;
             };

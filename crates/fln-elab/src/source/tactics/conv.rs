@@ -297,12 +297,7 @@ impl Context {
         self.equality_transport(
             &Typed {
                 value: second,
-                type_: equality::equation(
-                    level.clone(),
-                    alpha.clone(),
-                    b.clone(),
-                    c.clone(),
-                ),
+                type_: equality::equation(level.clone(), alpha.clone(), b.clone(), c.clone()),
             },
             &motive,
             first,

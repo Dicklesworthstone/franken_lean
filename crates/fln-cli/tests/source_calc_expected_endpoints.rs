@@ -54,7 +54,7 @@ const HYPOTHESES: &[&str] = &[
     "example (a : Nat) (h : a < 4) (k : 4 < 5) : a < 5 :=\n  calc\n    _ < 4 := h\n    (4 : Nat) < 5 := k\n",
     "example (a : Nat) (h : a < 4) (k : 4 < 5) : a < 5 :=\n  calc\n    _ < 4 := h\n    _ < (5 : Nat) := k\n",
     "theorem c_succ_step : 3 < 5 :=\n  calc\n    _ < 4 := Nat.lt_succ_self 3\n    _ < _ := by decide\n",
-    "theorem c_inferred :=\n  calc\n    _ < 4 := Nat.lt_succ_self 3\n    _ < 5 := by decide\n",
+    "example :=\n  calc\n    _ < 4 := Nat.lt_succ_self 3\n    _ < 5 := by decide\n",
 ];
 
 fn pinned_lib() -> Option<PathBuf> {
@@ -184,7 +184,7 @@ fn calc_deferred_tactics_and_congruence_pending_synthesis_work_without_imports()
 inductive Nat where
   | zero : Nat
   | succ : Nat → Nat
-inductive Eq {α : Type} : α → α → Prop where
+inductive Eq.{u} {α : Sort u} : α → α → Prop where
   | refl (a : α) : Eq a a
 class Base (α : Type) where
   one : α
@@ -210,7 +210,7 @@ theorem congruencePending : Holds Nat Nat.zero (Nat.succ Nat.zero) :=
 inductive Nat where
   | zero : Nat
   | succ : Nat → Nat
-inductive Eq {α : Type} : α → α → Prop where
+inductive Eq.{u} {α : Sort u} : α → α → Prop where
   | refl (a : α) : Eq a a
 theorem wrongDeferredEq : Eq Nat.zero (Nat.succ Nat.zero) :=
   calc

@@ -133,7 +133,9 @@ fn read_bounded(path: &Path, bound: u64) -> Result<Vec<u8>, LakeFetchError> {
 fn capture_prefix(path: &Path) -> Result<(Vec<u8>, u64), LakeFetchError> {
     let metadata = fs::symlink_metadata(path).map_err(io_error)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(invalid("Git output capture is not a regular nonsymlink file"));
+        return Err(invalid(
+            "Git output capture is not a regular nonsymlink file",
+        ));
     }
     let file = File::open(path).map_err(io_error)?;
     let metadata = file.metadata().map_err(io_error)?;
@@ -375,8 +377,12 @@ impl Runner {
             manifest_quote(label),
             manifest_quote(&self.executable.to_string_lossy()),
             manifest_quote(&self.digest.to_hex()),
-            input_index_digest.as_deref().map_or("null".to_owned(), manifest_quote),
-            status.code().map_or("null".to_owned(), |code| code.to_string()),
+            input_index_digest
+                .as_deref()
+                .map_or("null".to_owned(), manifest_quote),
+            status
+                .code()
+                .map_or("null".to_owned(), |code| code.to_string()),
             stopped.map_or("null".to_owned(), manifest_quote),
             stdout.len(),
             stderr.len(),
@@ -598,9 +604,15 @@ fn check_existing_worktree(
     // incorrectly reject every revision change as staged modifications.
     let mut worktree_args = prefix.clone();
     worktree_args.extend(
-        ["diff-files", "--raw", "--no-ext-diff", "--no-textconv", "--"]
-            .iter()
-            .map(OsString::from),
+        [
+            "diff-files",
+            "--raw",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+        ]
+        .iter()
+        .map(OsString::from),
     );
     let mut other_args = prefix.clone();
     other_args.extend(
@@ -733,7 +745,9 @@ impl Transaction {
             )?,
             other => other?,
         };
-        if !full_revision(&commit) || full_revision(revision) && !commit.eq_ignore_ascii_case(revision) {
+        if !full_revision(&commit)
+            || full_revision(revision) && !commit.eq_ignore_ascii_case(revision)
+        {
             return Err(invalid(
                 "Git did not resolve the requested revision to its full commit",
             ));
@@ -777,7 +791,10 @@ impl Transaction {
                 )?;
                 Some(PreviousCheckout {
                     revision: old_revision,
-                    recovery: self.runner.job.join(format!("previous-{}", self.pending.len())),
+                    recovery: self
+                        .runner
+                        .job
+                        .join(format!("previous-{}", self.pending.len())),
                     moved: false,
                 })
             }
@@ -802,7 +819,9 @@ impl Transaction {
     pub fn promote(&mut self) -> Result<(), LakeFetchError> {
         for (destination, revision) in &self.reused {
             if checkout_revision(destination)? != *revision {
-                return Err(invalid("reused Git HEAD changed during dependency resolution"));
+                return Err(invalid(
+                    "reused Git HEAD changed during dependency resolution",
+                ));
             }
         }
         for pending in &self.pending {
@@ -811,7 +830,9 @@ impl Transaction {
                 false,
             )?;
             if checkout_revision(&pending.stage)? != pending.revision {
-                return Err(invalid("staged Git HEAD changed during dependency resolution"));
+                return Err(invalid(
+                    "staged Git HEAD changed during dependency resolution",
+                ));
             }
             if let Some(previous) = &pending.previous {
                 check_existing_worktree(
@@ -936,11 +957,13 @@ mod tests {
     use super::*;
 
     fn fixture(label: &str) -> (PathBuf, Runner) {
-        let parent = fs::canonicalize(std::env::temp_dir()).unwrap().join(format!(
-            "fln-git-test-{label}-{}-{}",
-            std::process::id(),
-            NEXT_JOB.fetch_add(1, Ordering::Relaxed)
-        ));
+        let parent = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "fln-git-test-{label}-{}-{}",
+                std::process::id(),
+                NEXT_JOB.fetch_add(1, Ordering::Relaxed)
+            ));
         private_directory(&parent).unwrap();
         let runner = Runner::new(new_job(&parent).unwrap()).unwrap();
         (parent, runner)
@@ -1005,14 +1028,28 @@ mod tests {
         );
         fs::write(checkout.join("value.txt"), "local edit\n").unwrap();
         assert_eq!(
-            fetch(&packages, "dependency", repo.to_str().unwrap(), Some(&commit)).unwrap(),
+            fetch(
+                &packages,
+                "dependency",
+                repo.to_str().unwrap(),
+                Some(&commit)
+            )
+            .unwrap(),
             checkout,
         );
         assert_eq!(
             fs::read_to_string(checkout.join("value.txt")).unwrap(),
             "local edit\n"
         );
-        assert!(fetch(&packages, "dependency", repo.to_str().unwrap(), Some("missing")).is_err());
+        assert!(
+            fetch(
+                &packages,
+                "dependency",
+                repo.to_str().unwrap(),
+                Some("missing")
+            )
+            .is_err()
+        );
         assert_eq!(
             fs::read_to_string(checkout.join("value.txt")).unwrap(),
             "local edit\n"
@@ -1034,9 +1071,23 @@ mod tests {
         let (root, mut runner) = fixture("invalid");
         let (repo, _) = repository(&root, &mut runner);
         let packages = root.join("packages");
-        assert!(fetch(&packages, "dependency", repo.to_str().unwrap(), Some("missing")).is_err());
+        assert!(
+            fetch(
+                &packages,
+                "dependency",
+                repo.to_str().unwrap(),
+                Some("missing")
+            )
+            .is_err()
+        );
         assert!(!packages.join("dependency").exists());
-        for name in ["../escape", "a/b", "«../escape»", ".fln-git-reserved", "a\\b"] {
+        for name in [
+            "../escape",
+            "a/b",
+            "«../escape»",
+            ".fln-git-reserved",
+            "a\\b",
+        ] {
             assert!(fetch(&packages, name, repo.to_str().unwrap(), Some("release")).is_err());
         }
         assert!(!root.join("escape").exists());
@@ -1163,7 +1214,9 @@ mod tests {
         .unwrap();
         fs::write(repo.join("sub/leaf/lakefile.toml"), "name = \"leaf\"\n").unwrap();
         let commit = commit_all(&repo, &mut runner);
-        runner.text(&repo, "fixture-tag", &["tag", "stable"]).unwrap();
+        runner
+            .text(&repo, "fixture-tag", &["tag", "stable"])
+            .unwrap();
         let project = root_package(
             &root,
             &format!(
@@ -1211,7 +1264,9 @@ mod tests {
                 "name = \"root\"\n[[require]]\nname = \"bad\"\ngit = {source}\nrev = \"missing\"\n[[require]]\nname = \"good\"\ngit = {source}\nrev = \"release\"\n",
             ),
         );
-        crate::Manifest::new("previous").save_to_dir(&project).unwrap();
+        crate::Manifest::new("previous")
+            .save_to_dir(&project)
+            .unwrap();
         let before = fs::read(project.join("lake-manifest.json")).unwrap();
         let error = crate::update_manifest(&project).unwrap_err();
         assert!(error.to_string().contains("bad"), "{error}");
@@ -1243,19 +1298,19 @@ mod tests {
                 manifest_quote(repo.to_str().unwrap()),
             ),
         );
-        crate::Manifest::new("previous").save_to_dir(&project).unwrap();
+        crate::Manifest::new("previous")
+            .save_to_dir(&project)
+            .unwrap();
         let before = fs::read(project.join("lake-manifest.json")).unwrap();
-        let error = crate::update_manifest_with_lean::<crate::LakeUpdateError>(
-            &project,
-            |_, bytes| {
+        let error =
+            crate::update_manifest_with_lean::<crate::LakeUpdateError>(&project, |_, bytes| {
                 assert_eq!(bytes, b"import Lake\n");
                 fs::write(project.join("lakefile.toml"), "name = \"changed\"\n").unwrap();
                 let mut config = crate::LakeConfig::parse_toml("name = \"dependency\"\n").unwrap();
                 config.format = crate::LakeConfigFormat::Lean;
                 Ok(config)
-            },
-        )
-        .unwrap_err();
+            })
+            .unwrap_err();
         assert!(error.to_string().contains("changed during"), "{error}");
         assert_eq!(
             fs::read(project.join("lake-manifest.json")).unwrap(),
@@ -1277,7 +1332,9 @@ mod tests {
         let (repo, old_commit) = repository(&root, &mut runner);
         fs::write(repo.join("value.txt"), "new upstream\n").unwrap();
         let new_commit = commit_all(&repo, &mut runner);
-        runner.text(&repo, "fixture-tag", &["tag", "latest"]).unwrap();
+        runner
+            .text(&repo, "fixture-tag", &["tag", "latest"])
+            .unwrap();
         let holder = root.join("holder");
         private_directory(&holder).unwrap();
         fs::write(

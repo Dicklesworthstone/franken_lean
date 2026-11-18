@@ -817,7 +817,12 @@ impl Context {
                         None => false,
                     }
                 } else {
-                    trial.match_rewrite_occurrence(&pattern, &alpha, term, !inside_out)?
+                    // Both `rw` and `simp` match pattern occurrences at reducible transparency
+                    // with Nat offset constraints (`Simp/Types.lean:173` `mkMetaConfig`,
+                    // `Simp/Rewrite.lean:119` `withSimpMetaConfig <| isDefEq lhs e`); running
+                    // explicit pattern matching at `.instances` unfolds `@[implicit_reducible]`
+                    // `Nat.add` on `?k + 0` and falsely matches arbitrary sums like `1 + b`.
+                    trial.match_rewrite_occurrence(&pattern, &alpha, term, true)?
                 };
                 if !matched {
                     return Ok(None);

@@ -66,6 +66,14 @@ const REJECTED: &[(&str, &str)] = &[
         "rfl_theorem",
         "example : 1 = fib (1 + 1) := by simp only [fib_two]\n",
     ),
+    // `Nat.lt_add_left_iff_pos` (`n < k + n ↔ 0 < k`): at reducible transparency `?k + 0`
+    // does not unfold `Nat.add` to match `1 + b` (bead fln-simp-add-zero-pattern-overmatch-5jie).
+    (
+        "add_zero_pattern_overmatch",
+        "@[simp] theorem add_zero_eq_probe (n k : Nat) : (k + 0 = n) = (k = n) :=\n\
+           Eq.rec (motive := fun x _ => (x = n) = (k = n)) rfl (Nat.add_zero k).symm\n\
+         example (b : Nat) : 1 + b = 0 := by simp\n",
+    ),
 ];
 
 fn pinned_lib() -> Option<PathBuf> {
@@ -186,6 +194,18 @@ const OFFSET_CLOSED: &[(&str, &str)] = &[
         "rw_successor",
         "example (x a : Nat) (h : a = x + 1) : g a = g (Nat.succ x) := by rw [h]\n",
     ),
+    (
+        "literal_under_app",
+        "example (f : Nat → Nat) : f (2 + 2) = f 4 := by simp only []\n",
+    ),
+    (
+        "with_reducible_rfl_closed",
+        "example : (1 + 1 : Nat) = 2 := by with_reducible rfl\n",
+    ),
+    (
+        "with_reducible_rfl_ascribed_offset",
+        "example (x : Nat) : (x + 1 : Nat) = Nat.succ x := by with_reducible rfl\n",
+    ),
 ];
 
 /// Left open at the pin and here: the offsets differ, or the heads do.
@@ -206,6 +226,18 @@ const OFFSET_OPEN: &[(&str, &str)] = &[
         "other_head",
         "def k (n : Nat) : Nat := n\nexample : g 2 = k 2 := by simp only\n",
     ),
+    (
+        "literal_under_app_mismatch",
+        "example (f : Nat → Nat) : f (2 + 2) = f 5 := by simp only []\n",
+    ),
+    (
+        "with_reducible_rfl_mismatch",
+        "example : (1 + 1 : Nat) = 3 := by with_reducible rfl\n",
+    ),
+    (
+        "with_reducible_rfl_ascribed_offset_mismatch",
+        "example (x : Nat) : (x + 2 : Nat) = Nat.succ x := by with_reducible rfl\n",
+    ),
 ];
 
 #[test]
@@ -223,7 +255,9 @@ fn a_reflexive_close_compares_nat_offsets_under_any_head() {
         let (code, stderr, pinned) = check(&lib, &root, name, program);
         assert_ne!(code, 0, "{name}: accepted {program}");
         assert!(
-            stderr.contains("made no progress") || stderr.contains("unsolved goals"),
+            stderr.contains("made no progress")
+                || stderr.contains("unsolved goals")
+                || stderr.contains("UnsupportedEquation"),
             "{name}: not the tactic's own failure\n{stderr}"
         );
         assert_ne!(pinned.unwrap_or(1), 0, "{name}: the pinned lean accepts it");

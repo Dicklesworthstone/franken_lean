@@ -41,7 +41,7 @@ const SEED_DO_PROGRAM: &str = r#"class Pure (f : Type -> Type) where
 class Bind (m : Type -> Type) where
   bind : {A B : Type} -> m A -> (A -> m B) -> m B
 
-def Id (A : Type) : Type := A
+abbrev Id (A : Type) : Type := A
 instance idPure : Pure Id := { pure := fun a => a }
 instance idBind : Bind Id := { bind := fun a k => k a }
 
@@ -179,15 +179,15 @@ fn alias_results_keep_bool_nat_and_string_distinct_in_both_presentations() {
     std::fs::create_dir_all(&dir).unwrap();
 
     // Unconditional import-free kind check.
-    for (expr, expected) in [
-        ("true", "\"finalValue\":true"),
-        ("\"hello\"", "\"finalValue\":\"hello\""),
-        ("1", "\"finalValue\":1"),
+    for (ty, expr, expected) in [
+        ("Bool", "true", "\"finalValue\":true"),
+        ("String", "\"hello\"", "\"finalValue\":\"hello\""),
+        ("Nat", "1", "\"finalValue\":1"),
     ] {
         let seed_source = dir.join("SeedKinds.lean");
         std::fs::write(
             &seed_source,
-            format!("{SEED_DO_PROGRAM}\ndef v := do return {expr}\n#eval v\n"),
+            format!("{SEED_DO_PROGRAM}\ndef v : Id {ty} := do return {expr}\n#eval v\n"),
         )
         .unwrap();
         let out = success(

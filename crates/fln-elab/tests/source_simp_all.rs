@@ -167,14 +167,54 @@ fn simp_custom_dischargers_run_composed_tactics_and_close_every_goal() {
     );
 }
 
+fn environment_with_implies_true() -> Environment {
+    let env = environment();
+    let implies_true = check_definition_source(
+        b"theorem implies_true.{u} (A : Sort u) : (A -> True) = True := propext (Iff.intro (fun _ => True.intro) (fun _ _ => True.intro))",
+        &env,
+        budget(),
+    )
+    .expect("elaborate implies_true");
+    let Outcome::Complete(admitted) = admit(&env, implies_true.declaration, budget()) else {
+        panic!("admit implies_true");
+    };
+    let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted) else {
+        panic!("convene implies_true");
+    };
+    let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(published))) =
+        checked.publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        )
+    else {
+        panic!("publish implies_true");
+    };
+    published.environment
+}
+
 #[test]
 fn simp_discharges_quantified_propositions_without_guessing_function_data() {
     accepted(
         "theorem t (P : Nat -> Prop) (h : ∀ n : Nat, P n) (a b : Nat) (rule : (∀ n : Nat, P n) -> a = b) : a = b := by simp (discharger := intro n; exact h n) only [rule]",
     );
-    accepted(
+    // At the pin (`v4.32.0`), `SimpTheorems.preprocess` opens `h : ∀ n : Nat, P n` into
+    // `P ?n = True`, so `simp only [rule, h]` leaves the side condition as `∀ n : Nat, True` and
+    // refuses without `implies_true` in the active simp set.
+    refused(
         "theorem t (P : Nat -> Prop) (h : ∀ n : Nat, P n) (a b : Nat) (rule : (∀ n : Nat, P n) -> a = b) : a = b := by simp only [rule, h]",
     );
+    let with_implies_true = environment_with_implies_true();
+    let discharged = check_definition_source(
+        "theorem t (P : Nat -> Prop) (h : ∀ n : Nat, P n) (a b : Nat) (rule : (∀ n : Nat, P n) -> a = b) : a = b := by simp only [rule, h, implies_true]".as_bytes(),
+        &with_implies_true,
+        budget(),
+    )
+    .expect("elaborate quantified side condition with implies_true");
+    assert!(matches!(
+        discharged.outcome,
+        Outcome::Complete(Verdict::Accepted { .. })
+    ));
     refused(
         "theorem t (a b : Nat) (rule : (Nat -> Nat) -> a = b) : a = b := by simp (discharger := intro n; exact n) only [rule]",
     );
@@ -196,9 +236,25 @@ fn simp_custom_dischargers_are_shared_by_hypotheses_and_simpa() {
     refused(
         "theorem t (P : Prop) (h : P) (a b : Nat) (rule : P -> a = b) : a = b := by\n conv => lhs; simp (discharger := exact h) only [rule]\n rfl",
     );
-    accepted(
+    // At `v4.32.0`, `simp (discharger := apply h) only [rule]` rewrites under `∀ n : Nat` and
+    // leaves the quantified reflexive goal open unless `implies_true` is in the active simp set.
+    refused(
         "theorem t (P : Nat -> Prop) (h : ∀ n : Nat, P n) (f : Nat -> Nat) (rule : ∀ n : Nat, P n -> f n = n) : ∀ n : Nat, f n = n := by simp (discharger := apply h) only [rule]",
     );
+    accepted(
+        "theorem t (P : Nat -> Prop) (h : ∀ n : Nat, P n) (f : Nat -> Nat) (rule : ∀ n : Nat, P n -> f n = n) : ∀ n : Nat, f n = n := by simp (discharger := apply h) only [rule]; intro _; rfl",
+    );
+    let with_implies_true = environment_with_implies_true();
+    let closed = check_definition_source(
+        "theorem t (P : Nat -> Prop) (h : ∀ n : Nat, P n) (f : Nat -> Nat) (rule : ∀ n : Nat, P n -> f n = n) : ∀ n : Nat, f n = n := by simp (discharger := apply h) only [rule, implies_true]".as_bytes(),
+        &with_implies_true,
+        budget(),
+    )
+    .expect("elaborate quantified binder simp with custom discharger and implies_true");
+    assert!(matches!(
+        closed.outcome,
+        Outcome::Complete(Verdict::Accepted { .. })
+    ));
 }
 
 #[test]

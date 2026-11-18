@@ -114,7 +114,10 @@ example (child : FamilyTree) (rest : FamilyForest) :
             else {
                 panic!("checked structurally recursive definition");
             };
-            assert_eq!(definition.safety, fln_env::constants::DefinitionSafety::Safe);
+            assert_eq!(
+                definition.safety,
+                fln_env::constants::DefinitionSafety::Safe
+            );
             assert_ne!(
                 definition.hints,
                 fln_env::constants::ReducibilityHints::Opaque
@@ -185,7 +188,11 @@ example : rightDepth (.node (.cons (.leaf 7) .nil)) = 2 := rfl
     );
     let base = check_below(&source);
     run(&base, "#eval leftDepth (.node (.cons (.leaf 7) .nil))", "3");
-    run(&base, "#eval rightDepth (.node (.cons (.leaf 7) .nil))", "2");
+    run(
+        &base,
+        "#eval rightDepth (.node (.cons (.leaf 7) .nil))",
+        "2",
+    );
 }
 
 #[test]

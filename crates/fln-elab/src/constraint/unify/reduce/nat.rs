@@ -969,6 +969,21 @@ impl Engine<'_> {
         let mut found = false;
         loop {
             self.meter.tick()?;
+            while let ExprNode::MData { expr, .. } = base.node() {
+                base = expr.clone();
+            }
+            if let ExprNode::LetE {
+                decl_name,
+                value,
+                body,
+                ..
+            } = base.node()
+                && decl_name.is_anonymous()
+                && matches!(body.node(), ExprNode::BVar { idx: 0 })
+            {
+                base = value.clone();
+                continue;
+            }
             let Some((name, arguments)) = class_spine(&base) else {
                 break;
             };

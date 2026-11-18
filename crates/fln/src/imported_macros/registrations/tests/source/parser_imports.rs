@@ -336,11 +336,7 @@ fn unselected_fixture_with_parsers(
         ),
     ];
     if shared_head {
-        registrations.push((
-            "SourceLibrary.alternate",
-            "SourceLibrary.diagnostic",
-            None,
-        ));
+        registrations.push(("SourceLibrary.alternate", "SourceLibrary.diagnostic", None));
     }
     batches::artifact_import_fixture_with_parser_dependency(
         &registrations,

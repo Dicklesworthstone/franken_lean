@@ -51,13 +51,16 @@ struct StructuralFamily {
 
 impl StructuralPlan {
     fn member_family(&self, member: usize) -> Option<(usize, &StructuralFamily, usize)> {
-        self.families.iter().enumerate().find_map(|(index, family)| {
-            family
-                .members
-                .iter()
-                .position(|candidate| *candidate == member)
-                .map(|position| (index, family, position))
-        })
+        self.families
+            .iter()
+            .enumerate()
+            .find_map(|(index, family)| {
+                family
+                    .members
+                    .iter()
+                    .position(|candidate| *candidate == member)
+                    .map(|position| (index, family, position))
+            })
     }
 }
 
@@ -522,7 +525,9 @@ impl Context {
             || first.num_nested != 0
             || parameters.len() != first.num_params as usize
         {
-            return Err(unsupported("nonindexed, nonnested mutual inductive families"));
+            return Err(unsupported(
+                "nonindexed, nonnested mutual inductive families",
+            ));
         }
         let fixed = &prefix[..plan.fixed];
         let fixed_ids: HashSet<_> = fixed.iter().map(|local| local.id.clone()).collect();
@@ -636,10 +641,9 @@ impl Context {
                 type_,
             })?;
             if let Some(expected) = &common_universe {
-                if !self.defeq_guarded(
-                    &Expr::sort(expected.clone()),
-                    &Expr::sort(universe.clone()),
-                )? {
+                if !self
+                    .defeq_guarded(&Expr::sort(expected.clone()), &Expr::sort(universe.clone()))?
+                {
                     return Err(unsupported("mutual structural results in one universe"));
                 }
             } else {
@@ -666,18 +670,26 @@ impl Context {
         for (index, name) in first.all.iter().enumerate() {
             let brec = Name::str(name.clone(), "brecOn");
             if !self.is_auxiliary_recursor(&brec)? {
-                return Err(unsupported("admitted course-of-values recursors for every family"));
+                return Err(unsupported(
+                    "admitted course-of-values recursors for every family",
+                ));
             }
             let Some(ConstantInfo::Defn(definition)) = self.txn.env.find(&brec).cloned() else {
-                return Err(unsupported("admitted course-of-values recursors for every family"));
+                return Err(unsupported(
+                    "admitted course-of-values recursors for every family",
+                ));
             };
             if definition.safety != DefinitionSafety::Safe {
-                return Err(unsupported("safe course-of-values recursors for every family"));
+                return Err(unsupported(
+                    "safe course-of-values recursors for every family",
+                ));
             }
             let mut universes = vec![universe.clone()];
             universes.extend_from_slice(levels);
             if universes.len() != definition.base.level_params.len() {
-                return Err(unsupported("the mutual course-of-values universe telescope"));
+                return Err(unsupported(
+                    "the mutual course-of-values universe telescope",
+                ));
             }
             let mut recursor = Typed {
                 value: Expr::const_(brec, universes.clone()),

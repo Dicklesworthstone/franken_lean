@@ -129,11 +129,12 @@ fn term_dispatch(declaration: &SyntaxDecl) -> Option<TermDispatch<'_>> {
             operand: *minimum,
         });
     }
-    (*prec >= LEAD_PREC && (ends_with_atom(body, 0) || ends_with_term(body, 0)))
-        .then_some(TermDispatch::Description {
+    (*prec >= LEAD_PREC && (ends_with_atom(body, 0) || ends_with_term(body, 0))).then_some(
+        TermDispatch::Description {
             precedence: *prec,
             body,
-        })
+        },
+    )
 }
 
 /// Account for structural equality and prefix inspection before comparing
@@ -225,9 +226,10 @@ fn compatible_dispatch(
             // A successful candidate consumes the distinguishing token, so a
             // sibling's mismatch there cannot outrank it by error progress.
             // Prefix-related descriptions do not have this guarantee.
-            Ok(left_prefix.iter().zip(&right_prefix).any(|(left, right)| {
-                left.iter().all(|token| !right.contains(token))
-            }))
+            Ok(left_prefix
+                .iter()
+                .zip(&right_prefix)
+                .any(|(left, right)| left.iter().all(|token| !right.contains(token))))
         }
         _ => Ok(false),
     }
