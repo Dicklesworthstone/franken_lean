@@ -429,6 +429,11 @@ impl Preparation<'_> {
             Operation::Push => (vec![c(HANDLE), c(PAYLOAD)], c(HANDLE), ValueType::Array),
             Operation::Size => (vec![c(HANDLE)], c("Nat"), ValueType::Nat),
             Operation::Get => (vec![c(HANDLE), c("Nat")], c(PAYLOAD), ValueType::Abi),
+            Operation::GetDefault => (
+                vec![c(PAYLOAD), c(HANDLE), c("Nat")],
+                c(PAYLOAD),
+                ValueType::Abi,
+            ),
             Operation::Set => (
                 vec![c(HANDLE), c("Nat"), c(PAYLOAD)],
                 c(HANDLE),
@@ -577,6 +582,39 @@ impl Preparation<'_> {
                 let value = application(primitive, [b(2)?, b(1)?]);
                 let body = self.array_recover(value, &payload)?;
                 (vec![family, c("Nat"), proofs::erased_type()], payload, body)
+            }
+            Operation::GetDefault => {
+                let erased_type = self.type_parameter(alpha)?;
+                let instance_level = Level::succ(level.clone())
+                    .map_err(|_| unsupported("Array.get!Internal instance universe"))?;
+                let instance = Expr::app(
+                    Expr::const_(name("Inhabited"), vec![instance_level]),
+                    alpha.clone(),
+                );
+                let instance = self.erase_runtime_type(&instance)?;
+                let shape = self
+                    .record_shape(&instance)?
+                    .ok_or_else(|| unsupported("Array.get!Internal instance record"))?;
+                let [constructor] = shape.constructors.as_slice() else {
+                    return Err(unsupported("Array.get!Internal instance constructor"));
+                };
+                if constructor.tag != 0
+                    || constructor.fields != [payload.clone()]
+                    || constructor.type_fields != [erased_type]
+                {
+                    return Err(unsupported("Array.get!Internal instance payload"));
+                }
+                if self.value_type(&instance)? != Some(ValueType::Constructor) {
+                    return Err(unsupported("Array.get!Internal instance representation"));
+                }
+                let default_value = if erased_type {
+                    proofs::erased_value()
+                } else {
+                    Expr::proj(shape.projection(constructor), 0, b(2)?)
+                };
+                let value = application(primitive, [default_value, b(1)?, b(0)?]);
+                let body = self.array_recover(value, &payload)?;
+                (vec![instance, family, c("Nat")], payload, body)
             }
             Operation::Set => {
                 let value = application(primitive, [b(3)?, b(2)?, b(1)?]);

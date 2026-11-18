@@ -23,7 +23,13 @@ fn encoded(label: &Name) -> String {
 pub(super) fn rows(environment: &Environment) -> Vec<String> {
     rows_from(
         environment,
-        ["Array.push", "Array.set", "Array.pop", "Array.modifyM"],
+        [
+            "Array.push",
+            "Array.get!Internal",
+            "Array.set",
+            "Array.pop",
+            "Array.modifyM",
+        ],
     )
 }
 

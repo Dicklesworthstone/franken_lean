@@ -362,4 +362,17 @@ fn a_nested_call_proof_is_its_own_goal_in_the_outer_goal() {
         assert_eq!(code, 0, "{name}: {program}\n{stderr}");
         assert_eq!(pinned.unwrap_or(0), 0, "{name}: the pinned lean rejects it");
     }
+    // Under Init.Data.Nat's larger simp set (including lambda-headed List rules), every variant
+    // must still stay well within budget rather than eta-expanding open decreasing-proof holes.
+    for (name, suffix) in ACCEPTED {
+        let label = format!("nat_simp_{name}");
+        let program = format!("import Init.Data.Nat\n{ACKERMANN}{suffix}");
+        let (code, stderr, pinned) = check(&lib, &root, &label, &program);
+        assert_eq!(code, 0, "{label}: {program}\n{stderr}");
+        assert_eq!(
+            pinned.unwrap_or(0),
+            0,
+            "{label}: the pinned lean rejects it"
+        );
+    }
 }

@@ -138,6 +138,106 @@ impl Context {
         Ok(actual != expected)
     }
 
+    fn level_is_always_nonzero(&mut self, root: &Level) -> Result<bool, NatDefinitionElabError> {
+        use fln_core::level::LevelView;
+        let mut pending = vec![root.clone()];
+        let mut kept = Vec::new();
+        let mut visited = HashSet::new();
+        while let Some(current) = pending.pop() {
+            self.tick()?;
+            match current.view() {
+                LevelView::Succ(_) => return Ok(true),
+                LevelView::Max(left, right) => {
+                    if visited.insert((
+                        std::ptr::from_ref(left) as usize,
+                        std::ptr::from_ref(right) as usize,
+                    )) {
+                        pending.push(right.clone());
+                        pending.push(left.clone());
+                    }
+                }
+                LevelView::IMax(left, right) => {
+                    if visited.insert((
+                        std::ptr::from_ref(left) as usize,
+                        std::ptr::from_ref(right) as usize,
+                    )) {
+                        pending.push(right.clone());
+                    }
+                }
+                LevelView::MVar(id) => {
+                    if visited.insert((std::ptr::from_ref(id) as usize, 0usize))
+                        && let Some(assigned) = self.txn.universes.assignments().get(id).cloned()
+                    {
+                        pending.push(assigned);
+                    }
+                }
+                LevelView::Zero | LevelView::Param(_) => {}
+            }
+            kept.push(current);
+        }
+        Ok(false)
+    }
+
+    fn level_is_always_zero(&mut self, root: &Level) -> Result<bool, NatDefinitionElabError> {
+        self.tick()?;
+        if root.is_always_zero() {
+            return Ok(true);
+        }
+        if !root.has_mvar() {
+            return Ok(false);
+        }
+        let remaining = crate::universe::DEFAULT_UNIVERSE_VISIT_LIMIT;
+        let Ok(instantiated) = self.txn.universes.instantiate_with_limit(root, remaining) else {
+            return Ok(false);
+        };
+        Ok(instantiated.is_always_zero())
+    }
+
+    /// Reject a Prop occurrence against a Type-valued carrier (and vice versa)
+    /// before entering unification. Lean has no universe cumulativity, so `Sort 0`
+    /// and `Sort (succ _)` are disjoint under every universe assignment; without
+    /// this, a lambda-headed `Type u` rule (`List.cons_append_fun`) eta-expands
+    /// a pending proof `?h x y` whose type is a defined proposition (`WellFoundedRelation.rel`).
+    fn rewrite_types_have_disjoint_sorts(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let (Some(mut left_sort), Some(mut right_sort)) =
+            (self.known_type(left)?, self.known_type(right)?)
+        else {
+            return Ok(false);
+        };
+        if !matches!(left_sort.node(), ExprNode::Sort { .. }) {
+            left_sort = self.whnf_with_transparency(
+                &left_sort,
+                UnificationTransparency::Abbreviations,
+                false,
+            )?;
+        }
+        if !matches!(right_sort.node(), ExprNode::Sort { .. }) {
+            right_sort = self.whnf_with_transparency(
+                &right_sort,
+                UnificationTransparency::Abbreviations,
+                false,
+            )?;
+        }
+        let (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) =
+            (left_sort.node(), right_sort.node())
+        else {
+            return Ok(false);
+        };
+        let a = a.clone();
+        let b = b.clone();
+        if self.level_is_always_zero(&a)? && self.level_is_always_nonzero(&b)? {
+            return Ok(true);
+        }
+        if self.level_is_always_nonzero(&a)? && self.level_is_always_zero(&b)? {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Reject an `apply` candidate only when its eventual conclusion and the
     /// target have different, stable outer heads. Telescope variables cannot
     /// change an admitted inductive head, so no premise holes are needed to
@@ -346,6 +446,23 @@ impl Context {
         // irreconcilable rigid heads. This accepts nothing and assigns no hole.
         if self.rewrite_types_have_distinct_heads(&type_, alpha)? {
             return Ok(false);
+        }
+        if self.rewrite_types_have_disjoint_sorts(&type_, alpha)? {
+            return Ok(false);
+        }
+        if self.is_unwrapped_lambda(pattern)? && !self.is_unwrapped_lambda(occurrence)? {
+            // `isDefEqEta` (vendored `Lean/Meta/ExprDefEq.lean:176-184`) only
+            // eta-expands a non-lambda occurrence when `whnfD (inferType b)` is
+            // `.forallE`; reject defined non-function types before `unify` opens
+            // the lambda body against an incompatible value or metavariable spine.
+            let reduced_type =
+                self.whnf_with_transparency(&type_, UnificationTransparency::Default, true)?;
+            if self
+                .rigid_rewrite_type_head(&reduced_type)?
+                .is_some_and(|head| head != RigidTypeHead::Forall)
+            {
+                return Ok(false);
+            }
         }
         self.queue_rewrite_selection(&type_, alpha, rewrite)?;
         self.queue_rewrite_selection(occurrence, pattern, rewrite)?;
@@ -1089,6 +1206,21 @@ impl Context {
         budget.max_assignments = 0;
         self.proof_types_match_with_budget(&left, &right, budget)
     }
+
+    fn is_unwrapped_lambda(
+        &mut self,
+        mut expression: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        loop {
+            self.tick()?;
+            match expression.node() {
+                ExprNode::MData { expr, .. } => expression = expr,
+                ExprNode::LetE { value, .. } if is_ascription(expression) => expression = value,
+                ExprNode::Lam { .. } => return Ok(true),
+                _ => return Ok(false),
+            }
+        }
+    }
 }
 
 /// `let _ : T := e; _`, the term this elaborator keeps for a source ascription `(e : T)`.
@@ -1636,5 +1768,129 @@ mod outcome_tests {
         assert_eq!(ctx.txn.env, before.env);
         assert_eq!(ctx.txn.lctx, before.lctx);
         assert!(ctx.equations.is_empty());
+    }
+
+    #[test]
+    fn disjoint_sorts_and_nonfunction_types_skip_lambda_eta_on_applied_holes() {
+        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::capability::{Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+        let mut ctx = context();
+        for source in [
+            "def rel (x y : Nat) : Prop := x = y",
+            "def natAlias : Type := Nat",
+        ] {
+            let declaration =
+                crate::check_definition_source(source.as_bytes(), &ctx.txn.env, ctx.kernel)
+                    .unwrap()
+                    .declaration;
+            let Outcome::Complete(admitted) = admit(&ctx.txn.env, declaration, ctx.kernel) else {
+                panic!("definition admission did not complete");
+            };
+            let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+            else {
+                panic!("definition was rejected");
+            };
+            let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
+                publication,
+            ))) = checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            )
+            else {
+                panic!("definition publication did not complete");
+            };
+            ctx.txn.env = publication.environment;
+        }
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        let x_id = FVarId(Name::from_components(["x"]));
+        let y_id = FVarId(Name::from_components(["y"]));
+        ctx.txn.lctx.add_param(
+            x_id.clone(),
+            x_id.0.clone(),
+            nat.clone(),
+            BinderInfo::Default,
+        );
+        ctx.txn.lctx.add_param(
+            y_id.clone(),
+            y_id.0.clone(),
+            nat.clone(),
+            BinderInfo::Default,
+        );
+        let x = Expr::fvar(x_id);
+        let y = Expr::fvar(y_id);
+
+        // Defined proposition `rel x y` vs polymorphic Type-level function `A → A`:
+        // rejected by sort disjointness in < 64 heartbeats without assigning `?h`.
+        let u = ctx.level().unwrap();
+        let carrier = ctx.hole(Expr::sort(Level::succ(u).unwrap())).unwrap();
+        let alpha = Expr::forall_e(
+            Name::anonymous(),
+            carrier.clone(),
+            carrier.clone(),
+            BinderInfo::Default,
+        );
+        let pattern = Expr::lam(
+            Name::from_components(["bs"]),
+            carrier,
+            Expr::bvar(0).unwrap(),
+            BinderInfo::Default,
+        );
+        let rel_type = Expr::forall_e(
+            Name::from_components(["x"]),
+            nat.clone(),
+            Expr::forall_e(
+                Name::from_components(["y"]),
+                nat.clone(),
+                app(
+                    Expr::const_(Name::from_components(["rel"]), vec![]),
+                    [Expr::bvar(1).unwrap(), Expr::bvar(0).unwrap()],
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let proof_hole = ctx.hole(rel_type).unwrap();
+        let proof_occurrence = app(proof_hole, [x.clone(), y.clone()]);
+        let before = ctx.txn.clone();
+        let start = ctx.txn.budget.heartbeats_consumed;
+        ctx.txn.budget.max_heartbeats = start + 64;
+        assert!(
+            !ctx.match_rewrite_occurrence(&pattern, &alpha, &proof_occurrence, true)
+                .unwrap()
+        );
+        assert!(ctx.txn.budget.heartbeats_consumed < start + 64);
+        assert_eq!(ctx.txn.mvars, before.mvars);
+        assert_eq!(ctx.txn.universes, before.universes);
+
+        // Defined non-function Type `natAlias` vs lambda pattern: rejected by `whnfD`
+        // domain check without eta-expanding or assigning `?v`.
+        ctx.txn.budget = before.budget.clone();
+        let val_type = Expr::forall_e(
+            Name::anonymous(),
+            nat.clone(),
+            Expr::forall_e(
+                Name::anonymous(),
+                nat,
+                Expr::const_(Name::from_components(["natAlias"]), vec![]),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let val_hole = ctx.hole(val_type).unwrap();
+        let val_occurrence = app(val_hole, [x, y]);
+        let before_val = ctx.txn.clone();
+        let start_val = ctx.txn.budget.heartbeats_consumed;
+        ctx.txn.budget.max_heartbeats = start_val + 96;
+        assert!(
+            !ctx.match_rewrite_occurrence(&pattern, &alpha, &val_occurrence, true)
+                .unwrap()
+        );
+        assert!(ctx.txn.budget.heartbeats_consumed < start_val + 96);
+        assert_eq!(ctx.txn.mvars, before_val.mvars);
+        assert_eq!(ctx.txn.universes, before_val.universes);
     }
 }

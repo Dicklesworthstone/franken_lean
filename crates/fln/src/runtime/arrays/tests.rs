@@ -80,7 +80,12 @@ fn arrays_of_data_and_callbacks_share_one_erased_primitive_with_typed_recovery()
             function(&[c("Nat")], c("Nat")),
         ];
         for payload in &payloads {
-            for operation in [Operation::Push, Operation::Get, Operation::ToList] {
+            for operation in [
+                Operation::Push,
+                Operation::Get,
+                Operation::GetDefault,
+                Operation::ToList,
+            ] {
                 let wrapper = preparation
                     .array_wrapper(operation, &Level::zero(), payload)
                     .unwrap()
@@ -95,7 +100,7 @@ fn arrays_of_data_and_callbacks_share_one_erased_primitive_with_typed_recovery()
                 Some(ValueType::Array)
             );
         }
-        assert_eq!(preparation.arrays.bindings.iter().flatten().count(), 3);
+        assert_eq!(preparation.arrays.bindings.iter().flatten().count(), 4);
         let (push, _) = preparation.arrays.bindings[Operation::Push.index()]
             .as_ref()
             .unwrap();
@@ -109,6 +114,23 @@ fn arrays_of_data_and_callbacks_share_one_erased_primitive_with_typed_recovery()
             .unwrap();
         assert_eq!(get.arguments, [ValueType::Array, ValueType::Nat]);
         assert_eq!(get.result, ValueType::Abi);
+        let (get_default, _) = preparation.arrays.bindings[Operation::GetDefault.index()]
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            get_default.arguments,
+            [ValueType::Abi, ValueType::Array, ValueType::Nat]
+        );
+        assert_eq!(
+            get_default.argument_ownership,
+            [
+                ArgumentOwnership::Borrowed,
+                ArgumentOwnership::Borrowed,
+                ArgumentOwnership::Borrowed,
+            ]
+        );
+        assert_eq!(get_default.result, ValueType::Abi);
+        assert_eq!(get_default.result_ownership, ResultOwnership::RawObject);
         for payload in payloads {
             let recovery = preparation.arrays.payloads.get(&payload).unwrap();
             let signature = preparation
@@ -154,6 +176,10 @@ fn type_valued_array_elements_are_inert_and_keep_the_original_container_type() {
                 .unwrap();
             let (_, arguments) = preparation.spine(&push).unwrap();
             assert_eq!(arguments.last(), Some(&proofs::erased_value()));
+            preparation
+                .array_wrapper(Operation::GetDefault, &level, &payload)
+                .unwrap()
+                .unwrap();
             preparation
                 .array_wrapper(Operation::ToList, &level, &payload)
                 .unwrap()

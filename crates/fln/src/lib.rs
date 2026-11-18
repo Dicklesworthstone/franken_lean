@@ -4535,13 +4535,18 @@ impl Engine {
                     }
                 })?;
             // A theorem, an opaque constant and an axiom have no body to execute here; they
-            // are admitted, as a template or a proof definition is.
+            // are admitted, as a template or a proof definition is. Under the `lean`
+            // presentation, ordinary `def` commands are also admitted without running them on
+            // the VM at declaration time (matching the pin's `addAndCompile`, so a 0-arity
+            // `def u : Nat := unreachable!` or `dbg_trace` fires only when `#eval` or `--run`
+            // evaluates it).
             if matches!(
                 declaration,
                 Declaration::Thm(_) | Declaration::Opaque(_) | Declaration::Axiom(_)
             ) || is_template
                 || is_proof_definition
                 || uses_sorry
+                || (!is_evaluation && presentation == EvaluationPresentation::Lean)
             {
                 // Ordered auxiliary declarations cross both checkers before
                 // the owner that cites them; no receipt is inferred or merged.

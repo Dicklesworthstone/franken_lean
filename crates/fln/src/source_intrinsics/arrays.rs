@@ -30,12 +30,13 @@ pub(crate) enum Operation {
     Push,
     Size,
     Get,
+    GetDefault,
     Set,
     Pop,
 }
 
 impl Operation {
-    pub(crate) const ALL: [Self; 9] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::FromList,
         Self::ToList,
         Self::Empty,
@@ -43,6 +44,7 @@ impl Operation {
         Self::Push,
         Self::Size,
         Self::Get,
+        Self::GetDefault,
         Self::Set,
         Self::Pop,
     ];
@@ -56,6 +58,7 @@ impl Operation {
             Self::Push => "Array.push",
             Self::Size => "Array.size",
             Self::Get => "Array.getInternal",
+            Self::GetDefault => "Array.get!Internal",
             Self::Set => "Array.set",
             Self::Pop => "Array.pop",
         }
@@ -80,7 +83,7 @@ impl Operation {
             | Self::Size
             | Self::Pop => 2,
             Self::Push => 3,
-            Self::Get => 4,
+            Self::Get | Self::GetDefault => 4,
             Self::Set => 5,
         }
     }

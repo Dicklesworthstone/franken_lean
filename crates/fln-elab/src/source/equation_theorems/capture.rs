@@ -507,11 +507,39 @@ impl Context {
         expected: &Expr,
         name: &Name,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
-        self.tick()?;
         let paren = parser_kind(&["Term", "paren"]);
-        if let Some([_, inner, _]) = node_args(syntax, &paren) {
-            return self.pattern(builder, inner, expected, name);
+        let mut syntax = syntax;
+        let mut aliases = Vec::new();
+        loop {
+            self.tick()?;
+            if let Some([_, inner, _]) = node_args(syntax, &paren) {
+                syntax = inner;
+                continue;
+            }
+            if let Some((alias, inner)) = super::super::patterns::named::parts(syntax)? {
+                aliases.push(alias);
+                syntax = inner;
+                continue;
+            }
+            break;
         }
+        let Some(value) = self.pattern_inner(builder, syntax, expected, name)? else {
+            return Ok(None);
+        };
+        for alias in aliases.into_iter().rev() {
+            builder.named.push((alias, value.clone()));
+        }
+        Ok(Some(value))
+    }
+
+    fn pattern_inner(
+        &mut self,
+        builder: &mut Builder,
+        syntax: &Syntax,
+        expected: &Expr,
+        name: &Name,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        self.tick()?;
         if is_kind(syntax, &hole_kind()) {
             return Ok(Some(builder.variable(
                 self,
@@ -519,13 +547,6 @@ impl Context {
                 expected.clone(),
                 true,
             )?));
-        }
-        if let Some((alias, inner)) = super::super::patterns::named::parts(syntax)? {
-            let Some(value) = self.pattern(builder, inner, expected, name)? else {
-                return Ok(None);
-            };
-            builder.named.push((alias, value.clone()));
-            return Ok(Some(value));
         }
         if let Syntax::Ident { val, .. } = syntax {
             if let Some(constructor) = self.pattern_constructor(val, expected)? {
@@ -657,38 +678,50 @@ impl Context {
         expected: &Expr,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         self.tick()?;
-        let Some((first, rest)) = items.split_first() else {
+        if items.is_empty() {
             let Some(nil) =
                 self.pattern_constructor(&Name::from_components(["List", "nil"]), expected)?
             else {
                 return Ok(None);
             };
             return self.constructor_pattern(builder, &nil, &[], expected);
-        };
+        }
         let Some(cons) =
             self.pattern_constructor(&Name::from_components(["List", "cons"]), expected)?
         else {
             return Ok(None);
         };
-        let Some((head_type, levels, params)) = self.constructor_instance(&cons, expected)? else {
+        let Some((_, levels, params)) = self.constructor_instance(&cons, expected)? else {
             return Ok(None);
         };
-        let _ = head_type;
         let Some(element) = params.first().cloned() else {
             return Ok(None);
         };
-        let Some(head) =
-            self.pattern(builder, first, &element, &Name::from_components(["head"]))?
+        let mut heads = Vec::with_capacity(items.len());
+        for item in items {
+            self.tick()?;
+            let Some(head) =
+                self.pattern(builder, item, &element, &Name::from_components(["head"]))?
+            else {
+                return Ok(None);
+            };
+            heads.push(head);
+        }
+        self.tick()?;
+        let Some(nil) =
+            self.pattern_constructor(&Name::from_components(["List", "nil"]), expected)?
         else {
             return Ok(None);
         };
-        let Some(tail) = self.list_pattern(builder, rest, expected)? else {
+        let Some(empty) = self.constructor_pattern(builder, &nil, &[], expected)? else {
             return Ok(None);
         };
-        Ok(Some([element, head, tail].into_iter().fold(
-            Expr::const_(cons.base.name.clone(), levels),
-            Expr::app,
-        )))
+        Ok(Some(heads.into_iter().rev().fold(empty, |tail, head| {
+            [element.clone(), head, tail].into_iter().fold(
+                Expr::const_(cons.base.name.clone(), levels.clone()),
+                Expr::app,
+            )
+        })))
     }
 
     fn is_nat(&mut self, expected: &Expr) -> Result<bool, NatDefinitionElabError> {

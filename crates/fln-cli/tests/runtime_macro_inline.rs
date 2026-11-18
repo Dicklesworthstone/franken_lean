@@ -246,3 +246,95 @@ fn macro_inline_is_refused_where_the_pin_refuses_it() {
         }
     }
 }
+
+#[test]
+fn panic_family_preserves_declaration_site_and_outside_cwd_uses_stdin_module() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let other_cwd = workspace();
+    let entry = root.join("PanicSite.lean");
+    std::fs::write(
+        &entry,
+        format!(
+            "{HEADER}def neverCalled : Nat := unreachable!\n\
+             def f (b : Bool) : Nat := match b with | false => 2 | true => panic! \"big\"\n\
+             namespace A\n\
+             private def h (b : Bool) : Nat := match b with | false => 10 | true => unreachable!\n\
+             def callH (b : Bool) : Nat := h b\n\
+             end A\n\
+             def d (n : Nat) : Nat := dbg_trace \"seen\"; n + 1\n\
+             #eval f false\n\
+             #eval f true\n\
+             #eval A.callH false\n\
+             #eval A.callH true\n\
+             #eval d 4\n\
+             #eval (panic! \"top\" : Nat)\n"
+        ),
+    )
+    .unwrap();
+    let records = std::env::var_os("FLN_IMPORT_REUSE_DIR")
+        .map(PathBuf::from)
+        .filter(|directory| directory.is_absolute())
+        .unwrap_or_else(|| root.join("records"));
+
+    for (cwd, arg, expected_module) in [
+        (root.as_path(), Path::new("PanicSite.lean"), "PanicSite"),
+        (other_cwd.as_path(), entry.as_path(), "_stdin"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+            .arg(arg)
+            .current_dir(cwd)
+            .env("LEAN_PATH", &lib)
+            .env("FLN_IMPORT_REUSE_DIR", &records)
+            .env("LEAN_BACKTRACE", "0")
+            .env_remove("LEAN_ABORT_ON_PANIC")
+            .output()
+            .expect("run installed lean");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+        assert!(stderr.is_empty(), "{stderr}");
+        let expected = format!(
+            "2\n\
+             PANIC at f {expected_module}:5:62: big\n\
+             0\n\
+             10\n\
+             PANIC at _private.{expected_module}.0.A.h {expected_module}:7:71: unreachable code has been reached\n\
+             0\n\
+             seen\n\
+             5\n\
+             PANIC at _private.{expected_module}.0._eval {expected_module}:16:7: top\n\
+             0\n"
+        );
+        assert_eq!(stdout, expected, "cwd={cwd:?}");
+
+        if let Some(lean) = lib
+            .parent()
+            .and_then(Path::parent)
+            .map(|t| t.join("bin/lean"))
+            .filter(|p| p.is_file())
+        {
+            let pin_out = Command::new(lean)
+                .arg(arg)
+                .current_dir(cwd)
+                .env("LEAN_PATH", &lib)
+                .env("LEAN_BACKTRACE", "0")
+                .env_remove("LEAN_ABORT_ON_PANIC")
+                .output()
+                .expect("run pinned lean");
+            assert_eq!(pin_out.status.code(), Some(0));
+            let pin_lines: String = String::from_utf8(pin_out.stdout)
+                .unwrap()
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("backtrace:")
+                        && !line.starts_with('#')
+                        && !line.contains("0x")
+                        && !line.trim().is_empty()
+                })
+                .map(|line| format!("{line}\n"))
+                .collect();
+            assert_eq!(stdout, pin_lines, "pin mismatch for {expected_module}");
+        }
+    }
+}

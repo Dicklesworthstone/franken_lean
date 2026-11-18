@@ -416,11 +416,6 @@ fn load_with_implicit_init(
             "a source module entry must have a .lean extension",
         ));
     }
-    let stem = entry
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| Failure::input("the source module entry needs a UTF-8 file name"))?;
-    validate_component(stem)?;
     // An empty parent denotes the current directory for a relative entry name.
     let parent = entry
         .parent()
@@ -434,7 +429,50 @@ fn load_with_implicit_init(
     if !entry_path.starts_with(&root) {
         return Err(Failure::input("source entry escaped its module root"));
     }
-    let entry_name = Name::from_components([stem]);
+    let entry_name = if implicit_init && matches!(origin, EntryOrigin::File) {
+        // `Lean/Shell.lean:546-553` + `Lean/Util/Path.lean:146-160`: without `-o`/`-c` or a
+        // package setup, `moduleNameOfFileName` derives the module name relative to the
+        // canonical current directory and falls back to `_stdin` when the file lies outside it.
+        match std::env::current_dir()
+            .and_then(std::fs::canonicalize)
+            .ok()
+            .and_then(|cwd| entry_path.strip_prefix(cwd).ok().map(Path::to_path_buf))
+        {
+            Some(relative) => {
+                let without_ext = relative.with_extension("");
+                let mut components = Vec::new();
+                let mut valid = true;
+                for part in without_ext.components() {
+                    let std::path::Component::Normal(text) = part else {
+                        valid = false;
+                        break;
+                    };
+                    let Some(text) = text.to_str() else {
+                        valid = false;
+                        break;
+                    };
+                    if validate_component(text).is_err() {
+                        valid = false;
+                        break;
+                    }
+                    components.push(text.to_owned());
+                }
+                if valid && !components.is_empty() && components.len() <= MAX_NAME_DEPTH {
+                    Name::from_components(components.iter().map(String::as_str))
+                } else {
+                    Name::from_components(["_stdin"])
+                }
+            }
+            None => Name::from_components(["_stdin"]),
+        }
+    } else {
+        let stem = entry
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| Failure::input("the source module entry needs a UTF-8 file name"))?;
+        validate_component(stem)?;
+        Name::from_components([stem])
+    };
     let mut names = vec![entry_name.clone()];
     let mut by_name = BTreeMap::from([(entry_name.clone(), 0usize)]);
     let mut by_path = BTreeMap::from([(entry_path, entry_name)]);

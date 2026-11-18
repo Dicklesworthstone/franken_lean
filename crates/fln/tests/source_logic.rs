@@ -674,6 +674,7 @@ fn several_elimination_targets_are_refused_not_misread() {
 /// refuses each file, all of which the pin accepts.
 #[test]
 fn tactics_the_checker_does_not_run_are_refused_not_misread() {
+    check("theorem wo4 (n : Nat) : n = n := by\n  cases n with rfl\n");
     let (engine, limits) = engine();
     for source in [
         "theorem l1 (n : Nat) : n = n := by\n  show n = n\n  rfl\n",
@@ -684,7 +685,6 @@ fn tactics_the_checker_does_not_run_are_refused_not_misread() {
         "theorem ro3 (n : Nat) : n + 0 = n := by\n  simp (config := { decide := true })\n",
         "theorem ro4 (n : Nat) : n + 0 = n := by\n  simp +arith (maxSteps := 10)\n",
         "theorem oi1 (n : Nat) : n = n := by\n  open Nat in rfl\n",
-        "theorem wo4 (n : Nat) : n = n := by\n  cases n with rfl\n",
     ] {
         assert!(
             !matches!(
@@ -1521,6 +1521,7 @@ fn headed_sections_and_exports_are_refused_not_read_as_plain_scopes() {
         "noncomputable section\ntheorem plain : True := True.intro\nend\n",
         "theorem plain : True := True.intro\nexport Nat (succ)\n",
         "open Nat (succ) in\ntheorem plain : True := True.intro\n",
+        "theorem plain (a : Nat) : a = a := by\n  conv => lhs\n",
     ] {
         let checked = checked_environment(source);
         assert!(
@@ -1536,7 +1537,7 @@ fn headed_sections_and_exports_are_refused_not_read_as_plain_scopes() {
     }
     for source in [
         "def d : Nat := 1\nattribute [inline] d\n",
-        "theorem plain (a : Nat) : a = a := by\n  conv => lhs\n",
+        "theorem plain (a b : Nat) : a = b := by\n  conv => lhs\n",
     ] {
         assert!(refused(source), "{source}");
     }

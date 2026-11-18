@@ -56,7 +56,8 @@ fn checked_io_results_print_once_refuse_unprintable_actions_and_guard_their_outp
     let positive = workspace.write(
         "Printed.lean",
         format!(
-            r#"{DEFINITIONS}def savedUnit : IO Unit := IO.println "unit-effect λ"
+            r#"{DEFINITIONS}def unusedUnreachable : Nat := unreachable!
+def savedUnit : IO Unit := IO.println "unit-effect λ"
 #eval savedUnit
 #eval (show IO PrintedIO from do
   let stream ← IO.getStdout
@@ -200,11 +201,14 @@ set_option eval.derive.repr false in
     let streams = workspace.write(
         "Streams.lean",
         format!(
-            r#"{DEFINITIONS}#eval IO.print "first"
+            r#"{DEFINITIONS}def xs : Array Nat := #[1, 2]
+#eval IO.print "first"
 #eval IO.eprintln "second"
 #eval (dbgTrace "traced" fun _ => (1 : Nat))
 #eval (@panicCore Nat (Inhabited.mk 7) "recover")
 #eval ([] : List Nat).head!
+#eval xs[5]! == 1
+#eval xs[1]! == 2
 #eval "after"
 "#
         ),
@@ -215,9 +219,12 @@ set_option eval.derive.repr false in
     // The pin observation disables backtraces: compare the original message
     // and its stream, never host-dependent return addresses.
     let list_panic = "PANIC at List.head! Init.Data.List.BasicAux:80:12: empty list";
+    let array_panic = "Error: index out of bounds";
     assert_eq!(
         captured.stdout,
-        format!("first\nsecond\ntraced\n1\nrecover\n7\n{list_panic}\n0\n\"after\"\n")
+        format!(
+            "first\nsecond\ntraced\n1\nrecover\n7\n{list_panic}\n0\n{array_panic}\nfalse\ntrue\n\"after\"\n"
+        )
     );
     let output = Command::new(env!("CARGO_BIN_EXE_fln"))
         .args(["run", "--json"])
@@ -235,7 +242,7 @@ set_option eval.derive.repr false in
     assert_eq!(json.matches("\"stdout\":").count(), 1, "{json}");
     assert!(
         json.contains(&format!(
-            "\"stdout\":\"firstsecond\\ntraced\\nrecover\\n{list_panic}\\n\""
+            "\"stdout\":\"firstsecond\\ntraced\\nrecover\\n{list_panic}\\n{array_panic}\\n\""
         )),
         "{json}"
     );

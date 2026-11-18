@@ -73,6 +73,11 @@ const ACCEPTED: &[(&str, &str, &str)] = &[
          by\n  first | (native_decide; fail) | native_decide\n",
         "",
     ),
+    (
+        "compiled_definition",
+        "def d2 : Fin 10 := ⟨3, by native_decide⟩\n#print axioms d2\n",
+        "'d2' depends on axioms: [d2._native.native_decide.ax_1]\n",
+    ),
 ];
 
 /// Accepted by the pin and here over a larger import, printing exactly what the pin prints.
@@ -89,6 +94,12 @@ const ACCEPTED_IMPORTS: &[(&str, &str, &str, &str)] = &[
         "theorem u : (-1 : UInt8) = 255 := by native_decide\n#print axioms u\nexample : \
          (200 : UInt8) + 100 = 44 := by native_decide\n",
         "'u' depends on axioms: [u._native.native_decide.ax_1_1]\n",
+    ),
+    (
+        "compiled_definition_evaluated",
+        "prelude\nimport Init.Tactics\nimport Init.Data.Repr\n",
+        "def d2 : Fin 10 := ⟨3, by native_decide⟩\n#print axioms d2\n#eval d2.val\n",
+        "'d2' depends on axioms: [d2._native.native_decide.ax_1]\n3\n",
     ),
 ];
 
@@ -132,13 +143,6 @@ const REFUSED: &[(&str, &str, &str, &str)] = &[
         TACTICS,
         "instance : Inhabited (PLift (2 = 2)) := ⟨⟨by native_decide⟩⟩\n",
         "native evaluation is not available here",
-    ),
-    // An executed definition's record has no place for an axiom before it.
-    (
-        "compiled_definition",
-        TACTICS,
-        "def d2 : Fin 10 := ⟨3, by native_decide⟩\n",
-        "`native_decide` in a definition this engine compiles",
     ),
 ];
 
