@@ -382,6 +382,40 @@ fn load_lean_stdin(source: Vec<u8>, max_bytes: usize) -> Result<Loaded, Failure>
     )
 }
 
+/// `Lean/Shell.lean:546-553` + `Lean/Util/Path.lean:146-160`: without `-o`/`-c` or a package
+/// setup, `moduleNameOfFileName` derives the module name relative to the canonical current
+/// directory and falls back to `_stdin` when the file lies outside it.
+fn lean_entry_module_name(entry_path: &Path, canonical_cwd: Option<&Path>) -> Name {
+    match canonical_cwd.and_then(|cwd| entry_path.strip_prefix(cwd).ok()) {
+        Some(relative) => {
+            let without_ext = relative.with_extension("");
+            let mut components = Vec::new();
+            let mut valid = true;
+            for part in without_ext.components() {
+                let std::path::Component::Normal(text) = part else {
+                    valid = false;
+                    break;
+                };
+                let Some(text) = text.to_str() else {
+                    valid = false;
+                    break;
+                };
+                if validate_component(text).is_err() {
+                    valid = false;
+                    break;
+                }
+                components.push(text.to_owned());
+            }
+            if valid && !components.is_empty() && components.len() <= MAX_NAME_DEPTH {
+                Name::from_components(components.iter().map(String::as_str))
+            } else {
+                Name::from_components(["_stdin"])
+            }
+        }
+        None => Name::from_components(["_stdin"]),
+    }
+}
+
 fn load_with_implicit_init(
     paths: &[PathBuf],
     mut sources: Vec<Vec<u8>>,
@@ -430,41 +464,8 @@ fn load_with_implicit_init(
         return Err(Failure::input("source entry escaped its module root"));
     }
     let entry_name = if implicit_init && matches!(origin, EntryOrigin::File) {
-        // `Lean/Shell.lean:546-553` + `Lean/Util/Path.lean:146-160`: without `-o`/`-c` or a
-        // package setup, `moduleNameOfFileName` derives the module name relative to the
-        // canonical current directory and falls back to `_stdin` when the file lies outside it.
-        match std::env::current_dir()
-            .and_then(std::fs::canonicalize)
-            .ok()
-            .and_then(|cwd| entry_path.strip_prefix(cwd).ok().map(Path::to_path_buf))
-        {
-            Some(relative) => {
-                let without_ext = relative.with_extension("");
-                let mut components = Vec::new();
-                let mut valid = true;
-                for part in without_ext.components() {
-                    let std::path::Component::Normal(text) = part else {
-                        valid = false;
-                        break;
-                    };
-                    let Some(text) = text.to_str() else {
-                        valid = false;
-                        break;
-                    };
-                    if validate_component(text).is_err() {
-                        valid = false;
-                        break;
-                    }
-                    components.push(text.to_owned());
-                }
-                if valid && !components.is_empty() && components.len() <= MAX_NAME_DEPTH {
-                    Name::from_components(components.iter().map(String::as_str))
-                } else {
-                    Name::from_components(["_stdin"])
-                }
-            }
-            None => Name::from_components(["_stdin"]),
-        }
+        let canonical_cwd = std::env::current_dir().and_then(std::fs::canonicalize).ok();
+        lean_entry_module_name(&entry_path, canonical_cwd.as_deref())
     } else {
         let stem = entry
             .file_stem()
@@ -1204,9 +1205,19 @@ mod tests {
         assert_eq!(
             *names,
             [
-                Name::from_components(["Main"]),
+                Name::from_components(["_stdin"]),
                 Name::from_components(["Init"])
             ]
+        );
+        let canonical_dir = std::fs::canonicalize(&directory.0).unwrap();
+        let canonical_entry = std::fs::canonicalize(&path).unwrap();
+        assert_eq!(
+            lean_entry_module_name(&canonical_entry, Some(&canonical_dir)),
+            Name::from_components(["Main"])
+        );
+        assert_eq!(
+            lean_entry_module_name(&canonical_entry, None),
+            Name::from_components(["_stdin"])
         );
         assert_eq!(*sources, [source.clone(), init.clone()]);
         assert_eq!(loaded.total_bytes, source.len() + init.len());
@@ -1240,7 +1251,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                Name::from_components(["Main"]),
+                Name::from_components(["_stdin"]),
                 Name::from_components(["Local"]),
                 Name::from_components(["Init"])
             ]
