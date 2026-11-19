@@ -58,10 +58,12 @@ fn reference_engine() -> Option<Engine> {
         BYTES,
         Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
     ));
+    let threads = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
     limits.jobs = fln::OleanFrontierJobs {
-        threads: NonZeroUsize::new(1).unwrap(),
+        threads,
         worker_stack_bytes: OLEAN_CHECK_KERNEL_STACK_BYTES,
     };
+    limits.read_jobs = limits.jobs;
     let started = std::time::Instant::now();
     eprintln!("Lake reference: admitting {} actual modules", modules.len());
     let imported = Engine::from_environment(Environment::new())
@@ -166,7 +168,7 @@ def branch : String := "main"
 def subtree (suffix : String) : FilePath := FilePath.mk ("sub/" ++ suffix)
 package gitConsumer
 require "source-dependency" from git (endpoint "repo") @ branch / subtree "lib"
-require optional from git ("../" ++ "repository")
+require optRepo from git ("../" ++ "repository")
 lean_lib GitConsumer
 "#,
         limits,
@@ -181,6 +183,7 @@ lean_lib GitConsumer
     assert_eq!(git.requires[0].rev.as_deref(), Some("main"));
     assert_eq!(git.requires[0].subdir.as_deref(), Some("sub/lib"));
     assert!(git.requires[0].path.is_none());
+    assert_eq!(git.requires[1].name, "optRepo");
     assert_eq!(git.requires[1].url.as_deref(), Some("../repository"));
     assert!(git.requires[1].path.is_none());
     assert!(git.requires[1].rev.is_none());
@@ -459,6 +462,22 @@ fn native_lake_reference_configuration_execution() {
             let Some(engine) = reference_engine() else {
                 return;
             };
+            let limits = fln::EngineExecutionLimits::for_user_program(Budget::for_stack_bytes(
+                SOURCE_RUN_KERNEL_STACK_BYTES,
+            ));
+            let error = configured(
+                &engine,
+                "import Lake\nopen Lake DSL\npackage bad\nrequire optional from git (\"../\" ++ \"repository\")\n",
+                limits,
+            )
+            .unwrap_err();
+            assert_eq!(error.class, "input", "{}", error.detail);
+            assert!(
+                error.detail.contains("already declared"),
+                "{}",
+                error.detail
+            );
+            assert!(!error.authority);
             assert_configuration_cases(engine);
         })
         .unwrap()
