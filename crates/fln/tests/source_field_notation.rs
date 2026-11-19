@@ -624,3 +624,54 @@ theorem selected_correct (token : Token) : selected token = 7 := by rfl
         }
     }
 }
+
+/// `fln-dyfz`: in `Lean/Elab/App.lean:1580-1588`, a dotted identifier whose prefix resolves to a
+/// declared function constant (`def f (n : Nat) : Nat := n; def g := f.nope`) reports the pin's
+/// `Unknown constant \`f.nope\`` (`error(lean.unknownIdentifier)` at v4.32.0), whereas a local
+/// function variable `(f : Nat → Nat)` or parenthesized projection `(f).nope` keeps field-notation
+/// unknown-field refusal and genuine structure projection (`p.fst`) is unaffected.
+#[test]
+fn dotted_name_on_declared_function_reports_unknown_constant_as_at_the_pin() {
+    let base = Engine::with_source_seed(limits().admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let options = KVMap::new();
+    for (source, expected) in [
+        (
+            "def f (n : Nat) : Nat := n\ndef g := f.nope\n",
+            "Unknown constant `f.nope`",
+        ),
+        (
+            "namespace N\ndef f (n : Nat) : Nat := n\ndef g := f.nope\nend N\n",
+            "Unknown constant `N.f.nope`",
+        ),
+        (
+            "def f (n : Nat) : Nat := n\ndef g := f.nope.more\n",
+            "Unknown constant `f.nope.more`",
+        ),
+        (
+            "def g (f : Nat → Nat) := f.nope\n",
+            "unknown record field nope",
+        ),
+        (
+            "def f (n : Nat) : Nat := n\ndef g := (f).nope\n",
+            "unknown record field nope",
+        ),
+    ] {
+        let error = base
+            .check_source_files(&[source.as_bytes()], &options, limits())
+            .expect_err("must be refused at elaboration");
+        assert_eq!(error.disposition().0, "elaboration", "{source}\n{error}");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(expected),
+            "expected `{expected}` in `{rendered}` for:\n{source}"
+        );
+    }
+    check(
+        "structure Pair where\n  fst : Nat\n  snd : Nat\n\
+         def readFirst (p : Pair) : Nat := p.fst\n\
+         theorem readFirst_eq : readFirst { fst := 3, snd := 4 } = 3 := by rfl\n",
+    );
+}

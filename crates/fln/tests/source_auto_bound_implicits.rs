@@ -498,29 +498,41 @@ def fieldCarrier : FieldCarrier Nat 7 := {}
 example : HEq (7 : Nat) 7 := fieldCarrier.compare (a := 7) (by rfl)
 "#;
 
-// `MutualDef.elabHeaders` binds auto carriers before elaborating a definition's
-// body, including definitions without a written result. Ordinary written
-// binder holes remain available for the body's type inference.
+// `MutualDef.elabHeaders` generalizes auto carriers when a definition's result
+// type is written (including solving written binder holes referenced in that
+// result type); when the result type is omitted, auto-bound implicits whose
+// carrier holes were resolved in the header or are sort-only (`α : Sort ?u`)
+// elaborate cleanly, while unassigned expression carrier holes fail against the
+// omitted result hole created before `addAutoBoundImplicits`.
 const INFERRED_RESULT_CARRIERS: &str = r#"
-def inferredEq (h : a = b) := h
-abbrev abbreviatedEq (h : a = b) := h
-def inferredHEq (h : HEq a b) := h
-def mixedCarrier (h : a = a) (n) := Nat.succ n
-def inferCarrier (h : a = a) (x) := (a = x)
-def inferTwo (h : HEq a b) (x) (y) := ((a = x) = (b = y))
+def writtenEq (h : a = b) : a = b := h
+abbrev abbreviatedEq (h : a = b) : a = b := h
+def writtenHEq (h : HEq a b) : HEq a b := h
+def writtenBinderEq (h : a = a) (x) : a = x → a = x := fun hx => hx
+def inferAutoType (x : α) := 0
+def inferResolvedCarrier (h : (a : Nat) = b) := h
+def inferResolvedHEq (h : HEq (a : Nat) (b : Nat)) := h
 def inferWrittenCarrier (A : Type) (x) := (x : A)
 def inferWritten (n) := Nat.succ n
-example : (3 : Nat) = 3 := inferredEq (a := (3 : Nat)) (b := 3) rfl
+example : (3 : Nat) = 3 := writtenEq (a := (3 : Nat)) (b := 3) rfl
 example : True.intro = True.intro := abbreviatedEq (a := True.intro) (b := True.intro) rfl
-example : HEq (3 : Nat) (3 : Nat) := inferredHEq (a := (3 : Nat)) (b := (3 : Nat)) (by rfl)
-example : mixedCarrier (a := true) rfl 4 = 5 := rfl
+example : HEq (3 : Nat) (3 : Nat) := writtenHEq (a := (3 : Nat)) (b := (3 : Nat)) (by rfl)
+example : writtenBinderEq (a := (3 : Nat)) rfl 3 rfl = rfl := rfl
+example : inferAutoType true = 0 := rfl
+example : (3 : Nat) = 3 := inferResolvedCarrier rfl
+example : HEq (3 : Nat) (3 : Nat) := inferResolvedHEq (a := 3) (b := 3) (by rfl)
 example : inferWritten 3 = 4 := rfl
-example : inferCarrier (a := (3 : Nat)) rfl 3 := rfl
-example : inferTwo (a := true) (b := true) (by rfl) true true := rfl
 example : inferWrittenCarrier Nat 5 = 5 := rfl
 "#;
 
 const INVALID_INFERRED_RESULT_CARRIERS: &[&str] = &[
+    "def inferredEq (h : a = b) := h\n",
+    "abbrev abbreviatedOmittedEq (h : a = b) := h\n",
+    "def inferredHEq (h : HEq a b) := h\n",
+    "def mixedCarrier (h : a = a) (n) := Nat.succ n\n",
+    "def inferCarrier (h : a = a) (x) := (a = x)\n",
+    "def inferTwo (h : HEq a b) (x) (y) := ((a = x) = (b = y))\n",
+    "def holeResult (h : a = b) : _ := h\n",
     "def bodySpecializes (h : a = a) := Nat.succ a\n",
     "def unresolvedWritten (x) := x\n",
     "def unresolvedMixed (h : a = a) (x) := h\n",
@@ -630,7 +642,7 @@ fn field_carriers_close_before_defaults_and_do_not_escape_the_record() {
 #[test]
 fn inferred_result_headers_generalize_carriers_before_body_inference() {
     let engine = checked(INFERRED_RESULT_CARRIERS);
-    for name in ["inferredEq", "abbreviatedEq"] {
+    for name in ["writtenEq", "abbreviatedEq"] {
         let found = binders(&engine, name, 4);
         assert_eq!(declaration_binder_count(&engine, name), 4);
         assert!(found[0].0.contains("._@."), "{name}: {found:?}");
@@ -656,8 +668,8 @@ fn inferred_result_headers_generalize_carriers_before_body_inference() {
         assert!(!info.constant_val().type_.has_expr_mvar());
         assert!(!info.constant_val().type_.has_level_mvar());
     }
-    let heq = binders(&engine, "inferredHEq", 5);
-    assert_eq!(declaration_binder_count(&engine, "inferredHEq"), 5);
+    let heq = binders(&engine, "writtenHEq", 5);
+    assert_eq!(declaration_binder_count(&engine, "writtenHEq"), 5);
     assert!(heq[0].0.contains("._@."));
     assert!(heq[2].0.contains("._@."));
     assert_ne!(heq[0].0, heq[2].0);
@@ -673,32 +685,25 @@ fn inferred_result_headers_generalize_carriers_before_body_inference() {
     );
     assert_eq!(heq[4].1, BinderInfo::Default);
 
-    // Generalizing an auto carrier must not turn the separately written `(n)`
-    // into another implicit parameter or prevent the body from inferring Nat.
-    let mixed = binders(&engine, "mixedCarrier", 4);
-    assert_eq!(declaration_binder_count(&engine, "mixedCarrier"), 4);
-    assert!(mixed[0].0.contains("._@."));
-    assert_eq!(mixed[0].1, BinderInfo::Implicit);
-    assert_eq!(mixed[1].0, "a");
-    assert_eq!(mixed[1].1, BinderInfo::Implicit);
-    assert_eq!(mixed[2].0, "h");
-    assert_eq!(mixed[2].1, BinderInfo::Default);
-    assert_eq!(mixed[3].0, "n");
-    assert_eq!(mixed[3].1, BinderInfo::Default);
-    assert_eq!(mixed[3].2, constant("Nat"));
-    let same = binders(&engine, "inferCarrier", 4);
-    assert_eq!(declaration_binder_count(&engine, "inferCarrier"), 4);
+    let same = binders(&engine, "writtenBinderEq", 4);
+    assert_eq!(declaration_binder_count(&engine, "writtenBinderEq"), 5);
     assert_eq!(same[3].0, "x");
     assert_eq!(same[3].1, BinderInfo::Default);
     assert_eq!(same[3].2, Expr::bvar(2).unwrap());
-    let two = binders(&engine, "inferTwo", 7);
-    assert_eq!(declaration_binder_count(&engine, "inferTwo"), 7);
-    assert_ne!(two[0].0, two[2].0);
-    assert_eq!((two[5].0.as_str(), two[6].0.as_str()), ("x", "y"));
-    assert_eq!(two[5].1, BinderInfo::Default);
-    assert_eq!(two[6].1, BinderInfo::Default);
-    assert_eq!(two[5].2, Expr::bvar(4).unwrap());
-    assert_eq!(two[6].2, Expr::bvar(3).unwrap());
+
+    let auto_type = binders(&engine, "inferAutoType", 2);
+    assert_eq!(declaration_binder_count(&engine, "inferAutoType"), 2);
+    assert_eq!(auto_type[0].0, "α");
+    assert_eq!(auto_type[0].1, BinderInfo::Implicit);
+    assert_eq!(auto_type[1].0, "x");
+    assert_eq!(auto_type[1].1, BinderInfo::Default);
+
+    let resolved = binders(&engine, "inferResolvedCarrier", 3);
+    assert_eq!(declaration_binder_count(&engine, "inferResolvedCarrier"), 3);
+    assert_eq!((resolved[0].0.as_str(), resolved[1].0.as_str()), ("a", "b"));
+    assert_eq!(resolved[0].2, constant("Nat"));
+    assert_eq!(resolved[1].2, constant("Nat"));
+
     let written_carrier = binders(&engine, "inferWrittenCarrier", 2);
     assert_eq!(declaration_binder_count(&engine, "inferWrittenCarrier"), 2);
     assert_eq!(written_carrier[0].0, "A");

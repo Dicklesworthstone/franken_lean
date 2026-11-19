@@ -672,11 +672,28 @@ impl ImportContexts {
     fn project_checked_implementations(
         &self,
         name: &Name,
+        module: &ExternalModule,
         public: &PublicModule,
         engine: &mut Engine,
         limits: OleanCheckLimits,
         meter: &mut Meter,
     ) -> Result<(), SourceModuleCheckError> {
+        fn has_prefix(prefix: &Name, candidate: &Name) -> bool {
+            let mut current = candidate.parent();
+            while !current.is_anonymous() {
+                if &current == prefix {
+                    return true;
+                }
+                current = current.parent();
+            }
+            false
+        }
+        let private_prefix = Name::num(Name::from_components(["_private"]).append_core(name), 0);
+        let module_entries: BTreeMap<&Name, &ConstantInfo> = module
+            .entries
+            .iter()
+            .map(|entry| (entry.declaration().name(), entry.declaration()))
+            .collect();
         let names: BTreeSet<_> = public
             .decoded
             .constants
@@ -684,7 +701,33 @@ impl ImportContexts {
             .map(ConstantInfo::name)
             .collect();
         let mut presentations = 0;
+        let collect = |expression: &fln_core::expr::Expr,
+                       references: &mut BTreeSet<Name>,
+                       presentations: &mut usize| {
+            crate::collect_constant_references(
+                expression,
+                references,
+                presentations,
+                limits.max_dependency_presentations,
+            )
+            .map_err(|error| match error {
+                fln_admission::ConstantReferenceCollectionError::PresentationLimit {
+                    limit,
+                    ..
+                } => SourceModuleCheckError::Limit {
+                    resource: "exported implementation dependencies",
+                    limit,
+                },
+                fln_admission::ConstantReferenceCollectionError::AllocationFailure { .. } => {
+                    unavailable(
+                        name,
+                        "exported implementation dependency allocation refused",
+                    )
+                }
+            })
+        };
         for constant in &public.decoded.constants {
+            let is_private_decl = has_prefix(&private_prefix, constant.name());
             let (type_, proof) = match constant {
                 ConstantInfo::Defn(definition) if definition.safety != DefinitionSafety::Safe => {
                     (&definition.base.type_, None)
@@ -700,41 +743,94 @@ impl ImportContexts {
                 .ok_or_else(|| {
                     unavailable(name, "exported implementation has no exact checked entry")
                 })?;
-            let mut references = BTreeSet::new();
             let before = presentations;
-            for expression in std::iter::once(type_).chain(proof) {
-                crate::collect_constant_references(
-                    expression,
-                    &mut references,
-                    &mut presentations,
-                    limits.max_dependency_presentations,
-                )
-                .map_err(|error| match error {
-                    fln_admission::ConstantReferenceCollectionError::PresentationLimit {
-                        limit,
-                        ..
-                    } => SourceModuleCheckError::Limit {
-                        resource: "exported implementation dependencies",
-                        limit,
-                    },
-                    fln_admission::ConstantReferenceCollectionError::AllocationFailure {
-                        ..
-                    } => unavailable(
-                        name,
-                        "exported implementation dependency allocation refused",
-                    ),
-                })?;
+            let mut type_references = BTreeSet::new();
+            collect(type_, &mut type_references, &mut presentations)?;
+            let mut proof_references = BTreeSet::new();
+            if let Some(proof) = proof {
+                collect(proof, &mut proof_references, &mut presentations)?;
+            }
+            let mut missing = BTreeSet::new();
+            let mut worklist = Vec::new();
+            for dependency in type_references {
+                if names.contains(&dependency) || engine.environment().contains(&dependency) {
+                    continue;
+                }
+                if is_private_decl {
+                    worklist.push(dependency);
+                } else {
+                    missing.insert(dependency);
+                }
+            }
+            for dependency in proof_references {
+                if names.contains(&dependency) || engine.environment().contains(&dependency) {
+                    continue;
+                }
+                worklist.push(dependency);
+            }
+            let mut visited = BTreeSet::new();
+            while let Some(dependency) = worklist.pop() {
+                if !visited.insert(dependency.clone()) {
+                    continue;
+                }
+                let Some(info) = module_entries.get(&dependency).copied() else {
+                    missing.insert(dependency);
+                    continue;
+                };
+                // A public theorem's proof may unfold checked private definitions of
+                // this module, never private axioms or hidden theorems; a `_private`
+                // theorem emitted into the primary `.olean` (`Nat.repeatTR.loop.eq_*`)
+                // may also cite checked private theorems of this module, never axioms.
+                let mut inner = BTreeSet::new();
+                match info {
+                    ConstantInfo::Axiom(_) => {
+                        missing.insert(dependency);
+                        continue;
+                    }
+                    ConstantInfo::Thm(thm) if !is_private_decl => {
+                        let _ = thm;
+                        missing.insert(dependency);
+                        continue;
+                    }
+                    ConstantInfo::Thm(thm) => {
+                        collect(&thm.base.type_, &mut inner, &mut presentations)?;
+                        collect(&thm.value, &mut inner, &mut presentations)?;
+                    }
+                    ConstantInfo::Defn(defn) => {
+                        collect(&defn.base.type_, &mut inner, &mut presentations)?;
+                        collect(&defn.value, &mut inner, &mut presentations)?;
+                    }
+                    ConstantInfo::Opaque(opaque) => {
+                        collect(&opaque.base.type_, &mut inner, &mut presentations)?;
+                        collect(&opaque.value, &mut inner, &mut presentations)?;
+                    }
+                    ConstantInfo::Induct(induct) => {
+                        collect(&induct.base.type_, &mut inner, &mut presentations)?;
+                        inner.extend(induct.ctors.iter().cloned());
+                    }
+                    ConstantInfo::Ctor(ctor) => {
+                        collect(&ctor.base.type_, &mut inner, &mut presentations)?;
+                    }
+                    ConstantInfo::Rec(rec) => {
+                        collect(&rec.base.type_, &mut inner, &mut presentations)?;
+                    }
+                    ConstantInfo::Quot(quot) => {
+                        collect(&quot.base.type_, &mut inner, &mut presentations)?;
+                    }
+                }
+                for next in inner {
+                    if !names.contains(&next) && !engine.environment().contains(&next) {
+                        worklist.push(next);
+                    }
+                }
             }
             meter.work(presentations - before)?;
-            references.retain(|dependency| {
-                !names.contains(dependency) && !engine.environment().contains(dependency)
-            });
-            if !references.is_empty() {
+            if !missing.is_empty() {
                 return Err(SourceModuleCheckError::ImportDeclarations {
                     module: name.clone(),
                     error: Box::new(OleanCheckError::MissingConstants {
                         declaration: constant.name().clone(),
-                        names: references.into_iter().collect(),
+                        names: missing.into_iter().collect(),
                     }),
                 });
             }
@@ -809,7 +905,14 @@ impl ImportContexts {
                     )
                 })?;
                 limits.admission = meter.limits.source.admission;
-                self.project_checked_implementations(name, public, &mut engine, limits, meter)?;
+                self.project_checked_implementations(
+                    name,
+                    module,
+                    public,
+                    &mut engine,
+                    limits,
+                    meter,
+                )?;
                 engine =
                     match engine.check_decoded_olean((*public.decoded).clone(), options, limits) {
                         Ok(Outcome::Complete(checked)) => checked.engine,

@@ -150,8 +150,22 @@ pub fn term_in_locals(
     locals: &[LocalDecl],
     term: &Expr,
 ) -> Result<String, Unsupported> {
+    term_in_locals_with_notations(env, scope, locals, term, None)
+}
+
+/// `term`, elaborated in `locals`, printed through any active file `notations`.
+pub fn term_in_locals_with_notations(
+    env: &Environment,
+    scope: &fln_elab::source::scope::SourceScope,
+    locals: &[LocalDecl],
+    term: &Expr,
+    notations: Option<&fln_parse::extensions::Notations>,
+) -> Result<String, Unsupported> {
     let names = shown_names(locals)?;
     let mut printer = Printer::in_scope(env, scope);
+    if let Some(notations) = notations {
+        printer = printer.with_notations(notations);
+    }
     for (index, local) in locals.iter().enumerate() {
         printer.tick()?;
         let type_ = close(&local.type_, &locals[..index])?;
@@ -173,6 +187,15 @@ pub fn term_in_locals(
 /// Render a raw trace without changing goals, definitions or metavariables.
 /// An unrenderable expression remains a refusal, even when a guard drops traces.
 pub fn render(env: &Environment, event: &SourceTrace) -> Result<String, Unsupported> {
+    render_with_notations(env, event, None)
+}
+
+/// Render a raw trace through the command's active file `notations`.
+pub fn render_with_notations(
+    env: &Environment,
+    event: &SourceTrace,
+    notations: Option<&fln_parse::extensions::Notations>,
+) -> Result<String, Unsupported> {
     let goals = match &event.content {
         TraceContent::Goals(goals) => goals,
         TraceContent::Message(message) | TraceContent::Info(message) => {
@@ -184,6 +207,9 @@ pub fn render(env: &Environment, event: &SourceTrace) -> Result<String, Unsuppor
     for goal in goals {
         let locals = goal.locals.decls();
         let mut printer = Printer::in_scope(env, &event.scope);
+        if let Some(notations) = notations {
+            printer = printer.with_notations(notations);
+        }
         let names = shown_names(locals)?;
         let mut lines = Vec::new();
         if !goal.tag.is_anonymous() {

@@ -3754,6 +3754,7 @@ impl Engine {
                             error,
                             engine.environment(),
                             &scope,
+                            Some(&grammar.notations()),
                         )
                     })? {
                     Outcome::Complete(result) => result,
@@ -3821,6 +3822,7 @@ impl Engine {
                             error,
                             engine.environment(),
                             &scope,
+                            Some(&grammar.notations()),
                         )
                     })? {
                     Outcome::Complete(admission) => admission,
@@ -3984,6 +3986,7 @@ impl Engine {
                             error,
                             engine.environment(),
                             &scope,
+                            Some(&grammar.notations()),
                         )
                     })? {
                     Outcome::Complete(result) => result,
@@ -3998,6 +4001,7 @@ impl Engine {
                     result.engine.environment(),
                     command_index,
                     original_offset,
+                    Some(&grammar.notations()),
                 )?;
                 scopes
                     .admitted_batch(
@@ -4031,6 +4035,10 @@ impl Engine {
                         at: Some(original_offset),
                     });
                 }
+                let native_capture = (is_example
+                    && presentation == EvaluationPresentation::Lean
+                    && isolate_stderr)
+                    .then(|| source_execution::NativeCaptureBuffer::new(evaluation_output_bytes));
                 let observed =
                     if is_example && fln_elab::source::trace::contains_trace(parsed.syntax()) {
                         engine.check_observed_source_example(
@@ -4044,7 +4052,7 @@ impl Engine {
                         // An example's check admits the axioms `native_decide` adds into its
                         // scratch successor, so the command's engine is its evaluator.
                         let scope = if is_example {
-                            native_scope(&scope, &engine, options, limits)
+                            native_scope(&scope, &engine, options, limits, native_capture.clone())
                         } else {
                             scope.clone()
                         };
@@ -4077,7 +4085,17 @@ impl Engine {
                             &error,
                             engine.environment(),
                             &scope,
+                            Some(&grammar.notations()),
                         ) {
+                            flush_native_capture(
+                                native_capture.as_ref(),
+                                &mut evaluation_output_bytes,
+                                &mut trace_messages,
+                                &mut trace_bytes,
+                                command_index,
+                                original_offset,
+                                true,
+                            )?;
                             guarded_errors.push(SourceWarning {
                                 command_index,
                                 at: original_offset,
@@ -4093,9 +4111,19 @@ impl Engine {
                             error,
                             engine.environment(),
                             &scope,
+                            Some(&grammar.notations()),
                         ));
                     }
                 };
+                flush_native_capture(
+                    native_capture.as_ref(),
+                    &mut evaluation_output_bytes,
+                    &mut trace_messages,
+                    &mut trace_bytes,
+                    command_index,
+                    original_offset,
+                    true,
+                )?;
                 source_records::traces::append(
                     &mut trace_messages,
                     &mut trace_bytes,
@@ -4104,6 +4132,7 @@ impl Engine {
                     engine.environment(),
                     command_index,
                     original_offset,
+                    Some(&grammar.notations()),
                 )?;
                 // A `#check` line prints through the notations active at its command.
                 if !is_example {
@@ -4226,6 +4255,7 @@ impl Engine {
                             error,
                             engine.environment(),
                             &scope,
+                            Some(&grammar.notations()),
                         )
                     })? {
                     Outcome::Complete(admission) => admission,
@@ -4240,6 +4270,7 @@ impl Engine {
                     engine.environment(),
                     command_index,
                     original_offset,
+                    Some(&grammar.notations()),
                 )?;
                 scopes
                     .admitted_batch(&admission, admission.engine.environment(), None)
@@ -4295,6 +4326,12 @@ impl Engine {
                 });
             }
             let mut traces = Vec::new();
+            let mut native_capture = None;
+            let is_async_theorem = fln_elab::source::is_theorem(parsed.syntax())
+                && scope.options.get_bool(
+                    &Name::from_components(["Elab", "async"]),
+                    options.get_bool(&Name::from_components(["Elab", "async"]), true),
+                );
             let declaration = if is_evaluation {
                 let name = fresh_generated_command_name(engine.environment(), command_index)
                     .map_err(|error| EngineExecutionError::BatchCommand {
@@ -4345,11 +4382,17 @@ impl Engine {
                     // This route admits the axioms `native_decide` adds before the declaration
                     // (below), so the command's engine is its evaluator.
                     fln_parse::SourceCommandKind::Definition => {
+                        let capture = (presentation == EvaluationPresentation::Lean
+                            && isolate_stderr)
+                            .then(|| {
+                                source_execution::NativeCaptureBuffer::new(evaluation_output_bytes)
+                            });
+                        native_capture = capture.clone();
                         fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
                             parsed.syntax(),
                             engine.environment(),
                             limits.kernel,
-                            &native_scope(&scope, &engine, options, limits),
+                            &native_scope(&scope, &engine, options, limits, capture),
                         )
                     }
                     fln_parse::SourceCommandKind::Check
@@ -4369,6 +4412,7 @@ impl Engine {
                     error,
                     engine.environment(),
                     &scope,
+                    Some(&grammar.notations()),
                 )
             })?;
             let (elaborated, evaluation_presentation, evaluation_deriving) = match declaration {
@@ -4376,6 +4420,15 @@ impl Engine {
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
+            flush_native_capture(
+                native_capture.as_ref(),
+                &mut evaluation_output_bytes,
+                &mut trace_messages,
+                &mut trace_bytes,
+                command_index,
+                original_offset,
+                !is_async_theorem,
+            )?;
             source_records::traces::append(
                 &mut trace_messages,
                 &mut trace_bytes,
@@ -4384,6 +4437,7 @@ impl Engine {
                 engine.environment(),
                 command_index,
                 original_offset,
+                Some(&grammar.notations()),
             )?;
             let fln_elab::source::ElaboratedDeclaration {
                 declaration,
@@ -4511,6 +4565,7 @@ impl Engine {
                             error,
                             engine.environment(),
                             &scope,
+                            Some(&grammar.notations()),
                         )
                     })? {
                         Outcome::Complete(proof) => proof,
@@ -4807,6 +4862,7 @@ impl Engine {
                     error,
                     engine.environment(),
                     &scope,
+                    Some(&grammar.notations()),
                 )
             })?;
             if !is_evaluation {
@@ -4834,6 +4890,7 @@ impl Engine {
                             error,
                             engine.environment(),
                             &scope,
+                            Some(&grammar.notations()),
                         )
                     })? {
                     Outcome::Complete(engine) => engine,
@@ -8007,6 +8064,7 @@ fn guarded_elaboration_error(
     error: &EngineExecutionError,
     env: &Environment,
     scope: &fln_elab::source::scope::SourceScope,
+    notations: Option<&fln_parse::extensions::Notations>,
 ) -> Option<String> {
     if !guard_checks_expected_error(guard, command_index)
         || source_check::classify(error).0 != "elaboration"
@@ -8018,14 +8076,14 @@ fn guarded_elaboration_error(
             if let fln_elab::NatDefinitionElabError::Inference(
                 fln_elab::source::SourceInferenceError::InstanceSynthesisRequired(Some(failure)),
             ) = error
-                && let Some(message) = instance_synthesis_message(env, scope, failure)
+                && let Some(message) = instance_synthesis_message(env, scope, failure, notations)
             {
                 return Some(message);
             }
             if let fln_elab::NatDefinitionElabError::Inference(
                 fln_elab::source::SourceInferenceError::InvalidFieldReceiver(refusal),
             ) = error
-                && let Some(message) = field_receiver_message(env, scope, refusal)
+                && let Some(message) = field_receiver_message(env, scope, refusal, notations)
             {
                 return Some(message);
             }
@@ -8039,7 +8097,13 @@ fn guarded_elaboration_error(
                     },
                 ),
             ) = error
-                && let Ok(proposition) = pretty::goals::term_in_locals(env, scope, &[], proposition)
+                && let Ok(proposition) = pretty::goals::term_in_locals_with_notations(
+                    env,
+                    scope,
+                    &[],
+                    proposition,
+                    notations,
+                )
             {
                 return Some(format!(
                     "Tactic `{}` evaluated that the proposition\n  {}\nis false",
@@ -8059,18 +8123,23 @@ fn instance_synthesis_message(
     env: &Environment,
     scope: &fln_elab::source::scope::SourceScope,
     failure: &fln_elab::source::InstanceSynthesisFailure,
+    notations: Option<&fln_parse::extensions::Notations>,
 ) -> Option<String> {
     if let Some(existing) = &failure.lean_message {
         return Some(existing.clone());
     }
     let locals = failure.locals.decls();
-    let goal = pretty::goals::term_in_locals(env, scope, locals, &failure.goal).ok()?;
+    let goal =
+        pretty::goals::term_in_locals_with_notations(env, scope, locals, &failure.goal, notations)
+            .ok()?;
     let mut message = format!(
         "failed to synthesize instance of type class\n  {}",
         goal.replace('\n', "\n  ")
     );
     if let Some((numeral, expected)) = &failure.numeral {
-        let expected = pretty::goals::term_in_locals(env, scope, locals, expected).ok()?;
+        let expected =
+            pretty::goals::term_in_locals_with_notations(env, scope, locals, expected, notations)
+                .ok()?;
         let digits = pretty::nat_decimal(numeral);
         message.push_str(&format!(
             "\nnumerals are polymorphic in Lean, but the numeral `{digits}` cannot be used in a \
@@ -8090,16 +8159,25 @@ pub(crate) fn attach_lean_elaboration_diagnostics(
     env: &Environment,
     scope: &fln_elab::source::scope::SourceScope,
 ) {
+    attach_lean_elaboration_diagnostics_with_notations(error, env, scope, None);
+}
+
+pub(crate) fn attach_lean_elaboration_diagnostics_with_notations(
+    error: &mut EngineExecutionError,
+    env: &Environment,
+    scope: &fln_elab::source::scope::SourceScope,
+    notations: Option<&fln_parse::extensions::Notations>,
+) {
     match error {
         EngineExecutionError::BatchCommand { error, .. } => {
-            attach_lean_elaboration_diagnostics(error, env, scope);
+            attach_lean_elaboration_diagnostics_with_notations(error, env, scope, notations);
         }
         EngineExecutionError::Frontend(NatDefinitionFrontendError::Elaborate(
             fln_elab::NatDefinitionElabError::Inference(
                 fln_elab::source::SourceInferenceError::InstanceSynthesisRequired(Some(failure)),
             ),
         )) if failure.lean_message.is_none() => {
-            failure.lean_message = instance_synthesis_message(env, scope, failure);
+            failure.lean_message = instance_synthesis_message(env, scope, failure, notations);
         }
         _ => {}
     }
@@ -8111,8 +8189,9 @@ fn batch_command_error(
     mut error: EngineExecutionError,
     env: &Environment,
     scope: &fln_elab::source::scope::SourceScope,
+    notations: Option<&fln_parse::extensions::Notations>,
 ) -> EngineExecutionError {
-    attach_lean_elaboration_diagnostics(&mut error, env, scope);
+    attach_lean_elaboration_diagnostics_with_notations(&mut error, env, scope, notations);
     EngineExecutionError::BatchCommand {
         index,
         error: Box::new(error),
@@ -8130,12 +8209,23 @@ fn field_receiver_message(
     env: &Environment,
     scope: &fln_elab::source::scope::SourceScope,
     refusal: &fln_elab::source::FieldReceiverRefusal,
+    notations: Option<&fln_parse::extensions::Notations>,
 ) -> Option<String> {
     let locals = refusal.locals.decls();
-    let printer = pretty::Printer::in_scope(env, scope);
+    let mut printer = pretty::Printer::in_scope(env, scope);
+    if let Some(notations) = notations {
+        printer = printer.with_notations(notations);
+    }
     let function = match refusal.function.node() {
         ExprNode::Const { name, .. } => printer.display_name(name),
-        _ => pretty::goals::term_in_locals(env, scope, locals, &refusal.function).ok()?,
+        _ => pretty::goals::term_in_locals_with_notations(
+            env,
+            scope,
+            locals,
+            &refusal.function,
+            notations,
+        )
+        .ok()?,
     };
     let takes_arguments = matches!(
         env.find(&refusal.base)?.constant_val().type_.node(),
@@ -8143,7 +8233,14 @@ fn field_receiver_message(
     );
     let base = printer.display_name(&refusal.base);
     let dots = if takes_arguments { " ..." } else { "" };
-    let receiver = pretty::goals::term_in_locals(env, scope, locals, &refusal.receiver).ok()?;
+    let receiver = pretty::goals::term_in_locals_with_notations(
+        env,
+        scope,
+        locals,
+        &refusal.receiver,
+        notations,
+    )
+    .ok()?;
     let receiver = if receiver.chars().count() > 30 || receiver.contains('\n') {
         format!("\n  {}", receiver.replace('\n', "\n  "))
     } else {
@@ -8211,6 +8308,7 @@ fn native_scope(
     engine: &Engine,
     options: &KVMap,
     limits: EngineExecutionLimits,
+    capture: Option<std::sync::Arc<std::sync::Mutex<source_execution::NativeCaptureBuffer>>>,
 ) -> fln_elab::source::scope::SourceScope {
     let mut merged = options.clone();
     for (name, value) in scope.options.entries() {
@@ -8219,9 +8317,41 @@ fn native_scope(
     let mut scope = scope.clone();
     scope.computability = engine.computability_provider();
     scope.native = Some(source_execution::CommandEvaluator::provider(
-        engine, &merged, limits,
+        engine, &merged, limits, capture,
     ));
     scope
+}
+
+fn flush_native_capture(
+    capture: Option<&std::sync::Arc<std::sync::Mutex<source_execution::NativeCaptureBuffer>>>,
+    evaluation_output_bytes: &mut usize,
+    trace_messages: &mut Vec<SourceTraceMessage>,
+    trace_bytes: &mut usize,
+    command_index: usize,
+    offset: fln_parse::BytePos,
+    bypass_guard: bool,
+) -> Result<(), EngineExecutionError> {
+    let Some(capture) = capture else {
+        return Ok(());
+    };
+    let (used_bytes, text) = {
+        let mut guard =
+            capture
+                .lock()
+                .map_err(|_| EngineExecutionError::UnexpectedPublication {
+                    detail: "native capture buffer mutex poisoned",
+                })?;
+        (guard.used_bytes, std::mem::take(&mut guard.text))
+    };
+    *evaluation_output_bytes = used_bytes;
+    source_records::traces::append_captured_info(
+        trace_messages,
+        trace_bytes,
+        text,
+        command_index,
+        offset,
+        bypass_guard,
+    )
 }
 
 /// Whether `guard` is the `#guard_msgs` of `command_index`, checks errors, and expects one.

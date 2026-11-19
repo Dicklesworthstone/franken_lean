@@ -28,13 +28,11 @@ const HEADER: &str = "prelude\nimport Init.Core\n";
 
 /// Accepted by the pinned `lean` v4.32.0 with `HEADER` (2026-10-23, exit 0, no messages).
 ///
-/// Two divergences of their own, not about annotations on recursors, keep some of it out of
-/// the comparison. Every family states its sort: an inferred one is stored here as the
-/// unnormalized `max (max 1 1) 1` where the pin stores `Type`. And `V` is only accepted, not
-/// compared: under `n : optParam Nat 2`, `n + 1` is stored here as `@HAdd.hAdd (optParam Nat 2)
-/// Nat Nat …` where the pin's `HAdd` output is `optParam Nat 2`, as it is for an `axiom` with
-/// the same binders; `D` is the same family without the operator.
-const FIXTURE: &str = "inductive T : Type where
+/// Families omit their result sort where the pin infers it (`fln-inductive-inferred-sort-normalization-f178`).
+/// `V` is only accepted, not compared: under `n : optParam Nat 2`, `n + 1` is stored here as
+/// `@HAdd.hAdd (optParam Nat 2) Nat Nat …` where the pin's `HAdd` output is `optParam Nat 2`, as
+/// it is for an `axiom` with the same binders; `D` is the same family without the operator.
+const FIXTURE: &str = "inductive T where
   | a (n : Nat) (m : Nat := 3)
 example : T.a 1 = T.a 1 3 := rfl
 def T.sum : T → Nat
@@ -46,15 +44,15 @@ theorem T.sum_cases (t : T) : t.sum = t.sum := by
 theorem T.sum_induction (t : T) : t.sum = t.sum := by
   induction t with
   | a n m => rfl
-inductive V : Type where
+inductive V where
   | c (n : Nat := 2) (f : Fin (n + 1)) (m : Nat := n)
 def V.get : V → Nat
   | .c n _ m => n + m
-inductive D : Type where
+inductive D where
   | c (n : Nat := 2) (f : Fin (Nat.succ n)) (m : Nat := n)
 def D.get : D → Nat
   | .c n _ m => n + m
-structure S : Type where
+structure S where
   x : Nat := 3
   y : Nat
 example : ({ y := 1 } : S).x = 3 := rfl
@@ -63,7 +61,7 @@ inductive I : Nat → Type where
 def I.second : I n → Nat
   | .mk _ k => k
 example : (I.mk 2 : I 2).second = 5 := rfl
-inductive R : Type where
+inductive R where
   | leaf
   | node (l : R) (k : Nat := 0)
 def R.size : R → Nat
@@ -75,27 +73,27 @@ theorem R.size_induction (r : R) : r.size = r.size := by
   | leaf => rfl
   | node l k ih => rfl
 mutual
-inductive A : Type where
+inductive A where
   | base (n : Nat := 1)
   | step (b : B) (k : Nat := 2)
-inductive B : Type where
+inductive B where
   | wrap (a : A) (j : Nat := 3)
 end
-inductive N : Type where
+inductive N where
   | mk (xs : List N) (k : Nat := 1)
-inductive F : Type where
+inductive F where
   | leaf
   | node (f : (x : Nat := 3) → F)
-inductive P (n : Nat := 3) : Type where
+inductive P (n : Nat := 3) where
   | mk : P n
-inductive O : Type 1 where
+inductive O where
   | mk (α : outParam Type) (x : semiOutParam Nat)
-inductive Q : Type where
+inductive Q where
   | mk (m : optParam (optParam Nat 3) 4)
 inductive J : (n : Nat := 3) → Type where
   | mk : J 0
 def tac : Lean.Syntax := Lean.Syntax.missing
-inductive W : Type where
+inductive W where
   | mk (n : Nat) (h : autoParam (n = n) tac)
 ";
 

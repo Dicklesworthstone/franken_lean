@@ -4001,6 +4001,10 @@ impl Context {
                             }
                             Task::Projection(field, at, arguments, expected, explicit, finish) => {
                                 let receiver = values.pop().expect("receiver precedes projection");
+                                let from_ident = matches!(
+                                    at,
+                                    Syntax::Ident { val, .. } if !val.parent().is_anonymous()
+                                );
                                 // `x.f ..` has no arguments to process: `hasArgs` counts positional
                                 // and named arguments only (vendored `Lean/Elab/App.lean:1850`), so a
                                 // strict-implicit receiver is not instantiated before the lookup.
@@ -4009,6 +4013,7 @@ impl Context {
                                     &field,
                                     !arguments.iter().all(application::is_ellipsis),
                                     Some(at),
+                                    from_ident,
                                 )? {
                                     record_terms::FieldResolution::Blocked {
                                         receiver,
@@ -7308,19 +7313,9 @@ fn definition_elaboration(
     // header holes; inferred results may still constrain ordinary parameters.
     context.resolve_instances(true)?;
     context.resume_postponed_eliminators(true)?;
-    if expected.is_some() || auto_count > 0 {
-        context.flush(true)?;
-        // `MutualDef.elabHeaders` calls `addAutoBoundImplicits` even when
-        // the result type is inferred. Generalize those carriers before the
-        // body can specialize them; ordinary written binder holes stay open.
-        // With no written result, only the parameter types supply names.
-        let result = expected
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| Expr::sort(Level::zero()));
-        context.generalize_auto_bound_holes(&mut parameters, auto_count, &result)?;
-    }
     if let Some(expected) = &expected {
+        context.flush(true)?;
+        context.generalize_auto_bound_holes(&mut parameters, auto_count, expected)?;
         let mut types = Vec::with_capacity(parameters.len() + 1);
         for parameter in &parameters {
             types.push(context.instantiate(&parameter.type_)?);
@@ -7329,6 +7324,28 @@ fn definition_elaboration(
         // Universe holes may still be constrained by the body. Ordinary term
         // holes and unresolved header instances must not cross this boundary.
         context.require_resolved_terms(&types)?;
+    } else if auto_count > 0 {
+        context.flush(true)?;
+        // `MutualDef.elabHeaders` (`Lean/Elab/MutualDef.lean:266-278`) creates the
+        // omitted result hole before `addAutoBoundImplicits` and `mkForallFVars'`.
+        // Any unassigned expression carrier hole `?h` in an auto-bound parameter's
+        // type stays unabstracted in the reverted result hole's metavariable type
+        // (`MetavarContext.lean:1204,1242`), whose scope precedes the generalized
+        // `α✝` binder introduced by `forallBoundedTelescope`, so body unification
+        // always rejects it while resolved/sort-only auto types proceed.
+        let mut holes = Vec::new();
+        for auto in &parameters[..auto_count] {
+            let type_ = context.instantiate(&auto.type_)?;
+            context.collect_unassigned_holes(&type_, &mut holes)?;
+        }
+        if !holes.is_empty() {
+            if let Some(error) = context.postponed_application_errors.first() {
+                return Err(error.clone());
+            }
+            return Err(failure(SourceInferenceError::UnresolvedHoles {
+                count: holes.len(),
+            }));
+        }
     }
     let (proof_instance, hidden_instance) = if is_instance {
         context.validate_instance_binder(

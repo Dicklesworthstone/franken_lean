@@ -201,11 +201,14 @@ fn pinned(lib: &Path, entry: &Path) -> Option<(i32, String)> {
 fn ours(lib: &Path, root: &Path, program: &str) -> (Option<i32>, String, String) {
     let entry = root.join("Notations.lean");
     std::fs::write(&entry, program).unwrap();
+    let reuse = std::env::var_os("FLN_IMPORT_REUSE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("records"));
     let output = Command::new(env!("CARGO_BIN_EXE_lean"))
         .arg(&entry)
         .current_dir(root)
         .env("LEAN_PATH", lib)
-        .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+        .env("FLN_IMPORT_REUSE_DIR", reuse)
         .output()
         .expect("run the installed lean");
     (
@@ -224,6 +227,35 @@ fn applications_print_through_the_files_notations_as_at_the_pin() {
     assert_eq!(stdout, EXPECTED);
     if let Some((code, stdout)) = pinned(&lib, &root.join("Notations.lean")) {
         assert_eq!((code, stdout.as_str()), (0, EXPECTED), "the pin moved");
+    }
+}
+
+#[test]
+fn goals_and_errors_print_through_the_files_notations_as_at_the_pin() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let program = concat!(
+        "prelude\nimport Init.Tactics\n",
+        "def pair (a b : Nat) : Nat := a + b\n",
+        "infixl:65 \" +++ \" => pair\n",
+        "notation \"ℕ\" => Nat\n",
+        "example (a b : ℕ) (h : a +++ b = a +++ b) : a +++ b = a +++ b := by\n",
+        "  trace_state\n",
+        "  exact h\n",
+        "/--\n",
+        "error: Tactic `native_decide` evaluated that the proposition\n",
+        "  1 +++ 2 = 4\n",
+        "is false\n",
+        "-/\n",
+        "#guard_msgs in\n",
+        "example : 1 +++ 2 = 4 := by native_decide\n",
+    );
+    let expected = "a b : ℕ\nh : a +++ b = a +++ b\n⊢ a +++ b = a +++ b\n";
+    let (code, stdout, stderr) = ours(&lib, &root, program);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(stdout, expected);
+    if let Some((code, stdout)) = pinned(&lib, &root.join("Notations.lean")) {
+        assert_eq!((code, stdout.as_str()), (0, expected), "the pin moved");
     }
 }
 
@@ -322,8 +354,13 @@ fn upstream_notation_printing_regressions_match_the_pin() {
         fln::OLEAN_PIN_COMMIT
     );
     let root = workspace();
-    let records = root.join("records");
-    std::fs::create_dir(&records).unwrap();
+    let records = std::env::var_os("FLN_IMPORT_REUSE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let path = root.join("records");
+            std::fs::create_dir(&path).unwrap();
+            path
+        });
     let cases = [
         (
             "1367",

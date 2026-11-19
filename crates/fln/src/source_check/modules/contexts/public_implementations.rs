@@ -391,3 +391,71 @@ fn checked_exported_proofs_keep_private_proof_and_axiom_dependencies_visible() {
         );
     }
 }
+
+#[test]
+fn private_exported_equation_theorems_project_checked_private_definitions_but_not_axioms() {
+    let helper = definition(
+        private("loop"),
+        constant(name("True")),
+        constant(name("True.intro")),
+        DefinitionSafety::Safe,
+    );
+    let eq_def = ConstantInfo::Thm(TheoremVal {
+        base: ConstantVal {
+            name: private("loop.eq_def"),
+            level_params: Vec::new(),
+            type_: constant(name("True")),
+        },
+        value: constant(private("loop")),
+        all: vec![private("loop.eq_def")],
+    });
+    let valid = receipt(std::slice::from_ref(&eq_def), &[helper, eq_def.clone()])
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let projected = project(&valid).unwrap().into_complete().unwrap();
+    assert!(
+        projected
+            .checked
+            .engine
+            .environment()
+            .contains(&private("loop.eq_def"))
+    );
+    assert!(
+        !projected
+            .checked
+            .engine
+            .environment()
+            .contains(&private("loop"))
+    );
+
+    let private_axiom = ConstantInfo::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: private("assumption"),
+            level_params: Vec::new(),
+            type_: constant(name("True")),
+        },
+        is_unsafe: false,
+    });
+    let bad_eq_def = ConstantInfo::Thm(TheoremVal {
+        base: ConstantVal {
+            name: private("bad.eq_def"),
+            level_params: Vec::new(),
+            type_: constant(name("True")),
+        },
+        value: constant(private("assumption")),
+        all: vec![private("bad.eq_def")],
+    });
+    let invalid = receipt(
+        std::slice::from_ref(&bad_eq_def),
+        &[private_axiom, bad_eq_def.clone()],
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap();
+    missing(
+        project(&invalid).unwrap_err(),
+        &private("bad.eq_def"),
+        &private("assumption"),
+    );
+}

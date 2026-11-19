@@ -343,6 +343,21 @@ pub(super) fn verify_declarations(
     Ok(())
 }
 
+/// Accumulated stream output from `native_decide` evaluations in one `lean`-presented command.
+pub(super) struct NativeCaptureBuffer {
+    pub(super) text: String,
+    pub(super) used_bytes: usize,
+}
+
+impl NativeCaptureBuffer {
+    pub(super) fn new(used_bytes: usize) -> std::sync::Arc<std::sync::Mutex<Self>> {
+        std::sync::Arc::new(std::sync::Mutex::new(Self {
+            text: String::new(),
+            used_bytes,
+        }))
+    }
+}
+
 /// `native_decide`'s evaluator for one source command (`fln_elab::native`). The command's own
 /// engine admits the elaborator's closed `Bool` definition into a scratch successor, compiles it
 /// and runs it on Golem through the door `#eval`'s values use, and discards the successor: the
@@ -352,6 +367,7 @@ pub(super) struct CommandEvaluator {
     engine: Engine,
     options: KVMap,
     limits: EngineExecutionLimits,
+    capture: Option<std::sync::Arc<std::sync::Mutex<NativeCaptureBuffer>>>,
 }
 
 impl CommandEvaluator {
@@ -360,12 +376,28 @@ impl CommandEvaluator {
         engine: &Engine,
         options: &KVMap,
         limits: EngineExecutionLimits,
+        capture: Option<std::sync::Arc<std::sync::Mutex<NativeCaptureBuffer>>>,
     ) -> fln_elab::native::NativeProvider {
         fln_elab::native::NativeProvider(std::sync::Arc::new(Self {
             engine: engine.clone(),
             options: options.clone(),
             limits,
+            capture,
         }))
+    }
+}
+
+fn native_capture_failure(
+    error: fln_rt::obj::StdoutCaptureError,
+) -> fln_elab::native::NativeEvaluation {
+    use fln_elab::native::NativeEvaluation;
+    match source_evaluation::capture_failure::<()>(error) {
+        Outcome::Inconclusive(reason) => NativeEvaluation::Inconclusive(reason),
+        Outcome::InternalFault(fault) => NativeEvaluation::InternalFault(fault),
+        Outcome::Complete(()) => NativeEvaluation::InternalFault(InternalFault::new(
+            "native evaluation",
+            "stdout capture error produced complete outcome",
+        )),
     }
 }
 
@@ -375,12 +407,38 @@ impl fln_elab::native::NativeEvaluator for CommandEvaluator {
         definition: &fln_env::constants::DefinitionVal,
     ) -> fln_elab::native::NativeEvaluation {
         use fln_elab::native::NativeEvaluation;
+        let capture = if let Some(sink) = &self.capture {
+            let used_bytes = match sink.lock() {
+                Ok(guard) => guard.used_bytes,
+                Err(_) => {
+                    return NativeEvaluation::InternalFault(InternalFault::new(
+                        "native evaluation",
+                        "native capture buffer mutex poisoned",
+                    ));
+                }
+            };
+            let remaining = self
+                .limits
+                .max_evaluation_output_bytes
+                .saturating_sub(used_bytes);
+            let allowance = remaining.min(LEAN_EVALUATION_STDOUT_LIMIT);
+            match fln_rt::obj::StdoutCapture::begin_evaluation(allowance) {
+                Ok(capture) => Some(capture),
+                Err(error) => return native_capture_failure(error),
+            }
+        } else {
+            None
+        };
         let executed = self.engine.execute_definition_entry(
             Declaration::Defn(definition.clone()),
             &self.options,
             self.limits,
             source_evaluation::Entry::Value,
         );
+        let captured = capture.map(fln_rt::obj::StdoutCapture::finish);
+        if let Some(error) = captured.as_ref().and_then(|captured| captured.error) {
+            return native_capture_failure(error);
+        }
         let execution = match executed {
             Ok(Outcome::Complete(execution)) => execution,
             Ok(Outcome::Inconclusive(reason)) => return NativeEvaluation::Inconclusive(reason),
@@ -395,22 +453,53 @@ impl fln_elab::native::NativeEvaluator for CommandEvaluator {
             }
             Err(error) => return NativeEvaluation::Unsupported(error.to_string()),
         };
-        match &execution.exit {
+        let value = match &execution.exit {
             VmExit::Returned(_) => match closed_vm_value(&execution.exit) {
-                Ok(Some(ClosedVmValue::Scalar(1))) => NativeEvaluation::Value(true),
-                Ok(Some(ClosedVmValue::Scalar(0))) => NativeEvaluation::Value(false),
-                other => NativeEvaluation::InternalFault(InternalFault::new(
-                    "native evaluation",
-                    format!("a closed `Bool` definition returned {other:?}"),
-                )),
+                Ok(Some(ClosedVmValue::Scalar(1))) => true,
+                Ok(Some(ClosedVmValue::Scalar(0))) => false,
+                other => {
+                    return NativeEvaluation::InternalFault(InternalFault::new(
+                        "native evaluation",
+                        format!("a closed `Bool` definition returned {other:?}"),
+                    ));
+                }
             },
             // The pin's `panic` reports and continues with the default value; Golem stops.
-            VmExit::Panicked { message, .. } => NativeEvaluation::Unsupported(format!(
-                "the evaluation panicked (`{message}`), which the pin reports and continues past"
-            )),
-            VmExit::Refused { refusal, .. } => {
-                NativeEvaluation::Unsupported(format!("the VM refused the evaluation: {refusal}"))
+            VmExit::Panicked { message, .. } => {
+                return NativeEvaluation::Unsupported(format!(
+                    "the evaluation panicked (`{message}`), which the pin reports and continues past"
+                ));
             }
+            VmExit::Refused { refusal, .. } => {
+                return NativeEvaluation::Unsupported(format!(
+                    "the VM refused the evaluation: {refusal}"
+                ));
+            }
+        };
+        if let (Some(sink), Some(finished)) = (&self.capture, captured)
+            && !finished.bytes.is_empty()
+        {
+            let Ok(chunk) = String::from_utf8(finished.bytes) else {
+                return NativeEvaluation::InternalFault(InternalFault::new(
+                    "native evaluation",
+                    "evaluation capture violated its UTF-8 contract",
+                ));
+            };
+            let Ok(mut guard) = sink.lock() else {
+                return NativeEvaluation::InternalFault(InternalFault::new(
+                    "native evaluation",
+                    "native capture buffer mutex poisoned",
+                ));
+            };
+            let Some(next_used) = guard.used_bytes.checked_add(chunk.len()) else {
+                return NativeEvaluation::InternalFault(InternalFault::new(
+                    "native evaluation",
+                    "evaluation output accounting overflow",
+                ));
+            };
+            guard.used_bytes = next_used;
+            guard.text.push_str(&chunk);
         }
+        NativeEvaluation::Value(value)
     }
 }

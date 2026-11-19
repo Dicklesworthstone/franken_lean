@@ -253,7 +253,7 @@ end
             "84",
         ));
         direct.push(run(
-            &format!("{source}#eval let index : Nat := work {n}; 42"),
+            &format!("{source}#eval let index : Nat := work {n}; 42 + index - index"),
             "42",
         ));
     }
@@ -285,7 +285,7 @@ fn case_indices_remain_strict_without_any_induction_hypotheses() {
             "42",
         ));
         direct.push(run(
-            &format!("{work}#eval let index : Nat := work {n}; 42"),
+            &format!("{work}#eval let index : Nat := work {n}; 42 + index - index"),
             "42",
         ));
     }

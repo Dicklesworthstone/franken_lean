@@ -32,9 +32,13 @@ impl Message<'_> {
             // printed without a position, as the pin prints information messages.
             Self::Trace(trace) if trace.is_info => {
                 let mut discarded = Vec::new();
-                let target = guards
-                    .get_mut(&trace.command_index)
-                    .and_then(|guard| guard.evaluation_target(&mut discarded));
+                let target = if trace.bypass_guard {
+                    None
+                } else {
+                    guards
+                        .get_mut(&trace.command_index)
+                        .and_then(|guard| guard.evaluation_target(&mut discarded))
+                };
                 budget
                     .append(&trace.message, stdout, target)
                     .map_err(|error| error.failure(trace.command_index, SourcePresentation::Lean))

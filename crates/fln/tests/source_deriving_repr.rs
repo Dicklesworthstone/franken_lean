@@ -1235,11 +1235,11 @@ def counted : Nat → Counted
             let lean_zero = steps("#eval counted 0", fln::EvaluationPresentation::Lean);
             let lean_many = steps("#eval counted 40", fln::EvaluationPresentation::Lean);
             let raw_zero = steps(
-                "#eval let value := counted 0; Std.Format.text \"done\"",
+                "#eval match counted 0 with | .done => Std.Format.text \"done\"",
                 fln::EvaluationPresentation::Raw,
             );
             let raw_many = steps(
-                "#eval let value := counted 40; Std.Format.text \"done\"",
+                "#eval match counted 40 with | .done => Std.Format.text \"done\"",
                 fln::EvaluationPresentation::Raw,
             );
             assert!(

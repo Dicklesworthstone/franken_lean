@@ -181,13 +181,21 @@ fn workspace() -> PathBuf {
     path
 }
 
-/// Exit code, stdout and stderr of `binary` on `<name>.lean`, run from `root`.
-fn run(binary: &Path, lib: &Path, root: &Path, name: &str) -> (Option<i32>, String, String) {
+/// Exit code, stdout and stderr of `binary` on `args`, run from `root`.
+fn run_args(
+    binary: &Path,
+    lib: &Path,
+    root: &Path,
+    args: &[&str],
+) -> (Option<i32>, String, String) {
+    let reuse = std::env::var_os("FLN_IMPORT_REUSE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("records"));
     let output = Command::new(binary)
-        .arg(format!("{name}.lean"))
+        .args(args)
         .current_dir(root)
         .env("LEAN_PATH", lib)
-        .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+        .env("FLN_IMPORT_REUSE_DIR", reuse)
         .env("LEAN_BACKTRACE", "0")
         .output()
         .expect("run lean");
@@ -196,6 +204,12 @@ fn run(binary: &Path, lib: &Path, root: &Path, name: &str) -> (Option<i32>, Stri
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// Exit code, stdout and stderr of `binary` on `<name>.lean`, run from `root`.
+fn run(binary: &Path, lib: &Path, root: &Path, name: &str) -> (Option<i32>, String, String) {
+    let file = format!("{name}.lean");
+    run_args(binary, lib, root, &[file.as_str()])
 }
 
 /// This crate's `lean` on `header` + `program`, and the pinned `lean` when it is installed.
@@ -269,21 +283,127 @@ fn native_decide_matches_the_pin() {
 
 /// An instance that panics while it is evaluated: the pin prints the message and continues with
 /// the `Inhabited` default, `isTrue`, so the proof stands (vendored
-/// `tests/elab/decideNativePanic.lean`). Both accept; this engine's VM does not print the panic
-/// message, which only the pin's stdout shows.
+/// `tests/elab/decideNativePanic.lean`). Both accept and emit identical stdout/stderr across
+/// default `stderrAsMessages`, `set_option stderrAsMessages false`, and `#guard_msgs`.
 #[test]
 fn a_panicking_evaluation_continues_with_the_default_as_the_pin_does() {
     let Some(lib) = pinned_lib() else {
         return;
     };
     let root = workspace();
-    let program = "inductive ItsTrue2 : Prop\n  | mk\ninstance : Inhabited (Decidable ItsTrue2) := \
-                   ⟨isTrue .mk⟩\ninstance : Decidable ItsTrue2 := panic \"oh no\"\nexample : \
-                   ItsTrue2 := by native_decide\n";
-    let ((code, stdout, stderr), pinned) = check(&lib, &root, "panicking", TACTICS, program);
+    let header_defs = "inductive ItsTrue2 : Prop\n  | mk\ninstance : Inhabited (Decidable ItsTrue2) := \
+                       ⟨isTrue .mk⟩\ninstance : Decidable ItsTrue2 := panic \"oh no\"\n";
+    for (name, tail, expected_stdout, expected_stderr) in [
+        (
+            "panicking",
+            "example : ItsTrue2 := by native_decide\n",
+            "oh no\n",
+            "",
+        ),
+        (
+            "panicking_stderr_false",
+            "set_option stderrAsMessages false\nexample : ItsTrue2 := by native_decide\n",
+            "",
+            "oh no\n",
+        ),
+        (
+            "panicking_guarded_theorem",
+            "/-- info: oh no -/\n#guard_msgs in\ntheorem t : ItsTrue2 := by native_decide\n",
+            "",
+            "",
+        ),
+        (
+            "panicking_guarded_example",
+            "#guard_msgs in\nexample : ItsTrue2 := by native_decide\n",
+            "oh no\n",
+            "",
+        ),
+    ] {
+        let program = format!("{header_defs}{tail}");
+        std::fs::write(
+            root.join(format!("{name}.lean")),
+            format!("{TACTICS}{program}"),
+        )
+        .unwrap();
+        let (code, stdout, stderr) = run(Path::new(env!("CARGO_BIN_EXE_lean")), &lib, &root, name);
+        assert_eq!(code, Some(0), "{name}: {stdout}{stderr}");
+        assert_eq!(stdout, expected_stdout, "{name} stdout");
+        assert_eq!(stderr, expected_stderr, "{name} stderr");
+        if let Some(pin) = lib
+            .parent()
+            .and_then(Path::parent)
+            .map(|toolchain| toolchain.join("bin/lean"))
+            .filter(|lean| lean.is_file())
+        {
+            let (pin_code, pin_stdout, pin_stderr) = run(&pin, &lib, &root, name);
+            assert_eq!(pin_code, Some(0), "{name}: the pinned lean rejects it");
+            assert_eq!(pin_stdout, expected_stdout, "{name}: pin stdout");
+            assert_eq!(pin_stderr, expected_stderr, "{name}: pin stderr");
+        }
+    }
+}
+
+/// Firing `panic!`, `assert!`, `unreachable!`, and `dbg_trace` surface forms match the pinned
+/// `lean` on both `#eval` (`lean <file>`) and `def main` (`lean --run <file>`), stdout and stderr.
+#[test]
+fn firing_panic_assert_unreachable_and_dbg_trace_match_the_pin_under_eval_and_main() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let pin = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file());
+    let eval_src = concat!(
+        "prelude\nimport Init.Data.Nat.Basic\nimport Init.System.IO\n",
+        "def f (n : Nat) : Nat := if n > 3 then panic! \"big\" else n\n",
+        "def g (n : Nat) : Nat := assert! n < 3; n + 1\n",
+        "def h (b : Bool) : Nat := if b then 10 else unreachable!\n",
+        "def traced (n : Nat) : Nat := dbg_trace \"seen\"; n + 1\n",
+        "#eval f 2\n#eval f 5\n#eval g 1\n#eval g 4\n#eval h true\n#eval h false\n#eval traced 4\n",
+    );
+    std::fs::write(root.join("PanicEval.lean"), eval_src).unwrap();
+    let (code, stdout, stderr) = run(
+        Path::new(env!("CARGO_BIN_EXE_lean")),
+        &lib,
+        &root,
+        "PanicEval",
+    );
     assert_eq!(code, Some(0), "{stdout}{stderr}");
-    if let Some((code, stdout)) = pinned {
-        assert_eq!(code, Some(0), "the pinned lean rejects it");
-        assert_eq!(stdout, "oh no\n");
+    assert!(stderr.is_empty(), "{stderr}");
+    if let Some(pin) = &pin {
+        let (pin_code, pin_stdout, pin_stderr) = run(pin, &lib, &root, "PanicEval");
+        assert_eq!(pin_code, Some(0));
+        assert_eq!(stdout, pin_stdout);
+        assert_eq!(stderr, pin_stderr);
+    }
+
+    let main_src = concat!(
+        "prelude\nimport Init.Data.Nat.Basic\nimport Init.System.IO\n",
+        "def f (n : Nat) : Nat := if n > 3 then panic! \"big\" else n\n",
+        "def g (n : Nat) : Nat := assert! n < 3; n + 1\n",
+        "def h (b : Bool) : Nat := if b then 10 else unreachable!\n",
+        "def traced (n : Nat) : Nat := dbg_trace \"seen\"; n + 1\n",
+        "def main : IO Unit := do\n",
+        "  IO.println (f 5)\n",
+        "  IO.println (g 4)\n",
+        "  IO.println (h false)\n",
+        "  IO.println (traced 4)\n",
+    );
+    std::fs::write(root.join("PanicMain.lean"), main_src).unwrap();
+    let (m_code, m_out, m_err) = run_args(
+        Path::new(env!("CARGO_BIN_EXE_lean")),
+        &lib,
+        &root,
+        &["--run", "PanicMain.lean"],
+    );
+    assert_eq!(m_code, Some(0), "{m_out}{m_err}");
+    if let Some(pin) = &pin {
+        let (p_code, p_out, p_err) = run_args(pin, &lib, &root, &["--run", "PanicMain.lean"]);
+        assert_eq!(p_code, Some(0));
+        assert_eq!(m_out, p_out);
+        assert_eq!(m_err, p_err);
     }
 }

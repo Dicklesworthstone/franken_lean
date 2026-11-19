@@ -425,8 +425,6 @@ pub fn elaborate_definition_with_effects_in_with_budget(
 /// constant (`Nat.nope`, `f.nope`, `Nat.succ.nope`) and `Unknown identifier` otherwise
 /// (`missing`, `Foo.b` when only the namespace `Foo` exists), both under
 /// `lean.unknownIdentifier`. Measured on the pinned `lean` (v4.32.0), 2026-10-05.
-/// A dotted name on a local function (`f.nope` with `def f`) never reaches here: it is
-/// taken as field notation and refused as an unknown record field (fln-dyfz).
 ///
 /// Only the error is passed: the elaborator's entry points run on small host stacks, so the
 /// success value is never moved through an extra frame.

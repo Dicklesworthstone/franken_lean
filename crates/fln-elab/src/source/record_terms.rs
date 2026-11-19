@@ -366,11 +366,16 @@ impl Context {
                     }
                     term
                 } else {
+                    let from_ident = matches!(
+                        record.at.as_ref(),
+                        Some(Syntax::Ident { val, .. }) if !val.parent().is_anonymous()
+                    );
                     let field = self.resolve_field_path(
                         record.receiver.clone(),
                         &record.path,
                         false,
                         record.at.as_ref(),
+                        from_ident,
                     )?;
                     self.field_value(field, Some(&record.expected))?
                 };
@@ -556,7 +561,7 @@ impl Context {
         let Some((receiver, path)) = self.qualified_field_receiver_at(name, at)? else {
             return Ok(None);
         };
-        let field = self.resolve_field_path(receiver, &path, false, at)?;
+        let field = self.resolve_field_path(receiver, &path, false, at, true)?;
         Ok(Some(self.field_value(field, expected)?))
     }
 
@@ -612,7 +617,7 @@ impl Context {
                 .iter()
                 .rev()
                 .fold(Name::anonymous(), |path, part| path.append_core(part));
-            let field = self.resolve_field_path(receiver, &path, false, Some(at))?;
+            let field = self.resolve_field_path(receiver, &path, false, Some(at), false)?;
             return Ok(Some(self.field_value(field, expected)?));
         }
         Ok(None)
@@ -701,6 +706,20 @@ impl Context {
         Ok(None)
     }
 
+    fn receiver_const_head(
+        &mut self,
+        mut expr: &Expr,
+    ) -> Result<Option<Name>, NatDefinitionElabError> {
+        while let ExprNode::App { f, .. } | ExprNode::MData { expr: f, .. } = expr.node() {
+            self.tick()?;
+            expr = f;
+        }
+        Ok(match expr.node() {
+            ExprNode::Const { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+    }
+
     /// `at` is the syntax `path` is spelled at the end of, which places each field
     /// ([`super::deprecated::field_spans`]).
     pub(super) fn resolve_field_path(
@@ -709,6 +728,7 @@ impl Context {
         path: &Name,
         has_arguments: bool,
         at: Option<&Syntax>,
+        from_ident: bool,
     ) -> Result<FieldResolution, NatDefinitionElabError> {
         if self.overload_depth == 0
             && self
@@ -725,7 +745,7 @@ impl Context {
             && path.parent().is_anonymous()
         {
             let field = self.indexed_field(receiver.clone(), index)?;
-            return self.resolve_field(receiver, &field, has_arguments, None);
+            return self.resolve_field(receiver, &field, has_arguments, None, None);
         }
         let parts = scope::components(path).map_err(|_| failure(SourceInferenceError::Scope))?;
         let spans = super::deprecated::field_spans(at, path);
@@ -739,6 +759,7 @@ impl Context {
                 &Name::from_components([part.as_str()]),
                 false,
                 spans.get(index).copied().flatten(),
+                (from_ident && index == 0).then_some(path),
             )?;
             receiver = self.field_value(field, None)?;
         }
@@ -747,6 +768,7 @@ impl Context {
             &Name::from_components([last.as_str()]),
             has_arguments,
             spans.last().copied().flatten(),
+            (from_ident && prefix.is_empty()).then_some(path),
         )
     }
 
@@ -761,6 +783,7 @@ impl Context {
         field: &Name,
         has_arguments: bool,
         span: Option<(usize, usize)>,
+        suffix: Option<&Name>,
     ) -> Result<FieldResolution, NatDefinitionElabError> {
         self.flush(false)?;
         self.resolve_instances(false)?;
@@ -843,10 +866,31 @@ impl Context {
                     receiver.type_ = projected;
                     continue;
                 }
-                _ => return Err(error(RecordTermError::ExpectedRecordType)),
+                _ => {
+                    if let Some(suffix) = suffix
+                        && let Some(constant) = self.receiver_const_head(&receiver.value)?
+                    {
+                        return Err(failure(SourceInferenceError::UnknownConstant(
+                            constant.append_core(suffix),
+                        )));
+                    }
+                    return Err(error(RecordTermError::ExpectedRecordType));
+                }
             };
             let definition = self.txn.env.find(&base).cloned();
-            let mut missing = error(RecordTermError::UnknownField(field.clone()));
+            let mut missing = if matches!(head.node(), ExprNode::ForallE { .. })
+                && let Some(suffix) = suffix
+                && let Some(constant) = self.receiver_const_head(&receiver.value)?
+            {
+                // `resolveLValAux` (`Lean/Elab/App.lean:1580-1588`): when the
+                // receiver is a constant of function type and `Function.<field>`
+                // is absent, a dotted identifier reports `Unknown constant`.
+                failure(SourceInferenceError::UnknownConstant(
+                    constant.append_core(suffix),
+                ))
+            } else {
+                error(RecordTermError::UnknownField(field.clone()))
+            };
             if matches!(definition, Some(ConstantInfo::Induct(_))) {
                 let mut trial = self.clone();
                 let projected = trial.record_field(receiver.clone(), field);

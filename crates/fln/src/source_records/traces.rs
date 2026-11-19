@@ -16,10 +16,53 @@ pub struct SourceTraceMessage {
     pub is_goal_state: bool,
     /// An information message (`simp?`'s suggestion), not a raw trace: `info:` severity.
     pub is_info: bool,
+    /// Captured by the outer command-driver `withIsolatedStreams` (`Lean/Language/Lean.lean:765`)
+    /// outside `#guard_msgs`, rather than inside an async snapshot task (`Command.lean:321`).
+    pub bypass_guard: bool,
+}
+
+const MAX_MESSAGES: usize = 4096;
+const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+pub(crate) fn append_captured_info(
+    messages: &mut Vec<SourceTraceMessage>,
+    bytes: &mut usize,
+    message: String,
+    command_index: usize,
+    offset: fln_parse::BytePos,
+    bypass_guard: bool,
+) -> Result<(), EngineExecutionError> {
+    if message.is_empty() {
+        return Ok(());
+    }
+    if messages.len() >= MAX_MESSAGES {
+        return Err(EngineExecutionError::SourceScopeLimit {
+            resource: "raw tactic trace messages",
+            limit: MAX_MESSAGES,
+        });
+    }
+    *bytes = bytes
+        .checked_add(message.len())
+        .and_then(|n| n.checked_add(1))
+        .filter(|n| *n <= MAX_BYTES)
+        .ok_or(EngineExecutionError::SourceScopeLimit {
+            resource: "raw tactic trace bytes",
+            limit: MAX_BYTES,
+        })?;
+    messages.push(SourceTraceMessage {
+        command_index,
+        at: offset,
+        message,
+        is_goal_state: false,
+        is_info: true,
+        bypass_guard,
+    });
+    Ok(())
 }
 
 /// Freeze display in the command's environment and scope, not the final file's.
 /// The batch bound also applies to messages that a later guard chooses to drop.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn append(
     messages: &mut Vec<SourceTraceMessage>,
     bytes: &mut usize,
@@ -28,9 +71,8 @@ pub(crate) fn append(
     environment: &Environment,
     command_index: usize,
     offset: fln_parse::BytePos,
+    notations: Option<&fln_parse::extensions::Notations>,
 ) -> Result<(), EngineExecutionError> {
-    const MAX_MESSAGES: usize = 4096;
-    const MAX_BYTES: usize = 16 * 1024 * 1024;
     for trace in traces {
         if messages.len() >= MAX_MESSAGES {
             return Err(EngineExecutionError::SourceScopeLimit {
@@ -38,8 +80,9 @@ pub(crate) fn append(
                 limit: MAX_MESSAGES,
             });
         }
-        let message = crate::pretty::goals::render(environment, &trace)
-            .map_err(|problem| EngineExecutionError::NotImplemented { feature: problem.0 })?;
+        let message =
+            crate::pretty::goals::render_with_notations(environment, &trace, notations)
+                .map_err(|problem| EngineExecutionError::NotImplemented { feature: problem.0 })?;
         *bytes = bytes
             .checked_add(message.len())
             .and_then(|n| n.checked_add(1))
@@ -70,6 +113,7 @@ pub(crate) fn append(
                 trace.content,
                 fln_elab::source::trace::TraceContent::Info(_)
             ),
+            bypass_guard: false,
         });
     }
     Ok(())
