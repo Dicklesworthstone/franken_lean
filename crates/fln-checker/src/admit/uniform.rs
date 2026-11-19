@@ -100,23 +100,7 @@ fn size(term: &WireExpr) -> usize {
     term.nodes().len().saturating_add(term.levels().len())
 }
 
-/// A sufficient, independently computed positivity test for the result sort
-/// of the family telescope `term` (a declared type, or the telescope the pin
-/// exposes by reduction, `Audit::reduced_telescope`).
-/// Sort u (which may be Prop) stays on its separate elimination-policy routes.
-pub(super) fn positive_result(term: &WireExpr, count: u32) -> bool {
-    if count as usize > MAX_NONRECURSIVE_FIELDS || size(term) > MAX_INDUCTIVE_EXPECTED_ARENA_UNITS {
-        return false;
-    }
-    let Some((_, tail)) = peel_binders_at(term, term.root(), count as usize) else {
-        return false;
-    };
-    let Some(ExprNode::Sort { level }) = term.node(tail) else {
-        return false;
-    };
-    let Ok(normal) = normalize(&WireLevel::from_parts(term.levels().to_vec(), *level)) else {
-        return false;
-    };
+fn positive_normal(normal: &crate::universe::NormalizedLevel) -> bool {
     let mut positive = Vec::with_capacity(normal.nodes().len());
     for node in normal.nodes() {
         let yes = match node {
@@ -128,6 +112,22 @@ pub(super) fn positive_result(term: &WireExpr, count: u32) -> bool {
         positive.push(yes);
     }
     positive[normal.root().index()]
+}
+
+/// Whether `term` reaches a normalizable sort after `count` binders, including
+/// universe-polymorphic sorts (`Sort u`, `Sort (imax u v)`) whose elimination
+/// policy is decided below by `positive_normal` (`elim_only_at_universe_zero`).
+pub(super) fn sort_result(term: &WireExpr, count: u32) -> bool {
+    if count as usize > MAX_NONRECURSIVE_FIELDS || size(term) > MAX_INDUCTIVE_EXPECTED_ARENA_UNITS {
+        return false;
+    }
+    let Some((_, tail)) = peel_binders_at(term, term.root(), count as usize) else {
+        return false;
+    };
+    let Some(ExprNode::Sort { level }) = term.node(tail) else {
+        return false;
+    };
+    normalize(&WireLevel::from_parts(term.levels().to_vec(), *level)).is_ok()
 }
 
 /// The generic predicate route is selected only at a definitely zero sort.
@@ -770,7 +770,7 @@ pub(super) fn routes_by_reduction(
                 || metadata.num_indices() > 0
                 || metadata.is_reflexive()
                 || !declaration.level_parameters().is_empty())
-                && positive_result(&reduced, count))),
+                && sort_result(&reduced, count))),
         // Definitive, unlike a stuck head: a completed reduction that exposes a
         // binder or a sort agrees with the pin's. The route refuses the claim.
         Telescope::Miscounted => Ok(true),
@@ -1190,9 +1190,7 @@ fn check(
             }
         },
     };
-    if !positive_result(&family_type, (p + q) as u32)
-        && !proposition_result(&family_type, (p + q) as u32)
-    {
+    if !sort_result(&family_type, (p + q) as u32) {
         return Err(InductiveVerdict::Deferred(
             InductiveSupportLimit::ResultUniverse,
         ));
@@ -1261,11 +1259,10 @@ fn check(
         return Err(overflow());
     };
     let result_level = WireLevel::from_parts(result_sort.levels().to_vec(), *level);
-    let proposition = normalize(&result_level)
-        .ok()
-        .and_then(|n| explicit_normal_universe(&n))
-        == Some(0);
-    let mut large_elimination = !proposition || n <= 1;
+    let normal_result = normalize(&result_level).map_err(|_| overflow())?;
+    let proposition = explicit_normal_universe(&normal_result) == Some(0);
+    let definitely_positive = positive_normal(&normal_result);
+    let mut large_elimination = definitely_positive || n <= 1;
     let mut staged =
         stage_inductive_member(environment, inductive, environment_budget, audit.cancelled)?;
     let mut locals = Vec::new();
@@ -1378,8 +1375,9 @@ fn check(
             )
             .map_err(|v| map_member_preamble(ctor_name, v))?;
             // Prop is impredicative: the witness field itself may live at any
-            // universe. This never licenses eliminating that witness into data.
-            if proposition && n == 1 && facts.explicit_universe != Some(0) {
+            // universe. Any result sort that may be zero (`!definitely_positive`,
+            // including `Sort u`) restricts large elimination to exposed/Prop fields.
+            if !definitely_positive && n == 1 && facts.explicit_universe != Some(0) {
                 let mut exposed = false;
                 for index in &result_indices {
                     audit.tick()?;

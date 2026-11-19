@@ -14619,6 +14619,175 @@ fn kr600_803_class_block_admits_a_small_elimination_recursor() {
     );
 }
 
+fn sort_box_entries(large: bool) -> Vec<ConstantEntry> {
+    let sort_box = checker_qualified(&["SortBox"]);
+    let mk = checker_qualified(&["SortBox", "mk"]);
+    let rec = checker_qualified(&["SortBox", "rec"]);
+    let u_name = checker_name("u");
+    let v_name = checker_name("v");
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let usort = || Expr::sort(u.clone());
+    let elim_sort = || {
+        if large {
+            Expr::sort(v.clone())
+        } else {
+            Expr::sort(Level::zero())
+        }
+    };
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let box_of = |alpha: Expr| {
+        Expr::app(
+            Expr::const_(primary_name("SortBox"), vec![u.clone()]),
+            alpha,
+        )
+    };
+    let mk_applied = |alpha: Expr, val: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::const_(Name::from_components(["SortBox", "mk"]), vec![u.clone()]),
+                alpha,
+            ),
+            val,
+        )
+    };
+    let motive_type = || primary_pi("t", BinderInfo::Default, box_of(bv(0)), elim_sort());
+    let minor_type = || {
+        primary_pi(
+            "val",
+            BinderInfo::Default,
+            bv(1),
+            Expr::app(bv(1), mk_applied(bv(2), bv(0))),
+        )
+    };
+    let recursor_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        usort(),
+        primary_pi(
+            "motive",
+            BinderInfo::Implicit,
+            motive_type(),
+            primary_pi(
+                "minor",
+                BinderInfo::Default,
+                minor_type(),
+                primary_pi(
+                    "major",
+                    BinderInfo::Default,
+                    box_of(bv(2)),
+                    Expr::app(bv(2), bv(0)),
+                ),
+            ),
+        ),
+    );
+    let rule_rhs = Expr::lam(
+        primary_name("α"),
+        usort(),
+        Expr::lam(
+            primary_name("motive"),
+            motive_type(),
+            Expr::lam(
+                primary_name("minor"),
+                minor_type(),
+                Expr::lam(
+                    primary_name("val"),
+                    bv(2),
+                    Expr::app(bv(1), bv(0)),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let rec_levels = if large {
+        vec![v_name, u_name.clone()]
+    } else {
+        vec![u_name.clone()]
+    };
+    vec![
+        ConstantEntry::new(
+            sort_box.clone(),
+            ConstantDeclaration::inductive(
+                vec![u_name.clone()],
+                decoded(&primary_pi("α", BinderInfo::Default, usort(), usort())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    1,
+                    0,
+                    vec![sort_box.clone()],
+                    vec![mk.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            mk.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Implicit,
+                    usort(),
+                    primary_pi("val", BinderInfo::Default, bv(0), box_of(bv(1))),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(sort_box.clone(), 0, 1, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                rec_levels,
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![sort_box],
+                    1,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(mk, 1, decoded(&rule_rhs))],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn kr600_803_sort_polymorphic_box_admits_small_and_refuses_large_elimination() {
+    let admitted = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &sort_box_entries(false),
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        admitted.is_admitted(),
+        "Sort-polymorphic box with Prop elimination must admit: {admitted:?}"
+    );
+    let forged = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &sort_box_entries(true),
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            forged,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::RecursorShape { .. }
+            )
+        ),
+        "Sort-polymorphic box hiding data cannot forge large elimination: {forged:?}"
+    );
+}
+
 /// A parameterized block with TWO constructors carrying DIFFERENT field counts
 /// (`nil` none, `one` a single field) — the shape `Init.Decidable` and
 /// `Init.Option` have and the single-constructor fixtures above cannot reach.

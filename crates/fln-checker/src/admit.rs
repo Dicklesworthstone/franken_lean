@@ -8408,7 +8408,7 @@ pub fn admit_inductive_with(
                     || metadata.num_indices() > 0
                     || metadata.is_reflexive()
                     || !declaration.level_parameters().is_empty())
-                    && uniform::positive_result(declaration.type_(), count))
+                    && uniform::sort_result(declaration.type_(), count))
         })
     {
         return uniform::admit(
