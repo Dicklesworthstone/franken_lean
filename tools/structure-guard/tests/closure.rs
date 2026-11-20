@@ -653,3 +653,182 @@ fn undeclared_build_script_is_flagged() {
         out.findings
     );
 }
+
+const SERDE_CHECKSUM: &str = "5f0e2c6ed6606019b4e29e69dbaba95b11854410e5347d525002456dbbb786b6";
+const BB_10_CHECKSUM: &str = "3078c7629b62d3f0439d1892204acaf4722ef9a126640836a75b38ce6fc36318";
+const BB_12_CHECKSUM: &str = "d2f6c7dbe95a6ed650284924c8c9012b2048b99f08531b6d3955a3763055d860";
+
+/// Add a SUITE.lock-pinned `asupersync` crate together with a reviewed, checksum-pinned
+/// transitive crates.io closure (including two simultaneous versions of `block-buffer`)
+/// and governed offline vendor metadata under `vendor/cargo` (no `.cargo/config.toml`).
+fn add_allowlisted_suite_registry_closure(files: &mut Vec<(String, String)>) {
+    add_asupersync_dependency(files, "@FIXTURE_ROOT@/suite/asupersync");
+    replace_fragment(
+        files,
+        "Cargo.lock",
+        "name = \"asupersync\"\nversion = \"0.1.0\"\n",
+        "name = \"asupersync\"\nversion = \"0.1.0\"\ndependencies = [\n \"serde\",\n \"block-buffer 0.10.4\",\n \"block-buffer 0.12.1\",\n]\n",
+    );
+    append(
+        files,
+        "Cargo.lock",
+        &format!(
+            "\n[[package]]\nname = \"serde\"\nversion = \"1.0.219\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{SERDE_CHECKSUM}\"\n\n[[package]]\nname = \"block-buffer\"\nversion = \"0.10.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{BB_10_CHECKSUM}\"\n\n[[package]]\nname = \"block-buffer\"\nversion = \"0.12.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{BB_12_CHECKSUM}\"\n"
+        ),
+    );
+    append(
+        files,
+        "ci/CLOSURE_ALLOWLIST.txt",
+        &format!(
+            "package serde version=1.0.219 source=registry checksum={SERDE_CHECKSUM} license=MIT_OR_Apache-2.0 build-script=yes proc-macro=no native-link=no unsafe-audit=external policy=runtime owner=serde-rs upgrade=suite-lock reason=transitive dep of asupersync (fln-883f)\npackage block-buffer version=0.10.4 source=registry checksum={BB_10_CHECKSUM} license=MIT_OR_Apache-2.0 build-script=no proc-macro=no native-link=no unsafe-audit=external policy=runtime owner=RustCrypto upgrade=suite-lock reason=transitive dep of asupersync (fln-883f)\npackage block-buffer version=0.12.1 source=registry checksum={BB_12_CHECKSUM} license=MIT_OR_Apache-2.0 build-script=no proc-macro=no native-link=no unsafe-audit=external policy=runtime owner=RustCrypto upgrade=suite-lock reason=transitive dep of asupersync (fln-883f)\n"
+        ),
+    );
+    files.push((
+        "vendor/cargo/serde/.cargo-checksum.json".to_string(),
+        format!("{{\"files\":{{}},\"package\":\"{SERDE_CHECKSUM}\"}}"),
+    ));
+    files.push((
+        "vendor/cargo/block-buffer-0.10.4/.cargo-checksum.json".to_string(),
+        format!("{{\"files\":{{}},\"package\":\"{BB_10_CHECKSUM}\"}}"),
+    ));
+    files.push((
+        "vendor/cargo/block-buffer-0.12.1/.cargo-checksum.json".to_string(),
+        format!("{{\"files\":{{}},\"package\":\"{BB_12_CHECKSUM}\"}}"),
+    ));
+}
+
+#[test]
+fn reviewed_checksum_pinned_suite_registry_closure_passes() {
+    let out = run_with(
+        "suite-registry-clean",
+        add_allowlisted_suite_registry_closure,
+    );
+    assert!(
+        out.findings.is_empty(),
+        "expected reviewed checksum-pinned suite closure to pass, got {:?}",
+        out.findings
+    );
+}
+
+#[test]
+fn registry_closure_rejects_unlisted_crate_version_drift_and_checksum_mismatch() {
+    // 1. Unlisted transitive registry crate fails with FLN-STRUCT-018.
+    let unlisted = run_with("registry-unlisted", |files| {
+        add_allowlisted_suite_registry_closure(files);
+        replace_fragment(
+            files,
+            "Cargo.lock",
+            " \"block-buffer 0.12.1\",\n",
+            " \"block-buffer 0.12.1\",\n \"sneaky\",\n",
+        );
+        append(
+            files,
+            "Cargo.lock",
+            "\n[[package]]\nname = \"sneaky\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+        );
+    });
+    assert_eq!(codes(&unlisted), vec!["FLN-STRUCT-018"]);
+    assert!(unlisted.findings[0].detail.contains("sneaky"));
+
+    // 2. Listed crate at an unlisted version fails with FLN-STRUCT-018.
+    let wrong_version = run_with("registry-wrong-version", |files| {
+        add_allowlisted_suite_registry_closure(files);
+        replace_fragment(
+            files,
+            "Cargo.lock",
+            "name = \"serde\"\nversion = \"1.0.219\"",
+            "name = \"serde\"\nversion = \"1.0.220\"",
+        );
+    });
+    assert_eq!(codes(&wrong_version), vec!["FLN-STRUCT-018"]);
+    assert!(wrong_version.findings[0].detail.contains("1.0.220"));
+    assert!(wrong_version.findings[0].detail.contains("1.0.219"));
+
+    // 3. Listed crate with a mismatched checksum fails with FLN-STRUCT-018.
+    let bad_checksum = run_with("registry-bad-checksum", |files| {
+        add_allowlisted_suite_registry_closure(files);
+        let tampered = "f".repeat(64);
+        replace_fragment(files, "Cargo.lock", SERDE_CHECKSUM, &tampered);
+    });
+    assert_eq!(codes(&bad_checksum), vec!["FLN-STRUCT-018"]);
+    assert!(bad_checksum.findings[0].detail.contains("checksum"));
+
+    // 4. Git-sourced external crate stays prohibited even if allowlist names the crate.
+    let git_source = run_with("registry-git-source", |files| {
+        add_allowlisted_suite_registry_closure(files);
+        replace_fragment(
+            files,
+            "Cargo.lock",
+            "source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+            "source = \"git+https://github.com/serde-rs/serde#0123456789abcdef0123456789abcdef01234567\"",
+        );
+    });
+    assert_eq!(codes(&git_source), vec!["FLN-STRUCT-018"]);
+    assert!(git_source.findings[0].detail.contains("git"));
+}
+
+#[test]
+fn registry_closure_enforces_suite_reachability_and_offline_vendoring() {
+    // 1. An allowlisted registry crate NOT reachable from any suite crate is refused.
+    let orphan = run_with("registry-orphan", |files| {
+        add_allowlisted_suite_registry_closure(files);
+        replace_fragment(files, "Cargo.lock", " \"serde\",\n", "");
+    });
+    assert_eq!(codes(&orphan), vec!["FLN-STRUCT-018"]);
+    assert!(orphan.findings[0].detail.contains("not reachable"));
+
+    // 2. Missing vendor/cargo offline directory is refused.
+    let no_vendor = run_with("registry-no-vendor-dir", |files| {
+        add_allowlisted_suite_registry_closure(files);
+        files.retain(|(rel, _)| !rel.starts_with("vendor/cargo/"));
+    });
+    assert_eq!(codes(&no_vendor), vec!["FLN-STRUCT-018"]);
+    assert_eq!(no_vendor.findings[0].path, "vendor/cargo");
+
+    // 3. Vendored .cargo-checksum.json digest drift is refused.
+    let bad_vendor = run_with("registry-vendor-checksum-drift", |files| {
+        add_allowlisted_suite_registry_closure(files);
+        let tampered = "e".repeat(64);
+        replace(
+            files,
+            "vendor/cargo/serde/.cargo-checksum.json",
+            &format!("{{\"files\":{{}},\"package\":\"{tampered}\"}}"),
+        );
+    });
+    assert_eq!(codes(&bad_vendor), vec!["FLN-STRUCT-018"]);
+    assert!(bad_vendor.findings[0].detail.contains("package digest"));
+
+    // 4. Direct dependency from a workspace crate onto an allowlisted registry crate is refused.
+    let direct_ws = run_with("registry-direct-workspace-dep", |files| {
+        add_allowlisted_suite_registry_closure(files);
+        replace_fragment(
+            files,
+            "Cargo.lock",
+            "name = \"fln-core\"\nversion = \"0.0.0\"\ndependencies = [\n \"asupersync\",\n]\n",
+            "name = \"fln-core\"\nversion = \"0.0.0\"\ndependencies = [\n \"asupersync\",\n \"serde\",\n]\n",
+        );
+    });
+    assert!(
+        direct_ws.findings.iter().any(
+            |f| f.code == "FLN-STRUCT-018" && f.detail.contains("directly depends on registry")
+        ),
+        "expected direct workspace registry dep finding, got {:?}",
+        direct_ws.findings
+    );
+
+    // 5. A stale registry allowlist row (one of two versions dropped from Cargo.lock) emits FLN-STRUCT-019.
+    let stale_version = run_with("registry-stale-version", |files| {
+        add_allowlisted_suite_registry_closure(files);
+        replace_fragment(files, "Cargo.lock", " \"block-buffer 0.12.1\",\n", "");
+        replace_fragment(
+            files,
+            "Cargo.lock",
+            &format!(
+                "\n[[package]]\nname = \"block-buffer\"\nversion = \"0.12.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{BB_12_CHECKSUM}\"\n"
+            ),
+            "",
+        );
+    });
+    assert_eq!(codes(&stale_version), vec!["FLN-STRUCT-019"]);
+    assert!(stale_version.findings[0].detail.contains("block-buffer"));
+}

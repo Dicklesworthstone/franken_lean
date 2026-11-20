@@ -1,21 +1,29 @@
-# CLOSURE_ALLOWLIST.txt — the governed dependency closure (plan D1; bead franken_lean-xwf).
+# CLOSURE_ALLOWLIST.txt — the governed dependency closure (plan D1; beads franken_lean-xwf, fln-883f).
 #
 # Every package in Cargo.lock must have exactly one row here, and every row must match a
 # Cargo.lock package — both directions enforced by `tools/structure-guard` on every run.
 # A diff to this file IS the review artifact for a closure change; CI fails on any
-# unlisted package, version/source/checksum mismatch, or stale row. External (registry)
-# packages are prohibited outright: only workspace crates and SUITE.lock-pinned
-# FrankenSuite path dependencies can ever appear. No serde, no tokio, no rocksdb, no
-# LLVM, no cranelift, no gmp-sys, no external SAT solver — ever.
+# unlisted package, version/source/checksum mismatch, or stale row.
+#
+# Per the 2026-09-27 D1 amendment (bead fln-g1mc, resolving franken_lean-z8j.1.18):
+# - Direct workspace dependencies remain restricted to workspace crates and SUITE.lock-pinned
+#   FrankenSuite path dependencies (never serde, tokio, rocksdb, LLVM, cranelift, gmp-sys, or
+#   an external SAT solver on any `fln-*` crate).
+# - Transitive crates.io dependencies of a SUITE.lock-pinned FrankenSuite package are admitted
+#   ONLY as `source=registry` rows pinning the exact `(name, version, 64-hex checksum)`,
+#   `upgrade=suite-lock`, and offline vendoring under `vendor/cargo` (keeping `.cargo/config.toml`
+#   forbidden under FLN-STRUCT-016).
+# - Git sources and unallowlisted external packages remain prohibited outright.
 #
 # Row grammar (one row per line; reason= captures the rest of the line):
-#   package <name> version=<v> source=workspace|suite checksum=<hex|-> license=<spdx>
+#   package <name> version=<v> source=workspace|suite|registry checksum=<hex|-> license=<spdx>
 #           build-script=yes|no proc-macro=yes|no native-link=yes|no
 #           unsafe-audit=<forbid|deny-ledgered|external> policy=runtime|build|dev|fuzz
 #           owner=<owner> upgrade=<policy> reason=<free text>
 #
 # source=workspace rows carry checksum=- (path members have no registry checksum);
-# source=suite rows carry the SUITE.lock commit as their provenance and checksum=-.
+# source=suite rows carry the SUITE.lock commit as their provenance and checksum=-;
+# source=registry rows carry the exact 64-hex Cargo.lock SHA-256 checksum and upgrade=suite-lock.
 # build-script=no is verified against the crate tree (no build.rs may exist).
 
 schema fln-closure-allowlist/1

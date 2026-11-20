@@ -1,13 +1,17 @@
-//! The dependency-closure audit (plan D1, §22.1-10; bead franken_lean-xwf):
+//! The dependency-closure audit (plan D1, §22.1-10; beads franken_lean-xwf, fln-883f):
 //! `Cargo.lock` ⇄ `ci/CLOSURE_ALLOWLIST.txt` ⇄ `SUITE.lock` ⇄ `rust-toolchain.toml`.
 //!
 //! What is enforced, both directions, on every run:
 //!
 //! * every `Cargo.lock` package has exactly one allowlist row (name + version + source
-//!   class), and every allowlist row matches a lock package — no unlisted package, no
+//!   class + exact 64-hex checksum for registry crates), and every allowlist row matches
+//!   a lock package — no unlisted package, no unlisted version, no checksum mismatch, no
 //!   stale approval (`FLN-STRUCT-018` / `FLN-STRUCT-019`);
-//! * registry/git packages are prohibited outright: a lock package carrying a `source`
-//!   or `checksum` is a finding, not a policy question (`FLN-STRUCT-018`);
+//! * git and non-crates.io external sources are prohibited outright (`FLN-STRUCT-018`);
+//!   crates.io registry packages are admitted ONLY inside the transitive closure of a
+//!   `SUITE.lock`-pinned FrankenSuite dependency, never as a direct dependency of any
+//!   workspace crate, and must be vendored offline under `vendor/cargo` with a
+//!   matching `.cargo-checksum.json` package digest (`FLN-STRUCT-018`);
 //! * every allowlist policy field is semantic: manifest version/license/dependency
 //!   closure, path-source checksum, build script, target kind, unsafe posture, owner,
 //!   lane, and upgrade authority are independently derived and compared;
@@ -18,7 +22,7 @@
 //! * a missing or malformed governance file is a `FLN-STRUCT-016` finding — the audit
 //!   degrades to findings, never to a silent skip.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -26,6 +30,18 @@ use crate::checks::Finding;
 use crate::graph::{CrateKind, GraphFile};
 use crate::manifest;
 use crate::{ALLOWLIST_FILE, LOCK_FILE, SUITE_LOCK_FILE, TOOLCHAIN_FILE};
+
+const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+const VENDOR_CARGO_DIR: &str = "vendor/cargo";
+
+/// Split a Cargo.lock v4 dependency specification (`"name"`, `"name 1.2.3"`, or
+/// `"name 1.2.3 (registry+...)"`) into `(name, optional_version)`.
+fn parse_lock_dep_spec(spec: &str) -> (&str, Option<&str>) {
+    let mut parts = spec.split_whitespace();
+    let name = parts.next().unwrap_or("");
+    let version = parts.next().filter(|token| !token.starts_with('('));
+    (name, version)
+}
 
 #[derive(Debug)]
 pub struct LockPackage {
@@ -59,7 +75,8 @@ pub fn parse_cargo_lock(text: &str, display_path: &str) -> Result<Vec<LockPackag
     let mut current: Option<PendingLockPackage> = None;
     let mut lock_version: Option<u64> = None;
     let mut dependency_array_line: Option<usize> = None;
-    let mut package_names = BTreeSet::new();
+    let mut path_package_names = BTreeSet::new();
+    let mut package_identities = BTreeSet::new();
 
     let mut finish =
         |cur: &mut Option<PendingLockPackage>, out: &mut Vec<LockPackage>| -> Result<(), String> {
@@ -67,16 +84,22 @@ pub fn parse_cargo_lock(text: &str, display_path: &str) -> Result<Vec<LockPackag
                 let name = package
                     .name
                     .ok_or_else(|| format!("{display_path}: package without name"))?;
-                if !package_names.insert(name.clone()) {
+                let version = package
+                    .version
+                    .ok_or_else(|| format!("{display_path}: package without version"))?;
+                if package.source.is_none() && !path_package_names.insert(name.clone()) {
                     return Err(format!(
                         "{display_path}: duplicate package identity for `{name}`"
                     ));
                 }
+                if !package_identities.insert((name.clone(), version.clone())) {
+                    return Err(format!(
+                        "{display_path}: duplicate package identity for `{name}` {version}"
+                    ));
+                }
                 out.push(LockPackage {
                     name,
-                    version: package
-                        .version
-                        .ok_or_else(|| format!("{display_path}: package without version"))?,
+                    version,
                     source: package.source,
                     checksum: package.checksum,
                     dependencies: package.dependencies.unwrap_or_default(),
@@ -346,10 +369,8 @@ pub fn parse_allowlist(text: &str) -> Result<Vec<AllowRow>, String> {
             }
         }
         let source = kv["source"];
-        if source != "workspace" && source != "suite" {
-            return Err(err(
-                "source must be workspace|suite (registry is prohibited)",
-            ));
+        if !matches!(source, "workspace" | "suite" | "registry") {
+            return Err(err("source must be workspace|suite|registry"));
         }
         for field in ["version", "license", "owner"] {
             if !is_safe_atom(kv[field]) {
@@ -363,6 +384,11 @@ pub fn parse_allowlist(text: &str) -> Result<Vec<AllowRow>, String> {
             && !(checksum.len() == 64 && checksum.chars().all(|ch| ch.is_ascii_hexdigit()))
         {
             return Err(err("checksum must be `-` or exactly 64 hexadecimal digits"));
+        }
+        if source == "registry" && checksum == "-" {
+            return Err(err(
+                "registry rows must pin an exact 64-hex checksum (not `-`)",
+            ));
         }
         let build_script = parse_yes_no(kv["build-script"], "build-script").map_err(|e| err(&e))?;
         let proc_macro = parse_yes_no(kv["proc-macro"], "proc-macro").map_err(|e| err(&e))?;
@@ -379,7 +405,13 @@ pub fn parse_allowlist(text: &str) -> Result<Vec<AllowRow>, String> {
         if !["workspace", "suite-lock"].contains(&upgrade) {
             return Err(err("upgrade must be workspace|suite-lock"));
         }
-        if rows.iter().any(|r| r.name == name) {
+        let duplicate = if source == "registry" {
+            rows.iter()
+                .any(|r| r.name == name && (r.source != "registry" || r.version == kv["version"]))
+        } else {
+            rows.iter().any(|r| r.name == name)
+        };
+        if duplicate {
             return Err(err(&format!("duplicate row for `{name}`")));
         }
         rows.push(AllowRow {
@@ -912,6 +944,74 @@ fn policy_for_dependency_section(section: &str) -> &'static str {
     }
 }
 
+/// Extract the exact 64-hex `"package"` digest from a vendored crate's `.cargo-checksum.json`.
+fn extract_cargo_checksum_package(text: &str) -> Option<String> {
+    let key = "\"package\"";
+    let idx = text.find(key)?;
+    let rest = text[idx + key.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let digest = &rest[..end];
+    if digest.len() == 64 && digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Some(digest.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn verify_vendored_crate(
+    vendor_root: &Path,
+    name: &str,
+    version: &str,
+    expected_checksum: &str,
+) -> Result<(), String> {
+    let versioned = vendor_root.join(format!("{name}-{version}"));
+    let plain = vendor_root.join(name);
+    let candidates = [versioned, plain];
+    let mut seen_mismatch: Option<String> = None;
+
+    for candidate in &candidates {
+        let Ok(meta) = fs::symlink_metadata(candidate) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "vendored crate path `{}` is a symlink",
+                candidate.display()
+            ));
+        }
+        if !meta.is_dir() {
+            continue;
+        }
+        let checksum_path = candidate.join(".cargo-checksum.json");
+        let text = fs::read_to_string(&checksum_path)
+            .map_err(|e| format!("cannot read `{}`: {e}", checksum_path.display()))?;
+        let Some(actual) = extract_cargo_checksum_package(&text) else {
+            return Err(format!(
+                "`{}` is missing a valid 64-hex `package` digest",
+                checksum_path.display()
+            ));
+        };
+        if actual == expected_checksum {
+            return Ok(());
+        }
+        seen_mismatch = Some(format!(
+            "`{}` package digest `{actual}` != expected `{expected_checksum}`",
+            checksum_path.display()
+        ));
+    }
+
+    if let Some(detail) = seen_mismatch {
+        Err(detail)
+    } else {
+        Err(format!(
+            "vendored crate `{name}` {version} not found under `{}`",
+            vendor_root.display()
+        ))
+    }
+}
+
 /// Run the closure audit. Missing/malformed governance files degrade to
 /// `FLN-STRUCT-016` findings so the remaining structural checks still report.
 pub fn audit(root: &Path, graph: &GraphFile) -> Vec<Finding> {
@@ -957,71 +1057,287 @@ pub fn audit(root: &Path, graph: &GraphFile) -> Vec<Finding> {
 
     let manifests = workspace_manifests(root, graph);
     if let (Some(packages), Some(rows)) = (&packages, &rows) {
-        let lock_by_name: BTreeMap<&str, &LockPackage> = packages
-            .iter()
-            .map(|package| (package.name.as_str(), package))
-            .collect();
-        let row_by_name: BTreeMap<&str, &AllowRow> =
-            rows.iter().map(|row| (row.name.as_str(), row)).collect();
+        let mut path_lock_by_name: BTreeMap<&str, &LockPackage> = BTreeMap::new();
+        let mut lock_by_key: BTreeMap<(&str, &str), &LockPackage> = BTreeMap::new();
+        let mut lock_versions_by_name: BTreeMap<&str, Vec<&LockPackage>> = BTreeMap::new();
+        for package in packages {
+            if package.source.is_none() && package.checksum.is_none() {
+                path_lock_by_name.insert(package.name.as_str(), package);
+            }
+            lock_by_key.insert((package.name.as_str(), package.version.as_str()), package);
+            lock_versions_by_name
+                .entry(package.name.as_str())
+                .or_default()
+                .push(package);
+        }
+
+        let mut path_row_by_name: BTreeMap<&str, &AllowRow> = BTreeMap::new();
+        let mut registry_rows_by_key: BTreeMap<(&str, &str), &AllowRow> = BTreeMap::new();
+        let mut registry_rows_by_name: BTreeMap<&str, Vec<&AllowRow>> = BTreeMap::new();
+        for row in rows {
+            if row.source == "registry" {
+                registry_rows_by_key.insert((row.name.as_str(), row.version.as_str()), row);
+                registry_rows_by_name
+                    .entry(row.name.as_str())
+                    .or_default()
+                    .push(row);
+            } else {
+                path_row_by_name.insert(row.name.as_str(), row);
+            }
+        }
+
+        // Resolve one Cargo.lock dependency string to its target LockPackage(s).
+        let resolve_dep = |spec: &str| -> Result<&LockPackage, String> {
+            let (dep_name, dep_ver) = parse_lock_dep_spec(spec);
+            if let Some(version) = dep_ver {
+                lock_by_key
+                    .get(&(dep_name, version))
+                    .copied()
+                    .ok_or_else(|| format!("dependency `{spec}` has no matching package record"))
+            } else {
+                match lock_versions_by_name.get(dep_name).map(Vec::as_slice) {
+                    Some([only]) => Ok(*only),
+                    Some(many) if many.len() > 1 => Err(format!(
+                        "unversioned dependency `{spec}` is ambiguous across {} versions",
+                        many.len()
+                    )),
+                    _ => Err(format!("dependency `{spec}` has no package record")),
+                }
+            }
+        };
+
+        // Compute the transitive closure reachable from SUITE.lock-pinned `source=suite` packages.
+        let mut reachable_from_suite: BTreeSet<(&str, &str)> = BTreeSet::new();
+        let mut queue: VecDeque<&LockPackage> = VecDeque::new();
+        for package in packages {
+            if package.source.is_none()
+                && package.checksum.is_none()
+                && path_row_by_name
+                    .get(package.name.as_str())
+                    .is_some_and(|row| row.source == "suite")
+                && graph.suite_deps.iter().any(|name| name == &package.name)
+                && reachable_from_suite.insert((package.name.as_str(), package.version.as_str()))
+            {
+                queue.push_back(package);
+            }
+        }
+        while let Some(current) = queue.pop_front() {
+            for dep in &current.dependencies {
+                if let Ok(target) = resolve_dep(dep)
+                    && reachable_from_suite.insert((target.name.as_str(), target.version.as_str()))
+                {
+                    queue.push_back(target);
+                }
+            }
+        }
+
+        let mut active_registry_packages: Vec<(&LockPackage, &AllowRow)> = Vec::new();
+        let mut unmatched_registry_names: BTreeSet<&str> = BTreeSet::new();
 
         for package in packages {
             if package.source.is_some() || package.checksum.is_some() {
-                findings.push(policy_finding(
-                    LOCK_FILE,
-                    format!(
-                        "package `{}` comes from a registry/git source — external packages are prohibited (D1)",
-                        package.name
-                    ),
-                ));
-                continue;
-            }
-            match row_by_name.get(package.name.as_str()) {
-                None => findings.push(policy_finding(
-                    LOCK_FILE,
-                    format!(
-                        "package `{}` {} has no row in {ALLOWLIST_FILE}",
-                        package.name, package.version
-                    ),
-                )),
-                Some(row) if row.version != package.version => {
-                    findings.push(policy_finding(
-                        ALLOWLIST_FILE,
-                        format!(
-                            "package `{}`: lock has {}, allowlist approves {}",
-                            package.name, package.version, row.version
-                        ),
-                    ));
-                }
-                Some(row) => {
-                    if row.source == "workspace" && !graph.crates.contains_key(&package.name) {
-                        findings.push(policy_finding(
-                            ALLOWLIST_FILE,
-                            format!(
-                                "package `{}` claims source=workspace but is not a declared workspace crate",
-                                package.name
-                            ),
-                        ));
-                    }
-                    if row.source == "suite"
-                        && !graph.suite_deps.iter().any(|name| name == &package.name)
-                    {
-                        findings.push(policy_finding(
-                            ALLOWLIST_FILE,
-                            format!(
-                                "package `{}` claims source=suite but is not a WORKSPACE_GRAPH suite-dep",
-                                package.name
-                            ),
-                        ));
-                    }
-                }
-            }
-            for dependency in &package.dependencies {
-                if !lock_by_name.contains_key(dependency.as_str()) {
+                if package.source.as_deref() != Some(CRATES_IO_SOURCE) {
                     findings.push(policy_finding(
                         LOCK_FILE,
                         format!(
-                            "package `{}` names dependency `{dependency}` which has no package record",
-                            package.name
+                            "package `{}` {} uses non-crates.io external/git source `{}` — prohibited (D1)",
+                            package.name,
+                            package.version,
+                            package.source.as_deref().unwrap_or("<missing>")
+                        ),
+                    ));
+                    unmatched_registry_names.insert(package.name.as_str());
+                } else {
+                    let Some(lock_checksum) = package.checksum.as_deref() else {
+                        findings.push(policy_finding(
+                            LOCK_FILE,
+                            format!(
+                                "registry package `{}` {} is missing a SHA-256 checksum (D1)",
+                                package.name, package.version
+                            ),
+                        ));
+                        unmatched_registry_names.insert(package.name.as_str());
+                        continue;
+                    };
+                    match registry_rows_by_key
+                        .get(&(package.name.as_str(), package.version.as_str()))
+                    {
+                        Some(row) => {
+                            if row.checksum != lock_checksum {
+                                findings.push(policy_finding(
+                                    LOCK_FILE,
+                                    format!(
+                                        "registry package `{}` {}: lock checksum `{lock_checksum}` != allowlist checksum `{}` (D1)",
+                                        package.name, package.version, row.checksum
+                                    ),
+                                ));
+                            }
+                            if row.upgrade != "suite-lock" {
+                                findings.push(policy_finding(
+                                    ALLOWLIST_FILE,
+                                    format!(
+                                        "registry package `{}` {} requires upgrade=suite-lock, found `{}`",
+                                        package.name, package.version, row.upgrade
+                                    ),
+                                ));
+                            }
+                            if !matches!(row.unsafe_audit.as_str(), "forbid" | "external") {
+                                findings.push(policy_finding(
+                                    ALLOWLIST_FILE,
+                                    format!(
+                                        "registry package `{}` {} requires unsafe-audit=forbid|external, found `{}`",
+                                        package.name, package.version, row.unsafe_audit
+                                    ),
+                                ));
+                            }
+                            if !reachable_from_suite
+                                .contains(&(package.name.as_str(), package.version.as_str()))
+                            {
+                                findings.push(policy_finding(
+                                    LOCK_FILE,
+                                    format!(
+                                        "registry package `{}` {} is not reachable from any SUITE.lock-pinned FrankenSuite dependency (D1)",
+                                        package.name, package.version
+                                    ),
+                                ));
+                            }
+                            active_registry_packages.push((package, row));
+                        }
+                        None => {
+                            unmatched_registry_names.insert(package.name.as_str());
+                            if let Some(approved) = registry_rows_by_name.get(package.name.as_str())
+                            {
+                                let versions: Vec<&str> =
+                                    approved.iter().map(|r| r.version.as_str()).collect();
+                                findings.push(policy_finding(
+                                    LOCK_FILE,
+                                    format!(
+                                        "registry package `{}`: lock has {}, allowlist approves [{}] (D1)",
+                                        package.name,
+                                        package.version,
+                                        versions.join(", ")
+                                    ),
+                                ));
+                            } else {
+                                findings.push(policy_finding(
+                                    LOCK_FILE,
+                                    format!(
+                                        "package `{}` {} comes from registry source `{}` and has no reviewed row in {ALLOWLIST_FILE} (D1)",
+                                        package.name, package.version, CRATES_IO_SOURCE
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else {
+                match path_row_by_name.get(package.name.as_str()) {
+                    None => findings.push(policy_finding(
+                        LOCK_FILE,
+                        format!(
+                            "package `{}` {} has no row in {ALLOWLIST_FILE}",
+                            package.name, package.version
+                        ),
+                    )),
+                    Some(row) if row.version != package.version => {
+                        findings.push(policy_finding(
+                            ALLOWLIST_FILE,
+                            format!(
+                                "package `{}`: lock has {}, allowlist approves {}",
+                                package.name, package.version, row.version
+                            ),
+                        ));
+                    }
+                    Some(row) => {
+                        if row.source == "workspace" && !graph.crates.contains_key(&package.name) {
+                            findings.push(policy_finding(
+                                ALLOWLIST_FILE,
+                                format!(
+                                    "package `{}` claims source=workspace but is not a declared workspace crate",
+                                    package.name
+                                ),
+                            ));
+                        }
+                        if row.source == "suite"
+                            && !graph.suite_deps.iter().any(|name| name == &package.name)
+                        {
+                            findings.push(policy_finding(
+                                ALLOWLIST_FILE,
+                                format!(
+                                    "package `{}` claims source=suite but is not a WORKSPACE_GRAPH suite-dep",
+                                    package.name
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            let is_workspace_pkg =
+                package.source.is_none() && graph.crates.contains_key(&package.name);
+            for dependency in &package.dependencies {
+                match resolve_dep(dependency) {
+                    Ok(target) => {
+                        if is_workspace_pkg && target.source.is_some() {
+                            findings.push(policy_finding(
+                                LOCK_FILE,
+                                format!(
+                                    "workspace crate `{}` directly depends on registry package `{}` {} — D1 forbids direct registry dependencies on fln-* crates",
+                                    package.name, target.name, target.version
+                                ),
+                            ));
+                        }
+                    }
+                    Err(detail) => {
+                        findings.push(policy_finding(
+                            LOCK_FILE,
+                            format!("package `{}` names {detail}", package.name),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Offline build guarantee (fln-883f): whenever any allowlisted registry crate is
+        // present in Cargo.lock, the governed `vendor/cargo` directory must exist (without
+        // introducing a forbidden `.cargo/config.toml`) and contain every active registry
+        // crate at its exact allowlisted SHA-256 checksum so `--offline` builds work on
+        // every host via explicit `--config source.crates-io.replace-with=...`.
+        if !active_registry_packages.is_empty() {
+            let vendor_root = root.join(VENDOR_CARGO_DIR);
+            match fs::symlink_metadata(&vendor_root) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    findings.push(policy_finding(
+                        VENDOR_CARGO_DIR,
+                        format!(
+                            "vendor directory `{VENDOR_CARGO_DIR}` is a symlink; offline vendor root must be a governed directory"
+                        ),
+                    ));
+                }
+                Ok(meta) if meta.is_dir() => {
+                    for (pkg, row) in &active_registry_packages {
+                        if let Err(detail) = verify_vendored_crate(
+                            &vendor_root,
+                            &pkg.name,
+                            &pkg.version,
+                            &row.checksum,
+                        ) {
+                            findings.push(policy_finding(
+                                VENDOR_CARGO_DIR,
+                                format!(
+                                    "offline vendor check failed for `{}` {}: {detail}",
+                                    pkg.name, pkg.version
+                                ),
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    findings.push(policy_finding(
+                        VENDOR_CARGO_DIR,
+                        format!(
+                            "Cargo.lock has {} registry package(s) but governed vendor directory `{VENDOR_CARGO_DIR}` is missing for offline builds",
+                            active_registry_packages.len()
                         ),
                     ));
                 }
@@ -1029,22 +1345,23 @@ pub fn audit(root: &Path, graph: &GraphFile) -> Vec<Finding> {
         }
 
         for (name, declaration) in &graph.crates {
-            if !lock_by_name.contains_key(name.as_str()) {
+            if !path_lock_by_name.contains_key(name.as_str()) {
                 findings.push(policy_finding(
                     LOCK_FILE,
                     format!("workspace crate `{name}` has no Cargo.lock package record"),
                 ));
             }
-            if !row_by_name.contains_key(name.as_str()) {
+            if !path_row_by_name.contains_key(name.as_str()) {
                 findings.push(policy_finding(
                     ALLOWLIST_FILE,
                     format!("workspace crate `{name}` has no reviewed allowlist row"),
                 ));
             }
 
-            let (Some(row), Some(info)) =
-                (row_by_name.get(name.as_str()).copied(), manifests.get(name))
-            else {
+            let (Some(row), Some(info)) = (
+                path_row_by_name.get(name.as_str()).copied(),
+                manifests.get(name),
+            ) else {
                 continue;
             };
             if row.source != "workspace" {
@@ -1149,7 +1466,7 @@ pub fn audit(root: &Path, graph: &GraphFile) -> Vec<Finding> {
         }
 
         for (name, info) in &manifests {
-            let Some(package) = lock_by_name.get(name.as_str()) else {
+            let Some(package) = path_lock_by_name.get(name.as_str()) else {
                 continue;
             };
             let manifest_dependencies: BTreeSet<String> = info
@@ -1158,13 +1475,17 @@ pub fn audit(root: &Path, graph: &GraphFile) -> Vec<Finding> {
                 .iter()
                 .map(|dependency| dependency.name.clone())
                 .collect();
-            if manifest_dependencies != package.dependencies {
+            let lock_dependencies: BTreeSet<String> = package
+                .dependencies
+                .iter()
+                .map(|dependency| parse_lock_dep_spec(dependency).0.to_string())
+                .collect();
+            if manifest_dependencies != lock_dependencies {
                 let only_manifest: Vec<&str> = manifest_dependencies
-                    .difference(&package.dependencies)
+                    .difference(&lock_dependencies)
                     .map(String::as_str)
                     .collect();
-                let only_lock: Vec<&str> = package
-                    .dependencies
+                let only_lock: Vec<&str> = lock_dependencies
                     .difference(&manifest_dependencies)
                     .map(String::as_str)
                     .collect();
@@ -1177,18 +1498,20 @@ pub fn audit(root: &Path, graph: &GraphFile) -> Vec<Finding> {
             }
         }
 
-        let lock_names: BTreeSet<&str> = packages
-            .iter()
-            .map(|package| package.name.as_str())
-            .collect();
         for row in rows {
-            if !lock_names.contains(row.name.as_str()) {
+            let matched = if row.source == "registry" {
+                lock_by_key.contains_key(&(row.name.as_str(), row.version.as_str()))
+                    || unmatched_registry_names.contains(row.name.as_str())
+            } else {
+                path_lock_by_name.contains_key(row.name.as_str())
+            };
+            if !matched {
                 findings.push(Finding {
                     code: "FLN-STRUCT-019",
                     path: ALLOWLIST_FILE.to_string(),
                     detail: format!(
-                        "allowlist row `{}` matches no Cargo.lock package (stale approval)",
-                        row.name
+                        "allowlist row `{}` {} matches no Cargo.lock package (stale approval)",
+                        row.name, row.version
                     ),
                 });
             }
@@ -1251,10 +1574,14 @@ pub fn audit(root: &Path, graph: &GraphFile) -> Vec<Finding> {
         if let (Some(packages), Some(rows)) = (&packages, &rows) {
             let lock_by_name: BTreeMap<&str, &LockPackage> = packages
                 .iter()
+                .filter(|package| package.source.is_none() && package.checksum.is_none())
                 .map(|package| (package.name.as_str(), package))
                 .collect();
-            let row_by_name: BTreeMap<&str, &AllowRow> =
-                rows.iter().map(|row| (row.name.as_str(), row)).collect();
+            let row_by_name: BTreeMap<&str, &AllowRow> = rows
+                .iter()
+                .filter(|row| row.source != "registry")
+                .map(|row| (row.name.as_str(), row))
+                .collect();
             let mut verified_repos = BTreeSet::new();
 
             for row in rows.iter().filter(|row| row.source == "suite") {
@@ -1774,6 +2101,37 @@ mod tests {
                 "[toolchain]\nchannel = \"nightly-2026-07-13\"\nprofile = \"fast\"\n"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_registry_allowlist_and_vendor_config() {
+        let csum = "5f0e2c6ed6606019b4e29e69dbaba95b11854410e5347d525002456dbbb786b6";
+        let csum2 = "3078c7629b62d3f0439d1892204acaf4722ef9a126640836a75b38ce6fc36318";
+        let multi = format!(
+            "schema fln-closure-allowlist/1\n\
+             package block-buffer version=0.10.4 source=registry checksum={csum} license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=external policy=runtime owner=RustCrypto upgrade=suite-lock reason=dep1\n\
+             package block-buffer version=0.12.1 source=registry checksum={csum2} license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=external policy=runtime owner=RustCrypto upgrade=suite-lock reason=dep2\n"
+        );
+        let rows = parse_allowlist(&multi).expect("multi-version registry rows parse");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].checksum, csum);
+        assert_eq!(rows[1].version, "0.12.1");
+
+        // Duplicate (name, version) for registry row is rejected.
+        let dup_ver = format!(
+            "{multi}package block-buffer version=0.10.4 source=registry checksum={csum} license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=external policy=runtime owner=RustCrypto upgrade=suite-lock reason=dup\n"
+        );
+        assert!(parse_allowlist(&dup_ver).is_err());
+
+        // Vendored .cargo-checksum.json package digest extraction.
+        assert_eq!(
+            extract_cargo_checksum_package(&format!(r#"{{"files":{{}},"package":"{csum}"}}"#)),
+            Some(csum.to_string())
+        );
+        assert_eq!(
+            extract_cargo_checksum_package(r#"{"files":{},"package":"short"}"#),
+            None
         );
     }
 }
