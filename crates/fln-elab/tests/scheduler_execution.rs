@@ -105,6 +105,108 @@ fn count(calls: &AtomicUsize) -> usize {
     calls.load(Ordering::SeqCst)
 }
 
+// Keep each frame alive across the recursive call. The probe uses more than
+// Rust's default 2 MiB worker stack, but fits the explicit 16 MiB reservation.
+// Run it in a subprocess so a regressed stack allocation cannot abort the suite.
+#[inline(never)]
+fn consume_stack(depth: usize) -> usize {
+    let mut frame = [0_u8; 32 * 1024];
+    frame[0] = depth as u8;
+    std::hint::black_box(&mut frame);
+    let nested = if depth == 0 {
+        0
+    } else {
+        consume_stack(depth - 1)
+    };
+    nested + usize::from(std::hint::black_box(frame[0]))
+}
+
+#[test]
+fn configured_stacks_cover_serial_parallel_barrier_and_retry() {
+    const PROBE: &str = "FLN_SCHEDULER_STACK_PROBE";
+    let Ok(scenario) = std::env::var(PROBE) else {
+        for scenario in ["serial", "parallel", "barrier", "retry"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "configured_stacks_cover_serial_parallel_barrier_and_retry",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(PROBE, scenario)
+                .env_remove("RUST_MIN_STACK")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{scenario} did not honor the requested stack: {:?}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        return;
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let a = counted(
+        0,
+        &Arc::new(AtomicUsize::new(0)),
+        EffectSummary::new(),
+        |_, _| Outcome::complete(Ok(published("A"))),
+    );
+    let declared_effects = if scenario == "barrier" {
+        effects([CommandEffect::Opaque {
+            reason: "stack probe at a serial barrier".into(),
+        }])
+    } else {
+        EffectSummary::new()
+    };
+    let retry = scenario == "retry";
+    let b = counted(1, &calls, declared_effects, move |environment, _| {
+        let mut product = ElabUnitProduct::empty();
+        if retry {
+            product.effects.record(read("A"));
+        }
+        if !retry || environment.contains(&name("A")) {
+            assert_eq!(consume_stack(128), (0..=128).sum());
+        }
+        Outcome::complete(Ok(product))
+    });
+    let config = ExecutionConfig {
+        worker_threads: if scenario == "serial" { 1 } else { 8 },
+        worker_stack_bytes: 16 * 1024 * 1024,
+        ..ExecutionConfig::default()
+    };
+    let output =
+        match DeterministicScheduler::execute(&graph(vec![a, b]), &Environment::new(), &config) {
+            Outcome::Complete(Ok(output)) => output,
+            other => panic!("stack probe did not complete: {other:?}"),
+        };
+    assert_eq!(output.committed_order, vec![CommandId(0), CommandId(1)]);
+    assert_eq!(output.retry_count, usize::from(retry));
+    assert_eq!(count(&calls), if retry { 2 } else { 1 });
+}
+
+#[test]
+fn absent_worker_stack_stops_before_running_or_publishing_commands() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let node = counted(0, &calls, EffectSummary::new(), |_, _| {
+        Outcome::complete(Ok(published("A")))
+    });
+    let environment = Environment::new();
+    let config = ExecutionConfig {
+        worker_stack_bytes: 0,
+        ..ExecutionConfig::default()
+    };
+    assert!(matches!(
+        DeterministicScheduler::execute(&graph(vec![node]), &environment, &config),
+        Outcome::Inconclusive(_)
+    ));
+    assert_eq!(count(&calls), 0);
+    assert!(!environment.contains(&name("A")));
+}
+
 #[test]
 fn declared_dependencies_execute_once_against_committed_predecessors() {
     for workers in [1, 8, 32] {

@@ -215,16 +215,19 @@ fn test_thread_matrix_schedule_independence_1_8_32_threads() {
         worker_threads: 1,
         enable_speculation: true,
         budget: budget.clone(),
+        ..ExecutionConfig::default()
     };
     let config_8 = ExecutionConfig {
         worker_threads: 8,
         enable_speculation: true,
         budget: budget.clone(),
+        ..ExecutionConfig::default()
     };
     let config_32 = ExecutionConfig {
         worker_threads: 32,
         enable_speculation: true,
         budget: budget.clone(),
+        ..ExecutionConfig::default()
     };
 
     let out_1 = match DeterministicScheduler::execute(&graph, &base_env, &config_1) {

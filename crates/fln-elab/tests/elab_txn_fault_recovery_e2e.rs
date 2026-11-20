@@ -239,6 +239,7 @@ fn fault_recovery_and_parallel_elaboration_are_schedule_independent_at_1_8_and_3
             worker_threads: threads,
             enable_speculation: true,
             budget: ElabBudget::new(200_000, 512),
+            ..ExecutionConfig::default()
         };
         let out = DeterministicScheduler::execute_parallel(&graph, &base_env, &config)
             .into_complete()

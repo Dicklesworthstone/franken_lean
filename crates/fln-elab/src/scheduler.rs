@@ -30,6 +30,13 @@ use crate::txn::ElabBudget;
 pub struct ExecutionConfig {
     /// Number of worker threads (e.g., 1, 8, 32).
     pub worker_threads: usize,
+    /// Native stack reserved for the coordinator and each elaboration worker.
+    ///
+    /// Callbacks that invoke K1 must supply at least the stack recorded by their
+    /// kernel budget's calibration. The default accommodates `Budget::DEFAULT`;
+    /// Rust's default worker stack does not. Serial commands, barriers and
+    /// speculative retries use this same reservation.
+    pub worker_stack_bytes: usize,
     /// Whether speculative parallel execution is enabled.
     pub enable_speculation: bool,
     /// Resource and heartbeat budget for elaboration.
@@ -40,6 +47,7 @@ impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             worker_threads: 1,
+            worker_stack_bytes: fln_kernel::verdict::Budget::MIN_STACK_BYTES,
             enable_speculation: true,
             budget: ElabBudget::default(),
         }
@@ -141,6 +149,7 @@ fn run_batch(
     nodes: &[DataflowNode],
     environment: &Environment,
     budget: &ElabBudget,
+    worker_stack_bytes: usize,
 ) -> Outcome<Vec<CommandOutcome>> {
     if let [node] = nodes {
         return Outcome::complete(vec![invoke(node, environment, budget)]);
@@ -149,6 +158,7 @@ fn run_batch(
         let mut handles = Vec::with_capacity(nodes.len());
         for node in nodes {
             let worker = std::thread::Builder::new()
+                .stack_size(worker_stack_bytes)
                 .spawn_scoped(scope, move || invoke(node, environment, budget));
             match worker {
                 Ok(handle) => handles.push((node.id, handle)),
@@ -182,6 +192,9 @@ pub struct DeterministicScheduler;
 
 impl DeterministicScheduler {
     /// Execute a dataflow graph sequentially, validating IDs before any callbacks.
+    ///
+    /// This low-level entry point runs on the caller's stack. Use [`Self::execute`]
+    /// when callbacks need the stack reservation from [`ExecutionConfig`].
     pub fn execute_sequential(
         graph: &DataflowGraph,
         base_env: &Environment,
@@ -211,6 +224,46 @@ impl DeterministicScheduler {
     /// Execute bounded ready prefixes, never speculating across a barrier or
     /// ahead of a declared dependency. Batch width is capped by worker_threads.
     pub fn execute_parallel(
+        graph: &DataflowGraph,
+        base_env: &Environment,
+        config: &ExecutionConfig,
+    ) -> Outcome<Result<SchedulerOutput, String>> {
+        if let Err(error) = graph.validate() {
+            return Outcome::complete(Err(error));
+        }
+        if graph.is_empty() {
+            return Outcome::complete(Ok(SchedulerOutput::empty(base_env)));
+        }
+        if config.worker_stack_bytes == 0 {
+            return Outcome::Inconclusive(Inconclusive::dependency_unavailable(
+                "elaboration requires a nonzero worker stack reservation",
+            ));
+        }
+        // Single-command batches and rebases run on the coordinator. Giving only
+        // parallel workers a calibrated stack would leave those paths dependent
+        // on the caller's (often 2 MiB test-thread) stack and on batch width.
+        std::thread::scope(|scope| {
+            let coordinator = std::thread::Builder::new()
+                .stack_size(config.worker_stack_bytes)
+                .spawn_scoped(scope, || {
+                    Self::execute_parallel_inner(graph, base_env, config)
+                });
+            match coordinator {
+                Ok(handle) => match handle.join() {
+                    Ok(outcome) => outcome,
+                    Err(_) => Outcome::InternalFault(InternalFault::new(
+                        "FL-INV-01",
+                        "elaboration coordinator panicked",
+                    )),
+                },
+                Err(error) => Outcome::Inconclusive(Inconclusive::dependency_unavailable(format!(
+                    "elaboration coordinator could not reserve a worker: {error}",
+                ))),
+            }
+        })
+    }
+
+    fn execute_parallel_inner(
         graph: &DataflowGraph,
         base_env: &Environment,
         config: &ExecutionConfig,
@@ -248,7 +301,12 @@ impl DeterministicScheduler {
             }
             let batch = &nodes[next..end];
             let concurrent = batch.len() > 1;
-            let outcomes = match run_batch(batch, &output.final_environment, &config.budget) {
+            let outcomes = match run_batch(
+                batch,
+                &output.final_environment,
+                &config.budget,
+                config.worker_stack_bytes,
+            ) {
                 Outcome::Complete(outcomes) => outcomes,
                 Outcome::Inconclusive(stop) => return Outcome::Inconclusive(stop),
                 Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
@@ -319,11 +377,7 @@ impl DeterministicScheduler {
         base_env: &Environment,
         config: &ExecutionConfig,
     ) -> Outcome<Result<SchedulerOutput, String>> {
-        if config.worker_threads > 1 && config.enable_speculation {
-            Self::execute_parallel(graph, base_env, config)
-        } else {
-            Self::execute_sequential(graph, base_env, &config.budget)
-        }
+        Self::execute_parallel(graph, base_env, config)
     }
 }
 
