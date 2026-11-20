@@ -455,37 +455,56 @@ impl Eq for Name {}
 
 impl std::hash::Hash for Name {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        enum HashTask<'a> {
-            Repr(&'a Repr),
-            Str(&'a String),
-            U64(u64),
-            Bool(bool),
-        }
-
-        let mut tasks = vec![HashTask::Repr(&self.0)];
-        while let Some(task) = tasks.pop() {
-            match task {
-                HashTask::Repr(repr) => {
-                    std::hash::Hash::hash(&std::mem::discriminant(repr), state);
-                    match repr {
-                        Repr::Anonymous => {}
-                        Repr::Str(node) => {
-                            tasks.push(HashTask::U64(node.hash));
-                            tasks.push(HashTask::Str(&node.component));
-                            tasks.push(HashTask::Repr(&node.pre.0));
-                        }
-                        Repr::Num(node) => {
-                            tasks.push(HashTask::U64(node.hash));
-                            tasks.push(HashTask::Bool(node.overflowed));
-                            tasks.push(HashTask::U64(node.component));
-                            tasks.push(HashTask::Repr(&node.pre.0));
-                        }
+        // Walk root-to-Anonymous hashing discriminants on the way down and
+        // component payloads on the way back up — bit-identical to derived
+        // `Hash`, with zero heap allocation for names of depth <= 32.
+        const INLINE_CAP: usize = 32;
+        let mut inline: [&Repr; INLINE_CAP] = [&Repr::Anonymous; INLINE_CAP];
+        let mut inline_len = 0usize;
+        let mut overflow: Vec<&Repr> = Vec::new();
+        let mut cur = &self.0;
+        loop {
+            std::hash::Hash::hash(&std::mem::discriminant(cur), state);
+            match cur {
+                Repr::Anonymous => break,
+                Repr::Str(node) => {
+                    if inline_len < INLINE_CAP {
+                        inline[inline_len] = cur;
+                        inline_len += 1;
+                    } else {
+                        overflow.push(cur);
                     }
+                    cur = &node.pre.0;
                 }
-                HashTask::Str(value) => std::hash::Hash::hash(value, state),
-                HashTask::U64(value) => std::hash::Hash::hash(&value, state),
-                HashTask::Bool(value) => std::hash::Hash::hash(&value, state),
+                Repr::Num(node) => {
+                    if inline_len < INLINE_CAP {
+                        inline[inline_len] = cur;
+                        inline_len += 1;
+                    } else {
+                        overflow.push(cur);
+                    }
+                    cur = &node.pre.0;
+                }
             }
+        }
+        let mut hash_node = |repr: &Repr| match repr {
+            Repr::Anonymous => {}
+            Repr::Str(node) => {
+                std::hash::Hash::hash(&node.component, state);
+                std::hash::Hash::hash(&node.hash, state);
+            }
+            Repr::Num(node) => {
+                std::hash::Hash::hash(&node.component, state);
+                std::hash::Hash::hash(&node.overflowed, state);
+                std::hash::Hash::hash(&node.hash, state);
+            }
+        };
+        while let Some(repr) = overflow.pop() {
+            hash_node(repr);
+        }
+        while inline_len > 0 {
+            inline_len -= 1;
+            hash_node(inline[inline_len]);
         }
     }
 }

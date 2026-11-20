@@ -216,8 +216,55 @@ impl PartialEq for Level {
         // Both immutable roots stay borrowed for this walk, so identities cannot
         // be reused. Set iteration never determines the result, and the table
         // does not escape this call (franken_lean-z8j.1.13).
+        // Fast zero-allocation inline worklist for shallow levels; deep or
+        // DAG-shared levels spill to the heap worklist and pointer-pair set.
+        const SMALL_CAP: usize = 16;
+        const SMALL_STEP_BUDGET: u32 = 24;
+        let mut small: [(&Level, &Level); SMALL_CAP] = [(self, other); SMALL_CAP];
+        let mut small_len = 1usize;
+        let mut small_steps = 0u32;
+
+        while small_len > 0 && small_steps < SMALL_STEP_BUDGET && small_len + 2 <= SMALL_CAP {
+            small_len -= 1;
+            let (left, right) = small[small_len];
+            if left.data != right.data {
+                return false;
+            }
+            if Arc::ptr_eq(left.node_arc(), right.node_arc()) {
+                continue;
+            }
+            small_steps += 1;
+            match (left.node(), right.node()) {
+                (Node::Zero, Node::Zero) => {}
+                (Node::Succ(a), Node::Succ(b)) => {
+                    small[small_len] = (a, b);
+                    small_len += 1;
+                }
+                (Node::Max(a1, a2), Node::Max(b1, b2))
+                | (Node::IMax(a1, a2), Node::IMax(b1, b2)) => {
+                    small[small_len] = (a2, b2);
+                    small[small_len + 1] = (a1, b1);
+                    small_len += 2;
+                }
+                (Node::Param(a), Node::Param(b)) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (Node::MVar(a), Node::MVar(b)) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        if small_len == 0 {
+            return true;
+        }
+
         let mut visited = HashSet::new();
-        let mut pending: Vec<(&Level, &Level)> = vec![(self, other)];
+        let mut pending: Vec<(&Level, &Level)> = Vec::from(&small[..small_len]);
         while let Some((left, right)) = pending.pop() {
             if left.data != right.data {
                 return false;

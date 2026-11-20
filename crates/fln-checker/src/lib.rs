@@ -146,7 +146,7 @@
 //! ### Deliberately on the SCHEMA side, with the reason
 //!
 //! `Expr`'s `PartialEq` compares the data word first and then walks the
-//! structure on a heap worklist (`expr.rs:511`). The data word is a fast
+//! structure on a heap worklist (`expr.rs:560`). The data word is a fast
 //! **reject** only, so a hash collision costs a structural walk and cannot
 //! manufacture a false "equal". Sharing it is therefore safe in the direction
 //! that matters. It still inherits the flag correctness above, which is why
@@ -411,7 +411,7 @@
 //! cite crates/fln-kernel/src/tc.rs:6732 :: if !e.has_fvar() {
 //! cite crates/fln-hash/src/canon.rs:1346 :: impl Canonical for Expr
 //! cite crates/fln-hash/src/canon.rs:835 :: pub trait Canonical: Sized
-//! cite crates/fln-core/src/expr.rs:511 :: impl PartialEq for Expr
+//! cite crates/fln-core/src/expr.rs:560 :: impl PartialEq for Expr
 //! cite crates/fln-conformance/src/witness.rs:585 :: id: "B3-INDEPENDENT-CHECKER"
 //! cite tools/structure-guard/src/checks.rs:1120 :: code: "FLN-STRUCT-037"
 //! cite tools/structure-guard/tests/seeded.rs:1322 :: fn the_checker_boundary_baseline_is_clean

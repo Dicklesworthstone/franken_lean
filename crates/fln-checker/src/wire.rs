@@ -60,9 +60,23 @@ pub enum NamePart {
 /// The components are shared, so copying a term copies its names by reference
 /// count rather than by string. Rewrites copy constant nodes constantly, and deep
 /// name clones were a third of the checker's time on real Init modules.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, Eq)]
 pub struct WireName {
     parts: std::sync::Arc<[NamePart]>,
+}
+
+impl PartialEq for WireName {
+    #[inline]
+    fn eq(&self, other: &WireName) -> bool {
+        std::sync::Arc::ptr_eq(&self.parts, &other.parts) || *self.parts == *other.parts
+    }
+}
+
+impl std::hash::Hash for WireName {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.parts.hash(state);
+    }
 }
 
 impl WireName {
@@ -92,6 +106,9 @@ impl Ord for WireName {
     fn cmp(&self, other: &WireName) -> std::cmp::Ordering {
         use std::cmp::Ordering;
 
+        if std::sync::Arc::ptr_eq(&self.parts, &other.parts) {
+            return Ordering::Equal;
+        }
         let mut left = self.parts.len();
         let mut right = other.parts.len();
         while left > 0 && right > 0 {
@@ -319,28 +336,118 @@ pub(crate) fn expression_owned_units(node: &ExprNode) -> u64 {
     1u64.saturating_add(payload)
 }
 
+#[derive(Default)]
+struct WireExprHasher(u64);
+
+impl WireExprHasher {
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl std::hash::Hasher for WireExprHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.mix(u64::from_le_bytes(*chunk));
+        }
+        if !rest.is_empty() {
+            let mut tail = [0u8; 8];
+            tail[..rest.len()].copy_from_slice(rest);
+            self.mix(u64::from_le_bytes(tail));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.mix(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.mix(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.mix(value);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.mix(u64::try_from(value).unwrap_or(u64::MAX));
+    }
+}
+
+struct WireExprData {
+    nodes: Vec<ExprNode>,
+    levels: Vec<LevelNode>,
+    /// Immutable precomputed structural hash of `(nodes, levels)`.
+    hash: u64,
+}
+
 /// One independently decoded expression and all levels embedded in it.
 ///
-/// Immutable arenas share their storage on clone. Inference, reduction and memo
-/// results can retain a term without copying its nodes or literal payloads.
-/// Arena builders still own mutable vectors and freeze them only at publication;
-/// no mutable access to the shared storage is exposed. Equality and hashing remain
-/// structural, and the decoder and term-operation budgets are unchanged.
-/// `Arc<Vec<_>>` also moves a builder's existing allocation without copying it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Immutable arenas share their storage on clone through a single `Arc`.
+/// Equality and hashing remain strictly structural while short-circuiting on
+/// pointer identity and the precomputed arena hash.
+#[derive(Clone)]
 pub struct WireExpr {
-    nodes: std::sync::Arc<Vec<ExprNode>>,
-    levels: std::sync::Arc<Vec<LevelNode>>,
+    data: std::sync::Arc<WireExprData>,
     root: ExprId,
+}
+
+impl std::fmt::Debug for WireExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireExpr")
+            .field("nodes", &self.data.nodes)
+            .field("levels", &self.data.levels)
+            .field("root", &self.root)
+            .finish()
+    }
+}
+
+impl PartialEq for WireExpr {
+    fn eq(&self, other: &WireExpr) -> bool {
+        if self.root != other.root {
+            return false;
+        }
+        if std::sync::Arc::ptr_eq(&self.data, &other.data) {
+            return true;
+        }
+        if self.data.hash != other.data.hash
+            || self.data.nodes.len() != other.data.nodes.len()
+            || self.data.levels.len() != other.data.levels.len()
+        {
+            return false;
+        }
+        self.data.nodes == other.data.nodes && self.data.levels == other.data.levels
+    }
+}
+
+impl Eq for WireExpr {}
+
+impl std::hash::Hash for WireExpr {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.root.hash(state);
+        self.data.hash.hash(state);
+    }
 }
 
 impl WireExpr {
     pub fn nodes(&self) -> &[ExprNode] {
-        &self.nodes
+        &self.data.nodes
     }
 
     pub fn levels(&self) -> &[LevelNode] {
-        &self.levels
+        &self.data.levels
     }
 
     pub const fn root(&self) -> ExprId {
@@ -348,11 +455,11 @@ impl WireExpr {
     }
 
     pub fn node(&self, id: ExprId) -> Option<&ExprNode> {
-        self.nodes.get(id.index())
+        self.data.nodes.get(id.index())
     }
 
     pub fn level(&self, id: LevelId) -> Option<&LevelNode> {
-        self.levels.get(id.index())
+        self.data.levels.get(id.index())
     }
 
     pub(crate) fn from_parts(
@@ -360,9 +467,18 @@ impl WireExpr {
         levels: Vec<LevelNode>,
         root: ExprId,
     ) -> WireExpr {
+        use std::hash::{Hash as _, Hasher as _};
+
+        let mut hasher = WireExprHasher::default();
+        nodes.hash(&mut hasher);
+        levels.hash(&mut hasher);
+        let hash = hasher.finish();
         WireExpr {
-            nodes: nodes.into(),
-            levels: levels.into(),
+            data: std::sync::Arc::new(WireExprData {
+                nodes,
+                levels,
+                hash,
+            }),
             root,
         }
     }

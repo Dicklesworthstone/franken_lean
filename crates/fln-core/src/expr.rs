@@ -22,7 +22,56 @@
 //!   = left fold of `mixHash` from seed 7 (Hashable.lean:37-38).
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
+
+/// Fast non-cryptographic hasher for ephemeral, non-escaping per-call memo tables
+/// (`expr_eq_impl`, `lift_loose`, `subst_loose`, `abstract_fvar`).
+#[derive(Default)]
+struct FastLocalHasher(u64);
+
+impl FastLocalHasher {
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl Hasher for FastLocalHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.mix(u64::from_le_bytes(*chunk));
+        }
+        if !rest.is_empty() {
+            let mut tail = [0u8; 8];
+            tail[..rest.len()].copy_from_slice(rest);
+            self.mix(u64::from_le_bytes(tail));
+        }
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.mix(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.mix(value);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.mix(value as u64);
+    }
+}
+
+type FastHashBuild = BuildHasherDefault<FastLocalHasher>;
 
 use crate::debug_walk::FlatDebug;
 use crate::lean_hash::{mix_hash, string_hash};
@@ -545,8 +594,173 @@ impl Expr {
         // Both immutable roots stay borrowed for this walk, so identities cannot
         // be reused. Set iteration never determines the result, and the table
         // does not escape this call (franken_lean-z8j.1.13).
-        let mut visited = HashSet::new();
-        let mut pending: Vec<(&Expr, &Expr)> = vec![(self, other)];
+        // Fast zero-allocation inline worklist for leaves and small compound
+        // terms; only deep or DAG-shared comparisons spill to the heap worklist
+        // and pointer-pair `visited` set (franken_lean-z8j.1.13).
+        const SMALL_CAP: usize = 16;
+        const SMALL_STEP_BUDGET: u32 = 24;
+        let mut small: [(&Expr, &Expr); SMALL_CAP] = [(self, other); SMALL_CAP];
+        let mut small_len = 1usize;
+        let mut small_steps = 0u32;
+
+        while small_len > 0 && small_steps < SMALL_STEP_BUDGET && small_len + 3 <= SMALL_CAP {
+            small_len -= 1;
+            let (left, right) = small[small_len];
+            if left.data != right.data {
+                return false;
+            }
+            if Arc::ptr_eq(left.node_arc(), right.node_arc()) {
+                continue;
+            }
+            small_steps += 1;
+            match (left.node(), right.node()) {
+                (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (
+                    ExprNode::Const {
+                        name: a,
+                        levels: a_levels,
+                    },
+                    ExprNode::Const {
+                        name: b,
+                        levels: b_levels,
+                    },
+                ) => {
+                    if a != b || a_levels != b_levels {
+                        return false;
+                    }
+                }
+                (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
+                    small[small_len] = (aa, ba);
+                    small[small_len + 1] = (af, bf);
+                    small_len += 2;
+                }
+                (
+                    ExprNode::Lam {
+                        binder_name: a_name,
+                        binder_type: a_type,
+                        body: a_body,
+                        binder_info: a_info,
+                    },
+                    ExprNode::Lam {
+                        binder_name: b_name,
+                        binder_type: b_type,
+                        body: b_body,
+                        binder_info: b_info,
+                    },
+                )
+                | (
+                    ExprNode::ForallE {
+                        binder_name: a_name,
+                        binder_type: a_type,
+                        body: a_body,
+                        binder_info: a_info,
+                    },
+                    ExprNode::ForallE {
+                        binder_name: b_name,
+                        binder_type: b_type,
+                        body: b_body,
+                        binder_info: b_info,
+                    },
+                ) => {
+                    if compare_binder_info && (a_name != b_name || a_info != b_info) {
+                        return false;
+                    }
+                    small[small_len] = (a_body, b_body);
+                    small[small_len + 1] = (a_type, b_type);
+                    small_len += 2;
+                }
+                (
+                    ExprNode::LetE {
+                        decl_name: a_name,
+                        type_: a_type,
+                        value: a_value,
+                        body: a_body,
+                        non_dep: a_non_dep,
+                    },
+                    ExprNode::LetE {
+                        decl_name: b_name,
+                        type_: b_type,
+                        value: b_value,
+                        body: b_body,
+                        non_dep: b_non_dep,
+                    },
+                ) => {
+                    if a_non_dep != b_non_dep || (compare_binder_info && a_name != b_name) {
+                        return false;
+                    }
+                    small[small_len] = (a_body, b_body);
+                    small[small_len + 1] = (a_value, b_value);
+                    small[small_len + 2] = (a_type, b_type);
+                    small_len += 3;
+                }
+                (ExprNode::Lit { literal: a }, ExprNode::Lit { literal: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (
+                    ExprNode::MData {
+                        data: a_data,
+                        expr: a_expr,
+                    },
+                    ExprNode::MData {
+                        data: b_data,
+                        expr: b_expr,
+                    },
+                ) => {
+                    if a_data != b_data {
+                        return false;
+                    }
+                    small[small_len] = (a_expr, b_expr);
+                    small_len += 1;
+                }
+                (
+                    ExprNode::Proj {
+                        struct_name: a_name,
+                        idx: a_idx,
+                        expr: a_expr,
+                    },
+                    ExprNode::Proj {
+                        struct_name: b_name,
+                        idx: b_idx,
+                        expr: b_expr,
+                    },
+                ) => {
+                    if a_name != b_name || a_idx != b_idx {
+                        return false;
+                    }
+                    small[small_len] = (a_expr, b_expr);
+                    small_len += 1;
+                }
+                _ => return false,
+            }
+        }
+        if small_len == 0 {
+            return true;
+        }
+
+        let mut visited: HashSet<(*const ExprNode, *const ExprNode), FastHashBuild> =
+            HashSet::with_hasher(FastHashBuild::default());
+        let mut pending: Vec<(&Expr, &Expr)> = Vec::from(&small[..small_len]);
         while let Some((left, right)) = pending.pop() {
             if left.data != right.data {
                 return false;
@@ -1027,7 +1241,8 @@ impl Expr {
         if amount == 0 || self.loose_bvar_range() <= cutoff {
             return Ok(self.clone());
         }
-        let mut done: HashMap<(Expr, u32), Expr> = HashMap::new();
+        let mut done: HashMap<(Expr, u32), Expr, FastHashBuild> =
+            HashMap::with_hasher(FastHashBuild::default());
         let mut stack = vec![(self.clone(), cutoff, false)];
         while let Some((current, cut, exit)) = stack.pop() {
             if amount == 0 || current.loose_bvar_range() <= cut {
@@ -1153,7 +1368,8 @@ impl Expr {
         if n == 0 || self.loose_bvar_range() <= k {
             return Ok(self.clone());
         }
-        let mut done: HashMap<(Expr, u32), Expr> = HashMap::new();
+        let mut done: HashMap<(Expr, u32), Expr, FastHashBuild> =
+            HashMap::with_hasher(FastHashBuild::default());
         let mut stack = vec![(self.clone(), k, false)];
         while let Some((current, cut, exit)) = stack.pop() {
             if current.loose_bvar_range() <= cut {
@@ -1280,7 +1496,8 @@ impl Expr {
         if !self.has_fvar() {
             return Ok(self.clone());
         }
-        let mut done: HashMap<(Expr, u32), Expr> = HashMap::new();
+        let mut done: HashMap<(Expr, u32), Expr, FastHashBuild> =
+            HashMap::with_hasher(FastHashBuild::default());
         let mut stack = vec![(self.clone(), k, false)];
         while let Some((current, cut, exit)) = stack.pop() {
             if !current.has_fvar() {
@@ -1464,8 +1681,8 @@ impl Expr {
     }
 }
 
-fn lifted_child(
-    done: &HashMap<(Expr, u32), Expr>,
+fn lifted_child<S: std::hash::BuildHasher>(
+    done: &HashMap<(Expr, u32), Expr, S>,
     child: &Expr,
     cut: u32,
 ) -> Result<Expr, TooManyBoundVars> {
