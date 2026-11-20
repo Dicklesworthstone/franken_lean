@@ -171,6 +171,9 @@ edge fln-mcp -> fln-core           # proof-state snapshots reference Expr and Na
 edge fln-doc -> fln-core           # documentation pages reference declaration Name (§16.2, rank 20 -> 0)
 edge fln-tui -> fln-core           # goal/progress/tribunal panel models reference Name and Expr (§16.4, rank 20 -> 0)
 edge fln-wasm -> fln-core          # capsule format and verdict types reference Name (§16.4b, rank 21 -> 0)
+edge fln-wasm -> fln-hash          # sealed .flnpack CartridgeArchiveV1 and canonical profile decoding (§16.4b, rank 21 -> 1)
+edge fln-wasm -> fln-checker       # WASM-clean independent .olean decoder and checker seat (§16.4b, rank 21 -> 6)
+edge fln-wasm -> fln               # dev-only: real sealed .flnpack capsule fixtures for WASM Judge verification tests (rank 21 -> 19)
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------
 # No fln-unsafe-* crate may depend, even transitively, on the trust base.

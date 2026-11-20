@@ -295,7 +295,10 @@ dependencies = [
 name = "fln-wasm"
 version = "0.0.0"
 dependencies = [
+ "fln",
+ "fln-checker",
  "fln-core",
+ "fln-hash",
 ]
 
 [[package]]
