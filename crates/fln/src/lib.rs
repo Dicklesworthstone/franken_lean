@@ -34,6 +34,7 @@ pub mod imported_ir;
 pub mod imported_macros;
 pub mod imported_parsers;
 mod olean_imports;
+pub mod parallel_elab;
 pub mod pretty;
 pub mod source_check;
 mod source_evaluation;
