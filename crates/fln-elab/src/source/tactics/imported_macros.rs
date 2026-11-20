@@ -424,7 +424,9 @@ impl Context {
                     observations,
                 });
                 let root = &*frames.last().expect("owned expansion frame").syntax;
-                if prepared_pattern_literal(root)?.is_some() {
+                if prepared_pattern_literal(root)?.is_some()
+                    || super::super::patterns::prepared_empty_matrix(root)?.is_some()
+                {
                     break self
                         .term_prepared_scoped(root, expected.clone(), None, None, finish)
                         .and_then(super::super::TermResult::term)?;

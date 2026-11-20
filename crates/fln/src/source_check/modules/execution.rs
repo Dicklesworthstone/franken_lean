@@ -8,6 +8,10 @@ use crate::{EngineExecutionLimits, EvaluationPresentation, SourceCommandBatchExe
 
 mod preflight;
 
+/// A presentation callback borrowing one module's completed command observations.
+pub(super) type SourceModuleObserver<'observer> = dyn for<'module, 'observation> FnMut(&'module Name, crate::SourceCommandObservation<'observation>)
+    + 'observer;
+
 #[derive(Debug, Clone, Copy)]
 pub struct SourceProgramLimits {
     pub execution: EngineExecutionLimits,
@@ -419,7 +423,7 @@ impl imported::SourceOleanImport {
         presentation: EvaluationPresentation,
         validate: &mut impl FnMut(&Name, &SourceCommandBatchExecution) -> Result<(), E>,
         mut macros: Option<&mut imported_macros::ModuleMacroSession>,
-        mut observe: Option<&mut dyn FnMut(&Name, crate::SourceCommandObservation<'_>)>,
+        mut observe: Option<&mut SourceModuleObserver<'_>>,
     ) -> Result<Outcome<SourceProgramExecution>, SourceProgramExecutionError<E>> {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return Ok(Outcome::Inconclusive(Inconclusive::cancelled(

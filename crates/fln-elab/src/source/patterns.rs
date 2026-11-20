@@ -68,6 +68,34 @@ fn identifier(name: Name) -> Syntax {
         preresolved: Vec::new(),
     }
 }
+
+/// Generated empty matrix obligations are compiler input. Neither their proof
+/// operation nor their already-bound columns may be replaced by a source macro.
+pub(super) fn prepared_empty_matrix(
+    syntax: &Syntax,
+) -> Result<Option<&[Syntax]>, NatDefinitionElabError> {
+    if syntax.kind() != Some(&parser_kind(&["Term", "flnPreparedEmptyMatrix"])) {
+        return Ok(None);
+    }
+    let [columns] = expect_node(
+        syntax,
+        &parser_kind(&["Term", "flnPreparedEmptyMatrix"]),
+        1,
+        "prepared empty matrix",
+    )?
+    else {
+        return Err(invalid());
+    };
+    let columns = expect_null_args(columns, "prepared empty matrix columns")?;
+    if columns.is_empty()
+        || columns.iter().any(
+            |column| !matches!(column, Syntax::Ident { preresolved, .. } if preresolved.is_empty()),
+        )
+    {
+        return Err(invalid());
+    }
+    Ok(Some(columns))
+}
 /// `..` as a generated pattern's last argument (`Term.ellipsis`).
 fn ellipsis() -> Syntax {
     Syntax::node(parser_kind(&["Term", "ellipsis"]), vec![atom("..")])
@@ -1079,9 +1107,20 @@ impl Context {
         }
         let mut arena = vec![Pattern::Bind(None)];
         let mut rows = Vec::new();
-        for (alt, expanded) in alts.iter().zip(&expanded_patterns) {
+        let finite_types = self.finite_pattern_columns(&discriminants, &expanded_patterns)?;
+        let mut finite_patterns = false;
+        // Keep normalized patterns alive alongside their original typing
+        // witnesses. Normalization never replaces the source-side obligation.
+        let mut finite_rows = Vec::with_capacity(expanded_patterns.len());
+        for expanded in &expanded_patterns {
+            let finite = self.expand_finite_pattern_row(expanded, &finite_types)?;
+            finite_patterns |= finite.is_some();
+            finite_rows.push(finite);
+        }
+        for ((alt, expanded), finite) in alts.iter().zip(&expanded_patterns).zip(&finite_rows) {
             self.tick()?;
             let alt = expect_node(alt, &parser_kind(&["Term", "matchAlt"]), 4, "alternative")?;
+            let expanded = finite.as_ref().unwrap_or(expanded);
             let [row] = expect_null_args(expanded, "one pattern row")? else {
                 return Err(invalid());
             };
@@ -1314,7 +1353,11 @@ impl Context {
                 Task::Build(mut matrix) => {
                     if matrix.rows.is_empty() {
                         let subject = matrix.subjects.first().ok_or_else(invalid)?;
-                        built.push(coverage::missing_case(subject.clone()));
+                        built.push(if finite_patterns {
+                            coverage::empty_case(&matrix.subjects)
+                        } else {
+                            coverage::missing_case(subject.clone())
+                        });
                         continue;
                     }
                     if matrix.subjects.is_empty() {
@@ -1414,7 +1457,7 @@ impl Context {
                         pending.push(Task::Build(matrix));
                         continue;
                     }
-                    let needs_fallback = has_fallback
+                    let needs_fallback = (has_fallback || finite_patterns)
                         && !self.matrix_constructors_exhaustive(&heads, &arena, &canonical)?;
                     let mut branches = Vec::new();
                     let mut alternatives = Vec::new();
@@ -1631,13 +1674,20 @@ impl Context {
                             }
                         }
                     }
-                    if !fallback.is_empty() {
+                    if !fallback.is_empty() || (finite_patterns && needs_fallback) {
                         alternatives.push(Alternative {
                             pattern: wildcard(),
                         });
+                        let subjects = if fallback.is_empty() {
+                            std::iter::once(subject.clone())
+                                .chain(matrix.subjects)
+                                .collect()
+                        } else {
+                            matrix.subjects
+                        };
                         branches.push(Matrix {
                             recursive_root: false,
-                            subjects: matrix.subjects,
+                            subjects,
                             rows: fallback,
                         });
                     }

@@ -97,6 +97,17 @@ pub(super) fn missing_case(subject: Name) -> Syntax {
     )
 }
 
+/// Fin literal expansion retains the constructor's bound proof as another
+/// selected matrix column. An empty branch must eliminate those actual
+/// discriminants, never an unrelated assumption from the ambient context.
+/// `nomatch` builds a checked contradiction or refuses the missing case.
+pub(super) fn empty_case(subjects: &[Name]) -> Syntax {
+    Syntax::node(
+        parser_kind(&["Term", "flnPreparedEmptyMatrix"]),
+        vec![null(subjects.iter().cloned().map(identifier).collect())],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

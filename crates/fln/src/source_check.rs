@@ -201,6 +201,7 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
             SourceInferenceError::NativeEvaluation(_) => ("capability", false, 5),
             SourceInferenceError::EvaluationPrinting(_)
             | SourceInferenceError::EquationTheorem(_)
+            | SourceInferenceError::UnsupportedFinLiteralPattern(_)
             | SourceInferenceError::PreresolvedReference { .. } => ("capability", false, 5),
             SourceInferenceError::SimpSet(
                 fln_elab::source::scope::simp::SimpSetError::Malformed,

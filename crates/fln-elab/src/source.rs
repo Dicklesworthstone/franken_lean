@@ -218,6 +218,9 @@ pub enum SourceInferenceError {
     /// A compiled declaration applies a recursor the pin's code generator does not
     /// support (`codegen.rs`, bead `franken_lean-z8j.1.6.6`).
     UnsupportedRecursor(Name),
+    /// A well-typed Fin numeral pattern needs a lowering this matrix does not
+    /// yet preserve, such as a symbolic bound or a changed OfNat dictionary.
+    UnsupportedFinLiteralPattern(&'static str),
     /// A generated recOn has no compiled LCNF signature at the pin.
     AuxiliaryNotCompiled(Name),
     /// A surviving executable reference has no compiled implementation.
@@ -524,6 +527,9 @@ impl std::fmt::Display for SourceInferenceError {
                 "code generator does not support recursor `{}` yet, consider using 'match ... with' and/or structural recursion",
                 name.to_display_string()
             ),
+            Self::UnsupportedFinLiteralPattern(reason) => {
+                write!(f, "Fin literal pattern lowering is not supported: {reason}")
+            }
             Self::AuxiliaryNotCompiled(name) => write!(
                 f,
                 "Failed to find LCNF signature for {}",
@@ -2953,6 +2959,20 @@ impl Context {
                                 if expand_macro {
                                     let locals =
                                         self.observes_term(syntax).then(|| self.txn.lctx.clone());
+                                    if let Some(columns) = patterns::prepared_empty_matrix(syntax)?
+                                    {
+                                        let terms = columns
+                                            .iter()
+                                            .map(|column| self.atom(column, None))
+                                            .collect::<Result<Vec<_>, _>>()?;
+                                        if let Some(locals) = locals {
+                                            tasks.push(Task::Observe(syntax, locals));
+                                        }
+                                        tasks.push(Task::Proof(
+                                            self.start_empty_match(terms, expected)?,
+                                        ));
+                                        continue;
+                                    }
                                     if let Some(literal) =
                                         tactics::imported_macros::prepared_pattern_literal(syntax)?
                                     {

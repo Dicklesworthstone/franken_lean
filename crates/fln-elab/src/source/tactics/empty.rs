@@ -165,6 +165,125 @@ impl Context {
         Ok(fields)
     }
 
+    /// The pin's contradiction leaf searches empty indexed families with a
+    /// shared fuel of sixteen case splits. Only constructor fields descended
+    /// from the selected evidence participate; ambient hypotheses do not.
+    fn search_empty_indexed_goal(
+        &mut self,
+        goal: ProofGoal,
+        selected: FVarId,
+        fuel: &mut u8,
+    ) -> Result<bool, NatDefinitionElabError> {
+        self.tick()?;
+        if *fuel == 0 {
+            return Ok(false);
+        }
+        self.txn.lctx = goal.lctx.clone();
+        let local = goal
+            .lctx
+            .find(&selected)
+            .ok_or_else(|| error(TacticError::EliminationLocal))?;
+        let type_ = self.whnf(&local.type_)?;
+        let (head, _) = operators::spine(&type_);
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(false);
+        };
+        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(name) else {
+            return Ok(false);
+        };
+        if !family.ctors.is_empty() && family.num_indices == 0 {
+            return Ok(false);
+        }
+        let family = family.clone();
+        *fuel -= 1;
+        let saved = self.clone();
+        let attempt = (|| {
+            let fields = self.empty_field_names(&family)?;
+            let mut proof =
+                self.empty_proof_state(goal.target.clone(), Expr::mvar(goal.id.clone()));
+            let mut branches = self.eliminate_proof_goal_with_substitutions(
+                &mut proof,
+                goal,
+                &eliminate::EliminationSyntax::RCases(fields),
+                false,
+                Some(&selected),
+                None,
+            )?;
+            while let Some(work) = proof.work.pop() {
+                self.tick()?;
+                match work {
+                    Work::Close(goal, value) => self.close_proof_goal(goal, value)?,
+                    Work::Goal(child) => {
+                        let branch = branches
+                            .remove(&child.id)
+                            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                        let mut closed = false;
+                        for mut field in branch.fields {
+                            self.tick()?;
+                            for step in &branch.substitutions {
+                                field = self.specialize_locals(&field, &step.replacements)?;
+                            }
+                            let ExprNode::FVar { id } = field.node() else {
+                                continue;
+                            };
+                            if self.search_empty_indexed_goal(child.clone(), id.clone(), fuel)? {
+                                closed = true;
+                                break;
+                            }
+                        }
+                        if !closed {
+                            return Ok(false);
+                        }
+                    }
+                    _ => return Err(failure(SourceInferenceError::Scope)),
+                }
+            }
+            Ok(true)
+        })();
+        match attempt {
+            Ok(true) => Ok(true),
+            result => {
+                let consumed = self.txn.budget.heartbeats_consumed;
+                let aux_names = self.aux_names.take();
+                *self = saved;
+                self.txn.budget.heartbeats_consumed = consumed;
+                self.aux_names = aux_names;
+                match result {
+                    Ok(false) => Ok(false),
+                    Err(problem) if backtrack::recoverable(&problem) => Ok(false),
+                    Err(problem) => Err(problem),
+                    Ok(true) => unreachable!(),
+                }
+            }
+        }
+    }
+
+    fn close_indexed_empty_leaf(
+        &mut self,
+        goal: ProofGoal,
+        evidence: &[Typed],
+    ) -> Result<bool, NatDefinitionElabError> {
+        for evidence in evidence {
+            self.tick()?;
+            self.txn.lctx = goal.lctx.clone();
+            let type_ = self.whnf(&evidence.type_)?;
+            let (head, _) = operators::spine(&type_);
+            if matches!(head.node(), ExprNode::Const { name, .. }
+                if name == &Name::from_components(["Eq"])
+                    || name == &Name::from_components(["HEq"]))
+            {
+                continue;
+            }
+            let ExprNode::FVar { id } = evidence.value.node() else {
+                continue;
+            };
+            if self.search_empty_indexed_goal(goal.clone(), id.clone(), &mut 16)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn solve_empty_matrix<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
@@ -211,11 +330,16 @@ impl Context {
                         });
                     }
                 }
-                match self.contradict_evidence_goal(goal, selected) {
+                match self.contradict_evidence_goal(goal.clone(), selected.clone()) {
                     Ok(()) => continue,
                     Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
                         TacticError::NoContradiction,
-                    ))) => return Err(error(TacticError::EliminationCoverage)),
+                    ))) => {
+                        if self.close_indexed_empty_leaf(goal, &selected)? {
+                            continue;
+                        }
+                        return Err(error(TacticError::EliminationCoverage));
+                    }
                     Err(error) => return Err(error),
                 }
             };

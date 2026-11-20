@@ -4,7 +4,9 @@
 //! from the supplied MacroM state and its own quotation context, while expansion
 //! work shares one graph-wide allowance. Only a complete graph publishes states.
 
-use super::execution::{SourceProgramExecution, SourceProgramExecutionError, SourceProgramLimits};
+use super::execution::{
+    SourceModuleObserver, SourceProgramExecution, SourceProgramExecutionError, SourceProgramLimits,
+};
 use super::*;
 use crate::imported_ir::VerifiedPartition;
 use crate::imported_macros::registrations::{
@@ -676,7 +678,7 @@ impl imported::SourceOleanImport {
         input: SourceModuleDeferredMacroInputs,
         cancellation: Option<&dyn CancellationProbe>,
         presentation: crate::EvaluationPresentation,
-        observe: Option<&mut dyn FnMut(&Name, crate::SourceCommandObservation<'_>)>,
+        observe: Option<&mut SourceModuleObserver<'_>>,
         validate: &mut impl FnMut(&Name, &crate::SourceCommandBatchExecution) -> Result<(), E>,
     ) -> SourceMacroProgramExecution<E> {
         self.execute_program_with_macro_preparation(
@@ -717,7 +719,7 @@ impl imported::SourceOleanImport {
         implicit_init: bool,
         presentation: crate::EvaluationPresentation,
         validate: &mut impl FnMut(&Name, &crate::SourceCommandBatchExecution) -> Result<(), E>,
-        observe: Option<&mut dyn FnMut(&Name, crate::SourceCommandObservation<'_>)>,
+        observe: Option<&mut SourceModuleObserver<'_>>,
     ) -> SourceMacroProgramExecution<E> {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return SourceMacroProgramExecution::stopped(Outcome::Inconclusive(

@@ -153,3 +153,221 @@ fn recursive_calls_hidden_in_literal_alternatives_remain_termination_obligations
     reject("def bad : Nat -> Nat | 0 => 0 | n => bad n");
     reject("def bad : Nat -> Nat | 0 => let unused := bad 0; 0 | .succ k => bad k");
 }
+
+#[test]
+fn indexed_empty_matching_searches_only_bounded_selected_evidence() {
+    check(
+        "inductive Step : Nat -> Prop where | next (n : Nat) (h : Step n) : Step (Nat.succ n)\n\
+         theorem emptyStep (h : Step 3) : False := nomatch h",
+    );
+    let prefix = "inductive Loop : Nat -> Prop where | next (n : Nat) (h : Loop n) : Loop n\n";
+    check(prefix);
+    for source in [
+        "theorem noUnboundedSearch (h : Loop 0) : False := nomatch h",
+        "def noAmbientProof (ambient : False) (n : Nat) : Nat := nomatch n",
+    ] {
+        reject(&format!("{prefix}{source}"));
+    }
+}
+
+#[test]
+fn same_named_finite_types_do_not_erase_data_or_unrelated_proofs() {
+    for (field_type, field_value) in [("Bool", "true"), ("True", "True.intro")] {
+        let prefix = format!(
+            "inductive Fin (n : Nat) where | mk (value : Nat) (extra : {field_type})\n\
+             instance : OfNat (Fin 3) 0 where ofNat := Fin.mk 0 {field_value}\n"
+        );
+        check(&prefix);
+        let source =
+            format!("{prefix}def code (x : Fin 3) : Nat := match x with | 0 => 1 | _ => 2");
+        let engine = engine();
+        let root = engine.logical_root(&KVMap::new());
+        let error = engine
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err("a same-named constructor is not the canonical Fin model");
+        assert_eq!(
+            error.disposition(),
+            ("capability", false, 5),
+            "{source}\n{error:?}"
+        );
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
+fn finite_literals_use_the_actual_imported_bounds_and_instances() {
+    use fln::source_check::modules::imported::SourceOleanImportLimits;
+    use fln::{Name, OleanCheckLimits, OleanDecodeLimits, OleanModuleInput, olean_module_imports};
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    let library = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home).join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean")
+            })
+        })
+        .filter(|path| path.join("Init/Data/Fin/Basic.olean").is_file());
+    let Some(library) = library else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "FLN_REQUIRE_REFERENCE is set but the pinned Fin library is absent"
+        );
+        eprintln!("SKIP: Fin literals require the pinned Reference library");
+        return;
+    };
+    const STACK: usize = 256 * 1024 * 1024;
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let root = Name::from_components(["Init", "Data", "Fin", "Basic"]);
+            let mut pending = vec![root.clone()];
+            let mut seen = BTreeSet::new();
+            let mut names = Vec::new();
+            let mut parts = Vec::new();
+            while let Some(module) = pending.pop() {
+                if !seen.insert(module.clone()) {
+                    continue;
+                }
+                let path = module
+                    .to_display_string()
+                    .split('.')
+                    .fold(library.clone(), |path, part| path.join(part))
+                    .with_extension("olean");
+                let exported = std::fs::read(&path).unwrap();
+                pending.extend(
+                    olean_module_imports(&exported, OleanDecodeLimits::new(exported.len()))
+                        .unwrap(),
+                );
+                parts.push([
+                    exported,
+                    std::fs::read(path.with_extension("olean.server")).unwrap(),
+                    std::fs::read(path.with_extension("olean.private")).unwrap(),
+                ]);
+                names.push(module);
+            }
+            let inputs: Vec<_> = names
+                .iter()
+                .zip(&parts)
+                .map(|(name, [exported, server, private])| OleanModuleInput {
+                    name,
+                    artifact: exported,
+                    server_artifact: Some(server),
+                    private_artifact: Some(private),
+                })
+                .collect();
+            let budget = Budget::for_stack_bytes(STACK);
+            let engine = Engine::builder()
+                .build_empty()
+                .import_olean_modules_for_source(
+                    &inputs,
+                    &[root],
+                    &KVMap::new(),
+                    SourceOleanImportLimits::new(OleanCheckLimits::new(STACK, budget)),
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap()
+                .engine;
+            let options = KVMap::new();
+            let initial_root = engine.logical_root(&options);
+            let check = |source: &str| {
+                let result = engine.check_source_files(
+                    &[source.as_bytes()],
+                    &options,
+                    SourceCheckLimits::new(EngineAdmissionLimits::new(budget)),
+                );
+                assert_eq!(engine.logical_root(&options), initial_root, "{source}");
+                result
+            };
+            for source in [
+                // `boo` is the literal Fin match in the pin's matchSparse2.lean.
+                "def boo (x : Fin 3) : Nat := match x with | 0 => 1 | 1 => 2 | 2 => 4\n\
+                 theorem zero : boo 0 = 1 := by rfl\n\
+                 theorem one : boo 1 = 2 := by rfl\n\
+                 theorem two : boo 2 = 4 := by rfl",
+                "def wrap : Fin 3 -> Nat | 3 => 1 | 4 => 2 | 5 => 4\n\
+                 theorem zero : wrap 0 = 1 := by rfl\n\
+                 theorem one : wrap 1 = 2 := by rfl\n\
+                 theorem two : wrap 2 = 4 := by rfl",
+                "def singleton (x : Fin 1) : Nat := match x with | 0 => 9\n\
+                 theorem value : _root_.singleton 0 = 9 := by rfl",
+                "def sparse (x : Fin 5) : Nat := match x with | 4 => 11 | _ => 13\n\
+                 theorem selected : sparse 4 = 11 := by rfl\n\
+                 theorem fallback : sparse 0 = 13 := by rfl",
+                "def large (x : Fin 3) : Nat := match x with\n\
+                 | 0 => 1 | 340282366920938463463374607431768211456 => 2 | 2 => 4\n\
+                 theorem value : large 1 = 2 := by rfl",
+                "def combine (x : Fin 2) (b : Bool) : Nat := match x, b with\n\
+                 | 0, false => 11 | 0, true => 12 | 1, false => 21 | 1, true => 22\n\
+                 theorem first : combine 0 true = 12 := by rfl\n\
+                 theorem last : combine 1 false = 21 := by rfl",
+                "abbrev Three := Fin 3\n\
+                 def alias (x : Three) : Nat := match x with | 0 => 1 | 1 => 2 | 2 => 4\n\
+                 theorem value : alias 2 = 4 := by rfl",
+            ] {
+                check(source)
+                    .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+                    .into_complete()
+                    .unwrap_or_else(|outcome| panic!("{source}\n{outcome:?}"));
+            }
+            // Reuse the same admitted Fin environment through the normal
+            // compiler, bytecode codec, and VM. Bounds are proof-only fields;
+            // the generated impossible branch must also survive erasure.
+            let runtime_source = b"def compiledFin (x : Fin 3) : Nat := match x with | 0 => 1 | 1 => 2 | 2 => 4\n\
+                #eval compiledFin 0\n#eval compiledFin 1\n#eval compiledFin 2\n#eval compiledFin 3";
+            let executed = engine
+                .execute_source_commands_with_checks(
+                    runtime_source,
+                    &options,
+                    fln::EngineExecutionLimits::new(budget),
+                )
+                .unwrap_or_else(|error| panic!("finite matching runtime: {error:?}"))
+                .into_complete()
+                .unwrap_or_else(|outcome| panic!("finite matching runtime: {outcome:?}"));
+            let actual: Vec<_> = executed
+                .batch
+                .source_evaluation_indices
+                .iter()
+                .map(|&index| {
+                    let fln::VmExit::Returned(value) = &executed.batch.executions[index].exit else {
+                        panic!("finite matching evaluation must return")
+                    };
+                    fln_vm::interpreter::nat_decimal(&value.value).expect("Nat result")
+                })
+                .collect();
+            assert_eq!(actual, ["1", "2", "4", "1"]);
+            assert_eq!(engine.logical_root(&options), initial_root);
+
+            for source in [
+                "def missing (x : Fin 3) : Nat := match x with | 0 => 1 | 1 => 2",
+                "def missing (h : False) (x : Fin 3) : Nat := match x with | 0 => 1 | 1 => 2",
+                "def duplicate (x : Fin 3) : Nat := match x with | 0 => 1 | 3 => 2 | 1 => 3 | 2 => 4",
+                "def missing (x : Fin 2) (b : Bool) : Nat := match x, b with\n\
+                 | 0, false => 11 | 0, true => 12 | 1, false => 21",
+                "def emptyLiteral (x : Fin 0) : Nat := match x with | 0 => 1",
+                "def hugeBound (x : Fin 340282366920938463463374607431768211456) : Nat := match x with | 0 => 1",
+            ] {
+                assert!(check(source).is_err(), "invalid finite coverage accepted: {source}");
+            }
+            // These are capability stops, never decided rejections of the
+            // source. A changed dictionary requires the pin's original RHS
+            // typing witness even though its value patterns are canonicalized.
+            for source in [
+                "local instance changedZero : OfNat (Fin 3) 0 where ofNat := ⟨1, by decide⟩\n\
+                 def changed (x : Fin 3) : Nat := match x with | 0 => 10 | 1 => 20 | 2 => 30",
+                "def symbolic (n : Nat) [NeZero n] (x : Fin n) : Nat := match x with | 0 => 1 | _ => 2",
+            ] {
+                let error = check(source).expect_err("unsupported Fin lowering must remain a nonanswer");
+                assert_eq!(error.disposition(), ("capability", false, 5), "{source}\n{error:?}");
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

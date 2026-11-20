@@ -41,6 +41,146 @@ fn budget() -> Budget {
     Budget::for_stack_bytes(2 * 1024 * 1024)
 }
 
+#[test]
+fn generated_empty_matrix_obligations_bypass_term_macros() {
+    struct EmptyProvider {
+        intercepted: AtomicU64,
+    }
+    fn term_kind(leaf: &str) -> Name {
+        Name::from_components(["Lean", "Parser", "Term", leaf])
+    }
+    fn prepared(column: Syntax) -> Syntax {
+        Syntax::node(
+            term_kind("flnPreparedEmptyMatrix"),
+            vec![Syntax::node(Name::from_components(["null"]), vec![column])],
+        )
+    }
+    fn selected_column() -> Syntax {
+        Syntax::Ident {
+            info: SourceInfo::None,
+            raw_val: fln_syntax::source::ByteSpan::default().into(),
+            val: Name::from_components(["n"]),
+            preresolved: Vec::new(),
+        }
+    }
+    impl TacticMacroExpander for EmptyProvider {
+        fn contains(&self, kind: &Name) -> bool {
+            *kind == term_kind("nomatch")
+                || *kind == term_kind("flnPreparedEmptyMatrix")
+                || *kind == Name::from_components(["ident"])
+        }
+        fn enter_tactic(&self, _: usize) -> Result<u64, TacticMacroError> {
+            Ok(0)
+        }
+        fn expand_tactic(
+            &self,
+            _: &Syntax,
+            _: usize,
+            _: u64,
+            _: usize,
+            _: &Environment,
+            _: &SourceScope,
+        ) -> Result<TacticMacroExpansion, TacticMacroError> {
+            Ok(TacticMacroExpansion::Exhausted)
+        }
+        fn expand_term(
+            &self,
+            syntax: &Syntax,
+            _: usize,
+            _: &Environment,
+            _: &SourceScope,
+        ) -> Result<Option<Syntax>, TacticMacroError> {
+            if matches!(syntax, Syntax::Ident { val, .. } if *val == Name::from_components(["makeEmpty"]))
+            {
+                return Ok(Some(prepared(selected_column())));
+            }
+            if matches!(syntax, Syntax::Ident { val, .. } if *val == Name::from_components(["makePublicEmpty"]))
+            {
+                return Ok(Some(Syntax::node(
+                    term_kind("nomatch"),
+                    vec![
+                        Syntax::atom(SourceInfo::None, "nomatch"),
+                        Syntax::node(Name::from_components(["null"]), vec![selected_column()]),
+                    ],
+                )));
+            }
+            if syntax.kind() == Some(&term_kind("nomatch"))
+                || syntax.kind() == Some(&term_kind("flnPreparedEmptyMatrix"))
+                || matches!(syntax, Syntax::Ident { val, .. } if *val == Name::from_components(["n"]) || *val == Name::from_components(["h"]))
+            {
+                self.intercepted.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(Syntax::node(
+                    Name::from_components(["num"]),
+                    vec![Syntax::atom(SourceInfo::None, "0")],
+                )));
+            }
+            Ok(None)
+        }
+    }
+    fn prepare(syntax: &mut Syntax) {
+        if let Syntax::Node { kind, args, .. } = syntax {
+            if *kind == term_kind("nomatch") {
+                let Syntax::Node { args: columns, .. } = &args[1] else {
+                    panic!("nomatch columns")
+                };
+                assert_eq!(columns.len(), 1);
+                *syntax = prepared(columns[0].clone());
+                return;
+            }
+            for argument in args {
+                prepare(argument);
+            }
+        }
+    }
+    let environment = environment();
+    let provider = Arc::new(EmptyProvider {
+        intercepted: AtomicU64::new(0),
+    });
+    let scope = SourceScope {
+        tactic_macros: Some(TacticMacroProvider(provider.clone())),
+        ..SourceScope::default()
+    };
+    let elaborate = |source: &str, generated: bool| {
+        let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
+        let mut syntax = parsed.syntax().clone();
+        if generated {
+            prepare(&mut syntax);
+        }
+        elaborate_definition_in_scope_with_budget(&syntax, &environment, budget(), &scope)
+    };
+    // The provider really can replace a public nomatch returned by a macro.
+    let ordinary = elaborate("def ordinary (n : Nat) : Nat := makePublicEmpty", false).unwrap();
+    assert!(matches!(
+        fln_kernel::check(&environment, &ordinary, budget()),
+        Outcome::Complete(Verdict::Accepted { .. })
+    ));
+    assert_eq!(provider.intercepted.swap(0, Ordering::Relaxed), 1);
+    // Only the selected False supplies a contradiction; an ambient False is
+    // not evidence for an empty matrix whose selected column is Nat.
+    let selected = elaborate("def selected (h : False) : Nat := nomatch h", true).unwrap();
+    assert!(matches!(
+        fln_kernel::check(&environment, &selected, budget()),
+        Outcome::Complete(Verdict::Accepted { .. })
+    ));
+    for (source, generated) in [
+        ("def missing (h : False) (n : Nat) : Nat := nomatch n", true),
+        ("def expanded (n : Nat) : Nat := makeEmpty", false),
+    ] {
+        assert!(
+            matches!(
+                elaborate(source, generated),
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::Tactic(
+                        fln_elab::source::TacticError::EliminationCoverage,
+                    )
+                ))
+            ),
+            "{source}"
+        );
+    }
+    assert_eq!(provider.intercepted.load(Ordering::Relaxed), 0);
+}
+
 fn environment() -> Environment {
     let mut environment = Environment::new();
     for declaration in fln_elab::seed::source_seed_declarations() {
