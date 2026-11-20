@@ -58,13 +58,14 @@ fn run(args: Vec<OsString>) -> fln_cli::MultiplexerOutput {
 fn lean_source_diagnostics_use_stdout_and_keep_nonanswers_distinct() {
     // No installed toolchain or synthetic source seed is needed for this
     // unknown-name refusal. The error carries no token span, so its location
-    // is the known command start, including after Unicode and CRLF text.
+    // is the known partition boundary before indentation, including after
+    // Unicode and CRLF text. It does not invent a missing token span.
     for source in [
         "prelude\naxiom α : Type\n  #check Missing\n",
         "prelude\r\naxiom α : Type\r\n  #check Missing\r\n",
     ] {
         let path = file(source);
-        let expected = ":3:2: error(lean.unknownIdentifier): Unknown identifier `Missing`\n";
+        let expected = ":3:0: error(lean.unknownIdentifier): Unknown identifier `Missing`\n";
         let output = Command::new(env!("CARGO_BIN_EXE_lean"))
             .arg(&path)
             .output()
@@ -92,6 +93,40 @@ fn lean_source_diagnostics_use_stdout_and_keep_nonanswers_distinct() {
         assert!(limited.stderr.starts_with("lean: resource:"), "{limited:?}");
         assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
     }
+}
+
+#[test]
+fn lean_keeps_completed_query_output_before_a_later_source_failure() {
+    for (source, expected) in [
+        (
+            "prelude\n#check Type\n#check Missing\n#check Prop\n",
+            "Type : Type 1\n<stdin>:3:0: error(lean.unknownIdentifier): Unknown identifier `Missing`\n",
+        ),
+        (
+            "prelude\r\n#check Type\r\nnamespace Ω\r\n#check Missing\r\nend Ω\r\n",
+            "Type : Type 1\n<stdin>:4:0: error(lean.unknownIdentifier): Unknown identifier `Missing`\n",
+        ),
+    ] {
+        let mut input = std::io::Cursor::new(source.as_bytes());
+        let output = fln_cli::run_lean_with_input([OsString::from("--stdin")], &mut input);
+        assert_eq!(output.exit_code, 1, "{output:?}");
+        assert_eq!(output.stdout, expected);
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+
+    // Whole-program syntax preflight still prevents any execution. Prefix
+    // retention does not weaken that gate or invent a successful parsed row.
+    let mut input = std::io::Cursor::new(b"prelude\n#check Type\n#check (\n");
+    let rejected = fln_cli::run_lean_with_input([OsString::from("--stdin")], &mut input);
+    assert_eq!(rejected.exit_code, 1, "{rejected:?}");
+    assert!(rejected.stdout.is_empty(), "{rejected:?}");
+    assert!(rejected.stderr.starts_with("lean: input:"), "{rejected:?}");
+
+    let mut input = std::io::Cursor::new(b"prelude\n#check Type\n#check Prop\n");
+    let recovered = fln_cli::run_lean_with_input([OsString::from("--stdin")], &mut input);
+    assert_eq!(recovered.exit_code, 0, "{recovered:?}");
+    assert_eq!(recovered.stdout, "Type : Type 1\nProp : Type\n");
+    assert!(recovered.stderr.is_empty(), "{recovered:?}");
 }
 
 /// A false `by rfl` is refused while elaborating the command at `at`, as at the
@@ -420,9 +455,14 @@ fn installed_anonymous_examples_check_silently_execute_queries_and_recover() {
         .arg(&path)
         .output()
         .unwrap();
-    assert!(!bad.status.success());
-    assert!(bad.stdout.is_empty());
-    assert!(!bad.stderr.is_empty());
+    assert_eq!(bad.status.code(), Some(1), "{bad:?}");
+    let diagnostic = String::from_utf8_lossy(&bad.stdout);
+    assert!(
+        diagnostic.starts_with(&format!("42\n{}:6:0: error: ", path.display())),
+        "{bad:?}"
+    );
+    assert!(diagnostic.contains("not definitionally equal"), "{bad:?}");
+    assert!(bad.stderr.is_empty(), "{bad:?}");
     std::fs::write(&path, &program).unwrap();
     let recovered = Command::new(env!("CARGO_BIN_EXE_lean"))
         .arg(&path)
@@ -3149,9 +3189,9 @@ fn rw_keeps_the_pins_bound_proof_choice_for_a_definition_head() {
     // The accepting control and a repeated rejection share the same admitted
     // imports, exercising recovery without changing the proof or tactic.
     for (name, expected) in [("proof.lean", 1), ("axiom.lean", 0), ("proof.lean", 1)] {
-        for (mut command, oracle) in [
-            (Command::new(&pinned), true),
-            (Command::new(env!("CARGO_BIN_EXE_lean")), false),
+        for mut command in [
+            Command::new(&pinned),
+            Command::new(env!("CARGO_BIN_EXE_lean")),
         ] {
             let executable = command.get_program().to_owned();
             let output = command
@@ -3170,11 +3210,11 @@ fn rw_keeps_the_pins_bound_proof_choice_for_a_definition_head() {
                 "{executable:?} {name}:\n{stdout}{stderr}"
             );
             if expected == 1 {
-                let diagnostic = if oracle { &stdout } else { &stderr };
                 assert!(
-                    diagnostic.contains("unsolved goals"),
+                    stdout.contains("unsolved goals"),
                     "{executable:?} {name} refused before reaching the goal: {stdout}{stderr}"
                 );
+                assert!(stderr.is_empty(), "{executable:?} {name}: {stderr}");
             }
         }
     }

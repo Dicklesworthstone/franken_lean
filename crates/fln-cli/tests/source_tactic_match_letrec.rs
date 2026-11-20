@@ -313,12 +313,13 @@ fn tactic_match_let_rec_and_refine_prime_fail_where_the_pin_fails() {
         }
         let (code, stdout, stderr) = ours(&lib, &root, name);
         assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+        let reason = reason.strip_prefix("elaboration refused source: ").unwrap();
         assert!(
-            stderr
-                .trim_end()
-                .ends_with(&format!("refused source: {reason}")),
-            "{name}: {stderr}"
+            stdout.trim_end().ends_with(&format!(": error: {reason}")),
+            "{name}: {stdout}{stderr}"
         );
+        assert!(stdout.starts_with(&format!("{name}:")), "{stdout}");
+        assert!(stderr.is_empty(), "{name}: {stderr}");
     }
 }
 
@@ -371,7 +372,19 @@ fn unsupported_match_and_let_rec_forms_are_refused_typed() {
         }
         let (code, stdout, stderr) = ours(&lib, &root, name);
         assert_eq!(code, *expected, "{name}: {stdout}{stderr}");
-        assert!(stdout.is_empty(), "{name}: {stdout}");
-        assert!(stderr.trim_end().ends_with(reason), "{name}: {stderr}");
+        if *expected == 5 {
+            assert!(stdout.is_empty(), "{name}: {stdout}");
+            assert!(stderr.trim_end().ends_with(reason), "{name}: {stderr}");
+        } else {
+            let reason = reason
+                .strip_prefix("refused source: elaboration refused source: ")
+                .unwrap();
+            assert!(stdout.starts_with(&format!("{name}:")), "{stdout}");
+            assert!(
+                stdout.trim_end().ends_with(&format!(": error: {reason}")),
+                "{name}: {stdout}"
+            );
+            assert!(stderr.is_empty(), "{name}: {stderr}");
+        }
     }
 }

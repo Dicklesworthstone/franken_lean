@@ -259,6 +259,107 @@ fn executable_attribute_failure_exposes_no_prefix_and_keeps_file_ownership() {
 }
 
 #[test]
+fn observing_completed_commands_does_not_publish_a_failed_successor() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    let good = "def observedValue : Nat := 40\n#eval observedValue + 2\n";
+    let bad = format!("{good}#check unknown_after_prefix\n");
+    let mut calls = 0;
+    let mut values = Vec::new();
+    let error = base
+        .execute_source_commands_with_observer(
+            bad.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+            fln::EvaluationPresentation::Raw,
+            &mut |observation| {
+                calls += 1;
+                assert!(!observation.is_complete());
+                assert_eq!(observation.command_count, 2);
+                for evaluation in observation.evaluations() {
+                    let VmExit::Returned(returned) = evaluation.exit() else {
+                        panic!("the successful prefix must retain its Nat result");
+                    };
+                    values.push(fln_vm::interpreter::nat_decimal(&returned.value).unwrap());
+                }
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown_after_prefix"));
+    assert_eq!(calls, 1);
+    assert_eq!(values, ["42"]);
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(!base.environment().contains(&n("observedValue")));
+
+    let retried = executed(&base, good);
+    let fresh = executed(&engine(), good);
+    assert_eq!(evaluated(&retried), [42]);
+    assert_eq!(
+        retried.batch.engine.logical_root(&KVMap::new()),
+        fresh.batch.engine.logical_root(&KVMap::new())
+    );
+    assert_eq!(
+        retried
+            .batch
+            .executions
+            .iter()
+            .map(|execution| &execution.flbc_artifact)
+            .collect::<Vec<_>>(),
+        fresh
+            .batch
+            .executions
+            .iter()
+            .map(|execution| &execution.flbc_artifact)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn observing_success_preserves_the_checked_environment_and_bytecode() {
+    let base = engine();
+    let source = "def observedValue : Nat := 40\n#eval observedValue + 2\n#check observedValue\n";
+    let ordinary = executed(&base, source);
+    let mut calls = 0;
+    let observed = base
+        .execute_source_commands_with_observer(
+            source.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+            fln::EvaluationPresentation::Raw,
+            &mut |observation| {
+                calls += 1;
+                assert!(observation.is_complete());
+                assert_eq!(observation.command_count, 3);
+                assert_eq!(observation.evaluations().count(), 1);
+                assert_eq!(observation.checks.len(), 1);
+            },
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(evaluated(&observed), [42]);
+    assert_eq!(
+        observed.batch.engine.logical_root(&KVMap::new()),
+        ordinary.batch.engine.logical_root(&KVMap::new())
+    );
+    assert_eq!(
+        observed
+            .batch
+            .executions
+            .iter()
+            .map(|execution| &execution.flbc_artifact)
+            .collect::<Vec<_>>(),
+        ordinary
+            .batch
+            .executions
+            .iter()
+            .map(|execution| &execution.flbc_artifact)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn executable_scope_limits_remain_resource_stops() {
     let base = engine();
     let source = "section\n".repeat(257);

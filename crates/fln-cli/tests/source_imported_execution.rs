@@ -823,7 +823,14 @@ fn synth_prints_the_instance_it_finds() {
     );
     let refused = lean_door(&workspace, &missing, &lib);
     assert_eq!(refused.code, 1, "{refused:?}");
-    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(refused.stderr.is_empty(), "{refused:?}");
+    assert!(
+        refused.stdout.starts_with(&format!(
+            "{}:3:0: error(lean.synthInstanceFailed): failed to synthesize instance of type class\n  Inhabited Empty\n",
+            missing.display()
+        )),
+        "{refused:?}"
+    );
 }
 
 /// `#print` (`Lean/Elab/Print.lean`) for constants the file declares: the header with its
@@ -1504,7 +1511,8 @@ instance : Repr Multiline where
     );
 
     // The record store is reused for the same imported closure. A failed
-    // guarded message still discards an earlier otherwise successful output.
+    // guarded message retains completed earlier output while keeping its own
+    // captured evaluation hidden.
     let mismatch = workspace.write(
         "Mismatch.lean",
         format!(
@@ -1514,7 +1522,7 @@ instance : Repr Multiline where
     );
     let refused = lean_door(&workspace, &mismatch, &lib);
     assert_eq!(refused.code, 1, "{refused:?}");
-    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert_eq!(refused.stdout, "true\n", "{refused:?}");
     assert!(
         refused
             .stderr
@@ -1794,7 +1802,8 @@ fn ordinary_file_and_stdin_admit_actual_init_without_invoking_main() {
     );
     let stopped = lean_stdin(&workspace, source, &library, &["--fln-max-steps=0"]);
     assert_eq!(stopped.code, 3, "{stopped:?}");
-    assert!(stopped.stdout.is_empty(), "{stopped:?}");
+    assert_eq!(stopped.stdout, "Int : Type\n", "{stopped:?}");
+    assert!(stopped.stderr.contains("ExecutionSteps"), "{stopped:?}");
     let invalid = lean_stdin(
         &workspace,
         b"#check Int\n#eval (42 : Nat)\n#check missing\n",
@@ -1802,8 +1811,12 @@ fn ordinary_file_and_stdin_admit_actual_init_without_invoking_main() {
         &[],
     );
     assert_eq!(invalid.code, 1, "{invalid:?}");
-    assert!(invalid.stdout.is_empty(), "{invalid:?}");
-    assert!(invalid.stderr.contains("missing"), "{invalid:?}");
+    assert!(invalid.stderr.is_empty(), "{invalid:?}");
+    assert_eq!(
+        invalid.stdout,
+        "Int : Type\n42\n<stdin>:3:0: error(lean.unknownIdentifier): Unknown identifier `missing`\n",
+        "{invalid:?}"
+    );
 }
 
 /// `prelude` means no imports at all, not even the implicit one. The door used
@@ -1831,9 +1844,13 @@ fn a_prelude_file_is_an_empty_world_through_the_lean_door() {
     let borrowed = workspace.write("Borrowed.lean", "prelude\n\ndef f (n : Nat) : Nat := n\n");
     let refused = lean_door(&workspace, &borrowed, &empty);
     assert_eq!(refused.code, 1, "{refused:?}");
-    assert!(refused.stdout.is_empty(), "{refused:?}");
-    assert!(
-        refused.stderr.contains("Unknown identifier `Nat`"),
+    assert!(refused.stderr.is_empty(), "{refused:?}");
+    assert_eq!(
+        refused.stdout,
+        format!(
+            "{}:3:0: error(lean.unknownIdentifier): Unknown identifier `Nat`\n",
+            borrowed.display()
+        ),
         "{refused:?}"
     );
 }

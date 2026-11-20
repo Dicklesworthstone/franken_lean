@@ -141,9 +141,12 @@ fn the_lean_door_evaluates_and_checks_under_namespaces_and_opens() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(output.stdout.is_empty(), "{output:?}");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("Unknown identifier `x`"),
-        "{output:?}"
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "{}:4:0: error(lean.unknownIdentifier): Unknown identifier `x`\n",
+            closed.display()
+        ),
     );
+    assert!(output.stderr.is_empty(), "{output:?}");
 }

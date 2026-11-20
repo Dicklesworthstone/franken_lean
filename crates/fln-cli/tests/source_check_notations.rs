@@ -307,7 +307,7 @@ fn a_section_capture_never_resolves_to_an_unrelated_global() {
         (
             "prelude\nimport Init.Core\nstructure Box where\n  val : Nat\nnamespace box\ndef val : Nat := 1\nend box\nnotation \"fieldFn!\" => fun box : Box => box.val\ntheorem escaped : fieldFn! ({ val := 2 } : Box) = 1 := rfl\n",
             1,
-            "elaboration",
+            "not definitionally equal",
             "Not a definitional equality",
         ),
     ];
@@ -318,8 +318,16 @@ fn a_section_capture_never_resolves_to_an_unrelated_global() {
             Some(native_code),
             "stdout: {stdout}\nstderr: {stderr}"
         );
-        assert!(stdout.is_empty(), "{stdout}");
-        assert!(stderr.contains(feature), "{stderr}");
+        if native_code == 5 {
+            assert!(stdout.is_empty(), "{stdout}");
+            assert!(stderr.contains(feature), "{stderr}");
+        } else {
+            assert!(
+                stdout.contains(": error: ") && stdout.contains(feature),
+                "{stdout}"
+            );
+            assert!(stderr.is_empty(), "{stderr}");
+        }
         let (code, output) = pinned(&lib, &root.join("Notations.lean"))
             .expect("the pinned Reference binary is required for the capture comparison");
         assert_eq!(code, 1, "{output}");

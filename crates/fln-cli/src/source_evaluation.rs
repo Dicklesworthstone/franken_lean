@@ -101,10 +101,27 @@ fn unit_type(type_: &fln::Expr) -> bool {
                 && levels.as_slice() == [fln::Level::one()])
 }
 
+trait EvaluationConstants {
+    fn constant(&self, name: &fln::Name) -> Option<&fln::ConstantInfo>;
+}
+
+impl EvaluationConstants for fln::SourceEvaluationObservation<'_> {
+    fn constant(&self, name: &fln::Name) -> Option<&fln::ConstantInfo> {
+        self.constant(name)
+    }
+}
+
+#[cfg(test)]
+impl EvaluationConstants for &fln::Environment {
+    fn constant(&self, name: &fln::Name) -> Option<&fln::ConstantInfo> {
+        self.find(name)
+    }
+}
+
 /// Imported Unit retains the admitted PUnit constructor's logical layout.
 /// The native ABI's scalar Unit is not that boxed, zero-field constructor.
 fn unit_payload(
-    environment: &fln::Environment,
+    execution: impl EvaluationConstants,
     runtime_type: &fln::Expr,
     exit: &fln::VmExit,
 ) -> Result<(), Error> {
@@ -115,7 +132,7 @@ fn unit_payload(
     let ctor_name = fln::Name::from_components(["PUnit", "unit"]);
     if constant(runtime_type, &["Unit"]) {
         let Some(fln::ConstantInfo::Defn(alias)) =
-            environment.find(&fln::Name::from_components(["Unit"]))
+            execution.constant(&fln::Name::from_components(["Unit"]))
         else {
             return Err(Error::InvalidUnit);
         };
@@ -127,7 +144,7 @@ fn unit_payload(
             return Err(Error::InvalidUnit);
         }
     }
-    let Some(fln::ConstantInfo::Induct(family)) = environment.find(&family_name) else {
+    let Some(fln::ConstantInfo::Induct(family)) = execution.constant(&family_name) else {
         return Err(Error::InvalidUnit);
     };
     let [universe] = family.base.level_params.as_slice() else {
@@ -146,7 +163,7 @@ fn unit_payload(
     {
         return Err(Error::InvalidUnit);
     }
-    let Some(fln::ConstantInfo::Ctor(ctor)) = environment.find(&ctor_name) else {
+    let Some(fln::ConstantInfo::Ctor(ctor)) = execution.constant(&ctor_name) else {
         return Err(Error::InvalidUnit);
     };
     if ctor.is_unsafe
@@ -177,7 +194,7 @@ fn unit_payload(
 /// from the checked family, never from a pinned numeric tag. Other exceptions
 /// retain their constructor name rather than guessing IO.Error.toString.
 fn exception_message(
-    environment: &fln::Environment,
+    execution: impl EvaluationConstants,
     runtime_type: &fln::Expr,
     exit: fln::VmExit,
 ) -> Result<String, Error> {
@@ -188,7 +205,7 @@ fn exception_message(
         return Err(Error::InvalidException);
     };
     let family_name = fln::Name::from_components(["IO", "Error"]);
-    let Some(fln::ConstantInfo::Induct(family)) = environment.find(&family_name) else {
+    let Some(fln::ConstantInfo::Induct(family)) = execution.constant(&family_name) else {
         return Err(Error::InvalidException);
     };
     if family.is_unsafe || family.num_params != 0 || !family.base.level_params.is_empty() {
@@ -202,7 +219,7 @@ fn exception_message(
     let Some(ctor_name) = family.ctors.get(tag) else {
         return Err(Error::InvalidException);
     };
-    let Some(fln::ConstantInfo::Ctor(ctor)) = environment.find(ctor_name) else {
+    let Some(fln::ConstantInfo::Ctor(ctor)) = execution.constant(ctor_name) else {
         return Err(Error::InvalidException);
     };
     if ctor.is_unsafe
@@ -243,16 +260,17 @@ fn exception_message(
     }
 }
 
-pub(super) fn raised(
-    execution: &fln::DefinitionExecution,
+pub(super) fn raised<'a>(
+    execution: impl Into<fln::SourceEvaluationObservation<'a>>,
     runtime_type: &fln::Expr,
     exit: fln::VmExit,
 ) -> Error {
+    let execution = execution.into();
     let fln::VmExit::Returned(returned) = &exit else {
         return Error::InvalidException;
     };
     let usage = returned.usage;
-    match exception_message(execution.engine.environment(), runtime_type, exit) {
+    match exception_message(execution, runtime_type, exit) {
         Ok(message) => Error::Raised {
             message,
             steps: usage.steps,
@@ -265,7 +283,10 @@ pub(super) fn raised(
 
 /// Validate every execution before rendering any output, including evaluations
 /// in dependencies. A later successful command cannot hide an IO exception.
-pub(super) fn check(execution: &fln::DefinitionExecution) -> Result<(), Error> {
+pub(super) fn check<'a>(
+    execution: impl Into<fln::SourceEvaluationObservation<'a>>,
+) -> Result<(), Error> {
+    let execution = execution.into();
     match execution.io_evaluation_outcome().map_err(Error::Io)? {
         Some(fln::IoEvaluationOutcome::Raised { runtime_type, exit }) => {
             Err(raised(execution, &runtime_type, exit))
@@ -304,7 +325,10 @@ pub(super) enum PresentedEvaluation {
 
 /// Only the source adapter's retained intent authorizes Lean presentation.
 /// The runtime type or constructor of an ordinary result supplies no marker.
-pub(super) fn has_checked_presentation(execution: &fln::DefinitionExecution) -> bool {
+pub(super) fn has_checked_presentation<'a>(
+    execution: impl Into<fln::SourceEvaluationObservation<'a>>,
+) -> bool {
+    let execution = execution.into();
     matches!(
         execution.evaluation_presentation(),
         Some(
@@ -318,23 +342,24 @@ pub(super) fn has_checked_presentation(execution: &fln::DefinitionExecution) -> 
 
 /// Project the result of the already-run action. Neither reading its outcome
 /// nor rendering its Format executes the action or calls its printer again.
-fn io_formatted(
-    execution: &fln::DefinitionExecution,
+fn io_formatted<'a>(
+    execution: impl Into<fln::SourceEvaluationObservation<'a>>,
     width: Option<usize>,
 ) -> Result<PresentedEvaluation, Error> {
+    let execution = execution.into();
     match execution.io_evaluation_outcome().map_err(Error::Io)? {
         Some(fln::IoEvaluationOutcome::Returned { runtime_type, exit }) => match width {
-            Some(width) => fln::source_format::render_vm(
-                execution.engine.environment(),
-                &runtime_type,
-                &exit,
-                width,
-                fln::source_format::Limits::default(),
-            )
-            .map(PresentedEvaluation::Text)
-            .map_err(Error::Format),
+            Some(width) => execution
+                .render_format(
+                    &runtime_type,
+                    &exit,
+                    width,
+                    fln::source_format::Limits::default(),
+                )
+                .map(PresentedEvaluation::Text)
+                .map_err(Error::Format),
             None => {
-                unit_payload(execution.engine.environment(), &runtime_type, &exit)?;
+                unit_payload(execution, &runtime_type, &exit)?;
                 Ok(PresentedEvaluation::IoUnit)
             }
         },
@@ -348,23 +373,28 @@ fn io_formatted(
 /// A selected Lean printer returns an admitted Format, either directly or in
 /// a checked IO result. The private execution marker selects the projection;
 /// any refusal remains a refusal and never retries the scalar presentation.
-pub(super) fn formatted(
-    execution: &fln::DefinitionExecution,
+pub(super) fn formatted<'a>(
+    execution: impl Into<fln::SourceEvaluationObservation<'a>>,
 ) -> Result<Option<PresentedEvaluation>, Error> {
+    let execution = execution.into();
     match execution.evaluation_presentation() {
         None => Ok(None),
-        Some(fln::EvaluationResultPresentation::Format { width }) => {
-            fln::source_format::render(execution, width, fln::source_format::Limits::default())
-                .map(PresentedEvaluation::Text)
-                .map(Some)
-                .map_err(Error::Format)
-        }
+        Some(fln::EvaluationResultPresentation::Format { width }) => execution
+            .render_format(
+                execution.runtime_type(),
+                execution.exit(),
+                width,
+                fln::source_format::Limits::default(),
+            )
+            .map(PresentedEvaluation::Text)
+            .map(Some)
+            .map_err(Error::Format),
         Some(fln::EvaluationResultPresentation::IoFormat { width }) => {
             io_formatted(execution, Some(width)).map(Some)
         }
         Some(fln::EvaluationResultPresentation::IoUnit) => io_formatted(execution, None).map(Some),
         Some(fln::EvaluationResultPresentation::Guard) => {
-            match fln::closed_vm_value(&execution.exit) {
+            match fln::closed_vm_value(execution.exit()) {
                 Ok(Some(fln::ClosedVmValue::Scalar(1))) => Ok(Some(PresentedEvaluation::IoUnit)),
                 Ok(Some(fln::ClosedVmValue::Scalar(0))) => Err(Error::GuardFalse),
                 Ok(_) => Err(Error::InvalidGuardResult),
@@ -473,15 +503,16 @@ impl FormattedOutputBudget {
     }
 }
 
-pub(super) fn value(
-    execution: &fln::DefinitionExecution,
+pub(super) fn value<'a>(
+    execution: impl Into<fln::SourceEvaluationObservation<'a>>,
 ) -> Result<Option<SourceFinalValue>, Error> {
+    let execution = execution.into();
     match execution.io_evaluation_outcome().map_err(Error::Io)? {
         Some(fln::IoEvaluationOutcome::Returned { runtime_type, exit }) => {
             // IO returns Type-valued PUnit (the normalized Unit alias). The
             // pin suppresses that result line; the raw JSON door retains it.
             if unit_type(&runtime_type) {
-                unit_payload(execution.engine.environment(), &runtime_type, &exit)?;
+                unit_payload(execution, &runtime_type, &exit)?;
                 return Ok(Some(SourceFinalValue::IoUnit));
             }
             closed_source_cli_value(&runtime_type, &exit).map_err(Error::Value)
@@ -489,9 +520,8 @@ pub(super) fn value(
         Some(fln::IoEvaluationOutcome::Raised { runtime_type, exit }) => {
             Err(raised(execution, &runtime_type, exit))
         }
-        None => {
-            closed_source_cli_value(&execution.runtime_type, &execution.exit).map_err(Error::Value)
-        }
+        None => closed_source_cli_value(execution.runtime_type(), execution.exit())
+            .map_err(Error::Value),
     }
 }
 

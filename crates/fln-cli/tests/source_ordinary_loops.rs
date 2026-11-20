@@ -335,7 +335,7 @@ fn source_imports_and_stdin_cannot_bypass_an_execution_ceiling() {
         let output = child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(expected_exit), "{output:?}");
         if expected_exit == 3 {
-            assert!(output.stdout.is_empty(), "{output:?}");
+            assert_eq!(output.stdout, b"Nat : Type\n", "{output:?}");
             assert!(String::from_utf8_lossy(&output.stderr).contains("ExecutionSteps"));
         } else {
             assert_eq!(String::from_utf8_lossy(&output.stdout), "Nat : Type\n42\n");

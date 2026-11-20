@@ -211,9 +211,10 @@ fn installed_public_instances_refuse_hidden_dependencies_and_recover() {
     }
     let lean = p.lean();
     assert!(!lean.status.success(), "{lean:?}");
-    assert!(lean.stdout.is_empty(), "{lean:?}");
+    assert!(lean.stderr.is_empty(), "{lean:?}");
     assert!(
-        String::from_utf8_lossy(&lean.stderr).contains("not definitionally equal"),
+        String::from_utf8_lossy(&lean.stdout).contains(": error: ")
+            && String::from_utf8_lossy(&lean.stdout).contains("not definitionally equal"),
         "{lean:?}"
     );
     p.write("Main.lean", client);

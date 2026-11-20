@@ -310,12 +310,13 @@ fn transparency_scopes_refuse_what_the_pin_does_not_unfold() {
         }
         let (code, stdout, stderr) = ours(&lib, &root, name);
         assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+        let reason = reason.strip_prefix("elaboration refused source: ").unwrap();
         assert!(
-            stderr
-                .trim_end()
-                .ends_with(&format!("refused source: {reason}")),
-            "{name}: {stderr}"
+            stdout.trim_end().ends_with(&format!(": error: {reason}")),
+            "{name}: {stdout}{stderr}"
         );
+        assert!(stdout.starts_with(&format!("{name}:")), "{stdout}");
+        assert!(stderr.is_empty(), "{name}: {stderr}");
     }
 }
 

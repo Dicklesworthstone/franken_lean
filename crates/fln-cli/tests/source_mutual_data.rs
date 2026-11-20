@@ -78,8 +78,14 @@ fn direct_mutual_folds_are_refused_by_both_personalities_as_the_pin_does() {
         .output()
         .unwrap();
     assert!(!output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let diagnostic = String::from_utf8_lossy(&output.stdout);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains(message),
+        diagnostic.starts_with(&format!("{}:", source.display())),
+        "{output:?}"
+    );
+    assert!(
+        diagnostic.contains(&format!(": error: {message}")),
         "{output:?}"
     );
     assert_eq!(

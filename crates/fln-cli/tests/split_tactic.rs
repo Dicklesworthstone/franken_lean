@@ -866,7 +866,14 @@ fn source_conditionals_do_not_refine_the_discriminant_or_leak_evidence() {
         }
         let (code, stdout, stderr) = ours(&lib, &root, name);
         assert_eq!(code, 1, "{name}: {stdout}{stderr}");
-        assert!(stdout.is_empty(), "{name}: {stdout}");
+        assert!(stdout.starts_with(&format!("{name}:")), "{name}: {stdout}");
+        let tag = if name == "NoEvidenceLeak.lean" {
+            "error(lean.unknownIdentifier)"
+        } else {
+            "error"
+        };
+        assert!(stdout.contains(&format!(": {tag}: ")), "{name}: {stdout}");
+        assert!(stderr.is_empty(), "{name}: {stderr}");
     }
 }
 
@@ -892,9 +899,11 @@ fn split_is_refused_where_the_pin_refuses_it() {
         let (code, stdout, stderr) = ours(&lib, &root, name);
         assert_eq!(code, 1, "{name}: {stdout}{stderr}");
         assert!(
-            stderr.ends_with(&format!("refused source: {message}")),
-            "{name}: {stderr}"
+            stdout.ends_with(&format!(": error: {message}")),
+            "{name}: {stdout}{stderr}"
         );
+        assert!(stdout.starts_with(&format!("{name}:")), "{stdout}");
+        assert!(stderr.is_empty(), "{name}: {stderr}");
     }
 }
 

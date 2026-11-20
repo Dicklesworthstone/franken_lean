@@ -2814,6 +2814,49 @@ impl Engine {
         limits: EngineExecutionLimits,
         presentation: EvaluationPresentation,
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
+        self.execute_source_commands_with_optional_observer(
+            source,
+            options,
+            limits,
+            presentation,
+            None,
+        )
+    }
+
+    /// Execute once, retaining observation-only output when a later command
+    /// fails. The observer receives one completed command prefix, including its
+    /// warnings and guard evidence; it never receives an Engine or Environment.
+    /// Its `is_complete` flag distinguishes a finished stream from a prefix.
+    ///
+    /// Syntax preflight failures produce no observation. Nested scoped and
+    /// guarded commands form one boundary: a failed body contributes no partial
+    /// query, warning or evaluation. The ordinary return value remains atomic
+    /// and preserves every typed failure or nonanswer.
+    pub fn execute_source_commands_with_observer(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+        presentation: EvaluationPresentation,
+        observe: &mut dyn FnMut(SourceCommandObservation<'_>),
+    ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
+        self.execute_source_commands_with_optional_observer(
+            source,
+            options,
+            limits,
+            presentation,
+            Some(observe),
+        )
+    }
+
+    fn execute_source_commands_with_optional_observer(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+        presentation: EvaluationPresentation,
+        observe: Option<&mut dyn FnMut(SourceCommandObservation<'_>)>,
+    ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
         let grammar = source_check::grammar::SourceGrammar::for_engine(self, None, false)?;
         let partitioned = grammar
             .enter(|| fln_parse::partition_source_module(source))
@@ -2825,9 +2868,11 @@ impl Engine {
             });
         }
         if partitioned.commands.is_empty() {
-            return Ok(Outcome::Complete(
-                self.empty_source_command_execution(options),
-            ));
+            let completed = self.empty_source_command_execution(options);
+            if let Some(observe) = observe {
+                observe(completed.observation());
+            }
+            return Ok(Outcome::Complete(completed));
         }
         self.execute_source_command_stream(
             partitioned.commands,
@@ -2841,6 +2886,7 @@ impl Engine {
             presentation,
             &[(source, None)],
             None,
+            observe,
         )
     }
 
@@ -2883,6 +2929,7 @@ impl Engine {
         presentation: EvaluationPresentation,
         source_files: &[(&[u8], Option<&Name>)],
         mut macros: Option<&mut imported_macros::source::FileSession<'_>>,
+        mut observe: Option<&mut dyn FnMut(SourceCommandObservation<'_>)>,
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
         use imported_macros::source::ProgramCommandSyntax;
         if let Some(reason) = macros.as_deref().and_then(|session| session.cancelled()) {
@@ -2897,7 +2944,7 @@ impl Engine {
             return Err(EngineExecutionError::EmptyBatch);
         }
 
-        let command_count = commands.len();
+        let mut command_count = commands.len();
         let sites = source_files
             .iter()
             .map(|(source, module)| source_check::source_site(source).map(|site| (site, *module)))
@@ -3028,277 +3075,313 @@ impl Engine {
                 at: Some(at),
             }
         };
-        while let Some(step) = queue.pop_front() {
-            if let Some(reason) = macros.as_deref().and_then(|session| session.cancelled()) {
-                return Ok(Outcome::Inconclusive(reason));
-            }
-            if let Some((index, offset)) = elaborated_command.take() {
-                deprecations.extend(deprecation_warnings(
-                    deprecation_sink.take(),
-                    index,
-                    offset,
-                    engine.environment(),
-                    &scopes.current,
-                    limits.kernel,
-                )?);
-            }
-            let (command_index, original_offset, command_source, top_level) = match step {
-                Step::Command(index, offset, source, top_level) => {
-                    (index, offset, source, top_level)
-                }
-                Step::Scope(index, transition) => {
-                    if let Some(session) = macros.as_deref() {
-                        session
-                            .check_native_control(
-                                scopes.imported_macros().expect("imported macro file scope"),
-                                &transition,
-                            )
-                            .map_err(|error| macro_error(index, fln_parse::BytePos(0), error))?;
+        // Save only immutable world handles at a top-level boundary, never a
+        // second execution. Nested `... in` bodies keep their enclosing
+        // boundary so a failing scoped or guarded command cannot leak rows.
+        let mut prefix = observe.as_ref().map(|_| {
+            (
+                0usize,
+                engine.clone(),
+                scopes.current.clone(),
+                file_base.clone(),
+            )
+        });
+        let stream_result: Result<Outcome<()>, EngineExecutionError> = (|| {
+            while let Some(step) = queue.pop_front() {
+                if let Some(reason) = macros.as_deref().and_then(|session| session.cancelled()) {
+                    // Cancellation first observed at the next top-level
+                    // command must retain the command that just completed.
+                    // A nested body or pending scope restoration still belongs
+                    // to the enclosing command's earlier boundary.
+                    if observe.is_some()
+                        && let Step::Command(index, _, _, true) = &step
+                    {
+                        prefix = Some((
+                            *index,
+                            engine.clone(),
+                            scopes.current.clone(),
+                            file_base.clone(),
+                        ));
                     }
-                    grammar.observe(&transition);
-                    scopes
-                        .check_limits(&transition)
-                        .map_err(|(resource, limit)| {
-                            scope_error(
-                                index,
-                                fln_parse::BytePos(0),
-                                format!("{resource} limit {limit} exceeded"),
-                            )
-                        })?;
-                    scopes
-                        .transition_worlds(
-                            transition,
-                            engine.environment(),
-                            public.as_ref().map(|world| world.engine().environment()),
-                        )
-                        .map_err(|error| {
-                            scope_error(index, fln_parse::BytePos(0), error.message())
-                        })?;
-                    continue;
+                    return Ok(Outcome::Inconclusive(reason));
                 }
-            };
-            elaborated_command = Some((command_index, original_offset));
-            // Consume each file boundary once, including when a temporary
-            // scope expansion revisits its original command index.
-            if file_starts.peek() == Some(&command_index) {
-                file_starts.next();
-                if sites[source_file].1.is_some() {
-                    engine.environment =
-                        fln_elab::source::scope::simp::export::export_source_module(
-                            &file_base,
-                            &engine.environment,
-                        )
-                        .map_err(|error| {
-                            scope_error(command_index, original_offset, error.to_string())
-                        })?;
-                }
-                source_file += 1;
-                file_base = engine.environment.clone();
-                scopes = source_check::scopes::Scopes::new(&engine);
-                scopes.current.private_module = private_module.cloned();
-                scopes.current.source_module = source_module.cloned();
-                grammar = source_check::grammar::SourceGrammar::for_engine(
-                    &engine,
-                    source_module,
-                    private_module.is_some(),
-                )?;
-                grammar.extend_scopes(&mut scopes);
-            }
-            if let Some(session) = macros.as_deref_mut() {
-                session.set_templates(grammar.templates()?);
-            }
-            let local_stderr_capture = scopes.current.options.get_bool(
-                &Name::from_components(["stderrAsMessages"]),
-                options.get_bool(&Name::from_components(["stderrAsMessages"]), true),
-            );
-            let isolate_stderr = match command_stderr_capture.as_mut() {
-                Some((index, active)) if *index == command_index => {
-                    *active |= local_stderr_capture;
-                    *active
-                }
-                _ => {
-                    command_stderr_capture = Some((command_index, local_stderr_capture));
-                    local_stderr_capture
-                }
-            };
-            let (site, module) = &sites[source_file];
-            scopes.current.source_site = Some(site.at_offset(original_offset));
-            if let Some(module) = module {
-                scopes.current.source_module = Some((*module).clone());
-            }
-            let control = grammar
-                .enter(|| fln_parse::command_scope::parse(command_source))
-                .map_err(|error| error.with_original_offset(original_offset))
-                .map_err(DefinitionFrontendError::Parse)
-                .map_err(|error| EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(EngineExecutionError::Frontend(error)),
-                    at: Some(original_offset),
-                })?;
-            if top_level
-                && !matches!(
-                    control,
-                    Some(fln_parse::command_scope::ScopeCommand::Trivia)
-                )
-                && let Some(session) = macros.as_deref_mut()
-            {
-                match grammar.enter(|| session.observe_top_level_command(command_source)) {
-                    Outcome::Complete(()) => {}
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                }
-            }
-            if let Some(control) = control {
-                use fln_parse::command_scope::ScopeCommand;
-                let control = if let Some(session) = macros.as_deref_mut() {
-                    let registry = scopes.imported_macros().expect("imported macro file scope");
-                    session
-                        .check_native_control(registry, &control)
-                        .map_err(|error| macro_error(command_index, original_offset, error))?;
-                    if matches!(control, ScopeCommand::GuardMsgs { .. }) {
-                        return Err(EngineExecutionError::BatchCommand {
-                            index: command_index,
-                            error: Box::new(EngineExecutionError::NotImplemented {
-                                feature: "imported macro execution under `#guard_msgs`",
-                            }),
-                            at: Some(original_offset),
-                        });
-                    }
-                    match session.expand_control(
-                        &engine,
-                        registry,
-                        command_source,
-                        control,
+                if let Some((index, offset)) = elaborated_command.take() {
+                    deprecations.extend(deprecation_warnings(
+                        deprecation_sink.take(),
+                        index,
+                        offset,
+                        engine.environment(),
                         &scopes.current,
-                    ) {
-                        Outcome::Complete(Ok(control)) => control,
-                        Outcome::Complete(Err(error)) => {
-                            return Err(macro_error(command_index, original_offset, error));
-                        }
-                        Outcome::Inconclusive(reason) => {
-                            return Ok(Outcome::Inconclusive(reason));
-                        }
-                        Outcome::InternalFault(fault) => {
-                            return Ok(Outcome::InternalFault(fault));
-                        }
+                        limits.kernel,
+                    )?);
+                }
+                let (command_index, original_offset, command_source, top_level) = match step {
+                    Step::Command(index, offset, source, top_level) => {
+                        (index, offset, source, top_level)
                     }
-                } else {
-                    control
+                    Step::Scope(index, transition) => {
+                        if let Some(session) = macros.as_deref() {
+                            session
+                                .check_native_control(
+                                    scopes.imported_macros().expect("imported macro file scope"),
+                                    &transition,
+                                )
+                                .map_err(|error| {
+                                    macro_error(index, fln_parse::BytePos(0), error)
+                                })?;
+                        }
+                        grammar.observe(&transition);
+                        scopes
+                            .check_limits(&transition)
+                            .map_err(|(resource, limit)| {
+                                scope_error(
+                                    index,
+                                    fln_parse::BytePos(0),
+                                    format!("{resource} limit {limit} exceeded"),
+                                )
+                            })?;
+                        scopes
+                            .transition_worlds(
+                                transition,
+                                engine.environment(),
+                                public.as_ref().map(|world| world.engine().environment()),
+                            )
+                            .map_err(|error| {
+                                scope_error(index, fln_parse::BytePos(0), error.message())
+                            })?;
+                        continue;
+                    }
                 };
-                match control {
-                    ScopeCommand::Trivia => {}
-                    // The command ends at its `#exit` token, so the warning sits there.
-                    ScopeCommand::Exit => {
-                        exit_warning = Some(SourceWarning {
-                            command_index,
-                            at: fln_parse::BytePos(
-                                original_offset.0
-                                    + command_source.len().saturating_sub("#exit".len()),
-                            ),
-                            message: "using 'exit' to interrupt Lean".to_owned(),
-                            severity: SourceSeverity::Warning,
-                            follows_output: false,
-                        });
+                if top_level && observe.is_some() {
+                    prefix = Some((
+                        command_index,
+                        engine.clone(),
+                        scopes.current.clone(),
+                        file_base.clone(),
+                    ));
+                }
+                elaborated_command = Some((command_index, original_offset));
+                // Consume each file boundary once, including when a temporary
+                // scope expansion revisits its original command index.
+                if file_starts.peek() == Some(&command_index) {
+                    file_starts.next();
+                    if sites[source_file].1.is_some() {
+                        engine.environment =
+                            fln_elab::source::scope::simp::export::export_source_module(
+                                &file_base,
+                                &engine.environment,
+                            )
+                            .map_err(|error| {
+                                scope_error(command_index, original_offset, error.to_string())
+                            })?;
                     }
-                    ScopeCommand::OpenIn {
-                        names,
-                        scoped,
-                        body,
-                    } => {
-                        let open = if scoped {
-                            ScopeCommand::OpenScoped(names)
-                        } else {
-                            ScopeCommand::Open(names)
-                        };
-                        for step in [
-                            Step::Scope(command_index, ScopeCommand::Section(None)),
-                            Step::Scope(command_index, open),
-                            Step::Command(
-                                command_index,
-                                fln_parse::BytePos(original_offset.0 + body),
-                                &command_source[body..],
-                                false,
-                            ),
-                            Step::Scope(command_index, ScopeCommand::End(None)),
-                        ]
-                        .into_iter()
-                        .rev()
-                        {
-                            queue.push_front(step);
-                        }
+                    source_file += 1;
+                    file_base = engine.environment.clone();
+                    scopes = source_check::scopes::Scopes::new(&engine);
+                    scopes.current.private_module = private_module.cloned();
+                    scopes.current.source_module = source_module.cloned();
+                    grammar = source_check::grammar::SourceGrammar::for_engine(
+                        &engine,
+                        source_module,
+                        private_module.is_some(),
+                    )?;
+                    grammar.extend_scopes(&mut scopes);
+                }
+                if let Some(session) = macros.as_deref_mut() {
+                    session.set_templates(grammar.templates()?);
+                }
+                let local_stderr_capture = scopes.current.options.get_bool(
+                    &Name::from_components(["stderrAsMessages"]),
+                    options.get_bool(&Name::from_components(["stderrAsMessages"]), true),
+                );
+                let isolate_stderr = match command_stderr_capture.as_mut() {
+                    Some((index, active)) if *index == command_index => {
+                        *active |= local_stderr_capture;
+                        *active
                     }
-                    // The pin's `in` macro for any other head: `section <head> <command> end`,
-                    // the head run as the command it is.
-                    ScopeCommand::In { head, body } => {
-                        for step in [
-                            Step::Scope(command_index, ScopeCommand::Section(None)),
-                            Step::Command(
-                                command_index,
-                                original_offset,
-                                &command_source[..head],
-                                false,
-                            ),
-                            Step::Command(
-                                command_index,
-                                fln_parse::BytePos(original_offset.0 + body),
-                                &command_source[body..],
-                                false,
-                            ),
-                            Step::Scope(command_index, ScopeCommand::End(None)),
-                        ]
-                        .into_iter()
-                        .rev()
-                        {
-                            queue.push_front(step);
-                        }
+                    _ => {
+                        command_stderr_capture = Some((command_index, local_stderr_capture));
+                        local_stderr_capture
                     }
-                    // The pin's `in` macro: `section set_option o v <command> end`.
-                    ScopeCommand::SetOptionIn { name, value, body } => {
-                        for step in [
-                            Step::Scope(command_index, ScopeCommand::Section(None)),
-                            Step::Scope(command_index, ScopeCommand::SetOption { name, value }),
-                            Step::Command(
-                                command_index,
-                                fln_parse::BytePos(original_offset.0 + body),
-                                &command_source[body..],
-                                false,
-                            ),
-                            Step::Scope(command_index, ScopeCommand::End(None)),
-                        ]
-                        .into_iter()
-                        .rev()
-                        {
-                            queue.push_front(step);
-                        }
+                };
+                let (site, module) = &sites[source_file];
+                scopes.current.source_site = Some(site.at_offset(original_offset));
+                if let Some(module) = module {
+                    scopes.current.source_module = Some((*module).clone());
+                }
+                let control = grammar
+                    .enter(|| fln_parse::command_scope::parse(command_source))
+                    .map_err(|error| error.with_original_offset(original_offset))
+                    .map_err(DefinitionFrontendError::Parse)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(EngineExecutionError::Frontend(error)),
+                        at: Some(original_offset),
+                    })?;
+                if top_level
+                    && !matches!(
+                        control,
+                        Some(fln_parse::command_scope::ScopeCommand::Trivia)
+                    )
+                    && let Some(session) = macros.as_deref_mut()
+                {
+                    match grammar.enter(|| session.observe_top_level_command(command_source)) {
+                        Outcome::Complete(()) => {}
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     }
-                    // The guarded command runs as written, as the pin's `runAndCollectMessages`
-                    // runs it; its messages are judged by the presentation, against `expected`.
-                    // Retain the parsed policy for the judge. A nested guard and unavailable
-                    // message sources remain explicit capability refusals.
-                    ScopeCommand::GuardMsgs {
-                        expected,
-                        specified,
-                        body,
-                    } => {
-                        let not_implemented = |feature| EngineExecutionError::BatchCommand {
-                            index: command_index,
-                            error: Box::new(EngineExecutionError::NotImplemented { feature }),
-                            at: Some(original_offset),
-                        };
-                        // `#guard_msgs` is syntax `Init/Notation.lean` declares
-                        // (`Lean.guardMsgsCmd`). A world built from `.olean`s that does not reach
-                        // it reads the command as an unknown token, as the pin does ("expected
-                        // token"); the seed stands for the implicit `Init`, which declares it.
-                        if !engine.imported_modules.is_empty()
-                            && !engine
-                                .environment()
-                                .contains(&Name::from_components(["Lean", "guardMsgsCmd"]))
-                        {
-                            let keyword = command_source
-                                .windows(b"#guard_msgs".len())
-                                .position(|window| window == b"#guard_msgs")
-                                .unwrap_or(0);
+                }
+                if let Some(control) = control {
+                    use fln_parse::command_scope::ScopeCommand;
+                    let control = if let Some(session) = macros.as_deref_mut() {
+                        let registry = scopes.imported_macros().expect("imported macro file scope");
+                        session
+                            .check_native_control(registry, &control)
+                            .map_err(|error| macro_error(command_index, original_offset, error))?;
+                        if matches!(control, ScopeCommand::GuardMsgs { .. }) {
                             return Err(EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(EngineExecutionError::NotImplemented {
+                                    feature: "imported macro execution under `#guard_msgs`",
+                                }),
+                                at: Some(original_offset),
+                            });
+                        }
+                        match session.expand_control(
+                            &engine,
+                            registry,
+                            command_source,
+                            control,
+                            &scopes.current,
+                        ) {
+                            Outcome::Complete(Ok(control)) => control,
+                            Outcome::Complete(Err(error)) => {
+                                return Err(macro_error(command_index, original_offset, error));
+                            }
+                            Outcome::Inconclusive(reason) => {
+                                return Ok(Outcome::Inconclusive(reason));
+                            }
+                            Outcome::InternalFault(fault) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
+                        }
+                    } else {
+                        control
+                    };
+                    match control {
+                        ScopeCommand::Trivia => {}
+                        // The command ends at its `#exit` token, so the warning sits there.
+                        ScopeCommand::Exit => {
+                            exit_warning = Some(SourceWarning {
+                                command_index,
+                                at: fln_parse::BytePos(
+                                    original_offset.0
+                                        + command_source.len().saturating_sub("#exit".len()),
+                                ),
+                                message: "using 'exit' to interrupt Lean".to_owned(),
+                                severity: SourceSeverity::Warning,
+                                follows_output: false,
+                            });
+                        }
+                        ScopeCommand::OpenIn {
+                            names,
+                            scoped,
+                            body,
+                        } => {
+                            let open = if scoped {
+                                ScopeCommand::OpenScoped(names)
+                            } else {
+                                ScopeCommand::Open(names)
+                            };
+                            for step in [
+                                Step::Scope(command_index, ScopeCommand::Section(None)),
+                                Step::Scope(command_index, open),
+                                Step::Command(
+                                    command_index,
+                                    fln_parse::BytePos(original_offset.0 + body),
+                                    &command_source[body..],
+                                    false,
+                                ),
+                                Step::Scope(command_index, ScopeCommand::End(None)),
+                            ]
+                            .into_iter()
+                            .rev()
+                            {
+                                queue.push_front(step);
+                            }
+                        }
+                        // The pin's `in` macro for any other head: `section <head> <command> end`,
+                        // the head run as the command it is.
+                        ScopeCommand::In { head, body } => {
+                            for step in [
+                                Step::Scope(command_index, ScopeCommand::Section(None)),
+                                Step::Command(
+                                    command_index,
+                                    original_offset,
+                                    &command_source[..head],
+                                    false,
+                                ),
+                                Step::Command(
+                                    command_index,
+                                    fln_parse::BytePos(original_offset.0 + body),
+                                    &command_source[body..],
+                                    false,
+                                ),
+                                Step::Scope(command_index, ScopeCommand::End(None)),
+                            ]
+                            .into_iter()
+                            .rev()
+                            {
+                                queue.push_front(step);
+                            }
+                        }
+                        // The pin's `in` macro: `section set_option o v <command> end`.
+                        ScopeCommand::SetOptionIn { name, value, body } => {
+                            for step in [
+                                Step::Scope(command_index, ScopeCommand::Section(None)),
+                                Step::Scope(command_index, ScopeCommand::SetOption { name, value }),
+                                Step::Command(
+                                    command_index,
+                                    fln_parse::BytePos(original_offset.0 + body),
+                                    &command_source[body..],
+                                    false,
+                                ),
+                                Step::Scope(command_index, ScopeCommand::End(None)),
+                            ]
+                            .into_iter()
+                            .rev()
+                            {
+                                queue.push_front(step);
+                            }
+                        }
+                        // The guarded command runs as written, as the pin's `runAndCollectMessages`
+                        // runs it; its messages are judged by the presentation, against `expected`.
+                        // Retain the parsed policy for the judge. A nested guard and unavailable
+                        // message sources remain explicit capability refusals.
+                        ScopeCommand::GuardMsgs {
+                            expected,
+                            specified,
+                            body,
+                        } => {
+                            let not_implemented = |feature| EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(EngineExecutionError::NotImplemented { feature }),
+                                at: Some(original_offset),
+                            };
+                            // `#guard_msgs` is syntax `Init/Notation.lean` declares
+                            // (`Lean.guardMsgsCmd`). A world built from `.olean`s that does not reach
+                            // it reads the command as an unknown token, as the pin does ("expected
+                            // token"); the seed stands for the implicit `Init`, which declares it.
+                            if !engine.imported_modules.is_empty()
+                                && !engine
+                                    .environment()
+                                    .contains(&Name::from_components(["Lean", "guardMsgsCmd"]))
+                            {
+                                let keyword = command_source
+                                    .windows(b"#guard_msgs".len())
+                                    .position(|window| window == b"#guard_msgs")
+                                    .unwrap_or(0);
+                                return Err(EngineExecutionError::BatchCommand {
                                 index: command_index,
                                 error: Box::new(EngineExecutionError::Frontend(
                                     DefinitionFrontendError::Parse(
@@ -3311,143 +3394,364 @@ impl Engine {
                                 )),
                                 at: Some(original_offset),
                             });
-                        }
-                        let spec = if specified {
-                            grammar
-                                .enter(|| {
-                                    fln_parse::command_scope::guard_spec::parse(
-                                        command_source,
-                                        body,
-                                    )
-                                })
-                                .map_err(|error| EngineExecutionError::BatchCommand {
-                                    index: command_index,
-                                    error: Box::new(EngineExecutionError::Frontend(
-                                        DefinitionFrontendError::Parse(error),
-                                    )),
-                                    at: Some(original_offset),
-                                })?
-                        } else {
-                            fln_parse::command_scope::guard_spec::GuardSpec::default()
-                        };
-                        if spec.positions {
-                            return Err(not_implemented("`#guard_msgs` with message positions"));
-                        }
-                        // We cannot recover and reproduce failed command diagnostics yet.
-                        // Never implement `drop error` by ignoring a failed computation.
-                        if spec.action(fln_parse::command_scope::guard_spec::Severity::Error)
-                            == fln_parse::command_scope::guard_spec::Action::Drop
-                        {
-                            return Err(not_implemented("`#guard_msgs` dropping error messages"));
-                        }
-                        if guards
-                            .last()
-                            .is_some_and(|guard| guard.command_index == command_index)
-                        {
-                            return Err(not_implemented("`#guard_msgs` inside `#guard_msgs`"));
-                        }
-                        // The pin passes such a guard by capturing the command's errors or
-                        // warnings, whose text this engine does not reproduce. Running the command
-                        // here would turn the pin's pass into a rejection. The warnings it does
-                        // reproduce ([`reproduced_warning`]) are judged. Expected `trace:`
-                        // lines run: goal traces are reproduced and routed at trace severity, and
-                        // the `lean` front door makes any mismatch against an expected trace a
-                        // non-answer rather than a rejection (fln-guard-msgs-trace-severity-iss2).
-                        // An expected error is judged when the guarded command is an `example`
-                        // or `#check`, which declare nothing: its elaboration error is logged and
-                        // compared as the pin's (below). Other commands keep this refusal.
-                        if expected.lines().any(|line| {
-                            let line = line.trim_start();
-                            line.starts_with("warning:")
-                                && !reproduced_warning(line, engine.environment())
-                        }) {
-                            return Err(not_implemented(
-                                "`#guard_msgs` expecting an error or warning message",
+                            }
+                            let spec = if specified {
+                                grammar
+                                    .enter(|| {
+                                        fln_parse::command_scope::guard_spec::parse(
+                                            command_source,
+                                            body,
+                                        )
+                                    })
+                                    .map_err(|error| EngineExecutionError::BatchCommand {
+                                        index: command_index,
+                                        error: Box::new(EngineExecutionError::Frontend(
+                                            DefinitionFrontendError::Parse(error),
+                                        )),
+                                        at: Some(original_offset),
+                                    })?
+                            } else {
+                                fln_parse::command_scope::guard_spec::GuardSpec::default()
+                            };
+                            if spec.positions {
+                                return Err(not_implemented(
+                                    "`#guard_msgs` with message positions",
+                                ));
+                            }
+                            // We cannot recover and reproduce failed command diagnostics yet.
+                            // Never implement `drop error` by ignoring a failed computation.
+                            if spec.action(fln_parse::command_scope::guard_spec::Severity::Error)
+                                == fln_parse::command_scope::guard_spec::Action::Drop
+                            {
+                                return Err(not_implemented(
+                                    "`#guard_msgs` dropping error messages",
+                                ));
+                            }
+                            if guards
+                                .last()
+                                .is_some_and(|guard| guard.command_index == command_index)
+                            {
+                                return Err(not_implemented("`#guard_msgs` inside `#guard_msgs`"));
+                            }
+                            // The pin passes such a guard by capturing the command's errors or
+                            // warnings, whose text this engine does not reproduce. Running the command
+                            // here would turn the pin's pass into a rejection. The warnings it does
+                            // reproduce ([`reproduced_warning`]) are judged. Expected `trace:`
+                            // lines run: goal traces are reproduced and routed at trace severity, and
+                            // the `lean` front door makes any mismatch against an expected trace a
+                            // non-answer rather than a rejection (fln-guard-msgs-trace-severity-iss2).
+                            // An expected error is judged when the guarded command is an `example`
+                            // or `#check`, which declare nothing: its elaboration error is logged and
+                            // compared as the pin's (below). Other commands keep this refusal.
+                            if expected.lines().any(|line| {
+                                let line = line.trim_start();
+                                line.starts_with("warning:")
+                                    && !reproduced_warning(line, engine.environment())
+                            }) {
+                                return Err(not_implemented(
+                                    "`#guard_msgs` expecting an error or warning message",
+                                ));
+                            }
+                            guards.push(SourceGuard {
+                                command_index,
+                                expected,
+                                spec,
+                            });
+                            queue.push_front(Step::Command(
+                                command_index,
+                                fln_parse::BytePos(original_offset.0 + body),
+                                &command_source[body..],
+                                false,
                             ));
                         }
-                        guards.push(SourceGuard {
-                            command_index,
-                            expected,
-                            spec,
-                        });
-                        queue.push_front(Step::Command(
-                            command_index,
-                            fln_parse::BytePos(original_offset.0 + body),
-                            &command_source[body..],
-                            false,
-                        ));
-                    }
-                    ScopeCommand::Namespace(_)
-                    | ScopeCommand::Section(_)
-                    | ScopeCommand::SectionWithModifiers { .. }
-                    | ScopeCommand::End(_)
-                    | ScopeCommand::Open(_)
-                    | ScopeCommand::OpenExplicit { .. }
-                    | ScopeCommand::OpenScoped(_)
-                    | ScopeCommand::SetOption { .. }
-                    | ScopeCommand::Universe(_)
-                    | ScopeCommand::Variable(_)
-                    | ScopeCommand::Include(_)
-                    | ScopeCommand::Omit(_)
-                    | ScopeCommand::Simp(_)
-                    | ScopeCommand::Executable(_)
-                    | ScopeCommand::Instance(_)
-                    | ScopeCommand::Export { .. }
-                    | ScopeCommand::Reducibility(_) => {
-                        grammar.observe(&control);
-                        // Read before the attribute applies: the status it finds is the
-                        // declaration's own.
-                        let unmarked: Vec<(fln_parse::BytePos, Name)> = match &control {
-                            ScopeCommand::Instance(attribute) => {
-                                source_check::instance_attributes::unmarked_definitions(
-                                    engine.environment(),
-                                    &scopes.current,
-                                    attribute,
-                                )
-                                .into_iter()
-                                .map(|name| (attribute.at, name))
-                                .collect()
-                            }
-                            _ => Vec::new(),
-                        };
-                        let command_base = engine.logical_root(options);
-                        match source_check::apply_module_control_command(
-                            &mut engine,
-                            &mut scopes,
-                            &file_base,
-                            control,
-                            limits.admission(),
-                            (0, command_index, original_offset.0),
-                            public.as_deref_mut(),
-                            options,
-                        )
-                        .map_err(|error| {
-                            EngineExecutionError::BatchCommand {
-                                index: command_index,
-                                error: Box::new(error.into_execution_error()),
-                                at: Some(original_offset),
-                            }
-                        })? {
-                            Outcome::Complete(admissions) => {
-                                if !admissions.is_empty() {
-                                    for admitted in &admissions {
-                                        scopes.admitted(&admitted.declaration);
-                                    }
-                                    source_records::push_command_admission(
-                                        &mut source_admissions,
-                                        SourceCommandAdmission {
-                                            command_index,
-                                            admission: DeclarationBatchAdmission {
-                                                engine: engine.clone(),
-                                                base_logical_root: command_base,
-                                                result_logical_root: engine.logical_root(options),
-                                                admissions,
-                                                local_instance: None,
+                        ScopeCommand::Namespace(_)
+                        | ScopeCommand::Section(_)
+                        | ScopeCommand::SectionWithModifiers { .. }
+                        | ScopeCommand::End(_)
+                        | ScopeCommand::Open(_)
+                        | ScopeCommand::OpenExplicit { .. }
+                        | ScopeCommand::OpenScoped(_)
+                        | ScopeCommand::SetOption { .. }
+                        | ScopeCommand::Universe(_)
+                        | ScopeCommand::Variable(_)
+                        | ScopeCommand::Include(_)
+                        | ScopeCommand::Omit(_)
+                        | ScopeCommand::Simp(_)
+                        | ScopeCommand::Executable(_)
+                        | ScopeCommand::Instance(_)
+                        | ScopeCommand::Export { .. }
+                        | ScopeCommand::Reducibility(_) => {
+                            grammar.observe(&control);
+                            // Read before the attribute applies: the status it finds is the
+                            // declaration's own.
+                            let unmarked: Vec<(fln_parse::BytePos, Name)> = match &control {
+                                ScopeCommand::Instance(attribute) => {
+                                    source_check::instance_attributes::unmarked_definitions(
+                                        engine.environment(),
+                                        &scopes.current,
+                                        attribute,
+                                    )
+                                    .into_iter()
+                                    .map(|name| (attribute.at, name))
+                                    .collect()
+                                }
+                                _ => Vec::new(),
+                            };
+                            let command_base = engine.logical_root(options);
+                            match source_check::apply_module_control_command(
+                                &mut engine,
+                                &mut scopes,
+                                &file_base,
+                                control,
+                                limits.admission(),
+                                (0, command_index, original_offset.0),
+                                public.as_deref_mut(),
+                                options,
+                            )
+                            .map_err(|error| {
+                                EngineExecutionError::BatchCommand {
+                                    index: command_index,
+                                    error: Box::new(error.into_execution_error()),
+                                    at: Some(original_offset),
+                                }
+                            })? {
+                                Outcome::Complete(admissions) => {
+                                    if !admissions.is_empty() {
+                                        for admitted in &admissions {
+                                            scopes.admitted(&admitted.declaration);
+                                        }
+                                        source_records::push_command_admission(
+                                            &mut source_admissions,
+                                            SourceCommandAdmission {
+                                                command_index,
+                                                admission: DeclarationBatchAdmission {
+                                                    engine: engine.clone(),
+                                                    base_logical_root: command_base,
+                                                    result_logical_root: engine
+                                                        .logical_root(options),
+                                                    admissions,
+                                                    local_instance: None,
+                                                },
                                             },
-                                        },
-                                    );
+                                        );
+                                    }
+                                }
+                                Outcome::Inconclusive(reason) => {
+                                    return Ok(Outcome::Inconclusive(reason));
+                                }
+                                Outcome::InternalFault(fault) => {
+                                    return Ok(Outcome::InternalFault(fault));
                                 }
                             }
+                            instance_attribute_warnings.extend(unmarked.into_iter().map(
+                                |(at, name)| SourceWarning {
+                                    command_index,
+                                    at: fln_parse::BytePos(original_offset.0 + at.0),
+                                    message: linters::unmarked_instance_message(&name),
+                                    severity: SourceSeverity::Warning,
+                                    follows_output: false,
+                                },
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                // A command that declares syntax extends the grammar and runs nothing.
+                if grammar
+                    .declare(
+                        command_source,
+                        source_check::grammar::resolver(engine.environment(), &scopes.current),
+                    )
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                {
+                    if let Some(session) = macros.as_deref() {
+                        session
+                            .check_native_syntax_declaration(
+                                scopes.imported_macros().expect("imported macro file scope"),
+                            )
+                            .map_err(|error| macro_error(command_index, original_offset, error))?;
+                        grammar.export_native().map_err(|error| {
+                            EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(error),
+                                at: Some(original_offset),
+                            }
+                        })?;
+                    }
+                    macro_pattern_warnings.extend(
+                        grammar
+                            .macro_warnings(&scopes.current.options)
+                            .iter()
+                            .map(|binder| SourceWarning {
+                                command_index,
+                                at: fln_parse::BytePos(original_offset.0 + binder.at),
+                                message: unused_variables::message(&binder.name),
+                                severity: SourceSeverity::Warning,
+                                follows_output: true,
+                            }),
+                    );
+                    grammar.extend_scopes(&mut scopes);
+                    continue;
+                }
+                let mut expanded = if let Some(session) = macros.as_deref_mut() {
+                    let result = grammar.enter(|| {
+                        session.expand_program_command(
+                            &engine,
+                            scopes.imported_macros().expect("imported macro file scope"),
+                            command_source,
+                            &scopes.current,
+                        )
+                    });
+                    match result {
+                        Outcome::Complete(Ok(parsed)) => Some(parsed),
+                        Outcome::Complete(Err(error)) => {
+                            return Err(macro_error(command_index, original_offset, error));
+                        }
+                        Outcome::Inconclusive(reason) => {
+                            return Ok(Outcome::Inconclusive(reason));
+                        }
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
+                } else {
+                    grammar
+                        .enter(|| source_records::parse_deriving_command(command_source))
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?
+                        .map(|parsed| ProgramCommandSyntax::Deriving(parsed.syntax().clone()))
+                };
+                let mut scope = if public.is_some() {
+                    let scope = match &expanded {
+                        Some(ProgramCommandSyntax::Deriving(syntax)) => {
+                            fln_elab::source::deriving::prepare_existing(
+                                syntax,
+                                engine.environment(),
+                                limits.kernel,
+                                &scopes.current,
+                            )
+                            .map(|request| request.scope)
+                            .map_err(DefinitionFrontendError::Elaborate)
+                        }
+                        Some(ProgramCommandSyntax::Mutual(members)) => scopes
+                            .current
+                            .for_mutual_declarations(members)
+                            .map_err(DefinitionFrontendError::Elaborate),
+                        Some(ProgramCommandSyntax::Single(parsed))
+                            if matches!(
+                                parsed.kind(),
+                                SourceCommandKind::Definition | SourceCommandKind::Example
+                            ) =>
+                        {
+                            scopes
+                                .current
+                                .for_declaration(parsed.syntax())
+                                .map_err(DefinitionFrontendError::Elaborate)
+                        }
+                        _ => grammar.enter(|| scopes.command_scope(command_source)),
+                    };
+                    let mut scope = scope.map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(EngineExecutionError::Frontend(error)),
+                        at: Some(original_offset),
+                    })?;
+                    if expanded.is_some() && scope.exports_declaration() {
+                        scope.instance_scopes = scopes.public_scope().instance_scopes;
+                    }
+                    scope
+                } else {
+                    scopes.current.clone()
+                };
+                if let Some(session) = macros.as_deref_mut() {
+                    match session.bind_tactics(
+                        scopes.imported_macros().expect("imported macro file scope"),
+                        command_source,
+                        &mut scope,
+                    ) {
+                        Outcome::Complete(Ok(())) => {}
+                        Outcome::Complete(Err(error)) => {
+                            return Err(macro_error(command_index, original_offset, error));
+                        }
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
+                }
+                // The equation theorems this command names, generated and admitted before it, as
+                // the pin's reserved-name action adds them when it resolves the name.
+                if public.is_none()
+                    && (expanded.is_some()
+                        || source_records::may_name_equation_theorems(command_source))
+                {
+                    // Mixed dispatch already returned the authoritative syntax.
+                    // Re-expanding the source here would replay native templates
+                    // solely to discard them during equation-name discovery.
+                    let parsed = expanded.is_none().then(|| {
+                        grammar.enter(|| {
+                            fln_parse::parse_source_command(command_source).and_then(|parsed| {
+                                grammar.expand_command(
+                                    parsed,
+                                    source_check::grammar::resolver(engine.environment(), &scope),
+                                )
+                            })
+                        })
+                    });
+                    let members = match &parsed {
+                        Some(Err(_)) => grammar
+                            .enter(|| fln_parse::command_scope::mutual::parse(command_source))
+                            .ok()
+                            .flatten(),
+                        _ => None,
+                    };
+                    let syntaxes: Vec<&fln_syntax::tree::Syntax> = match &expanded {
+                        Some(parsed) => parsed.syntaxes(),
+                        None => match (&parsed, &members) {
+                            (Some(Ok(parsed)), _) => vec![parsed.syntax()],
+                            (_, Some(members)) => members.iter().collect(),
+                            _ => Vec::new(),
+                        },
+                    };
+                    if !syntaxes.is_empty() {
+                        let realized = grammar
+                            .enter(|| {
+                                engine.realize_equation_theorems(
+                                    &syntaxes,
+                                    &scope,
+                                    options,
+                                    limits.admission(),
+                                    Some(&file_base),
+                                )
+                            })
+                            .map_err(|error| EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(error),
+                                at: Some(original_offset),
+                            })?;
+                        match realized {
+                            Outcome::Complete(Some(admission)) => {
+                                scopes
+                                    .admitted_batch(
+                                        &admission,
+                                        admission.engine.environment(),
+                                        None,
+                                    )
+                                    .map_err(|error| {
+                                        scope_error(command_index, original_offset, error.message())
+                                    })?;
+                                engine = admission.engine.clone();
+                                source_records::push_command_admission(
+                                    &mut source_admissions,
+                                    SourceCommandAdmission {
+                                        command_index,
+                                        admission,
+                                    },
+                                );
+                            }
+                            Outcome::Complete(None) => {}
                             Outcome::Inconclusive(reason) => {
                                 return Ok(Outcome::Inconclusive(reason));
                             }
@@ -3455,224 +3759,17 @@ impl Engine {
                                 return Ok(Outcome::InternalFault(fault));
                             }
                         }
-                        instance_attribute_warnings.extend(unmarked.into_iter().map(
-                            |(at, name)| SourceWarning {
-                                command_index,
-                                at: fln_parse::BytePos(original_offset.0 + at.0),
-                                message: linters::unmarked_instance_message(&name),
-                                severity: SourceSeverity::Warning,
-                                follows_output: false,
-                            },
-                        ));
                     }
                 }
-                continue;
-            }
-            // A command that declares syntax extends the grammar and runs nothing.
-            if grammar
-                .declare(
-                    command_source,
-                    source_check::grammar::resolver(engine.environment(), &scopes.current),
-                )
-                .map_err(|error| EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(error),
-                    at: Some(original_offset),
-                })?
-            {
-                if let Some(session) = macros.as_deref() {
-                    session
-                        .check_native_syntax_declaration(
-                            scopes.imported_macros().expect("imported macro file scope"),
-                        )
-                        .map_err(|error| macro_error(command_index, original_offset, error))?;
-                    grammar.export_native().map_err(|error| {
-                        EngineExecutionError::BatchCommand {
-                            index: command_index,
-                            error: Box::new(error),
-                            at: Some(original_offset),
-                        }
-                    })?;
-                }
-                macro_pattern_warnings.extend(
-                    grammar
-                        .macro_warnings(&scopes.current.options)
-                        .iter()
-                        .map(|binder| SourceWarning {
-                            command_index,
-                            at: fln_parse::BytePos(original_offset.0 + binder.at),
-                            message: unused_variables::message(&binder.name),
-                            severity: SourceSeverity::Warning,
-                            follows_output: true,
-                        }),
-                );
-                grammar.extend_scopes(&mut scopes);
-                continue;
-            }
-            let mut expanded = if let Some(session) = macros.as_deref_mut() {
-                let result = grammar.enter(|| {
-                    session.expand_program_command(
-                        &engine,
-                        scopes.imported_macros().expect("imported macro file scope"),
-                        command_source,
-                        &scopes.current,
-                    )
-                });
-                match result {
-                    Outcome::Complete(Ok(parsed)) => Some(parsed),
-                    Outcome::Complete(Err(error)) => {
-                        return Err(macro_error(command_index, original_offset, error));
-                    }
-                    Outcome::Inconclusive(reason) => {
-                        return Ok(Outcome::Inconclusive(reason));
-                    }
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                }
-            } else {
-                grammar
-                    .enter(|| source_records::parse_deriving_command(command_source))
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })?
-                    .map(|parsed| ProgramCommandSyntax::Deriving(parsed.syntax().clone()))
-            };
-            let mut scope = if public.is_some() {
-                let scope = match &expanded {
-                    Some(ProgramCommandSyntax::Deriving(syntax)) => {
-                        fln_elab::source::deriving::prepare_existing(
-                            syntax,
-                            engine.environment(),
-                            limits.kernel,
-                            &scopes.current,
-                        )
-                        .map(|request| request.scope)
-                        .map_err(DefinitionFrontendError::Elaborate)
-                    }
-                    Some(ProgramCommandSyntax::Mutual(members)) => scopes
-                        .current
-                        .for_mutual_declarations(members)
-                        .map_err(DefinitionFrontendError::Elaborate),
-                    Some(ProgramCommandSyntax::Single(parsed))
-                        if matches!(
-                            parsed.kind(),
-                            SourceCommandKind::Definition | SourceCommandKind::Example
-                        ) =>
-                    {
-                        scopes
-                            .current
-                            .for_declaration(parsed.syntax())
-                            .map_err(DefinitionFrontendError::Elaborate)
-                    }
-                    _ => grammar.enter(|| scopes.command_scope(command_source)),
-                };
-                let mut scope = scope.map_err(|error| EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(EngineExecutionError::Frontend(error)),
-                    at: Some(original_offset),
-                })?;
-                if expanded.is_some() && scope.exports_declaration() {
-                    scope.instance_scopes = scopes.public_scope().instance_scopes;
-                }
-                scope
-            } else {
-                scopes.current.clone()
-            };
-            if let Some(session) = macros.as_deref_mut() {
-                match session.bind_tactics(
-                    scopes.imported_macros().expect("imported macro file scope"),
-                    command_source,
-                    &mut scope,
-                ) {
-                    Outcome::Complete(Ok(())) => {}
-                    Outcome::Complete(Err(error)) => {
-                        return Err(macro_error(command_index, original_offset, error));
-                    }
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                }
-            }
-            // The equation theorems this command names, generated and admitted before it, as
-            // the pin's reserved-name action adds them when it resolves the name.
-            if public.is_none()
-                && (expanded.is_some()
-                    || source_records::may_name_equation_theorems(command_source))
-            {
-                // Mixed dispatch already returned the authoritative syntax.
-                // Re-expanding the source here would replay native templates
-                // solely to discard them during equation-name discovery.
-                let parsed = expanded.is_none().then(|| {
-                    grammar.enter(|| {
-                        fln_parse::parse_source_command(command_source).and_then(|parsed| {
-                            grammar.expand_command(
-                                parsed,
-                                source_check::grammar::resolver(engine.environment(), &scope),
-                            )
-                        })
-                    })
-                });
-                let members = match &parsed {
-                    Some(Err(_)) => grammar
-                        .enter(|| fln_parse::command_scope::mutual::parse(command_source))
-                        .ok()
-                        .flatten(),
-                    _ => None,
-                };
-                let syntaxes: Vec<&fln_syntax::tree::Syntax> = match &expanded {
-                    Some(parsed) => parsed.syntaxes(),
-                    None => match (&parsed, &members) {
-                        (Some(Ok(parsed)), _) => vec![parsed.syntax()],
-                        (_, Some(members)) => members.iter().collect(),
-                        _ => Vec::new(),
-                    },
-                };
-                if !syntaxes.is_empty() {
-                    let realized = grammar
-                        .enter(|| {
-                            engine.realize_equation_theorems(
-                                &syntaxes,
-                                &scope,
-                                options,
-                                limits.admission(),
-                                Some(&file_base),
-                            )
-                        })
-                        .map_err(|error| EngineExecutionError::BatchCommand {
-                            index: command_index,
-                            error: Box::new(error),
-                            at: Some(original_offset),
-                        })?;
-                    match realized {
-                        Outcome::Complete(Some(admission)) => {
-                            scopes
-                                .admitted_batch(&admission, admission.engine.environment(), None)
-                                .map_err(|error| {
-                                    scope_error(command_index, original_offset, error.message())
-                                })?;
-                            engine = admission.engine.clone();
-                            source_records::push_command_admission(
-                                &mut source_admissions,
-                                SourceCommandAdmission {
-                                    command_index,
-                                    admission,
-                                },
-                            );
-                        }
-                        Outcome::Complete(None) => {}
-                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                    }
-                }
-            }
-            let warn_sorry = scope
-                .options
-                .get_bool(&Name::from_components(["warn", "sorry"]), true);
-            warning_sites.insert(command_index, (original_offset, command_source, warn_sorry));
-            // A command this parse does not read is not linted; its own path reports it. A
-            // `mutual` block is linted member by member, each at its own offset in the block.
-            let (members, block) =
-                match grammar.enter(|| fln_parse::parse_source_command(command_source)) {
+                let warn_sorry = scope
+                    .options
+                    .get_bool(&Name::from_components(["warn", "sorry"]), true);
+                warning_sites.insert(command_index, (original_offset, command_source, warn_sorry));
+                // A command this parse does not read is not linted; its own path reports it. A
+                // `mutual` block is linted member by member, each at its own offset in the block.
+                let (members, block) = match grammar
+                    .enter(|| fln_parse::parse_source_command(command_source))
+                {
                     // The pin lints every command; a query's term (`#check`, `#eval`, `#reduce`)
                     // binds variables as a declaration does.
                     Ok(parsed)
@@ -3698,193 +3795,186 @@ impl Engine {
                             .map(|at| fln_parse::BytePos(original_offset.0 + at.0)),
                     ),
                 };
-            for (member, (at, syntax)) in members.into_iter().enumerate() {
-                lint_sites.insert(
-                    (command_index, member),
-                    (
-                        fln_parse::BytePos(original_offset.0 + at.0),
-                        syntax,
-                        scope.options.clone(),
-                        block,
-                        scope.clone(),
-                    ),
-                );
-            }
-            // Only an `example` or `#check` is judged by its error (below): the pin would still
-            // add any other failing declaration, which this engine cannot reproduce.
-            let guarded_error = guard_checks_expected_error(guards.last(), command_index);
-            if guarded_error && scope.exports_declaration() {
-                return Err(EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(EngineExecutionError::NotImplemented {
-                        feature: "`#guard_msgs` expecting an error or warning message",
-                    }),
-                    at: Some(original_offset),
-                });
-            }
-            if scope.exports_declaration()
-                && let Some(public) = public.as_deref_mut()
-            {
-                // Public interfaces are fixed in the export world; a theorem
-                // alone checks its hidden proof privately before publication.
-                // Queries continue to observe the complete private world.
-                let (next, admission) = match grammar
-                    .enter(|| match expanded.take() {
-                        Some(parsed) => public.admit_command_syntax(
-                            &engine,
-                            command_source,
-                            parsed.into_scoped()?,
-                            options,
-                            limits.admission(),
-                            &scope,
-                            &scopes.current,
+                for (member, (at, syntax)) in members.into_iter().enumerate() {
+                    lint_sites.insert(
+                        (command_index, member),
+                        (
+                            fln_parse::BytePos(original_offset.0 + at.0),
+                            syntax,
+                            scope.options.clone(),
+                            block,
+                            scope.clone(),
                         ),
-                        None => public.admit_command(
-                            &engine,
-                            command_source,
-                            options,
-                            limits.admission(),
-                            &scope,
-                            &scopes.current,
-                        ),
-                    })
-                    .map_err(|error| {
-                        batch_command_error(
-                            command_index,
-                            original_offset,
-                            error,
-                            engine.environment(),
-                            &scope,
-                            Some(&grammar.notations()),
-                        )
-                    })? {
-                    Outcome::Complete(result) => result,
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                };
-                engine = next;
-                scopes
-                    .admitted_batch(
-                        &admission,
-                        engine.environment(),
-                        Some(public.engine().environment()),
-                    )
-                    .map_err(|error| {
-                        scope_error(command_index, original_offset, error.message())
-                    })?;
-                source_records::push_command_admission(
-                    &mut source_admissions,
-                    SourceCommandAdmission {
-                        command_index,
-                        admission,
-                    },
-                );
-                continue;
-            }
-            let admission_batch = match &expanded {
-                Some(ProgramCommandSyntax::Mutual(_) | ProgramCommandSyntax::Deriving(_)) => true,
-                Some(ProgramCommandSyntax::Single(_)) => false,
-                None => grammar
-                    .enter(|| fln_parse::command_scope::mutual::parse(command_source))
-                    .map_err(|error| error.with_original_offset(original_offset))
-                    .map_err(DefinitionFrontendError::Parse)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
+                    );
+                }
+                // Only an `example` or `#check` is judged by its error (below): the pin would still
+                // add any other failing declaration, which this engine cannot reproduce.
+                let guarded_error = guard_checks_expected_error(guards.last(), command_index);
+                if guarded_error && scope.exports_declaration() {
+                    return Err(EngineExecutionError::BatchCommand {
                         index: command_index,
-                        error: Box::new(EngineExecutionError::Frontend(error)),
+                        error: Box::new(EngineExecutionError::NotImplemented {
+                            feature: "`#guard_msgs` expecting an error or warning message",
+                        }),
                         at: Some(original_offset),
-                    })?
-                    .is_some(),
-            };
-            if admission_batch {
-                // Keep complete mutual and standalone deriving groups on the existing two-checker
-                // admission path. Never publish members sequentially or treat
-                // declarations as VM executions merely to advance the stream.
-                let admission = match grammar
-                    .enter(|| match expanded.take() {
-                        Some(parsed) => engine.admit_scoped_command_syntax_with_base(
-                            command_source,
-                            parsed.into_scoped()?,
-                            options,
-                            limits.admission(),
-                            &scope,
-                            Some(&file_base),
-                        ),
-                        None => engine.admit_source_command_in_scope(
-                            command_source,
-                            options,
-                            limits.admission(),
-                            &scope,
-                        ),
-                    })
-                    .map_err(|error| {
-                        batch_command_error(
-                            command_index,
-                            original_offset,
-                            error,
-                            engine.environment(),
-                            &scope,
-                            Some(&grammar.notations()),
-                        )
-                    })? {
-                    Outcome::Complete(admission) => admission,
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                };
-                scopes
-                    .admitted_batch(&admission, admission.engine.environment(), None)
-                    .map_err(|error| {
-                        scope_error(command_index, original_offset, error.message())
-                    })?;
-                engine = admission.engine.clone();
-                source_records::push_command_admission(
-                    &mut source_admissions,
-                    SourceCommandAdmission {
-                        command_index,
-                        admission,
-                    },
-                );
-                continue;
-            }
-            let parsed = match expanded.take() {
-                Some(ProgramCommandSyntax::Single(parsed)) => *parsed,
-                Some(ProgramCommandSyntax::Mutual(_) | ProgramCommandSyntax::Deriving(_)) => {
-                    return Err(EngineExecutionError::UnexpectedPublication {
-                        detail: "an expanded declaration group escaped batch admission",
                     });
                 }
-                None => grammar
-                    .enter(|| {
-                        fln_parse::parse_source_command(command_source).and_then(|parsed| {
-                            grammar.expand_command(
-                                parsed,
-                                source_check::grammar::resolver(engine.environment(), &scope),
-                            )
+                if scope.exports_declaration()
+                    && let Some(public) = public.as_deref_mut()
+                {
+                    // Public interfaces are fixed in the export world; a theorem
+                    // alone checks its hidden proof privately before publication.
+                    // Queries continue to observe the complete private world.
+                    let (next, admission) = match grammar
+                        .enter(|| match expanded.take() {
+                            Some(parsed) => public.admit_command_syntax(
+                                &engine,
+                                command_source,
+                                parsed.into_scoped()?,
+                                options,
+                                limits.admission(),
+                                &scope,
+                                &scopes.current,
+                            ),
+                            None => public.admit_command(
+                                &engine,
+                                command_source,
+                                options,
+                                limits.admission(),
+                                &scope,
+                                &scopes.current,
+                            ),
                         })
-                    })
-                    .map_err(|error| error.with_original_offset(original_offset))
-                    .map_err(DefinitionFrontendError::Parse)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(EngineExecutionError::Frontend(error)),
-                        at: Some(original_offset),
-                    })?,
-            };
-            // An inline `@[simp]` is registered (or, on an example, refused) only by the
-            // admission path `check_source_files` uses; the paths below would drop it.
-            let has_inline_simp =
-                matches!(
-                    parsed.kind(),
-                    SourceCommandKind::Definition | SourceCommandKind::Example
-                ) && (fln_elab::source::scope::simp::registration(parsed.syntax())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })?
-                    .is_some()
-                    || fln_elab::source::scope::simp::reducibility(parsed.syntax())
+                        .map_err(|error| {
+                            batch_command_error(
+                                command_index,
+                                original_offset,
+                                error,
+                                engine.environment(),
+                                &scope,
+                                Some(&grammar.notations()),
+                            )
+                        })? {
+                        Outcome::Complete(result) => result,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    engine = next;
+                    scopes
+                        .admitted_batch(
+                            &admission,
+                            engine.environment(),
+                            Some(public.engine().environment()),
+                        )
+                        .map_err(|error| {
+                            scope_error(command_index, original_offset, error.message())
+                        })?;
+                    source_records::push_command_admission(
+                        &mut source_admissions,
+                        SourceCommandAdmission {
+                            command_index,
+                            admission,
+                        },
+                    );
+                    continue;
+                }
+                let admission_batch = match &expanded {
+                    Some(ProgramCommandSyntax::Mutual(_) | ProgramCommandSyntax::Deriving(_)) => {
+                        true
+                    }
+                    Some(ProgramCommandSyntax::Single(_)) => false,
+                    None => grammar
+                        .enter(|| fln_parse::command_scope::mutual::parse(command_source))
+                        .map_err(|error| error.with_original_offset(original_offset))
+                        .map_err(DefinitionFrontendError::Parse)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(EngineExecutionError::Frontend(error)),
+                            at: Some(original_offset),
+                        })?
+                        .is_some(),
+                };
+                if admission_batch {
+                    // Keep complete mutual and standalone deriving groups on the existing two-checker
+                    // admission path. Never publish members sequentially or treat
+                    // declarations as VM executions merely to advance the stream.
+                    let admission = match grammar
+                        .enter(|| match expanded.take() {
+                            Some(parsed) => engine.admit_scoped_command_syntax_with_base(
+                                command_source,
+                                parsed.into_scoped()?,
+                                options,
+                                limits.admission(),
+                                &scope,
+                                Some(&file_base),
+                            ),
+                            None => engine.admit_source_command_in_scope(
+                                command_source,
+                                options,
+                                limits.admission(),
+                                &scope,
+                            ),
+                        })
+                        .map_err(|error| {
+                            batch_command_error(
+                                command_index,
+                                original_offset,
+                                error,
+                                engine.environment(),
+                                &scope,
+                                Some(&grammar.notations()),
+                            )
+                        })? {
+                        Outcome::Complete(admission) => admission,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    scopes
+                        .admitted_batch(&admission, admission.engine.environment(), None)
+                        .map_err(|error| {
+                            scope_error(command_index, original_offset, error.message())
+                        })?;
+                    engine = admission.engine.clone();
+                    source_records::push_command_admission(
+                        &mut source_admissions,
+                        SourceCommandAdmission {
+                            command_index,
+                            admission,
+                        },
+                    );
+                    continue;
+                }
+                let parsed = match expanded.take() {
+                    Some(ProgramCommandSyntax::Single(parsed)) => *parsed,
+                    Some(ProgramCommandSyntax::Mutual(_) | ProgramCommandSyntax::Deriving(_)) => {
+                        return Err(EngineExecutionError::UnexpectedPublication {
+                            detail: "an expanded declaration group escaped batch admission",
+                        });
+                    }
+                    None => grammar
+                        .enter(|| {
+                            fln_parse::parse_source_command(command_source).and_then(|parsed| {
+                                grammar.expand_command(
+                                    parsed,
+                                    source_check::grammar::resolver(engine.environment(), &scope),
+                                )
+                            })
+                        })
+                        .map_err(|error| error.with_original_offset(original_offset))
+                        .map_err(DefinitionFrontendError::Parse)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(EngineExecutionError::Frontend(error)),
+                            at: Some(original_offset),
+                        })?,
+                };
+                // An inline `@[simp]` is registered (or, on an example, refused) only by the
+                // admission path `check_source_files` uses; the paths below would drop it.
+                let has_inline_simp =
+                    matches!(
+                        parsed.kind(),
+                        SourceCommandKind::Definition | SourceCommandKind::Example
+                    ) && (fln_elab::source::scope::simp::registration(parsed.syntax())
                         .map_err(DefinitionFrontendError::Elaborate)
                         .map_err(EngineExecutionError::Frontend)
                         .map_err(|error| EngineExecutionError::BatchCommand {
@@ -3892,156 +3982,169 @@ impl Engine {
                             error: Box::new(error),
                             at: Some(original_offset),
                         })?
-                        .is_some());
-            let has_inline_default =
-                matches!(
-                    parsed.kind(),
-                    SourceCommandKind::Definition | SourceCommandKind::Example
-                ) && !fln_elab::source::default_instance_registration(parsed.syntax())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })?
-                    .is_empty();
-            // The pin keeps a definition whose code generation fails: `addAndCompile` logs
-            // "failed to compile definition, …" (or that a root `main` has a type the compiler
-            // does not run) after kernel admission and the file goes on.
-            // Under a guard expecting an error, such a definition is admitted uncompiled, as a
-            // `noncomputable section` admits it, and that message is logged for the guard.
-            let mut guarded_compile_error = None;
-            if guarded_error
-                && parsed.kind() == SourceCommandKind::Definition
-                && !scope.noncomputable_section
-                && !(has_inline_simp || has_inline_default)
-                && let Err(
-                    error @ fln_elab::NatDefinitionElabError::Inference(
-                        fln_elab::source::SourceInferenceError::NoncomputableDependency(_)
-                        | fln_elab::source::SourceInferenceError::InvalidMainType,
-                    ),
-                ) = grammar.enter(|| {
-                    fln_elab::elaborate_definition_in_scope_with_budget(
-                        parsed.syntax(),
-                        engine.environment(),
-                        limits.kernel,
-                        &scope,
-                    )
-                })
-            {
-                guarded_compile_error = Some(error.to_string());
-                scope.noncomputable_section = true;
-            }
-            if guarded_error
-                && guarded_compile_error.is_none()
-                && !(matches!(
-                    parsed.kind(),
-                    SourceCommandKind::Check | SourceCommandKind::Example
-                ) && !(has_inline_simp || has_inline_default))
-            {
-                return Err(EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(EngineExecutionError::NotImplemented {
-                        feature: "`#guard_msgs` expecting an error or warning message",
-                    }),
-                    at: Some(original_offset),
-                });
-            }
-            if fln_elab::source::is_theorem(parsed.syntax())
-                && (macros.is_some() || source_records::may_name_equation_theorems(command_source))
-                && let Some(public) = public.as_deref_mut()
-            {
-                // Generate eligible public equations before the private proof,
-                // but commit both worlds only after that whole proof succeeds.
-                let observed =
-                    fln_elab::source::trace::contains_trace(parsed.syntax()).then_some(&parsed);
-                let result = match grammar
-                    .enter(|| {
-                        if macros.is_some() {
-                            public.admit_private_command_syntax(
-                                &engine,
-                                command_source,
-                                imported_macros::source::scoped_command(parsed.clone())?,
-                                options,
-                                limits.admission(),
-                                &scope,
-                                &file_base,
-                            )
-                        } else {
-                            public.admit_private_command(
-                                &engine,
-                                command_source,
-                                options,
-                                limits.admission(),
-                                &scope,
-                                &file_base,
-                                observed,
-                            )
-                        }
-                    })
-                    .map_err(|error| {
-                        batch_command_error(
-                            command_index,
-                            original_offset,
-                            error,
+                        .is_some()
+                        || fln_elab::source::scope::simp::reducibility(parsed.syntax())
+                            .map_err(DefinitionFrontendError::Elaborate)
+                            .map_err(EngineExecutionError::Frontend)
+                            .map_err(|error| EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(error),
+                                at: Some(original_offset),
+                            })?
+                            .is_some());
+                let has_inline_default =
+                    matches!(
+                        parsed.kind(),
+                        SourceCommandKind::Definition | SourceCommandKind::Example
+                    ) && !fln_elab::source::default_instance_registration(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?
+                        .is_empty();
+                // The pin keeps a definition whose code generation fails: `addAndCompile` logs
+                // "failed to compile definition, …" (or that a root `main` has a type the compiler
+                // does not run) after kernel admission and the file goes on.
+                // Under a guard expecting an error, such a definition is admitted uncompiled, as a
+                // `noncomputable section` admits it, and that message is logged for the guard.
+                let mut guarded_compile_error = None;
+                if guarded_error
+                    && parsed.kind() == SourceCommandKind::Definition
+                    && !scope.noncomputable_section
+                    && !(has_inline_simp || has_inline_default)
+                    && let Err(
+                        error @ fln_elab::NatDefinitionElabError::Inference(
+                            fln_elab::source::SourceInferenceError::NoncomputableDependency(_)
+                            | fln_elab::source::SourceInferenceError::InvalidMainType,
+                        ),
+                    ) = grammar.enter(|| {
+                        fln_elab::elaborate_definition_in_scope_with_budget(
+                            parsed.syntax(),
                             engine.environment(),
+                            limits.kernel,
                             &scope,
-                            Some(&grammar.notations()),
                         )
-                    })? {
-                    Outcome::Complete(result) => result,
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                };
-                source_records::traces::append(
-                    &mut trace_messages,
-                    &mut trace_bytes,
-                    result.traces,
-                    &parsed,
-                    result.engine.environment(),
-                    command_index,
-                    original_offset,
-                    Some(&grammar.notations()),
-                )?;
-                scopes
-                    .admitted_batch(
-                        &result.admission,
-                        result.engine.environment(),
-                        Some(public.engine().environment()),
-                    )
-                    .map_err(|error| {
-                        scope_error(command_index, original_offset, error.message())
-                    })?;
-                engine = result.engine;
-                source_records::push_command_admission(
-                    &mut source_admissions,
-                    SourceCommandAdmission {
-                        command_index,
-                        admission: result.admission,
-                    },
-                );
-                continue;
-            }
-            if matches!(
-                parsed.kind(),
-                SourceCommandKind::Check | SourceCommandKind::Example
-            ) && !(has_inline_simp || has_inline_default)
-            {
-                let is_example = parsed.kind() == SourceCommandKind::Example;
-                if !allow_checks && !is_example {
+                    })
+                {
+                    guarded_compile_error = Some(error.to_string());
+                    scope.noncomputable_section = true;
+                }
+                if guarded_error
+                    && guarded_compile_error.is_none()
+                    && !(matches!(
+                        parsed.kind(),
+                        SourceCommandKind::Check | SourceCommandKind::Example
+                    ) && !(has_inline_simp || has_inline_default))
+                {
                     return Err(EngineExecutionError::BatchCommand {
                         index: command_index,
-                        error: Box::new(EngineExecutionError::StandaloneCheckRequired),
+                        error: Box::new(EngineExecutionError::NotImplemented {
+                            feature: "`#guard_msgs` expecting an error or warning message",
+                        }),
                         at: Some(original_offset),
                     });
                 }
-                let native_capture = (is_example
-                    && presentation == EvaluationPresentation::Lean
-                    && isolate_stderr)
-                    .then(|| source_execution::NativeCaptureBuffer::new(evaluation_output_bytes));
-                let observed =
-                    if is_example && fln_elab::source::trace::contains_trace(parsed.syntax()) {
+                if fln_elab::source::is_theorem(parsed.syntax())
+                    && (macros.is_some()
+                        || source_records::may_name_equation_theorems(command_source))
+                    && let Some(public) = public.as_deref_mut()
+                {
+                    // Generate eligible public equations before the private proof,
+                    // but commit both worlds only after that whole proof succeeds.
+                    let observed =
+                        fln_elab::source::trace::contains_trace(parsed.syntax()).then_some(&parsed);
+                    let result = match grammar
+                        .enter(|| {
+                            if macros.is_some() {
+                                public.admit_private_command_syntax(
+                                    &engine,
+                                    command_source,
+                                    imported_macros::source::scoped_command(parsed.clone())?,
+                                    options,
+                                    limits.admission(),
+                                    &scope,
+                                    &file_base,
+                                )
+                            } else {
+                                public.admit_private_command(
+                                    &engine,
+                                    command_source,
+                                    options,
+                                    limits.admission(),
+                                    &scope,
+                                    &file_base,
+                                    observed,
+                                )
+                            }
+                        })
+                        .map_err(|error| {
+                            batch_command_error(
+                                command_index,
+                                original_offset,
+                                error,
+                                engine.environment(),
+                                &scope,
+                                Some(&grammar.notations()),
+                            )
+                        })? {
+                        Outcome::Complete(result) => result,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    source_records::traces::append(
+                        &mut trace_messages,
+                        &mut trace_bytes,
+                        result.traces,
+                        &parsed,
+                        result.engine.environment(),
+                        command_index,
+                        original_offset,
+                        Some(&grammar.notations()),
+                    )?;
+                    scopes
+                        .admitted_batch(
+                            &result.admission,
+                            result.engine.environment(),
+                            Some(public.engine().environment()),
+                        )
+                        .map_err(|error| {
+                            scope_error(command_index, original_offset, error.message())
+                        })?;
+                    engine = result.engine;
+                    source_records::push_command_admission(
+                        &mut source_admissions,
+                        SourceCommandAdmission {
+                            command_index,
+                            admission: result.admission,
+                        },
+                    );
+                    continue;
+                }
+                if matches!(
+                    parsed.kind(),
+                    SourceCommandKind::Check | SourceCommandKind::Example
+                ) && !(has_inline_simp || has_inline_default)
+                {
+                    let is_example = parsed.kind() == SourceCommandKind::Example;
+                    if !allow_checks && !is_example {
+                        return Err(EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(EngineExecutionError::StandaloneCheckRequired),
+                            at: Some(original_offset),
+                        });
+                    }
+                    let native_capture = (is_example
+                        && presentation == EvaluationPresentation::Lean
+                        && isolate_stderr)
+                        .then(|| {
+                            source_execution::NativeCaptureBuffer::new(evaluation_output_bytes)
+                        });
+                    let observed = if is_example
+                        && fln_elab::source::trace::contains_trace(parsed.syntax())
+                    {
                         engine.check_observed_source_example(
                             parsed,
                             options,
@@ -4067,54 +4170,365 @@ impl Engine {
                             )
                             .map(|outcome| outcome.map_complete(|check| (check, Vec::new())))
                     };
-                let (mut checked, traces) = match observed {
-                    Ok(Outcome::Complete(checked)) => checked,
-                    Ok(Outcome::Inconclusive(reason)) => {
-                        return Ok(Outcome::Inconclusive(reason));
-                    }
-                    Ok(Outcome::InternalFault(fault)) => {
-                        return Ok(Outcome::InternalFault(fault));
-                    }
-                    Err(error) => {
-                        // Under a `#guard_msgs` that checks errors, an `example` or `#check`
-                        // that fails to elaborate logs its error, which the guard judges as
-                        // the pin's message, and declares nothing. A resource stop, an
-                        // inconclusive check or a kernel answer still ends the batch.
-                        if let Some(message) = guarded_elaboration_error(
-                            guards.last(),
-                            command_index,
-                            &error,
-                            engine.environment(),
-                            &scope,
-                            Some(&grammar.notations()),
-                        ) {
-                            flush_native_capture(
-                                native_capture.as_ref(),
-                                &mut evaluation_output_bytes,
-                                &mut trace_messages,
-                                &mut trace_bytes,
+                    let (mut checked, traces) = match observed {
+                        Ok(Outcome::Complete(checked)) => checked,
+                        Ok(Outcome::Inconclusive(reason)) => {
+                            return Ok(Outcome::Inconclusive(reason));
+                        }
+                        Ok(Outcome::InternalFault(fault)) => {
+                            return Ok(Outcome::InternalFault(fault));
+                        }
+                        Err(error) => {
+                            // Under a `#guard_msgs` that checks errors, an `example` or `#check`
+                            // that fails to elaborate logs its error, which the guard judges as
+                            // the pin's message, and declares nothing. A resource stop, an
+                            // inconclusive check or a kernel answer still ends the batch.
+                            if let Some(message) = guarded_elaboration_error(
+                                guards.last(),
+                                command_index,
+                                &error,
+                                engine.environment(),
+                                &scope,
+                                Some(&grammar.notations()),
+                            ) {
+                                flush_native_capture(
+                                    native_capture.as_ref(),
+                                    &mut evaluation_output_bytes,
+                                    &mut trace_messages,
+                                    &mut trace_bytes,
+                                    command_index,
+                                    original_offset,
+                                    true,
+                                )?;
+                                guarded_errors.push(SourceWarning {
+                                    command_index,
+                                    at: original_offset,
+                                    message,
+                                    severity: SourceSeverity::Error,
+                                    follows_output: false,
+                                });
+                                continue;
+                            }
+                            return Err(batch_command_error(
                                 command_index,
                                 original_offset,
-                                true,
-                            )?;
-                            guarded_errors.push(SourceWarning {
-                                command_index,
-                                at: original_offset,
-                                message,
-                                severity: SourceSeverity::Error,
-                                follows_output: false,
-                            });
-                            continue;
+                                error,
+                                engine.environment(),
+                                &scope,
+                                Some(&grammar.notations()),
+                            ));
                         }
-                        return Err(batch_command_error(
-                            command_index,
-                            original_offset,
-                            error,
-                            engine.environment(),
-                            &scope,
-                            Some(&grammar.notations()),
-                        ));
+                    };
+                    flush_native_capture(
+                        native_capture.as_ref(),
+                        &mut evaluation_output_bytes,
+                        &mut trace_messages,
+                        &mut trace_bytes,
+                        command_index,
+                        original_offset,
+                        true,
+                    )?;
+                    source_records::traces::append(
+                        &mut trace_messages,
+                        &mut trace_bytes,
+                        traces,
+                        &checked.parsed,
+                        engine.environment(),
+                        command_index,
+                        original_offset,
+                        Some(&grammar.notations()),
+                    )?;
+                    // A `#check` line prints through the notations active at its command.
+                    if !is_example {
+                        checked.notations = grammar.notations();
                     }
+                    let check_index = checks.len();
+                    checks.push(checked);
+                    outputs.push(if is_example {
+                        SourceCommandOutput::Example {
+                            command_index,
+                            check_index,
+                        }
+                    } else {
+                        SourceCommandOutput::Check {
+                            command_index,
+                            check_index,
+                        }
+                    });
+                    continue;
+                }
+
+                let is_instance = parsed.kind() == fln_parse::SourceCommandKind::Definition
+                    && fln_elab::source::instance_registration(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?
+                        .is_some();
+                // A noncomputable declaration is checked, never compiled (the pin's `noncomputableExt`).
+                let is_noncomputable = parsed.kind() == fln_parse::SourceCommandKind::Definition
+                    && fln_elab::source::noncomputable_registration(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?
+                        .is_some();
+                // A `@[macro_inline]` tag is recorded only by the admission path below.
+                let has_macro_inline = parsed.kind() == fln_parse::SourceCommandKind::Definition
+                    && fln_elab::source::scope::simp::macro_inline(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?;
+                let has_executable = parsed.kind() == fln_parse::SourceCommandKind::Definition
+                    && !fln_elab::source::scope::executable::registrations(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?
+                        .is_empty();
+                if fln_elab::source::is_record(parsed.syntax())
+                    || fln_elab::source::is_inductive(parsed.syntax())
+                    || fln_elab::source::partial::is_partial(parsed.syntax())
+                    || is_instance
+                    || has_inline_simp
+                    || has_inline_default
+                    || has_macro_inline
+                    || has_executable
+                    || is_noncomputable
+                    || (scope.noncomputable_section
+                        && parsed.kind() == fln_parse::SourceCommandKind::Definition)
+                {
+                    let (admission, traces) = match grammar
+                        .enter(|| {
+                            if fln_elab::source::trace::contains_trace(parsed.syntax()) {
+                                engine
+                                    .admit_observed_source_definition(
+                                        &parsed,
+                                        options,
+                                        limits.admission(),
+                                        &scope,
+                                    )
+                                    .map(|outcome| {
+                                        outcome.map_complete(|observed| {
+                                            (observed.admission, observed.traces)
+                                        })
+                                    })
+                            } else if macros.is_some() {
+                                engine
+                                    .admit_scoped_command_syntax_with_base(
+                                        command_source,
+                                        imported_macros::source::scoped_command(parsed.clone())?,
+                                        options,
+                                        limits.admission(),
+                                        &scope,
+                                        Some(&file_base),
+                                    )
+                                    .map(|outcome| {
+                                        outcome.map_complete(|admission| (admission, Vec::new()))
+                                    })
+                            } else {
+                                engine
+                                    .admit_source_command_in_scope(
+                                        command_source,
+                                        options,
+                                        limits.admission(),
+                                        &scope,
+                                    )
+                                    .map(|outcome| {
+                                        outcome.map_complete(|admission| (admission, Vec::new()))
+                                    })
+                            }
+                        })
+                        .map_err(|error| {
+                            batch_command_error(
+                                command_index,
+                                original_offset,
+                                error,
+                                engine.environment(),
+                                &scope,
+                                Some(&grammar.notations()),
+                            )
+                        })? {
+                        Outcome::Complete(admission) => admission,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    source_records::traces::append(
+                        &mut trace_messages,
+                        &mut trace_bytes,
+                        traces,
+                        &parsed,
+                        engine.environment(),
+                        command_index,
+                        original_offset,
+                        Some(&grammar.notations()),
+                    )?;
+                    scopes
+                        .admitted_batch(&admission, admission.engine.environment(), None)
+                        .map_err(|error| {
+                            scope_error(command_index, original_offset, error.message())
+                        })?;
+                    engine = admission.engine.clone();
+                    source_records::push_command_admission(
+                        &mut source_admissions,
+                        SourceCommandAdmission {
+                            command_index,
+                            admission,
+                        },
+                    );
+                    if let Some(message) = guarded_compile_error.take() {
+                        guarded_errors.push(SourceWarning {
+                            command_index,
+                            at: original_offset,
+                            message,
+                            severity: SourceSeverity::Error,
+                            follows_output: false,
+                        });
+                    }
+                    continue;
+                }
+
+                let is_evaluation = parsed.kind() == fln_parse::SourceCommandKind::Evaluation;
+                // `#guard` is syntax `Init/Guard.lean` declares (`Lean.Parser.Command.guardCmd`). A
+                // world built from `.olean`s that does not reach it reads the command as an unknown
+                // token, as the pin does ("expected token"); the seed stands for the implicit `Init`,
+                // which declares it. The same rule as `#guard_msgs`'s, above.
+                let guard_command =
+                    Name::from_components(["Lean", "Parser", "Command", "guardCmd"]);
+                if is_evaluation
+                    && parsed.syntax().kind() == Some(&guard_command)
+                    && !engine.imported_modules.is_empty()
+                    && !engine.environment().contains(&guard_command)
+                {
+                    let keyword = command_source
+                        .windows(b"#guard".len())
+                        .position(|window| window == b"#guard")
+                        .unwrap_or(0);
+                    return Err(EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(EngineExecutionError::Frontend(
+                            DefinitionFrontendError::Parse(
+                                fln_parse::NatDefinitionParseError::OutsideSeedGrammar {
+                                    at: fln_parse::BytePos(original_offset.0 + keyword),
+                                    expected:
+                                        fln_parse::NatDefinitionExpectation::DefinitionKeyword,
+                                },
+                            ),
+                        )),
+                        at: Some(original_offset),
+                    });
+                }
+                let mut traces = Vec::new();
+                let mut native_capture = None;
+                let is_async_theorem = fln_elab::source::is_theorem(parsed.syntax())
+                    && scope.options.get_bool(
+                        &Name::from_components(["Elab", "async"]),
+                        options.get_bool(&Name::from_components(["Elab", "async"]), true),
+                    );
+                let declaration = if is_evaluation {
+                    let name = fresh_generated_command_name(engine.environment(), command_index)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?;
+                    source_evaluation::elaborate(
+                        &engine,
+                        parsed.syntax(),
+                        name,
+                        &scope,
+                        options,
+                        limits,
+                        presentation,
+                    )
+                    .map(|outcome| {
+                        outcome.map_complete(|evaluation| {
+                            (
+                                fln_elab::source::ElaboratedDeclaration {
+                                    declaration: evaluation.declaration,
+                                    auxiliary_declarations: Vec::new(),
+                                    equation_info: None,
+                                    local_functions: Vec::new(),
+                                    irreducible: false,
+                                    noncomputable: false,
+                                },
+                                evaluation.presentation,
+                                evaluation.deriving,
+                            )
+                        })
+                    })
+                } else if fln_elab::source::trace::contains_trace(parsed.syntax()) {
+                    source_records::elaboration_outcome(
+                        fln_elab::source::trace::elaborate_definition(
+                            parsed.syntax(),
+                            engine.environment(),
+                            limits.kernel,
+                            &scope,
+                        ),
+                    )
+                    .map(|outcome| {
+                        outcome.map_complete(|observed| {
+                            traces = observed.traces;
+                            (observed.candidate, None, None)
+                        })
+                    })
+                } else {
+                    source_records::elaboration_outcome(match parsed.kind() {
+                        // This route admits the axioms `native_decide` adds before the declaration
+                        // (below), so the command's engine is its evaluator.
+                        fln_parse::SourceCommandKind::Definition => {
+                            let capture = (presentation == EvaluationPresentation::Lean
+                                && isolate_stderr)
+                                .then(|| {
+                                    source_execution::NativeCaptureBuffer::new(
+                                        evaluation_output_bytes,
+                                    )
+                                });
+                            native_capture = capture.clone();
+                            fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
+                                parsed.syntax(),
+                                engine.environment(),
+                                limits.kernel,
+                                &native_scope(&scope, &engine, options, limits, capture),
+                            )
+                        }
+                        fln_parse::SourceCommandKind::Check
+                        | fln_parse::SourceCommandKind::Example
+                        | fln_parse::SourceCommandKind::Evaluation => {
+                            return Err(EngineExecutionError::UnexpectedPublication {
+                                detail: "source check escaped its scratch-only command branch",
+                            });
+                        }
+                    })
+                    .map(|outcome| outcome.map_complete(|declaration| (declaration, None, None)))
+                }
+                .map_err(|error| {
+                    batch_command_error(
+                        command_index,
+                        original_offset,
+                        error,
+                        engine.environment(),
+                        &scope,
+                        Some(&grammar.notations()),
+                    )
+                })?;
+                let (elaborated, evaluation_presentation, evaluation_deriving) = match declaration {
+                    Outcome::Complete(declaration) => declaration,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
                 flush_native_capture(
                     native_capture.as_ref(),
@@ -4123,146 +4537,8 @@ impl Engine {
                     &mut trace_bytes,
                     command_index,
                     original_offset,
-                    true,
+                    !is_async_theorem,
                 )?;
-                source_records::traces::append(
-                    &mut trace_messages,
-                    &mut trace_bytes,
-                    traces,
-                    &checked.parsed,
-                    engine.environment(),
-                    command_index,
-                    original_offset,
-                    Some(&grammar.notations()),
-                )?;
-                // A `#check` line prints through the notations active at its command.
-                if !is_example {
-                    checked.notations = grammar.notations();
-                }
-                let check_index = checks.len();
-                checks.push(checked);
-                outputs.push(if is_example {
-                    SourceCommandOutput::Example {
-                        command_index,
-                        check_index,
-                    }
-                } else {
-                    SourceCommandOutput::Check {
-                        command_index,
-                        check_index,
-                    }
-                });
-                continue;
-            }
-
-            let is_instance = parsed.kind() == fln_parse::SourceCommandKind::Definition
-                && fln_elab::source::instance_registration(parsed.syntax())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })?
-                    .is_some();
-            // A noncomputable declaration is checked, never compiled (the pin's `noncomputableExt`).
-            let is_noncomputable = parsed.kind() == fln_parse::SourceCommandKind::Definition
-                && fln_elab::source::noncomputable_registration(parsed.syntax())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })?
-                    .is_some();
-            // A `@[macro_inline]` tag is recorded only by the admission path below.
-            let has_macro_inline = parsed.kind() == fln_parse::SourceCommandKind::Definition
-                && fln_elab::source::scope::simp::macro_inline(parsed.syntax())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })?;
-            let has_executable = parsed.kind() == fln_parse::SourceCommandKind::Definition
-                && !fln_elab::source::scope::executable::registrations(parsed.syntax())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })?
-                    .is_empty();
-            if fln_elab::source::is_record(parsed.syntax())
-                || fln_elab::source::is_inductive(parsed.syntax())
-                || fln_elab::source::partial::is_partial(parsed.syntax())
-                || is_instance
-                || has_inline_simp
-                || has_inline_default
-                || has_macro_inline
-                || has_executable
-                || is_noncomputable
-                || (scope.noncomputable_section
-                    && parsed.kind() == fln_parse::SourceCommandKind::Definition)
-            {
-                let (admission, traces) = match grammar
-                    .enter(|| {
-                        if fln_elab::source::trace::contains_trace(parsed.syntax()) {
-                            engine
-                                .admit_observed_source_definition(
-                                    &parsed,
-                                    options,
-                                    limits.admission(),
-                                    &scope,
-                                )
-                                .map(|outcome| {
-                                    outcome.map_complete(|observed| {
-                                        (observed.admission, observed.traces)
-                                    })
-                                })
-                        } else if macros.is_some() {
-                            engine
-                                .admit_scoped_command_syntax_with_base(
-                                    command_source,
-                                    imported_macros::source::scoped_command(parsed.clone())?,
-                                    options,
-                                    limits.admission(),
-                                    &scope,
-                                    Some(&file_base),
-                                )
-                                .map(|outcome| {
-                                    outcome.map_complete(|admission| (admission, Vec::new()))
-                                })
-                        } else {
-                            engine
-                                .admit_source_command_in_scope(
-                                    command_source,
-                                    options,
-                                    limits.admission(),
-                                    &scope,
-                                )
-                                .map(|outcome| {
-                                    outcome.map_complete(|admission| (admission, Vec::new()))
-                                })
-                        }
-                    })
-                    .map_err(|error| {
-                        batch_command_error(
-                            command_index,
-                            original_offset,
-                            error,
-                            engine.environment(),
-                            &scope,
-                            Some(&grammar.notations()),
-                        )
-                    })? {
-                    Outcome::Complete(admission) => admission,
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                };
                 source_records::traces::append(
                     &mut trace_messages,
                     &mut trace_bytes,
@@ -4273,395 +4549,496 @@ impl Engine {
                     original_offset,
                     Some(&grammar.notations()),
                 )?;
-                scopes
-                    .admitted_batch(&admission, admission.engine.environment(), None)
-                    .map_err(|error| {
-                        scope_error(command_index, original_offset, error.message())
-                    })?;
-                engine = admission.engine.clone();
-                source_records::push_command_admission(
-                    &mut source_admissions,
-                    SourceCommandAdmission {
-                        command_index,
-                        admission,
-                    },
-                );
-                if let Some(message) = guarded_compile_error.take() {
-                    guarded_errors.push(SourceWarning {
-                        command_index,
-                        at: original_offset,
-                        message,
-                        severity: SourceSeverity::Error,
-                        follows_output: false,
+                let fln_elab::source::ElaboratedDeclaration {
+                    declaration,
+                    auxiliary_declarations,
+                    equation_info,
+                    local_functions,
+                    irreducible,
+                    noncomputable,
+                } = elaborated;
+                if noncomputable {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "a noncomputable section declaration escaped its admission-only route",
                     });
                 }
-                continue;
-            }
-
-            let is_evaluation = parsed.kind() == fln_parse::SourceCommandKind::Evaluation;
-            // `#guard` is syntax `Init/Guard.lean` declares (`Lean.Parser.Command.guardCmd`). A
-            // world built from `.olean`s that does not reach it reads the command as an unknown
-            // token, as the pin does ("expected token"); the seed stands for the implicit `Init`,
-            // which declares it. The same rule as `#guard_msgs`'s, above.
-            let guard_command = Name::from_components(["Lean", "Parser", "Command", "guardCmd"]);
-            if is_evaluation
-                && parsed.syntax().kind() == Some(&guard_command)
-                && !engine.imported_modules.is_empty()
-                && !engine.environment().contains(&guard_command)
-            {
-                let keyword = command_source
-                    .windows(b"#guard".len())
-                    .position(|window| window == b"#guard")
-                    .unwrap_or(0);
-                return Err(EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(EngineExecutionError::Frontend(
-                        DefinitionFrontendError::Parse(
-                            fln_parse::NatDefinitionParseError::OutsideSeedGrammar {
-                                at: fln_parse::BytePos(original_offset.0 + keyword),
-                                expected: fln_parse::NatDefinitionExpectation::DefinitionKeyword,
-                            },
-                        ),
-                    )),
-                    at: Some(original_offset),
-                });
-            }
-            let mut traces = Vec::new();
-            let mut native_capture = None;
-            let is_async_theorem = fln_elab::source::is_theorem(parsed.syntax())
-                && scope.options.get_bool(
-                    &Name::from_components(["Elab", "async"]),
-                    options.get_bool(&Name::from_components(["Elab", "async"]), true),
-                );
-            let declaration = if is_evaluation {
-                let name = fresh_generated_command_name(engine.environment(), command_index)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })?;
-                source_evaluation::elaborate(
-                    &engine,
-                    parsed.syntax(),
-                    name,
-                    &scope,
-                    options,
-                    limits,
-                    presentation,
-                )
-                .map(|outcome| {
-                    outcome.map_complete(|evaluation| {
-                        (
-                            fln_elab::source::ElaboratedDeclaration {
-                                declaration: evaluation.declaration,
-                                auxiliary_declarations: Vec::new(),
-                                equation_info: None,
-                                local_functions: Vec::new(),
-                                irreducible: false,
-                                noncomputable: false,
-                            },
-                            evaluation.presentation,
-                            evaluation.deriving,
-                        )
-                    })
-                })
-            } else if fln_elab::source::trace::contains_trace(parsed.syntax()) {
-                source_records::elaboration_outcome(fln_elab::source::trace::elaborate_definition(
-                    parsed.syntax(),
-                    engine.environment(),
-                    limits.kernel,
-                    &scope,
-                ))
-                .map(|outcome| {
-                    outcome.map_complete(|observed| {
-                        traces = observed.traces;
-                        (observed.candidate, None, None)
-                    })
-                })
-            } else {
-                source_records::elaboration_outcome(match parsed.kind() {
-                    // This route admits the axioms `native_decide` adds before the declaration
-                    // (below), so the command's engine is its evaluator.
-                    fln_parse::SourceCommandKind::Definition => {
-                        let capture = (presentation == EvaluationPresentation::Lean
-                            && isolate_stderr)
-                            .then(|| {
-                                source_execution::NativeCaptureBuffer::new(evaluation_output_bytes)
-                            });
-                        native_capture = capture.clone();
-                        fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
-                            parsed.syntax(),
-                            engine.environment(),
-                            limits.kernel,
-                            &native_scope(&scope, &engine, options, limits, capture),
-                        )
-                    }
-                    fln_parse::SourceCommandKind::Check
-                    | fln_parse::SourceCommandKind::Example
-                    | fln_parse::SourceCommandKind::Evaluation => {
-                        return Err(EngineExecutionError::UnexpectedPublication {
-                            detail: "source check escaped its scratch-only command branch",
-                        });
-                    }
-                })
-                .map(|outcome| outcome.map_complete(|declaration| (declaration, None, None)))
-            }
-            .map_err(|error| {
-                batch_command_error(
-                    command_index,
-                    original_offset,
-                    error,
-                    engine.environment(),
-                    &scope,
-                    Some(&grammar.notations()),
-                )
-            })?;
-            let (elaborated, evaluation_presentation, evaluation_deriving) = match declaration {
-                Outcome::Complete(declaration) => declaration,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            };
-            flush_native_capture(
-                native_capture.as_ref(),
-                &mut evaluation_output_bytes,
-                &mut trace_messages,
-                &mut trace_bytes,
-                command_index,
-                original_offset,
-                !is_async_theorem,
-            )?;
-            source_records::traces::append(
-                &mut trace_messages,
-                &mut trace_bytes,
-                traces,
-                &parsed,
-                engine.environment(),
-                command_index,
-                original_offset,
-                Some(&grammar.notations()),
-            )?;
-            let fln_elab::source::ElaboratedDeclaration {
-                declaration,
-                auxiliary_declarations,
-                equation_info,
-                local_functions,
-                irreducible,
-                noncomputable,
-            } = elaborated;
-            if noncomputable {
-                return Err(EngineExecutionError::UnexpectedPublication {
-                    detail: "a noncomputable section declaration escaped its admission-only route",
-                });
-            }
-            let evaluation_base = evaluation_deriving
-                .as_ref()
-                .map_or(&engine, |deriving| &deriving.engine);
-            // `#eval` refuses an expression that depends on `sorry` before compiling or running it.
-            // `#eval!` explicitly opts out of that check, retaining the same execution pipeline.
-            // `#guard` evaluates through `evalExpr`, which has no such check
-            // (vendored `Lean/Meta/Eval.lean`).
-            if is_evaluation
-                && parsed.syntax().kind()
-                    != Some(&Name::from_components([
-                        "Lean", "Parser", "Command", "evalBang",
-                    ]))
-                && !matches!(
-                    evaluation_presentation,
-                    Some(EvaluationResultPresentation::Guard)
-                )
-                && source_execution::evaluation_depends_on_sorry(
-                    evaluation_base,
-                    std::iter::once(&declaration).chain(&local_functions),
-                )?
-            {
-                // Under a `#guard_msgs` expecting an error, an `#eval` was refused before here.
-                return Err(EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(EngineExecutionError::EvaluationDependsOnSorry),
-                    at: Some(original_offset),
-                });
-            }
-            // A `protected` declaration is tagged once admitted, as the admitted route tags it, so
-            // a later command's atomic name does not reach it through its namespace, an `open` or
-            // an `export` alias (the pin's `resolveQualifiedName` and `getAliases`).
-            let protected = if !is_evaluation
-                && fln_elab::source::protected_registration(parsed.syntax())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })?
-                    .is_some()
-            {
-                match &declaration {
-                    Declaration::Defn(value) => Some(value.base.name.clone()),
-                    Declaration::Thm(value) => Some(value.base.name.clone()),
-                    Declaration::Opaque(value) => Some(value.base.name.clone()),
-                    Declaration::Axiom(value) => Some(value.base.name.clone()),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            if presentation != EvaluationPresentation::Lean
-                && matches!(
-                    evaluation_presentation,
-                    Some(
-                        EvaluationResultPresentation::IoFormat { .. }
-                            | EvaluationResultPresentation::IoUnit
+                let evaluation_base = evaluation_deriving
+                    .as_ref()
+                    .map_or(&engine, |deriving| &deriving.engine);
+                // `#eval` refuses an expression that depends on `sorry` before compiling or running it.
+                // `#eval!` explicitly opts out of that check, retaining the same execution pipeline.
+                // `#guard` evaluates through `evalExpr`, which has no such check
+                // (vendored `Lean/Meta/Eval.lean`).
+                if is_evaluation
+                    && parsed.syntax().kind()
+                        != Some(&Name::from_components([
+                            "Lean", "Parser", "Command", "evalBang",
+                        ]))
+                    && !matches!(
+                        evaluation_presentation,
+                        Some(EvaluationResultPresentation::Guard)
                     )
-                )
-                && guards
-                    .last()
-                    .is_some_and(|guard| guard.command_index == command_index)
-            {
-                // Only the `lean` presentation isolates an action's stdout into its messages.
-                // Elsewhere refuse before executing the action, never after its stdout or
-                // filesystem effects have already escaped the guard.
-                return Err(EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(EngineExecutionError::NotImplemented {
-                        feature: "`#guard_msgs` over an IO action",
-                    }),
-                    at: Some(original_offset),
-                });
-            }
-            // Parametric definitions are checked templates, not standalone VM
-            // entry points. Compile concrete uses on demand; never use a failed
-            // compilation as a reason to silently admit an executable command.
-            let is_template = match &declaration {
-                Declaration::Defn(definition) if !is_evaluation => {
-                    runtime::is_template(definition)
-                        || runtime::is_record_template(
+                    && source_execution::evaluation_depends_on_sorry(
+                        evaluation_base,
+                        std::iter::once(&declaration).chain(&local_functions),
+                    )?
+                {
+                    // Under a `#guard_msgs` expecting an error, an `#eval` was refused before here.
+                    return Err(EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(EngineExecutionError::EvaluationDependsOnSorry),
+                        at: Some(original_offset),
+                    });
+                }
+                // A `protected` declaration is tagged once admitted, as the admitted route tags it, so
+                // a later command's atomic name does not reach it through its namespace, an `open` or
+                // an `export` alias (the pin's `resolveQualifiedName` and `getAliases`).
+                let protected = if !is_evaluation
+                    && fln_elab::source::protected_registration(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?
+                        .is_some()
+                {
+                    match &declaration {
+                        Declaration::Defn(value) => Some(value.base.name.clone()),
+                        Declaration::Thm(value) => Some(value.base.name.clone()),
+                        Declaration::Opaque(value) => Some(value.base.name.clone()),
+                        Declaration::Axiom(value) => Some(value.base.name.clone()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if presentation != EvaluationPresentation::Lean
+                    && matches!(
+                        evaluation_presentation,
+                        Some(
+                            EvaluationResultPresentation::IoFormat { .. }
+                                | EvaluationResultPresentation::IoUnit
+                        )
+                    )
+                    && guards
+                        .last()
+                        .is_some_and(|guard| guard.command_index == command_index)
+                {
+                    // Only the `lean` presentation isolates an action's stdout into its messages.
+                    // Elsewhere refuse before executing the action, never after its stdout or
+                    // filesystem effects have already escaped the guard.
+                    return Err(EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(EngineExecutionError::NotImplemented {
+                            feature: "`#guard_msgs` over an IO action",
+                        }),
+                        at: Some(original_offset),
+                    });
+                }
+                // Parametric definitions are checked templates, not standalone VM
+                // entry points. Compile concrete uses on demand; never use a failed
+                // compilation as a reason to silently admit an executable command.
+                let is_template = match &declaration {
+                    Declaration::Defn(definition) if !is_evaluation => {
+                        runtime::is_template(definition)
+                            || runtime::is_record_template(
+                                engine.environment(),
+                                definition,
+                                limits.ingress,
+                            )
+                            .map_err(|error| {
+                                EngineExecutionError::BatchCommand {
+                                    index: command_index,
+                                    error: Box::new(EngineExecutionError::Ingress(error)),
+                                    at: Some(original_offset),
+                                }
+                            })?
+                    }
+                    _ => false,
+                };
+                // A named proof definition has no runtime result. Classify its
+                // closed header before compilation, then retain its original
+                // definition and the ordinary dual-admission evidence below.
+                let is_proof_definition = match &declaration {
+                    Declaration::Defn(definition) if !is_evaluation && !is_template => {
+                        match source_records::declaration_is_proposition(
                             engine.environment(),
-                            definition,
-                            limits.ingress,
+                            &definition.base,
+                            limits.kernel,
                         )
                         .map_err(|error| {
-                            EngineExecutionError::BatchCommand {
-                                index: command_index,
-                                error: Box::new(EngineExecutionError::Ingress(error)),
-                                at: Some(original_offset),
+                            batch_command_error(
+                                command_index,
+                                original_offset,
+                                error,
+                                engine.environment(),
+                                &scope,
+                                Some(&grammar.notations()),
+                            )
+                        })? {
+                            Outcome::Complete(proof) => proof,
+                            Outcome::Inconclusive(reason) => {
+                                return Ok(Outcome::Inconclusive(reason));
                             }
-                        })?
-                }
-                _ => false,
-            };
-            // A named proof definition has no runtime result. Classify its
-            // closed header before compilation, then retain its original
-            // definition and the ordinary dual-admission evidence below.
-            let is_proof_definition = match &declaration {
-                Declaration::Defn(definition) if !is_evaluation && !is_template => {
-                    match source_records::declaration_is_proposition(
-                        engine.environment(),
-                        &definition.base,
-                        limits.kernel,
-                    )
-                    .map_err(|error| {
-                        batch_command_error(
-                            command_index,
-                            original_offset,
-                            error,
-                            engine.environment(),
-                            &scope,
-                            Some(&grammar.notations()),
-                        )
-                    })? {
-                        Outcome::Complete(proof) => proof,
-                        Outcome::Inconclusive(reason) => {
-                            return Ok(Outcome::Inconclusive(reason));
-                        }
-                        Outcome::InternalFault(fault) => {
-                            return Ok(Outcome::InternalFault(fault));
+                            Outcome::InternalFault(fault) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
                         }
                     }
-                }
-                _ => false,
-            };
-            // A definition that uses `sorry` is admitted with its warning and never run: the pin
-            // compiles it and fails only when it is evaluated.
-            let uses_sorry = !is_evaluation
-                && source_execution::uses_sorry(&declaration).map_err(|error| {
-                    EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    }
-                })?;
-            // A theorem, an opaque constant and an axiom have no body to execute here; they
-            // are admitted, as a template or a proof definition is. Under the `lean`
-            // presentation, ordinary `def` commands are also admitted without running them on
-            // the VM at declaration time (matching the pin's `addAndCompile`, so a 0-arity
-            // `def u : Nat := unreachable!` or `dbg_trace` fires only when `#eval` or `--run`
-            // evaluates it).
-            if matches!(
-                declaration,
-                Declaration::Thm(_) | Declaration::Opaque(_) | Declaration::Axiom(_)
-            ) || is_template
-                || is_proof_definition
-                || uses_sorry
-                || (!is_evaluation && presentation == EvaluationPresentation::Lean)
-            {
-                // Ordered auxiliary declarations cross both checkers before
-                // the owner that cites them; no receipt is inferred or merged.
-                let auxiliaries = if auxiliary_declarations.is_empty() {
-                    None
-                } else {
-                    match engine
-                        .admit_declarations(&auxiliary_declarations, options, limits.admission())
+                    _ => false,
+                };
+                // A definition that uses `sorry` is admitted with its warning and never run: the pin
+                // compiles it and fails only when it is evaluated.
+                let uses_sorry = !is_evaluation
+                    && source_execution::uses_sorry(&declaration).map_err(|error| {
+                        EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        }
+                    })?;
+                // A theorem, an opaque constant and an axiom have no body to execute here; they
+                // are admitted, as a template or a proof definition is. Under the `lean`
+                // presentation, ordinary `def` commands are also admitted without running them on
+                // the VM at declaration time (matching the pin's `addAndCompile`, so a 0-arity
+                // `def u : Nat := unreachable!` or `dbg_trace` fires only when `#eval` or `--run`
+                // evaluates it).
+                if matches!(
+                    declaration,
+                    Declaration::Thm(_) | Declaration::Opaque(_) | Declaration::Axiom(_)
+                ) || is_template
+                    || is_proof_definition
+                    || uses_sorry
+                    || (!is_evaluation && presentation == EvaluationPresentation::Lean)
+                {
+                    // Ordered auxiliary declarations cross both checkers before
+                    // the owner that cites them; no receipt is inferred or merged.
+                    let auxiliaries = if auxiliary_declarations.is_empty() {
+                        None
+                    } else {
+                        match engine
+                            .admit_declarations(
+                                &auxiliary_declarations,
+                                options,
+                                limits.admission(),
+                            )
+                            .map_err(|error| EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(error.into()),
+                                at: Some(original_offset),
+                            })? {
+                            Outcome::Complete(admission) => Some(admission),
+                            Outcome::Inconclusive(reason) => {
+                                return Ok(Outcome::Inconclusive(reason));
+                            }
+                            Outcome::InternalFault(fault) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
+                        }
+                    };
+                    let base = auxiliaries.as_ref().map_or(&engine, |batch| &batch.engine);
+                    let mut admission = match base
+                        .admit_declarations(&[declaration], options, limits.admission())
                         .map_err(|error| EngineExecutionError::BatchCommand {
                             index: command_index,
                             error: Box::new(error.into()),
                             at: Some(original_offset),
                         })? {
-                        Outcome::Complete(admission) => Some(admission),
+                        Outcome::Complete(admission) => admission,
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                    }
-                };
-                let base = auxiliaries.as_ref().map_or(&engine, |batch| &batch.engine);
-                let mut admission = match base
-                    .admit_declarations(&[declaration], options, limits.admission())
+                    };
+                    source_records::apply_batch_effects(
+                        &mut admission,
+                        irreducible,
+                        equation_info.as_ref(),
+                        options,
+                    )
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
-                        error: Box::new(error.into()),
+                        error: Box::new(error),
                         at: Some(original_offset),
-                    })? {
-                    Outcome::Complete(admission) => admission,
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    })?;
+                    if let Some(name) = &protected {
+                        admission.engine.environment =
+                            source_records::tag_protected(&admission.engine, name).map_err(
+                                |error| EngineExecutionError::BatchCommand {
+                                    index: command_index,
+                                    error: Box::new(error),
+                                    at: Some(original_offset),
+                                },
+                            )?;
+                        admission.result_logical_root = admission.engine.logical_root(options);
+                    }
+                    if let Some(declared) = admission
+                        .admissions
+                        .first()
+                        .and_then(|admitted| source_records::declared_name(&admitted.declaration))
+                        .cloned()
+                        && let Some(environment) = source_records::tag_deprecated(
+                            &admission.engine,
+                            parsed.syntax(),
+                            &declared,
+                            &scope,
+                            limits.kernel,
+                        )
+                        .map_err(|error| {
+                            EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(error),
+                                at: Some(original_offset),
+                            }
+                        })?
+                    {
+                        admission.engine.environment = environment;
+                        admission.result_logical_root = admission.engine.logical_root(options);
+                    }
+                    let mut admission = match engine.finish_local_function_batch(
+                        admission,
+                        &local_functions,
+                        options,
+                        limits.admission(),
+                    )? {
+                        Outcome::Complete(admission) => admission,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    let equation_scope = scope
+                        .for_declaration(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?;
+                    admission = match engine.finish_source_simp_batch(
+                        admission,
+                        None,
+                        &equation_scope,
+                        options,
+                        limits.admission(),
+                    )? {
+                        Outcome::Complete(admission) => admission,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    // One command, one transition, retaining every auxiliary receipt.
+                    if let Some(auxiliaries) = auxiliaries {
+                        admission.base_logical_root = auxiliaries.base_logical_root;
+                        admission.admissions.splice(0..0, auxiliaries.admissions);
+                    }
+                    scopes
+                        .admitted_batch(&admission, admission.engine.environment(), None)
+                        .map_err(|error| {
+                            scope_error(command_index, original_offset, error.message())
+                        })?;
+                    engine = admission.engine.clone();
+                    source_records::push_command_admission(
+                        &mut source_admissions,
+                        SourceCommandAdmission {
+                            command_index,
+                            admission,
+                        },
+                    );
+                    continue;
+                }
+                if !auxiliary_declarations.is_empty() {
+                    // An executed definition's record has no predecessor receipt slot.
+                    return Err(EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(EngineExecutionError::NotImplemented {
+                            feature: if auxiliary_declarations
+                                .iter()
+                                .any(|declaration| matches!(declaration, Declaration::Axiom(_)))
+                            {
+                                "`native_decide` in a definition this engine compiles"
+                            } else {
+                                "auxiliary theorems in a definition this engine compiles"
+                            },
+                        }),
+                        at: Some(original_offset),
+                    });
+                }
+                let entry = if is_evaluation {
+                    source_evaluation::Entry::Evaluation
+                } else {
+                    source_evaluation::Entry::Value
                 };
-                source_records::apply_batch_effects(
-                    &mut admission,
+                // Golem reads its options at command entry (`maxHeartbeats`). An option `set_option`
+                // set and the table honored in this scope overrides the batch's value.
+                let scoped_options = (!scope.options.is_empty()).then(|| {
+                    let mut merged = options.clone();
+                    for (name, value) in scope.options.entries() {
+                        merged.insert(name.clone(), value.clone());
+                    }
+                    merged
+                });
+                let remaining = limits
+                    .max_evaluation_output_bytes
+                    .saturating_sub(evaluation_output_bytes);
+                // The pin's `#eval` collects stdout and stderr, including native
+                // panic and trace diagnostics, and accounts escaped JSON bytes.
+                // Other non-raw evaluations isolate raw bytes and can leave stderr
+                // on the process stream when `stderrAsMessages` is false.
+                let lean_pin_capture = presentation == EvaluationPresentation::Lean
+                    && matches!(
+                        evaluation_presentation,
+                        Some(
+                            EvaluationResultPresentation::Format { .. }
+                                | EvaluationResultPresentation::IoFormat { .. }
+                                | EvaluationResultPresentation::IoUnit
+                        )
+                    );
+                let isolate_non_raw = is_evaluation && presentation != EvaluationPresentation::Raw;
+                if isolate_non_raw {
+                    let local_stderr_capture = scoped_options
+                        .as_ref()
+                        .unwrap_or(options)
+                        .get_bool(&Name::from_components(["stderrAsMessages"]), true);
+                    if isolate_stderr != local_stderr_capture
+                        && guards
+                            .iter()
+                            .any(|guard| guard.command_index == command_index)
+                    {
+                        return Err(EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(EngineExecutionError::NotImplemented {
+                                feature: "nested scoped stderr capture outside a message guard",
+                            }),
+                            at: Some(original_offset),
+                        });
+                    }
+                }
+                let capture = if lean_pin_capture && isolate_stderr {
+                    let allowance = remaining.min(LEAN_EVALUATION_STDOUT_LIMIT);
+                    match StdoutCapture::begin_evaluation(allowance) {
+                        Ok(capture) => Some(capture),
+                        Err(error) => return Ok(source_evaluation::capture_failure(error)),
+                    }
+                } else if lean_pin_capture || isolate_non_raw {
+                    match StdoutCapture::begin_isolated(remaining, isolate_stderr) {
+                        Ok(capture) => Some(capture),
+                        Err(error) => return Ok(source_evaluation::capture_failure(error)),
+                    }
+                } else {
+                    None
+                };
+                let invoked = evaluation_base.execute_definition_entry_with_helpers(
+                    declaration,
+                    &local_functions,
+                    scoped_options.as_ref().unwrap_or(options),
+                    limits,
+                    entry,
+                );
+                let captured = capture.map(StdoutCapture::finish);
+                if let Some(error) = captured.as_ref().and_then(|captured| captured.error) {
+                    return Ok(source_evaluation::capture_failure(error));
+                }
+                let mut execution = match invoked {
+                    Ok(Outcome::Complete(execution)) => execution,
+                    Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
+                    Ok(Outcome::InternalFault(fault)) => {
+                        return Ok(Outcome::InternalFault(fault));
+                    }
+                    Err(error) => {
+                        return Err(EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        });
+                    }
+                };
+                if let Some(deriving) = evaluation_deriving {
+                    execution.evaluation_auxiliaries = deriving.admissions;
+                }
+                if let Some(finished) = captured {
+                    evaluation_output_bytes = evaluation_output_bytes
+                        .checked_add(finished.bytes.len())
+                        .ok_or(EngineExecutionError::UnexpectedPublication {
+                            detail: "evaluation output accounting overflow",
+                        })?;
+                    let bytes = finished.bytes;
+                    let text = String::from_utf8(bytes.clone()).map_err(|_| {
+                        EngineExecutionError::UnexpectedPublication {
+                            detail: "evaluation capture violated its UTF-8 contract",
+                        }
+                    })?;
+                    execution.evaluation_output = Some(text);
+                    execution.io_stdout = Some(bytes);
+                }
+                source_records::apply_execution_effects(
+                    &mut execution,
                     irreducible,
                     equation_info.as_ref(),
-                    options,
+                    scoped_options.as_ref().unwrap_or(options),
                 )
-                .map_err(|error| EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(error),
-                    at: Some(original_offset),
+                .map_err(|error| {
+                    batch_command_error(
+                        command_index,
+                        original_offset,
+                        error,
+                        engine.environment(),
+                        &scope,
+                        Some(&grammar.notations()),
+                    )
                 })?;
+                if !is_evaluation {
+                    let equation_scope = scope
+                        .for_declaration(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?;
+                    execution.engine = match execution
+                        .engine
+                        .freeze_source_equation_policy(
+                            &execution.declaration,
+                            &equation_scope,
+                            options,
+                            limits.kernel,
+                        )
+                        .map_err(|error| {
+                            batch_command_error(
+                                command_index,
+                                original_offset,
+                                error,
+                                engine.environment(),
+                                &scope,
+                                Some(&grammar.notations()),
+                            )
+                        })? {
+                        Outcome::Complete(engine) => engine,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    execution.result_logical_root = execution
+                        .engine
+                        .logical_root(scoped_options.as_ref().unwrap_or(options));
+                }
                 if let Some(name) = &protected {
-                    admission.engine.environment =
-                        source_records::tag_protected(&admission.engine, name).map_err(
+                    execution.engine.environment =
+                        source_records::tag_protected(&execution.engine, name).map_err(
                             |error| EngineExecutionError::BatchCommand {
                                 index: command_index,
                                 error: Box::new(error),
                                 at: Some(original_offset),
                             },
                         )?;
-                    admission.result_logical_root = admission.engine.logical_root(options);
+                    execution.result_logical_root = execution
+                        .engine
+                        .logical_root(scoped_options.as_ref().unwrap_or(options));
                 }
-                if let Some(declared) = admission
-                    .admissions
-                    .first()
-                    .and_then(|admitted| source_records::declared_name(&admitted.declaration))
-                    .cloned()
+                if !is_evaluation
+                    && let Some(declared) =
+                        source_records::declared_name(&execution.declaration).cloned()
                     && let Some(environment) = source_records::tag_deprecated(
-                        &admission.engine,
+                        &execution.engine,
                         parsed.syntax(),
                         &declared,
                         &scope,
@@ -4673,644 +5050,489 @@ impl Engine {
                         at: Some(original_offset),
                     })?
                 {
-                    admission.engine.environment = environment;
-                    admission.result_logical_root = admission.engine.logical_root(options);
+                    execution.engine.environment = environment;
+                    execution.result_logical_root = execution
+                        .engine
+                        .logical_root(scoped_options.as_ref().unwrap_or(options));
                 }
-                let mut admission = match engine.finish_local_function_batch(
-                    admission,
-                    &local_functions,
-                    options,
-                    limits.admission(),
-                )? {
-                    Outcome::Complete(admission) => admission,
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                };
-                let equation_scope = scope
-                    .for_declaration(parsed.syntax())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })?;
-                admission = match engine.finish_source_simp_batch(
-                    admission,
-                    None,
-                    &equation_scope,
-                    options,
-                    limits.admission(),
-                )? {
-                    Outcome::Complete(admission) => admission,
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                };
-                // One command, one transition, retaining every auxiliary receipt.
-                if let Some(auxiliaries) = auxiliaries {
-                    admission.base_logical_root = auxiliaries.base_logical_root;
-                    admission.admissions.splice(0..0, auxiliaries.admissions);
+                if !is_evaluation {
+                    scopes.admitted(&execution.declaration);
                 }
-                scopes
-                    .admitted_batch(&admission, admission.engine.environment(), None)
-                    .map_err(|error| {
-                        scope_error(command_index, original_offset, error.message())
-                    })?;
-                engine = admission.engine.clone();
-                source_records::push_command_admission(
-                    &mut source_admissions,
-                    SourceCommandAdmission {
-                        command_index,
-                        admission,
-                    },
-                );
-                continue;
-            }
-            if !auxiliary_declarations.is_empty() {
-                // An executed definition's record has no predecessor receipt slot.
-                return Err(EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(EngineExecutionError::NotImplemented {
-                        feature: if auxiliary_declarations
-                            .iter()
-                            .any(|declaration| matches!(declaration, Declaration::Axiom(_)))
-                        {
-                            "`native_decide` in a definition this engine compiles"
-                        } else {
-                            "auxiliary theorems in a definition this engine compiles"
-                        },
-                    }),
-                    at: Some(original_offset),
-                });
-            }
-            let entry = if is_evaluation {
-                source_evaluation::Entry::Evaluation
-            } else {
-                source_evaluation::Entry::Value
-            };
-            // Golem reads its options at command entry (`maxHeartbeats`). An option `set_option`
-            // set and the table honored in this scope overrides the batch's value.
-            let scoped_options = (!scope.options.is_empty()).then(|| {
-                let mut merged = options.clone();
-                for (name, value) in scope.options.entries() {
-                    merged.insert(name.clone(), value.clone());
+                execution.evaluation_presentation = evaluation_presentation;
+                if !is_evaluation {
+                    for helper in &execution.local_functions {
+                        scopes.admitted(&helper.declaration);
+                    }
                 }
-                merged
-            });
-            let remaining = limits
-                .max_evaluation_output_bytes
-                .saturating_sub(evaluation_output_bytes);
-            // The pin's `#eval` collects stdout and stderr, including native
-            // panic and trace diagnostics, and accounts escaped JSON bytes.
-            // Other non-raw evaluations isolate raw bytes and can leave stderr
-            // on the process stream when `stderrAsMessages` is false.
-            let lean_pin_capture = presentation == EvaluationPresentation::Lean
-                && matches!(
+                let execution_index = executions.len();
+                // Printer candidates retain their checked successor in the
+                // execution evidence, but never become source declarations.
+                // Raw evaluation and silent Unit actions keep their established
+                // transitions; mapped IO printers remain private as well.
+                if !matches!(
                     evaluation_presentation,
                     Some(
                         EvaluationResultPresentation::Format { .. }
                             | EvaluationResultPresentation::IoFormat { .. }
-                            | EvaluationResultPresentation::IoUnit
+                            | EvaluationResultPresentation::Guard
                     )
-                );
-            let isolate_non_raw = is_evaluation && presentation != EvaluationPresentation::Raw;
-            if isolate_non_raw {
-                let local_stderr_capture = scoped_options
-                    .as_ref()
-                    .unwrap_or(options)
-                    .get_bool(&Name::from_components(["stderrAsMessages"]), true);
-                if isolate_stderr != local_stderr_capture
-                    && guards
-                        .iter()
-                        .any(|guard| guard.command_index == command_index)
-                {
-                    return Err(EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(EngineExecutionError::NotImplemented {
-                            feature: "nested scoped stderr capture outside a message guard",
-                        }),
-                        at: Some(original_offset),
-                    });
+                ) {
+                    engine = execution.engine.clone();
                 }
-            }
-            let capture = if lean_pin_capture && isolate_stderr {
-                let allowance = remaining.min(LEAN_EVALUATION_STDOUT_LIMIT);
-                match StdoutCapture::begin_evaluation(allowance) {
-                    Ok(capture) => Some(capture),
-                    Err(error) => return Ok(source_evaluation::capture_failure(error)),
-                }
-            } else if lean_pin_capture || isolate_non_raw {
-                match StdoutCapture::begin_isolated(remaining, isolate_stderr) {
-                    Ok(capture) => Some(capture),
-                    Err(error) => return Ok(source_evaluation::capture_failure(error)),
-                }
-            } else {
-                None
-            };
-            let invoked = evaluation_base.execute_definition_entry_with_helpers(
-                declaration,
-                &local_functions,
-                scoped_options.as_ref().unwrap_or(options),
-                limits,
-                entry,
-            );
-            let captured = capture.map(StdoutCapture::finish);
-            if let Some(error) = captured.as_ref().and_then(|captured| captured.error) {
-                return Ok(source_evaluation::capture_failure(error));
-            }
-            let mut execution = match invoked {
-                Ok(Outcome::Complete(execution)) => execution,
-                Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
-                Ok(Outcome::InternalFault(fault)) => {
-                    return Ok(Outcome::InternalFault(fault));
-                }
-                Err(error) => {
-                    return Err(EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    });
-                }
-            };
-            if let Some(deriving) = evaluation_deriving {
-                execution.evaluation_auxiliaries = deriving.admissions;
-            }
-            if let Some(finished) = captured {
-                evaluation_output_bytes = evaluation_output_bytes
-                    .checked_add(finished.bytes.len())
-                    .ok_or(EngineExecutionError::UnexpectedPublication {
-                        detail: "evaluation output accounting overflow",
-                    })?;
-                let bytes = finished.bytes;
-                let text = String::from_utf8(bytes.clone()).map_err(|_| {
-                    EngineExecutionError::UnexpectedPublication {
-                        detail: "evaluation capture violated its UTF-8 contract",
-                    }
-                })?;
-                execution.evaluation_output = Some(text);
-                execution.io_stdout = Some(bytes);
-            }
-            source_records::apply_execution_effects(
-                &mut execution,
-                irreducible,
-                equation_info.as_ref(),
-                scoped_options.as_ref().unwrap_or(options),
-            )
-            .map_err(|error| {
-                batch_command_error(
-                    command_index,
-                    original_offset,
-                    error,
-                    engine.environment(),
-                    &scope,
-                    Some(&grammar.notations()),
-                )
-            })?;
-            if !is_evaluation {
-                let equation_scope = scope
-                    .for_declaration(parsed.syntax())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    })?;
-                execution.engine = match execution
-                    .engine
-                    .freeze_source_equation_policy(
-                        &execution.declaration,
-                        &equation_scope,
-                        options,
-                        limits.kernel,
-                    )
-                    .map_err(|error| {
-                        batch_command_error(
-                            command_index,
-                            original_offset,
-                            error,
-                            engine.environment(),
-                            &scope,
-                            Some(&grammar.notations()),
-                        )
-                    })? {
-                    Outcome::Complete(engine) => engine,
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                };
-                execution.result_logical_root = execution
-                    .engine
-                    .logical_root(scoped_options.as_ref().unwrap_or(options));
-            }
-            if let Some(name) = &protected {
-                execution.engine.environment =
-                    source_records::tag_protected(&execution.engine, name).map_err(|error| {
-                        EngineExecutionError::BatchCommand {
-                            index: command_index,
-                            error: Box::new(error),
-                            at: Some(original_offset),
-                        }
-                    })?;
-                execution.result_logical_root = execution
-                    .engine
-                    .logical_root(scoped_options.as_ref().unwrap_or(options));
-            }
-            if !is_evaluation
-                && let Some(declared) =
-                    source_records::declared_name(&execution.declaration).cloned()
-                && let Some(environment) = source_records::tag_deprecated(
-                    &execution.engine,
-                    parsed.syntax(),
-                    &declared,
-                    &scope,
-                    limits.kernel,
-                )
-                .map_err(|error| EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(error),
-                    at: Some(original_offset),
-                })?
-            {
-                execution.engine.environment = environment;
-                execution.result_logical_root = execution
-                    .engine
-                    .logical_root(scoped_options.as_ref().unwrap_or(options));
-            }
-            if !is_evaluation {
-                scopes.admitted(&execution.declaration);
-            }
-            execution.evaluation_presentation = evaluation_presentation;
-            if !is_evaluation {
-                for helper in &execution.local_functions {
-                    scopes.admitted(&helper.declaration);
-                }
-            }
-            let execution_index = executions.len();
-            // Printer candidates retain their checked successor in the
-            // execution evidence, but never become source declarations.
-            // Raw evaluation and silent Unit actions keep their established
-            // transitions; mapped IO printers remain private as well.
-            if !matches!(
-                evaluation_presentation,
-                Some(
-                    EvaluationResultPresentation::Format { .. }
-                        | EvaluationResultPresentation::IoFormat { .. }
-                        | EvaluationResultPresentation::Guard
-                )
-            ) {
-                engine = execution.engine.clone();
-            }
-            executions.push(execution);
-            execution_command_indices.push(command_index);
-            if is_evaluation {
-                evaluation_indices.push(execution_index);
-                outputs.push(SourceCommandOutput::Evaluation {
-                    command_index,
-                    execution_index,
-                });
-            }
-        }
-
-        if let Some((index, offset)) = elaborated_command.take() {
-            deprecations.extend(deprecation_warnings(
-                deprecation_sink.take(),
-                index,
-                offset,
-                engine.environment(),
-                &scopes.current,
-                limits.kernel,
-            )?);
-        }
-        drop(deprecation_sink);
-        let mut execution_indices = Vec::new();
-        execution_indices
-            .try_reserve_exact(execution_command_indices.len())
-            .map_err(|_| EngineExecutionError::AllocationFailure {
-                resource: "retained source execution index table",
-                requested: execution_command_indices.len(),
-            })?;
-        execution_indices.extend_from_slice(&execution_command_indices);
-        if source_module.is_some() {
-            engine.environment = grammar.record(engine.environment())?;
-        }
-        let result_logical_root = engine.logical_root(options);
-        if let Some(public) = public {
-            public.retain_scope(scopes.public_scope());
-        }
-        // The pin's `warnIfUsesSorry` runs on every declaration a command adds, an `example`'s
-        // included; a definition with `sorry` is admitted above, never executed.
-        let mut sorry_commands = BTreeSet::new();
-        let declarations: Vec<(usize, &Declaration)> = source_admissions
-            .iter()
-            .flat_map(|row| {
-                row.admission
-                    .admissions
-                    .iter()
-                    .map(move |admitted| (row.command_index, &admitted.declaration))
-            })
-            .chain(outputs.iter().filter_map(|output| {
-                match output {
-                    SourceCommandOutput::Example {
+                executions.push(execution);
+                execution_command_indices.push(command_index);
+                if is_evaluation {
+                    evaluation_indices.push(execution_index);
+                    outputs.push(SourceCommandOutput::Evaluation {
                         command_index,
-                        check_index,
-                    } => checks
-                        .get(*check_index)
-                        .map(|check| (*command_index, &check.declaration)),
-                    _ => None,
+                        execution_index,
+                    });
                 }
-            }))
-            .collect();
-        for &(command, declaration) in &declarations {
-            if !sorry_commands.contains(&command) && source_execution::uses_sorry(declaration)? {
-                sorry_commands.insert(command);
             }
-        }
-        // A seed world (no `sorryAx`) is this engine's own, not the pin's, and its renderings
-        // admit no warning but `sorry`'s.
-        let pin_world = engine
-            .environment()
-            .find(&Name::from_components(["sorryAx"]))
-            .is_some();
-        // A definition the stream compiled and published is an execution, not an admission
-        // row; an evaluation's execution declares nothing the user wrote.
-        let evaluated: BTreeSet<usize> = evaluation_indices.iter().copied().collect();
-        let linted: Vec<(usize, &Declaration)> = declarations
-            .iter()
-            .copied()
-            .chain(
-                executions
+
+            if let Some((index, offset)) = elaborated_command.take() {
+                deprecations.extend(deprecation_warnings(
+                    deprecation_sink.take(),
+                    index,
+                    offset,
+                    engine.environment(),
+                    &scopes.current,
+                    limits.kernel,
+                )?);
+            }
+            Ok(Outcome::Complete(()))
+        })();
+        let mut prefix_warning_error = None;
+        let mut terminal = match stream_result {
+            Ok(Outcome::Complete(())) => None,
+            stopped if observe.is_none() => {
+                return match stopped {
+                    Err(error) => Err(error),
+                    Ok(Outcome::Inconclusive(reason)) => Ok(Outcome::Inconclusive(reason)),
+                    Ok(Outcome::InternalFault(fault)) => Ok(Outcome::InternalFault(fault)),
+                    Ok(Outcome::Complete(())) => unreachable!(),
+                };
+            }
+            stopped => {
+                let (end, saved_engine, saved_scope, saved_base) =
+                    prefix.expect("an observed stream retains its initial boundary");
+                command_count = end;
+                engine = saved_engine;
+                scopes.current = saved_scope;
+                file_base = saved_base;
+                // A boundary cancellation precedes the ordinary next-step
+                // drain. Preserve that completed command's deprecation uses
+                // without changing the original cancellation disposition.
+                if let Some((index, offset)) = elaborated_command.take()
+                    && index < end
+                {
+                    match deprecation_warnings(
+                        deprecation_sink.take(),
+                        index,
+                        offset,
+                        engine.environment(),
+                        &scopes.current,
+                        limits.kernel,
+                    ) {
+                        Ok(warnings) => deprecations.extend(warnings),
+                        Err(error) => prefix_warning_error = Some(error),
+                    }
+                }
+                let retained_executions =
+                    execution_command_indices.partition_point(|index| *index < end);
+                executions.truncate(retained_executions);
+                execution_command_indices.truncate(retained_executions);
+                evaluation_indices.retain(|index| *index < retained_executions);
+                outputs.retain(|output| output.command_index() < end);
+                let retained_checks = outputs
                     .iter()
-                    .zip(&execution_command_indices)
-                    .enumerate()
-                    .filter(|(index, _)| !evaluated.contains(index))
-                    .map(|(_, (execution, &command))| (command, &execution.declaration)),
-            )
-            .collect();
-        // The pin's reducibility warnings are logged while a command elaborates, ahead of its
-        // `sorry` warning (reported with the kernel's check) and its linters.
-        // Deprecation warnings are logged while a command elaborates, ahead of its attributes'.
-        let mut warnings: Vec<SourceWarning> = deprecations;
-        if pin_world {
-            warnings.extend(instance_attribute_warnings);
-            warnings.extend(macro_pattern_warnings);
-            warnings.extend(declaration_reducibility_warnings(
-                &lint_sites,
-                &linted,
-                engine.environment(),
-            ));
-        }
-        warnings.extend(sorry_commands.iter().copied().filter_map(|command| {
-            let &(offset, source, warn) = warning_sites.get(&command)?;
-            warn.then(|| SourceWarning {
-                command_index: command,
-                at: fln_parse::BytePos(
-                    offset.0
-                        + fln_parse::command_scope::declaration_warning_offset(source).unwrap_or(0),
-                ),
-                message: "declaration uses `sorry`".to_owned(),
-                severity: SourceSeverity::Warning,
-                follows_output: false,
-            })
-        }));
-        // The pin's `linter.unusedVariables` runs after each command that logged no error and
-        // contains no `sorry`.
-        if pin_world {
-            // Every constructor spelling, for telling a pattern variable from a constructor, and
-            // the indexed families' constructors with the fields a pattern leaves unread.
-            let spelling = |name: &Name| match name.leaf_view() {
-                fln_core::name::LeafView::Str(text) => Some(text.to_owned()),
-                _ => None,
-            };
-            let environment = engine.environment();
-            // A constant this source declared is absent from the imported environment.
-            let local = |name: &Name| {
-                engine
-                    .imported_environment()
-                    .is_none_or(|imported| !imported.contains(name))
-            };
-            let spellings: std::collections::HashSet<String> = environment
-                .constants()
-                .filter(|(_, info)| matches!(info, ConstantInfo::Ctor(_)))
-                .filter_map(|(name, _)| spelling(name))
+                    .filter(|output| {
+                        matches!(
+                            output,
+                            SourceCommandOutput::Check { .. } | SourceCommandOutput::Example { .. }
+                        )
+                    })
+                    .count();
+                checks.truncate(retained_checks);
+                source_admissions.retain(|row| row.command_index < end);
+                guards.retain(|guard| guard.command_index < end);
+                guarded_errors.retain(|warning| warning.command_index < end);
+                trace_messages.retain(|trace| trace.command_index < end);
+                deprecations.retain(|warning| warning.command_index < end);
+                instance_attribute_warnings.retain(|warning| warning.command_index < end);
+                macro_pattern_warnings.retain(|warning| warning.command_index < end);
+                warning_sites.retain(|command, _| *command < end);
+                lint_sites.retain(|(command, _), _| *command < end);
+                exit_warning = exit_warning.filter(|warning| warning.command_index < end);
+                Some(stopped)
+            }
+        };
+        drop(deprecation_sink);
+        // Finalize the same warning/linter evidence for the retained prefix.
+        // A presentation-only failure here cannot replace the original typed
+        // source failure. The ordinary path still reports its exact error.
+        let finalized: Result<SourceCommandBatchExecution, EngineExecutionError> = (|| {
+            if let Some(error) = prefix_warning_error {
+                return Err(error);
+            }
+            let mut execution_indices = Vec::new();
+            execution_indices
+                .try_reserve_exact(execution_command_indices.len())
+                .map_err(|_| EngineExecutionError::AllocationFailure {
+                    resource: "retained source execution index table",
+                    requested: execution_command_indices.len(),
+                })?;
+            execution_indices.extend_from_slice(&execution_command_indices);
+            if terminal.is_none() && source_module.is_some() {
+                engine.environment = grammar.record(engine.environment())?;
+            }
+            let result_logical_root = engine.logical_root(options);
+            if terminal.is_none()
+                && let Some(public) = public
+            {
+                public.retain_scope(scopes.public_scope());
+            }
+            // The pin's `warnIfUsesSorry` runs on every declaration a command adds, an `example`'s
+            // included; a definition with `sorry` is admitted above, never executed.
+            let mut sorry_commands = BTreeSet::new();
+            let declarations: Vec<(usize, &Declaration)> = source_admissions
+                .iter()
+                .flat_map(|row| {
+                    row.admission
+                        .admissions
+                        .iter()
+                        .map(move |admitted| (row.command_index, &admitted.declaration))
+                })
+                .chain(outputs.iter().filter_map(|output| {
+                    match output {
+                        SourceCommandOutput::Example {
+                            command_index,
+                            check_index,
+                        } => checks
+                            .get(*check_index)
+                            .map(|check| (*command_index, &check.declaration)),
+                        _ => None,
+                    }
+                }))
                 .collect();
-            let mut constructors = unused_variables::Constructors {
-                names: std::collections::HashSet::new(),
-                local: environment
+            for &(command, declaration) in &declarations {
+                if !sorry_commands.contains(&command) && source_execution::uses_sorry(declaration)?
+                {
+                    sorry_commands.insert(command);
+                }
+            }
+            // A seed world (no `sorryAx`) is this engine's own, not the pin's, and its renderings
+            // admit no warning but `sorry`'s.
+            let pin_world = engine
+                .environment()
+                .find(&Name::from_components(["sorryAx"]))
+                .is_some();
+            // A definition the stream compiled and published is an execution, not an admission
+            // row; an evaluation's execution declares nothing the user wrote.
+            let evaluated: BTreeSet<usize> = evaluation_indices.iter().copied().collect();
+            let linted: Vec<(usize, &Declaration)> = declarations
+                .iter()
+                .copied()
+                .chain(
+                    executions
+                        .iter()
+                        .zip(&execution_command_indices)
+                        .enumerate()
+                        .filter(|(index, _)| !evaluated.contains(index))
+                        .map(|(_, (execution, &command))| (command, &execution.declaration)),
+                )
+                .collect();
+            // The pin's reducibility warnings are logged while a command elaborates, ahead of its
+            // `sorry` warning (reported with the kernel's check) and its linters.
+            // Deprecation warnings are logged while a command elaborates, ahead of its attributes'.
+            let mut warnings: Vec<SourceWarning> = deprecations;
+            if pin_world {
+                warnings.extend(instance_attribute_warnings);
+                warnings.extend(macro_pattern_warnings);
+                warnings.extend(declaration_reducibility_warnings(
+                    &lint_sites,
+                    &linted,
+                    engine.environment(),
+                ));
+            }
+            warnings.extend(sorry_commands.iter().copied().filter_map(|command| {
+                let &(offset, source, warn) = warning_sites.get(&command)?;
+                warn.then(|| SourceWarning {
+                    command_index: command,
+                    at: fln_parse::BytePos(
+                        offset.0
+                            + fln_parse::command_scope::declaration_warning_offset(source)
+                                .unwrap_or(0),
+                    ),
+                    message: "declaration uses `sorry`".to_owned(),
+                    severity: SourceSeverity::Warning,
+                    follows_output: false,
+                })
+            }));
+            // The pin's `linter.unusedVariables` runs after each command that logged no error and
+            // contains no `sorry`.
+            if pin_world {
+                // Every constructor spelling, for telling a pattern variable from a constructor, and
+                // the indexed families' constructors with the fields a pattern leaves unread.
+                let spelling = |name: &Name| match name.leaf_view() {
+                    fln_core::name::LeafView::Str(text) => Some(text.to_owned()),
+                    _ => None,
+                };
+                let environment = engine.environment();
+                // A constant this source declared is absent from the imported environment.
+                let local = |name: &Name| {
+                    engine
+                        .imported_environment()
+                        .is_none_or(|imported| !imported.contains(name))
+                };
+                let spellings: std::collections::HashSet<String> = environment
                     .constants()
-                    .filter(|(name, info)| matches!(info, ConstantInfo::Ctor(_)) && local(name))
+                    .filter(|(_, info)| matches!(info, ConstantInfo::Ctor(_)))
                     .filter_map(|(name, _)| spelling(name))
-                    .collect(),
-                indexed: environment
-                    .constants()
-                    .filter_map(|(name, info)| match info {
-                        ConstantInfo::Ctor(ctor) => match environment.find(&ctor.induct) {
-                            Some(ConstantInfo::Induct(family)) if family.num_indices > 0 => {
-                                Some(unused_variables::IndexedConstructor::new(
-                                    name.clone(),
-                                    local(name),
-                                    ctor.induct.clone(),
-                                    &ctor.base.type_,
-                                    ctor.num_params,
-                                    family.num_indices,
-                                ))
-                            }
+                    .collect();
+                let mut constructors = unused_variables::Constructors {
+                    names: std::collections::HashSet::new(),
+                    local: environment
+                        .constants()
+                        .filter(|(name, info)| matches!(info, ConstantInfo::Ctor(_)) && local(name))
+                        .filter_map(|(name, _)| spelling(name))
+                        .collect(),
+                    indexed: environment
+                        .constants()
+                        .filter_map(|(name, info)| match info {
+                            ConstantInfo::Ctor(ctor) => match environment.find(&ctor.induct) {
+                                Some(ConstantInfo::Induct(family)) if family.num_indices > 0 => {
+                                    Some(unused_variables::IndexedConstructor::new(
+                                        name.clone(),
+                                        local(name),
+                                        ctor.induct.clone(),
+                                        &ctor.base.type_,
+                                        ctor.num_params,
+                                        family.num_indices,
+                                    ))
+                                }
+                                _ => None,
+                            },
                             _ => None,
-                        },
-                        _ => None,
-                    })
-                    .collect(),
-                families: environment
-                    .constants()
-                    .filter_map(|(name, info)| match info {
-                        ConstantInfo::Induct(family) if family.num_indices > 0 => Some((
-                            name.clone(),
-                            (family.num_params as usize, family.num_indices as usize),
-                        )),
-                        _ => None,
-                    })
-                    .collect(),
-            };
-            // Which of a command's atomic identifiers name a constructor where it is, by the pin's
-            // `resolveGlobalName`. Without the alias or protected tables every constructor
-            // spelling is kept, which only withholds warnings.
-            let resolution = fln_elab::aliases::AliasTable::read(environment)
-                .ok()
-                .zip(fln_elab::protected_names::ProtectedNames::read(environment).ok());
-            let is_constructor =
-                |name: &Name| matches!(environment.find(name), Some(ConstantInfo::Ctor(_)));
-            for (&(command, _), (offset, syntax, options, _, scope)) in &lint_sites {
-                constructors.names = match &resolution {
-                    Some((aliases, protected)) => unused_variables::atomic_spellings(syntax)
-                        .into_iter()
-                        .filter(|text| {
-                            constructors.local.contains(text)
-                                || spellings.contains(text)
-                                    && match scope.resolve_with_aliases(
-                                        &Name::from_components([text.as_str()]),
-                                        |declaration| environment.contains(declaration),
-                                        aliases,
-                                        protected,
-                                    ) {
-                                        Ok(found) => {
-                                            found.is_some_and(|name| is_constructor(&name))
-                                        }
-                                        Err(fln_elab::source::scope::ScopeError::Ambiguous(
-                                            _,
-                                            candidates,
-                                        )) => candidates.iter().any(is_constructor),
-                                        Err(_) => true,
-                                    }
                         })
                         .collect(),
-                    None => spellings.clone(),
+                    families: environment
+                        .constants()
+                        .filter_map(|(name, info)| match info {
+                            ConstantInfo::Induct(family) if family.num_indices > 0 => Some((
+                                name.clone(),
+                                (family.num_params as usize, family.num_indices as usize),
+                            )),
+                            _ => None,
+                        })
+                        .collect(),
                 };
-                // In the pin's order: the `:=` note while the command elaborates (`sorry` does
-                // not suppress it), then the unused-variables linter (skipped with `sorry`),
-                // then `linter.defProp`.
-                let declared = linted_declaration(syntax, &linted, command);
-                let mut lints: Vec<linters::Lint> =
-                    linters::deprecated_assignment_syntax(syntax, options)
-                        .into_iter()
-                        .collect();
-                // The `:=` note is logged while the command elaborates; the linters after it.
-                let elaboration_notes = lints.len();
-                // The pin runs no linter after a command that logged an error.
-                let errored = guarded_errors
-                    .iter()
-                    .any(|error| error.command_index == command);
-                if !errored
-                    && !sorry_commands.contains(&command)
-                    && !unused_variables::has_sorry(syntax)
-                {
-                    // A field filled by its tactic ran one inside the body, so the pin reads
-                    // the body's binders only through its elaborated term.
-                    let body_ran_tactics = declared.is_some_and(|(_, _, value, _)| {
-                        unused_variables::omits_tactic_field(syntax, value, engine.environment())
-                    });
-                    // A command compiled by well-founded recursion proves its decreasing goals
-                    // with tactics after its body, whose metavariable assignments the pin reads
-                    // for the body's binders' uses.
-                    let well_founded = linted.iter().filter(|(index, _)| *index == command).any(
-                        |(_, declaration)| match declaration {
-                            Declaration::Defn(value) => {
-                                unused_variables::applies_well_founded_fixpoint(&value.value)
-                            }
-                            Declaration::Thm(value) => {
-                                unused_variables::applies_well_founded_fixpoint(&value.value)
-                            }
-                            Declaration::Opaque(value) => {
-                                unused_variables::applies_well_founded_fixpoint(&value.value)
-                            }
-                            Declaration::Mutual(values) => values.iter().any(|value| {
-                                unused_variables::applies_well_founded_fixpoint(&value.value)
-                            }),
-                            _ => false,
-                        },
-                    );
-                    let mut unused = Vec::new();
-                    if !body_ran_tactics {
-                        // An equation's or alternative's pattern variables are bound once the
-                        // body is elaborated, over no pending metavariable, so the pin still
-                        // warns about them in a well-founded command (upstream
-                        // `elab/issue2925`, a mutual block, warns about its unused `m`).
-                        unused.extend(unused_variables::unused_pattern_variables(
-                            syntax,
-                            options,
-                            &constructors,
-                            declared.map(|(_, type_, _, _)| type_),
-                        ));
+                // Which of a command's atomic identifiers name a constructor where it is, by the pin's
+                // `resolveGlobalName`. Without the alias or protected tables every constructor
+                // spelling is kept, which only withholds warnings.
+                let resolution = fln_elab::aliases::AliasTable::read(environment)
+                    .ok()
+                    .zip(fln_elab::protected_names::ProtectedNames::read(environment).ok());
+                let is_constructor =
+                    |name: &Name| matches!(environment.find(name), Some(ConstantInfo::Ctor(_)));
+                for (&(command, _), (offset, syntax, options, _, scope)) in &lint_sites {
+                    constructors.names = match &resolution {
+                        Some((aliases, protected)) => unused_variables::atomic_spellings(syntax)
+                            .into_iter()
+                            .filter(|text| {
+                                constructors.local.contains(text)
+                                    || spellings.contains(text)
+                                        && match scope.resolve_with_aliases(
+                                            &Name::from_components([text.as_str()]),
+                                            |declaration| environment.contains(declaration),
+                                            aliases,
+                                            protected,
+                                        ) {
+                                            Ok(found) => {
+                                                found.is_some_and(|name| is_constructor(&name))
+                                            }
+                                            Err(
+                                                fln_elab::source::scope::ScopeError::Ambiguous(
+                                                    _,
+                                                    candidates,
+                                                ),
+                                            ) => candidates.iter().any(is_constructor),
+                                            Err(_) => true,
+                                        }
+                            })
+                            .collect(),
+                        None => spellings.clone(),
+                    };
+                    // In the pin's order: the `:=` note while the command elaborates (`sorry` does
+                    // not suppress it), then the unused-variables linter (skipped with `sorry`),
+                    // then `linter.defProp`.
+                    let declared = linted_declaration(syntax, &linted, command);
+                    let mut lints: Vec<linters::Lint> =
+                        linters::deprecated_assignment_syntax(syntax, options)
+                            .into_iter()
+                            .collect();
+                    // The `:=` note is logged while the command elaborates; the linters after it.
+                    let elaboration_notes = lints.len();
+                    // The pin runs no linter after a command that logged an error.
+                    let errored = guarded_errors
+                        .iter()
+                        .any(|error| error.command_index == command);
+                    if !errored
+                        && !sorry_commands.contains(&command)
+                        && !unused_variables::has_sorry(syntax)
+                    {
+                        // A field filled by its tactic ran one inside the body, so the pin reads
+                        // the body's binders only through its elaborated term.
+                        let body_ran_tactics = declared.is_some_and(|(_, _, value, _)| {
+                            unused_variables::omits_tactic_field(
+                                syntax,
+                                value,
+                                engine.environment(),
+                            )
+                        });
+                        // A command compiled by well-founded recursion proves its decreasing goals
+                        // with tactics after its body, whose metavariable assignments the pin reads
+                        // for the body's binders' uses.
+                        let well_founded = linted
+                            .iter()
+                            .filter(|(index, _)| *index == command)
+                            .any(|(_, declaration)| match declaration {
+                                Declaration::Defn(value) => {
+                                    unused_variables::applies_well_founded_fixpoint(&value.value)
+                                }
+                                Declaration::Thm(value) => {
+                                    unused_variables::applies_well_founded_fixpoint(&value.value)
+                                }
+                                Declaration::Opaque(value) => {
+                                    unused_variables::applies_well_founded_fixpoint(&value.value)
+                                }
+                                Declaration::Mutual(values) => values.iter().any(|value| {
+                                    unused_variables::applies_well_founded_fixpoint(&value.value)
+                                }),
+                                _ => false,
+                            });
+                        let mut unused = Vec::new();
+                        if !body_ran_tactics {
+                            // An equation's or alternative's pattern variables are bound once the
+                            // body is elaborated, over no pending metavariable, so the pin still
+                            // warns about them in a well-founded command (upstream
+                            // `elab/issue2925`, a mutual block, warns about its unused `m`).
+                            unused.extend(unused_variables::unused_pattern_variables(
+                                syntax,
+                                options,
+                                &constructors,
+                                declared.map(|(_, type_, _, _)| type_),
+                            ));
+                        }
+                        if !body_ran_tactics && !well_founded {
+                            unused.extend(unused_variables::unused_fun_binders(
+                                syntax,
+                                options,
+                                &constructors,
+                            ));
+                            unused.extend(unused_variables::unused_type_binders(syntax, options));
+                        }
+                        if let Some((_, type_, value, _)) = declared {
+                            unused.extend(unused_variables::unused_signature_binders(
+                                syntax, type_, value, options,
+                            ));
+                        }
+                        unused.sort_by_key(|unused| unused.at);
+                        lints.extend(unused.into_iter().map(|unused| linters::Lint {
+                            at: unused.at,
+                            message: unused_variables::message(&unused.name),
+                        }));
                     }
-                    if !body_ran_tactics && !well_founded {
-                        unused.extend(unused_variables::unused_fun_binders(
-                            syntax,
-                            options,
-                            &constructors,
-                        ));
-                        unused.extend(unused_variables::unused_type_binders(syntax, options));
-                    }
-                    if let Some((_, type_, value, _)) = declared {
-                        unused.extend(unused_variables::unused_signature_binders(
-                            syntax, type_, value, options,
-                        ));
-                    }
-                    unused.sort_by_key(|unused| unused.at);
-                    lints.extend(unused.into_iter().map(|unused| linters::Lint {
-                        at: unused.at,
-                        message: unused_variables::message(&unused.name),
-                    }));
-                }
-                // `linter.checkUnivs`, after the unused-variables warnings and before
-                // `linter.defProp`, as the pin runs them; like every linter, not after an error.
-                if !errored {
-                    for (_, declaration) in linted.iter().filter(|(index, _)| *index == command) {
-                        for (name, type_) in universe_linted(declaration) {
-                            match linters::universes_only_together(syntax, name, type_, options) {
-                                Ok(lint) => lints.extend(lint),
-                                Err(feature) => {
-                                    return Err(EngineExecutionError::BatchCommand {
-                                        index: command,
-                                        error: Box::new(EngineExecutionError::NotImplemented {
-                                            feature,
-                                        }),
-                                        at: Some(fln_parse::BytePos(offset.0)),
-                                    });
+                    // `linter.checkUnivs`, after the unused-variables warnings and before
+                    // `linter.defProp`, as the pin runs them; like every linter, not after an error.
+                    if !errored {
+                        for (_, declaration) in linted.iter().filter(|(index, _)| *index == command)
+                        {
+                            for (name, type_) in universe_linted(declaration) {
+                                match linters::universes_only_together(syntax, name, type_, options)
+                                {
+                                    Ok(lint) => lints.extend(lint),
+                                    Err(feature) => {
+                                        return Err(EngineExecutionError::BatchCommand {
+                                            index: command,
+                                            error: Box::new(EngineExecutionError::NotImplemented {
+                                                feature,
+                                            }),
+                                            at: Some(fln_parse::BytePos(offset.0)),
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
+                    if let Some((name, type_, _, abbreviation)) = declared {
+                        lints.extend(linters::definition_is_proposition(
+                            syntax,
+                            name,
+                            type_,
+                            abbreviation,
+                            engine.environment(),
+                            options,
+                        ));
+                    }
+                    for (index, lint) in lints.into_iter().enumerate() {
+                        warnings.push(SourceWarning {
+                            command_index: command,
+                            at: fln_parse::BytePos(offset.0 + lint.at),
+                            message: lint.message,
+                            severity: SourceSeverity::Warning,
+                            follows_output: index >= elaboration_notes,
+                        });
+                    }
                 }
-                if let Some((name, type_, _, abbreviation)) = declared {
-                    lints.extend(linters::definition_is_proposition(
-                        syntax,
-                        name,
-                        type_,
-                        abbreviation,
-                        engine.environment(),
-                        options,
-                    ));
-                }
-                for (index, lint) in lints.into_iter().enumerate() {
-                    warnings.push(SourceWarning {
-                        command_index: command,
-                        at: fln_parse::BytePos(offset.0 + lint.at),
-                        message: lint.message,
-                        severity: SourceSeverity::Warning,
-                        follows_output: index >= elaboration_notes,
-                    });
-                }
+                // A command's lint warnings follow its other warnings, in source order.
+                warnings.sort_by_key(|warning| warning.command_index);
             }
-            // A command's lint warnings follow its other warnings, in source order.
+            // A guarded command's error follows its traces and precedes later commands' warnings.
+            warnings.extend(guarded_errors);
             warnings.sort_by_key(|warning| warning.command_index);
+            // The last command, so the order by command stays.
+            warnings.extend(exit_warning);
+            Ok(SourceCommandBatchExecution {
+                scope: scopes.current,
+                batch: DefinitionBatchExecution {
+                    engine,
+                    base_logical_root,
+                    result_logical_root,
+                    executions,
+                    source_module_order: Vec::new(),
+                    source_evaluation_indices: evaluation_indices,
+                    source_admissions,
+                    source_execution_command_indices: execution_indices,
+                },
+                command_count,
+                execution_command_indices,
+                outputs,
+                checks,
+                guards,
+                warnings,
+                traces: trace_messages,
+                final_file_base: file_base,
+            })
+        })();
+        if terminal.is_none()
+            && finalized.is_ok()
+            && let Some(reason) = macros.as_deref().and_then(|session| session.cancelled())
+        {
+            terminal = Some(Ok(Outcome::Inconclusive(reason)));
         }
-        // A guarded command's error follows its traces and precedes later commands' warnings.
-        warnings.extend(guarded_errors);
-        warnings.sort_by_key(|warning| warning.command_index);
-        // The last command, so the order by command stays.
-        warnings.extend(exit_warning);
-        if let Some(reason) = macros.as_deref().and_then(|session| session.cancelled()) {
-            return Ok(Outcome::Inconclusive(reason));
+        if let (Some(observe), Ok(completed)) = (observe.as_mut(), finalized.as_ref()) {
+            let mut observations = completed.observation();
+            observations.complete = terminal.is_none();
+            observe(observations);
         }
-        Ok(Outcome::Complete(SourceCommandBatchExecution {
-            scope: scopes.current,
-            batch: DefinitionBatchExecution {
-                engine,
-                base_logical_root,
-                result_logical_root,
-                executions,
-                source_module_order: Vec::new(),
-                source_evaluation_indices: evaluation_indices,
-                source_admissions,
-                source_execution_command_indices: execution_indices,
-            },
-            command_count,
-            execution_command_indices,
-            outputs,
-            checks,
-            guards,
-            warnings,
-            traces: trace_messages,
-            final_file_base: file_base,
-        }))
+        match terminal {
+            None => finalized.map(Outcome::Complete),
+            Some(Err(error)) => Err(error),
+            Some(Ok(Outcome::Inconclusive(reason))) => Ok(Outcome::Inconclusive(reason)),
+            Some(Ok(Outcome::InternalFault(fault))) => Ok(Outcome::InternalFault(fault)),
+            Some(Ok(Outcome::Complete(()))) => unreachable!(),
+        }
     }
 
     /// Execute a definition-only prefix, then dual-check one terminal `#check`.
@@ -5716,6 +5938,7 @@ impl Engine {
                         .source,
                     Some(entry),
                 )],
+                None,
                 None,
             )? {
                 Outcome::Complete(completed) => completed,
@@ -6250,6 +6473,7 @@ impl Engine {
                     .map(|index| (modules[*index].source, Some(modules[*index].name)))
                     .collect::<Vec<_>>(),
                 None,
+                None,
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(inconclusive) => {
@@ -6393,6 +6617,7 @@ impl Engine {
                 None,
                 EvaluationPresentation::Raw,
                 source_files,
+                None,
                 None,
             )? {
                 // This door returns no per-command outputs, so nothing could judge a guard:
@@ -8028,6 +8253,208 @@ pub struct SourceCommandBatchExecution {
     /// Raw tactic messages, captured in execution order (including backtracked branches).
     pub traces: Vec<SourceTraceMessage>,
     pub(crate) final_file_base: Environment,
+}
+
+/// Read-only messages and evaluation evidence from a completed source prefix.
+///
+/// This view deliberately exposes neither the successor engine nor its
+/// environment. A caller may retain rendered messages, checked query candidates
+/// and runtime observations; it cannot obtain a partially accepted module from
+/// an unsuccessful source run. The private environment is used only for bounded
+/// printing and constant metadata queries.
+#[derive(Clone, Copy, Debug)]
+pub struct SourceCommandObservation<'a> {
+    pub command_count: usize,
+    pub execution_command_indices: &'a [usize],
+    pub evaluation_indices: &'a [usize],
+    pub outputs: &'a [SourceCommandOutput],
+    pub checks: &'a [SourceCheck],
+    pub guards: &'a [SourceGuard],
+    pub warnings: &'a [SourceWarning],
+    pub traces: &'a [SourceTraceMessage],
+    executions: &'a [DefinitionExecution],
+    engine: &'a Engine,
+    complete: bool,
+}
+
+impl SourceCommandBatchExecution {
+    /// Borrow the completed batch's observation-only presentation surface.
+    pub fn observation(&self) -> SourceCommandObservation<'_> {
+        SourceCommandObservation {
+            command_count: self.command_count,
+            execution_command_indices: &self.execution_command_indices,
+            evaluation_indices: &self.batch.source_evaluation_indices,
+            outputs: &self.outputs,
+            checks: &self.checks,
+            guards: &self.guards,
+            warnings: &self.warnings,
+            traces: &self.traces,
+            executions: &self.batch.executions,
+            engine: &self.batch.engine,
+            complete: true,
+        }
+    }
+}
+
+impl<'a> SourceCommandObservation<'a> {
+    /// Whether the source command stream finished. This flag supplies no
+    /// admission authority; the original typed result remains authoritative.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Executed definitions and evaluations, without their successor engines.
+    pub fn executions(&self) -> impl ExactSizeIterator<Item = SourceEvaluationObservation<'a>> {
+        self.executions
+            .iter()
+            .map(SourceEvaluationObservation::from)
+    }
+
+    pub fn execution(&self, index: usize) -> Option<SourceEvaluationObservation<'a>> {
+        self.executions
+            .get(index)
+            .map(SourceEvaluationObservation::from)
+    }
+
+    /// Only explicit evaluation commands, in source order.
+    pub fn evaluations(&self) -> impl Iterator<Item = SourceEvaluationObservation<'a>> {
+        self.evaluation_indices
+            .iter()
+            .filter_map(|index| self.execution(*index))
+    }
+
+    pub fn printer_for(&self, checked: &'a SourceCheck) -> pretty::Printer<'a> {
+        pretty::Printer::in_scope(self.engine.environment(), &checked.scope)
+            .with_notations(&checked.notations)
+    }
+
+    pub fn constant_type(&self, name: &Name) -> Option<&'a Expr> {
+        self.engine
+            .environment()
+            .find(name)
+            .map(|info| &info.constant_val().type_)
+    }
+
+    pub fn is_local_constant(&self, name: &Name) -> bool {
+        match self.engine.imported_environment() {
+            Some(imported) => !imported.contains(name),
+            None => self.engine.imported_modules().is_empty(),
+        }
+    }
+
+    /// Restrict presentation to commands preceding a failed guard or VM exit.
+    /// No execution or elaboration is repeated, and no successor is published.
+    pub fn before_command(self, end: usize) -> Self {
+        let end = end.min(self.command_count);
+        let executions = self
+            .execution_command_indices
+            .partition_point(|index| *index < end);
+        let outputs = self
+            .outputs
+            .partition_point(|output| output.command_index() < end);
+        let checks = self.outputs[..outputs]
+            .iter()
+            .filter(|output| {
+                matches!(
+                    output,
+                    SourceCommandOutput::Check { .. } | SourceCommandOutput::Example { .. }
+                )
+            })
+            .count();
+        Self {
+            command_count: end,
+            execution_command_indices: &self.execution_command_indices[..executions],
+            evaluation_indices: &self.evaluation_indices[..self
+                .evaluation_indices
+                .partition_point(|index| *index < executions)],
+            outputs: &self.outputs[..outputs],
+            checks: &self.checks[..checks.min(self.checks.len())],
+            guards: &self.guards[..self
+                .guards
+                .partition_point(|guard| guard.command_index < end)],
+            warnings: &self.warnings[..self
+                .warnings
+                .partition_point(|warning| warning.command_index < end)],
+            traces: &self.traces[..self
+                .traces
+                .partition_point(|trace| trace.command_index < end)],
+            executions: &self.executions[..executions.min(self.executions.len())],
+            engine: self.engine,
+            complete: self.complete && end == self.command_count,
+        }
+    }
+}
+
+impl SourceCommandOutput {
+    pub fn command_index(&self) -> usize {
+        match self {
+            Self::Evaluation { command_index, .. }
+            | Self::Check { command_index, .. }
+            | Self::Example { command_index, .. } => *command_index,
+        }
+    }
+}
+
+/// A completed evaluation's presentation evidence, without its engine.
+#[derive(Clone, Copy, Debug)]
+pub struct SourceEvaluationObservation<'a> {
+    execution: &'a DefinitionExecution,
+}
+
+impl<'a> From<&'a DefinitionExecution> for SourceEvaluationObservation<'a> {
+    fn from(execution: &'a DefinitionExecution) -> Self {
+        Self { execution }
+    }
+}
+
+impl<'a> SourceEvaluationObservation<'a> {
+    pub fn exit(&self) -> &'a VmExit {
+        &self.execution.exit
+    }
+
+    pub fn runtime_type(&self) -> &'a Expr {
+        &self.execution.runtime_type
+    }
+
+    pub fn constant(&self, name: &Name) -> Option<&'a ConstantInfo> {
+        self.execution.engine.environment().find(name)
+    }
+
+    pub fn evaluation_output(&self) -> Option<&'a str> {
+        self.execution.evaluation_output()
+    }
+
+    pub fn captured_stdout(&self) -> Option<&'a [u8]> {
+        self.execution.captured_stdout()
+    }
+
+    pub fn evaluation_presentation(&self) -> Option<EvaluationResultPresentation> {
+        self.execution.evaluation_presentation()
+    }
+
+    pub fn io_evaluation_outcome(
+        &self,
+    ) -> Result<Option<IoEvaluationOutcome>, IoEvaluationProjectionError> {
+        self.execution.io_evaluation_outcome()
+    }
+
+    /// Render an already-computed Format in the checked evaluation world.
+    /// This executes neither the action nor its printer again.
+    pub fn render_format(
+        &self,
+        runtime_type: &Expr,
+        exit: &VmExit,
+        width: usize,
+        limits: source_format::Limits,
+    ) -> Result<String, source_format::Error> {
+        source_format::render_vm(
+            self.execution.engine.environment(),
+            runtime_type,
+            exit,
+            width,
+            limits,
+        )
+    }
 }
 
 pub use source_records::traces::SourceTraceMessage;

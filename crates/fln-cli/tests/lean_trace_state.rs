@@ -62,15 +62,31 @@ fn guard_filter_drops_trace_without_disabling_proof_checking() {
     let rejected =
         lean("#guard_msgs (drop trace) in\nexample (P : Prop) : P := by trace_state; constructor");
     assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
-    assert!(rejected.stdout.is_empty());
+    let diagnostic = String::from_utf8_lossy(&rejected.stdout);
+    assert!(
+        diagnostic.ends_with("Main.lean:4:0: error: no constructor applies to the current goal\n"),
+        "{rejected:?}"
+    );
+    assert!(
+        !diagnostic.contains('⊢'),
+        "a failed guard must not leak its trace: {rejected:?}"
+    );
+    assert!(rejected.stderr.is_empty(), "{rejected:?}");
 }
 #[test]
-fn later_bad_proof_never_publishes_earlier_buffered_traces() {
+fn later_bad_proof_retains_only_completed_command_traces() {
     let output = lean(
         "example : Fact := by trace_state; constructor\nexample (P : Prop) : P := by constructor",
     );
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(output.stdout.is_empty());
+    let diagnostic = String::from_utf8_lossy(&output.stdout);
+    assert!(diagnostic.starts_with("⊢ Fact\n"), "{output:?}");
+    assert_eq!(diagnostic.matches("⊢ Fact\n").count(), 1, "{output:?}");
+    assert!(
+        diagnostic.ends_with("Main.lean:4:0: error: no constructor applies to the current goal\n"),
+        "{output:?}"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[test]

@@ -520,6 +520,7 @@ impl imported::SourceOleanImport {
             false,
             presentation,
             &mut |_, _| Ok::<(), std::convert::Infallible>(()),
+            None,
         )
     }
 
@@ -565,6 +566,7 @@ impl imported::SourceOleanImport {
             true,
             presentation,
             validate,
+            None,
         )
     }
 
@@ -604,6 +606,7 @@ impl imported::SourceOleanImport {
             false,
             presentation,
             &mut |_, _| Ok::<(), std::convert::Infallible>(()),
+            None,
         )
     }
 
@@ -620,6 +623,60 @@ impl imported::SourceOleanImport {
         input: SourceModuleDeferredMacroInputs,
         cancellation: Option<&dyn CancellationProbe>,
         presentation: crate::EvaluationPresentation,
+        validate: &mut impl FnMut(&Name, &crate::SourceCommandBatchExecution) -> Result<(), E>,
+    ) -> SourceMacroProgramExecution<E> {
+        self.execute_lean_source_modules_with_observed_deferred_macros(
+            modules,
+            entry,
+            options,
+            limits,
+            input,
+            cancellation,
+            presentation,
+            None,
+            validate,
+        )
+    }
+
+    /// Retain observation-only command output on a later source failure while
+    /// using the same demand-driven macro execution and module validation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_lean_source_modules_with_deferred_imported_macros_and_observer<E>(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        input: SourceModuleDeferredMacroInputs,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: crate::EvaluationPresentation,
+        observe: &mut dyn FnMut(&Name, crate::SourceCommandObservation<'_>),
+        validate: &mut impl FnMut(&Name, &crate::SourceCommandBatchExecution) -> Result<(), E>,
+    ) -> SourceMacroProgramExecution<E> {
+        self.execute_lean_source_modules_with_observed_deferred_macros(
+            modules,
+            entry,
+            options,
+            limits,
+            input,
+            cancellation,
+            presentation,
+            Some(observe),
+            validate,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_lean_source_modules_with_observed_deferred_macros<E>(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        input: SourceModuleDeferredMacroInputs,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: crate::EvaluationPresentation,
+        observe: Option<&mut dyn FnMut(&Name, crate::SourceCommandObservation<'_>)>,
         validate: &mut impl FnMut(&Name, &crate::SourceCommandBatchExecution) -> Result<(), E>,
     ) -> SourceMacroProgramExecution<E> {
         self.execute_program_with_macro_preparation(
@@ -644,6 +701,7 @@ impl imported::SourceOleanImport {
             true,
             presentation,
             validate,
+            observe,
         )
     }
 
@@ -659,6 +717,7 @@ impl imported::SourceOleanImport {
         implicit_init: bool,
         presentation: crate::EvaluationPresentation,
         validate: &mut impl FnMut(&Name, &crate::SourceCommandBatchExecution) -> Result<(), E>,
+        observe: Option<&mut dyn FnMut(&Name, crate::SourceCommandObservation<'_>)>,
     ) -> SourceMacroProgramExecution<E> {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return SourceMacroProgramExecution::stopped(Outcome::Inconclusive(
@@ -702,6 +761,7 @@ impl imported::SourceOleanImport {
             presentation,
             validate,
             Some(&mut session),
+            observe,
         ) {
             Ok(outcome) => outcome.map_complete(Ok),
             Err(error) => {

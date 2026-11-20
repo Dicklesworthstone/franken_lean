@@ -42,6 +42,114 @@ fn lean_io(workspace: &Workspace, entry: &Path, lib: &Path) -> Run {
 }
 
 #[test]
+fn lean_failures_keep_queries_warnings_and_single_execution_effects() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-observed-prefix");
+    let counter = workspace.write("counter.txt", "");
+    let path = format!("(System.FilePath.mk {:?})", counter.to_str().unwrap());
+    let source = format!(
+        r#"{DEFINITIONS}#eval (show IO Unit from do
+  let prior ← IO.FS.readFile {path}
+  IO.FS.writeFile {path} (prior ++ "x")
+  IO.println "prefix-effect λ")
+def ignore (unused : Nat) : Nat := 0
+#check Nat
+#check Missing
+"#
+    );
+    let entry = workspace.write("Prefix.lean", &source);
+    let error_line = source[..source.find("#check Missing").unwrap()]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let oracle = lib.parent().unwrap().parent().unwrap().join("bin/lean");
+    let pinned_prefix = if oracle.is_file() {
+        let output = Command::new(&oracle)
+            .arg(&entry)
+            .env("LEAN_PATH", &lib)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "x");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        Some(
+            stdout
+                .strip_suffix(&format!(
+                    "{}:{error_line}:7: error(lean.unknownIdentifier): Unknown identifier `Missing`\n",
+                    entry.display()
+                ))
+                .expect("the pinned unknown-name diagnostic moved")
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+    std::fs::write(&counter, "").unwrap();
+    let failed = lean_io(&workspace, &entry, &lib);
+    assert_eq!(failed.code, 1, "{failed:?}");
+    assert!(failed.stderr.is_empty(), "{failed:?}");
+    let prefix = failed
+        .stdout
+        .strip_suffix(&format!(
+            "{}:{error_line}:0: error(lean.unknownIdentifier): Unknown identifier `Missing`\n",
+            entry.display(),
+        ))
+        .expect("retain the source refusal after its completed messages");
+    assert!(prefix.starts_with("prefix-effect λ\n"), "{failed:?}");
+    assert_eq!(prefix.matches("prefix-effect λ\n").count(), 1, "{failed:?}");
+    assert!(
+        prefix.contains(": warning: unused variable `unused`"),
+        "{failed:?}"
+    );
+    assert!(prefix.ends_with("Nat : Type\n"), "{failed:?}");
+    if let Some(pinned_prefix) = pinned_prefix {
+        assert_eq!(
+            prefix, pinned_prefix,
+            "completed messages agree with the pin"
+        );
+    }
+    // Re-executing the prefix to recover its messages would append a second x.
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "x");
+
+    let guarded = workspace.write(
+        "GuardFailure.lean",
+        format!("{DEFINITIONS}#eval (42 : Nat)\n/-- info: 8 -/\n#guard_msgs in\n#eval (7 : Nat)\n#eval (99 : Nat)\n"),
+    );
+    let mismatch = lean_io(&workspace, &guarded, &lib);
+    assert_eq!(mismatch.code, 1, "{mismatch:?}");
+    assert_eq!(mismatch.stdout, "42\n", "{mismatch:?}");
+    assert!(
+        mismatch.stderr.starts_with("lean: guard-msgs:"),
+        "{mismatch:?}"
+    );
+
+    let raised = workspace.write(
+        "RuntimeFailure.lean",
+        format!(
+            r#"{DEFINITIONS}#check Nat
+#eval (show IO Unit from do
+  IO.println "before-exception"
+  throw (IO.userError "prefix failure"))
+#eval (99 : Nat)
+"#
+        ),
+    );
+    let exception = lean_io(&workspace, &raised, &lib);
+    assert_eq!(exception.code, 1, "{exception:?}");
+    assert_eq!(
+        exception.stdout, "Nat : Type\nbefore-exception\n",
+        "{exception:?}"
+    );
+    assert!(
+        exception.stderr.starts_with("lean: io-exception:"),
+        "{exception:?}"
+    );
+    assert!(exception.stderr.contains("prefix failure"), "{exception:?}");
+}
+
+#[test]
 fn checked_io_results_print_once_refuse_unprintable_actions_and_guard_their_output() {
     let Some(lib) = pinned_lib() else { return };
     let workspace = Workspace::new("lean-door-checked-io");

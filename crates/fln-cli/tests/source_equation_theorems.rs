@@ -641,7 +641,9 @@ fn equation_theorems_are_the_pins_and_rewrite_as_the_pin_does() {
             "{name}: a capability refusal\n{}",
             ours.stderr
         );
-        assert!(ours.stderr.contains(message), "{name}: {}", ours.stderr);
+        assert!(ours.stdout.contains(": error"), "{name}: {}", ours.stdout);
+        assert!(ours.stdout.contains(message), "{name}: {}", ours.stdout);
+        assert!(ours.stderr.is_empty(), "{name}: {}", ours.stderr);
         if let Some(pinned) = pinned {
             assert_ne!(pinned.code, 0, "{name}: the pinned lean accepts it");
             assert!(pinned.stdout.contains(message), "{name}: {}", pinned.stdout);

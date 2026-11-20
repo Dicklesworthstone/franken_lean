@@ -83,21 +83,36 @@ fn interpolation_matches_the_pin_with_imported_and_local_instances_and_recovers_
     );
 
     // A refusal must not leave a cached declaration or expansion behind for a retry.
-    for invalid in [
+    for (index, invalid) in [
         format!("{IMPORTS}inductive NoPrinter where | value\n#eval s!\"{{NoPrinter.value}}\"\n"),
         format!("{IMPORTS}def wrong : Nat := s!\"{{(1 : Nat)}}\"\n"),
         // ToString's class and instances do not make the macro available without its import.
         "prelude\nimport Init.Data.ToString.Basic\n#eval s!\"closed\"\n".to_string(),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         workspace.write("Main.lean", invalid);
         let pin = lean(&workspace, &oracle, &entry, &lib);
         assert_eq!(pin.status.code(), Some(1), "Reference: {pin:?}");
         let refused = lean(&workspace, executable, &entry, &lib);
         assert_eq!(refused.status.code(), Some(1), "FrankenLean: {refused:?}");
-        assert!(
-            refused.stdout.is_empty(),
-            "a refused program produced output: {refused:?}"
-        );
+        if index < 2 {
+            assert!(
+                String::from_utf8_lossy(&refused.stdout).contains(": error"),
+                "{refused:?}"
+            );
+            assert!(refused.stderr.is_empty(), "{refused:?}");
+        } else {
+            assert!(
+                refused.stdout.is_empty(),
+                "a syntax-preflight refusal produced output: {refused:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&refused.stderr).starts_with("lean: input:"),
+                "{refused:?}"
+            );
+        }
     }
     workspace.write("Main.lean", &source);
     let recovered = lean(&workspace, executable, &entry, &lib);

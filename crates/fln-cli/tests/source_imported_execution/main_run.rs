@@ -179,9 +179,11 @@ def main : IO Unit := do
     );
     let refused = lean_main(&workspace, &library, &[], "--run", &invalid, &[]);
     assert_eq!(refused.code, 1, "{refused:?}");
-    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(refused.stderr.is_empty(), "{refused:?}");
     assert!(
-        refused.stderr.contains("`main` function must have type"),
+        refused
+            .stdout
+            .contains(": error: `main` function must have type"),
         "{refused:?}"
     );
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserved\n");

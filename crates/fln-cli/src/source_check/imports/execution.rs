@@ -208,6 +208,23 @@ fn append(output: &mut String, text: &str) -> Result<(), Failure> {
     Ok(())
 }
 
+fn with_observed_prefix(
+    mut failed: MultiplexerOutput,
+    observed: Option<MultiplexerOutput>,
+) -> MultiplexerOutput {
+    let Some(mut observed) = observed else {
+        return failed;
+    };
+    if observed.exit_code != 0 {
+        return observed;
+    }
+    if let Err(error) = append(&mut observed.stdout, &failed.stdout) {
+        return failure(error, Presentation::Lean);
+    }
+    failed.stdout = observed.stdout;
+    failed
+}
+
 /// Legacy FlN inputs retain their bounded runner. Every Lean source file uses
 /// ordinary module semantics, independently of whether `main` is invoked.
 /// Header parsing and admission stay on a worker sized for imported declarations.
@@ -459,6 +476,13 @@ fn run_loaded(
             }
             let evaluation_presentation = evaluation_presentation(presentation);
             let mut macro_report = None;
+            let sink = crate::WarningSink::Print { file: &display, source: &sources[0] };
+            let mut observed_prefix = None;
+            let mut observe = |module: &Name, observations: fln::SourceCommandObservation<'_>| {
+                if module == &names[0] && !observations.is_complete() {
+                    observed_prefix = Some(crate::render_lean_source_observation(observations, sink));
+                }
+            };
             let execution = if let Some(prepared) = macro_inputs {
                 if let Err(error) = prepared.enable_syntax(receipt) {
                     return Some(failure(error, presentation));
@@ -468,11 +492,12 @@ fn run_loaded(
                     Err(error) => return Some(failure(error, presentation)),
                 };
                 if ordinary_lean {
-                    let executed = receipt.execute_lean_source_modules_with_deferred_imported_macros_and_validation(
+                    let executed = receipt.execute_lean_source_modules_with_deferred_imported_macros_and_observer(
                         &inputs, &names[0], &fln::KVMap::new(), limits,
                         macro_inputs, None, evaluation_presentation,
+                        &mut observe,
                         &mut |module: &Name, commands: &fln::SourceCommandBatchExecution| {
-                            validate_lean_module(module, commands, module == &names[0])
+                            validate_lean_module(module, commands, (module == &names[0]).then_some(sink))
                         },
                     );
                     macro_report = match macros::Report::from_attempts(
@@ -508,10 +533,11 @@ fn run_loaded(
                     })
                 }
             } else if ordinary_lean {
-                receipt.execute_lean_source_modules_with_validation(
+                receipt.execute_lean_source_modules_with_observer_and_validation(
                     &inputs, &names[0], &fln::KVMap::new(), limits, None, evaluation_presentation,
+                    &mut observe,
                     &mut |module: &Name, commands: &fln::SourceCommandBatchExecution| {
-                        validate_lean_module(module, commands, module == &names[0])
+                        validate_lean_module(module, commands, (module == &names[0]).then_some(sink))
                     },
                 )
                 .map_err(|error| match error {
@@ -528,13 +554,13 @@ fn run_loaded(
             };
             let completed = match execution {
                 Ok(Outcome::Complete(completed)) => completed,
-                Ok(Outcome::Inconclusive(reason)) => return Some(failure(Failure::new(
+                Ok(Outcome::Inconclusive(reason)) => return Some(with_observed_prefix(failure(Failure::new(
                     "inconclusive", &format!("source program did not finish: {reason:?}"), false, 3,
-                ), presentation)),
-                Ok(Outcome::InternalFault(fault)) => return Some(failure(Failure::new(
+                ), presentation), observed_prefix)),
+                Ok(Outcome::InternalFault(fault)) => return Some(with_observed_prefix(failure(Failure::new(
                     "internal-fault", &format!("source program faulted: {fault:?}"), false, 4,
-                ), presentation)),
-                Err(output) => return Some(output),
+                ), presentation), observed_prefix)),
+                Err(output) => return Some(with_observed_prefix(output, observed_prefix)),
             };
             Some(match presentation {
                 Presentation::Lean => match lean_output(
@@ -940,26 +966,24 @@ fn validate_module_exits(
 fn validate_lean_module(
     module: &Name,
     commands: &fln::SourceCommandBatchExecution,
-    entry: bool,
+    entry: Option<crate::WarningSink<'_>>,
 ) -> Result<(), MultiplexerOutput> {
     if let Err(error) = validate_module_exits(module, commands) {
-        let has_output = error.class == "io-exception";
-        let mut failed = failure(error, Presentation::Lean);
-        if entry {
-            failed
-                .stdout
-                .insert_str(0, &captured_through_failure(commands));
+        if let Some(sink) = entry {
+            let presented = render_lean_source_commands(commands, sink);
+            if presented.exit_code != 0 {
+                return Err(presented);
+            }
         }
-        if has_output {
-            failed.stdout = source_evaluation::output_before_failure(&commands.batch.executions)
-                .map_err(|error| error.failure(0, SourcePresentation::Lean))?;
-        }
-        return Err(failed);
+        return Err(failure(error, Presentation::Lean));
     }
     if !commands.guards.is_empty() {
-        let mut presented = render_lean_source_commands(commands, crate::WarningSink::Discard);
+        let mut presented =
+            render_lean_source_commands(commands, entry.unwrap_or(crate::WarningSink::Discard));
         if presented.exit_code != 0 {
-            presented.stdout.clear();
+            if entry.is_none() {
+                presented.stdout.clear();
+            }
             return Err(presented);
         }
     }
@@ -1025,24 +1049,6 @@ fn lean_output(
         ));
     }
     Ok(render_lean_source_commands(&module.commands, sink))
-}
-
-/// What a module's captured IO evaluations wrote, in order, through the first evaluation that
-/// did not complete: the `lean` presentation holds an action's output until it is printed, and
-/// the pin prints it ahead of the action's exception.
-fn captured_through_failure(commands: &fln::SourceCommandBatchExecution) -> String {
-    let mut text = String::new();
-    for execution in &commands.batch.executions {
-        if let Some(bytes) = execution.captured_stdout() {
-            text.push_str(&String::from_utf8_lossy(bytes));
-        }
-        if !matches!(execution.exit, fln::VmExit::Returned(_))
-            || source_evaluation::check(execution).is_err()
-        {
-            break;
-        }
-    }
-    text
 }
 
 /// Invoke main only after the complete source front end, including dependency

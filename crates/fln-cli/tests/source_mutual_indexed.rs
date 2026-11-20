@@ -46,6 +46,12 @@ fn mutual_indexed_example_is_refused_by_both_personalities_as_the_pin_does() {
         .output()
         .unwrap();
     assert!(!output.status.success(), "{output:?}");
-    assert!(!output.stderr.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let diagnostic = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        diagnostic.starts_with(&format!("{}:", source.display()))
+            && diagnostic.contains(": error: "),
+        "{output:?}"
+    );
     assert_eq!(std::fs::read_to_string(&source).unwrap(), EXAMPLE);
 }

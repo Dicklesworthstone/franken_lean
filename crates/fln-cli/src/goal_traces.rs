@@ -68,12 +68,12 @@ impl Message<'_> {
     }
 }
 
-pub(super) fn ordered(
-    completed: &fln::SourceCommandBatchExecution,
-) -> Result<Vec<Message<'_>>, MultiplexerOutput> {
+pub(super) fn ordered<'a>(
+    completed: fln::SourceCommandObservation<'a>,
+) -> Result<Vec<Message<'a>>, MultiplexerOutput> {
     let mut messages = Vec::new();
     let mut previous = None;
-    for trace in &completed.traces {
+    for trace in completed.traces {
         if trace.command_index >= completed.command_count
             || previous.is_some_and(|prior| prior > trace.command_index)
         {

@@ -289,6 +289,7 @@ impl imported::SourceOleanImport {
             presentation,
             &mut |_, _| Ok::<(), std::convert::Infallible>(()),
             None,
+            None,
         )
         .map_err(SourceProgramExecutionError::into_source_error)
     }
@@ -342,6 +343,7 @@ impl imported::SourceOleanImport {
             presentation,
             &mut |_, _| Ok::<(), std::convert::Infallible>(()),
             None,
+            None,
         )
         .map_err(SourceProgramExecutionError::into_source_error)
     }
@@ -372,6 +374,36 @@ impl imported::SourceOleanImport {
             presentation,
             validate,
             None,
+            None,
+        )
+    }
+
+    /// Execute and validate ordinary Lean modules while retaining observation-only
+    /// messages from a completed command prefix when a later command fails.
+    /// Whole-program syntax preflight and the atomic result are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_lean_source_modules_with_observer_and_validation<E>(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: EvaluationPresentation,
+        observe: &mut dyn FnMut(&Name, crate::SourceCommandObservation<'_>),
+        validate: &mut impl FnMut(&Name, &SourceCommandBatchExecution) -> Result<(), E>,
+    ) -> Result<Outcome<SourceProgramExecution>, SourceProgramExecutionError<E>> {
+        self.execute_source_modules_with_implicit_init(
+            modules,
+            entry,
+            options,
+            limits,
+            cancellation,
+            true,
+            presentation,
+            validate,
+            None,
+            Some(observe),
         )
     }
 
@@ -387,6 +419,7 @@ impl imported::SourceOleanImport {
         presentation: EvaluationPresentation,
         validate: &mut impl FnMut(&Name, &SourceCommandBatchExecution) -> Result<(), E>,
         mut macros: Option<&mut imported_macros::ModuleMacroSession>,
+        mut observe: Option<&mut dyn FnMut(&Name, crate::SourceCommandObservation<'_>)>,
     ) -> Result<Outcome<SourceProgramExecution>, SourceProgramExecutionError<E>> {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
@@ -618,8 +651,17 @@ impl imported::SourceOleanImport {
                     completed.scope.private_module =
                         header.module_system.then(|| module.name.clone());
                     completed.scope.source_module = Some(module.name.clone());
+                    if let Some(observe) = observe.as_mut() {
+                        observe(module.name, completed.observation());
+                    }
                     Ok(Outcome::Complete(completed))
                 } else {
+                    let observing = observe.is_some();
+                    let mut report = |observations: crate::SourceCommandObservation<'_>| {
+                        if let Some(observe) = observe.as_mut() {
+                            observe(module.name, observations);
+                        }
+                    };
                     engine
                         .execute_source_command_stream(
                             body,
@@ -633,6 +675,9 @@ impl imported::SourceOleanImport {
                             presentation,
                             &[(module.source, Some(module.name))],
                             session,
+                            observing.then_some(
+                                &mut report as &mut dyn FnMut(crate::SourceCommandObservation<'_>),
+                            ),
                         )
                         .map_err(source_command_error)
                 }

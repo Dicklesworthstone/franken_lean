@@ -136,11 +136,11 @@ fn conv_failures_are_refused_as_the_pin_reports_them() {
         let (code, stdout, stderr) = ours(&lib, &root, name);
         assert_eq!(code, 1, "{name}: {stdout}{stderr}");
         assert!(
-            stderr
-                .trim_end()
-                .ends_with(&format!("refused source: {message}")),
-            "{name}: {stderr}"
+            stdout.trim_end().ends_with(&format!(": error: {message}")),
+            "{name}: {stdout}{stderr}"
         );
+        assert!(stdout.starts_with(&format!("{name}:")), "{stdout}");
+        assert!(stderr.is_empty(), "{name}: {stderr}");
     }
 }
 
@@ -160,9 +160,10 @@ fn an_unimplemented_conv_tactic_is_refused_typed() {
     let (code, stdout, stderr) = ours(&lib, &root, name);
     assert_eq!(code, 1, "{stdout}{stderr}");
     assert!(
-        stderr.contains("unsupported tactic `Lean.Parser.Tactic.Conv.reduce`"),
-        "{stderr}"
+        stdout.contains(": error: unsupported tactic `Lean.Parser.Tactic.Conv.reduce`"),
+        "{stdout}{stderr}"
     );
+    assert!(stderr.is_empty(), "{stderr}");
 }
 
 /// `Conv.evalDelta` uses `deltaExpand`, then `changeLhs`: selected definitions
@@ -230,11 +231,11 @@ fn conv_rewrite_abstracts_as_the_pins_kabstract() {
         let (code, stdout, stderr) = ours(&lib, &root, name);
         assert_eq!(code, 1, "{name}: {stdout}{stderr}");
         assert!(
-            stderr
-                .trim_end()
-                .ends_with(&format!("refused source: {reason}")),
-            "{name}: {stderr}"
+            stdout.trim_end().ends_with(&format!(": error: {reason}")),
+            "{name}: {stdout}{stderr}"
         );
+        assert!(stdout.starts_with(&format!("{name}:")), "{stdout}");
+        assert!(stderr.is_empty(), "{name}: {stderr}");
     }
 }
 
@@ -256,7 +257,7 @@ example (f : Nat → Nat) (n : Nat) (h : f (n + 1) = 0) : f (Nat.succ n) + f (n 
   sorry
 "#,
         "No goals to be solved",
-        "tactic has no remaining goal",
+        "No goals to be solved",
     ),
     (
         "NoOffsetInstance.lean",

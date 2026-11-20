@@ -261,12 +261,13 @@ fn wf_tactic_macros_fail_where_the_pin_fails() {
         }
         let (code, stdout, stderr) = ours(&lib, &root, name);
         assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+        let reason = reason.strip_prefix("elaboration refused source: ").unwrap();
         assert!(
-            stderr
-                .trim_end()
-                .ends_with(&format!("refused source: {reason}")),
-            "{name}: {stderr}"
+            stdout.trim_end().ends_with(&format!(": error: {reason}")),
+            "{name}: {stdout}{stderr}"
         );
+        assert!(stdout.starts_with(&format!("{name}:")), "{stdout}");
+        assert!(stderr.is_empty(), "{name}: {stderr}");
     }
 }
 
@@ -312,7 +313,14 @@ fn simp_wf_outside_its_fragment_is_refused_typed() {
         }
         let (code, stdout, stderr) = ours(&lib, &root, name);
         assert_eq!(code, *expected, "{name}: {stdout}{stderr}");
-        assert!(stdout.is_empty(), "{name}: {stdout}");
-        assert!(stderr.trim_end().ends_with(reason), "{name}: {stderr}");
+        let reason = reason
+            .strip_prefix("refused source: elaboration refused source: ")
+            .unwrap();
+        assert!(stdout.starts_with(&format!("{name}:")), "{stdout}");
+        assert!(
+            stdout.trim_end().ends_with(&format!(": error: {reason}")),
+            "{name}: {stdout}"
+        );
+        assert!(stderr.is_empty(), "{name}: {stderr}");
     }
 }

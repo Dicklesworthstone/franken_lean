@@ -433,7 +433,7 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     assert!(late_check_refusal.stderr.is_empty());
     assert_eq!(
         utf8(&late_check_refusal.stdout),
-        "<stdin>:4:0: error(lean.unknownIdentifier): Unknown identifier `Missing`\n"
+        "Nat : Type\n42\n<stdin>:4:0: error(lean.unknownIdentifier): Unknown identifier `Missing`\n"
     );
 
     let future_definition = run_lean_stdin(
@@ -457,7 +457,7 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     // identifier `missing`` (v4.32.0, 2026-10-05). An elaboration error, not a K1 rejection.
     assert_eq!(
         utf8(&piped_late_refusal.stdout),
-        "<stdin>:2:0: error(lean.unknownIdentifier): Unknown identifier `missing`\n"
+        "42\n<stdin>:2:0: error(lean.unknownIdentifier): Unknown identifier `missing`\n"
     );
 
     let piped_budget_stop = run_lean_stdin(
@@ -539,7 +539,7 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     assert_eq!(
         utf8(&refused.stdout),
         format!(
-            "{}:2:0: error(lean.unknownIdentifier): Unknown identifier `missing`\n",
+            "42\n{}:2:0: error(lean.unknownIdentifier): Unknown identifier `missing`\n",
             source.display()
         )
     );
@@ -917,7 +917,7 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
         assert_eq!(
             utf8(&late_refusal.stdout),
             format!(
-                "{}:3:0: error(lean.unknownIdentifier): Unknown identifier `missing`\n",
+                "42\n{}:3:0: error(lean.unknownIdentifier): Unknown identifier `missing`\n",
                 main.display()
             )
         );

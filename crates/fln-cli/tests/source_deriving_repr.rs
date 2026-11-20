@@ -265,14 +265,19 @@ instance : ToString StringOnly where
         let ours = run(&source);
         // MissingPrinter retains the native capability classification (5),
         // while a failed #synth is an elaboration failure (1). The pin uses 1
-        // for both; neither door may publish earlier evaluation output.
+        // for both. A completed private fallback's output remains visible
+        // when the later #synth fails, without installing a global instance.
         let expected_exit = if index == 0 { 1 } else { 5 };
         assert_eq!(ours.status.code(), Some(expected_exit), "{body}: {ours:?}");
-        assert!(ours.stdout.is_empty(), "{body}: {ours:?}");
-        let diagnostic = String::from_utf8_lossy(&ours.stderr);
         if index == 0 {
+            let diagnostic = String::from_utf8_lossy(&ours.stdout);
+            assert!(diagnostic.starts_with("PrivateRepr.mk\n"), "{body}: {ours:?}");
+            assert!(diagnostic.contains(": error"), "{body}: {ours:?}");
             assert!(diagnostic.contains("Repr"), "{body}: {ours:?}");
+            assert!(ours.stderr.is_empty(), "{body}: {ours:?}");
         } else {
+            assert!(ours.stdout.is_empty(), "{body}: {ours:?}");
+            let diagnostic = String::from_utf8_lossy(&ours.stderr);
             assert!(
                 diagnostic.contains("could not synthesize a Repr or ToString instance"),
                 "{body}: {ours:?}",

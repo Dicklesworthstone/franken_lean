@@ -451,8 +451,8 @@ const LEAN_USAGE: &str = concat!(
     "K1 plus the independent checker in a discarded scratch successor, then\n",
     "printed as `term : type` without compilation, VM execution, or publication.\n",
     "A query sees its admitted import world and every preceding command successor.\n",
-    "Check and #eval output is buffered in source order until the whole source\n",
-    "succeeds; a later failure leaves stdout empty. A local-import entry gets the\n",
+    "Completed command output and warnings survive a later elaboration or execution\n",
+    "failure. Whole-program syntax preflight still precedes execution. A local-import entry gets the\n",
     "same ordered command stream after its transitive dependency closure completes.\n",
     "An empty source file or empty --stdin stream succeeds silently after imports.\n",
     "Dependency definitions, #eval, and scratch-only #check run silently.\n",
@@ -11965,10 +11965,9 @@ fn lean_evaluation_line(
 
 fn render_lean_source_check_line(
     checked: &fln::SourceCheck,
-    engine: &fln::Engine,
+    observations: fln::SourceCommandObservation<'_>,
     printer: &mut fln::pretty::Printer<'_>,
 ) -> Result<String, MultiplexerOutput> {
-    let environment = engine.environment();
     let Some(term) = checked.parsed.query_term_normalized() else {
         return Err(source_failure(
             "internal-fault",
@@ -12048,16 +12047,16 @@ fn render_lean_source_check_line(
         .and_then(|kind| kind.strip_prefix("Lean.Parser.Command."))
         .filter(|form| matches!(*form, "print" | "printSig" | "printAxioms" | "printEqns"))
     {
-        return render_lean_print(form, checked, engine, printer);
+        return render_lean_print(form, checked, observations, printer);
     }
     // `#check c` for an identifier naming a constant prints its signature
     // (`delabConstWithSignature`); any other term, a notation's use among them, prints as
     // `term : type`.
     let constant = match &opened {
         Some((value, _)) if checked.parsed.query_is_identifier() => match value.node() {
-            fln::ExprNode::Const { name, .. } => environment
-                .find(name)
-                .map(|info| (name.clone(), info.constant_val().type_.clone())),
+            fln::ExprNode::Const { name, .. } => observations
+                .constant_type(name)
+                .map(|type_| (name.clone(), type_.clone())),
             _ => None,
         },
         _ => None,
@@ -12083,7 +12082,7 @@ fn render_lean_source_check_line(
 fn render_lean_print(
     form: &str,
     checked: &fln::SourceCheck,
-    engine: &fln::Engine,
+    observations: fln::SourceCommandObservation<'_>,
     printer: &mut fln::pretty::Printer<'_>,
 ) -> Result<String, MultiplexerOutput> {
     let refuse = |what: &str| {
@@ -12128,11 +12127,7 @@ fn render_lean_print(
     let printed = if form == "printAxioms" {
         printer.print_axioms(name)
     } else {
-        let local = match engine.imported_environment() {
-            Some(imported) => !imported.contains(name),
-            None => engine.imported_modules().is_empty(),
-        };
-        if !local {
+        if !observations.is_local_constant(name) {
             return refuse("an imported constant, whose `defeq` and `meta` tags are not decoded,");
         }
         printer.print_constant(name, form == "printSig")
@@ -12149,12 +12144,13 @@ fn source_uses_mixed_lean_commands(source: &[u8]) -> bool {
     fln::partition_source_module(source).is_ok()
 }
 
-fn source_execution_exit_failure(
+fn source_execution_exit_failure<'a>(
     command_index: usize,
-    execution: &fln::DefinitionExecution,
+    execution: impl Into<fln::SourceEvaluationObservation<'a>>,
     presentation: SourcePresentation,
 ) -> Option<MultiplexerOutput> {
-    match &execution.exit {
+    let execution = execution.into();
+    match execution.exit() {
         fln::VmExit::Returned(_) => source_evaluation::check(execution)
             .err()
             .map(|error| error.failure(command_index, presentation)),
@@ -12332,7 +12328,43 @@ fn render_lean_source_commands(
     completed: &fln::SourceCommandBatchExecution,
     sink: WarningSink<'_>,
 ) -> MultiplexerOutput {
-    if completed.execution_command_indices.len() != completed.batch.executions.len() {
+    render_lean_source_observation(completed.observation(), sink)
+}
+
+fn source_observation_failure(
+    completed: fln::SourceCommandObservation<'_>,
+    sink: WarningSink<'_>,
+    command: usize,
+    mut failure: MultiplexerOutput,
+) -> MultiplexerOutput {
+    let prefix = render_lean_source_observation(completed.before_command(command), sink);
+    if prefix.exit_code != 0 {
+        return prefix;
+    }
+    if prefix
+        .stdout
+        .len()
+        .checked_add(failure.stdout.len())
+        .is_none_or(|bytes| bytes > 16 * 1024 * 1024)
+        || failure.stdout.try_reserve(prefix.stdout.len()).is_err()
+    {
+        return source_failure(
+            "resource",
+            "could not retain the bounded source output prefix",
+            false,
+            SourcePresentation::Lean,
+            3,
+        );
+    }
+    failure.stdout.insert_str(0, &prefix.stdout);
+    failure
+}
+
+fn render_lean_source_observation(
+    completed: fln::SourceCommandObservation<'_>,
+    sink: WarningSink<'_>,
+) -> MultiplexerOutput {
+    if completed.execution_command_indices.len() != completed.executions().len() {
         return source_failure(
             "internal-fault",
             "mixed source execution index table did not cover every execution",
@@ -12346,7 +12378,7 @@ fn render_lean_source_commands(
         .execution_command_indices
         .iter()
         .copied()
-        .zip(&completed.batch.executions)
+        .zip(completed.executions())
     {
         if command_index >= completed.command_count
             || previous_execution_command.is_some_and(|previous| previous >= command_index)
@@ -12360,22 +12392,57 @@ fn render_lean_source_commands(
             );
         }
         previous_execution_command = Some(command_index);
-        if let Some(failure) =
+        if let Some(mut failure) =
             source_execution_exit_failure(command_index, execution, SourcePresentation::Lean)
         {
-            if matches!(
-                source_evaluation::check(execution),
-                Err(source_evaluation::Error::Raised { .. })
-            ) {
-                let mut failure = failure;
-                failure.stdout =
-                    match source_evaluation::output_before_failure(&completed.batch.executions) {
-                        Ok(output) => output,
-                        Err(error) => {
-                            return error.failure(command_index, SourcePresentation::Lean);
+            let prefix =
+                render_lean_source_observation(completed.before_command(command_index), sink);
+            if prefix.exit_code != 0 {
+                return prefix;
+            }
+            failure.stdout = prefix.stdout;
+            // A guarded command owns all of its captured messages. In
+            // particular an exception cannot leak its unchecked inner output.
+            if !completed
+                .guards
+                .iter()
+                .any(|guard| guard.command_index == command_index)
+            {
+                let mut budget = source_evaluation::FormattedOutputBudget::new(16 * 1024 * 1024);
+                let mut output = String::new();
+                if !failure.stdout.is_empty()
+                    && let Err(error) = budget.append(&failure.stdout, &mut output, None)
+                {
+                    return error.failure(command_index, SourcePresentation::Lean);
+                }
+                let capture = execution
+                    .evaluation_output()
+                    .filter(|text| !text.is_empty())
+                    .map(Ok)
+                    .or_else(|| {
+                        execution
+                            .captured_stdout()
+                            .filter(|bytes| !bytes.is_empty())
+                            .map(std::str::from_utf8)
+                    });
+                if let Some(capture) = capture {
+                    let text = match capture {
+                        Ok(text) => text,
+                        Err(_) => {
+                            return source_failure(
+                                "internal-fault",
+                                "an evaluation's captured output was not UTF-8",
+                                false,
+                                SourcePresentation::Lean,
+                                4,
+                            );
                         }
                     };
-                return failure;
+                    if let Err(error) = budget.append(text, &mut output, None) {
+                        return error.failure(command_index, SourcePresentation::Lean);
+                    }
+                }
+                failure.stdout = output;
             }
             return failure;
         }
@@ -12390,7 +12457,7 @@ fn render_lean_source_commands(
     // as the pin's `messageToString` renders them and judged below, never printed.
     // Each guard's messages, and whether a `#check` rendering is among them.
     let mut guarded = guard_messages::Guards::new();
-    for guard in &completed.guards {
+    for guard in completed.guards {
         if guard.command_index >= completed.command_count
             || guarded.contains_key(&guard.command_index)
         {
@@ -12427,7 +12494,7 @@ fn render_lean_source_commands(
         Err(failure) => return failure,
     };
     let mut messages = messages.iter().peekable();
-    for output in &completed.outputs {
+    for output in completed.outputs {
         let command_index = match output {
             fln::SourceCommandOutput::Evaluation { command_index, .. }
             | fln::SourceCommandOutput::Check { command_index, .. }
@@ -12461,7 +12528,7 @@ fn render_lean_source_commands(
             fln::SourceCommandOutput::Evaluation {
                 execution_index, ..
             } => {
-                let Some(execution) = completed.batch.executions.get(*execution_index) else {
+                let Some(execution) = completed.execution(*execution_index) else {
                     return source_failure(
                         "internal-fault",
                         "mixed source evaluation index escaped the execution table",
@@ -12476,8 +12543,7 @@ fn render_lean_source_commands(
                     .copied()
                     != Some(command_index)
                     || completed
-                        .batch
-                        .source_evaluation_indices
+                        .evaluation_indices
                         .get(evaluation_output_position)
                         .copied()
                         != Some(*execution_index)
@@ -12547,10 +12613,16 @@ fn render_lean_source_commands(
                         let mut failed = error.failure(command_index, SourcePresentation::Lean);
                         // A captured action that then raised keeps what was printed before it,
                         // its own output included, as the pin's earlier messages stay printed.
-                        if captured.is_some() {
-                            failed.stdout.insert_str(0, &stdout);
+                        if !guarded.contains_key(&command_index)
+                            && let Some(text) = text
+                        {
+                            let mut budget =
+                                source_evaluation::FormattedOutputBudget::new(16 * 1024 * 1024);
+                            if let Err(error) = budget.append(text, &mut failed.stdout, None) {
+                                return error.failure(command_index, SourcePresentation::Lean);
+                            }
                         }
-                        return failed;
+                        return source_observation_failure(completed, sink, command_index, failed);
                     }
                 };
                 match formatted {
@@ -12641,17 +12713,15 @@ fn render_lean_source_commands(
                 }
                 let line = match render_lean_source_check_line(
                     check,
-                    &completed.batch.engine,
+                    completed,
                     // The scope at the `#check`, not at the end of the file: its namespace and
                     // `open`s decide how a constant is named.
-                    &mut fln::pretty::Printer::in_scope(
-                        completed.batch.engine.environment(),
-                        &check.scope,
-                    )
-                    .with_notations(&check.notations),
+                    &mut completed.printer_for(check),
                 ) {
                     Ok(line) => line,
-                    Err(error) => return error,
+                    Err(error) => {
+                        return source_observation_failure(completed, sink, command_index, error);
+                    }
                 };
                 // A guarded `#check` contributes the line this door prints for it.
                 if let Some(guard) = guarded.get_mut(&command_index) {
@@ -12669,7 +12739,7 @@ fn render_lean_source_commands(
     }
     // The pin sorts individual messages before joining and trimming, then applies the
     // selected whitespace and substring policy. No policy changes execution authority.
-    for guard in &completed.guards {
+    for guard in completed.guards {
         let Some(messages) = guarded.remove(&guard.command_index) else {
             return source_failure(
                 "internal-fault",
@@ -12694,33 +12764,43 @@ fn render_lean_source_commands(
             // printer is not proven equal to the pin's in general: a mismatch there may be
             // this rendering, so it is a non-answer, never a rejection.
             if from_check {
-                return source_failure(
-                    "capability",
-                    &format!(
-                        "command {}: `#guard_msgs` over `#check`, a raw goal trace or an expected error produced a \
+                return source_observation_failure(
+                    completed,
+                    sink,
+                    guard.command_index,
+                    source_failure(
+                        "capability",
+                        &format!(
+                            "command {}: `#guard_msgs` over `#check`, a raw goal trace or an expected error produced a \
                          message that differs from the docstring, and this door's goal/`#check`/error rendering \
                          is not proven to be the pin's:\n\n{produced}",
+                            guard.command_index
+                        ),
+                        false,
+                        SourcePresentation::Lean,
+                        CAPABILITY_NOT_IMPLEMENTED_EXIT,
+                    ),
+                );
+            }
+            return source_observation_failure(
+                completed,
+                sink,
+                guard.command_index,
+                source_failure(
+                    "guard-msgs",
+                    &format!(
+                        "command {}: ❌️ Docstring on `#guard_msgs` does not match generated \
+                     message:\n\n{produced}",
                         guard.command_index
                     ),
                     false,
                     SourcePresentation::Lean,
-                    CAPABILITY_NOT_IMPLEMENTED_EXIT,
-                );
-            }
-            return source_failure(
-                "guard-msgs",
-                &format!(
-                    "command {}: ❌️ Docstring on `#guard_msgs` does not match generated \
-                     message:\n\n{produced}",
-                    guard.command_index
+                    1,
                 ),
-                false,
-                SourcePresentation::Lean,
-                1,
             );
         }
     }
-    if evaluation_output_position != completed.batch.source_evaluation_indices.len() {
+    if evaluation_output_position != completed.evaluation_indices.len() {
         return source_failure(
             "internal-fault",
             "mixed source evaluation index had no output row",

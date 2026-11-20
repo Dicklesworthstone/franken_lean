@@ -316,11 +316,17 @@ fn delta_and_guard_expr_fail_where_the_pin_fails() {
         }
         let (code, stdout, stderr) = ours(&lib, &root, name);
         assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+        let reason = reason.strip_prefix("elaboration refused source: ").unwrap();
+        let tag = if reason.starts_with("Unknown identifier ") {
+            "error(lean.unknownIdentifier)"
+        } else {
+            "error"
+        };
         assert!(
-            stderr
-                .trim_end()
-                .ends_with(&format!("refused source: {reason}")),
-            "{name}: {stderr}"
+            stdout.trim_end().ends_with(&format!(": {tag}: {reason}")),
+            "{name}: {stdout}{stderr}"
         );
+        assert!(stdout.starts_with(&format!("{name}:")), "{stdout}");
+        assert!(stderr.is_empty(), "{name}: {stderr}");
     }
 }
