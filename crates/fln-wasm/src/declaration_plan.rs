@@ -30,6 +30,7 @@ pub(super) struct DeclarationPlan {
     pub units: Vec<DeclarationUnit>,
     pub order: Vec<usize>,
     pub already_present: u32,
+    pub repeats: Vec<usize>,
 }
 
 pub(super) enum PlanError {
@@ -216,6 +217,7 @@ pub(super) fn plan_declarations(
     let mut seen = BTreeSet::new();
     let mut by_name = BTreeMap::new();
     let mut already_present = 0u32;
+    let mut repeats = Vec::new();
     let mut recursors: BTreeMap<&WireName, Vec<usize>> = BTreeMap::new();
     let mut compiled: BTreeMap<(u8, &[WireName]), Vec<usize>> = BTreeMap::new();
     let mut quotients = [None; 4];
@@ -226,13 +228,20 @@ pub(super) fn plan_declarations(
         let declaration = entry.declaration();
         if let Some(existing) = environment.find(entry.name()) {
             // Imported rows already passed admission in this module's actual
-            // closure. Reuse only an identical independent reading, including
-            // when a module repeats a subset of an imported atomic family.
+            // closure. Identical readings reuse that authority. Compatible
+            // nonidentical theorem rows keep their original imported binding
+            // and recheck their own proof after all ordinary declarations.
             charge_reading(declaration, &mut work)?;
             charge_reading(existing, &mut work)?;
             let previous = ConstantEntry::new(entry.name().clone(), existing.clone());
             if previous.reading_digest() != entry.reading_digest() {
-                return Err(rejected(entry));
+                if !super::import_repeats::compatible(&previous, entry, &mut work.remaining)
+                    .map_err(PlanError::Inconclusive)?
+                {
+                    return Err(rejected(entry));
+                }
+                push(&mut repeats, index)?;
+                continue;
             }
             already_present = already_present
                 .checked_add(1)
@@ -434,9 +443,11 @@ pub(super) fn plan_declarations(
             ))?;
         return Err(PlanError::Rejected(name.clone()));
     }
+    repeats.sort_by(|&a, &b| entries[a].name().cmp(entries[b].name()));
     Ok(DeclarationPlan {
         units,
         order,
         already_present,
+        repeats,
     })
 }

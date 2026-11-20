@@ -519,6 +519,13 @@ impl ConstantDeclaration {
         self.body.as_ref().map(ConstantBody::value)
     }
 
+    /// The original mutual-name metadata of a body-bearing declaration.
+    /// Import-time theorem repeats preserve this list while checking their
+    /// proof under a fresh scratch identity.
+    pub fn body_mutual(&self) -> Option<&[WireName]> {
+        self.body.as_ref().map(ConstantBody::mutual)
+    }
+
     /// Return the body only when every schema dimension permits delta
     /// reduction in a safe declaration. This keeps callers from forgetting the
     /// common unsafe flag.

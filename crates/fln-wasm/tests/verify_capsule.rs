@@ -7,7 +7,7 @@
 use fln::capsule::{CapsuleLimits, PINNED_EPOCH, SCHEMA_OLEAN_CAPSULE, seal_olean_capsule};
 use fln::{
     AxiomVal, BinderInfo, Budget, ConstantInfo, ConstantVal, ConstructorVal, ContentRoot,
-    DefinitionSafety, DefinitionVal, Expr, InductiveVal, KVMap, Level, Mode, Name,
+    DataValue, DefinitionSafety, DefinitionVal, Expr, InductiveVal, KVMap, Level, Mode, Name,
     OLEAN_ACCEPTED_VERSIONS, OLEAN_PIN_COMMIT, OLEAN_PIN_TAG, OLEAN_REGION_ALIGN,
     OleanModuleImport, OleanModuleInput, OleanModuleWriteInput, OleanWriteBudget, OleanWriteHeader,
     Outcome, QuotKind, QuotVal, RecursorRule, RecursorVal, ReducibilityHints,
@@ -32,6 +32,70 @@ fn n(name: &str) -> Name {
 
 fn b(index: u32) -> Expr {
     Expr::bvar(index).unwrap()
+}
+
+fn identity_theorem(name: &str, binder: &str, style: BinderInfo) -> ConstantInfo {
+    let type_ = Expr::forall_e(
+        n(binder),
+        Expr::sort(Level::zero()),
+        Expr::forall_e(n("proof"), b(0), b(1), BinderInfo::Default),
+        style,
+    );
+    let value = Expr::lam(
+        n(binder),
+        Expr::sort(Level::zero()),
+        Expr::lam(n("proof"), b(0), b(0), BinderInfo::Default),
+        style,
+    );
+    ConstantInfo::Thm(TheoremVal {
+        base: ConstantVal {
+            name: n(name),
+            level_params: vec![],
+            type_,
+        },
+        value,
+        all: vec![n(name)],
+    })
+}
+
+fn alternate_proof(mut info: ConstantInfo) -> ConstantInfo {
+    let ConstantInfo::Thm(theorem) = &mut info else {
+        panic!("theorem fixture");
+    };
+    theorem.value = Expr::app(
+        Expr::lam(
+            n("saved"),
+            theorem.base.type_.clone(),
+            b(0),
+            BinderInfo::Default,
+        ),
+        theorem.value.clone(),
+    );
+    info
+}
+
+fn erased_theorem(info: &ConstantInfo, is_unsafe: bool) -> ConstantInfo {
+    let ConstantInfo::Thm(theorem) = info else {
+        panic!("theorem fixture");
+    };
+    ConstantInfo::Axiom(AxiomVal {
+        base: theorem.base.clone(),
+        is_unsafe,
+    })
+}
+
+fn proof_definition(name: &str, type_: Expr, value: Expr) -> ConstantInfo {
+    ConstantInfo::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: n(name),
+            level_params: vec![],
+            type_,
+        },
+        value,
+        hints: ReducibilityHints::Abbrev,
+        safety: DefinitionSafety::Safe,
+        all: vec![n(name)],
+    })
 }
 
 fn generic_theorem(name: &str, forged: bool) -> ConstantInfo {
@@ -639,6 +703,309 @@ fn imported_identical_declarations_reuse_checked_authority_including_family_subs
         verify_flnpack_capsule(&capsule, VerificationBudget::default()),
         Verdict::Accepted { declarations: 4 }
     );
+}
+
+#[test]
+fn native_sealed_theorem_repeats_recheck_distinct_proofs_and_binder_styles() {
+    let original = identity_theorem("Shared.id", "P", BinderInfo::Default);
+    for repeated in [
+        alternate_proof(original.clone()),
+        identity_theorem("Shared.id", "Q", BinderInfo::Implicit),
+    ] {
+        for imported in [false, true] {
+            let base = encode_module(std::slice::from_ref(&original), &[], 2);
+            let imports = if imported { vec!["Base"] } else { vec![] };
+            let top = encode_module(std::slice::from_ref(&repeated), &imports, 4);
+            let capsule = seal_modules(&[("Base", &base), ("Top", &top)]);
+            assert_eq!(
+                verify_flnpack_capsule(&capsule, VerificationBudget::default()),
+                Verdict::Accepted { declarations: 2 },
+                "imported={imported}"
+            );
+        }
+    }
+
+    // Universe parameters and shared universe nodes use the independent
+    // structural comparison too, rather than a primary Expr equality answer.
+    let original = generic_theorem("Shared.generic", false);
+    let base = encode_module(std::slice::from_ref(&original), &[], 2);
+    let top = encode_module(&[alternate_proof(original)], &["Base"], 4);
+    let capsule = seal_modules(&[("Base", &base), ("Top", &top)]);
+    assert_eq!(
+        verify_flnpack_capsule(&capsule, VerificationBudget::default()),
+        Verdict::Accepted { declarations: 2 }
+    );
+}
+
+#[test]
+fn native_sealed_erased_axiom_repeats_preserve_theorem_checks() {
+    let theorem = identity_theorem("Shared.id", "P", BinderInfo::Default);
+    let erased = erased_theorem(&theorem, false);
+    for (first, repeated) in [(&theorem, &erased), (&erased, &theorem)] {
+        let base = encode_module(std::slice::from_ref(first), &[], 2);
+        let top = encode_module(std::slice::from_ref(repeated), &["Base"], 4);
+        let capsule = seal_modules(&[("Base", &base), ("Top", &top)]);
+        assert_eq!(
+            verify_flnpack_capsule(&capsule, VerificationBudget::default()),
+            Verdict::Accepted { declarations: 2 }
+        );
+    }
+}
+
+#[test]
+fn repeated_theorem_helpers_use_old_imports_and_scratch_names_never_escape() {
+    let original = identity_theorem("Shared.id", "P", BinderInfo::Default);
+    let ConstantInfo::Thm(mut repeated) = original.clone() else {
+        panic!("theorem fixture");
+    };
+    let helper = proof_definition(
+        "Top.helper",
+        repeated.base.type_.clone(),
+        Expr::const_(n("Shared.id"), vec![]),
+    );
+    repeated.value = Expr::const_(n("Top.helper"), vec![]);
+    let collision = simple_axiom("Shared.id._fln_subsumed_repeat");
+    let base = encode_module(&[original], &[], 2);
+    let top = encode_module(
+        &[ConstantInfo::Thm(repeated.clone()), collision, helper],
+        &["Base"],
+        4,
+    );
+    let capsule = seal_modules(&[("Base", &base), ("Top", &top)]);
+    assert_eq!(
+        verify_flnpack_capsule(&capsule, VerificationBudget::default()),
+        Verdict::Accepted { declarations: 4 },
+        "the new proof depends on a local helper which uses the old import"
+    );
+
+    let scratch = Name::num(Name::str(n("Shared.id"), "_fln_subsumed_repeat"), 1);
+    let leak = encode_module(
+        &[proof_definition(
+            "Leak.use",
+            repeated.base.type_,
+            Expr::const_(scratch, vec![]),
+        )],
+        &["Top"],
+        6,
+    );
+    let capsule = untrusted_module_capsule(
+        &[("Base", &base, 1), ("Top", &top, 3), ("Leak", &leak, 1)],
+        ObjectRequirementV1::Required,
+    );
+    assert_eq!(
+        verify_flnpack_capsule(&capsule, VerificationBudget::default()),
+        Verdict::Rejected {
+            first_rejection: n("Leak.use"),
+            rejection_count: 1
+        },
+        "the collision-free checking identity must not enter an import snapshot"
+    );
+}
+
+#[test]
+fn forged_theorem_repeats_are_rejected_in_each_actual_import_closure() {
+    let original = identity_theorem("Shared.id", "P", BinderInfo::Default);
+    let ConstantInfo::Thm(mut forged) = original.clone() else {
+        panic!("theorem fixture");
+    };
+    // This closed, well-formed term applies Prop as a function. Inference
+    // refuses it with FunctionExpected, independently of the repeat signature.
+    forged.value = Expr::app(Expr::sort(Level::zero()), Expr::sort(Level::zero()));
+    let base = encode_module(std::slice::from_ref(&original), &[], 2);
+    for imported in [false, true] {
+        let imports = if imported { vec!["Base"] } else { vec![] };
+        let top = encode_module(&[ConstantInfo::Thm(forged.clone())], &imports, 4);
+        let capsule = untrusted_module_capsule(
+            &[("Base", &base, 1), ("Top", &top, 1)],
+            ObjectRequirementV1::Required,
+        );
+        assert_eq!(
+            verify_flnpack_capsule(&capsule, VerificationBudget::default()),
+            Verdict::Rejected {
+                first_rejection: n("Shared.id"),
+                rejection_count: 1
+            },
+            "imported={imported}; report the original name, never its scratch name"
+        );
+
+        // A loose bound variable is a different checker contract: malformed
+        // inference input currently yields an internal fault, never rejection.
+        let mut malformed = forged.clone();
+        malformed.value = b(0);
+        let top = encode_module(&[ConstantInfo::Thm(malformed)], &imports, 4);
+        let capsule = untrusted_module_capsule(
+            &[("Base", &base, 1), ("Top", &top, 1)],
+            ObjectRequirementV1::Required,
+        );
+        assert!(matches!(
+            verify_flnpack_capsule(&capsule, VerificationBudget::default()),
+            Verdict::Inconclusive { verified_so_far: 1, reason }
+                if reason.contains("LooseBoundVariables")
+        ));
+    }
+
+    let ConstantInfo::Thm(mut borrowed) = original.clone() else {
+        panic!("theorem fixture");
+    };
+    let hidden = proof_definition(
+        "Base.hidden",
+        borrowed.base.type_.clone(),
+        borrowed.value.clone(),
+    );
+    borrowed.value = Expr::const_(n("Base.hidden"), vec![]);
+    let base = encode_module(&[original, hidden], &[], 2);
+    let top = encode_module(&[ConstantInfo::Thm(borrowed)], &[], 4);
+    let capsule = untrusted_module_capsule(
+        &[("Base", &base, 2), ("Top", &top, 1)],
+        ObjectRequirementV1::Required,
+    );
+    assert_eq!(
+        verify_flnpack_capsule(&capsule, VerificationBudget::default()),
+        Verdict::Rejected {
+            first_rejection: n("Shared.id"),
+            rejection_count: 1
+        },
+        "compatible global signatures do not import a sibling's proof dependencies"
+    );
+}
+
+#[test]
+fn nonidentical_repeat_headers_preserve_metadata_safety_and_definition_conflicts() {
+    let original = identity_theorem("Shared.id", "P", BinderInfo::Default);
+    let ConstantInfo::Thm(theorem) = &original else {
+        panic!("theorem fixture");
+    };
+    let mut cases = Vec::new();
+    let mut changed = theorem.clone();
+    changed.base.type_ = Expr::sort(Level::zero());
+    cases.push((original.clone(), ConstantInfo::Thm(changed), "statement"));
+    let mut changed = theorem.clone();
+    changed.base.level_params.push(n("u"));
+    cases.push((
+        original.clone(),
+        ConstantInfo::Thm(changed),
+        "level parameters",
+    ));
+    let mut changed = theorem.clone();
+    changed.all = vec![n("Other.theorem")];
+    cases.push((
+        original.clone(),
+        ConstantInfo::Thm(changed),
+        "mutual metadata",
+    ));
+    cases.push((
+        original.clone(),
+        erased_theorem(&original, true),
+        "unsafe axiom",
+    ));
+
+    let mut left = theorem.clone();
+    left.base.type_ = Expr::let_e(
+        n("unused"),
+        Expr::sort(Level::zero()),
+        theorem.base.type_.clone(),
+        theorem.base.type_.clone(),
+        false,
+    );
+    let mut right = theorem.clone();
+    right.base.type_ = Expr::let_e(
+        n("unused"),
+        Expr::sort(Level::zero()),
+        theorem.base.type_.clone(),
+        theorem.base.type_.clone(),
+        true,
+    );
+    cases.push((
+        ConstantInfo::Thm(left),
+        ConstantInfo::Thm(right),
+        "let non-dependence",
+    ));
+
+    let mut left = theorem.clone();
+    let mut right = theorem.clone();
+    let mut first_metadata = KVMap::new();
+    first_metadata.insert(n("repeat.flag"), DataValue::OfBool(false));
+    let mut second_metadata = KVMap::new();
+    second_metadata.insert(n("repeat.flag"), DataValue::OfBool(true));
+    left.base.type_ = Expr::mdata(first_metadata, theorem.base.type_.clone());
+    right.base.type_ = Expr::mdata(second_metadata, theorem.base.type_.clone());
+    cases.push((
+        ConstantInfo::Thm(left),
+        ConstantInfo::Thm(right),
+        "statement metadata",
+    ));
+
+    let ConstantInfo::Thm(alternate) = alternate_proof(original.clone()) else {
+        panic!("theorem fixture");
+    };
+    cases.push((
+        proof_definition(
+            "Shared.id",
+            theorem.base.type_.clone(),
+            theorem.value.clone(),
+        ),
+        proof_definition("Shared.id", alternate.base.type_, alternate.value),
+        "different definition bodies",
+    ));
+    for (first, repeated, label) in cases {
+        let base = encode_module(&[first], &[], 2);
+        let top = encode_module(&[repeated], &["Base"], 4);
+        let capsule = untrusted_module_capsule(
+            &[("Base", &base, 1), ("Top", &top, 1)],
+            ObjectRequirementV1::Required,
+        );
+        assert!(
+            matches!(
+                verify_flnpack_capsule(&capsule, VerificationBudget::default()),
+                Verdict::Malformed(CapsuleError::ModuleGraph(_))
+            ),
+            "must preserve {label}"
+        );
+    }
+}
+
+#[test]
+fn repeated_theorem_comparison_and_fresh_name_generation_are_bounded() {
+    let original = identity_theorem("Shared.id", "P", BinderInfo::Default);
+    let mut rows = vec![original.clone()];
+    let stem = Name::str(n("Shared.id"), "_fln_subsumed_repeat");
+    for suffix in 0..12 {
+        let name = if suffix == 0 {
+            stem.clone()
+        } else {
+            Name::num(stem.clone(), suffix)
+        };
+        let mut collision = simple_axiom("unused");
+        let ConstantInfo::Axiom(value) = &mut collision else {
+            panic!("axiom fixture");
+        };
+        value.base.name = name;
+        rows.push(collision);
+    }
+    let base = encode_module(&rows, &[], 2);
+    let top = encode_module(&[alternate_proof(original)], &["Base"], 4);
+    let capsule = seal_modules(&[("Base", &base), ("Top", &top)]);
+    assert_eq!(
+        verify_flnpack_capsule(&capsule, VerificationBudget::default()),
+        Verdict::Accepted { declarations: 14 }
+    );
+    for max_steps in [0, 1] {
+        assert!(matches!(
+            verify_flnpack_capsule(
+                &capsule,
+                VerificationBudget {
+                    max_steps,
+                    ..VerificationBudget::default()
+                }
+            ),
+            Verdict::Inconclusive { .. }
+        ));
+    }
+    assert!(matches!(
+        verify_flnpack_capsule(&capsule, VerificationBudget { max_steps: 256, ..VerificationBudget::default() }),
+        Verdict::Inconclusive { verified_so_far: 13, reason }
+            if reason == "import repeat comparison budget exhausted"
+    ));
 }
 
 #[test]

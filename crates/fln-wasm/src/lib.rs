@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 mod declaration_plan;
+mod import_repeats;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -181,8 +182,9 @@ pub struct VerificationBudget {
     pub max_declarations: u32,
     /// Maximum payload bytes to decode/expand.
     pub max_payload_bytes: u64,
-    /// Maximum checker reduction/inference steps per declaration, and maximum
-    /// declaration-planning presentations per module.
+    /// Maximum checker reduction/inference steps per declaration. Also bounds
+    /// each planning/import-comparison pass per module and scratch-name
+    /// preparation per repeated theorem.
     pub max_steps: u64,
 }
 
@@ -439,6 +441,8 @@ fn decode_module_parts(parts: &[&[u8]], max_objects: u64) -> Result<OleanReading
 ///
 /// Requires a valid semantic profile; legacy integrity-only capsules return
 /// `Verdict::Malformed(CapsuleError::Truncated)`.
+/// Compatible theorem repeats are independently rechecked without replacing
+/// their imported binding. Nonidentical axiom/axiom subsumption remains unsupported.
 pub fn verify_flnpack_capsule(bytes: &[u8], budget: VerificationBudget) -> Verdict {
     if bytes.len() as u64 > budget.max_payload_bytes {
         return Verdict::Inconclusive {
@@ -709,21 +713,29 @@ pub fn verify_olean_parts(parts: &[&[u8]], budget: VerificationBudget) -> Verdic
 /// dependency order. Resolve the independently decoded imports before checking,
 /// then give each module exactly its own transitive import environment.
 fn check_module_closure(modules: &[DecodedModule], budget: VerificationBudget) -> Verdict {
-    // A capsule claims one final environment. Independently valid, disjoint
-    // modules with different declarations under the same name cannot inhabit
-    // that environment, even when neither imports the other.
-    let mut global_names = BTreeMap::new();
+    // A capsule claims one final environment. Exact repeats and compatible
+    // theorem/erased-axiom signatures may coexist, but every new proof must
+    // still be admitted in its own module's actual import closure below.
+    let mut global_names: BTreeMap<_, (&ConstantEntry, Digest)> = BTreeMap::new();
     for module in modules {
+        let mut comparison_work = budget.max_steps;
         for entry in &module.constants {
             let digest = entry.reading_digest();
-            if global_names
-                .insert(entry.name(), digest)
-                .is_some_and(|previous| previous != digest)
-            {
-                return Verdict::Malformed(CapsuleError::ModuleGraph(format!(
-                    "conflicting declaration {} across capsule modules",
-                    wire_name_to_core(entry.name()).to_display_string()
-                )));
+            if let Some((previous, previous_digest)) = global_names.get(entry.name()) {
+                if *previous_digest != digest {
+                    match import_repeats::compatible(previous, entry, &mut comparison_work) {
+                        Ok(true) => {}
+                        Ok(false) => return conflicting_declaration(entry),
+                        Err(reason) => {
+                            return Verdict::Inconclusive {
+                                verified_so_far: 0,
+                                reason: reason.to_owned(),
+                            };
+                        }
+                    }
+                }
+            } else {
+                global_names.insert(entry.name(), (entry, digest));
             }
         }
     }
@@ -775,6 +787,7 @@ fn check_module_closure(modules: &[DecodedModule], budget: VerificationBudget) -
     let mut import_work = 0u64;
     let mut admitted: Vec<Option<ConstantEnvironment>> = vec![None; modules.len()];
     for index in order {
+        let mut comparison_work = budget.max_steps;
         // Start from the largest already checked direct import. Persistent
         // snapshots make a single-parent chain an O(1) clone per module, not
         // repeated validation of its entire transitive closure. Other direct
@@ -809,9 +822,34 @@ fn check_module_closure(modules: &[DecodedModule], budget: VerificationBudget) -
                         reason: "import environment presentation budget exhausted".to_owned(),
                     };
                 }
-                // Global name/digest validation above already proves that a
-                // shared imported name has identical content in every module.
-                if env.find(name).is_none() {
+                if let Some(existing) = env.find(name) {
+                    // Shared import snapshots have shared term/name storage.
+                    // Preserve their equality shortcut before cloning or
+                    // hashing a common ancestor's complete proof reading.
+                    if existing != declaration {
+                        let previous = ConstantEntry::new(name.clone(), existing.clone());
+                        let entry = ConstantEntry::new(name.clone(), declaration.clone());
+                        if previous.reading_digest() != entry.reading_digest() {
+                            match import_repeats::compatible(
+                                &previous,
+                                &entry,
+                                &mut comparison_work,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => return conflicting_declaration(&entry),
+                                Err(reason) => {
+                                    return Verdict::Inconclusive {
+                                        verified_so_far: verified,
+                                        reason: reason.to_owned(),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    // Both imported variants were independently admitted in
+                    // their original closures. Retain the deterministic first
+                    // representative, as native import merging does.
+                } else {
                     let entry = ConstantEntry::new(name.clone(), declaration.clone());
                     env = match extend_env(&env, &entry, env_budget, verified) {
                         Ok(next) => next,
@@ -831,6 +869,13 @@ fn check_module_closure(modules: &[DecodedModule], budget: VerificationBudget) -
     Verdict::Accepted {
         declarations: verified,
     }
+}
+
+fn conflicting_declaration(entry: &ConstantEntry) -> Verdict {
+    Verdict::Malformed(CapsuleError::ModuleGraph(format!(
+        "conflicting declaration {} across capsule modules",
+        wire_name_to_core(entry.name()).to_display_string()
+    )))
 }
 
 fn missing_import_snapshot(verified: u32) -> Verdict {
@@ -992,6 +1037,51 @@ fn check_constant_stream_in(
             }
             verified = verified.saturating_add(1);
         }
+    }
+
+    // Repeats are intentionally absent from the local dependency owners. A
+    // helper can refer to the already checked imported theorem, while a new
+    // proof of that theorem can refer to the helper without a false cycle.
+    for index in plan.repeats {
+        let entry = &entries[index];
+        if entry.declaration().kind() == ConstantKind::Theorem {
+            let fresh = match import_repeats::fresh_theorem(entry, env, budget.max_steps) {
+                Ok(fresh) => fresh,
+                Err(reason) => {
+                    return Verdict::Inconclusive {
+                        verified_so_far: verified,
+                        reason: reason.to_owned(),
+                    };
+                }
+            };
+            let stopped = |reason| Verdict::Inconclusive {
+                verified_so_far: verified,
+                reason,
+            };
+            match admit(env, &fresh, admission_budget) {
+                CheckerVerdict::Admitted(_) => {}
+                CheckerVerdict::Rejected(_) => {
+                    return Verdict::Rejected {
+                        first_rejection: wire_name_to_core(entry.name()),
+                        rejection_count: 1,
+                    };
+                }
+                CheckerVerdict::Deferred(reason) => {
+                    return stopped(format!("repeated theorem deferred: {reason:?}"));
+                }
+                CheckerVerdict::Inconclusive(stop) => {
+                    return stopped(format!(
+                        "repeated theorem admission budget exhausted: {stop:?}"
+                    ));
+                }
+                CheckerVerdict::InternalFault(fault) => {
+                    return stopped(format!("repeated theorem admission fault: {fault:?}"));
+                }
+            }
+        }
+        // Compatible erased axioms carry no body to recheck. Neither kind
+        // replaces the imported binding or publishes a scratch declaration.
+        verified = verified.saturating_add(1);
     }
 
     Verdict::Accepted {
