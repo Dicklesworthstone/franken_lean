@@ -12,8 +12,9 @@
 //!
 //! Every program was run through the pinned `lean` v4.32.0 with the same header first
 //! (2026-10-23), and is compared with the pinned binary's output again when that is present.
-//! FrankenLean refuses a whole command where the pin reports an error inside it, so a refusal is
-//! compared by the command it names, not by the pin's message.
+//! FrankenLean retains the command start when an elaboration error has no token span. Those
+//! refusals are compared by that source position and their typed reason; the pinned first
+//! token position remains recorded separately.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -160,7 +161,7 @@ const REFUSALS: &[(&str, &str, &str, &str)] = &[
 import Init.Core
 example (a b : Nat) (h : a = b) : b = a := Eq.symm ..
 ",
-        "command 0, byte 25:",
+        "3:0: error:",
         "left 1 unresolved metavariables",
         "3:43: error: don't know how to synthesize implicit argument `h`",
     ),
@@ -169,7 +170,7 @@ example (a b : Nat) (h : a = b) : b = a := Eq.symm ..
 import Init.Core
 theorem t (a b : Nat) : a = b → b = a := Eq.symm ..
 ",
-        "command 0, byte 25:",
+        "3:0: error:",
         "",
         "3:41: error: Type mismatch",
     ),
@@ -179,7 +180,7 @@ import Init.Core
 theorem pick (a : Nat) (_b : Nat := 7) : a = a := rfl
 theorem p1 : (3 : Nat) = 3 := @pick ..
 ",
-        "command 1, byte 79:",
+        "4:0: error:",
         "left 1 unresolved metavariables",
         "4:30: error: don't know how to synthesize implicit argument `_b`",
     ),
@@ -190,7 +191,7 @@ def h : List Nat → Nat
   | List.cons _ _ _ .. => 0
   | .nil => 1
 ",
-        "command 0, byte 25:",
+        "3:0: error:",
         "constructor pattern has the wrong number of explicit fields",
         "4:4: error: Invalid pattern: Too many arguments to `List.cons`; expected 2 explicit \
          arguments",
@@ -202,7 +203,7 @@ def h : List Nat → Nat
   | .cons _ _ _ .. => 0
   | .nil => 1
 ",
-        "command 0, byte 25:",
+        "3:0: error:",
         "constructor pattern has the wrong number of explicit fields",
         "4:4: error: Function expected at",
     ),
@@ -212,7 +213,7 @@ import Init.Core
 def two (a : Nat) (_b : Bool) : Nat := a
 theorem p : two .. 1 = 1 := rfl
 ",
-        "command 1, byte 66:",
+        "4:0: error:",
         "requires a function type",
         "4:16: error: unexpected '..'",
     ),
@@ -222,7 +223,7 @@ import Init.Core
 def si ⦃n : Nat⦄ (_h : n = n) : Nat := n
 example : Nat := (si .. : Nat)
 ",
-        "command 1, byte 70:",
+        "4:0: error:",
         "Type mismatch",
         "4:17: error: Type mismatch",
     ),
@@ -231,7 +232,7 @@ example : Nat := (si .. : Nat)
 import Init.Core
 example : Nat := id ..
 ",
-        "command 0, byte 25:",
+        "3:0: error:",
         "left 1 unresolved metavariables",
         "3:17: error: don't know how to synthesize implicit argument `a`",
     ),
@@ -242,7 +243,7 @@ def P (n : Nat) : Prop := n = n
 theorem P.mk' (_h : P 0) : True := trivial
 example (h : ∀ ⦃n : Nat⦄, P n) : True := h.mk' ..
 ",
-        "command 2, byte 100:",
+        "5:0: error:",
         "unknown record field mk'",
         "5:43: error(lean.invalidField): Invalid field `mk'`: The environment does not contain \
          `Function.mk'`",
@@ -353,9 +354,10 @@ fn an_ellipsis_the_pin_refuses_is_refused_at_its_command() {
         let (code, stdout, stderr) = ours(&lib, &root, program);
         assert_ne!(code, Some(0), "accepted {program}stdout: {stdout}");
         assert!(
-            stderr.contains(command) && stderr.contains(reason),
-            "{program}stderr: {stderr}"
+            stdout.contains(command) && stdout.contains(reason),
+            "{program}stdout: {stdout}\nstderr: {stderr}"
         );
+        assert!(stderr.is_empty(), "{program}stderr: {stderr}");
         if let Some((code, stdout)) = pinned(&lib, &root.join("Ellipsis.lean")) {
             assert_eq!(code, 1, "the pin moved on {program}");
             assert!(

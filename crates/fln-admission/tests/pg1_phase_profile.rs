@@ -173,7 +173,7 @@ fn profile_module_against_base(
         );
         let k1_dur = tk.elapsed();
         let k1_steps = match k1_outcome {
-            Outcome::Complete(Verdict::Accepted { consumption }) => consumption.steps,
+            Outcome::Complete(Verdict::Accepted { consumption }) => consumption.steps_used,
             other => panic!("K1 did not accept {unit_name}: {other:?}"),
         };
 

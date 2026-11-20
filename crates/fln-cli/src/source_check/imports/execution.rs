@@ -140,9 +140,12 @@ fn module_failure(
     display: &str,
 ) -> MultiplexerOutput {
     let (class, authority, exit) = error.disposition();
-    // A frontend's token position is lost if the typed error is flattened into
-    // Failure first. Only the entry's own source can locate it here; imported
-    // modules and nonanswers retain their ordinary typed failure presentation.
+    // Lean logs source diagnostics on stdout, using a one-based line and a
+    // zero-based Unicode codepoint column. Preserve the typed frontend until
+    // after locating it: flattening it first loses both the diagnostic name
+    // and its token position. Errors without a token location use the known
+    // command start; unsupported syntax and other nonanswers keep their
+    // distinct operational failure presentation.
     if matches!(presentation, Presentation::Lean)
         && class == "elaboration"
         && let fln::source_check::modules::SourceModuleCheckError::Source {
@@ -155,35 +158,28 @@ fn module_failure(
                 },
         } = &error
         && module == entry
-        && let fln::EngineExecutionError::Frontend(frontend) = cause.as_ref()
+        && let Some((at, tag, message)) =
+            cause.lean_source_diagnostic(fln_parse::BytePos(*command_start))
     {
-        if let Some((tag, message)) = cause.lean_diagnostic() {
-            let position = frontend
-                .primary_offset()
-                .and_then(|relative| command_start.checked_add(relative.0))
-                .and_then(|offset| crate::source_position_at(source, offset))
-                .or_else(|| crate::source_position_at(source, *command_start));
-            if let Some(position) = position {
-                return MultiplexerOutput::failure(
-                    format!(
-                        "{display}:{}:{}: {tag}: {message}\n",
-                        position.line, position.column
-                    ),
-                    exit,
-                );
-            }
-        }
-        if let Some(relative) = frontend.primary_offset()
-            && let Some(offset) = command_start.checked_add(relative.0)
-            && let Some(position) = crate::source_position_at(source, offset)
-        {
-            return MultiplexerOutput::failure(
-                format!(
-                    "{display}:{}:{}: error: {cause}\n",
-                    position.line, position.column
+        let position = crate::source_position_at(source, at.0)
+            .or_else(|| crate::source_position_at(source, *command_start));
+        if let Some(position) = position {
+            let message = BoundedText::new(message);
+            return MultiplexerOutput {
+                stdout: format!(
+                    "{display}:{}:{}: {tag}: {}{}\n",
+                    position.line,
+                    position.column,
+                    message.text(),
+                    if message.truncated() {
+                        " [detail truncated]"
+                    } else {
+                        ""
+                    },
                 ),
-                exit,
-            );
+                stderr: String::new(),
+                exit_code: exit,
+            };
         }
     }
     failure(
