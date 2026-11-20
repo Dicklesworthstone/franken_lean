@@ -606,8 +606,8 @@ fn fln_5efd_semireducible_ofnat_diagnostics_match_reference_pin() {
             .output()
             .expect("run FrankenLean lean on fln-5efd rejected fixture");
         assert_eq!(fln_out.status.code(), Some(1), "{rejected}: {fln_out:?}");
-        assert!(fln_out.stdout.is_empty(), "{rejected}: {fln_out:?}");
-        let fln_diag = String::from_utf8_lossy(&fln_out.stderr);
+        assert!(fln_out.stderr.is_empty(), "{rejected}: {fln_out:?}");
+        let fln_diag = String::from_utf8_lossy(&fln_out.stdout);
         assert_eq!(
             fln_diag, ref_diag,
             "{rejected}: FrankenLean diagnostic text diverged from pinned Reference lean"

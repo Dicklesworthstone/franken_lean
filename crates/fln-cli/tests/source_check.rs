@@ -54,6 +54,46 @@ fn run(args: Vec<OsString>) -> fln_cli::MultiplexerOutput {
     fln_cli::run(args)
 }
 
+#[test]
+fn lean_source_diagnostics_use_stdout_and_keep_nonanswers_distinct() {
+    // No installed toolchain or synthetic source seed is needed for this
+    // unknown-name refusal. The error carries no token span, so its location
+    // is the known command start, including after Unicode and CRLF text.
+    for source in [
+        "prelude\naxiom α : Type\n  #check Missing\n",
+        "prelude\r\naxiom α : Type\r\n  #check Missing\r\n",
+    ] {
+        let path = file(source);
+        let expected = ":3:2: error(lean.unknownIdentifier): Unknown identifier `Missing`\n";
+        let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("{}{expected}", path.display()),
+        );
+        assert!(output.stderr.is_empty(), "{output:?}");
+
+        let mut input = std::io::Cursor::new(source.as_bytes());
+        let stdin = fln_cli::run_lean_with_input([OsString::from("--stdin")], &mut input);
+        assert_eq!(stdin.exit_code, 1, "{stdin:?}");
+        assert_eq!(stdin.stdout, format!("<stdin>{expected}"));
+        assert!(stdin.stderr.is_empty(), "{stdin:?}");
+
+        let mut input = std::io::Cursor::new(source.as_bytes());
+        let limited = fln_cli::run_lean_with_input(
+            [OsString::from("--stdin"), OsString::from("--max-bytes=1")],
+            &mut input,
+        );
+        assert_eq!(limited.exit_code, 3, "{limited:?}");
+        assert!(limited.stdout.is_empty(), "{limited:?}");
+        assert!(limited.stderr.starts_with("lean: resource:"), "{limited:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+    }
+}
+
 /// A false `by rfl` is refused while elaborating the command at `at`, as at the
 /// pin ("Tactic `rfl` failed: The left-hand side … is not definitionally equal to
 /// the right-hand side"), and is never left for the kernel to reject.
@@ -2601,6 +2641,16 @@ fn installed_refinement_final_unification_agrees_with_the_pin() {
             1,
             true,
         ),
+        (
+            "prelude\nimport Init.Tactics\nexample (α : Type) (x : α) : α := by refine x; exact x\n",
+            1,
+            true,
+        ),
+        (
+            "prelude\r\nimport Init.Tactics\r\nexample (α : Type) (x : α) : α := by refine x; exact x\r\n",
+            1,
+            true,
+        ),
         ("theorem bad (n : Nat) : n = n := Eq.refl ?_", 1, false),
         (
             "theorem bad (n m : Nat) : n = m := by exact Eq.refl ?_",
@@ -2615,9 +2665,9 @@ fn installed_refinement_final_unification_agrees_with_the_pin() {
         let name = format!("case{index}.lean");
         let source_path = root.join(&name);
         std::fs::write(&source_path, source).unwrap();
-        for (mut command, oracle) in [
-            (Command::new(&pinned), true),
-            (Command::new(env!("CARGO_BIN_EXE_lean")), false),
+        for mut command in [
+            Command::new(&pinned),
+            Command::new(env!("CARGO_BIN_EXE_lean")),
         ] {
             let executable = command.get_program().to_owned();
             let output = command
@@ -2645,17 +2695,12 @@ fn installed_refinement_final_unification_agrees_with_the_pin() {
                 let before = &source[..source.find("exact ").unwrap()];
                 let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
                 let column = before.rsplit('\n').next().unwrap().chars().count();
-                let diagnostic = if oracle { &stdout } else { &stderr };
                 assert!(
-                    diagnostic.starts_with(&format!("{name}:{line}:{column}:")),
+                    stdout.starts_with(&format!("{name}:{line}:{column}:")),
                     "wrong first error position: {stdout}{stderr}"
                 );
-                let message = if oracle {
-                    "No goals to be solved"
-                } else {
-                    "tactic has no remaining goal"
-                };
-                assert!(diagnostic.contains(message), "{stdout}{stderr}");
+                assert!(stdout.contains("No goals to be solved"), "{stdout}{stderr}");
+                assert!(stderr.is_empty(), "{stdout}{stderr}");
             }
             assert_eq!(std::fs::read(&source_path).unwrap(), source.as_bytes());
         }

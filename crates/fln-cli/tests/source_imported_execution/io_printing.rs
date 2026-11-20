@@ -254,12 +254,17 @@ set_option eval.derive.repr false in
     );
     let refused = lean_io(&workspace, &malformed, &lib);
     assert_eq!(refused.code, 1, "{refused:?}");
-    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(refused.stderr.is_empty(), "{refused:?}");
     assert!(
-        refused.stderr.starts_with("lean: elaboration: "),
+        refused
+            .stdout
+            .starts_with(&format!("{}:", malformed.display())),
         "{refused:?}"
     );
-    assert!(refused.stderr.contains("Type mismatch"), "{refused:?}");
+    assert!(
+        refused.stdout.contains(": error: Type mismatch"),
+        "{refused:?}"
+    );
 
     // An action's output is a message of its own, as the pin's `#eval` logs it from inside
     // `withIsolatedStreams`: printed where the command is (after an earlier command's

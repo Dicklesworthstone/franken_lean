@@ -143,9 +143,21 @@ pub struct OleanReader<'a> {
     level_memo: HashMap<u64, LevelId>,
 }
 
-/// The constants one artifact chain declares, as the checker reads them.
+/// One direct import, read independently from `Lean.Import` (`Lean/Setup.lean`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OleanImport {
+    pub module: WireName,
+    pub import_all: bool,
+    pub is_exported: bool,
+    pub is_meta: bool,
+}
+
+/// The module header and constants one artifact chain declares, as the checker
+/// reads them. Import closure is part of the artifact, not caller-supplied trust.
 #[derive(Debug, Clone)]
 pub struct OleanReading {
+    pub is_module: bool,
+    pub imports: Vec<OleanImport>,
     pub constants: Vec<ConstantEntry>,
 }
 
@@ -190,6 +202,26 @@ impl<'a> OleanReader<'a> {
             names: HashMap::new(),
             expr_memo: HashMap::new(),
             level_memo: HashMap::new(),
+        })
+    }
+
+    /// Check the identity of every supplied part before interpreting its data.
+    /// The format reader itself remains independent of a particular compiler
+    /// epoch. A verification door supplies its pin here, including the GMP flag.
+    /// Both fixed strings must match with canonical zero padding, as laid out
+    /// in `module.cpp`'s `olean_header` and generated `OLEAN_CONTRACT.md` §1.
+    pub fn headers_match(&self, flags: u8, lean_version: &str, githash: &str) -> bool {
+        let padded_matches = |bytes: &[u8], expected: &str| {
+            bytes.starts_with(expected.as_bytes())
+                && bytes[expected.len()..].iter().all(|byte| *byte == 0)
+        };
+        let version_start = MAGIC.len() + 2;
+        let hash_start = BASE_ADDR_AT - 40;
+        self.parts.iter().all(|part| {
+            part.bytes[MAGIC.len()] == self.parts[0].bytes[MAGIC.len()]
+                && part.bytes[MAGIC.len() + 1] == flags
+                && padded_matches(&part.bytes[version_start..hash_start], lean_version)
+                && padded_matches(&part.bytes[hash_start..BASE_ADDR_AT], githash)
         })
     }
 
@@ -569,13 +601,28 @@ impl<'a> OleanReader<'a> {
         // ModuleData: imports, constNames, constants, extraConstNames, entries;
         // then the isModule byte (Environment.lean:109).
         let module = self.constructor(root, 0, 5, "ModuleData")?;
+        let is_module = self.bool(module, 5, 0, "ModuleData.isModule")?;
+        let mut imports = Vec::new();
+        for import in self.array(self.field(module, 0)?)? {
+            let at = self.constructor(import, 0, 1, "Import")?;
+            imports.push(OleanImport {
+                module: self.name(self.field(at, 0)?)?,
+                import_all: self.bool(at, 1, 0, "Import.importAll")?,
+                is_exported: self.bool(at, 1, 1, "Import.isExported")?,
+                is_meta: self.bool(at, 1, 2, "Import.isMeta")?,
+            });
+        }
         let constants = self.field(module, 2)?;
         let mut entries = Vec::new();
         for info in self.array(constants)? {
             self.visited = 0;
             entries.push(self.constant(info)?);
         }
-        Ok(OleanReading { constants: entries })
+        Ok(OleanReading {
+            is_module,
+            imports,
+            constants: entries,
+        })
     }
 
     /// One `ConstantInfo`: a tag-per-kind wrapper around its value structure
@@ -1266,11 +1313,66 @@ mod tests {
     #[test]
     fn an_axiom_in_a_hand_assembled_region_reads_as_the_format_says() {
         let reading = read_constants(&[&axioms(&["A"], 0)], 1_000).expect("the region reads");
+        assert!(!reading.is_module);
+        assert!(reading.imports.is_empty());
         assert_eq!(reading.constants.len(), 1);
         assert_eq!(
             reading.constants[0].reading_digest(),
             expected_axiom("A", ConstantSafety::Safe).reading_digest()
         );
+    }
+
+    fn module_with_import(import_flags: [u8; 3], is_module: u8) -> Vec<u8> {
+        let mut region = Region::new();
+        let text = region.string("Dependency");
+        let name = region.ctor(1, &[boxed(0), text], &0_u64.to_le_bytes());
+        let import = region.ctor(0, &[name], &import_flags);
+        let imports = region.array(&[import]);
+        let empty = region.array(&[]);
+        let module = region.ctor(0, &[imports, empty, empty, empty, empty], &[is_module]);
+        region.finish(module)
+    }
+
+    #[test]
+    fn module_imports_are_independently_read_with_their_flags() {
+        let bytes = module_with_import([1, 0, 1], 1);
+        let reading = read_constants(&[&bytes], 100).expect("module header reads");
+        assert!(reading.is_module);
+        assert!(reading.constants.is_empty());
+        assert_eq!(
+            reading.imports,
+            vec![OleanImport {
+                module: WireName::from_parts(vec![NamePart::Text("Dependency".to_owned())]),
+                import_all: true,
+                is_exported: false,
+                is_meta: true,
+            }]
+        );
+        assert!(matches!(
+            read_constants(&[&bytes], 2),
+            Err(OleanReadError::Budget { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_module_and_import_flags_are_refused() {
+        for (flags, expected) in [
+            ([2, 0, 0], "Import.importAll"),
+            ([0, 2, 0], "Import.isExported"),
+            ([0, 0, 2], "Import.isMeta"),
+        ] {
+            assert!(matches!(
+                read_constants(&[&module_with_import(flags, 1)], 100),
+                Err(OleanReadError::Shape { what, .. }) if what == expected
+            ));
+        }
+        assert!(matches!(
+            read_constants(&[&module_with_import([0, 1, 0], 2)], 100),
+            Err(OleanReadError::Shape {
+                what: "ModuleData.isModule",
+                ..
+            })
+        ));
     }
 
     #[test]

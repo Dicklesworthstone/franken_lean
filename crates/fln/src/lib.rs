@@ -9249,6 +9249,54 @@ impl EngineExecutionError {
             _ => None,
         }
     }
+
+    /// A frontend diagnostic's file byte position, Lean severity tag and body.
+    ///
+    /// `command_start` is the original file offset of the command slice. Parse
+    /// refusals have already been rebased into that file; elaborator positions
+    /// are relative to the slice. When the error carries no token position,
+    /// the known command start is retained instead of guessing at an occurrence
+    /// of a name in the source. This is presentation only: callers must retain
+    /// the typed error's disposition, including capability and resource stops.
+    pub fn lean_source_diagnostic(
+        &self,
+        command_start: fln_parse::BytePos,
+    ) -> Option<(fln_parse::BytePos, &'static str, String)> {
+        let frontend = match self {
+            Self::BatchCommand { error, at, .. } => {
+                return error.lean_source_diagnostic(at.unwrap_or(command_start));
+            }
+            Self::Frontend(frontend) => frontend,
+            _ => return None,
+        };
+        let at = match frontend {
+            NatDefinitionFrontendError::Parse(error) => error.primary_offset(),
+            NatDefinitionFrontendError::Elaborate(_) => frontend
+                .primary_offset()
+                .and_then(|relative| command_start.0.checked_add(relative.0))
+                .map(fln_parse::BytePos),
+        }
+        .unwrap_or(command_start);
+        if let Some((tag, message)) = self.lean_diagnostic() {
+            return Some((at, tag, message.to_owned()));
+        }
+        let (tag, message) = match frontend {
+            NatDefinitionFrontendError::Elaborate(error) => match error {
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::UnknownConstant(_)
+                    | fln_elab::source::SourceInferenceError::UnknownMemberConstant(_),
+                ) => ("error(lean.unknownIdentifier)", error.to_string()),
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::Tactic(
+                        fln_elab::source::TacticError::NoGoals { .. },
+                    ),
+                ) => ("error", "No goals to be solved".to_owned()),
+                _ => ("error", error.to_string()),
+            },
+            NatDefinitionFrontendError::Parse(error) => ("error", error.to_string()),
+        };
+        Some((at, tag, message))
+    }
 }
 
 impl fmt::Display for EngineExecutionError {
