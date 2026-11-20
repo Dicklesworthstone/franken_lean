@@ -23,7 +23,7 @@ use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::Outcome;
 use fln_env::environment::Environment;
-use fln_kernel::{Budget, Verdict};
+use fln_kernel::verdict::{Budget, Verdict};
 
 const STACK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
@@ -97,7 +97,7 @@ fn collect_transitive_imports(
         };
         let decoded = decode_olean_module_input_with(&input, limits, CheckerReading::Skip)
             .unwrap_or_else(|e| panic!("decode header for {name}: {e}"));
-        for imp in &decoded.imports {
+        for imp in &decoded.module.imports {
             let imp_name = imp.module.to_display_string();
             if !loaded.contains_key(&imp_name) {
                 queue.push_back(imp_name);
@@ -188,7 +188,8 @@ fn profile_module_against_base(
             .unwrap_or_else(|e| panic!("council error on {unit_name}: {e}"))
         {
             Outcome::Complete(admitted) => admitted,
-            other => panic!("council non-complete on {unit_name}: {other:?}"),
+            Outcome::Inconclusive(r) => panic!("council inconclusive on {unit_name}: {r:?}"),
+            Outcome::InternalFault(f) => panic!("council fault on {unit_name}: {f:?}"),
         };
         let council_dur = tc.elapsed();
         // `admit_declaration_unrooted` runs BOTH K1 and independent checker + projection + publish.
@@ -307,7 +308,12 @@ fn pg1_profile_prelude_and_target_modules() {
                         .expect("check import closure")
                     {
                         Outcome::Complete(c) => c,
-                        other => panic!("import closure non-complete for {mod_name}: {other:?}"),
+                        Outcome::Inconclusive(r) => {
+                            panic!("import closure inconclusive for {mod_name}: {r:?}")
+                        }
+                        Outcome::InternalFault(f) => {
+                            panic!("import closure fault for {mod_name}: {f:?}")
+                        }
                     };
                     println!(
                         "\n[closure for {mod_name}: {} dep modules loaded in {:.1}s]",
