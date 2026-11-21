@@ -29,6 +29,7 @@ pub(super) fn rows(environment: &Environment) -> Vec<String> {
             "Array.set",
             "Array.pop",
             "Array.modifyM",
+            "Array.mapM",
         ],
     )
 }

@@ -21,6 +21,7 @@ pub(super) struct Store {
     payloads: std::collections::HashMap<Expr, Name>,
     recoveries: BTreeMap<Name, (Expr, ValueType)>,
     modify: Option<Name>,
+    map: Option<Name>,
 }
 
 fn c(label: &str) -> Expr {
@@ -57,6 +58,10 @@ fn list(level: &Level, payload: &Expr) -> Expr {
 
 pub(super) fn canonical_modify_pair(source: &Name, selected: &Name) -> bool {
     source == &name("Array.modifyM") && selected == &name("Array.modifyMUnsafe")
+}
+
+pub(super) fn canonical_map_pair(source: &Name, selected: &Name) -> bool {
+    source == &name("Array.mapM") && selected == &name("Array.mapMUnsafe")
 }
 
 impl Preparation<'_> {
@@ -97,6 +102,43 @@ impl Preparation<'_> {
         definition.all.clear();
         self.remember_array_definition(definition)?;
         self.arrays.modify = Some(private.clone());
+        Ok(private)
+    }
+
+    /// The pin's unsafe `Array.mapMUnsafe` reuses storage across element types
+    /// via `unsafeCast` (`Array NonScalar` / `Array PNonScalar`). Its checked
+    /// safe logical body allocates with `emptyWithCapacity as.size`, reads
+    /// `as[i]`, pushes `← f as[i]`, and preserves exact callback order and
+    /// monadic sequencing without `unsafeCast` or `LawfulMonad` assumptions.
+    /// Only the complete canonical pair authorizes this private executable copy.
+    pub(super) fn array_map_target(&mut self) -> Result<Name, IngressError> {
+        self.tick()?;
+        if let Some(adapter) = &self.arrays.map {
+            return Ok(adapter.clone());
+        }
+        arrays::map_matches(
+            self.environment,
+            self.implementations
+                .as_ref()
+                .expect("Array map implementation edge was already validated"),
+            self.runtime_initializers,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        let Some(ConstantInfo::Defn(original)) = self.environment.find(&name("Array.mapM")) else {
+            return Err(unsupported("Array map requires its safe logical interface"));
+        };
+        if original.safety != DefinitionSafety::Safe {
+            return Err(unsupported("Array map requires its safe logical interface"));
+        }
+        let mut definition = original.clone();
+        let private = name("_fln_runtime_array_mapM");
+        definition.base.name = private.clone();
+        definition.hints = ReducibilityHints::Abbrev;
+        definition.all.clear();
+        self.remember_array_definition(definition)?;
+        self.arrays.map = Some(private.clone());
         Ok(private)
     }
 

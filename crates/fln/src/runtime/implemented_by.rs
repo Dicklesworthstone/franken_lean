@@ -191,6 +191,9 @@ impl Preparation<'_> {
             if arrays::canonical_modify_pair(&target, &next) {
                 return self.array_modify_target().map(Some);
             }
+            if arrays::canonical_map_pair(&target, &next) {
+                return self.array_map_target().map(Some);
+            }
             replaced = true;
             target = next;
         }

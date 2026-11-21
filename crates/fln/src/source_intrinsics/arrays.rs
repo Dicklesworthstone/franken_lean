@@ -109,6 +109,7 @@ fn inventory() -> &'static BTreeMap<&'static str, Expected> {
             include_str!("array_fold/dependencies.txt"),
             include_str!("arrays/dependencies.txt"),
             include_str!("arrays/modify_dependencies.txt"),
+            include_str!("arrays/map_dependencies.txt"),
         ] {
             for line in text.lines() {
                 let fields: Vec<_> = line.split('\t').collect();
@@ -252,6 +253,25 @@ pub(crate) fn modify_matches(
     check_closure(
         environment,
         [name("Array.modifyM")],
+        implementations,
+        initializers,
+        externs,
+        visited,
+        limits,
+    )
+}
+
+pub(crate) fn map_matches(
+    environment: &Environment,
+    implementations: &ImplementedByTable,
+    initializers: Option<&BTreeSet<Name>>,
+    externs: &mut Option<fln_elab::externs::ExternTable>,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    check_closure(
+        environment,
+        [name("Array.mapM")],
         implementations,
         initializers,
         externs,

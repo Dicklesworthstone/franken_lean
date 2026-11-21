@@ -687,6 +687,51 @@ def modifyTraceCode (index : Nat) : Nat :=
         );
         collect_case_failure(
             &mut failures,
+            "Array map and mapM callbacks, type changes, and monadic sequencing",
+            || {
+                execution::program(
+                    engine,
+                    "checked Array.mapM preserves callbacks, type changes, and non-lawful monadic effects",
+                    r#"
+structure MapTraceResult (A : Type) where
+  value : A
+  trace : Nat
+def MapTrace (A : Type) : Type := Nat -> MapTraceResult A
+def mapTracePure {A : Type} (value : A) : MapTrace A :=
+  fun state => { value := value, trace := state * 10 + 9 }
+def mapTraceBind {A B : Type}
+    (action : MapTrace A) (next : A -> MapTrace B) : MapTrace B :=
+  fun state =>
+    let result := action (state * 10 + 6)
+    next result.value result.trace
+instance mapTraceMonad : Monad MapTrace :=
+  { pure := fun value => mapTracePure value,
+    bind := fun action next => mapTraceBind action next }
+def tracedMap (values : Array Nat) : MapTrace (Array Nat) :=
+  Array.mapM (m := MapTrace)
+    (fun (value : Nat) (state : Nat) => { value := value + 1, trace := state * 10 + value })
+    values
+def mapTraceCode (values : Array Nat) : Nat :=
+  let result := tracedMap values 0
+  let total := result.value.toList.foldl (fun (sum value : Nat) => sum + value) 0
+  total * 100000 + result.trace
+-- FLN_EXPECT_NAT 1
+#eval if #[0, 1].map (fun n => n + 1) == #[1, 2] then 1 else 0
+-- FLN_EXPECT_NAT 0
+#eval ((#[] : Array Nat).map (fun n => n + 1)).size
+-- FLN_EXPECT_NAT 1
+#eval let orig : Array Nat := #[2, 4, 6]; let mapped : Array Bool := orig.map (fun n => n == 4); if orig == #[2, 4, 6] && mapped == #[false, true, false] then 1 else 0
+-- FLN_EXPECT_NAT 9
+#eval mapTraceCode #[]
+-- FLN_EXPECT_NAT 561629
+#eval mapTraceCode #[1, 2]
+"#,
+                    5,
+                );
+            },
+        );
+        collect_case_failure(
+            &mut failures,
             "typed Array elements and partial primitives",
             || {
                 execution::program(

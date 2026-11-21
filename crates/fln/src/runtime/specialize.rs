@@ -166,6 +166,7 @@ impl Preparation<'_> {
             "_fln_runtime_array_size",
             "_fln_runtime_array_get",
             "_fln_runtime_array_modifyM",
+            "_fln_runtime_array_mapM",
         ]
         .into_iter()
         .any(|label| name == &Name::from_components([label]))

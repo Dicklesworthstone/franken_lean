@@ -503,6 +503,86 @@ fn array_modify_adapter_preserves_changed_helpers_edges_and_initialization_autho
 }
 
 #[test]
+fn canonical_array_map_uses_its_checked_body_without_changing_logical_declarations() {
+    with_fixture(|environment| {
+        let logical = name("Array.mapM");
+        let original = environment.find(&logical).unwrap().clone();
+        let mut preparation = Preparation::new(environment, IngressLimits::default());
+        let target = preparation
+            .implementation_target(&logical)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target, name("_fln_runtime_array_mapM"));
+        let adapter = preparation.specialized_definition(&target).unwrap();
+        let ConstantInfo::Defn(original_definition) = &original else {
+            unreachable!("the actual mapM model is a definition");
+        };
+        assert_eq!(adapter.value, original_definition.value);
+        assert_eq!(adapter.base.type_, original_definition.base.type_);
+        assert_eq!(
+            adapter.base.level_params,
+            original_definition.base.level_params
+        );
+        assert_eq!(adapter.safety, DefinitionSafety::Safe);
+        assert_eq!(
+            preparation.implementation_target(&logical).unwrap(),
+            Some(target.clone())
+        );
+        assert_eq!(environment.find(&logical), Some(&original));
+        assert!(!environment.contains(&target));
+    });
+}
+
+#[test]
+fn array_map_adapter_preserves_changed_helpers_edges_and_initialization_authority() {
+    with_fixture(|environment| {
+        let logical = name("Array.mapM");
+        for label in ["Array.mapM", "Array.mapMUnsafe", "Array.push"] {
+            let changed = changed_body(environment, label);
+            let mut preparation = Preparation::new(&changed, IngressLimits::default());
+            assert!(
+                matches!(
+                    preparation.implementation_target(&logical),
+                    Err(IngressError::UnsupportedNode { .. })
+                ),
+                "{label}"
+            );
+            assert!(preparation.arrays.map.is_none());
+        }
+        for label in ["Array.mapM", "Array.mapMUnsafe", "Array.push"] {
+            let initializers = BTreeSet::from([name(label)]);
+            let mut preparation = Preparation::new(environment, IngressLimits::default())
+                .with_runtime_initializers(&initializers);
+            assert!(
+                matches!(
+                    preparation.implementation_target(&logical),
+                    Err(IngressError::UnsupportedNode { .. })
+                ),
+                "{label}"
+            );
+            assert!(preparation.arrays.map.is_none());
+        }
+        let Some(ConstantInfo::Defn(original)) = environment.find(&name("Array.mapMUnsafe")) else {
+            unreachable!("the actual selected implementation is a definition");
+        };
+        let mut alternative = original.clone();
+        let alternate = name("alternateArrayMapImplementation");
+        alternative.base.name = alternate.clone();
+        alternative.all = vec![alternate.clone()];
+        let changed = environment
+            .add_decl(ConstantInfo::Defn(alternative))
+            .unwrap();
+        let changed = implemented_by::register(&changed, &logical, &alternate).unwrap();
+        let mut preparation = Preparation::new(&changed, IngressLimits::default());
+        assert_eq!(
+            preparation.implementation_target(&logical).unwrap(),
+            Some(alternate)
+        );
+        assert!(preparation.arrays.map.is_none());
+    });
+}
+
+#[test]
 fn native_array_validation_and_private_names_obey_ingress_bounds() {
     with_fixture(|environment| {
         for max_nodes in [0, 16, 128] {
