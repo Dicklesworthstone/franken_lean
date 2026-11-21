@@ -10,11 +10,11 @@ use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId, Literal, NatLit};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_env::constants::{
-    ConstantInfo, ConstantVal, Declaration, DefinitionSafety, DefinitionVal, InductiveVal,
-    ReducibilityHints, TheoremVal,
+    ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, InductiveVal, ReducibilityHints,
+    TheoremVal,
 };
 use fln_env::environment::Environment;
-use fln_kernel::Budget;
+use fln_kernel::verdict::Budget;
 
 /// Generated `_sizeOf_<k>` helpers and `_sizeOf_inst` dictionaries, ordered so
 /// every function precedes the instance that references it.

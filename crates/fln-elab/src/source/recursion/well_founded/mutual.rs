@@ -87,15 +87,10 @@ pub(in crate::source) struct Plan {
     domains: Vec<Expr>,
 }
 
-/// The unvisited calls needed by one lazy GuessLex candidate. An initial pass
-/// also discovers the member's complete call count and complex-measure boundary.
+/// Elaborate the body once and capture its packed call obligations for reuse
+/// across GuessLex candidates without re-elaborating the source syntax.
 #[derive(Clone)]
 pub(in crate::source) enum Probe {
-    All,
-    /// Original call indices, in increasing order without duplicates.
-    Calls(Vec<usize>),
-    /// Elaborate the body once and capture its packed call obligations for reuse
-    /// across GuessLex candidates without re-elaborating the source syntax.
     Capture,
 }
 
@@ -1748,73 +1743,32 @@ impl Context {
                     }
                 };
                 let prepared = self.lower_pattern_matrices(proof)?;
-                if let Some(probe) = &member.probe {
+                if let Some(Probe::Capture) = &member.probe {
                     let varying: Vec<_> = (plan.fixed..parameters.len()).collect();
                     let complex = self.complex_measure_possible(&goals, &parameters, &varying)?;
-                    if matches!(probe, Probe::Capture) {
-                        let mut packed = Vec::with_capacity(obligations.len());
-                        for obligation in &obligations {
-                            self.tick()?;
-                            let raw_target = self.instantiate(&obligation.raw_target)?;
-                            let (_, _, next, current) =
-                                self.decreasing_relation_parts(&raw_target)?;
-                            packed.push((next, current));
-                        }
-                        let total = goals.len();
-                        let snapshot = MemberProbeSnapshot {
-                            fixed_values: fixed_values.clone(),
-                            goals,
-                            packed,
-                            prepared,
-                            default_tactic: hint.decreasing.is_none(),
-                            complex,
-                        };
-                        self.mutual_member
-                            .as_mut()
-                            .ok_or_else(scope)?
-                            .probe_snapshot = Some(snapshot);
-                        return Err(error(RecursionError::MutualMeasureProbe {
-                            relations: Vec::new(),
-                            total,
-                            complex,
-                        }));
-                    }
-                    let mut relations = Vec::new();
-                    let mut requested = match probe {
-                        Probe::All => None,
-                        Probe::Calls(calls) => Some(calls.iter().copied().peekable()),
-                        Probe::Capture => unreachable!("handled above"),
-                    };
-                    for (index, goal) in goals.iter().enumerate() {
+                    let mut packed = Vec::with_capacity(obligations.len());
+                    for obligation in &obligations {
                         self.tick()?;
-                        if let Some(calls) = &mut requested {
-                            let Some(&next) = calls.peek() else {
-                                break;
-                            };
-                            if index != next {
-                                continue;
-                            }
-                            calls.next();
-                        }
-                        let relation = match self.classify_call(
-                            &prepared,
-                            goal,
-                            &goal.target,
-                            hint.decreasing.is_none(),
-                        )? {
-                            Ok(CallRelation::Eq) => MutualMeasureRelation::Eq,
-                            Ok(CallRelation::Lt) => MutualMeasureRelation::Lt,
-                            Ok(CallRelation::Le) => MutualMeasureRelation::Le,
-                            Err(_) => MutualMeasureRelation::Unknown,
-                        };
-                        relations.push((index, relation));
-                        if relation == MutualMeasureRelation::Unknown {
-                            break;
-                        }
+                        let raw_target = self.instantiate(&obligation.raw_target)?;
+                        let (_, _, next, current) = self.decreasing_relation_parts(&raw_target)?;
+                        packed.push((next, current));
                     }
+                    let total = goals.len();
+                    let snapshot = MemberProbeSnapshot {
+                        fixed_values: fixed_values.clone(),
+                        goals,
+                        packed,
+                        prepared: prepared.into_owned(),
+                        default_tactic: hint.decreasing.is_none(),
+                        complex,
+                    };
+                    self.mutual_member
+                        .as_mut()
+                        .ok_or_else(scope)?
+                        .probe_snapshot = Some(snapshot);
                     return Err(error(RecursionError::MutualMeasureProbe {
-                        relations,
-                        total: goals.len(),
+                        relations: Vec::new(),
+                        total,
                         complex,
                     }));
                 }

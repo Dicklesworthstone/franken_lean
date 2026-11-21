@@ -349,23 +349,28 @@ fn automatic_decreasing_proof() -> Syntax {
             )],
         )
     }
-    fn first(tactics: Vec<Syntax>) -> Syntax {
+    fn first_seqs(sequences: Vec<Syntax>) -> Syntax {
         Syntax::node(
             parser_kind(&["Tactic", "first"]),
             vec![
                 atom("first"),
                 null(
-                    tactics
+                    sequences
                         .into_iter()
-                        .map(|tactic| {
-                            Syntax::node(
-                                Name::from_components(["group"]),
-                                vec![atom("|"), sequence(vec![tactic])],
-                            )
+                        .map(|seq| {
+                            Syntax::node(Name::from_components(["group"]), vec![atom("|"), seq])
                         })
                         .collect(),
                 ),
             ],
+        )
+    }
+    fn first(tactics: Vec<Syntax>) -> Syntax {
+        first_seqs(
+            tactics
+                .into_iter()
+                .map(|tactic| sequence(vec![tactic]))
+                .collect(),
         )
     }
     fn lexicographic_constructors(family: &str) -> Syntax {
@@ -402,7 +407,7 @@ fn automatic_decreasing_proof() -> Syntax {
             null(Vec::new()),
         ],
     );
-    let alternatives = ["done", "assumption", "omega"]
+    let alternatives: Vec<_> = ["done", "assumption", "omega"]
         .into_iter()
         .map(|name| {
             let mut args = vec![atom(name)];
@@ -426,7 +431,7 @@ fn automatic_decreasing_proof() -> Syntax {
         lexicographic_constructors("PSigma"),
         first(alternatives),
     ]);
-    first(vec![direct, with_simp])
+    sequence(vec![first_seqs(vec![direct, with_simp])])
 }
 
 impl Context {
