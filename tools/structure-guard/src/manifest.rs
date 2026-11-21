@@ -257,6 +257,211 @@ pub fn parse_workspace_members(text: &str, display_path: &str) -> Result<Vec<Str
     members.ok_or_else(|| format!("{display_path}: missing workspace.members"))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct SuitePackageManifest {
+    pub name: String,
+    pub version: Option<String>,
+    pub license: Option<String>,
+    pub links: Option<String>,
+    pub proc_macro: bool,
+}
+
+/// Extract the audited `[package]` and `[lib]` metadata from an external
+/// `SUITE.lock`-pinned FrankenSuite manifest. Unlike workspace manifests (which
+/// stay on the strict single-line [`parse`] grammar), suite repositories carry
+/// real multi-section manifests (`[workspace]`, multiline `include = [...]`,
+/// `[features]`, `[lints.*]`, target-specific `[dependencies]`). This parser
+/// still fails closed on duplicate `[package]`/`[lib]` sections, duplicate
+/// audited keys, unterminated multiline strings/arrays, or missing package
+/// identity.
+pub fn parse_suite_package(text: &str, display_path: &str) -> Result<SuitePackageManifest, String> {
+    let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut license: Option<String> = None;
+    let mut links: Option<String> = None;
+    let mut proc_macro = false;
+
+    let mut section = String::new();
+    let mut seen_package = false;
+    let mut seen_lib = false;
+    let mut package_keys = BTreeSet::new();
+    let mut lib_keys = BTreeSet::new();
+    let mut bracket_depth: usize = 0;
+    let mut brace_depth: usize = 0;
+
+    for (idx, raw) in text.lines().enumerate() {
+        let lineno = idx + 1;
+        let line = strip_comment(raw)
+            .map_err(|message| format!("{display_path}:{lineno}: {message}"))?
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        let err = |msg: &str| format!("{display_path}:{lineno}: {msg}: `{line}`");
+
+        // While inside a multiline array/inline table (e.g. `include = [ ... ]`),
+        // track bracket/brace balance and skip entries without mistaking them for
+        // section headers or audited keys.
+        if bracket_depth > 0 || brace_depth > 0 {
+            update_nesting(line, &mut bracket_depth, &mut brace_depth).map_err(&err)?;
+            continue;
+        }
+
+        if line.starts_with('[') {
+            if line.starts_with("[[") {
+                if !line.ends_with("]]") {
+                    return Err(err("malformed array-of-tables header"));
+                }
+                section = line.to_string();
+                continue;
+            }
+            let inner = line
+                .strip_prefix('[')
+                .and_then(|v| v.strip_suffix(']'))
+                .ok_or_else(|| err("malformed section header"))?
+                .trim();
+            if inner == "package" {
+                if seen_package {
+                    return Err(err("duplicate `[package]` section"));
+                }
+                seen_package = true;
+            } else if inner == "lib" {
+                if seen_lib {
+                    return Err(err("duplicate `[lib]` section"));
+                }
+                seen_lib = true;
+            }
+            section = inner.to_string();
+            continue;
+        }
+
+        if section == "package" {
+            let (k, v) = line
+                .split_once('=')
+                .ok_or_else(|| err("expected `key = value` in `[package]`"))?;
+            let (k, v) = (k.trim(), v.trim());
+            if !package_keys.insert(k.to_string()) {
+                return Err(err("duplicate `[package]` key"));
+            }
+            match k {
+                "name" => {
+                    name = Some(
+                        unquote(v)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| err("package.name must be a non-empty quoted string"))?
+                            .to_string(),
+                    );
+                }
+                "version" => {
+                    version = Some(
+                        unquote(v)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                err("package.version must be a non-empty quoted string")
+                            })?
+                            .to_string(),
+                    );
+                }
+                "license" => {
+                    license = Some(
+                        unquote(v)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                err("package.license must be a non-empty quoted string")
+                            })?
+                            .to_string(),
+                    );
+                }
+                "links" => {
+                    links = Some(
+                        unquote(v)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| err("package.links must be a non-empty quoted string"))?
+                            .to_string(),
+                    );
+                }
+                _ => update_nesting(v, &mut bracket_depth, &mut brace_depth).map_err(&err)?,
+            }
+        } else if section == "lib" {
+            let (k, v) = line
+                .split_once('=')
+                .ok_or_else(|| err("expected `key = value` in `[lib]`"))?;
+            let (k, v) = (k.trim(), v.trim());
+            if !lib_keys.insert(k.to_string()) {
+                return Err(err("duplicate `[lib]` key"));
+            }
+            if k == "proc-macro" {
+                proc_macro = match v {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(err("lib.proc-macro must be true or false")),
+                };
+            } else {
+                update_nesting(v, &mut bracket_depth, &mut brace_depth).map_err(&err)?;
+            }
+        } else if let Some((_, v)) = line.split_once('=') {
+            update_nesting(v.trim(), &mut bracket_depth, &mut brace_depth).map_err(&err)?;
+        } else {
+            update_nesting(line, &mut bracket_depth, &mut brace_depth).map_err(&err)?;
+        }
+    }
+
+    if bracket_depth != 0 || brace_depth != 0 {
+        return Err(format!(
+            "{display_path}: unterminated multiline array or inline table"
+        ));
+    }
+    if !seen_package {
+        return Err(format!("{display_path}: missing `[package]` section"));
+    }
+    Ok(SuitePackageManifest {
+        name: name.ok_or_else(|| format!("{display_path}: missing package.name"))?,
+        version,
+        license,
+        links,
+        proc_macro,
+    })
+}
+
+fn update_nesting(
+    line: &str,
+    bracket_depth: &mut usize,
+    brace_depth: &mut usize,
+) -> Result<(), &'static str> {
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in line.chars() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '[' => *bracket_depth = bracket_depth.saturating_add(1),
+            ']' => {
+                *bracket_depth = bracket_depth
+                    .checked_sub(1)
+                    .ok_or("unbalanced closing `]`")?;
+            }
+            '{' => *brace_depth = brace_depth.saturating_add(1),
+            '}' => {
+                *brace_depth = brace_depth.checked_sub(1).ok_or("unbalanced closing `}`")?;
+            }
+            _ => {}
+        }
+    }
+    if quoted {
+        return Err("unterminated quoted string");
+    }
+    Ok(())
+}
+
 pub fn parse(text: &str, display_path: &str) -> Result<Manifest, String> {
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
@@ -500,6 +705,71 @@ mod tests {
                 "accepted {malformed_table}"
             );
         }
+    }
+
+    #[test]
+    fn suite_package_parser_extracts_multisection_metadata_and_fails_closed() {
+        let suite = "\
+[workspace]
+members = [
+    \".\",
+    \"sub\",
+]
+
+[package]
+name = \"asupersync\"
+version = \"0.6.2\"
+edition = \"2024\"
+license = \"LicenseRef-MIT-OpenAI-Anthropic-Rider\"
+include = [
+    \"Cargo.toml\",
+    \"[package]\", # inside array literal, must not reset section
+    \"src/**\",
+]
+
+[features]
+default = [\"runtime-core\"]
+slim = [
+    \"runtime-core\",
+]
+
+[dependencies]
+serde = { version = \"1.0\", features = [\"derive\"] }
+
+[[bin]]
+name = \"asupersync\"
+";
+        let parsed = parse_suite_package(suite, "suite/Cargo.toml").expect("parses");
+        assert_eq!(parsed.name, "asupersync");
+        assert_eq!(parsed.version.as_deref(), Some("0.6.2"));
+        assert_eq!(
+            parsed.license.as_deref(),
+            Some("LicenseRef-MIT-OpenAI-Anthropic-Rider")
+        );
+        assert!(parsed.links.is_none());
+        assert!(!parsed.proc_macro);
+
+        let with_links_and_pm = "\
+[package]
+name = \"demo-pm\"
+version = \"1.0.0\"
+license = \"MIT\"
+links = \"demo-native\"
+
+[lib]
+proc-macro = true
+";
+        let pm = parse_suite_package(with_links_and_pm, "pm/Cargo.toml").expect("parses");
+        assert_eq!(pm.links.as_deref(), Some("demo-native"));
+        assert!(pm.proc_macro);
+
+        // Fail closed on duplicate sections, duplicate keys, missing name, or unterminated arrays.
+        assert!(
+            parse_suite_package("[package]\nname = \"a\"\n[package]\nname = \"b\"\n", "t").is_err()
+        );
+        assert!(parse_suite_package("[package]\nname = \"a\"\nname = \"b\"\n", "t").is_err());
+        assert!(parse_suite_package("[package]\nversion = \"1.0.0\"\n", "t").is_err());
+        assert!(parse_suite_package("[package]\nname = \"a\"\ninclude = [\n\"x\"\n", "t").is_err());
     }
 
     #[test]

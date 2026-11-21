@@ -26,7 +26,7 @@ rust-commit 90850177249efe0321573c569aec5d12b257f8d6
 target x86_64-unknown-linux-gnu
 
 # ---- the FrankenSuite (D1 closed universe), pinned at exact commits --------------------
-suite asupersync       commit=8522f9411c7652accf3996b215fca8df901c1489 path=/dp/asupersync
+suite asupersync       commit=b32c5ba663156bb6ee1888f86dfddffa8e8570c5 path=/data/projects/asupersync
 suite frankensqlite    commit=bc189a5429bc153cd2160a8ff002544f63bfcda6 path=/dp/frankensqlite
 suite franken_networkx commit=9d710b1c33e99412c94de7fa4de2f7ce4954110f path=/dp/franken_networkx
 suite frankensearch    commit=4302c377169c97d52296efa77fc37e66429aad44 path=/dp/frankensearch
@@ -41,6 +41,9 @@ suite frankentorch     commit=e4c6bdd5ec629ae70b40da9314da345ade012ca7 path=/dp/
 
 # ---- allowed suite packages, mapped to their pinned repos ------------------------------
 crate asupersync       repo=asupersync
+crate franken-decision repo=asupersync
+crate franken-evidence repo=asupersync
+crate franken-kernel   repo=asupersync
 crate fsqlite          repo=frankensqlite
 crate franken_networkx repo=franken_networkx
 crate frankensearch    repo=frankensearch

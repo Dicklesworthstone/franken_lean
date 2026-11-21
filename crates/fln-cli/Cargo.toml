@@ -9,6 +9,7 @@ default-run = "fln"
 # fln-mode-provenance: sound
 
 [dependencies]
+asupersync = { path = "../../../asupersync", default-features = false, features = ["slim-runtime-profile"] }
 fln = { path = "../fln" }
 fln-core = { path = "../fln-core" }
 fln-hash = { path = "../fln-hash" }

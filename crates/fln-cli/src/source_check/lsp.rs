@@ -1,4 +1,14 @@
-//! Native proof-library diagnostics on a long-lived, stack-calibrated worker.
+//! Native proof-library diagnostics on an `asupersync` `Cx`-region effect plane
+//! (bead `fln-otk7`).
+//!
+//! Each document check generation opens an owned `asupersync::cx::ChildRegion`
+//! on a stack-calibrated runtime worker and passes a `Cx`-backed
+//! [`crate::runtime_plane::CxCancellationProbe`] into
+//! `SourceModuleSession::check_with_cancel`. When a superseding `didChange` or
+//! `didClose` arrives while checking, the server cancels the old generation's
+//! child region, awaits full region drain and quiescence, discards stale output
+//! without acquiring publication authority, and serves the newer generation in a
+//! fresh child region.
 //!
 //! A document whose imports include `.olean` modules is checked against that import
 //! world, resolved and obtained exactly as `fln check-source` obtains it, under the
@@ -9,13 +19,23 @@
 use super::imports::EditorWorld;
 use super::imports::editor::{self, Sources};
 use super::*;
+use crate::runtime_plane::{
+    CxCancellationProbe, IncomingTransport, RegionCounters, RuntimeEvent, RuntimeEventSink,
+    build_effect_runtime, cancel_reason, shutdown_runtime,
+};
+use asupersync::Cx;
+use asupersync::cx::ChildRegionSpec;
+use asupersync::runtime::Runtime;
 use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
 use fln::source_check::modules::{
     SourceModuleCacheLimits, SourceModuleCheckError, SourceModuleCheckLimits, SourceModuleSession,
 };
-use fln_server::dispatch::OpenDocumentSource;
-use std::collections::VecDeque;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use fln_server::dispatch::{
+    CheckOutcome, IncomingCheckAction, OpenDocumentSource, classify_incoming_for_active_check,
+};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 mod completion;
 mod dependencies;
@@ -26,85 +46,111 @@ mod tokens;
 use fln::source_check::inspect::{ObservationKind, SourceObservation};
 use fln_server::dispatch::semantic::{Answer, Query, QueryKind};
 
-enum Request {
-    Check(Sources),
-    Inspect(Sources, usize, QueryKind),
-}
-enum Response {
-    Diagnostics(Vec<String>),
-    Semantic(Result<Option<Answer>, String>),
+enum CheckRunOutcome {
+    Completed {
+        messages: Vec<String>,
+        cache_hit: Option<bool>,
+        authoritative: bool,
+    },
+    Cancelled,
 }
 
 pub(crate) struct Checker {
-    worker: Option<Worker>,
+    runtime: Option<Arc<Runtime>>,
+    sessions: Arc<Mutex<Sessions>>,
+    transport: Option<Arc<Mutex<IncomingTransport>>>,
+    counters: Arc<RegionCounters>,
+    sink: RuntimeEventSink,
+    generations: BTreeMap<String, u64>,
     dependencies: dependencies::Dependencies,
 }
-struct Worker {
-    input: SyncSender<Option<Request>>,
-    output: Receiver<Response>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-impl Worker {
-    fn new() -> std::io::Result<Self> {
-        let (input, requests) = sync_channel::<Option<Request>>(1);
-        let (responses, output) = sync_channel(1);
-        let thread = std::thread::Builder::new()
-            .name("fln-lsp-proof-check".to_owned())
-            // `.olean` worlds are admitted, or their records re-proved, on this thread
-            // under the `.olean` depth budget, as `lake build`'s worker does. Source
-            // checking keeps its own calibrated budget.
-            .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES.max(SOURCE_RUN_KERNEL_STACK_BYTES))
-            .spawn(move || {
-                let mut session = Sessions::default();
-                while let Ok(Some(request)) = requests.recv() {
-                    let response = match request {
-                        Request::Check(sources) => {
-                            Response::Diagnostics(check_sources(&mut session, &sources))
-                        }
-                        Request::Inspect(sources, offset, kind) => Response::Semantic(
-                            inspect_sources(&mut session, &sources, offset, kind),
-                        ),
-                    };
-                    if responses.send(response).is_err() {
-                        break;
-                    }
-                }
-            })?;
-        Ok(Self {
-            input,
-            output,
-            thread: Some(thread),
-        })
-    }
-}
-impl Drop for Worker {
+
+impl Drop for Checker {
     fn drop(&mut self) {
-        let _ = self.input.send(None);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(runtime) = self.runtime.take()
+            && let Ok(owned) = Arc::try_unwrap(runtime)
+        {
+            shutdown_runtime(owned);
         }
     }
 }
+
 impl Checker {
     pub(crate) fn new() -> Self {
         Self {
-            worker: None,
+            runtime: None,
+            sessions: Arc::new(Mutex::new(Sessions::default())),
+            transport: None,
+            counters: Arc::new(RegionCounters::new()),
+            sink: RuntimeEventSink::from_env(),
+            generations: BTreeMap::new(),
             dependencies: dependencies::Dependencies::default(),
         }
     }
+
+    pub(crate) fn with_runtime(
+        runtime: Arc<Runtime>,
+        transport: Option<Arc<Mutex<IncomingTransport>>>,
+        counters: Arc<RegionCounters>,
+        sink: RuntimeEventSink,
+    ) -> Self {
+        Self {
+            runtime: Some(runtime),
+            sessions: Arc::new(Mutex::new(Sessions::default())),
+            transport,
+            counters,
+            sink,
+            generations: BTreeMap::new(),
+            dependencies: dependencies::Dependencies::default(),
+        }
+    }
+
+    fn ensure_runtime(&mut self) -> Result<Arc<Runtime>, String> {
+        if let Some(runtime) = &self.runtime {
+            return Ok(Arc::clone(runtime));
+        }
+        // `.olean` worlds are admitted, or their records re-proved, on the
+        // calibrated runtime worker under the `.olean` depth budget, as
+        // `lake build`'s worker does. Source checking keeps its own budget.
+        let stack_bytes = OLEAN_CHECK_KERNEL_STACK_BYTES.max(SOURCE_RUN_KERNEL_STACK_BYTES);
+        let runtime = Arc::new(build_effect_runtime("fln-lsp-asupersync", 2, stack_bytes)?);
+        self.runtime = Some(Arc::clone(&runtime));
+        Ok(runtime)
+    }
+
+    fn next_generation(&mut self, uri: &str) -> u64 {
+        let entry = self.generations.entry(uri.to_owned()).or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
+    }
+
     pub(crate) fn check(
         &mut self,
         uri: &str,
         text: &str,
         documents: &[OpenDocumentSource<'_>],
     ) -> Vec<String> {
+        match self.check_cancellable_inner(uri, 0, text, documents, false) {
+            CheckOutcome::Complete(messages) => messages,
+            CheckOutcome::Cancelled => Vec::new(),
+        }
+    }
+
+    fn check_cancellable_inner(
+        &mut self,
+        uri: &str,
+        version: i64,
+        text: &str,
+        documents: &[OpenDocumentSource<'_>],
+        allow_cancel: bool,
+    ) -> CheckOutcome {
         self.dependencies.begin(uri, documents);
         if text.len() > SOURCE_RUN_DEFAULT_MAX_BYTES {
-            return project(
+            return CheckOutcome::Complete(project(
                 uri,
                 text,
                 &nonanswer("resource", "editor source exceeds its byte limit"),
-            );
+            ));
         }
         // Header parsing uses the complete lexical source view. Keep its exact
         // error offset instead of flattening a syntax error into an I/O failure.
@@ -116,7 +162,7 @@ impl Checker {
             }
             Ok(_) => {}
             Err(error) => {
-                return project(
+                return CheckOutcome::Complete(project(
                     uri,
                     text,
                     &diagnostic(
@@ -125,47 +171,383 @@ impl Checker {
                         error.primary_offset().map_or(0, |p| p.0),
                         &error.to_string(),
                     ),
-                );
+                ));
             }
         }
         let sources = match editor::load(uri, text, documents, SOURCE_RUN_DEFAULT_MAX_BYTES) {
             Ok(sources) => sources,
             Err(error) => {
                 let snapshot = failure(uri, text.as_bytes(), 0, error.class, &error.detail);
-                return project(uri, text, &snapshot);
+                return CheckOutcome::Complete(project(uri, text, &snapshot));
             }
         };
         self.dependencies
             .loaded(uri, &sources.uris, &sources.absent_sources);
-        if self.worker.is_none() {
-            match Worker::new() {
-                Ok(worker) => self.worker = Some(worker),
+
+        let runtime = match self.ensure_runtime() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return CheckOutcome::Complete(project(uri, text, &nonanswer("resource", &error)));
+            }
+        };
+
+        let request_id = self.counters.next_request_id();
+        let generation = self.next_generation(uri);
+        let sessions = Arc::clone(&self.sessions);
+        let transport = self.transport.clone();
+        let counters = Arc::clone(&self.counters);
+        let sink = self.sink.clone();
+        let uri_owned = uri.to_owned();
+
+        let outcome = runtime.block_on(async move {
+            let root_cx = Cx::current().expect("asupersync runtime Cx");
+            let child = match root_cx.open_child_region(ChildRegionSpec::inherit()).await {
+                Ok(child) => child,
                 Err(error) => {
-                    return project(
-                        uri,
+                    return Ok(CheckOutcome::Complete(project(
+                        &uri_owned,
                         text,
                         &nonanswer(
                             "resource",
-                            &format!("could not start proof worker: {error}"),
+                            &format!("could not open proof-check region: {error:?}"),
                         ),
-                    );
+                    )));
+                }
+            };
+            let region_id = format!("{:?}", child.region_id());
+            let (active_regions, live_tasks_before) = counters.on_region_opened();
+
+            // Check any already-buffered FIFO frames before starting work.
+            let mut pre_superseded = false;
+            let mut watch_incoming = allow_cancel && transport.is_some();
+            if watch_incoming
+                && let Some(transport_arc) = &transport
+                && let Ok(mut guard) = transport_arc.lock()
+            {
+                let mut inspected = VecDeque::new();
+                while let Some(frame) = guard.pop_deferred() {
+                    if let Ok(Some(ref bytes)) = frame {
+                        match classify_incoming_for_active_check(bytes, &uri_owned, version) {
+                            IncomingCheckAction::Supersedes => {
+                                pre_superseded = true;
+                            }
+                            IncomingCheckAction::Barrier => {
+                                watch_incoming = false;
+                            }
+                            IncomingCheckAction::NonBarrier => {}
+                        }
+                    } else {
+                        watch_incoming = false;
+                    }
+                    inspected.push_back(frame);
+                    if pre_superseded || !watch_incoming {
+                        break;
+                    }
+                }
+                while let Some(frame) = guard.pop_deferred() {
+                    inspected.push_back(frame);
+                }
+                for frame in inspected {
+                    guard.push_deferred(frame);
                 }
             }
+
+            if pre_superseded {
+                sink.record(RuntimeEvent {
+                    subsystem: "lsp",
+                    event: "region_opened",
+                    request_id,
+                    target: uri_owned.clone(),
+                    version: Some(version),
+                    generation,
+                    region_id: region_id.clone(),
+                    cancellation_outcome: "none",
+                    cache_hit: None,
+                    active_regions,
+                    live_tasks: live_tasks_before,
+                    authoritative_publication: false,
+                    detail: None,
+                });
+                let _ = child.cancel(cancel_reason("superseded before check start"));
+                let _ = child.close().await;
+                let (active_regions, live_tasks) = counters.on_region_drained(true);
+                sink.record(RuntimeEvent {
+                    subsystem: "lsp",
+                    event: "region_cancelled_and_drained",
+                    request_id,
+                    target: uri_owned,
+                    version: Some(version),
+                    generation,
+                    region_id,
+                    cancellation_outcome: "cancelled_before_start",
+                    cache_hit: None,
+                    active_regions,
+                    live_tasks,
+                    authoritative_publication: false,
+                    detail: None,
+                });
+                return Ok(CheckOutcome::Cancelled);
+            }
+
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let task_cancel = Arc::clone(&cancel_flag);
+            let started_flag = Arc::new(AtomicBool::new(false));
+            let task_started = Arc::clone(&started_flag);
+            let live_tasks = counters.on_task_spawned();
+            sink.record(RuntimeEvent {
+                subsystem: "lsp",
+                event: "region_opened",
+                request_id,
+                target: uri_owned.clone(),
+                version: Some(version),
+                generation,
+                region_id: region_id.clone(),
+                cancellation_outcome: "none",
+                cache_hit: None,
+                active_regions,
+                live_tasks,
+                authoritative_publication: false,
+                detail: None,
+            });
+
+            let mut task = match child.cx().spawn(move |task_cx| async move {
+                task_started.store(true, Ordering::SeqCst);
+                let probe = CxCancellationProbe::new(task_cx, task_cancel);
+                let Ok(mut guard) = sessions.lock() else {
+                    return Err("proof worker session lock poisoned".to_owned());
+                };
+                Ok(check_sources_with_cancel(
+                    &mut guard,
+                    &sources,
+                    Some(&probe),
+                ))
+            }) {
+                Ok(task) => task,
+                Err(error) => {
+                    let _ = counters.on_task_drained();
+                    let _ = child.close().await;
+                    let (active_regions, live_tasks) = counters.on_region_drained(false);
+                    sink.record(RuntimeEvent {
+                        subsystem: "lsp",
+                        event: "region_failed",
+                        request_id,
+                        target: uri_owned.clone(),
+                        version: Some(version),
+                        generation,
+                        region_id,
+                        cancellation_outcome: "none",
+                        cache_hit: None,
+                        active_regions,
+                        live_tasks,
+                        authoritative_publication: false,
+                        detail: Some(format!("spawn failed: {error:?}")),
+                    });
+                    return Ok(CheckOutcome::Complete(project(
+                        &uri_owned,
+                        text,
+                        &nonanswer(
+                            "resource",
+                            &format!("could not spawn proof-check task: {error:?}"),
+                        ),
+                    )));
+                }
+            };
+
+            let mut superseded = false;
+            let join_outcome = if watch_incoming {
+                let mut join_fut = std::pin::pin!(task.join(&root_cx));
+                let raced = std::future::poll_fn(|poll_cx| {
+                    use std::future::Future;
+                    use std::task::Poll;
+                    if let Poll::Ready(res) = join_fut.as_mut().poll(poll_cx) {
+                        return Poll::Ready(Some(res));
+                    }
+                    if watch_incoming
+                        && let Some(transport_arc) = &transport
+                        && let Ok(mut guard) = transport_arc.lock()
+                    {
+                        loop {
+                            match guard.receiver_mut().poll_recv(&root_cx, poll_cx) {
+                                Poll::Ready(Ok(frame)) => {
+                                    let action = match &frame {
+                                        Ok(Some(bytes)) => classify_incoming_for_active_check(
+                                            bytes, &uri_owned, version,
+                                        ),
+                                        _ => IncomingCheckAction::Barrier,
+                                    };
+                                    guard.push_deferred(frame);
+                                    match action {
+                                        IncomingCheckAction::Supersedes => {
+                                            return Poll::Ready(None);
+                                        }
+                                        IncomingCheckAction::NonBarrier => continue,
+                                        IncomingCheckAction::Barrier => {
+                                            watch_incoming = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Poll::Ready(Err(_)) => {
+                                    guard.push_deferred(Ok(None));
+                                    watch_incoming = false;
+                                    break;
+                                }
+                                Poll::Pending => break,
+                            }
+                        }
+                    }
+                    Poll::Pending
+                })
+                .await;
+                match raced {
+                    Some(res) => res,
+                    None => {
+                        superseded = true;
+                        cancel_flag.store(true, Ordering::SeqCst);
+                        let _ =
+                            child.cancel(cancel_reason("superseded by newer document generation"));
+                        join_fut.await
+                    }
+                }
+            } else {
+                task.join(&root_cx).await
+            };
+
+            let _ = counters.on_task_drained();
+            let _ = child.close().await;
+            let (active_regions, live_tasks) = counters.on_region_drained(superseded);
+
+            if superseded {
+                let (cancellation_outcome, cache_hit) = match &join_outcome {
+                    Ok(Ok(CheckRunOutcome::Cancelled)) => (
+                        if started_flag.load(Ordering::Acquire) {
+                            "cancelled_active"
+                        } else {
+                            "cancelled_before_start"
+                        },
+                        None,
+                    ),
+                    Ok(Ok(CheckRunOutcome::Completed {
+                        cache_hit: Some(true),
+                        ..
+                    })) => ("cancelled_after_cache_hit", Some(true)),
+                    Ok(Ok(CheckRunOutcome::Completed { cache_hit, .. })) => {
+                        ("raced_with_completion_discarded", *cache_hit)
+                    }
+                    _ => ("cancelled_active", None),
+                };
+                sink.record(RuntimeEvent {
+                    subsystem: "lsp",
+                    event: "region_cancelled_and_drained",
+                    request_id,
+                    target: uri_owned,
+                    version: Some(version),
+                    generation,
+                    region_id,
+                    cancellation_outcome,
+                    cache_hit,
+                    active_regions,
+                    live_tasks,
+                    authoritative_publication: false,
+                    detail: None,
+                });
+                return Ok(CheckOutcome::Cancelled);
+            }
+
+            match join_outcome {
+                Ok(Ok(CheckRunOutcome::Completed {
+                    messages,
+                    cache_hit,
+                    authoritative,
+                })) => {
+                    sink.record(RuntimeEvent {
+                        subsystem: "lsp",
+                        event: "region_completed",
+                        request_id,
+                        target: uri_owned,
+                        version: Some(version),
+                        generation,
+                        region_id,
+                        cancellation_outcome: "none",
+                        cache_hit,
+                        active_regions,
+                        live_tasks,
+                        authoritative_publication: authoritative,
+                        detail: None,
+                    });
+                    Ok(CheckOutcome::Complete(messages))
+                }
+                Ok(Ok(CheckRunOutcome::Cancelled)) => {
+                    sink.record(RuntimeEvent {
+                        subsystem: "lsp",
+                        event: "region_cancelled_and_drained",
+                        request_id,
+                        target: uri_owned,
+                        version: Some(version),
+                        generation,
+                        region_id,
+                        cancellation_outcome: "cancelled_active",
+                        cache_hit: None,
+                        active_regions,
+                        live_tasks,
+                        authoritative_publication: false,
+                        detail: None,
+                    });
+                    Ok(CheckOutcome::Cancelled)
+                }
+                Ok(Err(detail)) => {
+                    sink.record(RuntimeEvent {
+                        subsystem: "lsp",
+                        event: "region_failed",
+                        request_id,
+                        target: uri_owned,
+                        version: Some(version),
+                        generation,
+                        region_id,
+                        cancellation_outcome: "none",
+                        cache_hit: None,
+                        active_regions,
+                        live_tasks,
+                        authoritative_publication: false,
+                        detail: Some(detail.clone()),
+                    });
+                    Err(detail)
+                }
+                Err(error) => {
+                    let detail = format!("proof worker stopped without a result: {error:?}");
+                    sink.record(RuntimeEvent {
+                        subsystem: "lsp",
+                        event: "region_failed",
+                        request_id,
+                        target: uri_owned,
+                        version: Some(version),
+                        generation,
+                        region_id,
+                        cancellation_outcome: "none",
+                        cache_hit: None,
+                        active_regions,
+                        live_tasks,
+                        authoritative_publication: false,
+                        detail: Some(detail.clone()),
+                    });
+                    Err(detail)
+                }
+            }
+        });
+
+        match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                // A faulted worker never leaves a previous success authoritative.
+                // Reset sessions so a later check starts from a fresh seed/cache.
+                self.sessions = Arc::new(Mutex::new(Sessions::default()));
+                CheckOutcome::Complete(project(
+                    uri,
+                    text,
+                    &fault("lsp-proof-worker", "proof worker stopped without a result"),
+                ))
+            }
         }
-        let worker = self.worker.as_ref().expect("started worker");
-        if worker.input.send(Some(Request::Check(sources))).is_ok()
-            && let Ok(Response::Diagnostics(messages)) = worker.output.recv()
-        {
-            return messages;
-        }
-        // A dead worker never leaves a previous success authoritative. A later
-        // check starts with a fresh seed/cache rather than a half-mutated world.
-        self.worker = None;
-        project(
-            uri,
-            text,
-            &fault("lsp-proof-worker", "proof worker stopped without a result"),
-        )
     }
 }
 
@@ -364,21 +746,41 @@ fn select<'a>(
     Ok((&mut kept.session, Some(WorldUse { imports, retained })))
 }
 
-fn check_sources(sessions: &mut Sessions, sources: &Sources) -> Vec<String> {
+fn check_sources_with_cancel(
+    sessions: &mut Sessions,
+    sources: &Sources,
+    cancellation: Option<&dyn fln::CancellationProbe>,
+) -> CheckRunOutcome {
+    if cancellation.is_some_and(fln::CancellationProbe::is_cancelled) {
+        return CheckRunOutcome::Cancelled;
+    }
     let uri = &sources.uris[0];
     // Source bytes came from validated UTF-8 editor text or the native lexer.
     let text = std::str::from_utf8(&sources.sources[0]).expect("editor source is UTF-8");
     let (session, world) = match select(sessions, sources) {
         Ok(selected) => selected,
-        Err(Unavailable::Snapshot(snapshot)) => return project(uri, text, &snapshot),
+        Err(Unavailable::Snapshot(snapshot)) => {
+            return CheckRunOutcome::Completed {
+                messages: project(uri, text, &snapshot),
+                cache_hit: None,
+                authoritative: false,
+            };
+        }
         Err(Unavailable::Failure(failure)) => {
-            return project(
-                uri,
-                text,
-                &self::failure(uri, text.as_bytes(), 0, failure.class, &failure.detail),
-            );
+            return CheckRunOutcome::Completed {
+                messages: project(
+                    uri,
+                    text,
+                    &self::failure(uri, text.as_bytes(), 0, failure.class, &failure.detail),
+                ),
+                cache_hit: None,
+                authoritative: false,
+            };
         }
     };
+    if cancellation.is_some_and(fln::CancellationProbe::is_cancelled) {
+        return CheckRunOutcome::Cancelled;
+    }
     let world = match world {
         Some(world) => format!(
             ",\"importWorld\":{},\"imports\":[{}]",
@@ -397,8 +799,9 @@ fn check_sources(sessions: &mut Sessions, sources: &Sources) -> Vec<String> {
         .zip(&sources.sources)
         .map(|(name, source)| fln::SourceModuleInput { name, source })
         .collect();
-    match session.check(&inputs, &sources.names[0]) {
+    match session.check_with_cancel(&inputs, &sources.names[0], cancellation) {
         Ok(fln::Outcome::Complete(result)) => {
+            let cache_hit = Some(result.reused_modules > 0 && result.elaborated_modules == 0);
             let mut messages = project(
                 uri,
                 text,
@@ -412,16 +815,34 @@ fn check_sources(sessions: &mut Sessions, sources: &Sources) -> Vec<String> {
                 result.checked.checked.theorems, result.reused_modules, result.elaborated_modules,
                 result.checked.replayed_declarations,
             ));
-            messages
+            CheckRunOutcome::Completed {
+                messages,
+                cache_hit,
+                authoritative: true,
+            }
         }
-        Ok(fln::Outcome::Inconclusive(reason)) => project(
-            uri,
-            text,
-            &nonanswer("source-check", &format!("{reason:?}")),
-        ),
-        Ok(fln::Outcome::InternalFault(reason)) => {
-            project(uri, text, &fault("source-check", &format!("{reason:?}")))
+        Ok(fln::Outcome::Inconclusive(reason))
+            if matches!(
+                reason.cause,
+                fln_core::outcome::InconclusiveCause::Cancelled { .. }
+            ) =>
+        {
+            CheckRunOutcome::Cancelled
         }
+        Ok(fln::Outcome::Inconclusive(reason)) => CheckRunOutcome::Completed {
+            messages: project(
+                uri,
+                text,
+                &nonanswer("source-check", &format!("{reason:?}")),
+            ),
+            cache_hit: None,
+            authoritative: false,
+        },
+        Ok(fln::Outcome::InternalFault(reason)) => CheckRunOutcome::Completed {
+            messages: project(uri, text, &fault("source-check", &format!("{reason:?}"))),
+            cache_hit: None,
+            authoritative: false,
+        },
         Err(error) => {
             let offset = match &error {
                 SourceModuleCheckError::Header { module, error } if module == &sources.names[0] => {
@@ -436,11 +857,18 @@ fn check_sources(sessions: &mut Sessions, sources: &Sources) -> Vec<String> {
                 _ => 0,
             };
             let (class, _, _) = error.disposition();
-            project(
-                uri,
-                text,
-                &failure(uri, &sources.sources[0], offset, class, &error.to_string()),
-            )
+            CheckRunOutcome::Completed {
+                messages: project(
+                    uri,
+                    text,
+                    &failure(uri, &sources.sources[0], offset, class, &error.to_string()),
+                ),
+                cache_hit: None,
+                authoritative: !matches!(
+                    class,
+                    "internal-fault" | "resource" | "inconclusive" | "cancelled"
+                ),
+            }
         }
     }
 }
@@ -464,21 +892,44 @@ impl fln_server::dispatch::WorkspaceChecker for Checker {
             SOURCE_RUN_DEFAULT_MAX_BYTES,
         )
         .map_err(|error| error.detail)?;
-        if self.worker.is_none() {
-            self.worker =
-                Some(Worker::new().map_err(|e| format!("could not start proof worker: {e}"))?);
-        }
-        let worker = self.worker.as_ref().expect("started query worker");
-        if worker
-            .input
-            .send(Some(Request::Inspect(sources, query.offset, query.kind)))
-            .is_ok()
-            && let Ok(Response::Semantic(result)) = worker.output.recv()
+        let runtime = self.ensure_runtime()?;
+        let sessions = Arc::clone(&self.sessions);
+        let offset = query.offset;
+        let kind = query.kind;
+        let counters = Arc::clone(&self.counters);
+        let result = runtime.block_on(async move {
+            let root_cx = Cx::current().expect("asupersync runtime Cx");
+            let child = root_cx
+                .open_child_region(ChildRegionSpec::inherit())
+                .await
+                .map_err(|error| format!("could not open query region: {error:?}"))?;
+            let _ = counters.on_region_opened();
+            let _ = counters.on_task_spawned();
+            let mut task = child
+                .cx()
+                .spawn(move |_task_cx| async move {
+                    let Ok(mut guard) = sessions.lock() else {
+                        return Err("proof worker session lock poisoned".to_owned());
+                    };
+                    inspect_sources(&mut guard, &sources, offset, kind)
+                })
+                .map_err(|error| format!("could not spawn query task: {error:?}"))?;
+            let joined = task.join(&root_cx).await;
+            let _ = counters.on_task_drained();
+            let _ = child.close().await;
+            let _ = counters.on_region_drained(false);
+            match joined {
+                Ok(answer) => answer,
+                Err(_) => Err("proof worker stopped without a semantic result".to_owned()),
+            }
+        });
+        if result
+            .as_ref()
+            .is_err_and(|msg| msg == "proof worker stopped without a semantic result")
         {
-            return result;
+            self.sessions = Arc::new(Mutex::new(Sessions::default()));
         }
-        self.worker = None;
-        Err("proof worker stopped without a semantic result".to_owned())
+        result
     }
 
     fn check(
@@ -489,6 +940,18 @@ impl fln_server::dispatch::WorkspaceChecker for Checker {
     ) -> Vec<String> {
         Checker::check(self, uri, text, documents)
     }
+
+    fn check_cancellable(
+        &mut self,
+        uri: &str,
+        version: i64,
+        text: &str,
+        documents: &[OpenDocumentSource<'_>],
+        allow_cancel: bool,
+    ) -> CheckOutcome {
+        self.check_cancellable_inner(uri, version, text, documents, allow_cancel)
+    }
+
     fn affected(
         &mut self,
         changed: &[String],

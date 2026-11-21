@@ -168,8 +168,17 @@ mod tests {
     }
     fn check(adapter: &mut Adapter<'_>, docs: &DocumentSession) {
         assert_eq!(
-            check_document(&mut Vec::new(), URI, docs.text(URI).unwrap(), adapter, docs).unwrap(),
-            DiagnosticCompletion::Complete
+            check_document(
+                &mut Vec::new(),
+                URI,
+                docs.version(URI).unwrap_or(0),
+                docs.text(URI).unwrap(),
+                adapter,
+                docs,
+                false,
+            )
+            .unwrap(),
+            Some(DiagnosticCompletion::Complete)
         );
     }
     fn connect(
@@ -270,8 +279,17 @@ mod tests {
         assert!(result.contains("second: absent") && !result.contains("first: absent"));
         docs.change(URI, 2, "failure".into()).unwrap();
         assert_eq!(
-            check_document(&mut Vec::new(), URI, "failure", &mut adapter, &docs).unwrap(),
-            DiagnosticCompletion::Failed
+            check_document(
+                &mut Vec::new(),
+                URI,
+                2,
+                "failure",
+                &mut adapter,
+                &docs,
+                false
+            )
+            .unwrap(),
+            Some(DiagnosticCompletion::Failed)
         );
         let result = request(&mut sessions, &id, &docs, &mut adapter, "{}");
         assert!(result.contains(r#""code":-32803"#) && !result.contains(r#""result":[]"#));

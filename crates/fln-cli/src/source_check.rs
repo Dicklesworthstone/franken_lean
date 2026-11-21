@@ -117,12 +117,13 @@ impl ModuleBuildContext {
         ))
     }
 
-    pub(super) fn compile(
+    pub(super) fn compile_with_cancel(
         &mut self,
         modules: &[fln::SourceModuleInput<'_>],
         entry: &fln::Name,
         write_budget: fln::OleanWriteBudget,
         records: Option<fln::source_check::modules::persisted::PersistedModules<'_>>,
+        cancellation: Option<&dyn fln::CancellationProbe>,
     ) -> Result<
         fln::Outcome<(
             fln::source_check::modules::SourceModuleBuild,
@@ -136,10 +137,15 @@ impl ModuleBuildContext {
         };
         match &mut self.kind {
             ModuleBuildKind::Ordinary(session) => session
-                .compile_with_records(modules, entry, write_budget, records, None)
+                .compile_with_records(modules, entry, write_budget, records, cancellation)
                 .map(|outcome| outcome.map_complete(|built| (built, None)))
                 .map_err(failure),
             ModuleBuildKind::ImportedMacros(context) => {
+                if cancellation.is_some_and(fln::CancellationProbe::is_cancelled) {
+                    return Ok(fln::Outcome::Inconclusive(fln::Inconclusive::cancelled(
+                        "lake-build/imported-macros",
+                    )));
+                }
                 let ImportedMacroBuildContext { base, limits } = context.as_mut();
                 let result = base
                     .receipt

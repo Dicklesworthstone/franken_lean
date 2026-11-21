@@ -576,6 +576,7 @@ struct Compilation {
 struct CompileFacets<'a> {
     entries: &'a [Name],
     executable: &'a BTreeSet<Name>,
+    cancellation: Option<&'a dyn fln::CancellationProbe>,
 }
 
 /// Every local dependency of an executable target also needs its own companion.
@@ -605,6 +606,7 @@ fn compile(
     records: Option<PersistedModules<'_>>,
     macro_config: Option<&source_check::ImportedMacroConfig>,
 ) -> Result<Compilation, Failure> {
+    let cancellation = facets.cancellation;
     let mut artifacts = BTreeMap::new();
     let mut imports = Vec::new();
     let mut macro_reports = Vec::new();
@@ -621,6 +623,12 @@ fn compile(
     let limits = SourceModuleCheckLimits::new(fln::SourceCheckLimits::new(admission));
     let mut artifact_bytes = 0usize;
     for entry in facets.entries {
+        if cancellation.is_some_and(fln::CancellationProbe::is_cancelled) {
+            return Err(Failure::new(
+                "cancelled",
+                "module build cancelled before compiling target",
+            ));
+        }
         let mut closure = BTreeSet::new();
         let mut seen = BTreeSet::new();
         let mut external = Vec::new();
@@ -678,7 +686,7 @@ fn compile(
             .as_mut()
             .expect("the current external context is installed")
             .1
-            .compile(&inputs, entry, budget, records)
+            .compile_with_cancel(&inputs, entry, budget, records, cancellation)
             .map_err(|(class, detail, authority)| Failure {
                 class,
                 detail,
@@ -687,9 +695,17 @@ fn compile(
         let (built, macro_report) = match built {
             Outcome::Complete(built) => built,
             Outcome::Inconclusive(reason) => {
+                let class = if matches!(
+                    reason.cause,
+                    fln_core::outcome::InconclusiveCause::Cancelled { .. }
+                ) {
+                    "cancelled"
+                } else {
+                    "inconclusive"
+                };
                 return Err(Failure::new(
-                    "inconclusive",
-                    format!("module build exhausted its resources: {reason:?}"),
+                    class,
+                    format!("module build did not complete: {reason:?}"),
                 ));
             }
             Outcome::InternalFault(fault) => {
@@ -1053,7 +1069,14 @@ fn build(
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
     command: BuildCommand,
+    cancellation: Option<&dyn fln::CancellationProbe>,
 ) -> Result<MultiplexerOutput, Failure> {
+    if cancellation.is_some_and(fln::CancellationProbe::is_cancelled) {
+        return Err(Failure::new(
+            "cancelled",
+            "module build cancelled before loading configuration",
+        ));
+    }
     let root = directory
         .canonicalize()
         .map_err(|error| Failure::io(&directory, error))?;
@@ -1098,6 +1121,7 @@ fn build(
         CompileFacets {
             entries: &plan.entries,
             executable: &executable,
+            cancellation,
         },
         &modules,
         jobs,
@@ -1105,6 +1129,12 @@ fn build(
         records.as_ref().and_then(|records| records.persisted()),
         macro_config.as_ref(),
     )?;
+    if cancellation.is_some_and(fln::CancellationProbe::is_cancelled) {
+        return Err(Failure::new(
+            "cancelled",
+            "module build cancelled before artifact publication",
+        ));
+    }
     let records_state = if macro_reports.is_empty() {
         records
             .as_ref()
@@ -1371,7 +1401,9 @@ fn record_snapshot(
 }
 
 /// `jobs` external `.olean` closure modules are checked at once; the build does
-/// not depend on it.
+/// not depend on it. Execution runs inside an owned `asupersync` `ChildRegion`
+/// on a stack-calibrated runtime worker so cancellation drains cleanly without
+/// publishing artifacts or leaking `.fln-olean-build.lock` (bead `fln-otk7`).
 pub(super) fn run(
     directory: PathBuf,
     targets: Vec<String>,
@@ -1380,27 +1412,259 @@ pub(super) fn run(
     posture: ImportPosture,
     command: BuildCommand,
 ) -> MultiplexerOutput {
-    let worker = std::thread::Builder::new()
-        .name("fln-lake-build".to_owned())
-        // Imports are admitted on this thread under the `.olean` depth budget.
-        .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
-        .spawn(move || build(directory, targets, json, jobs, posture, command));
-    match worker {
-        Ok(worker) => match worker.join() {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => command.failure(error, json),
-            Err(_) => command.failure(
-                Failure::new("internal-fault", "module build worker panicked"),
+    let counters = crate::runtime_plane::RegionCounters::new();
+    let sink = crate::runtime_plane::RuntimeEventSink::from_env();
+    run_in_asupersync_region(
+        directory, targets, json, jobs, posture, command, None, &counters, &sink,
+    )
+}
+
+/// Run a Lake build inside an owned `asupersync` `ChildRegion`, optionally
+/// listening to an external `asupersync::channel::oneshot::Receiver<()>` cancel
+/// signal (and reporting region/task/cancellation counters and structured logs).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_in_asupersync_region(
+    directory: PathBuf,
+    targets: Vec<String>,
+    json: bool,
+    jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
+    command: BuildCommand,
+    mut cancel_rx: Option<asupersync::channel::oneshot::Receiver<()>>,
+    counters: &crate::runtime_plane::RegionCounters,
+    sink: &crate::runtime_plane::RuntimeEventSink,
+) -> MultiplexerOutput {
+    let runtime = match crate::runtime_plane::build_effect_runtime(
+        "fln-lake-asupersync",
+        2,
+        OLEAN_CHECK_KERNEL_STACK_BYTES,
+    ) {
+        Ok(runtime) => runtime,
+        Err(detail) => {
+            return command.failure(Failure::new("resource", detail), json);
+        }
+    };
+
+    let request_id = counters.next_request_id();
+    let generation = request_id;
+    let target_label = if targets.is_empty() {
+        directory.display().to_string()
+    } else {
+        targets.join(",")
+    };
+
+    let result = runtime.block_on(async {
+        let root_cx = asupersync::Cx::current().expect("asupersync runtime Cx");
+        let child = root_cx
+            .open_child_region(asupersync::cx::ChildRegionSpec::inherit())
+            .await
+            .map_err(|error| {
+                Failure::new(
+                    "resource",
+                    format!("could not open lake build region: {error:?}"),
+                )
+            })?;
+        let region_id = format!("{:?}", child.region_id());
+        let (active_regions, _) = counters.on_region_opened();
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_cancel = std::sync::Arc::clone(&cancel_flag);
+        let started_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_started = std::sync::Arc::clone(&started_flag);
+        let live_tasks = counters.on_task_spawned();
+        sink.record(crate::runtime_plane::RuntimeEvent {
+            subsystem: "lake",
+            event: "region_opened",
+            request_id,
+            target: target_label.clone(),
+            version: None,
+            generation,
+            region_id: region_id.clone(),
+            cancellation_outcome: "none",
+            cache_hit: None,
+            active_regions,
+            live_tasks,
+            authoritative_publication: false,
+            detail: None,
+        });
+
+        let mut task = match child.cx().spawn(move |task_cx| async move {
+            task_started.store(true, std::sync::atomic::Ordering::SeqCst);
+            let probe = crate::runtime_plane::CxCancellationProbe::new(task_cx, task_cancel);
+            build(
+                directory,
+                targets,
                 json,
-            ),
-        },
-        Err(error) => command.failure(
-            Failure::new(
-                "resource",
-                format!("could not start module build worker: {error}"),
-            ),
-            json,
-        ),
+                jobs,
+                posture,
+                command,
+                Some(&probe),
+            )
+        }) {
+            Ok(task) => task,
+            Err(error) => {
+                let _ = counters.on_task_drained();
+                let _ = child.close().await;
+                let (active_regions, live_tasks) = counters.on_region_drained(false);
+                sink.record(crate::runtime_plane::RuntimeEvent {
+                    subsystem: "lake",
+                    event: "region_failed",
+                    request_id,
+                    target: target_label.clone(),
+                    version: None,
+                    generation,
+                    region_id,
+                    cancellation_outcome: "none",
+                    cache_hit: None,
+                    active_regions,
+                    live_tasks,
+                    authoritative_publication: false,
+                    detail: Some(format!("spawn failed: {error:?}")),
+                });
+                return Err(Failure::new(
+                    "resource",
+                    format!("could not spawn lake build task: {error:?}"),
+                ));
+            }
+        };
+
+        let mut cancel_requested = false;
+        let join_outcome = if let Some(ref mut rx) = cancel_rx {
+            let mut join_fut = std::pin::pin!(task.join(&root_cx));
+            let mut cancel_fut = std::pin::pin!(rx.recv(&root_cx));
+            let raced = std::future::poll_fn(|poll_cx| {
+                use std::future::Future;
+                use std::task::Poll;
+                if let Poll::Ready(res) = join_fut.as_mut().poll(poll_cx) {
+                    return Poll::Ready(Some(res));
+                }
+                if let Poll::Ready(Ok(())) = cancel_fut.as_mut().poll(poll_cx) {
+                    return Poll::Ready(None);
+                }
+                Poll::Pending
+            })
+            .await;
+            match raced {
+                Some(res) => res,
+                None => {
+                    cancel_requested = true;
+                    cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = child.cancel(crate::runtime_plane::cancel_reason(
+                        "lake build cancelled by caller",
+                    ));
+                    join_fut.await
+                }
+            }
+        } else {
+            task.join(&root_cx).await
+        };
+
+        let _ = counters.on_task_drained();
+        let _ = child.close().await;
+        let (active_regions, live_tasks) = counters.on_region_drained(cancel_requested);
+
+        if cancel_requested {
+            let cancellation_outcome = match &join_outcome {
+                Ok(Err(error)) if error.class == "cancelled" => {
+                    if started_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        "cancelled_active"
+                    } else {
+                        "cancelled_before_start"
+                    }
+                }
+                Err(_) => "cancelled_active",
+                Ok(Ok(_)) => "raced_with_completion_discarded",
+                Ok(Err(_)) => "cancelled_active",
+            };
+            sink.record(crate::runtime_plane::RuntimeEvent {
+                subsystem: "lake",
+                event: "region_cancelled_and_drained",
+                request_id,
+                target: target_label,
+                version: None,
+                generation,
+                region_id,
+                cancellation_outcome,
+                cache_hit: None,
+                active_regions,
+                live_tasks,
+                authoritative_publication: false,
+                detail: None,
+            });
+            return Err(Failure::new(
+                "cancelled",
+                "module build cancelled and region drained without publication",
+            ));
+        }
+
+        match join_outcome {
+            Ok(Ok(output)) => {
+                sink.record(crate::runtime_plane::RuntimeEvent {
+                    subsystem: "lake",
+                    event: "region_completed",
+                    request_id,
+                    target: target_label,
+                    version: None,
+                    generation,
+                    region_id,
+                    cancellation_outcome: "none",
+                    cache_hit: None,
+                    active_regions,
+                    live_tasks,
+                    authoritative_publication: output.exit_code == 0,
+                    detail: None,
+                });
+                Ok(output)
+            }
+            Ok(Err(error)) => {
+                sink.record(crate::runtime_plane::RuntimeEvent {
+                    subsystem: "lake",
+                    event: "region_failed",
+                    request_id,
+                    target: target_label,
+                    version: None,
+                    generation,
+                    region_id,
+                    cancellation_outcome: if error.class == "cancelled" {
+                        "cancelled_active"
+                    } else {
+                        "none"
+                    },
+                    cache_hit: None,
+                    active_regions,
+                    live_tasks,
+                    authoritative_publication: false,
+                    detail: Some(error.detail.clone()),
+                });
+                Err(error)
+            }
+            Err(error) => {
+                sink.record(crate::runtime_plane::RuntimeEvent {
+                    subsystem: "lake",
+                    event: "region_failed",
+                    request_id,
+                    target: target_label,
+                    version: None,
+                    generation,
+                    region_id,
+                    cancellation_outcome: "none",
+                    cache_hit: None,
+                    active_regions,
+                    live_tasks,
+                    authoritative_publication: false,
+                    detail: Some(format!("module build task join failed: {error:?}")),
+                });
+                Err(Failure::new(
+                    "internal-fault",
+                    format!("module build worker failed: {error:?}"),
+                ))
+            }
+        }
+    });
+
+    crate::runtime_plane::shutdown_runtime(runtime);
+    match result {
+        Ok(output) => output,
+        Err(error) => command.failure(error, json),
     }
 }
 

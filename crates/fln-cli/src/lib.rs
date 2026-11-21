@@ -19,6 +19,7 @@ mod guard_spec_tests;
 mod imported_ir;
 mod lake_build;
 mod output;
+pub mod runtime_plane;
 mod source_check;
 mod source_evaluation;
 mod source_main;
@@ -14876,16 +14877,18 @@ fn run_sources(
     )
 }
 
-/// Run the shared native proof-checking LSP session on process standard streams.
+/// Run the shared native proof-checking LSP session on process standard streams,
+/// backed by an `asupersync` `Cx`-region effect plane with active generation
+/// cancellation on superseding edits (bead `fln-otk7`).
 pub fn serve_lsp() -> MultiplexerOutput {
     use std::io::{BufReader, BufWriter, Write};
-    let stdin = std::io::stdin();
+    let reader = BufReader::new(std::io::stdin());
     let stdout = std::io::stdout();
-    let mut reader = BufReader::new(stdin.lock());
     let mut writer = BufWriter::new(stdout.lock());
+    let counters = std::sync::Arc::new(runtime_plane::RegionCounters::new());
+    let sink = runtime_plane::RuntimeEventSink::from_env();
 
-    let mut checker = source_check::lsp::Checker::new();
-    let outcome = fln_server::dispatch::serve_workspace(&mut reader, &mut writer, &mut checker);
+    let outcome = serve_lsp_with_streams(reader, &mut writer, counters, sink);
     if let Err(error) = writer.flush() {
         return MultiplexerOutput::failure(
             format!("fln serve-lsp: transport flush error: {error}\n"),
@@ -14907,6 +14910,75 @@ pub fn serve_lsp() -> MultiplexerOutput {
             MultiplexerOutput::failure(format!("fln serve-lsp: transport error: {error}\n"), 1)
         }
     }
+}
+
+/// Run the native `asupersync`-backed LSP session against caller-supplied streams
+/// with explicit region counters and structured runtime event sink.
+pub fn serve_lsp_with_streams<R, W>(
+    reader: R,
+    writer: &mut W,
+    counters: std::sync::Arc<runtime_plane::RegionCounters>,
+    sink: runtime_plane::RuntimeEventSink,
+) -> std::io::Result<fln_server::dispatch::ServerOutcome>
+where
+    R: std::io::BufRead + Send + 'static,
+    W: std::io::Write,
+{
+    let stack_bytes = OLEAN_CHECK_KERNEL_STACK_BYTES.max(SOURCE_RUN_KERNEL_STACK_BYTES);
+    let runtime = std::sync::Arc::new(
+        runtime_plane::build_effect_runtime("fln-lsp-asupersync", 2, stack_bytes)
+            .map_err(std::io::Error::other)?,
+    );
+    let (transport, reader_handle) = runtime_plane::IncomingTransport::spawn_reader(reader)?;
+    let mut source = runtime_plane::AsupersyncMessageSource::new(
+        std::sync::Arc::clone(&transport),
+        std::sync::Arc::clone(&runtime),
+    );
+    let mut checker = source_check::lsp::Checker::with_runtime(
+        std::sync::Arc::clone(&runtime),
+        Some(std::sync::Arc::clone(&transport)),
+        counters,
+        sink,
+    );
+    let outcome =
+        fln_server::dispatch::serve_workspace_with_source(&mut source, writer, &mut checker);
+    drop(checker);
+    drop(source);
+    drop(transport);
+    if let Ok(owned) = std::sync::Arc::try_unwrap(runtime) {
+        runtime_plane::shutdown_runtime(owned);
+    }
+    // The reader thread exits cleanly on EOF or channel disconnect once the
+    // server finishes; detach only if stdin remains blocked after clean exit.
+    if reader_handle.is_finished() {
+        let _ = reader_handle.join();
+    }
+    outcome
+}
+
+/// Run a Lake module build inside an owned `asupersync` `ChildRegion`, exposing
+/// cooperative cancellation, region accounting, and structured runtime logs for
+/// production and integration verification (bead `fln-otk7`).
+pub fn run_lake_build_in_region(
+    directory: PathBuf,
+    targets: Vec<String>,
+    json: bool,
+    jobs: std::num::NonZeroUsize,
+    cancel_rx: Option<asupersync::channel::oneshot::Receiver<()>>,
+    counters: &runtime_plane::RegionCounters,
+    sink: &runtime_plane::RuntimeEventSink,
+) -> MultiplexerOutput {
+    lake_build::run_in_asupersync_region(
+        directory,
+        targets,
+        json,
+        jobs,
+        ImportPosture::ReuseVerified,
+        lake_build::BuildCommand::Build,
+        cancel_rx,
+        counters,
+        sink,
+    )
 }
 
 /// Convert a byte offset in the UTF-8 document into a Lean 1-based-line,

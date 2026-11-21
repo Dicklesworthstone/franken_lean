@@ -4,6 +4,19 @@ use std::collections::BTreeSet;
 
 mod diagnostics;
 
+/// Framed JSON-RPC message stream consumed by the LSP dispatcher.
+pub trait MessageSource {
+    fn read_message(&mut self) -> io::Result<Option<Vec<u8>>>;
+}
+
+pub(super) struct BufReadMessageSource<'a>(pub(super) &'a mut dyn BufRead);
+
+impl MessageSource for BufReadMessageSource<'_> {
+    fn read_message(&mut self) -> io::Result<Option<Vec<u8>>> {
+        transport::read_message(self.0)
+    }
+}
+
 /// An import-aware checker that can identify the open documents affected by a
 /// source event. `affected` must include transitive consumers, or conservatively
 /// include every possible consumer when dependency discovery was incomplete.
@@ -36,6 +49,23 @@ pub trait WorkspaceChecker {
 
     fn check(&mut self, uri: &str, text: &str, documents: &[OpenDocumentSource<'_>])
     -> Vec<String>;
+
+    /// Region-cancellable check entry point. When `allow_cancel` is true and a
+    /// superseding edit or close arrives while checking, the implementation may
+    /// cancel its active check region, drain it to quiescence, and return
+    /// [`CheckOutcome::Cancelled`] without publishing stale diagnostics.
+    fn check_cancellable(
+        &mut self,
+        uri: &str,
+        version: i64,
+        text: &str,
+        documents: &[OpenDocumentSource<'_>],
+        allow_cancel: bool,
+    ) -> CheckOutcome {
+        let _ = (version, allow_cancel);
+        CheckOutcome::Complete(self.check(uri, text, documents))
+    }
+
     fn affected(&mut self, changed: &[String], documents: &[OpenDocumentSource<'_>])
     -> Vec<String>;
 }
@@ -77,6 +107,23 @@ impl CheckSource for Adapter<'_> {
         self.2.record(uri, text, documents, &notifications);
         notifications
     }
+    fn check_cancellable(
+        &mut self,
+        uri: &str,
+        version: i64,
+        text: &str,
+        documents: &[OpenDocumentSource<'_>],
+        allow_cancel: bool,
+    ) -> CheckOutcome {
+        self.1 = semantic::index::Revision::new();
+        let outcome = self
+            .0
+            .check_cancellable(uri, version, text, documents, allow_cancel);
+        if let CheckOutcome::Complete(notifications) = &outcome {
+            self.2.record(uri, text, documents, notifications);
+        }
+        outcome
+    }
     fn tracks_dependencies(&self) -> bool {
         true
     }
@@ -101,9 +148,22 @@ pub fn serve_workspace(
     output: &mut dyn Write,
     checker: &mut dyn WorkspaceChecker,
 ) -> io::Result<ServerOutcome> {
+    let mut source = BufReadMessageSource(input);
+    serve_workspace_with_source(&mut source, output, checker)
+}
+
+/// Workspace LSP loop backed by an explicit [`MessageSource`], allowing an
+/// async runtime transport (such as `asupersync`) to observe superseding edits
+/// while a proof-check region is actively running without duplicating protocol
+/// state or JSON-RPC framing.
+pub fn serve_workspace_with_source(
+    source: &mut dyn MessageSource,
+    output: &mut dyn Write,
+    checker: &mut dyn WorkspaceChecker,
+) -> io::Result<ServerOutcome> {
     let revision = semantic::index::Revision::new();
-    super::serve_inner(
-        input,
+    super::serve_inner_with_source(
+        source,
         output,
         &mut Adapter(checker, revision, diagnostics::Cache::default()),
     )
@@ -169,7 +229,16 @@ pub(super) fn refresh(
     }
     for target in targets {
         let completion = match target.text {
-            Some(text) => check_document(output, target.uri, text, checker, session)?,
+            Some(text) => check_document(
+                output,
+                target.uri,
+                target.version,
+                text,
+                checker,
+                session,
+                false,
+            )?
+            .unwrap_or(DiagnosticCompletion::Failed),
             None => {
                 write_protocol_message(output, clear_diagnostics_notification(target.uri))?;
                 write_protocol_message(

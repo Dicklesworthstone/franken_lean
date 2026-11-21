@@ -1800,16 +1800,17 @@ pub fn audit(root: &Path, graph: &GraphFile) -> Vec<Finding> {
                         }
                     };
                     let display = suite_manifest_path.display().to_string();
-                    let suite_manifest = match manifest::parse(&suite_text, &display) {
+                    let suite_manifest = match manifest::parse_suite_package(&suite_text, &display)
+                    {
                         Ok(manifest) => manifest,
                         Err(detail) => {
                             findings.push(suite_finding(
-                                &display,
-                                format!(
-                                    "suite package `{}` manifest is outside the constrained closure grammar: {detail}",
-                                    dependency.name
-                                ),
-                            ));
+                                    &display,
+                                    format!(
+                                        "suite package `{}` manifest failed audited package metadata extraction: {detail}",
+                                        dependency.name
+                                    ),
+                                ));
                             continue;
                         }
                     };
@@ -1856,21 +1857,26 @@ pub fn audit(root: &Path, graph: &GraphFile) -> Vec<Finding> {
                             ),
                         ));
                     }
-                    if row.proc_macro {
+                    if row.proc_macro != suite_manifest.proc_macro {
                         findings.push(policy_finding(
                             ALLOWLIST_FILE,
                             format!(
-                                "suite package `{}` claims proc-macro=yes, but its constrained manifest has no proc-macro target",
-                                dependency.name
+                                "suite package `{}` allowlist proc-macro={} but manifest lib.proc-macro is {}",
+                                dependency.name,
+                                if row.proc_macro { "yes" } else { "no" },
+                                suite_manifest.proc_macro
                             ),
                         ));
                     }
-                    if row.native_link {
+                    let has_native_link = suite_manifest.links.is_some();
+                    if row.native_link != has_native_link {
                         findings.push(policy_finding(
                             ALLOWLIST_FILE,
                             format!(
-                                "suite package `{}` claims native-link=yes, but its constrained manifest has no links key",
-                                dependency.name
+                                "suite package `{}` allowlist native-link={} but manifest links presence is {}",
+                                dependency.name,
+                                if row.native_link { "yes" } else { "no" },
+                                has_native_link
                             ),
                         ));
                     }

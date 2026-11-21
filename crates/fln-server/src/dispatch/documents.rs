@@ -11,6 +11,17 @@ pub struct OpenDocumentSource<'a> {
 
 pub type OnDocumentCheck<'a> = dyn FnMut(&str, &str, &[OpenDocumentSource<'_>]) -> Vec<String> + 'a;
 
+/// Result of one document check callback.
+///
+/// `Cancelled` means a superseding edit or close arrived while the check was
+/// actively running; the cancelled candidate must not publish diagnostics,
+/// update the diagnostic frontier, or acquire publication authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckOutcome {
+    Complete(Vec<String>),
+    Cancelled,
+}
+
 pub(super) trait CheckSource {
     fn semantic_queries(&self) -> bool {
         false
@@ -36,6 +47,17 @@ pub(super) trait CheckSource {
     }
     fn check(&mut self, uri: &str, text: &str, documents: &[OpenDocumentSource<'_>])
     -> Vec<String>;
+    fn check_cancellable(
+        &mut self,
+        uri: &str,
+        version: i64,
+        text: &str,
+        documents: &[OpenDocumentSource<'_>],
+        allow_cancel: bool,
+    ) -> CheckOutcome {
+        let _ = (version, allow_cancel);
+        CheckOutcome::Complete(self.check(uri, text, documents))
+    }
 }
 impl<F: FnMut(&str, &str) -> Vec<String>> CheckSource for F {
     fn check(&mut self, uri: &str, text: &str, _: &[OpenDocumentSource<'_>]) -> Vec<String> {

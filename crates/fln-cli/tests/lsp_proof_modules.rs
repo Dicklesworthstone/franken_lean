@@ -215,10 +215,14 @@ fn open_imports_override_disk_and_closed_imports_return_to_disk_without_stale_hi
     let entry = uri(&root.join("Main.lean"));
     let messages = fln(&[
         open(&lib, "def value := 7"),
+        wait(&lib, 1, 21),
         open(&entry, "import Lib\ntheorem use : value = 7 := by rfl"),
+        wait(&entry, 1, 22),
         change(&lib, 2, "def value := 9"),
+        wait(&lib, 2, 23),
         document("textDocument/didSave", &entry),
         change(&entry, 2, "import Lib\ntheorem use : value = 9 := by rfl"),
+        wait(&entry, 2, 24),
         document("textDocument/didClose", &lib),
         document("textDocument/didSave", &entry),
         change(&entry, 3, "import Lib\ntheorem use : value = 0 := by rfl"),
@@ -253,6 +257,7 @@ fn invalidated_open_imports_block_disk_fallback_and_diagnostic_waits_then_recove
     );
     let messages = fln(&[
         open(&lib, "def value := 7"),
+        wait(&lib, 1, 22),
         open(&entry, "import Lib\ntheorem use : value = 7 := by rfl"),
         rejected,
         document("textDocument/didSave", &entry),
@@ -307,11 +312,13 @@ fn unrelated_documents_cannot_lend_declarations_and_false_proofs_do_not_poison_r
             "untitled:Main.lean",
             "theorem stolen : secret = 7 := by rfl",
         ),
+        wait("untitled:Main.lean", 1, 41),
         change(
             "untitled:Main.lean",
             2,
             "theorem falseProof : (0 : Nat) = 1 := by rfl",
         ),
+        wait("untitled:Main.lean", 2, 42),
         change(
             "untitled:Main.lean",
             3,
@@ -331,6 +338,7 @@ fn resource_stops_are_nonanswers_and_do_not_reuse_an_old_success() {
     let document_uri = "untitled:Limit.lean";
     let messages = fln(&[
         open(document_uri, "def valid := 7"),
+        wait(document_uri, 1, 30),
         change(document_uri, 2, &" ".repeat(1024 * 1024 + 1)),
         wait(document_uri, 2, 31),
         change(document_uri, 3, "theorem valid : (7 : Nat) = 7 := by rfl"),

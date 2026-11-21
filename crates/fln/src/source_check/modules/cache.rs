@@ -851,6 +851,7 @@ pub(super) fn run_collecting(
                                 public.as_mut(),
                                 Some((module.source, header.body_start)),
                                 session,
+                                cancellation,
                             )
                         }
                     };

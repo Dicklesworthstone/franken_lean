@@ -16,11 +16,15 @@ mod diagnostic_wait;
 mod incremental;
 mod watch;
 mod workspace;
-pub use workspace::{WorkspaceChecker, serve_workspace};
+pub use workspace::{
+    MessageSource, WorkspaceChecker, serve_workspace, serve_workspace_with_source,
+};
 mod documents;
 pub mod semantic;
 use documents::CheckSource;
-pub use documents::{OnDocumentCheck, OpenDocumentSource, serve, serve_with_documents};
+pub use documents::{
+    CheckOutcome, OnDocumentCheck, OpenDocumentSource, serve, serve_with_documents,
+};
 mod json;
 mod rpc;
 mod session;
@@ -75,6 +79,75 @@ struct CheckedVersion {
     uri: String,
     version: i64,
     completion: DiagnosticCompletion,
+}
+
+enum DocumentEventOutcome {
+    Checked(CheckedVersion),
+    Cancelled { uri: String },
+}
+
+/// How an incoming framed LSP message interacts with an active document check
+/// for `(active_uri, active_version)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncomingCheckAction {
+    /// A newer edit (`didChange` with `version > active_version` or malformed
+    /// payload on `active_uri`) or `didClose` for `active_uri`: actively cancel
+    /// the in-flight region, drain it, and discard its result.
+    Supersedes,
+    /// An edit/notification targeting a different document: buffer in FIFO
+    /// arrival order and keep watching for a superseding event on `active_uri`.
+    NonBarrier,
+    /// A query, wait, explicit save on `active_uri`, cancel-request, shutdown,
+    /// exit, or unclassifiable frame: buffer in FIFO order and let the active
+    /// check complete before serving this message.
+    Barrier,
+}
+
+/// Read-only envelope classifier used by async transports (`asupersync`) to
+/// decide whether a newly arrived frame supersedes an in-flight check region.
+#[must_use]
+pub fn classify_incoming_for_active_check(
+    frame: &[u8],
+    active_uri: &str,
+    active_version: i64,
+) -> IncomingCheckAction {
+    let Ok(text) = std::str::from_utf8(frame) else {
+        return IncomingCheckAction::Barrier;
+    };
+    let Ok(envelope) = parse_envelope(text) else {
+        return IncomingCheckAction::Barrier;
+    };
+    if !matches!(&envelope.id, RequestIdField::Absent) {
+        return IncomingCheckAction::Barrier;
+    }
+    let DecodedField::Valid(method) = &envelope.method else {
+        return IncomingCheckAction::Barrier;
+    };
+    match method.as_str() {
+        "textDocument/didChange" => match decoded_uri(envelope.params) {
+            Ok(uri) if uri == active_uri => match decoded_version(envelope.params) {
+                Ok(version) if version > active_version => IncomingCheckAction::Supersedes,
+                // Malformed version on the active document triggers invalidation in
+                // handle_change; stale non-monotone versions are ignored and never
+                // cancel a newer check.
+                Err(_) => IncomingCheckAction::Supersedes,
+                Ok(_) => IncomingCheckAction::NonBarrier,
+            },
+            Ok(_) => IncomingCheckAction::NonBarrier,
+            Err(_) => IncomingCheckAction::Barrier,
+        },
+        "textDocument/didClose" => match decoded_uri(envelope.params) {
+            Ok(uri) if uri == active_uri => IncomingCheckAction::Supersedes,
+            Ok(_) => IncomingCheckAction::NonBarrier,
+            Err(_) => IncomingCheckAction::Barrier,
+        },
+        "textDocument/didOpen" | "textDocument/didSave" => match decoded_uri(envelope.params) {
+            Ok(uri) if uri == active_uri => IncomingCheckAction::Barrier,
+            Ok(_) => IncomingCheckAction::NonBarrier,
+            Err(_) => IncomingCheckAction::Barrier,
+        },
+        _ => IncomingCheckAction::Barrier,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,12 +230,28 @@ fn classify_callback_message(message: &str, document_uri: &str) -> CallbackMessa
 fn check_document(
     output: &mut dyn Write,
     uri: &str,
+    version: i64,
     content: &str,
     on_did_open: &mut dyn CheckSource,
     session: &DocumentSession,
-) -> io::Result<DiagnosticCompletion> {
+    allow_cancel: bool,
+) -> io::Result<Option<DiagnosticCompletion>> {
     write_protocol_message(output, file_progress_notification(uri, true))?;
-    let notifications = on_did_open.check(uri, content, &session.sources());
+    output.flush()?;
+    let notifications = match on_did_open.check_cancellable(
+        uri,
+        version,
+        content,
+        &session.sources(),
+        allow_cancel,
+    ) {
+        CheckOutcome::Complete(notifications) => notifications,
+        CheckOutcome::Cancelled => {
+            write_protocol_message(output, file_progress_notification(uri, false))?;
+            output.flush()?;
+            return Ok(None);
+        }
+    };
     let classes = notifications
         .iter()
         .map(|message| classify_callback_message(message, uri))
@@ -218,11 +307,12 @@ fn check_document(
         write_protocol_message(output, diagnostic_callback_failure_notification(uri))?;
     }
     write_protocol_message(output, file_progress_notification(uri, false))?;
-    Ok(if callback_valid {
+    output.flush()?;
+    Ok(Some(if callback_valid {
         completion
     } else {
         DiagnosticCompletion::Failed
-    })
+    }))
 }
 
 fn complete_waits(output: &mut dyn Write, ids: Vec<RequestId>) -> io::Result<()> {
@@ -382,7 +472,7 @@ fn handle_open(
     session: &mut DocumentSession,
     params: RawField<'_>,
     on_did_open: &mut dyn CheckSource,
-) -> io::Result<Option<CheckedVersion>> {
+) -> io::Result<Option<DocumentEventOutcome>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
         Err(message) => {
@@ -408,12 +498,14 @@ fn handle_open(
     match session.open(uri.clone(), version, text.clone()) {
         Ok(retention) => {
             write_retention_outcome(output, retention)?;
-            let completion = check_document(output, &uri, &text, on_did_open, session)?;
-            Ok(Some(CheckedVersion {
-                uri,
-                version,
-                completion,
-            }))
+            match check_document(output, &uri, version, &text, on_did_open, session, true)? {
+                Some(completion) => Ok(Some(DocumentEventOutcome::Checked(CheckedVersion {
+                    uri,
+                    version,
+                    completion,
+                }))),
+                None => Ok(Some(DocumentEventOutcome::Cancelled { uri })),
+            }
         }
         Err(refusal) => {
             write_warning(output, refusal.message())?;
@@ -429,7 +521,7 @@ fn handle_change(
     frontiers: &mut BTreeMap<String, DiagnosticFrontier>,
     params: RawField<'_>,
     on_did_open: &mut dyn CheckSource,
-) -> io::Result<Option<CheckedVersion>> {
+) -> io::Result<Option<DocumentEventOutcome>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
         Err(message) => {
@@ -476,12 +568,14 @@ fn handle_change(
     match session.change(&uri, version, text.clone()) {
         Ok(retention) => {
             write_retention_outcome(output, retention)?;
-            let completion = check_document(output, &uri, &text, on_did_open, session)?;
-            Ok(Some(CheckedVersion {
-                uri,
-                version,
-                completion,
-            }))
+            match check_document(output, &uri, version, &text, on_did_open, session, true)? {
+                Some(completion) => Ok(Some(DocumentEventOutcome::Checked(CheckedVersion {
+                    uri,
+                    version,
+                    completion,
+                }))),
+                None => Ok(Some(DocumentEventOutcome::Cancelled { uri })),
+            }
         }
         Err(SessionRefusal::AccountingInvariant) => {
             invalidate_source_and_clear(
@@ -526,7 +620,9 @@ fn handle_save(
         DecodedField::Valid(text) => match session.save_with_text(&uri, text.clone()) {
             Ok(retention) => {
                 write_retention_outcome(output, retention)?;
-                let completion = check_document(output, &uri, &text, on_did_open, session)?;
+                let completion =
+                    check_document(output, &uri, version, &text, on_did_open, session, false)?
+                        .unwrap_or(DiagnosticCompletion::Failed);
                 Ok(Some(CheckedVersion {
                     uri,
                     version,
@@ -568,7 +664,9 @@ fn handle_save(
                 )?;
                 return Ok(None);
             };
-            let completion = check_document(output, &uri, &text, on_did_open, session)?;
+            let completion =
+                check_document(output, &uri, version, &text, on_did_open, session, false)?
+                    .unwrap_or(DiagnosticCompletion::Failed);
             Ok(Some(CheckedVersion {
                 uri,
                 version,
@@ -837,6 +935,15 @@ fn serve_inner(
     output: &mut dyn Write,
     on_did_open: &mut dyn CheckSource,
 ) -> io::Result<ServerOutcome> {
+    let mut source = workspace::BufReadMessageSource(input);
+    serve_inner_with_source(&mut source, output, on_did_open)
+}
+
+fn serve_inner_with_source(
+    input: &mut dyn MessageSource,
+    output: &mut dyn Write,
+    on_did_open: &mut dyn CheckSource,
+) -> io::Result<ServerOutcome> {
     let mut state = ServerState::Uninitialized;
     let mut documents_opened = 0u64;
     let mut documents_changed = 0u64;
@@ -848,7 +955,7 @@ fn serve_inner(
     let mut rpc_sessions = rpc::Sessions::default();
 
     loop {
-        let Some(message) = transport::read_message(input)? else {
+        let Some(message) = input.read_message()? else {
             return Ok(ServerOutcome {
                 clean: state == ServerState::ShuttingDown,
                 documents_opened,
@@ -938,6 +1045,7 @@ fn serve_inner(
             None
         };
         let mut checked_event = None;
+        let mut cancelled_current = false;
         match (method.as_str(), id, state) {
             ("initialize", Some(request_id), ServerState::Uninitialized) => {
                 if on_did_open.semantic_queries()
@@ -996,22 +1104,28 @@ fn serve_inner(
                 });
             }
             ("textDocument/didOpen", None, ServerState::Running) => {
-                if let Some(checked) =
-                    handle_open(output, &mut session, envelope.params, on_did_open)?
-                {
-                    documents_opened = documents_opened.saturating_add(1);
-                    rpc_sessions.close(&checked.uri);
-                    checked_event = Some(checked.uri.clone());
-                    record_frontier(&mut frontiers, &checked);
-                    settle_waits(
-                        output,
-                        waits.complete_ready(&checked.uri, checked.version),
-                        checked.completion,
-                    )?;
+                match handle_open(output, &mut session, envelope.params, on_did_open)? {
+                    Some(DocumentEventOutcome::Checked(checked)) => {
+                        documents_opened = documents_opened.saturating_add(1);
+                        rpc_sessions.close(&checked.uri);
+                        checked_event = Some(checked.uri.clone());
+                        record_frontier(&mut frontiers, &checked);
+                        settle_waits(
+                            output,
+                            waits.complete_ready(&checked.uri, checked.version),
+                            checked.completion,
+                        )?;
+                    }
+                    Some(DocumentEventOutcome::Cancelled { uri }) => {
+                        documents_opened = documents_opened.saturating_add(1);
+                        rpc_sessions.close(&uri);
+                        cancelled_current = true;
+                    }
+                    None => {}
                 }
             }
             ("textDocument/didChange", None, ServerState::Running) => {
-                if let Some(checked) = handle_change(
+                match handle_change(
                     output,
                     &mut session,
                     &mut waits,
@@ -1019,14 +1133,21 @@ fn serve_inner(
                     envelope.params,
                     on_did_open,
                 )? {
-                    documents_changed = documents_changed.saturating_add(1);
-                    checked_event = Some(checked.uri.clone());
-                    record_frontier(&mut frontiers, &checked);
-                    settle_waits(
-                        output,
-                        waits.complete_ready(&checked.uri, checked.version),
-                        checked.completion,
-                    )?;
+                    Some(DocumentEventOutcome::Checked(checked)) => {
+                        documents_changed = documents_changed.saturating_add(1);
+                        checked_event = Some(checked.uri.clone());
+                        record_frontier(&mut frontiers, &checked);
+                        settle_waits(
+                            output,
+                            waits.complete_ready(&checked.uri, checked.version),
+                            checked.completion,
+                        )?;
+                    }
+                    Some(DocumentEventOutcome::Cancelled { .. }) => {
+                        documents_changed = documents_changed.saturating_add(1);
+                        cancelled_current = true;
+                    }
+                    None => {}
                 }
             }
             ("textDocument/didSave", None, ServerState::Running) => {
@@ -1154,7 +1275,7 @@ fn serve_inner(
             }
             (_, None, _) => {}
         }
-        if let Some(before) = before {
+        if !cancelled_current && let Some(before) = before {
             let changed = before.changed(&session, checked_event.as_deref());
             if !changed.is_empty() {
                 workspace::refresh(
@@ -1168,6 +1289,7 @@ fn serve_inner(
                 )?;
             }
         }
+        output.flush()?;
     }
 }
 

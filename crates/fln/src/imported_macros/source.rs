@@ -1370,6 +1370,7 @@ impl Engine {
                 None,
                 None,
                 Some(&mut session),
+                None,
             ) {
                 Ok(outcome) => outcome.map_complete(Ok),
                 Err(error) => Outcome::Complete(Err(error)),

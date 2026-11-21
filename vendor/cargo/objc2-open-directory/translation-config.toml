@@ -1,0 +1,24 @@
+framework = "OpenDirectory"
+crate = "objc2-open-directory"
+required-crates = ["objc2", "objc2-foundation"]
+macos = "10.6"
+maccatalyst = "13.0"
+
+external.SFAuthorization.module = "SecurityFoundation.SFAuthorization"
+
+# Old compatibility aliases
+typedef._ODRecordType.skipped = true
+typedef._ODAttributeType.skipped = true
+typedef._ODAuthenticationType.skipped = true
+
+# These exist both in Objective-C and CF.
+# TODO: Make these somehow be the same type.
+typedef.ODContextRef.renamed = "ODContextRef"
+typedef.ODNodeRef.renamed = "ODNodeRef"
+typedef.ODQueryRef.renamed = "ODQueryRef"
+typedef.ODRecordRef.renamed = "ODRecordRef"
+typedef.ODSessionRef.renamed = "ODSessionRef"
+
+# Conflicts with each other, and it's not clear if one is preferred.
+fn.ODNodeCreateRecord.renamed = "create_record"
+fn.ODNodeCopyRecord.renamed = "copy_record"

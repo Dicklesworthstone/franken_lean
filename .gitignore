@@ -169,3 +169,8 @@ __pycache__/
 
 # RCH worker scratch (artifact-publication trees, cargo caches).
 .rch-tmp/
+
+# Vendored crates for offline closed-universe builds (fln-otk7): preserve
+# vendored source files whose names match `core` / `core.*` or `*.log`.
+!/vendor/cargo/
+!/vendor/cargo/**

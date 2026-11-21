@@ -262,8 +262,11 @@ fn removed_imports_and_stale_dependency_messages_do_not_schedule_spurious_checks
     let main = uri(&root.join("Main.lean"));
     let messages = fln(&[
         open(&lib, "def value := 0"),
+        wait(&lib, 1, 80),
         open(&main, "import Lib\ntheorem use : value = 0 := by rfl"),
+        wait(&main, 1, 81),
         change(&lib, 2, "def value := 0"),
+        wait(&lib, 2, 82),
         notify(
             "textDocument/didChange",
             format!(
@@ -272,6 +275,7 @@ fn removed_imports_and_stale_dependency_messages_do_not_schedule_spurious_checks
             ),
         ),
         change(&main, 2, "theorem independent : (0 : Nat) = 0 := by rfl"),
+        wait(&main, 2, 83),
         change(&lib, 3, "def value := 9"),
     ]);
     assert_eq!(successes_for(&messages, &main).len(), 3, "{messages:#?}");
@@ -289,7 +293,9 @@ fn structural_quoted_names_and_equivalent_file_uri_spellings_keep_dependency_ide
             &main,
             "import «Quoted.Library»\ntheorem use : value = 0 := by rfl",
         ),
+        wait(&main, 1, 84),
         open(&lib, "def value := 1"),
+        wait(&lib, 1, 85),
         change(&lib, 2, "def value := 0"),
     ]);
     assert_eq!(errors(&messages, &main).len(), 1, "{messages:#?}");

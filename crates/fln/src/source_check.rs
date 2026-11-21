@@ -819,7 +819,7 @@ impl Engine {
         limits: SourceCheckLimits,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
         self.check_source_files_recording(
-            sources, options, limits, None, None, None, None, None, None,
+            sources, options, limits, None, None, None, None, None, None, None,
         )
     }
 
@@ -837,7 +837,13 @@ impl Engine {
         mut public: Option<&mut modules::visibility::PublicWorld<'_>>,
         original_source: Option<(&[u8], fln_parse::BytePos)>,
         mut macros: Option<&mut crate::imported_macros::source::FileSession<'_>>,
+        cancellation: Option<&dyn crate::CancellationProbe>,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
+        if cancellation.is_some_and(crate::CancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "source-check/before-commands",
+            )));
+        }
         if let Some(reason) = macros.as_deref().and_then(|session| session.cancelled()) {
             return Ok(Outcome::Inconclusive(reason));
         }
@@ -908,6 +914,11 @@ impl Engine {
                 .map(|command| SourceStep::Command(command, true))
                 .collect();
             while let Some(step) = queue.pop_front() {
+                if cancellation.is_some_and(crate::CancellationProbe::is_cancelled) {
+                    return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                        "source-check/command",
+                    )));
+                }
                 if let Some(reason) = macros.as_deref().and_then(|session| session.cancelled()) {
                     return Ok(Outcome::Inconclusive(reason));
                 }

@@ -1899,6 +1899,9 @@ fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) 
     }
     let allowed_suite: BTreeSet<&str> = BTreeSet::from([
         "asupersync",
+        "franken-decision",
+        "franken-evidence",
+        "franken-kernel",
         "fsqlite",
         "franken_networkx",
         "frankensearch",
