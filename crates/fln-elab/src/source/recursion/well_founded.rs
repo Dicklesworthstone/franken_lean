@@ -323,10 +323,19 @@ pub(in crate::source) fn decreasing_tactic_expansion() -> &'static Syntax {
     EXPANSION.get_or_init(automatic_decreasing_proof)
 }
 
+fn direct_decreasing_proof() -> &'static Syntax {
+    static DIRECT: std::sync::OnceLock<Syntax> = std::sync::OnceLock::new();
+    DIRECT.get_or_init(|| build_decreasing_proof(false))
+}
+
 /// The pin's lexicographic constructor prefix and Nat base-case fragment of
 /// decreasing_tactic after the checked continuation has exposed its measure.
 /// This is native syntax expansion; no Reference metaprogram is executed.
 fn automatic_decreasing_proof() -> Syntax {
+    build_decreasing_proof(true)
+}
+
+fn build_decreasing_proof(include_simp: bool) -> Syntax {
     fn null(args: Vec<Syntax>) -> Syntax {
         Syntax::node(Name::from_components(["null"]), args)
     }
@@ -349,28 +358,23 @@ fn automatic_decreasing_proof() -> Syntax {
             )],
         )
     }
-    fn first_seqs(sequences: Vec<Syntax>) -> Syntax {
+    fn first(tactics: Vec<Syntax>) -> Syntax {
         Syntax::node(
             parser_kind(&["Tactic", "first"]),
             vec![
                 atom("first"),
                 null(
-                    sequences
+                    tactics
                         .into_iter()
-                        .map(|seq| {
-                            Syntax::node(Name::from_components(["group"]), vec![atom("|"), seq])
+                        .map(|tactic| {
+                            Syntax::node(
+                                Name::from_components(["group"]),
+                                vec![atom("|"), sequence(vec![tactic])],
+                            )
                         })
                         .collect(),
                 ),
             ],
-        )
-    }
-    fn first(tactics: Vec<Syntax>) -> Syntax {
-        first_seqs(
-            tactics
-                .into_iter()
-                .map(|tactic| sequence(vec![tactic]))
-                .collect(),
         )
     }
     fn lexicographic_constructors(family: &str) -> Syntax {
@@ -396,17 +400,6 @@ fn automatic_decreasing_proof() -> Syntax {
             vec![atom("repeat"), sequence(vec![first(alternatives)])],
         )
     }
-    let simp = Syntax::node(
-        parser_kind(&["Tactic", "simp"]),
-        vec![
-            atom("simp"),
-            null(Vec::new()),
-            null(Vec::new()),
-            null(Vec::new()),
-            null(Vec::new()),
-            null(Vec::new()),
-        ],
-    );
     let alternatives: Vec<_> = ["done", "assumption", "omega"]
         .into_iter()
         .map(|name| {
@@ -417,21 +410,28 @@ fn automatic_decreasing_proof() -> Syntax {
             Syntax::node(parser_kind(&["Tactic", name]), args)
         })
         .collect();
-    let direct = sequence(vec![
-        lexicographic_constructors("Prod"),
-        lexicographic_constructors("PSigma"),
-        first(alternatives.clone()),
-    ]);
-    let with_simp = sequence(vec![
-        Syntax::node(
+    let mut steps = Vec::with_capacity(4);
+    if include_simp {
+        let simp = Syntax::node(
+            parser_kind(&["Tactic", "simp"]),
+            vec![
+                atom("simp"),
+                null(Vec::new()),
+                null(Vec::new()),
+                null(Vec::new()),
+                null(Vec::new()),
+                null(Vec::new()),
+            ],
+        );
+        steps.push(Syntax::node(
             parser_kind(&["Tactic", "tacticTry_"]),
             vec![atom("try"), sequence(vec![simp])],
-        ),
-        lexicographic_constructors("Prod"),
-        lexicographic_constructors("PSigma"),
-        first(alternatives),
-    ]);
-    sequence(vec![first_seqs(vec![direct, with_simp])])
+        ));
+    }
+    steps.push(lexicographic_constructors("Prod"));
+    steps.push(lexicographic_constructors("PSigma"));
+    steps.push(first(alternatives));
+    sequence(steps)
 }
 
 impl Context {
@@ -1422,6 +1422,59 @@ impl Context {
         }))
     }
 
+    /// Try the default lexicographic/arithmetic tactic without running `simp`
+    /// first. When omega is unavailable (e.g. `Init.WFComputable` without
+    /// `Init.Omega`) or the goal needs `simp` (e.g. `SizeOf` lemmas), roll back
+    /// cleanly while retaining spent work and immutable environment caches so
+    /// the caller falls through to the full `automatic_decreasing_proof`.
+    fn try_direct_decreasing_proof(
+        &mut self,
+        goal: &tactics::ProofGoal,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let snapshot = self.clone();
+        let syntax = direct_decreasing_proof();
+        let result = (|| {
+            let state = self.start_decreasing_proof(syntax, vec![goal.clone()])?;
+            self.run_decreasing_proof(syntax, state)?;
+            Ok(true)
+        })();
+        if matches!(result, Ok(true)) {
+            self.txn.lctx = snapshot.txn.lctx;
+            return result;
+        }
+        let spent = self.txn.budget.heartbeats_consumed;
+        let model_cache = self.txn.nat_sub_model_cache.clone();
+        let registry_cache = self.registry_cache.clone();
+        let alias_cache = self.alias_cache.clone();
+        let protected_cache = self.protected_cache.clone();
+        let auxiliary_cache = self.auxiliary_cache.clone();
+        let deprecation_cache = self.deprecation_cache.clone();
+        let simp_key_cache = self.simp_key_cache.clone();
+        *self = snapshot;
+        self.txn.budget.heartbeats_consumed = spent;
+        self.txn.nat_sub_model_cache = model_cache;
+        self.registry_cache = registry_cache;
+        self.alias_cache = alias_cache;
+        self.protected_cache = protected_cache;
+        self.auxiliary_cache = auxiliary_cache;
+        self.deprecation_cache = deprecation_cache;
+        self.simp_key_cache = simp_key_cache;
+        match result {
+            Err(problem)
+                if tactics::backtrack::recoverable(&problem)
+                    || matches!(
+                        problem,
+                        NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
+                            tactics::TacticError::ArithmeticUnsupported
+                        ))
+                    ) =>
+            {
+                Ok(false)
+            }
+            result => result,
+        }
+    }
+
     /// Run the selected decreasing proof: a supplied script once, on every
     /// obligation in order; the default tactic once per obligation.
     fn prove_decreasing_goals(
@@ -1447,6 +1500,9 @@ impl Context {
                     .is_some_and(|state| state.mutual.is_none())
                     && self.try_fast_decreasing_sub(&goal)?
                 {
+                    continue;
+                }
+                if self.try_direct_decreasing_proof(&goal)? {
                     continue;
                 }
                 let state = self.start_decreasing_proof(prepared, vec![goal])?;
@@ -2068,7 +2124,10 @@ impl Context {
                 introduced: Vec::new(),
                 no_implicit_lambda: false,
             };
-            if default && self.try_fast_decreasing_sub(&fresh)? {
+            if default
+                && (self.try_fast_decreasing_sub(&fresh)?
+                    || self.try_direct_decreasing_proof(&fresh)?)
+            {
                 return Ok(());
             }
             let state = self.start_decreasing_proof(proof, vec![fresh])?;
@@ -2076,9 +2135,21 @@ impl Context {
         })();
         let spent = self.txn.budget.heartbeats_consumed;
         let model_cache = self.txn.nat_sub_model_cache.clone();
+        let registry_cache = self.registry_cache.clone();
+        let alias_cache = self.alias_cache.clone();
+        let protected_cache = self.protected_cache.clone();
+        let auxiliary_cache = self.auxiliary_cache.clone();
+        let deprecation_cache = self.deprecation_cache.clone();
+        let simp_key_cache = self.simp_key_cache.clone();
         *self = snapshot;
         self.txn.budget.heartbeats_consumed = spent;
         self.txn.nat_sub_model_cache = model_cache;
+        self.registry_cache = registry_cache;
+        self.alias_cache = alias_cache;
+        self.protected_cache = protected_cache;
+        self.auxiliary_cache = auxiliary_cache;
+        self.deprecation_cache = deprecation_cache;
+        self.simp_key_cache = simp_key_cache;
         result
     }
 

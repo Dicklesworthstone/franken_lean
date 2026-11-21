@@ -31,6 +31,39 @@ impl MutualMeasureCandidate {
     }
 }
 
+/// Create a fresh scoped context on the same immutable `environment`/`scope`,
+/// inheriting only immutable environment-keyed read caches, the shared
+/// heartbeat budget, and `nat_sub_model_cache` (never locals, metavariables,
+/// or proof assignments). Avoids rebuilding `InstanceIndex` per child pass.
+fn fork_scoped_with_caches(
+    meter: &Context,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<Context, NatDefinitionElabError> {
+    let mut child = Context::scoped(environment, kernel, scope)?;
+    child.txn.budget = meter.txn.budget.clone();
+    child.txn.nat_sub_model_cache = meter.txn.nat_sub_model_cache.clone();
+    child.registry_cache = meter.registry_cache.clone();
+    child.alias_cache = meter.alias_cache.clone();
+    child.protected_cache = meter.protected_cache.clone();
+    child.auxiliary_cache = meter.auxiliary_cache.clone();
+    child.deprecation_cache = meter.deprecation_cache.clone();
+    child.simp_key_cache = meter.simp_key_cache.clone();
+    Ok(child)
+}
+
+fn absorb_child_caches(meter: &mut Context, child: &Context) {
+    meter.txn.budget = child.txn.budget.clone();
+    meter.txn.nat_sub_model_cache = child.txn.nat_sub_model_cache.clone();
+    meter.registry_cache = child.registry_cache.clone();
+    meter.alias_cache = child.alias_cache.clone();
+    meter.protected_cache = child.protected_cache.clone();
+    meter.auxiliary_cache = child.auxiliary_cache.clone();
+    meter.deprecation_cache = child.deprecation_cache.clone();
+    meter.simp_key_cache = child.simp_key_cache.clone();
+}
+
 pub fn is_ordinary_group_member(syntax: &Syntax) -> bool {
     let Some(declaration) = syntax_args(syntax, &parser_kind(&["Command", "declaration"])) else {
         return false;
@@ -178,8 +211,7 @@ fn elaborate_with_meter(
     };
     let mut headers = Vec::new();
     for syntax in members {
-        let mut context = Context::scoped(environment, kernel, scope)?;
-        context.txn.budget = meter.txn.budget.clone();
+        let mut context = fork_scoped_with_caches(&meter, environment, kernel, scope)?;
         context.partial = Some(State {
             kind: Kind::Unsafe,
             group: Some(prototype.clone()),
@@ -193,7 +225,7 @@ fn elaborate_with_meter(
             .base
             .level_params
             .retain(|level| !fixed_levels.contains(level));
-        meter.txn.budget = context.txn.budget;
+        absorb_child_caches(&mut meter, &context);
         headers.push(header.base);
     }
     let mut group = Group {
@@ -206,8 +238,7 @@ fn elaborate_with_meter(
     let mut hints = Vec::new();
     let theorem = proof_group == Some(true);
     for syntax in members {
-        let mut context = Context::scoped(environment, kernel, scope)?;
-        context.txn.budget = meter.txn.budget.clone();
+        let mut context = fork_scoped_with_caches(&meter, environment, kernel, scope)?;
         context.partial = Some(State {
             kind: Kind::Unsafe,
             group: Some(group.clone()),
@@ -239,7 +270,7 @@ fn elaborate_with_meter(
         )?;
         universes.push((context.level_params.clone(), context.explicit_levels));
         hints.push(context.finish_mutual_member_hint()?);
-        meter.txn.budget = context.txn.budget;
+        absorb_child_caches(&mut meter, &context);
         bodies.push(definition);
     }
     if !scope.variables.is_empty() {
@@ -488,8 +519,7 @@ fn mutual_structural(
     let mut last = None;
     for decreasing in fixed..candidates {
         let attempt = (|| {
-            let mut planner = Context::scoped(environment, kernel, scope)?;
-            planner.txn.budget = meter.txn.budget.clone();
+            let mut planner = fork_scoped_with_caches(meter, environment, kernel, scope)?;
             let planned = planner.mutual_structural_plan(
                 names.clone(),
                 types.clone(),
@@ -498,13 +528,12 @@ fn mutual_structural(
                 decreasing,
                 levels.clone(),
             );
-            meter.txn.budget = planner.txn.budget;
+            absorb_child_caches(meter, &planner);
             let plan = std::sync::Arc::new(planned?);
             let mut wrappers = Vec::new();
             let mut pieces = Vec::new();
             for (position, &index) in component.iter().enumerate() {
-                let mut context = Context::scoped(environment, kernel, scope)?;
-                context.txn.budget = meter.txn.budget.clone();
+                let mut context = fork_scoped_with_caches(meter, environment, kernel, scope)?;
                 context.partial = Some(State {
                     kind: Kind::Unsafe,
                     group: Some(parts.group.clone()),
@@ -517,7 +546,7 @@ fn mutual_structural(
                     captures.clone(),
                 ));
                 let elaborated = definition_in_context(&parts.members[index], &mut context);
-                meter.txn.budget = context.txn.budget.clone();
+                absorb_child_caches(meter, &context);
                 let Declaration::Mutual(mut definitions) = elaborated? else {
                     return Err(refusal("one ordinary body per mutual header"));
                 };
@@ -552,10 +581,9 @@ fn mutual_structural(
                     &parts.bodies[index],
                 )?);
             }
-            let mut assembler = Context::scoped(environment, kernel, scope)?;
-            assembler.txn.budget = meter.txn.budget.clone();
+            let mut assembler = fork_scoped_with_caches(meter, environment, kernel, scope)?;
             let assembled = assembler.assemble_mutual_structural(&plan, &pieces, &obligations);
-            meter.txn.budget = assembler.txn.budget;
+            absorb_child_caches(meter, &assembler);
             let mutual = assembled?;
             let implementations = mutual_implementations(meter, parts.bodies, component, &names)?;
             Ok((mutual, wrappers, implementations))
@@ -865,13 +893,12 @@ fn mutual_well_founded(
         .collect();
     let mut choices = Vec::new();
     if inferred {
-        let mut planner = Context::scoped(environment, kernel, scope)?;
-        planner.txn.budget = meter.txn.budget.clone();
+        let mut planner = fork_scoped_with_caches(meter, environment, kernel, scope)?;
         planner.level_params = levels.clone();
         planner.explicit_levels = levels.len();
         for (type_, &arity) in types.iter().zip(&arities) {
             let result = planner.mutual_simple_measures(type_, arity, fixed);
-            meter.txn.budget = planner.txn.budget.clone();
+            absorb_child_caches(meter, &planner);
             choices.push(result?);
         }
     } else {
@@ -900,8 +927,7 @@ fn mutual_well_founded(
         ));
     }
     let make_plan = |meter: &mut Context, measures: &[Expr]| {
-        let mut planner = Context::scoped(environment, kernel, scope)?;
-        planner.txn.budget = meter.txn.budget.clone();
+        let mut planner = fork_scoped_with_caches(meter, environment, kernel, scope)?;
         let planned = planner.mutual_well_founded_plan(
             component_names.clone(),
             types.clone(),
@@ -910,13 +936,11 @@ fn mutual_well_founded(
             fixed,
             levels.clone(),
         );
-        meter.txn.budget = planner.txn.budget;
+        absorb_child_caches(meter, &planner);
         planned.map(std::sync::Arc::new)
     };
     let make_measure = |meter: &mut Context, measures: &[Expr]| {
-        let mut planner = Context::scoped(environment, kernel, scope)?;
-        planner.txn.budget = meter.txn.budget.clone();
-        planner.txn.nat_sub_model_cache = meter.txn.nat_sub_model_cache.clone();
+        let mut planner = fork_scoped_with_caches(meter, environment, kernel, scope)?;
         let built = planner.mutual_candidate_measure(
             &component_names,
             &types,
@@ -925,8 +949,7 @@ fn mutual_well_founded(
             fixed,
             levels.clone(),
         );
-        meter.txn.budget = planner.txn.budget;
-        meter.txn.nat_sub_model_cache = planner.txn.nat_sub_model_cache;
+        absorb_child_caches(meter, &planner);
         built
     };
     let mut base_plan: Option<std::sync::Arc<recursion::WellFoundedPlan>> = None;
@@ -1039,9 +1062,14 @@ fn mutual_well_founded(
                 let (ctx, snapshot) = captured[position].as_mut().expect("captured member probe");
                 ctx.txn.budget = meter.txn.budget.clone();
                 ctx.txn.nat_sub_model_cache = meter.txn.nat_sub_model_cache.clone();
+                ctx.registry_cache = meter.registry_cache.clone();
+                ctx.alias_cache = meter.alias_cache.clone();
+                ctx.protected_cache = meter.protected_cache.clone();
+                ctx.auxiliary_cache = meter.auxiliary_cache.clone();
+                ctx.deprecation_cache = meter.deprecation_cache.clone();
+                ctx.simp_key_cache = meter.simp_key_cache.clone();
                 let probed = ctx.probe_mutual_calls(snapshot, &measure_sum, &missing);
-                meter.txn.budget = ctx.txn.budget.clone();
-                meter.txn.nat_sub_model_cache = ctx.txn.nat_sub_model_cache.clone();
+                absorb_child_caches(meter, ctx);
                 let total = counts[position].expect("captured total");
                 for (call, relation) in probed? {
                     meter.tick()?;
@@ -1123,8 +1151,7 @@ fn mutual_well_founded(
                 }
                 break make_plan(meter, &candidates[slot].measures)?;
             }
-            let mut planner = Context::scoped(environment, kernel, scope)?;
-            planner.txn.budget = meter.txn.budget.clone();
+            let mut planner = fork_scoped_with_caches(meter, environment, kernel, scope)?;
             planner.level_params = levels.clone();
             planner.explicit_levels = levels.len();
             let mut measures = Vec::new();
@@ -1134,7 +1161,7 @@ fn mutual_well_founded(
                     .map(|&slot| candidates[slot].measures[member].clone())
                     .collect();
                 let measure = planner.mutual_lexicographic_measure(type_, arity, &coordinates);
-                meter.txn.budget = planner.txn.budget.clone();
+                absorb_child_caches(meter, &planner);
                 measures.push(measure?);
             }
             break make_plan(meter, &measures)?;
@@ -1155,10 +1182,9 @@ fn mutual_well_founded(
         wrappers.push(wrapper);
         pieces.push(piece);
     }
-    let mut assembler = Context::scoped(environment, kernel, scope)?;
-    assembler.txn.budget = meter.txn.budget.clone();
+    let mut assembler = fork_scoped_with_caches(meter, environment, kernel, scope)?;
     let mutual = assembler.assemble_mutual_well_founded(&plan, &pieces)?;
-    meter.txn.budget = assembler.txn.budget;
+    absorb_child_caches(meter, &assembler);
     // `addAndCompileUnsafe` (Lean/Elab/PreDefinition/Basic.lean): the pin also
     // admits each member's original recursive body as `partial def
     // <member>._unsafe_rec`, calling its peers' companions, and compiles those.
@@ -1214,9 +1240,7 @@ fn capture_mutual_member(
     (position, index): (usize, usize),
     captures: &[LocalDecl],
 ) -> Result<(Context, recursion::MemberProbeSnapshot), NatDefinitionElabError> {
-    let mut context = Context::scoped(environment, kernel, scope)?;
-    context.txn.budget = meter.txn.budget.clone();
-    context.txn.nat_sub_model_cache = meter.txn.nat_sub_model_cache.clone();
+    let mut context = fork_scoped_with_caches(meter, environment, kernel, scope)?;
     let result = (|| {
         context.txn.lctx = LocalContext::new();
         for capture in captures {
@@ -1247,8 +1271,7 @@ fn capture_mutual_member(
             Ok(_) => Err(failure(SourceInferenceError::Scope)),
         }
     })();
-    meter.txn.budget = context.txn.budget.clone();
-    meter.txn.nat_sub_model_cache = context.txn.nat_sub_model_cache.clone();
+    absorb_child_caches(meter, &context);
     let snapshot = result?;
     Ok((context, snapshot))
 }
@@ -1265,9 +1288,7 @@ fn mutual_well_founded_member(
     captures: &[LocalDecl],
     probe: Option<recursion::MutualMeasureRequest>,
 ) -> Result<(DefinitionVal, Expr), NatDefinitionElabError> {
-    let mut context = Context::scoped(environment, kernel, scope)?;
-    context.txn.budget = meter.txn.budget.clone();
-    context.txn.nat_sub_model_cache = meter.txn.nat_sub_model_cache.clone();
+    let mut context = fork_scoped_with_caches(meter, environment, kernel, scope)?;
     let result = (|| {
         // Termination proofs run after MutualClosure. Unused section locals
         // are no longer in scope, even when their names could solve a goal.
@@ -1313,8 +1334,7 @@ fn mutual_well_founded_member(
         }
         Ok((wrapper, piece))
     })();
-    meter.txn.budget = context.txn.budget;
-    meter.txn.nat_sub_model_cache = context.txn.nat_sub_model_cache;
+    absorb_child_caches(meter, &context);
     result
 }
 
