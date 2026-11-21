@@ -221,6 +221,9 @@ pub enum SourceInferenceError {
     /// A well-typed Fin numeral pattern needs a lowering this matrix does not
     /// yet preserve, such as a symbolic bound or a changed OfNat dictionary.
     UnsupportedFinLiteralPattern(&'static str),
+    /// A valid structure constructor form whose own visibility or parameter
+    /// overrides cannot yet be preserved by the native source declaration path.
+    UnsupportedRecordConstructor(&'static str),
     /// A generated recOn has no compiled LCNF signature at the pin.
     AuxiliaryNotCompiled(Name),
     /// A surviving executable reference has no compiled implementation.
@@ -529,6 +532,9 @@ impl std::fmt::Display for SourceInferenceError {
             ),
             Self::UnsupportedFinLiteralPattern(reason) => {
                 write!(f, "Fin literal pattern lowering is not supported: {reason}")
+            }
+            Self::UnsupportedRecordConstructor(reason) => {
+                write!(f, "unsupported structure constructor: {reason}")
             }
             Self::AuxiliaryNotCompiled(name) => write!(
                 f,
