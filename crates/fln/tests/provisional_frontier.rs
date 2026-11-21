@@ -852,3 +852,201 @@ fn pure_dominator_and_eligibility_helpers_match_diamond_graph_law() {
     );
     assert_eq!(first_cnt[&2], 1);
 }
+
+/// Regression test for the Phase-2 `HostAllocationFailure` worker-unwind
+/// deadlock found on live Mathlib S27: when Phase-2 workers unwind on
+/// `HostAllocationFailure` at `--jobs 4`, `phase2_guarded` catches the unwind,
+/// schedules an isolated single-threaded retry, never drops a worker or stalls
+/// `in_flight`, and exercises persistent `ProvisionalEnvironment` base reuse
+/// across a multi-hop Phase-2 chain (`Root -> Mid -> Leaf`).
+#[test]
+fn phase2_host_allocation_failure_retries_isolated_and_never_deadlocks_workers() {
+    use std::sync::atomic::AtomicUsize;
+
+    let prop = Expr::sort(Level::zero());
+    let base_bytes = encode_module(
+        &[],
+        &[
+            axiom("Base.P", prop.clone()),
+            axiom("Base.p", Expr::const_(n("Base.P"), Vec::new())),
+        ],
+    );
+    let root_bytes = encode_module(
+        &["Base"],
+        &[
+            safe_def(
+                "Root.cheap",
+                Expr::const_(n("Base.P"), Vec::new()),
+                Expr::const_(n("Base.p"), Vec::new()),
+            ),
+            safe_def(
+                "Root.heavy",
+                Expr::const_(n("Base.P"), Vec::new()),
+                beta_chain("Base.P", "Base.p", 250),
+            ),
+        ],
+    );
+    // Transient OOM target (`Mid`) plus its dependent (`Leaf`) to verify
+    // `phase2_base_of` persistent-environment reuse and consumer retirement.
+    let mid_bytes = encode_module(
+        &["Base", "Root"],
+        &[safe_def(
+            "Mid.useHeavy",
+            Expr::const_(n("Base.P"), Vec::new()),
+            Expr::const_(n("Root.heavy"), Vec::new()),
+        )],
+    );
+    let leaf_bytes = encode_module(
+        &["Base", "Root", "Mid"],
+        &[safe_def(
+            "Leaf.useMid",
+            Expr::const_(n("Base.P"), Vec::new()),
+            Expr::const_(n("Mid.useHeavy"), Vec::new()),
+        )],
+    );
+    // Persistent OOM target (`Doomed`) plus its dependent (`BehindDoomed`) to
+    // verify repeated OOM settles cleanly as `Inconclusive` + `Blocked`.
+    let doomed_bytes = encode_module(
+        &["Base", "Root"],
+        &[safe_def(
+            "Doomed.useHeavy",
+            Expr::const_(n("Base.P"), Vec::new()),
+            Expr::const_(n("Root.heavy"), Vec::new()),
+        )],
+    );
+    let behind_doomed_bytes = encode_module(
+        &["Base", "Doomed"],
+        &[safe_def(
+            "BehindDoomed.useDoomed",
+            Expr::const_(n("Base.P"), Vec::new()),
+            Expr::const_(n("Doomed.useHeavy"), Vec::new()),
+        )],
+    );
+
+    let mods = vec![
+        (n("Base"), base_bytes),
+        (n("Root"), root_bytes),
+        (n("Mid"), mid_bytes),
+        (n("Leaf"), leaf_bytes),
+        (n("Doomed"), doomed_bytes),
+        (n("BehindDoomed"), behind_doomed_bytes),
+    ];
+    let inputs = to_inputs(&mods);
+
+    let limits = limits_with_steps(300);
+    let options = KVMap::new();
+    let jobs = jobs(4);
+
+    // Decode call counts per module:
+    // - Call 1 happens during Phase 1 initial decode.
+    // - Call 2 is Phase 2's first attempt.
+    // - Call 3 is Phase 2's isolated retry.
+    let mid_calls = AtomicUsize::new(0);
+    let doomed_calls = AtomicUsize::new(0);
+    let admitted = fln_admission::Admitted {
+        environment: Environment::new(),
+        checker_environment: None,
+        imported_modules: Default::default(),
+        imported_environment: None,
+        imported_module_dependencies: Default::default(),
+        executable_opaques: Default::default(),
+        runtime_initializers: Default::default(),
+        options: KVMap::new(),
+    };
+    let hooks = fln_admission::FrontierRunHooks {
+        check: &|job| admitted.frontier_check_module(job, &options, limits),
+        decode: &|idx| {
+            if idx == 2 {
+                let call = mid_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if call == 2 {
+                    std::panic::panic_any(fln_admission::HostAllocationFailure {
+                        requested: 65_536,
+                    });
+                }
+            }
+            if idx == 4 {
+                let call = doomed_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if call >= 2 {
+                    std::panic::panic_any(fln_admission::HostAllocationFailure {
+                        requested: 131_072,
+                    });
+                }
+            }
+            fln_admission::decode_olean_module_input(&inputs[idx], limits)
+        },
+        memory: &fln_admission::HostProcessMemorySource,
+    };
+
+    let frontier = admitted
+        .check_olean_frontier_provisional_using(&inputs, limits, jobs, None, &mut |_| {}, hooks)
+        .expect("provisional frontier must recover from Phase-2 HostAllocationFailure");
+
+    let by_name: BTreeMap<String, _> = frontier
+        .rows
+        .iter()
+        .map(|row| (row.name.to_display_string(), row))
+        .collect();
+
+    assert_eq!(
+        mid_calls.load(Ordering::SeqCst),
+        3,
+        "Mid decoded once in P1, failed once in P2, succeeded on isolated P2 retry"
+    );
+    assert_eq!(
+        doomed_calls.load(Ordering::SeqCst),
+        3,
+        "Doomed decoded once in P1, failed once in P2, and failed once on isolated P2 retry"
+    );
+
+    let mid = by_name["Mid"];
+    assert!(
+        matches!(
+            mid.verdict,
+            ProvisionalModuleVerdict::AcceptedUnderAssumptions { declarations: 1 }
+        ),
+        "Mid must recover on isolated retry: {:?}",
+        mid.verdict
+    );
+    assert!(
+        mid.memory_retry.is_some(),
+        "Mid must record its Phase-2 memory_retry"
+    );
+    assert_eq!(mid.assumes, vec![n("Root")]);
+    assert_eq!(mid.assumed_declarations, 1);
+
+    let leaf = by_name["Leaf"];
+    assert!(
+        matches!(
+            leaf.verdict,
+            ProvisionalModuleVerdict::AcceptedUnderAssumptions { declarations: 1 }
+        ),
+        "Leaf must accept via Mid's reused base ProvisionalEnvironment: {:?}",
+        leaf.verdict
+    );
+    assert_eq!(leaf.assumes, vec![n("Root")]);
+    assert_eq!(leaf.assumed_declarations, 1);
+
+    let doomed = by_name["Doomed"];
+    assert!(
+        matches!(
+            doomed.verdict,
+            ProvisionalModuleVerdict::Inconclusive { .. }
+        ),
+        "Doomed must settle as typed Inconclusive after isolated retry fails: {:?}",
+        doomed.verdict
+    );
+    assert!(
+        doomed.memory_retry.is_some(),
+        "Doomed must record its Phase-2 memory_retry"
+    );
+
+    let behind = by_name["BehindDoomed"];
+    assert!(
+        matches!(
+            &behind.verdict,
+            ProvisionalModuleVerdict::Blocked { by, .. } if by == &n("Doomed")
+        ),
+        "BehindDoomed must settle cleanly as Blocked by Doomed: {:?}",
+        behind.verdict
+    );
+}

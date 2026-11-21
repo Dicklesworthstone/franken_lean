@@ -254,6 +254,7 @@ impl<E> ProvisionalFrontier<E> {
 pub struct PerDeclarationModuleCheck {
     pub verdict: PerDeclarationModuleOutcome,
     pub entries: Vec<(EnvironmentEntry, bool)>,
+    pub final_env: Option<ProvisionalEnvironment>,
     pub accepted_declarations: usize,
     pub total_declarations: usize,
     pub assumed_declaration_names: Vec<Name>,
@@ -661,6 +662,7 @@ pub fn check_decoded_olean_per_declaration(
                     return Ok(PerDeclarationModuleCheck {
                         verdict: PerDeclarationModuleOutcome::InternalFault(fault),
                         entries: Vec::new(),
+                        final_env: None,
                         accepted_declarations: 0,
                         total_declarations: decoded.constants.len(),
                         assumed_declaration_names: Vec::new(),
@@ -678,6 +680,7 @@ pub fn check_decoded_olean_per_declaration(
             return Ok(PerDeclarationModuleCheck {
                 verdict: PerDeclarationModuleOutcome::PartialAssumed(reason),
                 entries: Vec::new(),
+                final_env: None,
                 accepted_declarations: 0,
                 total_declarations: decoded.constants.len(),
                 assumed_declaration_names: Vec::new(),
@@ -705,6 +708,7 @@ pub fn check_decoded_olean_per_declaration(
             return Ok(PerDeclarationModuleCheck {
                 verdict: PerDeclarationModuleOutcome::Failed(error),
                 entries: Vec::new(),
+                final_env: None,
                 accepted_declarations: 0,
                 total_declarations: decoded.constants.len(),
                 assumed_declaration_names: Vec::new(),
@@ -799,6 +803,7 @@ pub fn check_decoded_olean_per_declaration(
                     return Ok(PerDeclarationModuleCheck {
                         verdict: PerDeclarationModuleOutcome::PartialAssumed(reason),
                         entries: Vec::new(),
+                        final_env: None,
                         accepted_declarations,
                         total_declarations: decoded.constants.len(),
                         assumed_declaration_names: Vec::new(),
@@ -855,6 +860,7 @@ pub fn check_decoded_olean_per_declaration(
                 return Ok(PerDeclarationModuleCheck {
                     verdict: PerDeclarationModuleOutcome::Failed(err),
                     entries: Vec::new(),
+                    final_env: None,
                     accepted_declarations,
                     total_declarations: decoded.constants.len(),
                     assumed_declaration_names: assumed_names.into_iter().collect(),
@@ -875,6 +881,7 @@ pub fn check_decoded_olean_per_declaration(
                 return Ok(PerDeclarationModuleCheck {
                     verdict: PerDeclarationModuleOutcome::InternalFault(fault),
                     entries: Vec::new(),
+                    final_env: None,
                     accepted_declarations,
                     total_declarations: decoded.constants.len(),
                     assumed_declaration_names: assumed_names.into_iter().collect(),
@@ -949,6 +956,7 @@ pub fn check_decoded_olean_per_declaration(
                                 OleanCheckError::Admission(error),
                             ),
                             entries: Vec::new(),
+                            final_env: None,
                             accepted_declarations,
                             total_declarations: decoded.constants.len(),
                             assumed_declaration_names: assumed_names.into_iter().collect(),
@@ -966,6 +974,7 @@ pub fn check_decoded_olean_per_declaration(
                         return Ok(PerDeclarationModuleCheck {
                             verdict: PerDeclarationModuleOutcome::InternalFault(fault),
                             entries: Vec::new(),
+                            final_env: None,
                             accepted_declarations,
                             total_declarations: decoded.constants.len(),
                             assumed_declaration_names: assumed_names.into_iter().collect(),
@@ -988,6 +997,7 @@ pub fn check_decoded_olean_per_declaration(
                     return Ok(PerDeclarationModuleCheck {
                         verdict: PerDeclarationModuleOutcome::Failed(error),
                         entries: Vec::new(),
+                        final_env: None,
                         accepted_declarations,
                         total_declarations: decoded.constants.len(),
                         assumed_declaration_names: assumed_names.into_iter().collect(),
@@ -1020,6 +1030,9 @@ pub fn check_decoded_olean_per_declaration(
         }
     }
 
+    if !assumed_names.is_empty() {
+        env = env.mark_assumed_batch(assumed_names.clone());
+    }
     let entries: Vec<(EnvironmentEntry, bool)> = decoded
         .constants
         .iter()
@@ -1038,6 +1051,7 @@ pub fn check_decoded_olean_per_declaration(
     Ok(PerDeclarationModuleCheck {
         verdict,
         entries,
+        final_env: Some(env),
         accepted_declarations,
         total_declarations: decoded.constants.len(),
         assumed_declaration_names,
@@ -1055,9 +1069,7 @@ pub fn check_decoded_olean_per_declaration(
 /// modules. Never exported into an `Admitted` engine, `.olean`, or cache record.
 struct Phase2ModulePayload {
     position: usize,
-    name: Name,
     entries: Vec<(EnvironmentEntry, bool)>,
-    contributes_assumptions: bool,
 }
 
 struct Phase2Work {
@@ -1067,21 +1079,30 @@ struct Phase2Work {
     phase1_memory_retry: Option<OleanFrontierMemoryRetry>,
     phase1_decode_retry: Option<OleanDecodeMemoryRetry>,
     estimated_bytes: u64,
+    base_provisional: Option<std::sync::Arc<ProvisionalEnvironment>>,
+    assumes: Vec<Name>,
     phase1_accepted_closure: Vec<std::sync::Arc<FrontierAccepted>>,
     phase2_closure: Vec<std::sync::Arc<Phase2ModulePayload>>,
+    retain_final_env: bool,
+    retain_payload_entries: bool,
 }
 
 struct Phase2Done {
     index: usize,
+    host_memory_refusal: bool,
+    usable: bool,
+    contributes_assumptions: bool,
     row: ProvisionalFrontierRow,
     payload: Option<Phase2ModulePayload>,
+    final_env: Option<ProvisionalEnvironment>,
 }
 
 fn assemble_provisional_environment(
     base: &Environment,
+    base_provisional: Option<&ProvisionalEnvironment>,
     phase1_closure: &[std::sync::Arc<FrontierAccepted>],
     phase2_closure: &[std::sync::Arc<Phase2ModulePayload>],
-) -> Result<(ProvisionalEnvironment, Vec<Name>, usize), OleanCheckError> {
+) -> Result<(ProvisionalEnvironment, usize), OleanCheckError> {
     enum ClosureItem<'a> {
         Phase1(&'a FrontierAccepted),
         Phase2(&'a Phase2ModulePayload),
@@ -1096,8 +1117,10 @@ fn assemble_provisional_environment(
     }
     ordered.sort_by_key(|(pos, _)| *pos);
 
-    let mut env = ProvisionalEnvironment::from_admitted(base.clone());
-    let mut assumes: BTreeSet<Name> = BTreeSet::new();
+    let mut env = match base_provisional {
+        Some(existing) => existing.clone(),
+        None => ProvisionalEnvironment::from_admitted(base.clone()),
+    };
     let mut assumed_to_mark: BTreeSet<Name> = BTreeSet::new();
     let mut merge_one =
         |entry: &EnvironmentEntry, is_assumed: bool| -> Result<(), OleanCheckError> {
@@ -1135,9 +1158,6 @@ fn assemble_provisional_environment(
                 }
             }
             ClosureItem::Phase2(module) => {
-                if module.contributes_assumptions {
-                    assumes.insert(module.name.clone());
-                }
                 for (entry, is_assumed) in &module.entries {
                     merge_one(entry, *is_assumed)?;
                 }
@@ -1148,7 +1168,77 @@ fn assemble_provisional_environment(
         env = env.mark_assumed_batch(assumed_to_mark);
     }
     let assumed_count = env.assumed_count();
-    Ok((env, assumes.into_iter().collect(), assumed_count))
+    Ok((env, assumed_count))
+}
+
+fn phase2_error_verdict(error: OleanCheckError) -> ProvisionalModuleVerdict {
+    match frontier_error_verdict(error) {
+        OleanModuleVerdict::Inconclusive(reason) => ProvisionalModuleVerdict::Inconclusive {
+            reason,
+            accepted_declarations: 0,
+            total_declarations: 0,
+            assumed_declaration_names: Vec::new(),
+        },
+        OleanModuleVerdict::InternalFault(fault) => ProvisionalModuleVerdict::InternalFault(fault),
+        OleanModuleVerdict::Failed(err) => ProvisionalModuleVerdict::Failed(err),
+        _ => ProvisionalModuleVerdict::InternalFault(InternalFault::new(
+            "FL-INV-07",
+            "provisional error mapped to unexpected verdict",
+        )),
+    }
+}
+
+/// Guard a Phase-2 worker check against panics and `HostAllocationFailure`
+/// unwinds (`fln-frontier-oom-abort-w9dx`), converting any unwind into a typed
+/// `Phase2Done` so the worker thread never dies and the scheduler never stalls.
+fn phase2_guarded(
+    base: &Environment,
+    module_name: &Name,
+    work: Phase2Work,
+    limits: OleanCheckLimits,
+    decode: &(dyn Fn(usize) -> Result<DecodedOlean, OleanCheckError> + Sync),
+) -> Phase2Done {
+    let started = std::time::Instant::now();
+    let index = work.index;
+    let estimated_bytes = work.estimated_bytes;
+    let assumes = work.assumes.clone();
+    let policy = limits.admission.policy;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_phase2_module(base, module_name, work, limits, decode)
+    }))
+    .unwrap_or_else(|payload| {
+        let error = frontier_unwound(payload);
+        let host_memory_refusal = olean_host_memory_refusal(&error);
+        Phase2Done {
+            index,
+            host_memory_refusal,
+            usable: false,
+            contributes_assumptions: false,
+            row: ProvisionalFrontierRow {
+                name: module_name.clone(),
+                phase: 2,
+                verdict: phase2_error_verdict(error),
+                assumes,
+                assumed_declarations: 0,
+                k1_steps: 0,
+                elapsed: started.elapsed(),
+                memory_retry: None,
+                decode_memory_retry: None,
+                memory: OleanFrontierMemoryAttribution::from_components(
+                    estimated_bytes,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+                policy_summary: CheckerPolicySummary::empty(policy),
+                unit_reports: Vec::new(),
+            },
+            payload: None,
+            final_env: None,
+        }
+    })
 }
 
 fn run_phase2_module(
@@ -1161,21 +1251,27 @@ fn run_phase2_module(
     let started = std::time::Instant::now();
     let index = work.index;
     let empty_policy = CheckerPolicySummary::empty(limits.admission.policy);
+    let assumes = work.assumes;
 
-    let (provisional_env, assumes, closure_assumed_count) = match assemble_provisional_environment(
+    let (provisional_env, closure_assumed_count) = match assemble_provisional_environment(
         base,
+        work.base_provisional.as_deref(),
         &work.phase1_accepted_closure,
         &work.phase2_closure,
     ) {
         Ok(assembled) => assembled,
         Err(error) => {
+            let host_memory_refusal = olean_host_memory_refusal(&error);
             return Phase2Done {
                 index,
+                host_memory_refusal,
+                usable: false,
+                contributes_assumptions: false,
                 row: ProvisionalFrontierRow {
                     name: module_name.clone(),
                     phase: 2,
-                    verdict: ProvisionalModuleVerdict::Failed(error),
-                    assumes: Vec::new(),
+                    verdict: phase2_error_verdict(error),
+                    assumes,
                     assumed_declarations: 0,
                     k1_steps: 0,
                     elapsed: started.elapsed(),
@@ -1193,6 +1289,7 @@ fn run_phase2_module(
                     unit_reports: Vec::new(),
                 },
                 payload: None,
+                final_env: None,
             };
         }
     };
@@ -1200,30 +1297,16 @@ fn run_phase2_module(
     let decoded = match decode(index) {
         Ok(decoded) => decoded,
         Err(error) => {
-            let verdict = match frontier_error_verdict(error) {
-                OleanModuleVerdict::Inconclusive(reason) => {
-                    ProvisionalModuleVerdict::Inconclusive {
-                        reason,
-                        accepted_declarations: 0,
-                        total_declarations: 0,
-                        assumed_declaration_names: Vec::new(),
-                    }
-                }
-                OleanModuleVerdict::InternalFault(fault) => {
-                    ProvisionalModuleVerdict::InternalFault(fault)
-                }
-                OleanModuleVerdict::Failed(err) => ProvisionalModuleVerdict::Failed(err),
-                _ => ProvisionalModuleVerdict::InternalFault(InternalFault::new(
-                    "FL-INV-07",
-                    "provisional decode error mapped to unexpected verdict",
-                )),
-            };
+            let host_memory_refusal = olean_host_memory_refusal(&error);
             return Phase2Done {
                 index,
+                host_memory_refusal,
+                usable: false,
+                contributes_assumptions: false,
                 row: ProvisionalFrontierRow {
                     name: module_name.clone(),
                     phase: 2,
-                    verdict,
+                    verdict: phase2_error_verdict(error),
                     assumes,
                     assumed_declarations: closure_assumed_count,
                     k1_steps: 0,
@@ -1242,6 +1325,7 @@ fn run_phase2_module(
                     unit_reports: Vec::new(),
                 },
                 payload: None,
+                final_env: None,
             };
         }
     };
@@ -1251,26 +1335,19 @@ fn run_phase2_module(
         match check_decoded_olean_per_declaration(&provisional_env, &decoded, limits, true) {
             Ok(checked) => checked,
             Err(error) => {
-                let verdict = match frontier_error_verdict(error) {
-                    OleanModuleVerdict::Inconclusive(reason) => {
-                        ProvisionalModuleVerdict::Inconclusive {
-                            reason,
-                            accepted_declarations: 0,
-                            total_declarations: decoded.constants.len(),
-                            assumed_declaration_names: Vec::new(),
-                        }
-                    }
-                    OleanModuleVerdict::InternalFault(fault) => {
-                        ProvisionalModuleVerdict::InternalFault(fault)
-                    }
-                    OleanModuleVerdict::Failed(err) => ProvisionalModuleVerdict::Failed(err),
-                    _ => ProvisionalModuleVerdict::InternalFault(InternalFault::new(
-                        "FL-INV-07",
-                        "provisional planning error mapped to unexpected verdict",
-                    )),
-                };
+                let host_memory_refusal = olean_host_memory_refusal(&error);
+                let mut verdict = phase2_error_verdict(error);
+                if let ProvisionalModuleVerdict::Inconclusive {
+                    total_declarations, ..
+                } = &mut verdict
+                {
+                    *total_declarations = decoded.constants.len();
+                }
                 return Phase2Done {
                     index,
+                    host_memory_refusal,
+                    usable: false,
+                    contributes_assumptions: false,
                     row: ProvisionalFrontierRow {
                         name: module_name.clone(),
                         phase: 2,
@@ -1293,6 +1370,7 @@ fn run_phase2_module(
                         unit_reports: Vec::new(),
                     },
                     payload: None,
+                    final_env: None,
                 };
             }
         };
@@ -1314,10 +1392,15 @@ fn run_phase2_module(
         admitted_bytes,
         0,
     );
+    let retain_env = work.retain_final_env.then_some(checked.final_env).flatten();
+    let retain_entries = work.retain_payload_entries;
 
     match checked.verdict {
         PerDeclarationModuleOutcome::Failed(error) => Phase2Done {
             index,
+            host_memory_refusal: false,
+            usable: false,
+            contributes_assumptions: false,
             row: ProvisionalFrontierRow {
                 name: module_name.clone(),
                 phase: 2,
@@ -1333,9 +1416,13 @@ fn run_phase2_module(
                 unit_reports: checked.unit_reports,
             },
             payload: None,
+            final_env: None,
         },
         PerDeclarationModuleOutcome::InternalFault(fault) => Phase2Done {
             index,
+            host_memory_refusal: false,
+            usable: false,
+            contributes_assumptions: false,
             row: ProvisionalFrontierRow {
                 name: module_name.clone(),
                 phase: 2,
@@ -1351,16 +1438,18 @@ fn run_phase2_module(
                 unit_reports: checked.unit_reports,
             },
             payload: None,
+            final_env: None,
         },
         PerDeclarationModuleOutcome::PartialAssumed(reason) => {
-            let payload = Phase2ModulePayload {
+            let payload = retain_entries.then_some(Phase2ModulePayload {
                 position: 0, // overwritten by scheduler with frontier position
-                name: module_name.clone(),
                 entries: checked.entries,
-                contributes_assumptions: own_assumed_count > 0,
-            };
+            });
             Phase2Done {
                 index,
+                host_memory_refusal: false,
+                usable: true,
+                contributes_assumptions: own_assumed_count > 0,
                 row: ProvisionalFrontierRow {
                     name: module_name.clone(),
                     phase: 2,
@@ -1380,23 +1469,25 @@ fn run_phase2_module(
                     policy_summary: checked.policy_summary,
                     unit_reports: checked.unit_reports,
                 },
-                payload: Some(payload),
+                payload,
+                final_env: retain_env,
             }
         }
         PerDeclarationModuleOutcome::AllAccepted => {
+            let payload = retain_entries.then_some(Phase2ModulePayload {
+                position: 0,
+                entries: checked.entries,
+            });
             if work.is_phase1_root {
                 // Never promote a Phase-1 inconclusive root to accepted in Phase 2.
                 let reason = work.phase1_reason.unwrap_or_else(|| {
                     Inconclusive::authority_incomplete("phase-1 inconclusive root")
                 });
-                let payload = Phase2ModulePayload {
-                    position: 0,
-                    name: module_name.clone(),
-                    entries: checked.entries,
-                    contributes_assumptions: false,
-                };
                 Phase2Done {
                     index,
+                    host_memory_refusal: false,
+                    usable: true,
+                    contributes_assumptions: false,
                     row: ProvisionalFrontierRow {
                         name: module_name.clone(),
                         phase: 2,
@@ -1416,17 +1507,15 @@ fn run_phase2_module(
                         policy_summary: checked.policy_summary,
                         unit_reports: checked.unit_reports,
                     },
-                    payload: Some(payload),
+                    payload,
+                    final_env: retain_env,
                 }
             } else {
-                let payload = Phase2ModulePayload {
-                    position: 0,
-                    name: module_name.clone(),
-                    entries: checked.entries,
-                    contributes_assumptions: false,
-                };
                 Phase2Done {
                     index,
+                    host_memory_refusal: false,
+                    usable: true,
+                    contributes_assumptions: false,
                     row: ProvisionalFrontierRow {
                         name: module_name.clone(),
                         phase: 2,
@@ -1443,7 +1532,8 @@ fn run_phase2_module(
                         policy_summary: checked.policy_summary,
                         unit_reports: checked.unit_reports,
                     },
-                    payload: Some(payload),
+                    payload,
+                    final_env: retain_env,
                 }
             }
         }
@@ -1690,12 +1780,57 @@ impl Admitted {
         }
         let phase1_root_set: BTreeSet<usize> = phase1_inconclusive_roots.iter().copied().collect();
 
+        // Pick each Phase-2 module's largest direct Phase-2 dependency as its
+        // persistent `ProvisionalEnvironment` base (deterministic function of
+        // import graph + frontier position; FL-INV-01). Only modules outside
+        // `closures[base_dep]` are merged as deltas, slashing Phase-2 allocation
+        // churn by ~1000x on deep Mathlib closures.
+        let mut phase2_base_of: Vec<Option<usize>> = vec![None; count];
+        let mut base_env_consumers: Vec<usize> = vec![0; count];
+        let mut remaining_delta_consumers: Vec<usize> = vec![0; count];
+        for &idx in &phase2_candidates {
+            let best_dep = dependencies[idx]
+                .iter()
+                .copied()
+                .filter(|dep| phase2_candidates.contains(dep))
+                .max_by_key(|&dep| (closures[dep].len(), std::cmp::Reverse(position[dep])));
+            phase2_base_of[idx] = best_dep;
+            if let Some(dep) = best_dep {
+                base_env_consumers[dep] += 1;
+            }
+            for &member in closures[idx].iter() {
+                if member == idx {
+                    continue;
+                }
+                if best_dep.is_some_and(|dep| closures[dep].contains(&member)) {
+                    continue;
+                }
+                remaining_delta_consumers[member] += 1;
+            }
+        }
+        // Release every Phase-1 accepted payload that no Phase-2 delta needs
+        // BEFORE spawning Phase-2 workers, reclaiming peak RSS up front.
+        let mut phase1_accepted = phase1.accepted;
+        for member in 0..count {
+            if remaining_delta_consumers[member] == 0 {
+                phase1_accepted[member] = None;
+            }
+        }
+
         let mut phase2_rows: Vec<Option<ProvisionalFrontierRow>> =
             (0..count).map(|_| None).collect();
         let mut phase2_payloads: Vec<Option<std::sync::Arc<Phase2ModulePayload>>> =
             vec![None; count];
+        let mut phase2_envs: Vec<Option<std::sync::Arc<ProvisionalEnvironment>>> =
+            vec![None; count];
+        let mut phase2_usable = vec![false; count];
+        let mut phase2_contributes_assumptions = vec![false; count];
         let mut phase2_decided = vec![false; count];
         let mut phase2_running = vec![false; count];
+        let mut phase2_memory_retries: Vec<Option<OleanFrontierMemoryRetry>> =
+            (0..count).map(|_| None).collect();
+        let mut retry_pending: BTreeSet<(usize, usize)> = BTreeSet::new();
+        let mut isolated_running: Option<usize> = None;
         let threads = jobs.threads.get();
         let base_env = &self.environment;
         let decode = hooks.decode;
@@ -1718,7 +1853,7 @@ impl Admitted {
                                     Err(_) => return,
                                 };
                                 let Ok(work) = next else { return };
-                                let done = run_phase2_module(
+                                let done = phase2_guarded(
                                     base_env,
                                     modules[work.index].name,
                                     work,
@@ -1737,6 +1872,103 @@ impl Admitted {
             }
             drop(done_tx);
 
+            let build_work = |index: usize,
+                              retain_final_env: bool,
+                              retain_payload_entries: bool,
+                              phase1_accepted: &[Option<std::sync::Arc<FrontierAccepted>>],
+                              phase2_payloads: &[Option<std::sync::Arc<Phase2ModulePayload>>],
+                              phase2_envs: &[Option<std::sync::Arc<ProvisionalEnvironment>>],
+                              phase2_contributes_assumptions: &[bool]|
+             -> Phase2Work {
+                let p1 = phase1_by_index[index].expect("phase1 row");
+                let phase1_reason = match &p1.verdict {
+                    OleanModuleVerdict::Inconclusive(reason) => Some(reason.clone()),
+                    _ => None,
+                };
+                let base_dep = phase2_base_of[index];
+                let base_provisional = base_dep.and_then(|dep| phase2_envs[dep].clone());
+                let mut assumes_set: BTreeSet<Name> = BTreeSet::new();
+                let mut p1_closure = Vec::new();
+                let mut p2_closure = Vec::new();
+                for &member in closures[index].iter() {
+                    if member == index {
+                        continue;
+                    }
+                    if phase2_contributes_assumptions[member] {
+                        assumes_set.insert(modules[member].name.clone());
+                    }
+                    if base_dep.is_some_and(|dep| closures[dep].contains(&member)) {
+                        continue;
+                    }
+                    if let Some(acc) = &phase1_accepted[member] {
+                        p1_closure.push(std::sync::Arc::clone(acc));
+                    } else if let Some(payload) = &phase2_payloads[member] {
+                        p2_closure.push(std::sync::Arc::clone(payload));
+                    }
+                }
+                Phase2Work {
+                    index,
+                    is_phase1_root: phase1_root_set.contains(&index),
+                    phase1_reason,
+                    phase1_memory_retry: p1.memory_retry.as_ref().map(|r| {
+                        OleanFrontierMemoryRetry {
+                            first_refusal: r.first_refusal.clone(),
+                            first_elapsed: r.first_elapsed,
+                        }
+                    }),
+                    phase1_decode_retry: p1.decode_memory_retry.as_ref().map(|r| {
+                        OleanDecodeMemoryRetry {
+                            first_error: r.first_error.clone(),
+                            first_elapsed: r.first_elapsed,
+                            retry_elapsed: r.retry_elapsed,
+                            retry_result: r.retry_result.clone(),
+                        }
+                    }),
+                    estimated_bytes: p1.memory.estimated_bytes,
+                    base_provisional,
+                    assumes: assumes_set.into_iter().collect(),
+                    phase1_accepted_closure: p1_closure,
+                    phase2_closure: p2_closure,
+                    retain_final_env,
+                    retain_payload_entries,
+                }
+            };
+
+            let release_consumers = |idx: usize,
+                                     base_env_consumers: &mut [usize],
+                                     remaining_delta_consumers: &mut [usize],
+                                     phase1_accepted: &mut [Option<
+                std::sync::Arc<FrontierAccepted>,
+            >],
+                                     phase2_payloads: &mut [Option<
+                std::sync::Arc<Phase2ModulePayload>,
+            >],
+                                     phase2_envs: &mut [Option<
+                std::sync::Arc<ProvisionalEnvironment>,
+            >]| {
+                let base_dep = phase2_base_of[idx];
+                if let Some(dep) = base_dep {
+                    base_env_consumers[dep] = base_env_consumers[dep].saturating_sub(1);
+                    if base_env_consumers[dep] == 0 {
+                        phase2_envs[dep] = None;
+                    }
+                }
+                for &member in closures[idx].iter() {
+                    if member == idx {
+                        continue;
+                    }
+                    if base_dep.is_some_and(|dep| closures[dep].contains(&member)) {
+                        continue;
+                    }
+                    remaining_delta_consumers[member] =
+                        remaining_delta_consumers[member].saturating_sub(1);
+                    if remaining_delta_consumers[member] == 0 {
+                        phase1_accepted[member] = None;
+                        phase2_payloads[member] = None;
+                    }
+                }
+            };
+
             let mut in_flight = 0_usize;
             let mut cancelled = false;
             let phase2_total = phase2_candidates.len();
@@ -1751,11 +1983,20 @@ impl Admitted {
                     if !phase2_candidates.contains(&index)
                         || phase2_decided[index]
                         || phase2_running[index]
+                        || retry_pending.contains(&(position[index], index))
                     {
                         continue;
                     }
                     if cancelled {
                         phase2_decided[index] = true;
+                        release_consumers(
+                            index,
+                            &mut base_env_consumers,
+                            &mut remaining_delta_consumers,
+                            &mut phase1_accepted,
+                            &mut phase2_payloads,
+                            &mut phase2_envs,
+                        );
                         let p1 = phase1_by_index[index].expect("phase1 row");
                         let row = ProvisionalFrontierRow {
                             name: modules[index].name.clone(),
@@ -1792,9 +2033,17 @@ impl Admitted {
                     let blocker = dependencies[index]
                         .iter()
                         .copied()
-                        .find(|&dep| !is_accepted[dep] && phase2_payloads[dep].is_none());
+                        .find(|&dep| !is_accepted[dep] && !phase2_usable[dep]);
                     if let Some(blocker_idx) = blocker {
                         phase2_decided[index] = true;
+                        release_consumers(
+                            index,
+                            &mut base_env_consumers,
+                            &mut remaining_delta_consumers,
+                            &mut phase1_accepted,
+                            &mut phase2_payloads,
+                            &mut phase2_envs,
+                        );
                         let p1 = phase1_by_index[index].expect("phase1 row");
                         let row = ProvisionalFrontierRow {
                             name: modules[index].name.clone(),
@@ -1828,61 +2077,106 @@ impl Admitted {
                     break;
                 }
 
-                for index in ready {
+                // Isolated single-threaded memory retry once in-flight workers drain.
+                if isolated_running.is_none()
+                    && in_flight == 0
+                    && let Some((_, retry_idx)) = retry_pending.pop_first()
+                {
+                    let work = build_work(
+                        retry_idx,
+                        base_env_consumers[retry_idx] > 0,
+                        remaining_delta_consumers[retry_idx] > 0,
+                        &phase1_accepted,
+                        &phase2_payloads,
+                        &phase2_envs,
+                        &phase2_contributes_assumptions,
+                    );
+                    phase2_running[retry_idx] = true;
+                    isolated_running = Some(retry_idx);
+                    in_flight = 1;
+                    if threads == 1 {
+                        let mut done =
+                            phase2_guarded(base_env, modules[retry_idx].name, work, limits, decode);
+                        in_flight = 0;
+                        isolated_running = None;
+                        phase2_running[retry_idx] = false;
+                        phase2_decided[retry_idx] = true;
+                        phase2_usable[retry_idx] = done.usable;
+                        phase2_contributes_assumptions[retry_idx] = done.contributes_assumptions;
+                        if let Some(retry) = phase2_memory_retries[retry_idx].take() {
+                            done.row.memory_retry = Some(retry);
+                        }
+                        if let Some(mut payload) = done.payload.take() {
+                            payload.position = position[retry_idx];
+                            phase2_payloads[retry_idx] = Some(std::sync::Arc::new(payload));
+                        }
+                        if let Some(env) = done.final_env.take() {
+                            phase2_envs[retry_idx] = Some(std::sync::Arc::new(env));
+                        }
+                        release_consumers(
+                            retry_idx,
+                            &mut base_env_consumers,
+                            &mut remaining_delta_consumers,
+                            &mut phase1_accepted,
+                            &mut phase2_payloads,
+                            &mut phase2_envs,
+                        );
+                        phase2_completed += 1;
+                        if let Some(cb) = on_phase2.as_deref_mut() {
+                            cb(phase2_completed, phase2_total, &done.row);
+                        }
+                        phase2_rows[retry_idx] = Some(done.row);
+                        continue;
+                    }
+                    if work_tx.send(work).is_err() {
+                        return Err(OleanCheckError::InternalInvariant {
+                            detail: "every provisional frontier worker thread has stopped",
+                        });
+                    }
+                }
+
+                // Do not start new concurrent modules while a memory retry is pending or isolated.
+                for index in ready
+                    .into_iter()
+                    .filter(|_| retry_pending.is_empty() && isolated_running.is_none())
+                {
                     if in_flight >= threads {
                         break;
                     }
-                    let p1 = phase1_by_index[index].expect("phase1 row");
-                    let phase1_reason = match &p1.verdict {
-                        OleanModuleVerdict::Inconclusive(reason) => Some(reason.clone()),
-                        _ => None,
-                    };
-                    let mut p1_closure = Vec::new();
-                    let mut p2_closure = Vec::new();
-                    for &member in closures[index].iter() {
-                        if member == index {
-                            continue;
-                        }
-                        if let Some(acc) = &phase1.accepted[member] {
-                            p1_closure.push(std::sync::Arc::clone(acc));
-                        } else if let Some(payload) = &phase2_payloads[member] {
-                            p2_closure.push(std::sync::Arc::clone(payload));
-                        }
-                    }
-                    let work = Phase2Work {
+                    let work = build_work(
                         index,
-                        is_phase1_root: phase1_root_set.contains(&index),
-                        phase1_reason,
-                        phase1_memory_retry: p1.memory_retry.as_ref().map(|r| {
-                            OleanFrontierMemoryRetry {
-                                first_refusal: r.first_refusal.clone(),
-                                first_elapsed: r.first_elapsed,
-                            }
-                        }),
-                        phase1_decode_retry: p1.decode_memory_retry.as_ref().map(|r| {
-                            OleanDecodeMemoryRetry {
-                                first_error: r.first_error.clone(),
-                                first_elapsed: r.first_elapsed,
-                                retry_elapsed: r.retry_elapsed,
-                                retry_result: r.retry_result.clone(),
-                            }
-                        }),
-                        estimated_bytes: p1.memory.estimated_bytes,
-                        phase1_accepted_closure: p1_closure,
-                        phase2_closure: p2_closure,
-                    };
+                        base_env_consumers[index] > 0,
+                        remaining_delta_consumers[index] > 0,
+                        &phase1_accepted,
+                        &phase2_payloads,
+                        &phase2_envs,
+                        &phase2_contributes_assumptions,
+                    );
                     phase2_running[index] = true;
                     in_flight += 1;
                     if threads == 1 {
                         let mut done =
-                            run_phase2_module(base_env, modules[index].name, work, limits, decode);
+                            phase2_guarded(base_env, modules[index].name, work, limits, decode);
                         in_flight -= 1;
                         phase2_running[index] = false;
                         phase2_decided[index] = true;
+                        phase2_usable[index] = done.usable;
+                        phase2_contributes_assumptions[index] = done.contributes_assumptions;
                         if let Some(mut payload) = done.payload.take() {
                             payload.position = position[index];
                             phase2_payloads[index] = Some(std::sync::Arc::new(payload));
                         }
+                        if let Some(env) = done.final_env.take() {
+                            phase2_envs[index] = Some(std::sync::Arc::new(env));
+                        }
+                        release_consumers(
+                            index,
+                            &mut base_env_consumers,
+                            &mut remaining_delta_consumers,
+                            &mut phase1_accepted,
+                            &mut phase2_payloads,
+                            &mut phase2_envs,
+                        );
                         phase2_completed += 1;
                         if let Some(cb) = on_phase2.as_deref_mut() {
                             cb(phase2_completed, phase2_total, &done.row);
@@ -1916,11 +2210,47 @@ impl Admitted {
                 in_flight -= 1;
                 let idx = done.index;
                 phase2_running[idx] = false;
+                if done.host_memory_refusal
+                    && isolated_running != Some(idx)
+                    && phase2_memory_retries[idx].is_none()
+                {
+                    let first_refusal = match done.row.verdict {
+                        ProvisionalModuleVerdict::Inconclusive { reason, .. } => reason,
+                        _ => Inconclusive::dependency_unavailable(
+                            "host memory refusal during phase-2 provisional check",
+                        ),
+                    };
+                    phase2_memory_retries[idx] = Some(OleanFrontierMemoryRetry {
+                        first_refusal,
+                        first_elapsed: done.row.elapsed,
+                    });
+                    retry_pending.insert((position[idx], idx));
+                    continue;
+                }
+                if isolated_running == Some(idx) {
+                    isolated_running = None;
+                }
+                if let Some(retry) = phase2_memory_retries[idx].take() {
+                    done.row.memory_retry = Some(retry);
+                }
                 phase2_decided[idx] = true;
+                phase2_usable[idx] = done.usable;
+                phase2_contributes_assumptions[idx] = done.contributes_assumptions;
                 if let Some(mut payload) = done.payload.take() {
                     payload.position = position[idx];
                     phase2_payloads[idx] = Some(std::sync::Arc::new(payload));
                 }
+                if let Some(env) = done.final_env.take() {
+                    phase2_envs[idx] = Some(std::sync::Arc::new(env));
+                }
+                release_consumers(
+                    idx,
+                    &mut base_env_consumers,
+                    &mut remaining_delta_consumers,
+                    &mut phase1_accepted,
+                    &mut phase2_payloads,
+                    &mut phase2_envs,
+                );
                 phase2_completed += 1;
                 if let Some(cb) = on_phase2.as_deref_mut() {
                     cb(phase2_completed, phase2_total, &done.row);
