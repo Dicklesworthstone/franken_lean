@@ -832,3 +832,217 @@ fn oracle_does_not_mistake_a_codegen_error_for_a_kernel_verdict() {
          rejection; got {verdict:?}"
     );
 }
+
+/// Reduced fixture from the `Mathlib.Algebra.Category.ModuleCat.Presheaf.Free`
+/// (`PresheafOfModules.freeObj._proof_2`) and `Ext.ExactSequences`
+/// (`covariant_sequence_exact₃'`) unfold-count differential
+/// (bead `fln-kernel-unfold-differential-tfvw`).
+///
+/// When `lazy_delta` compares arguments of a same-head `Regular` application
+/// (`dropProof a t5 =?= dropProof b s5`) last-to-first in pin order, it first
+/// compares the two proof arguments `t5 : P a` and `s5 : P b` whose proposition
+/// types are NOT definitionally equal. Lean 4's `is_def_eq_proof_irrel`
+/// (`type_checker.cpp:855-862, 1117-1118`) returns `l_false` and short-circuits
+/// immediately with 0 unfolds of `t5..t1` / `s5..s1`, then unfolds `dropProof`
+/// on both sides and accepts `a =?= a`. Before this fix, K1 collapsed `lbool`
+/// to `bool`, fell through into `lazy_delta`, and unfolded every theorem tower
+/// on both sides (3,256x `Eq.symm`, 3,256x `congrArg`, 3,256x `id`, 814x
+/// `Finsupp.mapRange._proof_1` on `PresheafOfModules.freeObj._proof_2`).
+#[test]
+fn unequal_prop_proof_args_short_circuit_without_unfolding_theorems() {
+    let source = "\
+axiom A : Type
+axiom a : A
+axiom b : A
+axiom P : A → Prop
+axiom hp : P a
+axiom hq : P b
+theorem t1 : P a := hp
+theorem t2 : P a := t1
+theorem t3 : P a := t2
+theorem t4 : P a := t3
+theorem t5 : P a := t4
+theorem s1 : P b := hq
+theorem s2 : P b := s1
+theorem s3 : P b := s2
+theorem s4 : P b := s3
+theorem s5 : P b := s4
+noncomputable def dropProof (x : A) (_ : P x) : A := a
+theorem same_head_unequal_proof_arg : Eq (dropProof a t5) (dropProof b s5) := Eq.refl a
+";
+
+    // Build the matching kernel environment (using axioms Eq / Eq.refl with the
+    // exact same signature as Init.Prelude so no inductive bootstrap is needed).
+    let nm = n;
+    let type0 = sort1();
+    let bv = |i: u32| Expr::bvar(i).expect("bvar");
+    let eq_ty = Expr::forall_e(
+        nm("α"),
+        type0.clone(),
+        Expr::forall_e(
+            nm("x"),
+            bv(0),
+            Expr::forall_e(nm("y"), bv(1), prop(), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let refl_ty = Expr::forall_e(
+        nm("α"),
+        type0.clone(),
+        Expr::forall_e(
+            nm("x"),
+            bv(0),
+            Expr::app(Expr::app(Expr::app(cst("Eq"), bv(1)), bv(0)), bv(0)),
+            BinderInfo::Implicit,
+        ),
+        BinderInfo::Implicit,
+    );
+    let mut env = Environment::new();
+    env = with_axiom(&env, "Eq", eq_ty);
+    env = with_axiom(&env, "Eq.refl", refl_ty);
+    env = with_axiom(&env, "A", type0);
+    env = with_axiom(&env, "a", cst("A"));
+    env = with_axiom(&env, "b", cst("A"));
+    env = with_axiom(
+        &env,
+        "P",
+        Expr::forall_e(nm("x"), cst("A"), prop(), BinderInfo::Default),
+    );
+    env = with_axiom(&env, "hp", Expr::app(cst("P"), cst("a")));
+    env = with_axiom(&env, "hq", Expr::app(cst("P"), cst("b")));
+
+    let add_thm = |env: &Environment, name: &str, ty: Expr, val: Expr| -> Environment {
+        let decl = thm(name, ty.clone(), val.clone());
+        let outcome = check(env, &decl, Budget::for_stack_bytes(32 * 1024 * 1024));
+        assert!(
+            matches!(
+                outcome,
+                fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+            ),
+            "fixture theorem {name} must be accepted: {outcome:?}"
+        );
+        env.add_decl(ConstantInfo::Thm(TheoremVal {
+            base: ConstantVal {
+                name: nm(name),
+                level_params: Vec::new(),
+                type_: ty,
+            },
+            value: val,
+            all: vec![nm(name)],
+        }))
+        .expect("admit fixture theorem")
+    };
+    let pa = Expr::app(cst("P"), cst("a"));
+    let pb = Expr::app(cst("P"), cst("b"));
+    let mut prev_t = cst("hp");
+    let mut prev_s = cst("hq");
+    for i in 1..=5_u32 {
+        let tn = format!("t{i}");
+        let sn = format!("s{i}");
+        env = add_thm(&env, &tn, pa.clone(), prev_t);
+        env = add_thm(&env, &sn, pb.clone(), prev_s);
+        prev_t = cst(&tn);
+        prev_s = cst(&sn);
+    }
+
+    let drop_ty = Expr::forall_e(
+        nm("x"),
+        cst("A"),
+        Expr::forall_e(
+            nm("_"),
+            Expr::app(cst("P"), bv(0)),
+            cst("A"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let drop_val = Expr::lam(
+        nm("x"),
+        cst("A"),
+        Expr::lam(
+            nm("_"),
+            Expr::app(cst("P"), bv(0)),
+            cst("a"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let drop_defn = DefinitionVal {
+        base: ConstantVal {
+            name: nm("dropProof"),
+            level_params: Vec::new(),
+            type_: drop_ty,
+        },
+        value: drop_val,
+        hints: fln_env::constants::ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Safe,
+        all: vec![nm("dropProof")],
+    };
+    assert!(matches!(
+        check(
+            &env,
+            &Declaration::Defn(drop_defn.clone()),
+            Budget::for_stack_bytes(32 * 1024 * 1024)
+        ),
+        fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+    ));
+    env = env
+        .add_decl(ConstantInfo::Defn(drop_defn))
+        .expect("admit dropProof");
+
+    let lhs = Expr::app(Expr::app(cst("dropProof"), cst("a")), cst("t5"));
+    let rhs = Expr::app(Expr::app(cst("dropProof"), cst("b")), cst("s5"));
+    let goal = Declaration::Thm(TheoremVal {
+        base: ConstantVal {
+            name: nm("same_head_unequal_proof_arg"),
+            level_params: Vec::new(),
+            type_: Expr::app(Expr::app(Expr::app(cst("Eq"), cst("A")), lhs), rhs),
+        },
+        value: Expr::app(Expr::app(cst("Eq.refl"), cst("A")), cst("a")),
+        all: vec![nm("same_head_unequal_proof_arg")],
+    });
+
+    let obs = fln_kernel::observe_unfolds(
+        &env,
+        &goal,
+        Budget::for_stack_bytes(32 * 1024 * 1024),
+        false,
+    );
+    assert!(
+        matches!(
+            obs.outcome,
+            fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+        ),
+        "K1 must accept same_head_unequal_proof_arg: {:?}",
+        obs.outcome
+    );
+    for i in 1..=5_u32 {
+        for prefix in ["t", "s"] {
+            let name = nm(&format!("{prefix}{i}"));
+            assert_eq!(
+                obs.unfolds.get(&name).copied().unwrap_or(0),
+                0,
+                "unequal-Prop proof argument must short-circuit without unfolding {prefix}{i}: {:?}",
+                obs.unfolds
+            );
+        }
+    }
+    assert_eq!(
+        obs.unfolds.get(&nm("dropProof")).copied().unwrap_or(0),
+        2,
+        "dropProof should unfold once per side after proof_irrel_eq short-circuits: {:?}",
+        obs.unfolds
+    );
+
+    if let Some(lean) = pinned_lean() {
+        let oracle = ask_reference(&lean, "tfvw-unequal-prop-proof-args", source);
+        assert_eq!(
+            oracle,
+            OracleVerdict::Accepted,
+            "pinned Reference v4.32.0 must accept the reduced fixture"
+        );
+    } else {
+        eprintln!("SKIP (typed limitation): pinned Reference {PIN_TAG} absent");
+    }
+}

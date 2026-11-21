@@ -126,6 +126,78 @@ pub fn check(env: &Environment, decl: &Declaration, budget: Budget) -> Outcome<V
     check_result_to_outcome(outcome, consumption, budget)
 }
 
+/// Non-authoritative unfold-count observation for differential diagnostics
+/// (`fln-kernel-unfold-differential-tfvw`). Never mints admission tokens.
+#[derive(Debug, Clone)]
+pub struct UnfoldObservation {
+    pub outcome: Outcome<Verdict>,
+    pub steps_used: u64,
+    pub unfolds: std::collections::BTreeMap<Name, u64>,
+}
+
+/// Check `decl` while recording every delta unfold and recursor/quotient
+/// reduction into `unfolds` (mirroring Lean 4 `Kernel.Diagnostics.unfoldCounter`).
+/// When `force_left_delta` is true, lazy delta always unfolds the left term first
+/// (negative control proving the differential detects priority-order divergences).
+pub fn observe_unfolds(
+    env: &Environment,
+    decl: &Declaration,
+    budget: Budget,
+    force_left_delta: bool,
+) -> UnfoldObservation {
+    if let Some(refusal) = refuse_uncalibrated_budget(budget) {
+        return UnfoldObservation {
+            outcome: refusal,
+            steps_used: 0,
+            unfolds: std::collections::BTreeMap::new(),
+        };
+    }
+    match decl {
+        Declaration::Inductive(_) | Declaration::Quotient(_) | Declaration::Mutual(_) => {
+            let outcome = check(env, decl, budget);
+            let steps_used = match &outcome {
+                Outcome::Complete(Verdict::Accepted { consumption, .. })
+                | Outcome::Complete(Verdict::Rejected { consumption, .. }) => {
+                    consumption.steps_used
+                }
+                _ => budget.steps,
+            };
+            UnfoldObservation {
+                outcome,
+                steps_used,
+                unfolds: std::collections::BTreeMap::new(),
+            }
+        }
+        Declaration::Defn(v) if v.safety == DefinitionSafety::Unsafe => {
+            let outcome = check_nonsafe_definition(env, v, budget);
+            let steps_used = match &outcome {
+                Outcome::Complete(Verdict::Accepted { consumption, .. })
+                | Outcome::Complete(Verdict::Rejected { consumption, .. }) => {
+                    consumption.steps_used
+                }
+                _ => budget.steps,
+            };
+            UnfoldObservation {
+                outcome,
+                steps_used,
+                unfolds: std::collections::BTreeMap::new(),
+            }
+        }
+        _ => {
+            let mut checker = TypeChecker::new(env, decl.level_params(), budget);
+            checker.enable_unfold_observation(force_left_delta);
+            let outcome = check_inner(env, decl, &mut checker);
+            let consumption = checker.consumption();
+            let unfolds = checker.take_unfold_counts();
+            UnfoldObservation {
+                outcome: check_result_to_outcome(outcome, consumption, budget),
+                steps_used: consumption.steps_used,
+                unfolds,
+            }
+        }
+    }
+}
+
 fn add_consumption(total: &mut verdict::Consumption, increment: verdict::Consumption) {
     total.steps_used += increment.steps_used;
     total.max_depth = total.max_depth.max(increment.max_depth);

@@ -2729,6 +2729,12 @@ pub(crate) struct TypeChecker<'a> {
     /// Immutable restrictions for a standalone equality query. Admission never
     /// sets this field, and every query owns all of its policy-sensitive caches.
     unfolding: Option<crate::DefEqUnfolding<'a>>,
+    /// Non-authoritative diagnostic unfold histogram for `observe_unfolds`
+    /// (`fln-kernel-unfold-differential-tfvw`). Always `None` in `check`.
+    unfold_counts: Option<std::collections::BTreeMap<Name, u64>>,
+    /// Diagnostic negative-control switch (`observe_unfolds` only): force
+    /// left-first lazy delta unfolding regardless of hint priority.
+    force_left_delta: bool,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -2778,6 +2784,23 @@ impl<'a> TypeChecker<'a> {
             defer_recursor_major: None,
             eager_reduction: false,
             unfolding: None,
+            unfold_counts: None,
+            force_left_delta: false,
+        }
+    }
+
+    pub(crate) fn enable_unfold_observation(&mut self, force_left_delta: bool) {
+        self.unfold_counts = Some(std::collections::BTreeMap::new());
+        self.force_left_delta = force_left_delta;
+    }
+
+    pub(crate) fn take_unfold_counts(&mut self) -> std::collections::BTreeMap<Name, u64> {
+        self.unfold_counts.take().unwrap_or_default()
+    }
+
+    fn record_unfold(&mut self, name: &Name) {
+        if let Some(counts) = self.unfold_counts.as_mut() {
+            *counts.entry(name.clone()).or_insert(0) += 1;
         }
     }
 
@@ -3837,19 +3860,22 @@ impl<'a> TypeChecker<'a> {
                             // kind; every other head is a known miss. Avoiding
                             // that futile governed step also lets a pending
                             // constructor projection extract its field directly.
-                            let recursor_candidate = match head.node() {
+                            let recursor_head = match head.node() {
                                 ExprNode::Const { name, .. } => match self.env.find(name) {
-                                    Some(ConstantInfo::Rec(_)) => true,
-                                    Some(ConstantInfo::Quot(quot)) => {
-                                        matches!(quot.kind, QuotKind::Lift | QuotKind::Ind)
+                                    Some(ConstantInfo::Rec(_)) => Some(name.clone()),
+                                    Some(ConstantInfo::Quot(quot))
+                                        if matches!(quot.kind, QuotKind::Lift | QuotKind::Ind) =>
+                                    {
+                                        Some(name.clone())
                                     }
-                                    _ => false,
+                                    _ => None,
                                 },
-                                _ => false,
+                                _ => None,
                             };
-                            if recursor_candidate {
+                            if let Some(rec_name) = recursor_head {
                                 match self.reduce_recursor(&current, depth + 1)? {
                                     Some(reduced) => {
+                                        self.record_unfold(&rec_name);
                                         current = reduced;
                                         depth += 1;
                                         self.step(depth)?;
@@ -4089,6 +4115,7 @@ impl<'a> TypeChecker<'a> {
             | Some(ConstantInfo::Rec(_))
             | None => return Ok(None),
         };
+        self.record_unfold(name);
         let levels = levels.clone();
         let mut unfolded = self.instantiate_lparams(&value, &params, &levels, depth + 1)?;
         for arg in args {
@@ -4994,9 +5021,12 @@ impl<'a> TypeChecker<'a> {
             {
                 return Ok(DefeqReduced::Decided(decided));
             }
-            // KR-306 definitional proof irrelevance in Prop.
-            if self.proof_irrel_eq(&tn, &sn, depth + 1)? {
-                return Ok(DefeqReduced::Decided(true));
+            // KR-306 definitional proof irrelevance in Prop (`type_checker.cpp:1117-1118`).
+            // Decisive in both directions: unequal proposition types return `false`
+            // immediately instead of falling through into `lazy_delta` and unfolding
+            // theorem proofs (`fln-kernel-unfold-differential-tfvw`).
+            if let Some(decided) = self.proof_irrel_eq(&tn, &sn, depth + 1)? {
+                return Ok(DefeqReduced::Decided(decided));
             }
             // KR-307/309 lazy delta by definitional height — with the KR-313
             // offset and literal-arithmetic machinery woven into every
@@ -5367,24 +5397,27 @@ impl<'a> TypeChecker<'a> {
         self.is_def_eq(&t_type, &s_type, depth + 1)
     }
 
-    /// KR-306: if `t`'s type is a Prop, t ≟ s reduces to type-defeq.
-    fn proof_irrel_eq(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<bool> {
+    /// KR-306 (pin `type_checker::is_def_eq_proof_irrel`, `type_checker.cpp:855-862`):
+    /// if `t`'s type is a `Prop`, `t ≟ s` is decided by `infer_type(t) ≟ infer_type(s)`
+    /// in both directions (`Some(true)` or `Some(false)`). Returns `None` (`l_undef`)
+    /// when `t` is not in `Prop` or typing rejects an operand.
+    fn proof_irrel_eq(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<Option<bool>> {
         let t_type = match self.infer_only(t, depth) {
             Ok(ty) => ty,
             // A term that fails to type here cannot claim irrelevance; let the
             // main ladder produce the real verdict.
-            Err(Stop::Reject(..)) => return Ok(false),
+            Err(Stop::Reject(..)) => return Ok(None),
             Err(stop) => return Err(stop),
         };
         if !self.is_prop(&t_type, depth)? {
-            return Ok(false);
+            return Ok(None);
         }
         let s_type = match self.infer_only(s, depth) {
             Ok(ty) => ty,
-            Err(Stop::Reject(..)) => return Ok(false),
+            Err(Stop::Reject(..)) => return Ok(None),
             Err(stop) => return Err(stop),
         };
-        self.is_def_eq(&t_type, &s_type, depth)
+        Ok(Some(self.is_def_eq(&t_type, &s_type, depth)?))
     }
 
     /// Is `type_` a proposition — i.e., does it live in `Sort 0`? (The pin's
@@ -5548,7 +5581,11 @@ impl<'a> TypeChecker<'a> {
                     None => return Ok(ReductionStatus::DefUnknown),
                 },
             },
-            (Some(a), Some(b)) => match a.cmp_priority(b) {
+            (Some(a), Some(b)) => match if self.force_left_delta {
+                std::cmp::Ordering::Greater
+            } else {
+                a.cmp_priority(b)
+            } {
                 std::cmp::Ordering::Greater => match self.unfold_definition(t, depth)? {
                     Some(next) => *t = self.whnf_core_for_defeq(&next, depth)?,
                     None => return Ok(ReductionStatus::DefUnknown),

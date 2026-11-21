@@ -76,6 +76,7 @@ pub mod syntax_hygiene;
 pub mod tcb_inventory;
 pub mod trace_replay;
 pub mod tree_identity;
+pub mod unfold_differential;
 pub mod witness;
 
 pub use fln_core::{checked_manifest_dir, checked_workspace_root};

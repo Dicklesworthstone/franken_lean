@@ -335,6 +335,7 @@ jobs:
             --test real_attribute_fixtures_e2e \
             --test real_module_fixtures_e2e \
             --test pinned_nat_council \
+            --test unfold_differential \
             --no-fail-fast -- --include-ignored --nocapture
 
       - name: hold the Reference-differential ledger to the pinned Reference (fln-ew20)
