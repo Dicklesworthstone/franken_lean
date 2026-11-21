@@ -14,6 +14,7 @@ struct MutualMeasureCandidate {
     measures: Vec<Expr>,
     after_complex: bool,
     plan: Option<std::sync::Arc<recursion::WellFoundedPlan>>,
+    measure_sum: Option<Expr>,
     calls: Vec<BTreeMap<usize, recursion::MutualMeasureRelation>>,
 }
 
@@ -24,6 +25,7 @@ impl MutualMeasureCandidate {
             measures,
             after_complex,
             plan: None,
+            measure_sum: None,
             calls,
         }
     }
@@ -911,6 +913,25 @@ fn mutual_well_founded(
         meter.txn.budget = planner.txn.budget;
         planned.map(std::sync::Arc::new)
     };
+    let make_measure = |meter: &mut Context, measures: &[Expr]| {
+        let mut planner = Context::scoped(environment, kernel, scope)?;
+        planner.txn.budget = meter.txn.budget.clone();
+        planner.txn.nat_sub_model_cache = meter.txn.nat_sub_model_cache.clone();
+        let built = planner.mutual_candidate_measure(
+            &component_names,
+            &types,
+            &arities,
+            measures,
+            fixed,
+            levels.clone(),
+        );
+        meter.txn.budget = planner.txn.budget;
+        meter.txn.nat_sub_model_cache = planner.txn.nat_sub_model_cache;
+        built
+    };
+    let mut base_plan: Option<std::sync::Arc<recursion::WellFoundedPlan>> = None;
+    let mut captured: Vec<Option<(Context, recursion::MemberProbeSnapshot)>> =
+        vec![None; component.len()];
     let mut counts = vec![None; component.len()];
     let mut remaining: Vec<Option<Vec<usize>>> = vec![None; component.len()];
     let mut order = Vec::new();
@@ -928,26 +949,31 @@ fn mutual_well_founded(
             if complex && candidate.after_complex {
                 return Err(unsupported("earlier complex inferred measures"));
             }
-            if candidate.plan.is_none() {
-                candidate.plan = Some(make_plan(meter, &candidate.measures)?);
-            }
-            let plan = candidate.plan.as_ref().expect("prepared candidate").clone();
             if !inferred {
+                if candidate.plan.is_none() {
+                    candidate.plan = Some(make_plan(meter, &candidate.measures)?);
+                }
                 chosen = Some(slot);
                 break;
             }
+            if candidate.measure_sum.is_none() {
+                candidate.measure_sum = Some(make_measure(meter, &candidate.measures)?);
+            }
+            let measure_sum = candidate
+                .measure_sum
+                .as_ref()
+                .expect("prepared candidate measure")
+                .clone();
             let mut disqualified = false;
             for (position, &index) in component.iter().enumerate() {
-                let request = if disqualified {
+                let needed_calls = if disqualified {
                     // GuessLex stops querying a column at its first Unknown.
                     // Still discover unseen members' calls and complex-measure
                     // boundary, without running any decreasing proof tactics.
-                    remaining[position]
-                        .is_none()
-                        .then_some(recursion::MutualMeasureRequest::Calls(Vec::new()))
+                    remaining[position].is_none().then(Vec::new)
                 } else {
                     match &remaining[position] {
-                        None => Some(recursion::MutualMeasureRequest::All),
+                        None => None, // captured below, then all calls requested
                         Some(calls) => {
                             let mut missing = Vec::new();
                             for &call in calls {
@@ -961,60 +987,72 @@ fn mutual_well_founded(
                                     None => missing.push(call),
                                 }
                             }
-                            (!missing.is_empty())
-                                .then_some(recursion::MutualMeasureRequest::Calls(missing))
+                            Some(missing)
                         }
                     }
                 };
-                let Some(request) = request else {
+                if remaining[position].is_none() {
+                    if base_plan.is_none() {
+                        base_plan = Some(make_plan(meter, &candidate.measures)?);
+                        if slot == 0 {
+                            candidate.plan = base_plan.clone();
+                        }
+                    }
+                    let (ctx, snapshot) = capture_mutual_member(
+                        meter,
+                        (environment, kernel, scope),
+                        parts,
+                        base_plan.as_ref().expect("base plan").clone(),
+                        (position, index),
+                        &captures,
+                    )?;
+                    let total = snapshot.goals.len();
+                    if counts[position].is_some_and(|previous| previous != total) {
+                        return Err(failure(SourceInferenceError::Scope));
+                    }
+                    counts[position] = Some(total);
+                    let mut calls = Vec::with_capacity(total);
+                    for call in 0..total {
+                        meter.tick()?;
+                        calls.push(call);
+                    }
+                    remaining[position] = Some(calls);
+                    complex |= snapshot.complex;
+                    captured[position] = Some((ctx, snapshot));
+                    if complex && candidate.after_complex {
+                        return Err(unsupported("earlier complex inferred measures"));
+                    }
+                }
+                let missing = if disqualified {
                     continue;
+                } else if let Some(missing) = needed_calls {
+                    missing
+                } else {
+                    remaining[position]
+                        .as_ref()
+                        .expect("captured remaining calls")
+                        .clone()
                 };
-                match mutual_well_founded_member(
-                    meter,
-                    (environment, kernel, scope),
-                    parts,
-                    plan.clone(),
-                    (position, index),
-                    &captures,
-                    Some(request),
-                ) {
-                    Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
-                        recursion::RecursionError::MutualMeasureProbe {
-                            relations,
-                            total,
-                            complex: member_complex,
-                        },
-                    ))) => {
-                        if counts[position].is_some_and(|previous| previous != total) {
-                            return Err(failure(SourceInferenceError::Scope));
-                        }
-                        counts[position] = Some(total);
-                        if remaining[position].is_none() {
-                            let mut calls = Vec::new();
-                            for call in 0..total {
-                                meter.tick()?;
-                                calls.push(call);
-                            }
-                            remaining[position] = Some(calls);
-                        }
-                        for (call, relation) in relations {
-                            meter.tick()?;
-                            disqualified |= relation == recursion::MutualMeasureRelation::Unknown;
-                            if call >= total
-                                || candidate.calls[position]
-                                    .insert(call, relation)
-                                    .is_some_and(|previous| previous != relation)
-                            {
-                                return Err(failure(SourceInferenceError::Scope));
-                            }
-                        }
-                        complex |= member_complex;
-                        if complex && candidate.after_complex {
-                            return Err(unsupported("earlier complex inferred measures"));
-                        }
+                if missing.is_empty() {
+                    continue;
+                }
+                let (ctx, snapshot) = captured[position].as_mut().expect("captured member probe");
+                ctx.txn.budget = meter.txn.budget.clone();
+                ctx.txn.nat_sub_model_cache = meter.txn.nat_sub_model_cache.clone();
+                let probed = ctx.probe_mutual_calls(snapshot, &measure_sum, &missing);
+                meter.txn.budget = ctx.txn.budget.clone();
+                meter.txn.nat_sub_model_cache = ctx.txn.nat_sub_model_cache.clone();
+                let total = counts[position].expect("captured total");
+                for (call, relation) in probed? {
+                    meter.tick()?;
+                    disqualified |= relation == recursion::MutualMeasureRelation::Unknown;
+                    if call >= total
+                        || candidate.calls[position]
+                            .insert(call, relation)
+                            .is_some_and(|previous| previous != relation)
+                    {
+                        return Err(failure(SourceInferenceError::Scope));
                     }
-                    Err(problem) => return Err(problem),
-                    Ok(_) => return Err(failure(SourceInferenceError::Scope)),
                 }
             }
             if disqualified {
@@ -1080,11 +1118,10 @@ fn mutual_well_founded(
             .all(|calls| calls.as_ref().is_some_and(Vec::is_empty))
         {
             if order.len() == 1 {
-                break candidates[slot]
-                    .plan
-                    .as_ref()
-                    .expect("selected plan")
-                    .clone();
+                if let Some(plan) = candidates[slot].plan.clone() {
+                    break plan;
+                }
+                break make_plan(meter, &candidates[slot].measures)?;
             }
             let mut planner = Context::scoped(environment, kernel, scope)?;
             planner.txn.budget = meter.txn.budget.clone();
@@ -1164,6 +1201,56 @@ fn mutual_measure_combinations(counts: &[usize]) -> Option<Vec<Vec<usize>>> {
             current[position] = 0;
         }
     }
+}
+
+/// Elaborate one mutual member body once against the shared `PSum` domain and
+/// return its captured probe context and packed call obligations for reuse
+/// across GuessLex candidates.
+fn capture_mutual_member(
+    meter: &mut Context,
+    (environment, kernel, scope): (&Environment, Budget, &SourceScope),
+    parts: &Parts<'_>,
+    plan: std::sync::Arc<recursion::WellFoundedPlan>,
+    (position, index): (usize, usize),
+    captures: &[LocalDecl],
+) -> Result<(Context, recursion::MemberProbeSnapshot), NatDefinitionElabError> {
+    let mut context = Context::scoped(environment, kernel, scope)?;
+    context.txn.budget = meter.txn.budget.clone();
+    context.txn.nat_sub_model_cache = meter.txn.nat_sub_model_cache.clone();
+    let result = (|| {
+        context.txn.lctx = LocalContext::new();
+        for capture in captures {
+            context.tick()?;
+            tactics::eliminate::add_local(&mut context.txn.lctx, capture);
+        }
+        context.partial = Some(State {
+            kind: Kind::Unsafe,
+            group: Some(parts.group.clone()),
+            ordinary: true,
+            ..State::default()
+        });
+        context.mutual_member = Some(recursion::MutualMember::new(
+            plan,
+            position,
+            captures.to_vec(),
+            Some(recursion::MutualMeasureRequest::Capture),
+        ));
+        match definition_in_context(&parts.members[index], &mut context) {
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
+                recursion::RecursionError::MutualMeasureProbe { .. },
+            ))) => context
+                .mutual_member
+                .as_mut()
+                .and_then(recursion::MutualMember::take_probe_snapshot)
+                .ok_or_else(|| failure(SourceInferenceError::Scope)),
+            Err(problem) => Err(problem),
+            Ok(_) => Err(failure(SourceInferenceError::Scope)),
+        }
+    })();
+    meter.txn.budget = context.txn.budget.clone();
+    meter.txn.nat_sub_model_cache = context.txn.nat_sub_model_cache.clone();
+    let snapshot = result?;
+    Ok((context, snapshot))
 }
 
 /// Every candidate uses a fresh context over the same admitted predecessor.

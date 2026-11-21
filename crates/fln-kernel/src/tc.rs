@@ -219,6 +219,17 @@ fn reject<T>(class: RejectClass, message: impl Into<String>) -> KResult<T> {
     Err(Stop::Reject(class, message.into()))
 }
 
+fn has_proj_head(mut e: &Expr) -> bool {
+    loop {
+        match e.node() {
+            ExprNode::Proj { .. } => return true,
+            ExprNode::App { f, .. } => e = f,
+            ExprNode::MData { expr, .. } => e = expr,
+            _ => return false,
+        }
+    }
+}
+
 fn clear_whnf_head(stop: Stop) -> Stop {
     match stop {
         Stop::DeferredRecursor { frame, major, .. } => Stop::DeferredRecursor {
@@ -3855,6 +3866,7 @@ impl<'a> TypeChecker<'a> {
             && let Some(cached) =
                 self.whnf_core_cheap_sensitive_cache
                     .get(e, &self.locals, &self.local_positions)
+            && !self.proj_spine_has_full_cache_hit(&cached)
         {
             // Replaying a result a projection affected makes the caller's
             // result projection-sensitive too.
@@ -3887,6 +3899,7 @@ impl<'a> TypeChecker<'a> {
                             &self.locals,
                             &self.local_positions,
                         )
+                        && !self.proj_spine_has_full_cache_hit(&cached)
                     {
                         self.cheap_proj_events += 1;
                         break cached;
@@ -5761,7 +5774,16 @@ impl<'a> TypeChecker<'a> {
             }
         }
         let outcome = self.lazy_delta_uncached(t.clone(), s.clone(), depth)?;
-        if (!self.eager_reduction || (!t.has_fvar() && !s.has_fvar()))
+        // A `Stuck` outcome ending at a projection head depends on `whnf_core_cache`
+        // being cold for that projection: once full `whnf_core` caches the reduced
+        // field, replaying the stale `Stuck(Proj, ...)` bypasses `whnf_core_cache`
+        // and re-runs `lazy_delta_proj_reduction` exponentially up a structure tower.
+        let stuck_at_proj = matches!(
+            &outcome,
+            LazyDelta::Stuck(to, so) if has_proj_head(to) || has_proj_head(so)
+        );
+        if !stuck_at_proj
+            && (!self.eager_reduction || (!t.has_fvar() && !s.has_fvar()))
             && self.lazy_delta_outcome_rows < TYPE_CHECKER_LAZY_DELTA_OUTCOME_MAX_ROWS
             && self.lazy_delta_outcome_scan_nodes < TYPE_CHECKER_LAZY_DELTA_OUTCOME_SCAN_NODES
         {
@@ -5949,6 +5971,26 @@ impl<'a> TypeChecker<'a> {
             Some(false) => ReductionStatus::DefDiff,
             None => ReductionStatus::Continue,
         })
+    }
+
+    fn proj_spine_has_full_cache_hit(&self, mut expr: &Expr) -> bool {
+        loop {
+            match expr.node() {
+                ExprNode::App { f, .. } => expr = f,
+                ExprNode::MData { expr: inner, .. } => expr = inner,
+                ExprNode::Proj { expr: inner, .. } => {
+                    if self
+                        .whnf_core_cache
+                        .get(expr, &self.locals, &self.local_positions)
+                        .is_some()
+                    {
+                        return true;
+                    }
+                    expr = inner;
+                }
+                _ => return false,
+            }
+        }
     }
 
     /// Pinned `try_unfold_proj_app`: an application whose head is a projection

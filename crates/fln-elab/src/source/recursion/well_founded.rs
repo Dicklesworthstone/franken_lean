@@ -412,7 +412,12 @@ fn automatic_decreasing_proof() -> Syntax {
             Syntax::node(parser_kind(&["Tactic", name]), args)
         })
         .collect();
-    sequence(vec![
+    let direct = sequence(vec![
+        lexicographic_constructors("Prod"),
+        lexicographic_constructors("PSigma"),
+        first(alternatives.clone()),
+    ]);
+    let with_simp = sequence(vec![
         Syntax::node(
             parser_kind(&["Tactic", "tacticTry_"]),
             vec![atom("try"), sequence(vec![simp])],
@@ -420,7 +425,8 @@ fn automatic_decreasing_proof() -> Syntax {
         lexicographic_constructors("Prod"),
         lexicographic_constructors("PSigma"),
         first(alternatives),
-    ])
+    ]);
+    first(vec![direct, with_simp])
 }
 
 impl Context {
@@ -1558,6 +1564,21 @@ impl Context {
         target: &Expr,
         default: bool,
     ) -> Result<Result<CallRelation, NatDefinitionElabError>, NatDefinitionElabError> {
+        let mutual = self
+            .well_founded
+            .as_ref()
+            .is_some_and(|state| state.mutual.is_some());
+        self.classify_call_with_weak(proof, goal, target, default, mutual)
+    }
+
+    fn classify_call_with_weak(
+        &mut self,
+        proof: &Syntax,
+        goal: &tactics::ProofGoal,
+        target: &Expr,
+        default: bool,
+        mutual: bool,
+    ) -> Result<Result<CallRelation, NatDefinitionElabError>, NatDefinitionElabError> {
         let mut trial = self.clone();
         trial.txn.lctx = goal.lctx.clone();
         // BasicMeasure.beta has already removed the argument pack before
@@ -1600,11 +1621,7 @@ impl Context {
         };
         // Mutual inference keeps its existing proof spelling and cost. Its
         // candidate search is separate from the single-function matrix here.
-        let weak_relation = if self
-            .well_founded
-            .as_ref()
-            .is_some_and(|state| state.mutual.is_some())
-        {
+        let weak_relation = if mutual {
             Expr::const_(Name::from_components(["Nat", "le"]), Vec::new())
         } else {
             inferred_nat_relation(false)

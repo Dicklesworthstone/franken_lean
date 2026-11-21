@@ -24,8 +24,8 @@ pub(super) use well_founded::Executable as WellFoundedExecutable;
 pub(super) use well_founded::State as WellFounded;
 pub(in crate::source) use well_founded::decreasing_tactic_expansion;
 pub(in crate::source) use well_founded::mutual::{
-    MemberHint, MutualMember, Plan as WellFoundedPlan, Probe as MutualMeasureRequest,
-    strongly_connected,
+    MemberHint, MemberProbeSnapshot, MutualMember, Plan as WellFoundedPlan,
+    Probe as MutualMeasureRequest, strongly_connected,
 };
 
 /// One checked entry of the mutual GuessLex call matrix. Unknown is a completed

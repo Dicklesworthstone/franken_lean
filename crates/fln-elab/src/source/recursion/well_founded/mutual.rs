@@ -94,6 +94,21 @@ pub(in crate::source) enum Probe {
     All,
     /// Original call indices, in increasing order without duplicates.
     Calls(Vec<usize>),
+    /// Elaborate the body once and capture its packed call obligations for reuse
+    /// across GuessLex candidates without re-elaborating the source syntax.
+    Capture,
+}
+
+/// Captured per-member call obligations after elaborating one mutual member body
+/// against the shared `PSum` domain. Reused across GuessLex measure candidates.
+#[derive(Clone)]
+pub(in crate::source) struct MemberProbeSnapshot {
+    pub fixed_values: Vec<Expr>,
+    pub goals: Vec<tactics::ProofGoal>,
+    pub packed: Vec<(Expr, Expr)>,
+    pub prepared: Syntax,
+    pub default_tactic: bool,
+    pub complex: bool,
 }
 
 /// The member of a planned group being elaborated in a context, and, once its
@@ -107,6 +122,7 @@ pub(in crate::source) struct MutualMember {
     /// A discarded GuessLex pass classifies each call without manufacturing a
     /// proof of a weak comparison or publishing an unfinished fixpoint.
     probe: Option<Probe>,
+    probe_snapshot: Option<MemberProbeSnapshot>,
 }
 
 impl MutualMember {
@@ -122,11 +138,16 @@ impl MutualMember {
             captures,
             piece: None,
             probe,
+            probe_snapshot: None,
         }
     }
 
     pub(in crate::source) fn piece(&self) -> Option<&Expr> {
         self.piece.as_ref()
+    }
+
+    pub(in crate::source) fn take_probe_snapshot(&mut self) -> Option<MemberProbeSnapshot> {
+        self.probe_snapshot.take()
     }
 }
 
@@ -1129,6 +1150,178 @@ impl Context {
             .value)
     }
 
+    /// Build only the closed `PSum` measure function `fun fixed => fun x : domain => Nat`
+    /// for one inferred GuessLex candidate, without synthesizing a relation or fixpoint.
+    pub(in crate::source) fn mutual_candidate_measure(
+        &mut self,
+        names: &[Name],
+        types: &[Expr],
+        arities: &[usize],
+        measures: &[Expr],
+        fixed: usize,
+        level_params: Vec<Name>,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        self.level_params = level_params.clone();
+        self.explicit_levels = level_params.len();
+        let saved = self.txn.lctx.clone();
+        let result = (|| {
+            self.txn.lctx = LocalContext::new();
+            let fixed_locals = self.open_mutual_fixed(&types[0], fixed)?;
+            let mut domains = Vec::new();
+            let mut packed_measures = Vec::new();
+            let mut measure_type: Option<Expr> = None;
+            let fixed_ids: HashSet<_> = fixed_locals.iter().map(|local| local.id.clone()).collect();
+            for (index, type_) in types.iter().enumerate() {
+                let before = self.txn.lctx.clone();
+                let mut type_ = type_.clone();
+                for local in &fixed_locals {
+                    self.tick()?;
+                    if !matches!(type_.node(), ExprNode::ForallE { .. }) {
+                        type_ = self.whnf(&type_)?;
+                    }
+                    let ExprNode::ForallE {
+                        binder_type, body, ..
+                    } = type_.node()
+                    else {
+                        return Err(failure(SourceInferenceError::ExpectedFunction));
+                    };
+                    if self.instantiate(binder_type)? != self.instantiate(&local.type_)? {
+                        return Err(unsupported("fixed parameters of one type in every member"));
+                    }
+                    let next = self.substitute(body, &Expr::fvar(local.id.clone()))?;
+                    type_ = next;
+                }
+                let mut varying = Vec::new();
+                for _ in fixed..arities[index] {
+                    self.tick()?;
+                    if !matches!(type_.node(), ExprNode::ForallE { .. }) {
+                        type_ = self.whnf(&type_)?;
+                    }
+                    let ExprNode::ForallE {
+                        binder_name,
+                        binder_type,
+                        body,
+                        binder_info,
+                    } = type_.node()
+                    else {
+                        return Err(failure(SourceInferenceError::ExpectedFunction));
+                    };
+                    let id = FVarId(self.fresh_name()?);
+                    self.txn.lctx.add_param(
+                        id.clone(),
+                        binder_name.clone(),
+                        binder_type.clone(),
+                        *binder_info,
+                    );
+                    varying.push(self.txn.lctx.find(&id).ok_or_else(scope)?.clone());
+                    let next = self.substitute(body, &Expr::fvar(id))?;
+                    type_ = next;
+                }
+                if varying.is_empty() {
+                    return Err(error(RecursionError::WellFoundedArgumentRequired));
+                }
+                let domain = self.well_founded_domain(&varying)?;
+                let mut measure = measures[index].clone();
+                for local in fixed_locals.iter().chain(&varying) {
+                    let ExprNode::Lam { body, .. } = measure.node() else {
+                        return Err(scope());
+                    };
+                    let next = self.substitute(body, &Expr::fvar(local.id.clone()))?;
+                    measure = next;
+                }
+                let actual_type = self
+                    .known_type(&measure)?
+                    .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+                let actual_type = self.instantiate(&actual_type)?;
+                if self
+                    .elimination_reads(&actual_type)?
+                    .iter()
+                    .any(|id| !fixed_ids.contains(id))
+                {
+                    return Err(unsupported(
+                        "a termination measure type depending on varying parameters",
+                    ));
+                }
+                if let Some(previous) = &measure_type {
+                    if !self.well_founded_default_conversion(previous, &actual_type)? {
+                        return Err(error(RecursionError::MutualMeasureTypeMismatch {
+                            first: names[0].clone(),
+                            other: names[index].clone(),
+                        }));
+                    }
+                } else {
+                    measure_type = Some(actual_type.clone());
+                }
+                packed_measures.push(
+                    self.uncurry_well_founded_value(
+                        &varying,
+                        Typed {
+                            value: measure,
+                            type_: actual_type,
+                        },
+                    )?
+                    .value,
+                );
+                domains.push(domain);
+                self.txn.lctx = before;
+            }
+            let mut domain = domains.last().cloned().ok_or_else(scope)?;
+            for part in domains.iter().rev().skip(1) {
+                self.tick()?;
+                domain = self.mutual_apply(&["PSum"], [part.clone(), domain])?.value;
+            }
+            let measure_type = measure_type.ok_or_else(scope)?;
+            let measure = self.mutual_function_of_sum(&domain, measure_type, &packed_measures)?;
+            let closed = self.close_mutual_fixed(&measure, &fixed_locals, true)?;
+            self.require_resolved_terms(std::slice::from_ref(&closed))?;
+            if closed.has_fvar() || closed.has_level_mvar() || closed.has_loose_bvars() {
+                return Err(scope());
+            }
+            Ok(closed)
+        })();
+        self.txn.lctx = saved;
+        result
+    }
+
+    /// Classify a batch of cached recursive calls against one candidate `PSum` measure
+    /// without re-elaborating the member's source body.
+    pub(in crate::source) fn probe_mutual_calls(
+        &mut self,
+        snapshot: &MemberProbeSnapshot,
+        measure: &Expr,
+        calls: &[usize],
+    ) -> Result<Vec<(usize, MutualMeasureRelation)>, NatDefinitionElabError> {
+        let measure_fn = self.open_mutual_closed(measure, &snapshot.fixed_values)?;
+        let lt = Expr::const_(Name::from_components(["Nat", "lt"]), Vec::new());
+        let mut relations = Vec::new();
+        for &call in calls {
+            self.tick()?;
+            let (next, current) = snapshot.packed.get(call).ok_or_else(scope)?;
+            let goal = snapshot.goals.get(call).ok_or_else(scope)?;
+            let target = Expr::app(
+                Expr::app(lt.clone(), Expr::app(measure_fn.clone(), next.clone())),
+                Expr::app(measure_fn.clone(), current.clone()),
+            );
+            let relation = match self.classify_call_with_weak(
+                &snapshot.prepared,
+                goal,
+                &target,
+                snapshot.default_tactic,
+                true,
+            )? {
+                Ok(CallRelation::Eq) => MutualMeasureRelation::Eq,
+                Ok(CallRelation::Lt) => MutualMeasureRelation::Lt,
+                Ok(CallRelation::Le) => MutualMeasureRelation::Le,
+                Err(_) => MutualMeasureRelation::Unknown,
+            };
+            relations.push((call, relation));
+            if relation == MutualMeasureRelation::Unknown {
+                break;
+            }
+        }
+        Ok(relations)
+    }
+
     /// Reopen the checked fixpoint prefix and its type in a member's own fixed
     /// context. The relation was selected once for the entire component.
     fn mutual_fix(&mut self, plan: &Plan, fixed: &[Expr]) -> Result<Typed, NatDefinitionElabError> {
@@ -1556,12 +1749,41 @@ impl Context {
                 };
                 let prepared = self.lower_pattern_matrices(proof)?;
                 if let Some(probe) = &member.probe {
-                    let mut relations = Vec::new();
                     let varying: Vec<_> = (plan.fixed..parameters.len()).collect();
                     let complex = self.complex_measure_possible(&goals, &parameters, &varying)?;
+                    if matches!(probe, Probe::Capture) {
+                        let mut packed = Vec::with_capacity(obligations.len());
+                        for obligation in &obligations {
+                            self.tick()?;
+                            let raw_target = self.instantiate(&obligation.raw_target)?;
+                            let (_, _, next, current) =
+                                self.decreasing_relation_parts(&raw_target)?;
+                            packed.push((next, current));
+                        }
+                        let total = goals.len();
+                        let snapshot = MemberProbeSnapshot {
+                            fixed_values: fixed_values.clone(),
+                            goals,
+                            packed,
+                            prepared,
+                            default_tactic: hint.decreasing.is_none(),
+                            complex,
+                        };
+                        self.mutual_member
+                            .as_mut()
+                            .ok_or_else(scope)?
+                            .probe_snapshot = Some(snapshot);
+                        return Err(error(RecursionError::MutualMeasureProbe {
+                            relations: Vec::new(),
+                            total,
+                            complex,
+                        }));
+                    }
+                    let mut relations = Vec::new();
                     let mut requested = match probe {
                         Probe::All => None,
                         Probe::Calls(calls) => Some(calls.iter().copied().peekable()),
+                        Probe::Capture => unreachable!("handled above"),
                     };
                     for (index, goal) in goals.iter().enumerate() {
                         self.tick()?;
@@ -1574,13 +1796,17 @@ impl Context {
                             }
                             calls.next();
                         }
-                        let relation =
-                            match self.classify_call(&prepared, goal, &goal.target, false)? {
-                                Ok(CallRelation::Eq) => MutualMeasureRelation::Eq,
-                                Ok(CallRelation::Lt) => MutualMeasureRelation::Lt,
-                                Ok(CallRelation::Le) => MutualMeasureRelation::Le,
-                                Err(_) => MutualMeasureRelation::Unknown,
-                            };
+                        let relation = match self.classify_call(
+                            &prepared,
+                            goal,
+                            &goal.target,
+                            hint.decreasing.is_none(),
+                        )? {
+                            Ok(CallRelation::Eq) => MutualMeasureRelation::Eq,
+                            Ok(CallRelation::Lt) => MutualMeasureRelation::Lt,
+                            Ok(CallRelation::Le) => MutualMeasureRelation::Le,
+                            Err(_) => MutualMeasureRelation::Unknown,
+                        };
                         relations.push((index, relation));
                         if relation == MutualMeasureRelation::Unknown {
                             break;
@@ -1595,7 +1821,20 @@ impl Context {
                 self.prove_decreasing_goals(&prepared, goals, hint.decreasing.is_some())?;
                 self.assign_decreasing_transports(obligations)?;
             }
-            if member.probe.is_some() {
+            if let Some(probe) = &member.probe {
+                if matches!(probe, Probe::Capture) {
+                    self.mutual_member
+                        .as_mut()
+                        .ok_or_else(scope)?
+                        .probe_snapshot = Some(MemberProbeSnapshot {
+                        fixed_values: fixed_values.clone(),
+                        goals: Vec::new(),
+                        packed: Vec::new(),
+                        prepared: automatic_decreasing_proof(),
+                        default_tactic: hint.decreasing.is_none(),
+                        complex: false,
+                    });
+                }
                 return Err(error(RecursionError::MutualMeasureProbe {
                     relations: Vec::new(),
                     total: 0,
