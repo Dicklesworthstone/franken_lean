@@ -788,3 +788,59 @@ example : Nat := (fun (e : Nat) => 3) 2
         "{ours}"
     );
 }
+
+/// Named instance binders (`[i : T]`) in `∀`, `fun`, dependent arrows, structure-instance
+/// fields, and queries match the pinned v4.32.0 `Lean/Linter/UnusedVariables.lean` rule:
+/// signature binders stay unabstracted in `BodyInfo` (so implicit typeclass resolution marks
+/// `f5`'s `i` used), whereas `fun`/`∀`/arrow/field binders are abstracted before `BodyInfo`
+/// and therefore warn whenever not explicitly referenced — even when resolved implicitly
+/// (`f8` / `s1` / `#check`), while explicit references (`u1`, `t4`, `d2`, `s2`), `_`-prefixed
+/// names (`u3`), anonymous `[T]` (`t6`), tactic bodies (`u8`'s `fun`), and
+/// `set_option linter.unusedVariables false` stay silent.
+#[test]
+fn named_instance_binders_in_fun_forall_and_arrows_match_the_pin() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "theorem t2 : ∀ {α : Type} [i : Inhabited α], True := fun {_} [_] => True.intro
+def f1 : ∀ {α : Type} [Inhabited α], Nat := fun {_} [i : Inhabited _] => 0
+def f2 {α : Type} [i : Inhabited α] : Nat := 0
+def f5 {α : Type} [i : Inhabited α] : α := default
+def f8 := fun {α : Type} [i : Inhabited α] => (default : α)
+def u1 := fun {α : Type} [i : Inhabited α] => @default α i
+def u3 := fun {α : Type} [_i : Inhabited α] => (default : α)
+theorem t4 : ∀ {α : Type} [i : Inhabited α], i = i := fun {_} [_] => rfl
+theorem t6 : ∀ {α : Type} [Inhabited α], True := fun {_} [_] => True.intro
+def d1 : {α : Type} → [i : Inhabited α] → Nat := fun {_} [_] => 0
+theorem d2 : {α : Type} → [i : Inhabited α] → @default α i = @default α i := fun {_} [_] => rfl
+theorem t_tac : ∀ {α : Type} [i : Inhabited α], True := by intro _ _; trivial
+def u8 : {α : Type} → [i : Inhabited α] → α := fun {_} [i : Inhabited _] => by exact default
+structure InstField where
+  f : ∀ {α : Type} [Inhabited α], α
+def s1 : InstField where
+  f {_} [i : Inhabited _] := default
+def s2 : InstField where
+  f {_} [i : Inhabited _] := @default _ i
+set_option linter.unusedVariables.funArgs false in
+def fa4 : {α : Type} → [Inhabited α] → Nat := fun {_} [i : Inhabited _] => 0
+set_option linter.unusedVariables false in
+def off1 : ∀ {α : Type} [i : Inhabited α], Nat := fun {_} [j : Inhabited _] => 0
+#check fun {α : Type} [i : Inhabited α] => (0 : Nat)
+#check fun {α : Type} [i : Inhabited α] => (default : α)
+#check ∀ {α : Type} [i : Inhabited α], True
+";
+    let (ours, pinned) = outputs_under(
+        &lib,
+        &root,
+        "inst_binders",
+        "prelude\nimport Init.Tactics\n",
+        program,
+    );
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        12,
+        "{ours}"
+    );
+}

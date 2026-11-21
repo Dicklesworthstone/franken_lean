@@ -1317,9 +1317,20 @@ pub(crate) fn unused_pattern_variables(
     unused
 }
 
-/// The binders a `fun`'s binder list names, or `None` when one has a form not read here.
-/// An instance binder is left unread: the pin may count resolution as its use.
-fn fun_binders(binders: &[Syntax], constructors: &Constructors) -> Option<Vec<(Name, usize)>> {
+/// The binders a `fun`'s binder list names, paired with whether `linter.unusedVariables.funArgs
+/// false` ignores them, or `None` when one has a form not read here.
+///
+/// The pin's `BodyInfo` holds only a declaration's signature parameters as unabstracted free
+/// variables (`Lean/Linter/UnusedVariables.lean:399-448`): a `fun`'s binders (including named
+/// `[i : T]` instance binders) are already abstracted, so they are used only when explicitly
+/// referenced in syntax — which is why the warning suggests naming an implicitly-used instance
+/// binder `_`. Under `funArgs false`, the pin ignores only a bare identifier or single-identifier
+/// type ascription directly under `basicFun` (`:273-276`), not implicit, strict-implicit, grouped,
+/// or instance binders.
+fn fun_binders(
+    binders: &[Syntax],
+    constructors: &Constructors,
+) -> Option<Vec<(Name, usize, bool)>> {
     // A binder name, a hole, or `x y` written as an application of names.
     fn idents(syntax: &Syntax) -> Option<Vec<(Name, usize)>> {
         let parts: Vec<&Syntax> = if is_kind(syntax, &["Term", "app"]) {
@@ -1342,7 +1353,7 @@ fn fun_binders(binders: &[Syntax], constructors: &Constructors) -> Option<Vec<(N
     let mut names = Vec::new();
     for binder in binders {
         if matches!(binder, Syntax::Ident { .. }) || is_kind(binder, &["Term", "hole"]) {
-            names.extend(idents(binder)?);
+            names.extend(idents(binder)?.into_iter().map(|(n, at)| (n, at, true)));
         } else if is_kind(binder, &["Term", "tuple"]) || is_kind(binder, &["Term", "anonymousCtor"])
         {
             // `fun (x, y) => …` matches on its argument: its names are pattern variables. Under
@@ -1353,20 +1364,34 @@ fn fun_binders(binders: &[Syntax], constructors: &Constructors) -> Option<Vec<(N
             }
             for declared in declarations(&[binder], constructors)? {
                 if let Declared::Named { name, at, .. } = declared {
-                    names.push((name, at));
+                    names.push((name, at, true));
                 }
             }
         } else if is_kind(binder, &["Term", "typeAscription"])
             || is_kind(binder, &["Term", "paren"])
         {
-            names.extend(idents(args(binder).get(1)?)?);
+            let inner = args(binder).get(1)?;
+            let single_ident = matches!(inner, Syntax::Ident { .. });
+            names.extend(
+                idents(inner)?
+                    .into_iter()
+                    .map(|(n, at)| (n, at, single_ident)),
+            );
         } else if is_kind(binder, &["Term", "implicitBinder"])
             || is_kind(binder, &["Term", "strictImplicitBinder"])
         {
             for name in args(args(binder).get(1)?) {
-                names.extend(idents(name)?);
+                names.extend(idents(name)?.into_iter().map(|(n, at)| (n, at, false)));
             }
-        } else if !is_kind(binder, &["Term", "instBinder"]) {
+        } else if is_kind(binder, &["Term", "instBinder"]) {
+            match args(args(binder).get(1)?) {
+                [] => {}
+                [name, _colon] => {
+                    names.extend(idents(name)?.into_iter().map(|(n, at)| (n, at, false)));
+                }
+                _ => return None,
+            }
+        } else {
             return None;
         }
     }
@@ -1381,10 +1406,10 @@ pub(crate) fn unused_fun_binders(
     options: &KVMap,
     constructors: &Constructors,
 ) -> Vec<UnusedBinder> {
-    // The pin's ignore functions for function arguments (`basicFun`) when `funArgs` is off.
-    if !linted(options, Some("funArgs")) {
+    if !linted(options, None) {
         return Vec::new();
     }
+    let fun_args_enabled = linted(options, Some("funArgs"));
     let functions = term_scopes(command, |node| {
         is_kind(node, &["Term", "basicFun"]).then_some(())
     });
@@ -1396,8 +1421,10 @@ pub(crate) fn unused_fun_binders(
         let Some(names) = fun_binders(args(binders), constructors) else {
             continue;
         };
-        for (name, at) in names {
-            if matches!(name.leaf_view(), LeafView::Str(text) if text.starts_with('_')) {
+        for (name, at, ignored_when_fun_args_off) in names {
+            if (ignored_when_fun_args_off && !fun_args_enabled)
+                || matches!(name.leaf_view(), LeafView::Str(text) if text.starts_with('_'))
+            {
                 continue;
             }
             if !referenced(function, &name, at) {
@@ -1409,8 +1436,11 @@ pub(crate) fn unused_fun_binders(
     unused
 }
 
-/// The names a binder group declares, or `None` for a form not read here. An instance
-/// binder declares nothing read here: the pin may count resolution as its use.
+/// The names a binder group declares, or `None` for a form not read here.
+///
+/// Named instance binders (`[i : T]`) in `∀`, dependent arrows, and structure-instance fields
+/// are abstracted before `BodyInfo` (`Lean/Linter/UnusedVariables.lean:399-448`), so the pin
+/// warns whenever `i` is not explicitly referenced; anonymous `[T]` binds no name.
 fn group_names(binder: &Syntax) -> Option<Vec<(Name, usize)>> {
     let mut names = Vec::new();
     let mut push = |syntax: &Syntax| -> Option<()> {
@@ -1430,7 +1460,13 @@ fn group_names(binder: &Syntax) -> Option<Vec<(Name, usize)>> {
         for name in args(args(binder).get(1)?) {
             push(name)?;
         }
-    } else if !is_kind(binder, &["Term", "instBinder"]) {
+    } else if is_kind(binder, &["Term", "instBinder"]) {
+        match args(args(binder).get(1)?) {
+            [] => {}
+            [name, _colon] => push(name)?,
+            _ => return None,
+        }
+    } else {
         return None;
     }
     Some(names)
