@@ -426,18 +426,56 @@ instance Synonym.module (M : Type) {R : Type} [Zero R] [Zero M] [Module R M] :
 variable (R : Type) [Ring R]
 set_option maxSynthPendingDepth 2 in
 #synth HasQuotient (Synonym (Synonym R)) (Submodule R (Synonym (Synonym R)))
+#synth HasQuotient (Synonym (Synonym R)) (Submodule R (Synonym (Synonym R)))
 "#;
     let (code, stdout, stderr) = ours(&lib, &root, program);
     assert_eq!(
         (code, stdout.as_str()),
-        (Some(0), "Submodule.hasQuotient\n"),
+        (Some(0), "Submodule.hasQuotient\nSubmodule.hasQuotient\n"),
         "stderr: {stderr}"
     );
     if let Some((pin_code, pin_stdout)) = pinned(&lib, &root.join("Diamonds.lean")) {
         assert_eq!(
             (pin_code, pin_stdout.as_str()),
-            (0, "Submodule.hasQuotient\n"),
+            (0, "Submodule.hasQuotient\nSubmodule.hasQuotient\n"),
             "the pin moved"
         );
+    }
+}
+
+/// Inherited default override referencing a newly declared field whose type mentions
+/// a parent field via its generated projection function (upstream `tests/elab/3150.lean`).
+#[test]
+fn inherited_default_override_after_projection_fn_reduction_matches_pin() {
+    let Some(lib) = pinned_lib() else { return };
+    if !lib.join("Init/Data/Zero.olean").is_file() {
+        return;
+    }
+    let root = workspace();
+    let program = r#"prelude
+import Init.Core
+import Init.Data.Zero
+variable (R A : Type) [One R] [One A]
+
+class OneHom where
+  toFun : R → A
+  map_one : toFun One.one = One.one
+
+structure Subone where
+  mem : R → Prop
+  one_mem : mem One.one
+
+structure Subalgebra [OneHom R A] : Type extends Subone A where
+  algebraMap_mem : ∀ r : R, mem (OneHom.toFun r)
+  one_mem := OneHom.map_one (R := R) (A := A) ▸ algebraMap_mem One.one
+
+example [OneHom R A] : Subalgebra R A where
+  mem _ := True
+  algebraMap_mem _ := True.intro
+"#;
+    let (code, stdout, stderr) = ours(&lib, &root, program);
+    assert_eq!((code, stdout.as_str()), (Some(0), ""), "stderr: {stderr}");
+    if let Some((pin_code, pin_stdout)) = pinned(&lib, &root.join("Diamonds.lean")) {
+        assert_eq!((pin_code, pin_stdout.as_str()), (0, ""), "the pin moved");
     }
 }

@@ -885,3 +885,28 @@ structure BadLeaf extends Mid Nat where
             .contains(&Name::from_components(["BadLeaf"]))
     );
 }
+
+#[test]
+fn inherited_default_override_can_reference_new_field_whose_type_uses_inherited_projection() {
+    let checked = check(
+        &engine(),
+        r#"
+structure Subone where
+  mem : Nat → Prop
+  one_mem : mem 0
+structure Subalg extends Subone where
+  map_mem : ∀ n : Nat, mem n
+  one_mem := map_mem 0
+def sa : Subalg where
+  mem _ := True
+  map_mem _ := True.intro
+example : sa.mem 0 := sa.one_mem
+"#,
+    );
+    assert!(
+        checked
+            .engine
+            .environment()
+            .contains(&Name::from_components(["Subalg", "one_mem", "_default"]))
+    );
+}

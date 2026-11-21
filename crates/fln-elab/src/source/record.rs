@@ -803,7 +803,7 @@ pub(super) fn elaborate_record_scoped(
         }
     }
     declarations.extend(flat_declarations);
-    let (copied, copied_instances) = context.copied_parent_projections(
+    let (copied, _copied_instances) = context.copied_parent_projections(
         &spec,
         inheritance.copied,
         &inheritance.aliases,
@@ -811,8 +811,6 @@ pub(super) fn elaborate_record_scoped(
     )?;
     declarations.extend(copied);
     declarations.extend(helpers);
-    let mut parent_instances = context.record_parent_instances(&spec, &inheritance.parents)?;
-    parent_instances.extend(copied_instances);
     let subobjects: std::collections::BTreeMap<_, _> = inheritance
         .parents
         .iter()
@@ -850,6 +848,7 @@ pub(super) fn elaborate_record_scoped(
             projection,
         });
     }
+    let parent_instances = context.record_parent_instances(&spec, &parents, budget)?;
     let structure = StructureEntry {
         name: name.clone(),
         fields,

@@ -7,27 +7,51 @@
 use super::*;
 
 impl Context {
+    /// Register direct class parent projections as instances, omitting any
+    /// parent that is already a proper ancestor of another direct class parent
+    /// (`addParentInstances`, vendored `Lean/Elab/Structure.lean:1508-1516`).
     pub(in crate::source::record) fn record_parent_instances(
         &mut self,
         spec: &RecordSpec,
-        parents: &[RecordParent],
+        parents: &[crate::records::imported::StructureParent],
+        budget: RecordBudget,
     ) -> Result<Vec<Name>, NatDefinitionElabError> {
         let mut output = Vec::new();
         if !spec.is_class {
             return Ok(output);
         }
         let registry = self.instance_registry()?;
+        let structures = crate::records::imported::ImportedStructures::read(&self.txn.env)
+            .map_err(|error| failure(SourceInferenceError::Record(error)))?;
+        let mut class_parents = Vec::new();
         for parent in parents {
             self.tick()?;
-            if parent.record != spec.name {
-                return Err(failure(SourceInferenceError::Scope));
+            if registry.is_class(&parent.name) {
+                class_parents.push(parent);
             }
-            let field = spec
-                .fields
-                .get(parent.field as usize)
-                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-            if registry.is_class(&parent.parent) {
-                output.push(spec.name.append_core(&field.user_name));
+        }
+        let mut resolution_orders = Vec::with_capacity(class_parents.len());
+        for parent in &class_parents {
+            self.tick()?;
+            let order = if structures.get(&parent.name).is_some() {
+                structures
+                    .resolution_order(&parent.name, budget)
+                    .map_err(|error| failure(SourceInferenceError::Record(error)))?
+            } else {
+                vec![parent.name.clone()]
+            };
+            resolution_orders.push(order);
+        }
+        for parent in &class_parents {
+            self.tick()?;
+            let is_proper_ancestor = resolution_orders.iter().any(|order| {
+                order
+                    .iter()
+                    .skip(1)
+                    .any(|ancestor| ancestor == &parent.name)
+            });
+            if !is_proper_ancestor {
+                output.push(parent.projection.clone());
             }
         }
         Ok(output)

@@ -727,7 +727,49 @@ impl Context {
             }
             let get = |expr: &Expr| done[&expr.allocation_identity()].clone();
             let result = match term.node() {
-                ExprNode::App { f, a } => Expr::app(get(f), get(a)),
+                ExprNode::App { f, a } => {
+                    let applied = Expr::app(get(f), get(a));
+                    let (head, arguments) = operators::spine(&applied);
+                    let reduced = if let ExprNode::Const { name, .. } = head.node()
+                        && let Some(ConstantInfo::Defn(definition)) =
+                            self.txn.env.find(name).cloned()
+                    {
+                        let env = self.txn.env.clone();
+                        if let Some(projection) = crate::records::projection::generated_projection(
+                            &env,
+                            &definition,
+                            || self.tick(),
+                        )? && arguments.len() > projection.parameters
+                        {
+                            let receiver = &arguments[projection.parameters];
+                            let (ctor_head, ctor_args) = operators::spine(receiver);
+                            if let ExprNode::Const {
+                                name: ctor_name, ..
+                            } = ctor_head.node()
+                                && let Some(ConstantInfo::Ctor(ctor)) = env.find(ctor_name)
+                                && ctor.induct == projection.structure
+                                && ctor_args.len()
+                                    == (ctor.num_params as usize + ctor.num_fields as usize)
+                                && projection.index < u64::from(ctor.num_fields)
+                            {
+                                let mut value = ctor_args
+                                    [ctor.num_params as usize + projection.index as usize]
+                                    .clone();
+                                for extra in &arguments[projection.parameters + 1..] {
+                                    value = Expr::app(value, extra.clone());
+                                }
+                                Some(value)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    reduced.unwrap_or(applied)
+                }
                 ExprNode::Lam {
                     binder_name,
                     binder_type,
