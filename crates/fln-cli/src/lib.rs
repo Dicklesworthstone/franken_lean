@@ -196,7 +196,7 @@ const MERGE_SORT_COMPANION_ONLY_UNSAFE_REC_RESIDUALS: [&str; 3] = [
 
 const USAGE: &str = concat!(
     "Usage:\n",
-    "  fln check-olean [--json] [--policy standard|release|paranoid|compat-bench] [--receipts PATH | --continue [--progress] [--jobs N]] [--max-bytes BYTES] PATH [ROOT...]\n",
+    "  fln check-olean [--json] [--policy standard|release|paranoid|compat-bench] [--receipts PATH | --continue [--provisional] [--progress] [--jobs N]] [--max-bytes BYTES] [--max-steps N] PATH [ROOT...]\n",
     "  fln check-source [--json] [--max-bytes BYTES] [--jobs N] [--import-posture P] [--imported-macros PARTITION.tsv [--macro-max-bytes BYTES] [--imported-syntax MODULE]...] PATH...\n",
     "    Check definitions and theorems without executing code. An import with no\n",
     "    source file under the entry's directory is read as an .olean from\n",
@@ -565,10 +565,12 @@ enum MultiplexerCommand {
         /// only). Never empty.
         roots: Vec<PathBuf>,
         max_bytes: usize,
+        max_steps: Option<u64>,
         json: bool,
         policy: fln::VerificationPolicy,
         receipts: Option<PathBuf>,
         continue_on_failure: bool,
+        provisional: bool,
         progress: bool,
         jobs: std::num::NonZeroUsize,
     },
@@ -1212,8 +1214,10 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
     let mut receipts = None;
     let mut policy: Option<fln::VerificationPolicy> = None;
     let mut continue_on_failure = false;
+    let mut provisional = false;
     let mut progress = false;
     let mut jobs: Option<std::num::NonZeroUsize> = None;
+    let mut max_steps: Option<u64> = None;
     let mut filtered = Vec::new();
     let mut options = true;
     let mut arguments = arguments.into_iter();
@@ -1232,6 +1236,15 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
             continue_on_failure = true;
             continue;
         }
+        if options && argument == "--provisional" {
+            if provisional {
+                return Err(UsageError(
+                    "--provisional may be supplied at most once".to_owned(),
+                ));
+            }
+            provisional = true;
+            continue;
+        }
         if options && argument == "--progress" {
             if progress {
                 return Err(UsageError(
@@ -1239,6 +1252,36 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
                 ));
             }
             progress = true;
+            continue;
+        }
+        let max_steps_value =
+            if options && argument == "--max-steps" {
+                Some(arguments.next().ok_or_else(|| {
+                    UsageError("--max-steps requires a positive integer".to_owned())
+                })?)
+            } else if options {
+                argument
+                    .to_str()
+                    .and_then(|value| value.strip_prefix("--max-steps="))
+                    .map(OsString::from)
+            } else {
+                None
+            };
+        if let Some(value) = max_steps_value {
+            if max_steps.is_some() {
+                return Err(UsageError(
+                    "--max-steps may be supplied at most once".to_owned(),
+                ));
+            }
+            let text = value
+                .to_str()
+                .ok_or_else(|| UsageError("--max-steps must be valid UTF-8".to_owned()))?;
+            let parsed = text.parse::<u64>().ok().filter(|&n| n > 0).ok_or_else(|| {
+                UsageError(format!(
+                    "--max-steps requires a positive decimal integer, got `{text}`"
+                ))
+            })?;
+            max_steps = Some(parsed);
             continue;
         }
         let policy_value = if options && argument == "--policy" {
@@ -1324,6 +1367,12 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
             ));
         }
     }
+    if provisional && !continue_on_failure {
+        return Err(UsageError(
+            "--provisional explores past inconclusive imports, so it requires --continue"
+                .to_owned(),
+        ));
+    }
     if progress && !continue_on_failure {
         return Err(UsageError(
             "--progress streams per-module rows, so it requires --continue".to_owned(),
@@ -1334,13 +1383,21 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
             "--jobs schedules per-module checks, so it requires --continue".to_owned(),
         ));
     }
+    if max_steps.is_some() && !continue_on_failure {
+        return Err(UsageError(
+            "--max-steps overrides the frontier execution budget, so it requires --continue"
+                .to_owned(),
+        ));
+    }
     Ok(MultiplexerCommand::CheckOlean {
         roots: paths,
         max_bytes,
+        max_steps,
         json,
         policy: policy.unwrap_or(fln::VerificationPolicy::Release),
         receipts,
         continue_on_failure,
+        provisional,
         progress,
         jobs: jobs.unwrap_or(std::num::NonZeroUsize::MIN),
     })
@@ -9682,11 +9739,14 @@ fn add_module_set_roots(
 /// all-or-nothing answer. Exit 0 only when every module is accepted; 4 on any
 /// internal fault; 1 when any module failed or was blocked; 3 when the only
 /// non-acceptances are inconclusive.
+#[allow(clippy::too_many_arguments)]
 fn check_olean_module_frontier(
     modules: Vec<NamedOleanBytes>,
     max_bytes: usize,
+    max_steps: Option<u64>,
     policy: fln::VerificationPolicy,
     json: bool,
+    provisional: bool,
     progress: bool,
     jobs: std::num::NonZeroUsize,
 ) -> MultiplexerOutput {
@@ -9764,31 +9824,87 @@ fn check_olean_module_frontier(
                     let _ = stderr.flush();
                 }
             };
-            match engine.check_olean_frontier_scheduled(
-                &inputs,
-                &fln::KVMap::new(),
-                fln::OleanCheckLimits::new(
-                    max_bytes,
-                    fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
-                )
-                .with_policy(policy),
-                fln::OleanFrontierJobs {
-                    threads: jobs,
-                    worker_stack_bytes: OLEAN_CHECK_KERNEL_STACK_BYTES,
-                },
-                &mut stream,
-            ) {
-                Ok(frontier) => render_check_olean_frontier(&frontier, json),
-                Err(error) => {
-                    let (class, authority, exit_code) = check_olean_error_disposition(&error);
-                    check_olean_failure_with_policy(
-                        class,
-                        &error.to_string(),
-                        authority && policy.is_attestable(),
-                        Some(policy),
-                        json,
-                        exit_code,
-                    )
+            let mut budget = fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES);
+            if let Some(steps) = max_steps {
+                budget.steps = steps;
+            }
+            let limits = fln::OleanCheckLimits::new(max_bytes, budget).with_policy(policy);
+            let frontier_jobs = fln::OleanFrontierJobs {
+                threads: jobs,
+                worker_stack_bytes: OLEAN_CHECK_KERNEL_STACK_BYTES,
+            };
+            if provisional {
+                let mut phase2_stream = |completed: usize,
+                                         total: usize,
+                                         row: &fln::ProvisionalFrontierRow| {
+                    if !progress {
+                        return;
+                    }
+                    let verdict = match &row.verdict {
+                        fln::ProvisionalModuleVerdict::Accepted { .. } => "accepted",
+                        fln::ProvisionalModuleVerdict::AcceptedUnderAssumptions { .. } => {
+                            "accepted-under-assumptions"
+                        }
+                        fln::ProvisionalModuleVerdict::Failed(_) => "failed",
+                        fln::ProvisionalModuleVerdict::Inconclusive { .. } => "inconclusive",
+                        fln::ProvisionalModuleVerdict::InternalFault(_) => "internal-fault",
+                        fln::ProvisionalModuleVerdict::Blocked { .. } => "blocked",
+                    };
+                    let line = format!(
+                        "{{\"schema\":\"fln.check-olean-frontier-progress/2\",\"event\":\"phase2_decided\",\"position\":{completed},\"total\":{total},\"module\":{},\"verdict\":{},\"assumedDeclarations\":{},\"k1Steps\":{},\"elapsedMs\":{}}}\n",
+                        json_string(&row.name.to_display_string()),
+                        json_string(verdict),
+                        row.assumed_declarations,
+                        row.k1_steps,
+                        row.elapsed.as_millis(),
+                    );
+                    use std::io::Write as _;
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = stderr.write_all(line.as_bytes());
+                    let _ = stderr.flush();
+                };
+                match engine.check_olean_frontier_provisional_scheduled_with_progress(
+                    &inputs,
+                    &fln::KVMap::new(),
+                    limits,
+                    frontier_jobs,
+                    None,
+                    &mut stream,
+                    Some(&mut phase2_stream),
+                ) {
+                    Ok(frontier) => render_check_olean_provisional_frontier(&frontier, json),
+                    Err(error) => {
+                        let (class, authority, exit_code) = check_olean_error_disposition(&error);
+                        check_olean_failure_with_policy(
+                            class,
+                            &error.to_string(),
+                            authority && policy.is_attestable(),
+                            Some(policy),
+                            json,
+                            exit_code,
+                        )
+                    }
+                }
+            } else {
+                match engine.check_olean_frontier_scheduled(
+                    &inputs,
+                    &fln::KVMap::new(),
+                    limits,
+                    frontier_jobs,
+                    &mut stream,
+                ) {
+                    Ok(frontier) => render_check_olean_frontier(&frontier, json),
+                    Err(error) => {
+                        let (class, authority, exit_code) = check_olean_error_disposition(&error);
+                        check_olean_failure_with_policy(
+                            class,
+                            &error.to_string(),
+                            authority && policy.is_attestable(),
+                            Some(policy),
+                            json,
+                            exit_code,
+                        )
+                    }
                 }
             }
         }) {
@@ -10165,6 +10281,303 @@ fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> Mul
     }
 }
 
+fn json_name_array(names: &[fln::Name]) -> String {
+    let items: Vec<String> = names
+        .iter()
+        .map(|name| json_string(&name.to_display_string()))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+fn render_check_olean_provisional_frontier(
+    frontier: &fln::ProvisionalFrontier,
+    json: bool,
+) -> MultiplexerOutput {
+    let counts = frontier.counts();
+    let authority = frontier.is_authoritative();
+    let exit_code = frontier.exit_code();
+    let policy_summary = &frontier.policy_summary;
+
+    let mut rows_json = Vec::with_capacity(frontier.rows.len());
+    let mut lines = Vec::new();
+    for row in &frontier.rows {
+        let module = row.name.to_display_string();
+        let elapsed_ms = row.elapsed.as_millis();
+        let (verdict, decls, total_decls, detail_text, blocked_by, blocked_reason, assumed_names) =
+            match &row.verdict {
+                fln::ProvisionalModuleVerdict::Accepted { declarations } => (
+                    "accepted",
+                    *declarations,
+                    *declarations,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    Vec::new(),
+                ),
+                fln::ProvisionalModuleVerdict::AcceptedUnderAssumptions { declarations } => (
+                    "accepted-under-assumptions",
+                    *declarations,
+                    *declarations,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    Vec::new(),
+                ),
+                fln::ProvisionalModuleVerdict::Failed(err) => (
+                    "failed",
+                    0,
+                    0,
+                    err.to_string(),
+                    String::new(),
+                    String::new(),
+                    Vec::new(),
+                ),
+                fln::ProvisionalModuleVerdict::Inconclusive {
+                    reason,
+                    accepted_declarations,
+                    total_declarations,
+                    assumed_declaration_names,
+                } => (
+                    "inconclusive",
+                    *accepted_declarations,
+                    *total_declarations,
+                    format!("{reason:?}"),
+                    String::new(),
+                    String::new(),
+                    assumed_declaration_names.clone(),
+                ),
+                fln::ProvisionalModuleVerdict::InternalFault(fault) => (
+                    "internal-fault",
+                    0,
+                    0,
+                    format!("{fault:?}"),
+                    String::new(),
+                    String::new(),
+                    Vec::new(),
+                ),
+                fln::ProvisionalModuleVerdict::Blocked { by, reason } => (
+                    "blocked",
+                    0,
+                    0,
+                    String::new(),
+                    by.to_display_string(),
+                    (*reason).to_owned(),
+                    Vec::new(),
+                ),
+            };
+        let detail = BoundedText::new(detail_text);
+        let attempt: u8 = if row.memory_retry.is_some() || row.decode_memory_retry.is_some() {
+            2
+        } else {
+            1
+        };
+        let memory_json = format!(
+            concat!(
+                "{{\"estimatedBytes\":{},\"peakBytes\":{},\"estimateErrorBytes\":{},",
+                "\"estimateDirection\":{},\"k1EnvironmentDeltaBytes\":{},\"checkerBytes\":{},",
+                "\"decodedOleanBytes\":{},\"admittedEntriesBytes\":{},\"admissionDeferrals\":{}}}"
+            ),
+            row.memory.estimated_bytes,
+            row.memory.peak_bytes,
+            row.memory.estimate_error_bytes,
+            json_string(row.memory.estimate_direction.as_str()),
+            row.memory.k1_environment_delta_bytes,
+            row.memory.checker_bytes,
+            row.memory.decoded_olean_bytes,
+            row.memory.admitted_entries_bytes,
+            row.memory.admission_deferrals,
+        );
+        rows_json.push(format!(
+            concat!(
+                "{{\"phase\":{},\"module\":{},\"verdict\":{},\"declarations\":{},",
+                "\"totalDeclarations\":{},\"assumes\":{},\"assumedDeclarations\":{},",
+                "\"assumedDeclarationNames\":{},\"k1Steps\":{},\"elapsedMs\":{},\"attempt\":{},",
+                "\"detail\":{},\"detailTruncated\":{},\"blockedBy\":{},\"blockedReason\":{},",
+                "\"memory\":{},\"checkerPolicy\":{}}}"
+            ),
+            row.phase,
+            json_string(&module),
+            json_string(verdict),
+            decls,
+            total_decls,
+            json_name_array(&row.assumes),
+            row.assumed_declarations,
+            json_name_array(&assumed_names),
+            row.k1_steps,
+            elapsed_ms,
+            attempt,
+            json_string(detail.text()),
+            detail.truncated(),
+            if blocked_by.is_empty() {
+                "null".to_owned()
+            } else {
+                json_string(&blocked_by)
+            },
+            if blocked_reason.is_empty() {
+                "null".to_owned()
+            } else {
+                json_string(&blocked_reason)
+            },
+            memory_json,
+            checker_policy_summary_json(&row.policy_summary),
+        ));
+
+        let assumes_str = if row.assumes.is_empty() {
+            "[]".to_owned()
+        } else {
+            let names: Vec<String> = row
+                .assumes
+                .iter()
+                .map(fln::Name::to_display_string)
+                .collect();
+            format!("[{}]", names.join(", "))
+        };
+        lines.push(match verdict {
+            "accepted" => format!(
+                "  [p{}] accepted                   {module}: {decls} decls, {} k1_steps, {elapsed_ms} ms",
+                row.phase, row.k1_steps
+            ),
+            "accepted-under-assumptions" => format!(
+                "  [p{}] accepted-under-assumptions {module}: {decls} decls, assumes={assumes_str} ({} assumed decls), {} k1_steps, {elapsed_ms} ms",
+                row.phase, row.assumed_declarations, row.k1_steps
+            ),
+            "inconclusive" if total_decls > 0 => {
+                let names: Vec<String> = assumed_names
+                    .iter()
+                    .map(fln::Name::to_display_string)
+                    .collect();
+                format!(
+                    "  [p{}] inconclusive               {module}: {decls} of {total_decls} declarations accepted, {} assumed [{}], {} k1_steps, {elapsed_ms} ms",
+                    row.phase,
+                    names.len(),
+                    names.join(", "),
+                    row.k1_steps
+                )
+            }
+            "blocked" => format!(
+                "  [p{}] blocked                    {module}: import {blocked_by} ({blocked_reason})",
+                row.phase
+            ),
+            other => format!(
+                "  [p{}] {other:<26} {module}: assumes={assumes_str}, {} k1_steps, {elapsed_ms} ms: {}",
+                row.phase,
+                row.k1_steps,
+                detail.text()
+            ),
+        });
+    }
+
+    let roots_json: Vec<String> = frontier
+        .roots
+        .iter()
+        .map(|root| {
+            format!(
+                concat!(
+                    "{{\"module\":{},\"unlockValue\":{},\"firstBlockerCount\":{},",
+                    "\"acceptedDeclarations\":{},\"totalDeclarations\":{},",
+                    "\"assumedDeclarations\":{},\"assumedDeclarationNames\":{}}}"
+                ),
+                json_string(&root.module.to_display_string()),
+                root.unlock_value,
+                root.first_blocker_count,
+                root.accepted_declarations,
+                root.total_declarations,
+                root.assumed_declarations,
+                json_name_array(&root.assumed_declaration_names),
+            )
+        })
+        .collect();
+    if !frontier.roots.is_empty() {
+        lines.push("inconclusive roots (dominator unlockValue vs firstBlockerCount):".to_owned());
+        for root in &frontier.roots {
+            let names: Vec<String> = root
+                .assumed_declaration_names
+                .iter()
+                .map(fln::Name::to_display_string)
+                .collect();
+            lines.push(format!(
+                "  root {}: unlockValue={}, firstBlockerCount={}, {}/{} declarations accepted, {} assumed [{}]",
+                root.module.to_display_string(),
+                root.unlock_value,
+                root.first_blocker_count,
+                root.accepted_declarations,
+                root.total_declarations,
+                root.assumed_declarations,
+                names.join(", "),
+            ));
+        }
+    }
+
+    let summary = format!(
+        "provisional modules: {}/{} accepted, {} accepted-under-assumptions, {} failed, {} inconclusive, {} internal-fault, {} blocked (eligibleBlocked={}, ineligibleBlocked={}, authority={})",
+        counts.accepted,
+        counts.modules,
+        counts.accepted_under_assumptions,
+        counts.failed,
+        counts.inconclusive,
+        counts.internal_fault,
+        counts.blocked,
+        frontier.eligible_blocked.len(),
+        frontier.ineligible_blocked.len(),
+        authority,
+    );
+    let output = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":{},\"provisional\":true,\"authority\":{},\"trust\":\"recheck\",",
+                "\"policy\":{},\"policySchema\":{},\"attestable\":{},\"g1Eligible\":{},\"checkerPolicy\":{},",
+                "\"modules\":{},\"accepted\":{},\"acceptedUnderAssumptions\":{},\"failed\":{},",
+                "\"inconclusive\":{},\"internalFault\":{},\"blocked\":{},",
+                "\"acceptedDeclarations\":{},\"acceptedUnderAssumptionsDeclarations\":{},",
+                "\"eligibleBlocked\":{},\"ineligibleBlocked\":{},\"eligibleModules\":{},\"ineligibleModules\":{},",
+                "\"roots\":[{}],\"rows\":[{}]}}\n"
+            ),
+            json_string(CHECK_OLEAN_FRONTIER_SCHEMA),
+            json_string(if exit_code == 0 {
+                "complete"
+            } else {
+                "frontier"
+            }),
+            authority,
+            json_string(policy_summary.policy.as_str()),
+            json_string(policy_summary.schema),
+            policy_summary.attestable && !frontier.has_phase2_rows,
+            policy_summary.policy.is_g1_eligible() && !frontier.has_phase2_rows,
+            checker_policy_summary_json(policy_summary),
+            counts.modules,
+            counts.accepted,
+            counts.accepted_under_assumptions,
+            counts.failed,
+            counts.inconclusive,
+            counts.internal_fault,
+            counts.blocked,
+            counts.accepted_declarations,
+            counts.accepted_under_assumptions_declarations,
+            frontier.eligible_blocked.len(),
+            frontier.ineligible_blocked.len(),
+            json_name_array(&frontier.eligible_blocked),
+            json_name_array(&frontier.ineligible_blocked),
+            roots_json.join(","),
+            rows_json.join(","),
+        )
+    } else {
+        format!(
+            "fln check-olean --continue --provisional: {summary}\n{}{}\n",
+            checker_policy_summary_human(policy_summary),
+            lines.join("\n")
+        )
+    };
+    if exit_code == 0 {
+        MultiplexerOutput::success(output)
+    } else {
+        MultiplexerOutput {
+            stdout: output,
+            stderr: String::new(),
+            exit_code,
+        }
+    }
+}
+
 fn check_olean_module_bytes(
     modules: Vec<NamedOleanBytes>,
     max_bytes: usize,
@@ -10289,10 +10702,12 @@ fn check_olean_module_bytes(
 fn check_olean(
     roots: &[PathBuf],
     max_bytes: usize,
+    max_steps: Option<u64>,
     policy: fln::VerificationPolicy,
     json: bool,
     receipts: Option<&Path>,
     continue_on_failure: bool,
+    provisional: bool,
     progress: bool,
     jobs: std::num::NonZeroUsize,
 ) -> MultiplexerOutput {
@@ -10383,7 +10798,16 @@ fn check_olean(
                     );
                 }
             };
-            return check_olean_module_frontier(modules, max_bytes, policy, json, progress, jobs);
+            return check_olean_module_frontier(
+                modules,
+                max_bytes,
+                max_steps,
+                policy,
+                json,
+                provisional,
+                progress,
+                jobs,
+            );
         }
         return check_olean_module_bytes(
             modules,
@@ -11701,6 +12125,11 @@ fn write_receipt_set(
     checked: &fln::CheckedOleanSet,
     policy: fln::VerificationPolicy,
 ) -> Result<WrittenReceiptSet, ReceiptWriteError> {
+    if checked.engine.environment().has_assumptions() {
+        return Err(ReceiptWriteError::Input {
+            detail: "refusing to write receipts from an assumption-bearing environment".to_owned(),
+        });
+    }
     if path.exists() {
         return Err(ReceiptWriteError::Input {
             detail: format!(
@@ -15005,19 +15434,23 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
         Ok(MultiplexerCommand::CheckOlean {
             roots,
             max_bytes,
+            max_steps,
             json,
             policy,
             receipts,
             continue_on_failure,
+            provisional,
             progress,
             jobs,
         }) => check_olean(
             &roots,
             max_bytes,
+            max_steps,
             policy,
             json,
             receipts.as_deref(),
             continue_on_failure,
+            provisional,
             progress,
             jobs,
         ),
@@ -20194,6 +20627,74 @@ mod tests {
             rendered.stdout.contains("\"failed\":0,\"inconclusive\":1,"),
             "{}",
             rendered.stdout
+        );
+    }
+
+    #[test]
+    fn write_receipt_set_refuses_assumption_bearing_environment() {
+        let base_name = fln::Name::from_components(["Fixture", "AssumedRcpt"]);
+        let base = empty_olean_fixture(&[]);
+        let inputs = [fln::OleanModuleInput {
+            name: &base_name,
+            artifact: &base,
+            server_artifact: None,
+            private_artifact: None,
+        }];
+        let limits = fln::OleanCheckLimits::new(
+            base.len(),
+            fln::Budget::for_stack_bytes(super::OLEAN_CHECK_KERNEL_STACK_BYTES),
+        );
+        let fln::Outcome::Complete(mut checked) =
+            fln::Engine::from_environment(fln::Environment::new())
+                .check_olean_modules(&inputs, &fln::KVMap::new(), limits)
+                .expect("empty module checks cleanly")
+        else {
+            panic!("empty module must check to Outcome::Complete");
+        };
+        let provisional =
+            fln::ProvisionalEnvironment::from_admitted(checked.engine.environment().clone());
+        let assumed_constant = fln::ConstantInfo::Axiom(fln::AxiomVal {
+            base: fln::ConstantVal {
+                name: fln::Name::from_components(["Fixture", "AssumedRcpt", "ax"]),
+                level_params: Vec::new(),
+                type_: fln::Expr::sort(fln::Level::zero()),
+            },
+            is_unsafe: false,
+        });
+        let provisional = provisional
+            .assume_constants(&[assumed_constant])
+            .expect("assume constant");
+        let env = provisional.as_check_environment().clone();
+        assert!(env.has_assumptions());
+        checked.engine = fln::Engine::from_environment(env);
+        let root = unique_scratch_root("assumed_receipt_refusal");
+        let receipts = root.join("assumed.receipts.jsonl");
+        let err = match super::write_receipt_set(
+            &receipts,
+            &[NamedOleanBytes {
+                name: base_name,
+                bytes: base,
+                server_bytes: None,
+                private_bytes: None,
+            }],
+            &checked,
+            fln::VerificationPolicy::Release,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("writer must refuse assumption-bearing environments"),
+        };
+        match err {
+            super::ReceiptWriteError::Input { detail } => {
+                assert!(
+                    detail.contains("assumption-bearing"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected ReceiptWriteError::Input, got {other:?}"),
+        }
+        assert!(
+            !receipts.exists(),
+            "refused receipt writer must not create a receipt file"
         );
     }
 }

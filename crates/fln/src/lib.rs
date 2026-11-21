@@ -187,8 +187,12 @@ pub use fln_admission::{
     OleanCheckError, OleanCheckLimits, OleanCheckedDeclaration, OleanCompanionPart,
     OleanDecodeError, OleanDecodeLimits, OleanDecodeMemoryRetry, OleanFrontierEvent,
     OleanFrontierJobs, OleanFrontierMemoryAttribution, OleanFrontierMemoryRetry, OleanFrontierRow,
-    OleanModuleInput, OleanModulePart, OleanModuleVerdict, VerificationPolicy,
-    classify_declaration_risks, declaration_content_digest, decode_olean_artifact,
+    OleanModuleInput, OleanModulePart, OleanModuleVerdict, PerDeclarationModuleCheck,
+    PerDeclarationModuleOutcome, ProvisionalCounts, ProvisionalDeclarationUnit,
+    ProvisionalDeclarationVerdict, ProvisionalEnvironment, ProvisionalFrontierRow,
+    ProvisionalModuleVerdict, ProvisionalRootSummary, VerificationPolicy,
+    check_decoded_olean_per_declaration, classify_blocked_eligibility, classify_declaration_risks,
+    compute_root_dominators, declaration_content_digest, decode_olean_artifact,
     decode_olean_module_artifacts, install_host_allocation_failure_hook, olean_module_imports,
 };
 // Council internals that `fln`'s own unit tests still drive through an `Engine`.
@@ -210,6 +214,9 @@ pub type CheckedOleanSet = fln_admission::CheckedOleanSet<Engine>;
 /// Per-module result of checking a closed `.olean` set
 /// ([`fln_admission::OleanFrontier`]).
 pub type OleanFrontier = fln_admission::OleanFrontier<Engine>;
+/// Provisional Phase-1 + Phase-2 result of checking a closed `.olean` set past
+/// inconclusive imports ([`fln_admission::ProvisionalFrontier`]).
+pub type ProvisionalFrontier = fln_admission::ProvisionalFrontier<Engine>;
 /// The authoritative outputs of one completed admission-only transition
 /// ([`fln_admission::DeclarationAdmission`]).
 pub type DeclarationAdmission = fln_admission::DeclarationAdmission<Engine>;
@@ -1740,7 +1747,15 @@ impl Engine {
             options: KVMap::new(),
         }
     }
+}
 
+impl fln_admission::reuse::CheckedEnvironment for Engine {
+    fn environment_ref(&self) -> &Environment {
+        &self.environment
+    }
+}
+
+impl Engine {
     /// Construct an engine directly from an applied module state, adopting its
     /// committed environment, epoch, and options while preserving standard mode
     /// and reproducibility.
@@ -2094,6 +2109,96 @@ impl Engine {
     ) -> Result<OleanFrontier, OleanCheckError> {
         self.admitted()
             .check_olean_frontier_scheduled(modules, options, limits, jobs, on_event)
+            .map(|frontier| frontier.map_engine(|engine| self.with_admitted(engine)))
+    }
+
+    /// Check a closed `.olean` set with Phase-2 provisional exploration past
+    /// inconclusive imports (`--continue --provisional`, bead
+    /// `fln-provisional-frontier-vf32`).
+    pub fn check_olean_frontier_provisional(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+    ) -> Result<ProvisionalFrontier, OleanCheckError> {
+        self.check_olean_frontier_provisional_scheduled(
+            modules,
+            options,
+            limits,
+            OleanFrontierJobs::SERIAL,
+            None,
+            &mut |_| {},
+        )
+    }
+
+    /// [`Engine::check_olean_frontier_provisional`] over `jobs.threads` modules
+    /// at once, with optional cancellation probe and Phase-1 observer.
+    pub fn check_olean_frontier_provisional_scheduled(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        cancellation: Option<&dyn CancellationProbe>,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+    ) -> Result<ProvisionalFrontier, OleanCheckError> {
+        self.admitted()
+            .check_olean_frontier_provisional_scheduled(
+                modules,
+                options,
+                limits,
+                jobs,
+                cancellation,
+                on_event,
+            )
+            .map(|frontier| frontier.map_engine(|engine| self.with_admitted(engine)))
+    }
+
+    /// Like [`Self::check_olean_frontier_provisional_scheduled`], also reporting
+    /// each Phase-2 module row as it finishes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_olean_frontier_provisional_scheduled_with_progress(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        cancellation: Option<&dyn CancellationProbe>,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+        on_phase2: Option<fln_admission::provisional::Phase2ProgressCallback<'_>>,
+    ) -> Result<ProvisionalFrontier, OleanCheckError> {
+        self.admitted()
+            .check_olean_frontier_provisional_scheduled_with_progress(
+                modules,
+                options,
+                limits,
+                jobs,
+                cancellation,
+                on_event,
+                on_phase2,
+            )
+            .map(|frontier| frontier.map_engine(|engine| self.with_admitted(engine)))
+    }
+
+    /// Hookable provisional frontier entry point for deterministic unit/fault tests.
+    pub fn check_olean_frontier_provisional_using(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        cancellation: Option<&dyn CancellationProbe>,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+        hooks: FrontierRunHooks<'_>,
+    ) -> Result<ProvisionalFrontier, OleanCheckError> {
+        self.admitted()
+            .check_olean_frontier_provisional_using(
+                modules,
+                limits,
+                jobs,
+                cancellation,
+                on_event,
+                hooks,
+            )
             .map(|frontier| frontier.map_engine(|engine| self.with_admitted(engine)))
     }
 

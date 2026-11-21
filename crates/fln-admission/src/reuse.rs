@@ -542,6 +542,7 @@ impl ModuleReuseRecord {
         checker: CheckerIdentity,
         content_root: LogicalRoot,
     ) -> std::result::Result<Self, ImportReuseRefusal> {
+        check_environment_recordable(&checked.engine.environment)?;
         let module = RecordedModule::from_checked(
             name,
             &checked.decoded,
@@ -658,17 +659,47 @@ fn module_content_root(
     ))
 }
 
+/// Environment projection checked by the import-reuse writer so an
+/// assumption-bearing environment can never be serialized into a reuse record
+/// (bead `fln-provisional-frontier-vf32`, FL-INV-02).
+pub trait CheckedEnvironment {
+    fn environment_ref(&self) -> &Environment;
+}
+
+impl CheckedEnvironment for Admitted {
+    fn environment_ref(&self) -> &Environment {
+        &self.environment
+    }
+}
+
+/// Refuse any assumption-bearing environment at the import-reuse writer boundary
+/// (not only in callers).
+pub fn check_environment_recordable(
+    environment: &Environment,
+) -> std::result::Result<(), ImportReuseRefusal> {
+    if environment.has_assumptions() {
+        return Err(ImportReuseRefusal::Unrecordable(
+            "assumption-bearing environment cannot be recorded for import reuse",
+        ));
+    }
+    Ok(())
+}
+
 impl ImportReuseRecord {
     /// The record of a council admission that has just completed under `key`.
     ///
-    /// Refused when the admission is not over an empty base, or when a checker row
-    /// cannot be bound to exactly one declaration of its module.
+    /// Refused when the admission is not over an empty base, carries provisional
+    /// assumptions, or when a checker row cannot be bound to exactly one
+    /// declaration of its module.
     pub fn from_admission<I: AdmittedImport>(
         key: ImportClosureKey,
         checker: CheckerIdentity,
         options: &KVMap,
         import: &I,
-    ) -> std::result::Result<Self, ImportReuseRefusal> {
+    ) -> std::result::Result<Self, ImportReuseRefusal>
+    where
+        I::Engine: CheckedEnvironment,
+    {
         Ok(Self::draft(key, checker, options, import.checked())?
             .complete(import.result_logical_root()))
     }
@@ -677,12 +708,13 @@ impl ImportReuseRecord {
     /// this module produced, before the host activates metadata over it. Only the result
     /// root, which a reuse re-proves against the host's own activation, is left to the host:
     /// a host never supplies what a record attests about declarations.
-    pub fn draft<E>(
+    pub fn draft<E: CheckedEnvironment>(
         key: ImportClosureKey,
         checker: CheckerIdentity,
         options: &KVMap,
         checked: &CheckedOleanSet<E>,
     ) -> std::result::Result<RecordDraft, ImportReuseRefusal> {
+        check_environment_recordable(checked.engine.environment_ref())?;
         if checked.base_logical_root != Environment::new().logical_root(options) {
             return Err(ImportReuseRefusal::Unrecordable(
                 "the admission was not over an empty base",

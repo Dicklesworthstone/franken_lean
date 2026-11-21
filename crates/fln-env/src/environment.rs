@@ -322,6 +322,7 @@ impl PreparedDeclarationAdmission {
                         digests,
                         extensions: env.extensions.clone(),
                         metadata_validation: env.metadata_validation.clone(),
+                        assumptions: env.assumptions.clone(),
                     },
                     digest: self.provisional_digest,
                     usage: self.usage,
@@ -1014,11 +1015,41 @@ pub struct Environment {
     /// in declaration lookup or kernel admission; its journals are the public
     /// baseline, and it carries no further validation snapshot.
     metadata_validation: Option<Arc<Environment>>,
+    /// Unchecked declarations inserted only through [`ProvisionalEnvironment`]
+    /// during `--provisional` frontier exploration (bead `fln-provisional-frontier-vf32`,
+    /// FL-INV-02). `None` for every ordinary admitted environment; once non-empty,
+    /// every successor preserves this poison so receipt, reuse-record, and `.olean`
+    /// writers refuse it unconditionally.
+    assumptions: Option<Arc<BTreeSet<Name>>>,
 }
 
 impl Environment {
     pub fn new() -> Environment {
         Environment::default()
+    }
+
+    /// Whether this snapshot carries any unchecked provisional assumption
+    /// (FL-INV-02). An environment with assumptions is never authoritative:
+    /// reuse-record, receipt, and `.olean` publishers must refuse it.
+    pub fn has_assumptions(&self) -> bool {
+        self.assumptions.as_ref().is_some_and(|set| !set.is_empty())
+    }
+
+    /// Number of unchecked provisional assumptions held in this snapshot.
+    pub fn assumed_count(&self) -> usize {
+        self.assumptions.as_ref().map_or(0, |set| set.len())
+    }
+
+    /// Whether `name` was inserted as an unchecked provisional assumption.
+    pub fn is_assumed(&self, name: &Name) -> bool {
+        self.assumptions
+            .as_ref()
+            .is_some_and(|set| set.contains(name))
+    }
+
+    /// Deterministic sorted iterator over unchecked provisional assumption names.
+    pub fn assumed_names(&self) -> impl Iterator<Item = &Name> {
+        self.assumptions.iter().flat_map(|set| set.iter())
     }
 
     pub fn len(&self) -> usize {
@@ -1076,12 +1107,14 @@ impl Environment {
             digests: checked_complete.digests.clone(),
             extensions: self.extensions.clone(),
             metadata_validation: None,
+            assumptions: checked_complete.assumptions.clone(),
         };
         Environment {
             constants: self.constants.clone(),
             digests: self.digests.clone(),
             extensions: self.extensions.clone(),
             metadata_validation: Some(Arc::new(validation)),
+            assumptions: self.assumptions.clone(),
         }
     }
 
@@ -1146,6 +1179,7 @@ impl Environment {
             constants: self.constants.insert(name, entry.info),
             extensions: self.extensions.clone(),
             metadata_validation: self.metadata_validation.clone(),
+            assumptions: self.assumptions.clone(),
         })
     }
 
@@ -1274,6 +1308,7 @@ impl Environment {
             constants: self.constants.insert(name, Arc::new(info)),
             extensions: self.extensions.clone(),
             metadata_validation: self.metadata_validation.clone(),
+            assumptions: self.assumptions.clone(),
         })
     }
 
@@ -1338,6 +1373,7 @@ impl Environment {
                     digests,
                     extensions: self.extensions.clone(),
                     metadata_validation: self.metadata_validation.clone(),
+                    assumptions: self.assumptions.clone(),
                 })
             })
     }
@@ -1482,6 +1518,7 @@ impl Environment {
                 .extensions
                 .insert(name, Arc::new(ExtensionState::new(descriptor))),
             metadata_validation: self.metadata_validation.clone(),
+            assumptions: self.assumptions.clone(),
         })
     }
 
@@ -1502,6 +1539,7 @@ impl Environment {
             digests: self.digests.clone(),
             extensions: self.extensions.insert(extension.clone(), Arc::new(next)),
             metadata_validation: self.metadata_validation.clone(),
+            assumptions: self.assumptions.clone(),
         })
     }
 
@@ -1593,6 +1631,7 @@ impl Environment {
                         digests: self.digests.clone(),
                         extensions: self.extensions.insert(name.clone(), Arc::new(state)),
                         metadata_validation: self.metadata_validation.clone(),
+                        assumptions: self.assumptions.clone(),
                     })
                     .map_err(EnvError::Checkpoint)
             },
@@ -1770,6 +1809,149 @@ impl Environment {
     /// both without ever mixing them.
     pub fn operational_root(metadata: &KVMap) -> Digest {
         hash(Domain::OperationalMeta, &metadata.to_canonical_bytes())
+    }
+}
+
+/// Non-authoritative environment wrapper for `--provisional` frontier exploration
+/// (bead `fln-provisional-frontier-vf32`, FL-INV-02 / FL-INV-06 / FL-INV-07).
+///
+/// An assumption is **never** an admission: `ProvisionalEnvironment` is a distinct
+/// type that cannot be converted back into an authoritative [`Environment`] or
+/// `Admitted` engine. Its inner [`Environment`] is poisoned with the exact set of
+/// unchecked assumed constant names so that any successor produced by K1/checker
+/// review retains `has_assumptions() == true`, and every receipt, import-reuse,
+/// and `.olean` publisher refuses it unconditionally.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProvisionalEnvironment {
+    inner: Environment,
+}
+
+impl ProvisionalEnvironment {
+    /// Start a provisional workspace from an admitted base environment.
+    pub fn from_admitted(environment: Environment) -> Self {
+        Self { inner: environment }
+    }
+
+    /// Borrow the underlying environment strictly for read-only K1 / independent-checker
+    /// declaration checks. Any successor environment published from this borrow
+    /// automatically inherits `has_assumptions()`.
+    pub fn as_check_environment(&self) -> &Environment {
+        &self.inner
+    }
+
+    /// Wrap a successor [`Environment`] returned by checking a declaration against
+    /// [`Self::as_check_environment`], preserving all existing assumptions.
+    pub fn with_checked_successor(&self, mut checked: Environment) -> Result<Self, EnvError> {
+        if let Some(existing) = &self.inner.assumptions
+            && !existing.is_empty()
+        {
+            let merged = match &checked.assumptions {
+                Some(next) if existing.is_subset(next) => Arc::clone(next),
+                Some(next) => {
+                    let mut combined = (**existing).clone();
+                    combined.extend(next.iter().cloned());
+                    Arc::new(combined)
+                }
+                None => Arc::clone(existing),
+            };
+            checked.assumptions = Some(merged);
+        }
+        Ok(Self { inner: checked })
+    }
+
+    /// Insert an atomic unit of unchecked declarations (a single declaration, or an
+    /// entire mutual/inductive/quotient block — never a partial block) as provisional
+    /// assumptions. Records every newly inserted constant name in `assumptions`.
+    pub fn assume_constants(&self, constants: &[ConstantInfo]) -> Result<Self, EnvError> {
+        let mut next = self.inner.clone();
+        let mut assumed = next.assumptions.as_deref().cloned().unwrap_or_default();
+        for info in constants {
+            let name = info.name().clone();
+            if let Some(existing) = next.constants.get(&name) {
+                if existing.as_ref() == info {
+                    continue;
+                }
+                return Err(EnvError::DuplicateDeclaration { name });
+            }
+            let digest = Environment::decl_content_digest(info);
+            next.digests = next.digests.insert(name.clone(), NamedDigest::new(digest));
+            next.constants = next.constants.insert(name.clone(), Arc::new(info.clone()));
+            assumed.insert(name);
+        }
+        if !assumed.is_empty() {
+            next.assumptions = Some(Arc::new(assumed));
+        }
+        Ok(Self { inner: next })
+    }
+
+    /// Merge an entry produced by an earlier Phase-1 or Phase-2 module. If `assumed`
+    /// is true (or if `self` already holds assumptions), the poison flag is preserved.
+    pub fn merge_entry(&self, entry: EnvironmentEntry, assumed: bool) -> Result<Self, EnvError> {
+        let name = entry.info.name().clone();
+        if let Some(existing) = self.inner.constants.get(&name) {
+            if existing.as_ref() == entry.info.as_ref() {
+                if assumed && !self.inner.is_assumed(&name) {
+                    let mut next = self.inner.clone();
+                    let mut set = next.assumptions.as_deref().cloned().unwrap_or_default();
+                    set.insert(name);
+                    next.assumptions = Some(Arc::new(set));
+                    return Ok(Self { inner: next });
+                }
+                return Ok(self.clone());
+            }
+            return Err(EnvError::DuplicateDeclaration { name });
+        }
+        let mut next = self.inner.with_entry(entry)?;
+        if assumed {
+            let mut set = next.assumptions.as_deref().cloned().unwrap_or_default();
+            set.insert(name);
+            next.assumptions = Some(Arc::new(set));
+        }
+        Ok(Self { inner: next })
+    }
+
+    /// Mark a batch of already-present declaration names as provisional assumptions
+    /// in a single persistent update.
+    pub fn mark_assumed_batch(&self, names: impl IntoIterator<Item = Name>) -> Self {
+        let mut iter = names.into_iter().peekable();
+        if iter.peek().is_none() {
+            return self.clone();
+        }
+        let mut next = self.inner.clone();
+        let mut set = next.assumptions.as_deref().cloned().unwrap_or_default();
+        set.extend(iter);
+        if !set.is_empty() {
+            next.assumptions = Some(Arc::new(set));
+        }
+        Self { inner: next }
+    }
+
+    pub fn has_assumptions(&self) -> bool {
+        self.inner.has_assumptions()
+    }
+
+    pub fn assumed_count(&self) -> usize {
+        self.inner.assumed_count()
+    }
+
+    pub fn is_assumed(&self, name: &Name) -> bool {
+        self.inner.is_assumed(name)
+    }
+
+    pub fn assumed_names(&self) -> impl Iterator<Item = &Name> {
+        self.inner.assumed_names()
+    }
+
+    pub fn contains(&self, name: &Name) -> bool {
+        self.inner.contains(name)
+    }
+
+    pub fn find(&self, name: &Name) -> Option<&ConstantInfo> {
+        self.inner.find(name)
+    }
+
+    pub fn entry(&self, name: &Name) -> Option<EnvironmentEntry> {
+        self.inner.entry(name)
     }
 }
 

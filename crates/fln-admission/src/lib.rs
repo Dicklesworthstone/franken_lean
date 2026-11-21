@@ -32,7 +32,15 @@
 #![feature(alloc_error_hook)]
 
 pub mod olean_imports;
+pub mod provisional;
 pub mod reuse;
+
+pub use provisional::{
+    PerDeclarationModuleCheck, PerDeclarationModuleOutcome, ProvisionalCounts,
+    ProvisionalDeclarationUnit, ProvisionalDeclarationVerdict, ProvisionalEnvironment,
+    ProvisionalFrontier, ProvisionalFrontierRow, ProvisionalModuleVerdict, ProvisionalRootSummary,
+    check_decoded_olean_per_declaration, classify_blocked_eligibility, compute_root_dominators,
+};
 
 /// The admission authority: a SHA-256 digest, made by `build.rs`, over every crate in this
 /// crate's dependency closure and the toolchain that compiles them.
@@ -3436,10 +3444,20 @@ pub fn plan_olean_declarations(
 }
 
 /// Pluggable worker callbacks and host-memory meter for frontier scheduling.
+#[derive(Clone, Copy)]
 pub struct FrontierRunHooks<'a> {
     pub check: &'a (dyn Fn(FrontierJob) -> FrontierDone + Sync),
     pub decode: &'a (dyn Fn(usize) -> Result<DecodedOlean, OleanCheckError> + Sync),
     pub memory: &'a (dyn FrontierMemorySource + Sync),
+}
+
+pub(crate) struct Phase1FrontierOutput {
+    pub frontier: OleanFrontier,
+    pub order: Vec<usize>,
+    pub position: Vec<usize>,
+    pub dependencies: Vec<BTreeSet<usize>>,
+    pub closures: Vec<std::sync::Arc<BTreeSet<usize>>>,
+    pub accepted: Vec<Option<std::sync::Arc<FrontierAccepted>>>,
 }
 
 impl Admitted {
@@ -3739,6 +3757,18 @@ impl Admitted {
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
         hooks: FrontierRunHooks<'_>,
     ) -> Result<OleanFrontier, OleanCheckError> {
+        self.check_olean_frontier_phase1_core(modules, limits, jobs, on_event, hooks)
+            .map(|output| output.frontier)
+    }
+
+    pub(crate) fn check_olean_frontier_phase1_core(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+        hooks: FrontierRunHooks<'_>,
+    ) -> Result<Phase1FrontierOutput, OleanCheckError> {
         let FrontierRunHooks {
             check,
             decode,
@@ -4304,10 +4334,17 @@ impl Admitted {
             limits.admission.policy,
             rows.iter().map(|row| &row.policy_summary),
         );
-        Ok(OleanFrontier {
-            engine,
-            rows,
-            policy_summary,
+        Ok(Phase1FrontierOutput {
+            frontier: OleanFrontier {
+                engine,
+                rows,
+                policy_summary,
+            },
+            order,
+            position,
+            dependencies,
+            closures,
+            accepted,
         })
     }
 

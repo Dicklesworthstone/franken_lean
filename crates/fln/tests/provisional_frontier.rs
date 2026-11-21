@@ -1,0 +1,854 @@
+//! Unit, mutant-killing, cancellation, and hostile-batch tests for the
+//! provisional `.olean` frontier (`--continue --provisional`, bead
+//! `fln-provisional-frontier-vf32`, FL-INV-01 / FL-INV-02 / FL-INV-06 / FL-INV-07).
+
+#![forbid(unsafe_code)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use fln::{
+    Budget, Engine, Environment, KVMap, Name, OleanCheckError, OleanCheckLimits, OleanFrontierJobs,
+    OleanModuleImport, OleanModuleInput, OleanModuleVerdict, OleanModuleWriteInput,
+    OleanWriteBudget, OleanWriteHeader, ProvisionalEnvironment, ProvisionalModuleVerdict,
+    classify_blocked_eligibility, compute_root_dominators, encode_olean_module,
+};
+use fln_admission::reuse::{
+    CheckerIdentity, ImportClosureKey, ImportReuseRecord, ImportReuseRefusal,
+    check_environment_recordable,
+};
+use fln_core::expr::{BinderInfo, Expr};
+use fln_core::level::Level;
+use fln_env::constants::{
+    AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, DefinitionSafety, DefinitionVal,
+    InductiveVal, RecursorRule, RecursorVal, ReducibilityHints,
+};
+use fln_env::modules::CancellationProbe;
+
+const STACK: usize = 64 * 1024 * 1024;
+
+fn n(text: &str) -> Name {
+    Name::from_components(text.split('.'))
+}
+
+fn axiom(name: &str, ty: Expr) -> ConstantInfo {
+    ConstantInfo::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: n(name),
+            level_params: Vec::new(),
+            type_: ty,
+        },
+        is_unsafe: false,
+    })
+}
+
+fn safe_def(name: &str, ty: Expr, value: Expr) -> ConstantInfo {
+    let decl_name = n(name);
+    ConstantInfo::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: decl_name.clone(),
+            level_params: Vec::new(),
+            type_: ty,
+        },
+        value,
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Safe,
+        all: vec![decl_name],
+    })
+}
+
+/// Build a valid, well-typed term that requires `depth` K1 beta-reductions /
+/// binder traversals to typecheck, so a tight `Budget::max_steps` deterministically
+/// produces an `Inconclusive` stop on this declaration while cheap declarations pass.
+fn beta_chain(prop_name: &str, witness_name: &str, depth: usize) -> Expr {
+    let prop = Expr::const_(n(prop_name), Vec::new());
+    let mut expr = Expr::const_(n(witness_name), Vec::new());
+    for _ in 0..depth {
+        let id = Expr::lam(
+            Name::str(Name::anonymous(), "x"),
+            prop.clone(),
+            Expr::bvar(0).expect("bvar 0"),
+            BinderInfo::Default,
+        );
+        expr = Expr::app(id, expr);
+    }
+    expr
+}
+
+fn encode_module(imports: &[&str], constants: &[ConstantInfo]) -> Vec<u8> {
+    let imports: Vec<OleanModuleImport> = imports
+        .iter()
+        .map(|module| OleanModuleImport {
+            module: n(module),
+            import_all: false,
+            is_exported: false,
+            is_meta: false,
+        })
+        .collect();
+    encode_olean_module(
+        OleanModuleWriteInput {
+            is_module: false,
+            imports: &imports,
+            constants,
+            extra_const_names: &[],
+        },
+        OleanWriteHeader {
+            version: fln::OLEAN_ACCEPTED_VERSIONS[0],
+            flags: 1,
+            lean_version: fln::OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
+            githash: fln::OLEAN_PIN_COMMIT,
+            base_addr: fln::OLEAN_REGION_ALIGN as u64,
+        },
+        OleanWriteBudget::default(),
+    )
+    .expect("valid pinned-format olean fixture")
+    .bytes
+}
+
+fn limits_with_steps(max_steps: u64) -> OleanCheckLimits {
+    let mut budget = Budget::for_stack_bytes(STACK);
+    budget.steps = max_steps;
+    OleanCheckLimits::new(16 * 1024 * 1024, budget)
+}
+
+fn jobs(threads: usize) -> OleanFrontierJobs {
+    OleanFrontierJobs {
+        threads: NonZeroUsize::new(threads).expect("non-zero threads"),
+        worker_stack_bytes: STACK,
+    }
+}
+
+struct FlagProbe<'a>(&'a AtomicBool);
+impl CancellationProbe for FlagProbe<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+fn chain_fixture() -> Vec<(Name, Vec<u8>)> {
+    let p_ty = Expr::const_(n("A.P"), Vec::new());
+    let mod_a = encode_module(
+        &[],
+        &[
+            axiom("A.P", Expr::sort(Level::zero())),
+            axiom("A.p", p_ty.clone()),
+        ],
+    );
+    let mod_b = encode_module(
+        &["A"],
+        &[
+            safe_def("B.ok1", p_ty.clone(), Expr::const_(n("A.p"), Vec::new())),
+            safe_def("B.heavy", p_ty.clone(), beta_chain("A.P", "A.p", 80)),
+            safe_def("B.ok2", p_ty.clone(), Expr::const_(n("B.ok1"), Vec::new())),
+        ],
+    );
+    let mod_c = encode_module(
+        &["B"],
+        &[safe_def(
+            "C.useB",
+            p_ty.clone(),
+            Expr::const_(n("B.heavy"), Vec::new()),
+        )],
+    );
+    let mod_d = encode_module(
+        &["C"],
+        &[safe_def(
+            "D.useC",
+            p_ty,
+            Expr::const_(n("C.useB"), Vec::new()),
+        )],
+    );
+    vec![
+        (n("A"), mod_a),
+        (n("B"), mod_b),
+        (n("C"), mod_c),
+        (n("D"), mod_d),
+    ]
+}
+
+fn to_inputs(mods: &[(Name, Vec<u8>)]) -> Vec<OleanModuleInput<'_>> {
+    mods.iter()
+        .map(|(name, bytes)| OleanModuleInput {
+            name,
+            artifact: bytes,
+            server_artifact: None,
+            private_artifact: None,
+        })
+        .collect()
+}
+
+type RowSignature = (String, u8, &'static str, Vec<String>, usize, Vec<String>);
+
+fn row_signature(frontier: &fln::ProvisionalFrontier) -> Vec<RowSignature> {
+    frontier
+        .rows
+        .iter()
+        .map(|row| {
+            let (tag, assumed_names) = match &row.verdict {
+                ProvisionalModuleVerdict::Accepted { .. } => ("accepted", Vec::new()),
+                ProvisionalModuleVerdict::AcceptedUnderAssumptions { .. } => {
+                    ("accepted-under-assumptions", Vec::new())
+                }
+                ProvisionalModuleVerdict::Failed(_) => ("failed", Vec::new()),
+                ProvisionalModuleVerdict::Inconclusive {
+                    assumed_declaration_names,
+                    ..
+                } => (
+                    "inconclusive",
+                    assumed_declaration_names
+                        .iter()
+                        .map(Name::to_display_string)
+                        .collect(),
+                ),
+                ProvisionalModuleVerdict::InternalFault(_) => ("internal-fault", Vec::new()),
+                ProvisionalModuleVerdict::Blocked { .. } => ("blocked", Vec::new()),
+            };
+            (
+                row.name.to_display_string(),
+                row.phase,
+                tag,
+                row.assumes.iter().map(Name::to_display_string).collect(),
+                row.assumed_declarations,
+                assumed_names,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn provisional_chain_explores_past_inconclusive_root_and_preserves_conservation() {
+    let fixture = chain_fixture();
+    let inputs = to_inputs(&fixture);
+    let engine = Engine::from_environment(Environment::new());
+    let limits = limits_with_steps(120);
+
+    // Without provisional: A accepted, B inconclusive, C and D blocked.
+    let plain = engine
+        .check_olean_frontier(&inputs, &KVMap::new(), limits)
+        .expect("frontier runs");
+    assert_eq!(plain.rows.len(), 4);
+    assert!(matches!(
+        plain.rows[0].verdict,
+        OleanModuleVerdict::Accepted { declarations: 2 }
+    ));
+    assert!(matches!(
+        plain.rows[1].verdict,
+        OleanModuleVerdict::Inconclusive(_)
+    ));
+    assert!(matches!(
+        plain.rows[2].verdict,
+        OleanModuleVerdict::Blocked { .. }
+    ));
+    assert!(matches!(
+        plain.rows[3].verdict,
+        OleanModuleVerdict::Blocked { .. }
+    ));
+
+    // With provisional: B re-run decl-by-decl (2/3 accepted, 1 assumed [B.heavy]);
+    // C and D accepted-under-assumptions with assumes=["B"], assumedDeclarations=1.
+    let prov = engine
+        .check_olean_frontier_provisional(&inputs, &KVMap::new(), limits)
+        .expect("provisional frontier runs");
+    let counts = prov.counts();
+    counts.assert_conservation();
+    assert_eq!(counts.modules, 4);
+    assert_eq!(counts.accepted, 1);
+    assert_eq!(counts.accepted_under_assumptions, 2);
+    assert_eq!(counts.inconclusive, 1);
+    assert_eq!(counts.failed, 0);
+    assert_eq!(counts.internal_fault, 0);
+    assert_eq!(counts.blocked, 0);
+    assert!(prov.has_phase2_rows);
+    assert!(
+        !prov.is_authoritative(),
+        "phase-2 rows must force authority=false"
+    );
+    assert_eq!(prov.exit_code(), 3, "non-zero exit when phase-2 rows exist");
+    assert_eq!(prov.eligible_blocked, vec![n("C"), n("D")]);
+    assert!(prov.ineligible_blocked.is_empty());
+
+    // Phase-1 engine must hold ONLY A's declarations, zero B/C/D or assumed decls.
+    let p1_engine = prov.phase1_engine.as_ref().expect("phase1 engine clean");
+    assert!(!p1_engine.environment().has_assumptions());
+    assert!(p1_engine.environment().contains(&n("A.P")));
+    assert!(!p1_engine.environment().contains(&n("B.heavy")));
+    assert!(!p1_engine.environment().contains(&n("C.useB")));
+
+    // Check root B's declaration-by-declaration summary and dominator unlock value.
+    assert_eq!(prov.roots.len(), 1);
+    let root_b = &prov.roots[0];
+    assert_eq!(root_b.module, n("B"));
+    assert_eq!(root_b.unlock_value, 2);
+    assert_eq!(root_b.first_blocker_count, 2);
+    assert_eq!(root_b.accepted_declarations, 2);
+    assert_eq!(root_b.total_declarations, 3);
+    assert_eq!(root_b.assumed_declarations, 1);
+    assert_eq!(root_b.assumed_declaration_names, vec![n("B.heavy")]);
+
+    let sig = row_signature(&prov);
+    assert_eq!(
+        sig,
+        vec![
+            ("A".to_owned(), 1, "accepted", vec![], 0, vec![]),
+            (
+                "B".to_owned(),
+                2,
+                "inconclusive",
+                vec![],
+                1,
+                vec!["B.heavy".to_owned()]
+            ),
+            (
+                "C".to_owned(),
+                2,
+                "accepted-under-assumptions",
+                vec!["B".to_owned()],
+                1,
+                vec![]
+            ),
+            (
+                "D".to_owned(),
+                2,
+                "accepted-under-assumptions",
+                vec!["B".to_owned()],
+                1,
+                vec![]
+            ),
+        ]
+    );
+}
+
+#[test]
+fn mutant_counting_phase2_acceptances_in_accepted_is_killed() {
+    let fixture = chain_fixture();
+    let inputs = to_inputs(&fixture);
+    let engine = Engine::from_environment(Environment::new());
+    let prov = engine
+        .check_olean_frontier_provisional(&inputs, &KVMap::new(), limits_with_steps(120))
+        .expect("provisional frontier");
+    let counts = prov.counts();
+    // Mutant: folding accepted_under_assumptions (2) into accepted (1) would give 3.
+    assert_eq!(
+        counts.accepted, 1,
+        "phase-2 acceptances must NEVER be counted in accepted"
+    );
+    assert_eq!(counts.accepted_under_assumptions, 2);
+    assert_ne!(
+        prov.exit_code(),
+        0,
+        "accepted-under-assumptions must NEVER yield exit 0"
+    );
+}
+
+#[test]
+fn mutant_assuming_past_a_failed_import_is_killed() {
+    let p_ty = Expr::const_(n("A.P"), Vec::new());
+    let mod_a = encode_module(
+        &[],
+        &[
+            axiom("A.P", Expr::sort(Level::zero())),
+            axiom("A.p", p_ty.clone()),
+        ],
+    );
+    // B declares an ill-typed definition (`Sort 1` where `A.P` expected) -> K1 Failed.
+    let mod_b = encode_module(
+        &["A"],
+        &[safe_def("B.bad", p_ty.clone(), Expr::sort(Level::one()))],
+    );
+    let mod_c = encode_module(
+        &["B"],
+        &[safe_def(
+            "C.useB",
+            p_ty,
+            Expr::const_(n("B.bad"), Vec::new()),
+        )],
+    );
+    let fixture = vec![(n("A"), mod_a), (n("B"), mod_b), (n("C"), mod_c)];
+    let inputs = to_inputs(&fixture);
+    let engine = Engine::from_environment(Environment::new());
+    let limits = limits_with_steps(10_000);
+
+    let prov = engine
+        .check_olean_frontier_provisional(&inputs, &KVMap::new(), limits)
+        .expect("provisional frontier");
+    let counts = prov.counts();
+    assert_eq!(counts.accepted, 1);
+    assert_eq!(counts.failed, 1);
+    assert_eq!(counts.blocked, 1);
+    assert_eq!(counts.accepted_under_assumptions, 0);
+    assert!(prov.eligible_blocked.is_empty());
+    assert_eq!(prov.ineligible_blocked, vec![n("C")]);
+    assert!(matches!(
+        prov.rows[2].verdict,
+        ProvisionalModuleVerdict::Blocked { ref by, .. } if *by == n("B")
+    ));
+}
+
+#[test]
+fn mutant_dropping_authority_false_downgrade_is_killed() {
+    let fixture = chain_fixture();
+    let inputs = to_inputs(&fixture);
+    let engine = Engine::from_environment(Environment::new());
+    let prov = engine
+        .check_olean_frontier_provisional(&inputs, &KVMap::new(), limits_with_steps(120))
+        .expect("provisional frontier");
+    assert!(
+        prov.policy_summary.attestable,
+        "policy itself is release/attestable"
+    );
+    assert!(prov.has_phase2_rows);
+    // Mutant: returning policy_summary.attestable directly would yield true.
+    assert!(
+        !prov.is_authoritative(),
+        "any phase-2 row MUST downgrade authority to false even under Release policy"
+    );
+}
+
+#[test]
+fn mutant_deriving_assumes_from_completion_order_is_killed_and_schedule_independent() {
+    let p_ty = Expr::const_(n("A.P"), Vec::new());
+    let mod_a = encode_module(
+        &[],
+        &[
+            axiom("A.P", Expr::sort(Level::zero())),
+            axiom("A.p", p_ty.clone()),
+        ],
+    );
+    // Two independent inconclusive roots (ZRoot and BRoot) with different step costs
+    // so multi-threaded workers complete them in varying order, plus a diamond merger M
+    // and a failed branch F + ineligible BehindFail.
+    let mod_z = encode_module(
+        &["A"],
+        &[safe_def(
+            "ZRoot.heavy",
+            p_ty.clone(),
+            beta_chain("A.P", "A.p", 90),
+        )],
+    );
+    let mod_b = encode_module(
+        &["A"],
+        &[safe_def(
+            "BRoot.heavy",
+            p_ty.clone(),
+            beta_chain("A.P", "A.p", 70),
+        )],
+    );
+    let mod_f = encode_module(
+        &["A"],
+        &[safe_def(
+            "FailRoot.bad",
+            p_ty.clone(),
+            Expr::sort(Level::one()),
+        )],
+    );
+    let mod_only_z = encode_module(
+        &["ZRoot"],
+        &[safe_def(
+            "OnlyZ.use",
+            p_ty.clone(),
+            Expr::const_(n("ZRoot.heavy"), Vec::new()),
+        )],
+    );
+    let mod_only_b = encode_module(
+        &["BRoot"],
+        &[safe_def(
+            "OnlyB.use",
+            p_ty.clone(),
+            Expr::const_(n("BRoot.heavy"), Vec::new()),
+        )],
+    );
+    let mod_diamond = encode_module(
+        &["OnlyZ", "OnlyB"],
+        &[safe_def(
+            "Diamond.use",
+            p_ty.clone(),
+            Expr::const_(n("OnlyZ.use"), Vec::new()),
+        )],
+    );
+    let mod_behind_fail = encode_module(
+        &["OnlyB", "FailRoot"],
+        &[safe_def(
+            "BehindFail.use",
+            p_ty,
+            Expr::const_(n("FailRoot.bad"), Vec::new()),
+        )],
+    );
+    let fixture = vec![
+        (n("A"), mod_a),
+        (n("ZRoot"), mod_z),
+        (n("BRoot"), mod_b),
+        (n("FailRoot"), mod_f),
+        (n("OnlyZ"), mod_only_z),
+        (n("OnlyB"), mod_only_b),
+        (n("Diamond"), mod_diamond),
+        (n("BehindFail"), mod_behind_fail),
+    ];
+    let inputs = to_inputs(&fixture);
+    let engine = Engine::from_environment(Environment::new());
+    let limits = limits_with_steps(120);
+
+    let r1 = engine
+        .check_olean_frontier_provisional_scheduled(
+            &inputs,
+            &KVMap::new(),
+            limits,
+            jobs(1),
+            None,
+            &mut |_| {},
+        )
+        .expect("jobs=1");
+    let r8 = engine
+        .check_olean_frontier_provisional_scheduled(
+            &inputs,
+            &KVMap::new(),
+            limits,
+            jobs(8),
+            None,
+            &mut |_| {},
+        )
+        .expect("jobs=8");
+    let r32 = engine
+        .check_olean_frontier_provisional_scheduled(
+            &inputs,
+            &KVMap::new(),
+            limits,
+            jobs(32),
+            None,
+            &mut |_| {},
+        )
+        .expect("jobs=32");
+
+    let sig1 = row_signature(&r1);
+    assert_eq!(
+        sig1,
+        row_signature(&r8),
+        "rows must be identical at --jobs 1 and 8"
+    );
+    assert_eq!(
+        sig1,
+        row_signature(&r32),
+        "rows must be identical at --jobs 1 and 32"
+    );
+    assert_eq!(r1.roots, r8.roots);
+    assert_eq!(r1.roots, r32.roots);
+
+    // Diamond imports OnlyZ (ZRoot) then OnlyB (BRoot), yet assumes MUST be sorted ["BRoot", "ZRoot"].
+    let diamond = r1
+        .rows
+        .iter()
+        .find(|row| row.name == n("Diamond"))
+        .expect("diamond row");
+    assert!(matches!(
+        diamond.verdict,
+        ProvisionalModuleVerdict::AcceptedUnderAssumptions { declarations: 1 }
+    ));
+    assert_eq!(diamond.assumes, vec![n("BRoot"), n("ZRoot")]);
+    assert_eq!(diamond.assumed_declarations, 2);
+
+    // BehindFail imports BRoot + FailRoot -> ineligible, stays Blocked!
+    let behind_fail = r1
+        .rows
+        .iter()
+        .find(|row| row.name == n("BehindFail"))
+        .expect("behind fail row");
+    assert!(matches!(
+        behind_fail.verdict,
+        ProvisionalModuleVerdict::Blocked { .. }
+    ));
+    assert_eq!(r1.eligible_blocked.len(), 3);
+    assert_eq!(r1.ineligible_blocked, vec![n("BehindFail")]);
+
+    // Dominator unlockValue check: BRoot dominates ONLY OnlyB (1), NOT Diamond and NOT BehindFail;
+    // ZRoot dominates ONLY OnlyZ (1), NOT Diamond.
+    let by_root: BTreeMap<Name, &fln::ProvisionalRootSummary> =
+        r1.roots.iter().map(|r| (r.module.clone(), r)).collect();
+    assert_eq!(by_root[&n("BRoot")].unlock_value, 1);
+    assert_eq!(by_root[&n("ZRoot")].unlock_value, 1);
+    // Meanwhile firstBlockerCount over-credits whichever root appeared first on Diamond/BehindFail.
+    let total_first_blocker: usize = r1.roots.iter().map(|r| r.first_blocker_count).sum();
+    assert!(
+        total_first_blocker >= 3,
+        "first_blocker_count over-credits shared blocked descendants while dominator unlock_value does not"
+    );
+}
+
+#[test]
+fn reuse_record_writer_refuses_assumption_bearing_environment() {
+    let base = Environment::new();
+    let p_decl = axiom("Assumed.P", Expr::sort(Level::zero()));
+    let prov = ProvisionalEnvironment::from_admitted(base)
+        .assume_constants(&[p_decl])
+        .expect("assume constant");
+    assert!(prov.has_assumptions());
+    assert_eq!(prov.assumed_count(), 1);
+    assert!(prov.is_assumed(&n("Assumed.P")));
+
+    // Direct writer refusal on the poisoned environment.
+    let refusal = check_environment_recordable(prov.as_check_environment());
+    assert!(matches!(refusal, Err(ImportReuseRefusal::Unrecordable(_))));
+
+    // Also prove ImportReuseRecord::draft refuses a CheckedOleanSet carrying a poisoned Engine.
+    let poisoned_engine = Engine::from_environment(prov.as_check_environment().clone());
+    assert!(poisoned_engine.environment().has_assumptions());
+    let fake_set = fln::CheckedOleanSet {
+        engine: poisoned_engine,
+        base_logical_root: Environment::new().logical_root(&KVMap::new()),
+        result_logical_root: Environment::new().logical_root(&KVMap::new()),
+        modules: Vec::new(),
+    };
+    let key = ImportClosureKey::compute(
+        &[],
+        &[],
+        &KVMap::new(),
+        CheckerIdentity::admission_authority(),
+    );
+    let draft = ImportReuseRecord::draft(
+        key,
+        CheckerIdentity::admission_authority(),
+        &KVMap::new(),
+        &fake_set,
+    );
+    assert!(
+        matches!(draft, Err(ImportReuseRefusal::Unrecordable(_))),
+        "reuse-record writer must refuse assumption-bearing CheckedOleanSet, got {draft:?}"
+    );
+}
+
+#[test]
+fn inductive_block_is_assumed_whole_never_in_part() {
+    // Build a minimal inductive `MyUnit` (type + ctor + rec) whose recursor/unit
+    // is forced to hit a tiny step limit (max_steps = 1) so the ENTIRE inductive
+    // block (Induct + Ctor + Rec) is assumed atomically as one unit.
+    let ind_name = n("MyUnit");
+    let ctor_name = n("MyUnit.mk");
+    let rec_name = n("MyUnit.rec");
+    let ind_const = Expr::const_(ind_name.clone(), Vec::new());
+    let u = Name::str(Name::anonymous(), "u");
+    let ind = ConstantInfo::Induct(InductiveVal {
+        base: ConstantVal {
+            name: ind_name.clone(),
+            level_params: Vec::new(),
+            type_: Expr::sort(Level::one()),
+        },
+        num_params: 0,
+        num_indices: 0,
+        all: vec![ind_name.clone()],
+        ctors: vec![ctor_name.clone()],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    });
+    let ctor = ConstantInfo::Ctor(ConstructorVal {
+        base: ConstantVal {
+            name: ctor_name.clone(),
+            level_params: Vec::new(),
+            type_: ind_const.clone(),
+        },
+        induct: ind_name.clone(),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 0,
+        is_unsafe: false,
+    });
+    let rec = ConstantInfo::Rec(RecursorVal {
+        base: ConstantVal {
+            name: rec_name.clone(),
+            level_params: vec![u.clone()],
+            type_: Expr::forall_e(
+                Name::str(Name::anonymous(), "motive"),
+                Expr::forall_e(
+                    Name::anonymous(),
+                    ind_const.clone(),
+                    Expr::sort(Level::param(u)),
+                    BinderInfo::Default,
+                ),
+                Expr::forall_e(
+                    Name::str(Name::anonymous(), "mk"),
+                    Expr::app(
+                        Expr::bvar(0).unwrap(),
+                        Expr::const_(ctor_name.clone(), Vec::new()),
+                    ),
+                    Expr::forall_e(
+                        Name::str(Name::anonymous(), "t"),
+                        ind_const.clone(),
+                        Expr::app(Expr::bvar(2).unwrap(), Expr::bvar(0).unwrap()),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Implicit,
+            ),
+        },
+        all: vec![ind_name.clone()],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 1,
+        num_minors: 1,
+        rules: vec![RecursorRule {
+            ctor: ctor_name.clone(),
+            nfields: 0,
+            rhs: Expr::lam(
+                Name::str(Name::anonymous(), "motive"),
+                Expr::forall_e(
+                    Name::anonymous(),
+                    ind_const.clone(),
+                    Expr::sort(Level::param(Name::str(Name::anonymous(), "u"))),
+                    BinderInfo::Default,
+                ),
+                Expr::lam(
+                    Name::str(Name::anonymous(), "mk"),
+                    Expr::app(
+                        Expr::bvar(0).unwrap(),
+                        Expr::const_(ctor_name.clone(), Vec::new()),
+                    ),
+                    Expr::bvar(0).unwrap(),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Implicit,
+            ),
+        }],
+        k: false,
+        is_unsafe: false,
+    });
+    let mod_ind = encode_module(&[], &[ind, ctor, rec]);
+    let mod_use = encode_module(
+        &["IndMod"],
+        &[safe_def(
+            "UseMod.val",
+            ind_const,
+            Expr::const_(ctor_name.clone(), Vec::new()),
+        )],
+    );
+    let fixture = vec![(n("IndMod"), mod_ind), (n("UseMod"), mod_use)];
+    let inputs = to_inputs(&fixture);
+    let engine = Engine::from_environment(Environment::new());
+    // Step limit = 1 forces IndMod's inductive block to hit Inconclusive;
+    // all 3 constants (MyUnit, MyUnit.mk, MyUnit.rec) MUST be assumed together!
+    let prov = engine
+        .check_olean_frontier_provisional(&inputs, &KVMap::new(), limits_with_steps(1))
+        .expect("provisional frontier");
+    assert_eq!(prov.roots.len(), 1);
+    assert_eq!(
+        prov.roots[0].assumed_declaration_names,
+        vec![ind_name, ctor_name, rec_name],
+        "inductive block must be assumed whole (type + ctor + rec together)"
+    );
+}
+
+#[test]
+fn cancellation_and_hostile_batch_preserve_conservation_and_recovery() {
+    let fixture = chain_fixture();
+    let inputs = to_inputs(&fixture);
+    let engine = Engine::from_environment(Environment::new());
+    let limits = limits_with_steps(120);
+
+    // Cancelled Phase 2: must yield Inconclusive::cancelled on unstarted Phase-2 rows,
+    // preserve conservation, keep authority=false, and succeed cleanly when retried.
+    let cancelled = AtomicBool::new(true);
+    let probe = FlagProbe(&cancelled);
+    let stopped = engine
+        .check_olean_frontier_provisional_scheduled(
+            &inputs,
+            &KVMap::new(),
+            limits,
+            jobs(1),
+            Some(&probe),
+            &mut |_| {},
+        )
+        .expect("cancelled provisional run completes with typed non-answers");
+    let stopped_counts = stopped.counts();
+    stopped_counts.assert_conservation();
+    assert_eq!(stopped_counts.accepted, 1);
+    assert_eq!(stopped_counts.inconclusive, 3);
+    assert!(!stopped.is_authoritative());
+    assert_eq!(stopped.exit_code(), 3);
+
+    // Recovery: clear cancellation flag and re-run -> full Phase-2 results.
+    cancelled.store(false, Ordering::SeqCst);
+    let recovered = engine
+        .check_olean_frontier_provisional_scheduled(
+            &inputs,
+            &KVMap::new(),
+            limits,
+            jobs(1),
+            Some(&probe),
+            &mut |_| {},
+        )
+        .expect("recovered provisional run");
+    assert_eq!(recovered.counts().accepted_under_assumptions, 2);
+
+    // Hostile-batch control: mix corrupt bytes, missing import, cycle, and valid chain.
+    let mut hostile = chain_fixture();
+    hostile.push((n("Corrupt"), b"not-an-olean-artifact".to_vec()));
+    hostile.push((n("MissingDep"), encode_module(&["NoSuchModule"], &[])));
+    hostile.push((n("CycA"), encode_module(&["CycB"], &[])));
+    hostile.push((n("CycB"), encode_module(&["CycA"], &[])));
+    hostile.push((n("BehindCorrupt"), encode_module(&["Corrupt"], &[])));
+    let hostile_inputs = to_inputs(&hostile);
+    let hostile_run = engine
+        .check_olean_frontier_provisional(&hostile_inputs, &KVMap::new(), limits)
+        .expect("hostile batch stays typed");
+    let hcounts = hostile_run.counts();
+    hcounts.assert_conservation();
+    assert_eq!(hcounts.accepted, 1);
+    assert_eq!(hcounts.accepted_under_assumptions, 2);
+    assert_eq!(hcounts.inconclusive, 1);
+    assert_eq!(
+        hcounts.failed, 4,
+        "Corrupt, MissingDep, CycA, CycB must fail"
+    );
+    assert_eq!(hcounts.blocked, 1, "BehindCorrupt must stay blocked");
+    assert!(!hostile_run.is_authoritative());
+    assert_eq!(hostile_run.exit_code(), 1);
+}
+
+#[test]
+fn pure_dominator_and_eligibility_helpers_match_diamond_graph_law() {
+    // 0: A (accepted), 1: R1 (inconclusive), 2: R2 (inconclusive), 3: F (failed)
+    // 4: C1 -> R1, 5: C2 -> R2, 6: M -> {C1, C2}, 7: X -> {C1, F}
+    let order = vec![0, 1, 2, 3, 4, 5, 6, 7];
+    let deps = vec![
+        BTreeSet::new(),
+        BTreeSet::from([0]),
+        BTreeSet::from([0]),
+        BTreeSet::from([0]),
+        BTreeSet::from([1]),
+        BTreeSet::from([2]),
+        BTreeSet::from([4, 5]),
+        BTreeSet::from([4, 3]),
+    ];
+    let v_acc = OleanModuleVerdict::Accepted { declarations: 1 };
+    let v_inc = OleanModuleVerdict::Inconclusive(fln::Inconclusive::authority_incomplete("step"));
+    let v_fail = OleanModuleVerdict::Failed(OleanCheckError::MissingConstants {
+        declaration: n("F.x"),
+        names: vec![n("Missing")],
+    });
+    let v_blk_r1 = OleanModuleVerdict::Blocked { by: n("R1") };
+    let v_blk_r2 = OleanModuleVerdict::Blocked { by: n("R2") };
+    let v_blk_c1 = OleanModuleVerdict::Blocked { by: n("C1") };
+    let verdicts = vec![
+        &v_acc, &v_inc, &v_inc, &v_fail, &v_blk_r1, &v_blk_r2, &v_blk_c1, &v_blk_c1,
+    ];
+    let (eligible, ineligible, _) = classify_blocked_eligibility(&order, &deps, &verdicts);
+    assert_eq!(eligible, vec![4, 5, 6]);
+    assert_eq!(ineligible, vec![7]);
+
+    let is_accepted = vec![true, false, false, false, false, false, false, false];
+    let is_blocked = vec![false, false, false, false, true, true, true, true];
+    let first_blocker = vec![None, None, None, None, Some(1), Some(2), Some(4), Some(4)];
+    let (unlock, first_cnt) =
+        compute_root_dominators(&order, &deps, &is_accepted, &is_blocked, &first_blocker);
+    assert_eq!(unlock[&1], 1, "R1 dominates only C1 (not M or X)");
+    assert_eq!(unlock[&2], 1, "R2 dominates only C2 (not M)");
+    assert_eq!(
+        unlock[&3], 0,
+        "F does not solely dominate X (R1 also blocks X)"
+    );
+    assert_eq!(
+        first_cnt[&1], 3,
+        "first_blocker over-credits R1 for C1, M, and X"
+    );
+    assert_eq!(first_cnt[&2], 1);
+}
