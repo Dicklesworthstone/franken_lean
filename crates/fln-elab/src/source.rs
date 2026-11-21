@@ -58,6 +58,7 @@ mod record;
 mod record_terms;
 mod recursion;
 mod reduce;
+pub mod size_of;
 mod tactics;
 pub use tactics::TacticError;
 pub mod trace;

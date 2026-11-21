@@ -244,7 +244,125 @@ impl Engine {
         // A late collision, budget stop, or journal error exposes no prefix.
         batch.admissions.extend(successor.admissions);
         batch.engine = successor.engine;
+        batch = match self.finish_source_inductive_size_of(batch, options, limits)? {
+            Outcome::Complete(batch) => batch,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         batch.result_logical_root = batch.engine.logical_root(options);
+        Ok(Outcome::Complete(batch))
+    }
+
+    /// Generate and admit `<first>._sizeOf_<k>`, `<I>._sizeOf_inst`, and
+    /// `<ctor>.sizeOf_spec` for newly admitted non-Prop safe inductive blocks
+    /// once `SizeOf` and arithmetic prelude constants exist in the environment
+    /// (vendored `Lean/Meta/SizeOf.lean:492-530`).
+    fn finish_source_inductive_size_of(
+        &self,
+        mut batch: DeclarationBatchAdmission,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let blocks: Vec<_> = batch
+            .admissions
+            .iter()
+            .filter_map(|admission| match &admission.declaration {
+                Declaration::Inductive(block) => Some(block.types.clone()),
+                _ => None,
+            })
+            .collect();
+        for block in &blocks {
+            let defs = match fln_elab::source::size_of::generate_inductive_size_of_defs(
+                batch.engine.environment(),
+                block,
+                limits.kernel,
+            ) {
+                Ok(Some(defs)) => defs,
+                Ok(None) => continue,
+                Err(error) => {
+                    return Err(EngineExecutionError::Frontend(
+                        DefinitionFrontendError::Elaborate(error),
+                    ));
+                }
+            };
+            let mut successor = match batch
+                .engine
+                .admit_declarations(&defs.declarations, options, limits)
+                .map_err(EngineExecutionError::from)?
+            {
+                Outcome::Complete(successor) => successor,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            for fn_name in &defs.functions {
+                successor.engine.environment = fln_elab::reducibility::register(
+                    successor.engine.environment(),
+                    fn_name,
+                    fln_elab::reducibility::Reducibility::Semireducible,
+                )
+                .map_err(|error| {
+                    frontend(SourceInferenceError::Unification(Box::new(
+                        fln_elab::constraint::unify::UnificationError::Reducibility(error),
+                    )))
+                })?;
+            }
+            for inst_name in &defs.instances {
+                successor.engine = match successor.engine.register_checked_source_instance(
+                    inst_name,
+                    1000,
+                    None,
+                    false,
+                    limits.kernel,
+                )? {
+                    Outcome::Complete(engine) => engine,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+            }
+            batch.admissions.extend(successor.admissions);
+            batch.engine = successor.engine;
+
+            let specs = match fln_elab::source::size_of::generate_inductive_size_of_specs(
+                batch.engine.environment(),
+                block,
+                limits.kernel,
+            ) {
+                Ok(Some(specs)) => specs,
+                Ok(None) => continue,
+                Err(error) => {
+                    return Err(EngineExecutionError::Frontend(
+                        DefinitionFrontendError::Elaborate(error),
+                    ));
+                }
+            };
+            let mut spec_batch = match batch
+                .engine
+                .admit_declarations(&specs.declarations, options, limits)
+                .map_err(EngineExecutionError::from)?
+            {
+                Outcome::Complete(successor) => successor,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            batch.admissions.extend(spec_batch.admissions);
+            for spec_name in &specs.theorems {
+                let checked = match spec_batch.engine.apply_checked_source_simp(
+                    spec_name,
+                    Some((1000, false)),
+                    true,
+                    true,
+                    options,
+                    limits,
+                )? {
+                    Outcome::Complete(checked) => checked,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                batch.admissions.extend(checked.admissions);
+                spec_batch.engine = checked.engine;
+            }
+            batch.engine = spec_batch.engine;
+        }
         Ok(Outcome::Complete(batch))
     }
 }
