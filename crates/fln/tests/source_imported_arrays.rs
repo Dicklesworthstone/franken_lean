@@ -160,7 +160,7 @@ fn actual_array_import(library: &Path, include_strings: bool) -> Engine {
         );
         assert_eq!(module.declarations.len(), module.decoded.constants.len());
         assert!(module.declarations.iter().all(|declaration| matches!(
-            declaration.checker.schema,
+            declaration.checker.expect("release agreement").schema,
             "fln.checker-admission/1" | "fln-checker/v1"
         )));
     }

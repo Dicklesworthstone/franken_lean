@@ -409,7 +409,10 @@ pub(super) fn run(library: &Path) {
                 .collect(),
         ));
         for row in &checked.declarations {
-            assert_eq!(row.checker.schema, "fln.checker-admission/1");
+            assert_eq!(
+                row.checker.expect("release agreement").schema,
+                "fln.checker-admission/1"
+            );
             admitted.insert(row.name.clone());
         }
         engine = checked.engine;

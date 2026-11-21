@@ -54,7 +54,10 @@ pub fn admitted(base: &fln::Engine, admission: fln::EngineAdmissionLimits) -> fl
     assert_eq!(checked.declarations.len(), checked.decoded.constants.len());
     assert!(!checked.declarations.is_empty());
     for declaration in &checked.declarations {
-        assert_eq!(declaration.checker.schema, "fln.checker-admission/1");
+        assert_eq!(
+            declaration.checker.expect("release agreement").schema,
+            "fln.checker-admission/1"
+        );
     }
     checked.engine
 }

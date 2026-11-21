@@ -277,7 +277,10 @@ pub(super) fn admitted(library: &Path) -> Engine {
             .expect("selected Hashable declaration admission completes");
         assert_eq!(checked.declarations.len(), checked.decoded.constants.len());
         for row in &checked.declarations {
-            assert_eq!(row.checker.schema, "fln.checker-admission/1");
+            assert_eq!(
+                row.checker.expect("release agreement").schema,
+                "fln.checker-admission/1"
+            );
             assert!(admitted.insert(row.name.clone()));
         }
         engine = checked.engine;

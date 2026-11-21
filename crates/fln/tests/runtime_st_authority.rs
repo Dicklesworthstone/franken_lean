@@ -661,7 +661,7 @@ fn admitted_st_and_est_execute_reference_actions_in_order_and_refuse_counterfeit
                         .declarations
                         .iter()
                         .all(|declaration| matches!(
-                            declaration.checker.schema,
+                            declaration.checker.expect("release agreement").schema,
                             "fln.checker-admission/1" | "fln-checker/v1"
                         )),
                     "fresh admissions and independently checked repeated rows retain their exact schema"
@@ -678,9 +678,10 @@ fn admitted_st_and_est_execute_reference_actions_in_order_and_refuse_counterfeit
                     .iter()
                     .find(|declaration| declaration.name == name(target))
                     .unwrap();
-                assert_eq!(row.checker.schema, "fln.checker-admission/1", "{target}");
+                let checker = row.checker.expect("release agreement");
+                assert_eq!(checker.schema, "fln.checker-admission/1", "{target}");
                 assert_eq!(
-                    row.checker.ground,
+                    checker.ground,
                     CheckerAdmissionGround::BodyCheckedAgainstDeclaredType,
                     "{target}"
                 );

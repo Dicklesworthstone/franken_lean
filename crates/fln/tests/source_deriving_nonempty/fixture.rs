@@ -170,7 +170,10 @@ pub(super) fn admitted(library: &Path) -> Engine {
         .expect("the small selected Prelude slice completes");
     assert_eq!(checked.declarations.len(), selected.len());
     for row in &checked.declarations {
-        assert_eq!(row.checker.schema, "fln.checker-admission/1");
+        assert_eq!(
+            row.checker.expect("release agreement").schema,
+            "fln.checker-admission/1"
+        );
     }
     let new_axioms: Vec<_> = selected
         .iter()

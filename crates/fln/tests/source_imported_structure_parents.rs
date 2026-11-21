@@ -334,7 +334,7 @@ fn actual_prelude() -> Engine {
         observed.decoded.constants.len()
     );
     assert!(observed.declarations.iter().all(|declaration| matches!(
-        declaration.checker.schema,
+        declaration.checker.expect("release agreement").schema,
         "fln.checker-admission/1" | "fln-checker/v1"
     )));
     assert_eq!(original.logical_root(&KVMap::new()), original_root);
