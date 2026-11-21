@@ -296,7 +296,7 @@ fn equality_and_quotient() -> Vec<ConstantInfo> {
         )
     };
     let motive = pi(
-        &[("b", Default, b(1)), ("h", Default, eq(b(2), b(1), b(0)))],
+        &[("b", Default, b(1)), ("t", Default, eq(b(2), b(1), b(0)))],
         Expr::sort(u.clone()),
     );
     let minor = app(
@@ -356,7 +356,7 @@ fn equality_and_quotient() -> Vec<ConstantInfo> {
                         ("α", Implicit, Expr::sort(u1.clone())),
                         ("a", Implicit, b(0)),
                         ("motive", Implicit, motive.clone()),
-                        ("minor", Default, minor.clone()),
+                        ("refl", Default, minor.clone()),
                         ("b", Implicit, b(3)),
                         ("t", Default, eq(b(4), b(3), b(0))),
                     ],
@@ -376,7 +376,7 @@ fn equality_and_quotient() -> Vec<ConstantInfo> {
                         ("α", Implicit, Expr::sort(u1)),
                         ("a", Default, b(0)),
                         ("motive", Default, motive),
-                        ("minor", Default, minor),
+                        ("refl", Default, minor),
                     ],
                     b(0),
                 ),
