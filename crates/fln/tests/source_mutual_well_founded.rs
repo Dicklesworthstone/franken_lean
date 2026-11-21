@@ -1615,3 +1615,80 @@ end Ex2
         refuse(base, failing);
     });
 }
+
+/// Acceptance criterion for `fln-mutual-definitions-cayv`: structural vs well-founded
+/// mutual selection matches the pin, and reducibility is observable via both `rfl` and
+/// `decide` (accepted for structural members only, refused for well-founded wrappers).
+#[test]
+fn structural_and_well_founded_mutual_reducibility_matches_pin_for_rfl_and_decide() {
+    let structural = r#"mutual
+  def structEven : Nat → Bool
+    | 0 => true
+    | n+1 => structOdd n
+  def structOdd : Nat → Bool
+    | 0 => false
+    | n+1 => structEven n
+end
+"#;
+    let well_founded = r#"mutual
+  def wfEven (n : Nat) : Bool :=
+    match n with
+    | 0 => true
+    | k+1 => wfOdd k
+  termination_by n
+  def wfOdd (n : Nat) : Bool :=
+    match n with
+    | 0 => false
+    | k+1 => wfEven k
+  termination_by n
+end
+"#;
+    on_generic_stack(move |base| {
+        let structural_proofs = format!(
+            "{structural}\nexample : structEven 4 = true := rfl\nexample : structOdd 3 = true := by decide\n"
+        );
+        oracle(&structural_proofs, true);
+        let struct_engine = check(base, &structural_proofs);
+        assert_ne!(
+            table(struct_engine.environment())
+                .unwrap()
+                .status(&n("structEven")),
+            Reducibility::Irreducible,
+            "structural mutual members must remain reducible, unlike WF wrappers"
+        );
+        assert_eq!(
+            evaluate(&struct_engine, "#eval structEven 10"),
+            ClosedVmValue::Scalar(1),
+        );
+
+        let wf_eval = format!("{well_founded}\n#eval wfEven 10");
+        assert_eq!(oracle(&wf_eval, true), "true\n");
+        let wf_engine = check(base, well_founded);
+        assert_eq!(
+            table(wf_engine.environment()).unwrap().status(&n("wfEven")),
+            Reducibility::Irreducible,
+            "well-founded mutual wrappers must stay @[irreducible]"
+        );
+        assert_auxiliary(&wf_engine, "wfEven._mutual");
+        assert_companions(&wf_engine, &["wfEven", "wfOdd"]);
+        assert_eq!(
+            evaluate(&wf_engine, "#eval wfEven 10"),
+            ClosedVmValue::Scalar(1),
+        );
+        for proof in [
+            "example : wfEven 0 = true := rfl",
+            "example : wfEven 0 = true := by decide",
+            "example : wfEven 0 = true := by with_reducible decide",
+        ] {
+            oracle(&format!("{well_founded}\n{proof}"), false);
+            refuse(&wf_engine, proof);
+        }
+        for proof in [
+            "example : wfEven 0 = true := by with_unfolding_all decide",
+            "example : wfEven 2 = true := by with_unfolding_all decide",
+        ] {
+            oracle(&format!("{well_founded}\n{proof}"), true);
+            check(&wf_engine, proof);
+        }
+    });
+}

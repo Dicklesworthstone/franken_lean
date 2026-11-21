@@ -196,6 +196,12 @@ pub(crate) enum Stop {
     DeferredRecursor {
         frame: Box<InductiveReductionFrame>,
         major: Expr,
+        /// `true` iff `frame.original` was reached directly at the top level of
+        /// `whnf`/`whnf_core` (no enclosing `App` head, pending projection,
+        /// `reduce_nat`, `quot_reduce_rec`, or K-reduction). When `true`,
+        /// `whnf(current) == whnf(frame.original)`, so `whnf_recursor_chain`
+        /// can cache `current` directly without retrying and re-unfolding it.
+        at_whnf_head: bool,
     },
     /// OUR accounting contradicted itself — not a statement about the
     /// declaration. Added for the bounded admission migration
@@ -211,6 +217,17 @@ type KResult<T> = Result<T, Stop>;
 
 fn reject<T>(class: RejectClass, message: impl Into<String>) -> KResult<T> {
     Err(Stop::Reject(class, message.into()))
+}
+
+fn clear_whnf_head(stop: Stop) -> Stop {
+    match stop {
+        Stop::DeferredRecursor { frame, major, .. } => Stop::DeferredRecursor {
+            frame,
+            major,
+            at_whnf_head: false,
+        },
+        other => other,
+    }
 }
 
 // The Reference type-checker state memoizes inference, whnf-core, whnf, and
@@ -1132,8 +1149,13 @@ impl ExprResultCache {
             .saturating_sub(self.local_dependency_scan_nodes)
             .min(TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY);
         let mut nodes_left = scan_limit;
+        let expressions: &[&Expr] = if key == value {
+            &[&key]
+        } else {
+            &[&key, &value]
+        };
         let dependencies = local_dependencies(
-            &[&key, &value],
+            expressions,
             locals,
             local_positions,
             &mut self.free_vars,
@@ -2657,7 +2679,21 @@ pub(crate) struct InductiveReductionFrame {
 enum WhnfRecursorContinuation {
     Finish(InductiveReductionFrame),
     Cache(Expr),
+    CacheWhnf(Expr),
     Retry(Expr),
+}
+
+/// Chain-local exact memo for `whnf_recursor_chain` at a fixed local context
+/// length. Unlike the bounded global `ExprResultCache`s, this table requires
+/// zero free-variable dependency scanning and never evicts or refuses a
+/// termination-critical continuation result; it is dropped when the chain
+/// returns. Core entries (`whnf_core`) and full WHNF entries (`whnf`) are kept
+/// separate so delta-unfolded origins never leak into `whnf_core`.
+#[derive(Default)]
+struct RecursorChainCache {
+    scope: usize,
+    core: KMap<Expr, Expr>,
+    whnf: KMap<Expr, Expr>,
 }
 
 pub(crate) struct TypeChecker<'a> {
@@ -2722,6 +2758,9 @@ pub(crate) struct TypeChecker<'a> {
     /// so its major is normalized on the chain's explicit stack. `is_def_eq`
     /// clears it for the comparison it runs.
     defer_recursor_major: Option<usize>,
+    /// Chain-local continuation results for the active `whnf_recursor_chain`.
+    /// Saved and restored around `is_def_eq` and nested chains.
+    recursor_chain_cache: Option<RecursorChainCache>,
     /// Query-local counterpart of the pin's `m_eager_reduce`. Only the
     /// domain comparison for an `eagerReduce _ _` argument may reduce open
     /// Nat applications; the previous value is restored after that query.
@@ -2732,6 +2771,9 @@ pub(crate) struct TypeChecker<'a> {
     /// Non-authoritative diagnostic unfold histogram for `observe_unfolds`
     /// (`fln-kernel-unfold-differential-tfvw`). Always `None` in `check`.
     unfold_counts: Option<std::collections::BTreeMap<Name, u64>>,
+    unfold_trace_target: Option<Name>,
+    unfold_trace: Vec<String>,
+    trace_defeq_outer: Option<(u64, u64, Name, Name)>,
     /// Diagnostic negative-control switch (`observe_unfolds` only): force
     /// left-first lazy delta unfolding regardless of hint priority.
     force_left_delta: bool,
@@ -2782,20 +2824,83 @@ impl<'a> TypeChecker<'a> {
             instantiate_lparams_cache: InstantiateLParamsCache::new(),
             recursor_major_cache: RecursorMajorCache::new(),
             defer_recursor_major: None,
+            recursor_chain_cache: None,
             eager_reduction: false,
             unfolding: None,
             unfold_counts: None,
+            unfold_trace_target: None,
+            unfold_trace: Vec::new(),
+            trace_defeq_outer: None,
             force_left_delta: false,
         }
     }
 
-    pub(crate) fn enable_unfold_observation(&mut self, force_left_delta: bool) {
+    pub(crate) fn enable_unfold_observation(
+        &mut self,
+        force_left_delta: bool,
+        trace_target: Option<Name>,
+    ) {
         self.unfold_counts = Some(std::collections::BTreeMap::new());
+        self.unfold_trace_target = trace_target;
         self.force_left_delta = force_left_delta;
     }
 
     pub(crate) fn take_unfold_counts(&mut self) -> std::collections::BTreeMap<Name, u64> {
         self.unfold_counts.take().unwrap_or_default()
+    }
+
+    pub(crate) fn take_unfold_trace(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.unfold_trace)
+    }
+
+    pub(crate) fn cache_diagnostic_summary(&self) -> String {
+        fn expr_line(name: &str, c: &ExprResultCache) -> String {
+            format!(
+                "{name}(e={} cells={} scan={} ref={} recl={} prio={})",
+                c.entries,
+                c.local_dependency_cells,
+                c.local_dependency_scan_nodes,
+                c.dependency_scan_refusals.len(),
+                c.dead_row_reclaims,
+                c.priority_results.len(),
+            )
+        }
+        fn pos_line(name: &str, c: &PositiveDefEqCache) -> String {
+            format!(
+                "{name}(e={} cells={} scan={} ref={} recl={})",
+                c.entries,
+                c.local_dependency_cells,
+                c.local_dependency_scan_nodes,
+                c.dependency_scan_refusals.len(),
+                c.dead_row_reclaims,
+            )
+        }
+        format!(
+            "{} | {} | {} | {} | {} | {} | {} | equiv(e={} n={} cells={} scan={}) | ld(rows={} scan={} hits={}) | mk(rows={} scan={} hits={}) | inst(i={} r={} rc={}/{} lp={}) | fresh={}",
+            expr_line("whnf", &self.whnf_cache),
+            expr_line("wcore", &self.whnf_core_cache),
+            expr_line("wcheap", &self.whnf_core_cheap_sensitive_cache),
+            expr_line("inf", &self.infer_cache),
+            expr_line("inf_only", &self.infer_only_cache),
+            pos_line("pos", &self.positive_def_eq_cache),
+            pos_line("rfail", &self.regular_app_def_eq_failure_cache),
+            self.equiv_manager.entries,
+            self.equiv_manager.nodes.len(),
+            self.equiv_manager.local_dependency_cells,
+            self.equiv_manager.local_dependency_scan_nodes,
+            self.lazy_delta_outcome_rows,
+            self.lazy_delta_outcome_scan_nodes,
+            self.lazy_delta_replay_hits,
+            self.major_coercion_outcome_rows,
+            self.major_coercion_scan_nodes,
+            self.major_coercion_replay_hits,
+            self.instantiate_cache.entries,
+            self.instantiate_rev_context_cache.entries,
+            self.instantiate_rev_context_cache.context_count,
+            self.instantiate_rev_context_cache.argument_cells,
+            self.instantiate_lparams_cache.entries,
+            self.fresh,
+        )
     }
 
     fn record_unfold(&mut self, name: &Name) {
@@ -3677,16 +3782,35 @@ impl<'a> TypeChecker<'a> {
     /// (`Lean.reduceBool`/`Lean.reduceNat`) is the native_decide surface, a
     /// follow-up slice: its absence leaves those applications stuck —
     /// under-acceptance, never over-acceptance.
+    fn chain_cached_whnf(&self, e: &Expr) -> Option<Expr> {
+        let chain = self.recursor_chain_cache.as_ref()?;
+        if chain.scope != self.locals.len() {
+            return None;
+        }
+        chain.whnf.get(e).or_else(|| chain.core.get(e)).cloned()
+    }
+
+    fn chain_cached_core(&self, e: &Expr) -> Option<Expr> {
+        let chain = self.recursor_chain_cache.as_ref()?;
+        if chain.scope != self.locals.len() {
+            return None;
+        }
+        chain.core.get(e).cloned()
+    }
+
     fn whnf(&mut self, e: &Expr, depth: u32) -> KResult<Expr> {
+        if let Some(cached) = self.chain_cached_whnf(e) {
+            return Ok(cached);
+        }
         if let Some(cached) = self.whnf_cache.get(e, &self.locals, &self.local_positions) {
             return Ok(cached);
         }
         let mut current = self.whnf_core(e, depth)?;
         let result = loop {
-            if let Some(value) = self.reduce_nat(&current, depth)? {
+            if let Some(value) = self.reduce_nat(&current, depth).map_err(clear_whnf_head)? {
                 break value;
             }
-            match self.unfold_definition(&current, depth)? {
+            match self.unfold_definition(&current, depth, "whnf")? {
                 Some(next) => current = self.whnf_core(&next, depth)?,
                 None => break current,
             }
@@ -3716,6 +3840,9 @@ impl<'a> TypeChecker<'a> {
 
     fn whnf_core_mode(&mut self, e: &Expr, depth: u32, cheap_proj: bool) -> KResult<Expr> {
         self.step(depth)?;
+        if !cheap_proj && let Some(cached) = self.chain_cached_core(e) {
+            return Ok(cached);
+        }
         // Both modes read the full cache, as the pin's `whnf_core` reads its one
         // cache whatever its flags: the cheap mode may return a full-mode result.
         if let Some(cached) = self
@@ -3743,13 +3870,39 @@ impl<'a> TypeChecker<'a> {
         let mut depth = depth;
         let mut pending_projs: Vec<(Name, u64)> = Vec::new();
         let result = loop {
-            if !cheap_proj && current != *e {
+            if current != *e {
                 if pending_projs.is_empty() {
+                    if !cheap_proj && let Some(cached) = self.chain_cached_core(&current) {
+                        break cached;
+                    }
                     if let Some(cached) =
                         self.whnf_core_cache
                             .get(&current, &self.locals, &self.local_positions)
                     {
                         break cached;
+                    }
+                    if cheap_proj
+                        && let Some(cached) = self.whnf_core_cheap_sensitive_cache.get(
+                            &current,
+                            &self.locals,
+                            &self.local_positions,
+                        )
+                    {
+                        self.cheap_proj_events += 1;
+                        break cached;
+                    }
+                } else if cheap_proj {
+                    if let Some(cached) =
+                        self.whnf_core_cache
+                            .get(&current, &self.locals, &self.local_positions)
+                    {
+                        match self.finish_pending_projs(cached, &mut pending_projs, &mut depth)? {
+                            PendingProj::Done(value) => break value,
+                            PendingProj::Continue(field) => {
+                                current = field;
+                                continue;
+                            }
+                        }
                     }
                 } else {
                     // KR-204: a successful inner projection can expose a field
@@ -3767,10 +3920,12 @@ impl<'a> TypeChecker<'a> {
                         current.node(),
                         ExprNode::Proj { .. } | ExprNode::MData { .. }
                     ) {
-                        self.whnf_cache
-                            .get(&current, &self.locals, &self.local_positions)
+                        self.chain_cached_whnf(&current).or_else(|| {
+                            self.whnf_cache
+                                .get(&current, &self.locals, &self.local_positions)
+                        })
                     } else {
-                        Some(self.whnf(&current, depth + 1)?)
+                        Some(self.whnf(&current, depth + 1).map_err(clear_whnf_head)?)
                     };
                     if let Some(structure) = structure {
                         match self.finish_pending_projs(
@@ -3825,7 +3980,9 @@ impl<'a> TypeChecker<'a> {
                     // per layer (FL-INV-07). Skip them here; rebuild if that
                     // dropped a wrapper even when the inner head is stable.
                     let (head0, args) = app_spine_skipping_mdata(&current);
-                    let head = self.whnf_core_mode(&head0, depth + 1, cheap_proj)?;
+                    let head = self
+                        .whnf_core_mode(&head0, depth + 1, cheap_proj)
+                        .map_err(clear_whnf_head)?;
                     if matches!(head.node(), ExprNode::Lam { .. }) {
                         let mut body = head;
                         let mut consumed = 0usize;
@@ -3873,7 +4030,15 @@ impl<'a> TypeChecker<'a> {
                                 _ => None,
                             };
                             if let Some(rec_name) = recursor_head {
-                                match self.reduce_recursor(&current, depth + 1)? {
+                                let reduced =
+                                    self.reduce_recursor(&current, depth + 1).map_err(|stop| {
+                                        if pending_projs.is_empty() {
+                                            stop
+                                        } else {
+                                            clear_whnf_head(stop)
+                                        }
+                                    })?;
+                                match reduced {
                                     Some(reduced) => {
                                         self.record_unfold(&rec_name);
                                         current = reduced;
@@ -3943,7 +4108,7 @@ impl<'a> TypeChecker<'a> {
                         }
                     }
                     if !cheap_proj && !matches!(current.node(), ExprNode::Proj { .. }) {
-                        current = self.whnf(&current, depth + 1)?;
+                        current = self.whnf(&current, depth + 1).map_err(clear_whnf_head)?;
                         match self.finish_pending_projs(current, &mut pending_projs, &mut depth)? {
                             PendingProj::Done(value) => break value,
                             PendingProj::Continue(field) => current = field,
@@ -3960,16 +4125,12 @@ impl<'a> TypeChecker<'a> {
                 },
             }
         };
-        // The explicit recursor continuation may retry an outer application
-        // after normalizing a newly exposed nested major. A completed stuck
-        // application is therefore useful information: without retaining the
-        // identity result, every retry re-walks the same stable prefix. Easy
-        // leaves remain uncached, and an interrupted/deferred computation
-        // never reaches this insertion point.
-        let cache_identity = matches!(
-            e.node(),
-            ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::Proj { .. }
-        );
+        // Pin (`type_checker.cpp:458-500`) caches `Proj` even when stuck, and
+        // returns stuck `App` directly without inserting `e -> e` into
+        // `m_whnf_core`. Skipping stuck `App` identity rows prevents blowing
+        // the 33.5M local-dependency scan cap on identity entries; deferred
+        // recursor chains rely on `recursor_chain_cache` directly.
+        let cache_identity = matches!(e.node(), ExprNode::Proj { .. });
         if result != *e || cache_identity {
             // A cheap computation with no projection event did exactly what the
             // full mode does, so its result is the full-mode result.
@@ -4013,7 +4174,7 @@ impl<'a> TypeChecker<'a> {
         } = value.node()
         {
             let expanded = string_lit_to_constructor(s);
-            self.whnf(&expanded, *depth + 1)?
+            self.whnf(&expanded, *depth + 1).map_err(clear_whnf_head)?
         } else {
             value
         };
@@ -4056,7 +4217,12 @@ impl<'a> TypeChecker<'a> {
     /// Slice note: theorems and opaques are NOT unfolded here (proof irrelevance
     /// covers theorem bodies; opaque unfolding is a follow-up refinement) — an
     /// under-unfolding can only under-accept, never over-accept.
-    fn unfold_definition(&mut self, e: &Expr, depth: u32) -> KResult<Option<Expr>> {
+    fn unfold_definition(
+        &mut self,
+        e: &Expr,
+        depth: u32,
+        site: &'static str,
+    ) -> KResult<Option<Expr>> {
         let mut args: Vec<Expr> = Vec::new();
         let mut head = e.clone();
         while let ExprNode::App { f, a } = head.node() {
@@ -4116,6 +4282,49 @@ impl<'a> TypeChecker<'a> {
             | None => return Ok(None),
         };
         self.record_unfold(name);
+        if self.unfold_trace_target.as_ref() == Some(name) && self.unfold_trace.len() < 40 {
+            let last_arg = args.last().map_or_else(
+                || "-".to_owned(),
+                |a| match a.node() {
+                    ExprNode::Const { name, .. } => name.to_display_string(),
+                    ExprNode::FVar { id } => format!("fvar({})", id.0.to_display_string()),
+                    ExprNode::App { f, .. } => {
+                        let (h, sp) = app_spine(a);
+                        let hn = match h.node() {
+                            ExprNode::Const { name, .. } => name.to_display_string(),
+                            ExprNode::FVar { id } => format!("fvar({})", id.0.to_display_string()),
+                            ExprNode::Proj {
+                                struct_name, idx, ..
+                            } => {
+                                format!("{}.{}", struct_name.to_display_string(), idx)
+                            }
+                            _ => format!("{:?}", std::mem::discriminant(f.node())),
+                        };
+                        format!("({hn} [{}])", sp.len())
+                    }
+                    ExprNode::Proj {
+                        struct_name, idx, ..
+                    } => {
+                        format!("{}.{}", struct_name.to_display_string(), idx)
+                    }
+                    _ => "other".to_owned(),
+                },
+            );
+            self.unfold_trace.push(format!(
+                "#{:02} step={} depth={} locals={} eager={} site={} wcore_scan={} inf_only_scan={} hash={:016x} nargs={} last_arg={}",
+                self.unfold_trace.len() + 1,
+                self.used.steps_used,
+                depth,
+                self.locals.len(),
+                u8::from(self.eager_reduction),
+                site,
+                self.whnf_core_cache.local_dependency_scan_nodes,
+                self.infer_only_cache.local_dependency_scan_nodes,
+                e.data().0,
+                args.len(),
+                last_arg,
+            ));
+        }
         let levels = levels.clone();
         let mut unfolded = self.instantiate_lparams(&value, &params, &levels, depth + 1)?;
         for arg in args {
@@ -4365,7 +4574,9 @@ impl<'a> TypeChecker<'a> {
         if args.len() <= mk_pos {
             return Ok(None);
         }
-        let mk = self.whnf(&args[mk_pos], depth + 1)?;
+        let mk = self
+            .whnf(&args[mk_pos], depth + 1)
+            .map_err(clear_whnf_head)?;
         let (mk_head, mk_args) = app_spine(&mk);
         let ExprNode::Const { name: mk_name, .. } = mk_head.node() else {
             return Ok(None);
@@ -4394,13 +4605,17 @@ impl<'a> TypeChecker<'a> {
     /// and the trailing arguments. Literal majors convert first: Nat via
     /// `nat_lit_to_constructor`, String via KR-314 expansion (inductive.h:93-95).
     fn inductive_reduce_rec(&mut self, e: &Expr, depth: u32) -> KResult<Option<Expr>> {
-        let Some((frame, major)) = self.prepare_inductive_reduction(e, depth)? else {
+        let Some((frame, major)) = self
+            .prepare_inductive_reduction(e, depth)
+            .map_err(clear_whnf_head)?
+        else {
             return Ok(None);
         };
         if self.defer_recursor_major == Some(self.locals.len()) {
             return Err(Stop::DeferredRecursor {
                 frame: Box::new(frame),
                 major,
+                at_whnf_head: true,
             });
         }
         let major = self.whnf_recursor_chain(&major, depth + 1)?;
@@ -4447,81 +4662,118 @@ impl<'a> TypeChecker<'a> {
     /// resource contract measures native stack, so the same reduction chain
     /// must spend steps without growing host frames.
     fn whnf_recursor_chain(&mut self, e: &Expr, depth: u32) -> KResult<Expr> {
-        let mut continuations = Vec::new();
-        let mut current = e.clone();
-        loop {
-            let mut normalized = if let Some(cached) =
-                self.whnf_cache
-                    .get(&current, &self.locals, &self.local_positions)
-            {
-                cached
-            } else if let Some((frame, major)) =
-                self.prepare_inductive_reduction(&current, depth)?
-            {
-                self.step(depth)?;
-                continuations.push(WhnfRecursorContinuation::Finish(frame));
-                current = major;
-                continue;
-            } else {
-                let previous = self.defer_recursor_major;
-                self.defer_recursor_major = Some(self.locals.len());
-                let result = self.whnf(&current, depth);
-                self.defer_recursor_major = previous;
-                match result {
-                    Ok(normalized) => normalized,
-                    Err(Stop::DeferredRecursor { frame, major }) => {
-                        continuations.push(WhnfRecursorContinuation::Retry(current.clone()));
-                        continuations.push(WhnfRecursorContinuation::Finish(*frame));
-                        current = major;
-                        continue;
-                    }
-                    Err(stop) => return Err(stop),
-                }
-            };
-
+        let scope = self.locals.len();
+        let prev_chain_cache = self.recursor_chain_cache.replace(RecursorChainCache {
+            scope,
+            core: KMap::default(),
+            whnf: KMap::default(),
+        });
+        let result = (|| {
+            let mut continuations = Vec::new();
+            let mut current = e.clone();
             loop {
-                match continuations.pop() {
-                    Some(WhnfRecursorContinuation::Cache(origin)) => {
-                        self.whnf_cache.insert_reduction_result(
-                            origin.clone(),
-                            normalized.clone(),
-                            &self.locals,
-                            &self.local_positions,
-                        );
-                        // A recursor is reduced from `whnf_core`. If its RHS
-                        // reaches a stuck nested match, the enclosing retry
-                        // re-enters through that same layer rather than through
-                        // full `whnf`; publish the completed continuation to
-                        // both tables or the predecessor reduction repeats
-                        // indefinitely. A saturated ordinary cache uses its
-                        // reserved continuation lane for exactly this seam.
-                        self.whnf_core_cache.insert_reduction_result(
-                            origin,
-                            normalized.clone(),
-                            &self.locals,
-                            &self.local_positions,
-                        );
-                    }
-                    Some(WhnfRecursorContinuation::Retry(retry)) => {
-                        current = retry;
-                        break;
-                    }
-                    Some(WhnfRecursorContinuation::Finish(frame)) => {
-                        match self.finish_inductive_reduction(&frame, normalized, depth)? {
-                            Some(reduced) => {
-                                continuations.push(WhnfRecursorContinuation::Cache(frame.original));
-                                current = reduced;
-                                break;
+                let mut normalized = if let Some(cached) = self.chain_cached_whnf(&current) {
+                    cached
+                } else if let Some(cached) =
+                    self.whnf_cache
+                        .get(&current, &self.locals, &self.local_positions)
+                {
+                    cached
+                } else if let Some((frame, major)) =
+                    self.prepare_inductive_reduction(&current, depth)?
+                {
+                    self.step(depth)?;
+                    continuations.push(WhnfRecursorContinuation::Finish(frame));
+                    current = major;
+                    continue;
+                } else {
+                    let previous = self.defer_recursor_major;
+                    self.defer_recursor_major = Some(scope);
+                    let result = self.whnf(&current, depth);
+                    self.defer_recursor_major = previous;
+                    match result {
+                        Ok(normalized) => normalized,
+                        Err(Stop::DeferredRecursor {
+                            frame,
+                            major,
+                            at_whnf_head,
+                        }) => {
+                            if at_whnf_head {
+                                if current != frame.original {
+                                    continuations
+                                        .push(WhnfRecursorContinuation::CacheWhnf(current));
+                                }
+                            } else {
+                                continuations.push(WhnfRecursorContinuation::Retry(current));
                             }
-                            None => {
-                                normalized = self.cache_stuck_recursor(frame.original);
+                            continuations.push(WhnfRecursorContinuation::Finish(*frame));
+                            current = major;
+                            continue;
+                        }
+                        Err(stop) => return Err(stop),
+                    }
+                };
+
+                loop {
+                    match continuations.pop() {
+                        Some(WhnfRecursorContinuation::Cache(origin)) => {
+                            if let Some(chain) = self.recursor_chain_cache.as_mut()
+                                && chain.scope == self.locals.len()
+                            {
+                                chain.core.insert(origin.clone(), normalized.clone());
+                                chain.whnf.insert(origin.clone(), normalized.clone());
+                            }
+                            self.whnf_cache.insert_reduction_result(
+                                origin.clone(),
+                                normalized.clone(),
+                                &self.locals,
+                                &self.local_positions,
+                            );
+                            self.whnf_core_cache.insert_reduction_result(
+                                origin,
+                                normalized.clone(),
+                                &self.locals,
+                                &self.local_positions,
+                            );
+                        }
+                        Some(WhnfRecursorContinuation::CacheWhnf(origin)) => {
+                            if let Some(chain) = self.recursor_chain_cache.as_mut()
+                                && chain.scope == self.locals.len()
+                            {
+                                chain.whnf.insert(origin.clone(), normalized.clone());
+                            }
+                            self.whnf_cache.insert_reduction_result(
+                                origin,
+                                normalized.clone(),
+                                &self.locals,
+                                &self.local_positions,
+                            );
+                        }
+                        Some(WhnfRecursorContinuation::Retry(retry)) => {
+                            current = retry;
+                            break;
+                        }
+                        Some(WhnfRecursorContinuation::Finish(frame)) => {
+                            match self.finish_inductive_reduction(&frame, normalized, depth)? {
+                                Some(reduced) => {
+                                    self.record_unfold(&frame.rec.base.name);
+                                    continuations
+                                        .push(WhnfRecursorContinuation::Cache(frame.original));
+                                    current = reduced;
+                                    break;
+                                }
+                                None => {
+                                    normalized = self.cache_stuck_recursor(frame.original);
+                                }
                             }
                         }
+                        None => return Ok(normalized),
                     }
-                    None => return Ok(normalized),
                 }
             }
-        }
+        })();
+        self.recursor_chain_cache = prev_chain_cache;
+        result
     }
 
     fn finish_inductive_reduction(
@@ -4897,8 +5149,47 @@ impl<'a> TypeChecker<'a> {
         // budget ran out. A recursor met here starts its own chain instead,
         // as it does outside any chain.
         let deferral = self.defer_recursor_major.take();
+        let chain_cache = self.recursor_chain_cache.take();
+        let saved_outer = if self.unfold_trace_target.is_some() {
+            let head_name = |e: &Expr| -> Name {
+                let (h, _) = app_spine(e);
+                match h.node() {
+                    ExprNode::Const { name, .. } => name.clone(),
+                    ExprNode::Proj { struct_name, .. } => struct_name.clone(),
+                    ExprNode::FVar { id } => id.0.clone(),
+                    _ => Name::anonymous(),
+                }
+            };
+            self.trace_defeq_outer
+                .replace((t.data().0, s.data().0, head_name(t), head_name(s)))
+        } else {
+            None
+        };
+        let trace_len_before = self.unfold_trace.len();
         let result = self.is_def_eq_core(t, s, depth);
+        if self.unfold_trace_target.is_some() {
+            if self.unfold_trace.len() > trace_len_before && self.unfold_trace.len() < 80 {
+                let verdict = match &result {
+                    Ok(true) => "TRUE",
+                    Ok(false) => "FALSE",
+                    Err(_) => "ERR",
+                };
+                if let Some((th, sh, tn, sn)) = &self.trace_defeq_outer {
+                    self.unfold_trace.push(format!(
+                        "  END step={} depth={} verdict={verdict} outer_t={}:{:016x} outer_s={}:{:016x}",
+                        self.used.steps_used,
+                        depth,
+                        tn.to_display_string(),
+                        th,
+                        sn.to_display_string(),
+                        sh,
+                    ));
+                }
+            }
+            self.trace_defeq_outer = saved_outer;
+        }
         self.defer_recursor_major = deferral;
+        self.recursor_chain_cache = chain_cache;
         if matches!(result, Ok(true)) {
             self.cache_positive_defeq(t, s);
         }
@@ -5268,22 +5559,31 @@ impl<'a> TypeChecker<'a> {
                 // `instantiate_rev` they remain equal, so the skip is only
                 // an optimization. We still instantiate the right domain
                 // for the local's type.
-                let instantiated_s = if !t_dom.is_alpha_equiv(&s_dom) {
+                let mut instantiated_s = if !t_dom.is_alpha_equiv(&s_dom) {
                     let var_t = self.instantiate_rev(&t_dom, &subst, 0, child_depth)?;
                     let var_s = self.instantiate_rev(&s_dom, &subst, 0, child_depth)?;
                     if !self.is_def_eq(&var_t, &var_s, child_depth)? {
                         return Ok(false);
                     }
-                    var_s
+                    Some(var_s)
                 } else {
-                    self.instantiate_rev(&s_dom, &subst, 0, child_depth)?
+                    None
                 };
 
-                // Pin only allocates a local when a body mentions a loose
-                // bvar; otherwise it pushes `g_dont_care`. Always allocating
-                // an fvar is equivalent: a closed body ignores the substitute.
-                let id = self.fresh_fvar(instantiated_s, None);
-                subst.push(Expr::fvar(id));
+                // Pin (`type_checker.cpp:723-730`) only allocates a local when
+                // a body mentions a loose bvar; otherwise it pushes a dummy
+                // closed placeholder (`g_dont_care`), avoiding spurious local
+                // context growth and domain instantiation on non-dependent arrows.
+                if t_body.has_loose_bvars() || s_body.has_loose_bvars() {
+                    let var_s = match instantiated_s.take() {
+                        Some(var_s) => var_s,
+                        None => self.instantiate_rev(&s_dom, &subst, 0, child_depth)?,
+                    };
+                    let id = self.fresh_fvar(var_s, None);
+                    subst.push(Expr::fvar(id));
+                } else {
+                    subst.push(Expr::sort(Level::zero()));
+                }
                 opened = opened
                     .checked_add(1)
                     .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
@@ -5569,14 +5869,14 @@ impl<'a> TypeChecker<'a> {
             (None, None) => return Ok(ReductionStatus::DefUnknown),
             (Some(_), None) => match self.try_unfold_proj_app(s, depth)? {
                 Some(next) => *s = next,
-                None => match self.unfold_definition(t, depth)? {
+                None => match self.unfold_definition(t, depth, "ld_l")? {
                     Some(next) => *t = self.whnf_core_for_defeq(&next, depth)?,
                     None => return Ok(ReductionStatus::DefUnknown),
                 },
             },
             (None, Some(_)) => match self.try_unfold_proj_app(t, depth)? {
                 Some(next) => *t = next,
-                None => match self.unfold_definition(s, depth)? {
+                None => match self.unfold_definition(s, depth, "ld_r")? {
                     Some(next) => *s = self.whnf_core_for_defeq(&next, depth)?,
                     None => return Ok(ReductionStatus::DefUnknown),
                 },
@@ -5586,11 +5886,11 @@ impl<'a> TypeChecker<'a> {
             } else {
                 a.cmp_priority(b)
             } {
-                std::cmp::Ordering::Greater => match self.unfold_definition(t, depth)? {
+                std::cmp::Ordering::Greater => match self.unfold_definition(t, depth, "ld_gt")? {
                     Some(next) => *t = self.whnf_core_for_defeq(&next, depth)?,
                     None => return Ok(ReductionStatus::DefUnknown),
                 },
-                std::cmp::Ordering::Less => match self.unfold_definition(s, depth)? {
+                std::cmp::Ordering::Less => match self.unfold_definition(s, depth, "ld_lt")? {
                     Some(next) => *s = self.whnf_core_for_defeq(&next, depth)?,
                     None => return Ok(ReductionStatus::DefUnknown),
                 },
@@ -5598,11 +5898,46 @@ impl<'a> TypeChecker<'a> {
                     if same_regular_app && self.regular_same_head_apps_def_eq(t, s, depth + 1)? {
                         return Ok(ReductionStatus::DefEqual);
                     }
-                    match self.unfold_definition(t, depth)? {
+                    if self.unfold_trace_target.is_some()
+                        && self.unfold_trace.len() < 80
+                        && matches!(app_spine(t).0.node(), ExprNode::Const { name, .. } if self.unfold_trace_target.as_ref() == Some(name))
+                    {
+                        let (sh, sargs) = app_spine(s);
+                        let sname = match sh.node() {
+                            ExprNode::Const { name, .. } => name.to_display_string(),
+                            _ => "nonconst".to_owned(),
+                        };
+                        let in_pos = self.positive_def_eq_cache.contains(
+                            t,
+                            s,
+                            &self.locals,
+                            &self.local_positions,
+                        );
+                        let in_eqv = self.equiv_manager.is_equiv(
+                            t,
+                            s,
+                            false,
+                            self.eager_reduction,
+                            &self.locals,
+                            &self.local_positions,
+                        );
+                        self.unfold_trace.push(format!(
+                            "  PAIR step={} depth={} t_hash={:016x} s_head={}({}) s_hash={:016x} in_pos={} in_eqv={}",
+                            self.used.steps_used,
+                            depth,
+                            t.data().0,
+                            sname,
+                            sargs.len(),
+                            s.data().0,
+                            in_pos,
+                            in_eqv,
+                        ));
+                    }
+                    match self.unfold_definition(t, depth, "ld_eq_l")? {
                         Some(next) => *t = self.whnf_core_for_defeq(&next, depth)?,
                         None => return Ok(ReductionStatus::DefUnknown),
                     }
-                    match self.unfold_definition(s, depth)? {
+                    match self.unfold_definition(s, depth, "ld_eq_r")? {
                         Some(next) => *s = self.whnf_core_for_defeq(&next, depth)?,
                         None => return Ok(ReductionStatus::DefUnknown),
                     }
@@ -6457,17 +6792,21 @@ impl<'a> TypeChecker<'a> {
         result
     }
 
-    /// Pin `infer_let`: open a consecutive let telescope iteratively, perform
-    /// checking-mode obligations at each row, then zeta-close the final body
-    /// type from innermost local to outermost.
+    /// Pin `infer_let` (`type_checker.cpp:217-238`, `local_ctx.cpp:94-125`):
+    /// open a consecutive let telescope iteratively, perform checking-mode
+    /// obligations at each row, then close the body type with `mk_pi(...,
+    /// remove_dead_let = true)` — preserving live `let` bindings instead of
+    /// eagerly zeta-substituting them (which blows up nested dependent `let`s
+    /// exponentially) and dropping dead `let` bindings via `lower_loose_bvars`.
     fn infer_let_spine(&mut self, e: &Expr, depth: u32, mode: InferMode) -> KResult<Expr> {
         let saved_locals = self.locals.len();
         let result = (|| {
             let mut current = e.clone();
             let mut opened_fvars = Vec::new();
-            let mut replacements = Vec::new();
+            let mut ordinals = KMap::default();
+            let mut lets: Vec<(Name, Expr, Expr, Expr, Expr, u32)> = Vec::new();
             while let ExprNode::LetE {
-                decl_name: _,
+                decl_name,
                 type_,
                 value,
                 body,
@@ -6475,6 +6814,9 @@ impl<'a> TypeChecker<'a> {
             } = current.node()
             {
                 self.step(depth)?;
+                let decl_name = decl_name.clone();
+                let orig_type = type_.clone();
+                let orig_value = value.clone();
                 let type_ = self.instantiate_rev(type_, &opened_fvars, 0, depth)?;
                 let value = self.instantiate_rev(value, &opened_fvars, 0, depth)?;
                 let body = body.clone();
@@ -6485,16 +6827,46 @@ impl<'a> TypeChecker<'a> {
                         return reject(RejectClass::TypeMismatch, "let value type mismatch");
                     }
                 }
-                let id = self.fresh_fvar(type_, Some(value.clone()));
-                opened_fvars.push(Expr::fvar(id.clone()));
-                replacements.push((id, value));
+                let active = u32::try_from(opened_fvars.len())
+                    .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
+                let id = self.fresh_fvar(type_.clone(), Some(value.clone()));
+                ordinals.insert(id.clone(), active);
+                opened_fvars.push(Expr::fvar(id));
+                lets.push((decl_name, orig_type, type_, orig_value, value, active));
                 current = body;
             }
             let body = self.instantiate_rev(&current, &opened_fvars, 0, depth)?;
-            let mut result = self.infer_core_mode(&body, depth, mode)?;
-            result = self.cheap_beta_reduce(&result);
-            for (id, value) in replacements.into_iter().rev() {
-                result = self.replace_fvar(&result, &id, &value, depth)?;
+            let body_type = self.infer_core_mode(&body, depth, mode)?;
+            let body_type = self.cheap_beta_reduce(&body_type);
+            let active = u32::try_from(opened_fvars.len())
+                .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
+            let mut result = self.abstract_fvar_set(&body_type, &ordinals, active, 0, depth)?;
+            let mut dead_run: u32 = 0;
+            for (decl_name, orig_type, type_, orig_value, value, idx) in lets.into_iter().rev() {
+                if result.has_loose_bvar(dead_run) {
+                    if dead_run > 0 {
+                        result = self.lower_loose_bvars(&result, dead_run, dead_run, depth)?;
+                        dead_run = 0;
+                    }
+                    let closed_type = if orig_type.loose_bvar_range() <= idx {
+                        orig_type
+                    } else {
+                        self.abstract_fvar_set(&type_, &ordinals, idx, 0, depth)?
+                    };
+                    let closed_value = if orig_value.loose_bvar_range() <= idx {
+                        orig_value
+                    } else {
+                        self.abstract_fvar_set(&value, &ordinals, idx, 0, depth)?
+                    };
+                    result = Expr::let_e(decl_name, closed_type, closed_value, result, false);
+                } else {
+                    dead_run = dead_run
+                        .checked_add(1)
+                        .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                }
+            }
+            if dead_run > 0 {
+                result = self.lower_loose_bvars(&result, dead_run, dead_run, depth)?;
             }
             Ok(result)
         })();
@@ -6741,51 +7113,70 @@ impl<'a> TypeChecker<'a> {
             .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
     }
 
-    fn replace_fvar(&mut self, e: &Expr, id: &FVarId, with: &Expr, depth: u32) -> KResult<Expr> {
-        // Post-order heap walk. Zeta of a deep let body used to recurse one
-        // frame per node (FL-INV-07).
-        enum Op {
-            Enter { e: Expr, depth: u32 },
-            Finish { e: Expr },
+    /// Pin `lower_loose_bvars(e, s, d)` (`expr.cpp:417-434`): decrement every
+    /// loose bound variable with index `>= s` (adjusted by binder depth) by `d`
+    /// (`s >= d`). Post-order heap walk so deep nests never overflow the native
+    /// stack (FL-INV-07).
+    fn lower_loose_bvars(&mut self, e: &Expr, s: u32, d: u32, depth: u32) -> KResult<Expr> {
+        if d == 0 || s >= e.loose_bvar_range() {
+            return Ok(e.clone());
         }
-        let lookup = |done: &KMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
-            done.get(&child.allocation_identity())
-                .cloned()
-                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
-        };
-        let mut done: KMap<usize, Expr> = KMap::default();
+        enum Op {
+            Enter { e: Expr, offset: u32, depth: u32 },
+            Finish { e: Expr, offset: u32 },
+        }
+        let lookup =
+            |done: &KMap<(usize, u32), Expr>, child: &Expr, offset: u32| -> KResult<Expr> {
+                done.get(&(child.allocation_identity(), offset))
+                    .cloned()
+                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+            };
+        let mut done: KMap<(usize, u32), Expr> = KMap::default();
         let mut stack = vec![Op::Enter {
             e: e.clone(),
+            offset: 0,
             depth,
         }];
         while let Some(op) = stack.pop() {
             match op {
-                Op::Enter { e, depth } => {
+                Op::Enter { e, offset, depth } => {
                     self.step(depth)?;
-                    let key = e.allocation_identity();
+                    let key = (e.allocation_identity(), offset);
                     if done.contains_key(&key) {
                         continue;
                     }
-                    if !e.has_fvar() {
+                    let Some(s1) = s.checked_add(offset) else {
+                        done.insert(key, e);
+                        continue;
+                    };
+                    if s1 >= e.loose_bvar_range() {
                         done.insert(key, e);
                         continue;
                     }
                     match e.node() {
-                        ExprNode::FVar { id: found } if found == id => {
-                            done.insert(key, with.clone());
-                        }
-                        ExprNode::FVar { .. } => {
-                            done.insert(key, e);
+                        ExprNode::BVar { idx } => {
+                            let result = if *idx >= s1 {
+                                let lowered = idx
+                                    .checked_sub(d)
+                                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                                Expr::bvar(lowered)
+                                    .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?
+                            } else {
+                                e.clone()
+                            };
+                            done.insert(key, result);
                         }
                         ExprNode::App { f, a } => {
                             let (f, a) = (f.clone(), a.clone());
-                            stack.push(Op::Finish { e });
+                            stack.push(Op::Finish { e, offset });
                             stack.push(Op::Enter {
                                 e: a,
+                                offset,
                                 depth: depth + 1,
                             });
                             stack.push(Op::Enter {
                                 e: f,
+                                offset,
                                 depth: depth + 1,
                             });
                         }
@@ -6795,40 +7186,52 @@ impl<'a> TypeChecker<'a> {
                         | ExprNode::ForallE {
                             binder_type, body, ..
                         } => {
+                            let next_offset = offset
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
                             let (ty, body) = (binder_type.clone(), body.clone());
-                            stack.push(Op::Finish { e });
+                            stack.push(Op::Finish { e, offset });
                             stack.push(Op::Enter {
                                 e: body,
+                                offset: next_offset,
                                 depth: depth + 1,
                             });
                             stack.push(Op::Enter {
                                 e: ty,
+                                offset,
                                 depth: depth + 1,
                             });
                         }
                         ExprNode::LetE {
                             type_, value, body, ..
                         } => {
+                            let next_offset = offset
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
                             let (ty, value, body) = (type_.clone(), value.clone(), body.clone());
-                            stack.push(Op::Finish { e });
+                            stack.push(Op::Finish { e, offset });
                             stack.push(Op::Enter {
                                 e: body,
+                                offset: next_offset,
                                 depth: depth + 1,
                             });
                             stack.push(Op::Enter {
                                 e: value,
+                                offset,
                                 depth: depth + 1,
                             });
                             stack.push(Op::Enter {
                                 e: ty,
+                                offset,
                                 depth: depth + 1,
                             });
                         }
                         ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
                             let inner = expr.clone();
-                            stack.push(Op::Finish { e });
+                            stack.push(Op::Finish { e, offset });
                             stack.push(Op::Enter {
                                 e: inner,
+                                offset,
                                 depth: depth + 1,
                             });
                         }
@@ -6837,13 +7240,16 @@ impl<'a> TypeChecker<'a> {
                         }
                     }
                 }
-                Op::Finish { e } => {
-                    let key = e.allocation_identity();
+                Op::Finish { e, offset } => {
+                    let key = (e.allocation_identity(), offset);
                     if done.contains_key(&key) {
                         continue;
                     }
+                    let next_offset = offset.saturating_add(1);
                     let result = match e.node() {
-                        ExprNode::App { f, a } => Expr::app(lookup(&done, f)?, lookup(&done, a)?),
+                        ExprNode::App { f, a } => {
+                            Expr::app(lookup(&done, f, offset)?, lookup(&done, a, offset)?)
+                        }
                         ExprNode::Lam {
                             binder_name,
                             binder_type,
@@ -6851,8 +7257,8 @@ impl<'a> TypeChecker<'a> {
                             binder_info,
                         } => Expr::lam(
                             binder_name.clone(),
-                            lookup(&done, binder_type)?,
-                            lookup(&done, body)?,
+                            lookup(&done, binder_type, offset)?,
+                            lookup(&done, body, next_offset)?,
                             *binder_info,
                         ),
                         ExprNode::ForallE {
@@ -6862,8 +7268,8 @@ impl<'a> TypeChecker<'a> {
                             binder_info,
                         } => Expr::forall_e(
                             binder_name.clone(),
-                            lookup(&done, binder_type)?,
-                            lookup(&done, body)?,
+                            lookup(&done, binder_type, offset)?,
+                            lookup(&done, body, next_offset)?,
                             *binder_info,
                         ),
                         ExprNode::LetE {
@@ -6874,26 +7280,27 @@ impl<'a> TypeChecker<'a> {
                             non_dep,
                         } => Expr::let_e(
                             decl_name.clone(),
-                            lookup(&done, type_)?,
-                            lookup(&done, value)?,
-                            lookup(&done, body)?,
+                            lookup(&done, type_, offset)?,
+                            lookup(&done, value, offset)?,
+                            lookup(&done, body, next_offset)?,
                             *non_dep,
                         ),
                         ExprNode::MData { data, expr } => {
-                            Expr::mdata(data.clone(), lookup(&done, expr)?)
+                            Expr::mdata(data.clone(), lookup(&done, expr, offset)?)
                         }
                         ExprNode::Proj {
                             struct_name,
                             idx,
                             expr,
-                        } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr)?),
+                        } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr, offset)?),
                         _ => e.clone(),
                     };
+                    let result = self.interner.intern(result);
                     done.insert(key, result);
                 }
             }
         }
-        done.get(&e.allocation_identity())
+        done.get(&(e.allocation_identity(), 0))
             .cloned()
             .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
     }
@@ -7107,6 +7514,12 @@ impl<'a> TypeChecker<'a> {
     /// exhausted. This identity result is termination-critical: a full bucket
     /// of distinct 32-bit Reference-hash collisions must not suppress it.
     fn cache_stuck_recursor(&mut self, stuck: Expr) -> Expr {
+        if let Some(chain) = self.recursor_chain_cache.as_mut()
+            && chain.scope == self.locals.len()
+        {
+            chain.core.insert(stuck.clone(), stuck.clone());
+            chain.whnf.insert(stuck.clone(), stuck.clone());
+        }
         self.whnf_cache.insert_identity_replacing_collision(
             stuck.clone(),
             &self.locals,
@@ -8341,28 +8754,157 @@ mod tests {
     }
 
     #[test]
-    fn replace_fvar_walks_a_deep_app_nest_without_stack_fault() {
+    fn lower_loose_bvars_walks_a_deep_app_nest_without_stack_fault() {
         let env = Environment::new();
         let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
-        let id = FVarId(Name::str(Name::anonymous(), "x"));
-        let fvar = Expr::fvar(id.clone());
-        let subst = Expr::sort(Level::zero());
-        let mut expr = fvar.clone();
+        let bvar2 = Expr::bvar(2).expect("packs");
+        let bvar1 = Expr::bvar(1).expect("packs");
+        let mut expr = bvar2.clone();
         for _ in 0..400 {
-            expr = Expr::app(expr, fvar.clone());
+            expr = Expr::app(expr, bvar2.clone());
         }
         let result = tc
-            .replace_fvar(&expr, &id, &subst, 0)
-            .expect("a 400-app fvar nest must not stack-fault");
+            .lower_loose_bvars(&expr, 1, 1, 0)
+            .expect("a 400-app bvar nest must not stack-fault");
         let mut current = &result;
         let mut apps = 0usize;
         while let ExprNode::App { f, a } = current.node() {
-            assert!(a == &subst, "every fvar argument is replaced");
+            assert!(a == &bvar1, "every loose bvar >= 1 is lowered by 1");
             current = f;
             apps += 1;
         }
         assert!(apps == 400, "the app spine length is preserved");
-        assert!(current == &subst, "the head fvar is replaced");
+        assert!(current == &bvar1, "the head bvar is lowered by 1");
+    }
+
+    #[test]
+    fn infer_let_preserves_dependent_lets_without_exponential_zeta_blowup() {
+        use fln_env::constants::{AxiomVal, ConstantVal};
+
+        let nat_name = Name::str(Name::anonymous(), "Nat");
+        let f_name = Name::str(Name::anonymous(), "f");
+        let p_name = Name::str(Name::anonymous(), "P");
+        let h_name = Name::str(Name::anonymous(), "h");
+        let nat = Expr::const_(nat_name.clone(), Vec::new());
+        let f = Expr::const_(f_name.clone(), Vec::new());
+        let p = Expr::const_(p_name.clone(), Vec::new());
+        let h = Expr::const_(h_name.clone(), Vec::new());
+        let zero = Expr::lit(Literal::Nat(NatLit::from_u64(0)));
+
+        let env = publish_checked(
+            &Environment::new(),
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: nat_name,
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                is_unsafe: false,
+            }),
+        );
+        let env = publish_checked(
+            &env,
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: f_name,
+                    level_params: Vec::new(),
+                    type_: Expr::forall_e(
+                        Name::anonymous(),
+                        nat.clone(),
+                        Expr::forall_e(
+                            Name::anonymous(),
+                            nat.clone(),
+                            nat.clone(),
+                            BinderInfo::Default,
+                        ),
+                        BinderInfo::Default,
+                    ),
+                },
+                is_unsafe: false,
+            }),
+        );
+        let env = publish_checked(
+            &env,
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: p_name,
+                    level_params: Vec::new(),
+                    type_: Expr::forall_e(
+                        Name::anonymous(),
+                        nat.clone(),
+                        Expr::sort(Level::zero()),
+                        BinderInfo::Default,
+                    ),
+                },
+                is_unsafe: false,
+            }),
+        );
+        let env = publish_checked(
+            &env,
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: h_name,
+                    level_params: Vec::new(),
+                    type_: Expr::forall_e(
+                        Name::anonymous(),
+                        nat.clone(),
+                        Expr::app(p.clone(), Expr::bvar(0).expect("packs")),
+                        BinderInfo::Default,
+                    ),
+                },
+                is_unsafe: false,
+            }),
+        );
+
+        // 40 nested doubling lets (`let x_{i+1} := f x_i x_i; ...; h x_40`) plus a dead inner let.
+        // Eager zeta substitution produces 2^40 nodes and exhausts any step budget;
+        // pin `local_ctx::mk_pi(..., remove_dead_let = true)` keeps the 40 live lets
+        // intact, drops the dead let, and finishes in linear steps.
+        let bvar0 = Expr::bvar(0).expect("packs");
+        let mut term = Expr::let_e(
+            Name::str(Name::anonymous(), "dead"),
+            nat.clone(),
+            zero.clone(),
+            Expr::app(h, Expr::bvar(1).expect("packs")),
+            false,
+        );
+        for i in (1..40).rev() {
+            let val = Expr::app(Expr::app(f.clone(), bvar0.clone()), bvar0.clone());
+            term = Expr::let_e(
+                Name::str(Name::anonymous(), &format!("x{i}")),
+                nat.clone(),
+                val,
+                term,
+                false,
+            );
+        }
+        term = Expr::let_e(
+            Name::str(Name::anonymous(), "x0"),
+            nat.clone(),
+            zero,
+            term,
+            false,
+        );
+
+        let budget = Budget::DEFAULT.narrowed(100_000, 1024);
+        let mut tc = TypeChecker::new(&env, &[], budget);
+        let inferred = tc
+            .infer(&term, 0)
+            .expect("nested dependent let inference must stay linear");
+        let mut cursor = &inferred;
+        let mut kept_lets = 0usize;
+        while let ExprNode::LetE { body, .. } = cursor.node() {
+            kept_lets += 1;
+            cursor = body;
+        }
+        assert!(
+            kept_lets == 40,
+            "all 40 live lets must be preserved and the dead let dropped; got {kept_lets}"
+        );
+        assert!(
+            *cursor == Expr::app(p, bvar0),
+            "inner body type must reference bvar 0 after dropping the dead inner let"
+        );
     }
 
     #[test]

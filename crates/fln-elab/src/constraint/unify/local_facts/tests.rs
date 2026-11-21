@@ -233,3 +233,63 @@ fn cache_keys_pin_allocations_and_never_identify_distinct_local_names() {
         Err(UnificationError::Cancelled)
     ));
 }
+
+#[test]
+fn scan_facts_reuses_polymorphic_subtrees_and_preserves_level_params() {
+    let u = name("u");
+    let v = name("v");
+    let shared = tower(
+        32,
+        Expr::app(
+            Expr::const_(
+                name("Poly"),
+                vec![
+                    Level::max(
+                        Level::param(u.clone()),
+                        Level::succ(Level::param(v.clone())).unwrap(),
+                    )
+                    .unwrap(),
+                    Level::imax(Level::param(u.clone()), Level::zero()).unwrap(),
+                ],
+            ),
+            local("x"),
+        ),
+    );
+    let mut cache = Cache::default();
+    let mut cold = meter(&|| false);
+    let got = cache.scan_facts(&shared, &mut cold).unwrap().unwrap();
+    let expected = super::super::facts(&shared, &mut meter(&|| false)).unwrap();
+    assert_eq!(got.fvars, expected.fvars);
+    assert_eq!(
+        got.params.iter().cloned().collect::<HashSet<_>>(),
+        expected.params.iter().cloned().collect::<HashSet<_>>()
+    );
+    assert!(got.uvars.is_empty());
+
+    let parent = Expr::app(shared, local("y"));
+    let mut warm = meter(&|| false);
+    let got_parent = cache.scan_facts(&parent, &mut warm).unwrap().unwrap();
+    let expected_parent = super::super::facts(&parent, &mut meter(&|| false)).unwrap();
+    assert_eq!(got_parent.fvars, expected_parent.fvars);
+    assert_eq!(
+        got_parent.params.iter().cloned().collect::<HashSet<_>>(),
+        expected_parent
+            .params
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+    );
+    assert!(warm.steps < 64, "warm steps={}", warm.steps);
+    assert!(cold.steps > 100, "cold steps={}", cold.steps);
+
+    let with_mvar = tower(
+        32,
+        Expr::app(local("x"), Expr::sort(Level::mvar(LMVarId(name("m"))))),
+    );
+    assert!(
+        cache
+            .scan_facts(&with_mvar, &mut meter(&|| false))
+            .unwrap()
+            .is_none()
+    );
+}

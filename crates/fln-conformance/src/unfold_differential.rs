@@ -19,7 +19,7 @@ use fln_core::outcome::Outcome;
 use fln_env::constants::ConstantInfo;
 use fln_env::environment::{Environment, ProvisionalEnvironment};
 use fln_kernel::verdict::{Budget, Verdict};
-use fln_kernel::{Declaration, UnfoldObservation, observe_unfolds};
+use fln_kernel::{Declaration, UnfoldObservation};
 
 /// Parsed unfold-count output from `scripts/tribunal/unfold_counts.lean`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -586,6 +586,17 @@ impl LoadedOleanModule {
         budget: Budget,
         force_left_delta: bool,
     ) -> Result<K1UnfoldRun, String> {
+        self.observe_declaration_traced(declaration, budget, force_left_delta, None)
+    }
+
+    /// Run `fln_kernel::observe_unfolds_traced` on one named declaration in this module.
+    pub fn observe_declaration_traced(
+        &self,
+        declaration: &str,
+        budget: Budget,
+        force_left_delta: bool,
+        trace_target: Option<&str>,
+    ) -> Result<K1UnfoldRun, String> {
         let target_decl_name = Name::from_components(declaration.split('.'));
         let target_pos = self
             .constants
@@ -619,8 +630,13 @@ impl LoadedOleanModule {
         };
 
         let started = Instant::now();
-        let observation =
-            observe_unfolds(env.as_check_environment(), &decl, budget, force_left_delta);
+        let observation = fln_kernel::observe_unfolds_traced(
+            env.as_check_environment(),
+            &decl,
+            budget,
+            force_left_delta,
+            trace_target.map(|s| Name::from_components(s.split('.'))),
+        );
         let wall = started.elapsed();
 
         Ok(K1UnfoldRun {

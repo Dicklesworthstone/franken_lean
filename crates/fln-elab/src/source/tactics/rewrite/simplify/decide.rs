@@ -10,10 +10,9 @@
 //! so the outermost such proposition is decided first: the walk here is pre-order and the rule
 //! is tried before every other rule.
 //!
-//! The evaluation is the kernel's, as for this engine's `decide` tactic
-//! (`decision_computes_true`), where the pin reduces with `whnf` at default transparency. A
-//! proposition whose decision the kernel computes through a definition that transparency does
-//! not unfold is decided here and left alone at the pin.
+//! The evaluation uses `decision_computes_true`/`decision_computes_false`, which mirrors
+//! the pin's `withAtLeastTransparency .default` by keeping `@[irreducible]` definitions
+//! folded unless an enclosing `with_unfolding_all` lifts transparency to `.all`.
 use super::*;
 use crate::source::instances::{SearchResult, nonmatch, registry_error};
 

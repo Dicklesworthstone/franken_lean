@@ -646,7 +646,48 @@ impl Context {
         let kernel = self
             .kernel
             .narrowed(self.kernel.steps.min(remaining), self.kernel.depth);
-        match fln_kernel::check_def_eq(&self.txn.env, &parameters, &computation, &truth, kernel) {
+        // The pin's `decide` / `simpUsingDecide` / `contradiction` evaluate the
+        // `Decidable` instance under `withAtLeastTransparency .default`
+        // (vendored `Lean/Elab/Tactic/Decide.lean:92`): `@[irreducible]`
+        // definitions stay folded unless an enclosing `with_unfolding_all`
+        // raised transparency to `.all`.
+        let empty_opaque = std::collections::BTreeSet::new();
+        let reducibility =
+            if self.tactic_transparency == Some(UnificationTransparency::SafeDefinitions) {
+                None
+            } else {
+                Some(crate::reducibility::table(&self.txn.env).map_err(|error| {
+                    failure(SourceInferenceError::Unification(Box::new(
+                        UnificationError::Reducibility(error),
+                    )))
+                })?)
+            };
+        let opaque_definitions = reducibility
+            .as_ref()
+            .map_or(&empty_opaque, |table| table.opaque_definitions());
+        let outcome = fln_kernel::check_def_eq_with_unfolding(
+            &self.txn.env,
+            &parameters,
+            &computation,
+            &truth,
+            kernel,
+            fln_kernel::DefEqUnfolding {
+                opaque_definitions,
+                unfold_theorems: false,
+            },
+        );
+        if let Outcome::Inconclusive(problem) = &outcome
+            && let fln_core::outcome::InconclusiveCause::ResourceExhausted { usage } =
+                &problem.cause
+            && matches!(usage.reason, fln_core::diag::ResourceReason::ExecutionSteps)
+        {
+            self.txn.budget.heartbeats_consumed = self
+                .txn
+                .budget
+                .heartbeats_consumed
+                .saturating_add(usage.observed);
+        }
+        match outcome {
             Outcome::Complete(verdict) => {
                 let consumed = match &verdict {
                     Verdict::Accepted { consumption } | Verdict::Rejected { consumption, .. } => {

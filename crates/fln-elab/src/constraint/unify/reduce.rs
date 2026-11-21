@@ -141,7 +141,13 @@ impl Engine<'_> {
                             self.demand(expr.clone(), &mut memo, &mut continuations)?;
                     }
                     ExprNode::MData { expr, .. } => head = expr.clone(),
-                    ExprNode::LetE { value, body, .. } => head = self.substitute(body, value)?,
+                    ExprNode::LetE { value, body, .. } => {
+                        head = if body.has_loose_bvars() {
+                            self.substitute(body, value)?
+                        } else {
+                            body.clone()
+                        };
+                    }
                     ExprNode::App { f, a } => {
                         args.push(a.clone());
                         head = f.clone();

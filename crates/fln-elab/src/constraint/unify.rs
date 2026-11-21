@@ -625,11 +625,8 @@ impl Engine<'_> {
             }
             return Ok(found.clone());
         }
-        let found = match self.local_facts.scan(expr, &mut self.meter)? {
-            Some(fvars) => Facts {
-                fvars,
-                ..Facts::default()
-            },
+        let found = match self.local_facts.scan_facts(expr, &mut self.meter)? {
+            Some(facts) => facts,
             None => facts(expr, &mut self.meter)?,
         };
         self.reserved.extend(found.fvars.iter().cloned());

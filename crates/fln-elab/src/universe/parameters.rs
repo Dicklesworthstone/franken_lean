@@ -26,6 +26,17 @@ pub fn instantiate<E>(
     if substitutions.len() != params.len() {
         return Err(scope());
     }
+    let mut is_identity = true;
+    for (param, level) in params.iter().zip(levels) {
+        tick()?;
+        if !matches!(level.view(), LevelView::Param(found) if found == param) {
+            is_identity = false;
+            break;
+        }
+    }
+    if is_identity {
+        return Ok(expr.clone());
+    }
     let mut done = HashMap::<usize, Expr>::new();
     let mut level_done = HashMap::<*const Level, Level>::new();
     let mut pending = vec![(expr, false)];

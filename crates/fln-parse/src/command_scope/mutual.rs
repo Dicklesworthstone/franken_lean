@@ -9,7 +9,55 @@ use super::*;
 fn refusal(view: &SourceView, tokens: &[LexedToken], at: usize) -> DefinitionParseError {
     NatDefinitionParseError::OutsideSeedGrammar {
         at: original_position(view, tokens, at),
-        expected: NatDefinitionExpectation::InductiveConstructor,
+        expected: NatDefinitionExpectation::MutualBlockEnd,
+    }
+}
+
+fn unsupported_member_label(syntax: &Syntax) -> &'static str {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return "command";
+    };
+    if kind != &Name::from_components(["Lean", "Parser", "Command", "declaration"])
+        || args.len() != 2
+    {
+        return "command";
+    }
+    let Some(body_kind) = args[1].kind() else {
+        return "command";
+    };
+    if body_kind == &parser_kind(&["Command", "structure"]) {
+        if let Syntax::Node {
+            args: struct_args, ..
+        } = &args[1]
+            && struct_args
+                .first()
+                .and_then(Syntax::kind)
+                .is_some_and(|k| k == &parser_kind(&["Command", "classTk"]))
+        {
+            return "class";
+        }
+        return "structure";
+    }
+    if body_kind == &parser_kind(&["Command", "axiom"]) {
+        "axiom"
+    } else if body_kind == &parser_kind(&["Command", "opaque"]) {
+        "opaque"
+    } else if body_kind == &parser_kind(&["Command", "instance"]) {
+        "instance"
+    } else if body_kind == &parser_kind(&["Command", "example"]) {
+        "example"
+    } else if body_kind == &parser_kind(&["Command", "inductive"]) {
+        "inductive"
+    } else if body_kind == &parser_kind(&["Command", "coinductive"]) {
+        "coinductive"
+    } else if body_kind == &parser_kind(&["Command", "definition"]) {
+        "def"
+    } else if body_kind == &parser_kind(&["Command", "abbrev"]) {
+        "abbrev"
+    } else if body_kind == &parser_kind(&["Command", "theorem"]) {
+        "theorem"
+    } else {
+        "declaration"
     }
 }
 fn word(view: &SourceView, token: &LexedToken, text: &str) -> bool {
@@ -176,18 +224,32 @@ pub fn parse_with_offsets(
         return Err(refusal(&view, &tokens, end));
     }
     let mut members = Vec::new();
-    let mut group_kind = None;
+    let mut group_kind: Option<MemberKind> = None;
     for (offset, bytes) in commands {
-        let parsed = parse_definition(bytes)
-            .map_err(|error| error.with_original_offset(BytePos(start.0 + offset.0)))?;
+        let member_at = BytePos(start.0 + offset.0);
+        let parsed =
+            parse_definition(bytes).map_err(|error| error.with_original_offset(member_at))?;
         let Some(kind) = member_kind(&parsed.syntax) else {
-            return Err(refusal(&view, &tokens, end));
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: member_at,
+                expected: NatDefinitionExpectation::SupportedMutualMember(
+                    unsupported_member_label(&parsed.syntax),
+                ),
+            });
         };
-        if group_kind.is_some_and(|previous| previous != kind) {
-            return Err(refusal(&view, &tokens, end));
+        if let Some(previous) = group_kind
+            && previous != kind
+        {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: member_at,
+                expected: NatDefinitionExpectation::UniformMutualMembers {
+                    first: previous.label(),
+                    found: kind.label(),
+                },
+            });
         }
         group_kind = Some(kind);
-        members.push((BytePos(start.0 + offset.0), parsed.syntax));
+        members.push((member_at, parsed.syntax));
     }
     Ok(Some(members))
 }
@@ -199,6 +261,18 @@ enum MemberKind {
     UnsafeDefinition,
     OrdinaryDefinition,
     Theorem,
+}
+
+impl MemberKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Inductive => "inductive",
+            Self::PartialDefinition => "partial def",
+            Self::UnsafeDefinition => "unsafe def",
+            Self::OrdinaryDefinition => "def",
+            Self::Theorem => "theorem",
+        }
+    }
 }
 
 /// This is only group classification. Preserve the complete declaration and
@@ -414,5 +488,52 @@ mod tests {
             "mutual\r\ninductive A where | mk\r\ninductive B where | bad deriving , Nat\r\nend";
         let error = parse(source.as_bytes()).unwrap_err();
         assert_eq!(error.primary_offset().unwrap().0, source.find(',').unwrap());
+    }
+
+    #[test]
+    fn unsupported_and_mixed_members_name_member_kind_not_inductive_constructor() {
+        for (source, expected) in [
+            (
+                "mutual\nstructure S where\n  x : Nat\nend",
+                NatDefinitionExpectation::SupportedMutualMember("structure"),
+            ),
+            (
+                "mutual\nclass C where\n  x : Nat\nend",
+                NatDefinitionExpectation::SupportedMutualMember("class"),
+            ),
+            (
+                "mutual\naxiom a : Nat\nend",
+                NatDefinitionExpectation::SupportedMutualMember("axiom"),
+            ),
+            (
+                "mutual\ndef x : Nat := 1\ntheorem y : True := True.intro\nend",
+                NatDefinitionExpectation::UniformMutualMembers {
+                    first: "def",
+                    found: "theorem",
+                },
+            ),
+            (
+                "mutual\ninductive A where | mk\ndef x : Nat := 1\nend",
+                NatDefinitionExpectation::UniformMutualMembers {
+                    first: "inductive",
+                    found: "def",
+                },
+            ),
+            ("mutual end", NatDefinitionExpectation::MutualBlockEnd),
+        ] {
+            let error = parse(source.as_bytes()).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    NatDefinitionParseError::OutsideSeedGrammar { expected: got, .. }
+                        if got == expected
+                ),
+                "{source} => {error}"
+            );
+            assert!(
+                !error.to_string().contains("InductiveConstructor"),
+                "{error}"
+            );
+        }
     }
 }

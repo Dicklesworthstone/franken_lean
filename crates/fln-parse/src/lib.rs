@@ -96,6 +96,16 @@ pub enum NatDefinitionExpectation {
     /// A declaration's doc comment that links into the reference manual (`lean-manual://`):
     /// the pin validates those links (`validateDocComment`) and this grammar does not.
     DocCommentWithoutManualLinks,
+    /// A well-formed non-empty `mutual ... end` block boundary.
+    MutualBlockEnd,
+    /// A supported `mutual` member kind (`inductive`, `def`, `abbrev`, `theorem`, `partial def`,
+    /// or `unsafe def`); carries the unsupported member kind that appeared in the block.
+    SupportedMutualMember(&'static str),
+    /// Uniform member kinds within a single `mutual` block.
+    UniformMutualMembers {
+        first: &'static str,
+        found: &'static str,
+    },
 }
 
 /// Why the bounded source command parser refused.

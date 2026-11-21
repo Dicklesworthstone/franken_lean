@@ -1,5 +1,5 @@
-//! Exact free-local metadata for immutable, universe-free syntax DAGs.
-//! Universe-bearing expressions keep the parent's ordered two-phase traversal.
+//! Exact free-local and universe-parameter metadata for immutable, hole-free syntax DAGs.
+//! Metavariable-bearing expressions keep the parent's ordered two-phase traversal.
 //! This is syntax analysis only: assignments and local definitions are not read.
 use super::*;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ const MAX_ENTRIES: usize = 16_384;
 const MAX_IDENTITIES: usize = 65_536;
 
 // Pin every allocation used as a key; equal hashes never identify expressions.
-type Entry = (Expr, Arc<[FVarId]>);
+type Entry = (Expr, Arc<[FVarId]>, Arc<[Name]>);
 
 #[derive(Default)]
 pub(super) struct Cache {
@@ -19,16 +19,58 @@ pub(super) struct Cache {
     identities: usize,
 }
 
+fn collect_level_params(
+    roots: &[&Level],
+    seen_params: &mut HashSet<Name>,
+    found_params: &mut Vec<Name>,
+    meter: &mut Meter<'_>,
+) -> Result<(), UnificationError> {
+    let mut seen_levels = HashSet::new();
+    let mut pending: Vec<&Level> = roots.iter().rev().copied().collect();
+    while let Some(level) = pending.pop() {
+        if !seen_levels.insert(std::ptr::from_ref(level)) {
+            continue;
+        }
+        meter.node()?;
+        if !level.has_param() {
+            continue;
+        }
+        match level.view() {
+            LevelView::Param(name) if seen_params.insert(name.clone()) => {
+                found_params.push(name.clone());
+            }
+            LevelView::Succ(inner) => pending.push(inner),
+            LevelView::Max(a, b) | LevelView::IMax(a, b) => {
+                pending.push(b);
+                pending.push(a);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 impl Cache {
+    #[cfg(test)]
     pub(super) fn scan(
         &mut self,
         root: &Expr,
         meter: &mut Meter<'_>,
     ) -> Result<Option<HashSet<FVarId>>, UnificationError> {
+        if root.has_level_param() || !root.has_fvar() {
+            return Ok(None);
+        }
+        Ok(self.scan_facts(root, meter)?.map(|facts| facts.fvars))
+    }
+
+    pub(super) fn scan_facts(
+        &mut self,
+        root: &Expr,
+        meter: &mut Meter<'_>,
+    ) -> Result<Option<Facts>, UnificationError> {
         if root.approx_depth() < MIN_DEPTH
             || !root.has_fvar()
             || root.has_expr_mvar()
-            || root.has_level_param()
             || root.has_level_mvar()
             || matches!(root.node(), ExprNode::FVar { .. })
         {
@@ -46,7 +88,10 @@ impl Cache {
             if self.entries.contains_key(&key) || staged.contains_key(&key) {
                 continue;
             }
-            let empty = !expr.has_fvar() && !expr.has_expr_mvar() && !expr.has_loose_bvars();
+            let empty = !expr.has_fvar()
+                && !expr.has_expr_mvar()
+                && !expr.has_level_param()
+                && !expr.has_loose_bvars();
             if !exit && !empty {
                 pending.push((expr.clone(), true));
                 for child in children(&expr).into_iter().rev().flatten() {
@@ -56,42 +101,67 @@ impl Cache {
             }
             let mut found = Vec::new();
             let mut seen = HashSet::new();
-            if let ExprNode::FVar { id } = expr.node() {
-                meter.node()?;
-                found.push(id.clone());
-            } else if !empty {
-                for child in children(&expr).into_iter().flatten() {
-                    meter.tick()?;
-                    let (_, locals) = staged
-                        .get(&child.allocation_identity())
-                        .or_else(|| self.entries.get(&child.allocation_identity()))
-                        .ok_or(UnificationError::ExpressionScope)?;
-                    for local in locals.iter() {
-                        meter.node()?;
-                        if seen.insert(local.clone()) {
-                            found.push(local.clone());
+            let mut found_params = Vec::new();
+            let mut seen_params = HashSet::new();
+            match expr.node() {
+                ExprNode::FVar { id } => {
+                    meter.node()?;
+                    found.push(id.clone());
+                }
+                ExprNode::Sort { level } if expr.has_level_param() => {
+                    collect_level_params(&[level], &mut seen_params, &mut found_params, meter)?;
+                }
+                ExprNode::Const { levels, .. } if expr.has_level_param() => {
+                    let level_refs: Vec<&Level> = levels.iter().collect();
+                    collect_level_params(&level_refs, &mut seen_params, &mut found_params, meter)?;
+                }
+                _ if !empty => {
+                    for child in children(&expr).into_iter().flatten() {
+                        meter.tick()?;
+                        let (_, locals, params) = staged
+                            .get(&child.allocation_identity())
+                            .or_else(|| self.entries.get(&child.allocation_identity()))
+                            .ok_or(UnificationError::ExpressionScope)?;
+                        for local in locals.iter() {
+                            meter.node()?;
+                            if seen.insert(local.clone()) {
+                                found.push(local.clone());
+                            }
+                        }
+                        for param in params.iter() {
+                            meter.node()?;
+                            if seen_params.insert(param.clone()) {
+                                found_params.push(param.clone());
+                            }
                         }
                     }
                 }
+                _ => {}
             }
+            let entry_identities = found.len() + found_params.len();
             if self.entries.len() + staged.len() >= MAX_ENTRIES
-                || self.identities + identities + found.len() > MAX_IDENTITIES
+                || self.identities + identities + entry_identities > MAX_IDENTITIES
             {
                 // Capacity exhaustion only declines caching. The ordinary
                 // traversal still runs, and this attempt refunds no work.
                 return Ok(None);
             }
-            identities += found.len();
-            staged.insert(key, (expr, found.into()));
+            identities += entry_identities;
+            staged.insert(key, (expr, found.into(), found_params.into()));
         }
-        let (_, locals) = staged
+        let (_, locals, params) = staged
             .get(&root.allocation_identity())
             .or_else(|| self.entries.get(&root.allocation_identity()))
             .ok_or(UnificationError::ExpressionScope)?;
-        let mut result = HashSet::new();
+        let mut fvars = HashSet::new();
         for local in locals.iter() {
             meter.node()?;
-            result.insert(local.clone());
+            fvars.insert(local.clone());
+        }
+        let mut out_params = Vec::with_capacity(params.len());
+        for param in params.iter() {
+            meter.node()?;
+            out_params.push(param.clone());
         }
         // Pay for publication before mutating the cache. Cancellation or a
         // work stop exposes neither partial metadata nor unpinned identities.
@@ -100,7 +170,11 @@ impl Cache {
         }
         self.entries.extend(staged);
         self.identities += identities;
-        Ok(Some(result))
+        Ok(Some(Facts {
+            fvars,
+            params: out_params,
+            uvars: Vec::new(),
+        }))
     }
 }
 
