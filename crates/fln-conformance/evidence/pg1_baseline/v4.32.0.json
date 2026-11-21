@@ -1,0 +1,868 @@
+{
+  "schema": "fln.pg1-baseline/1",
+  "bead": "fln-kfdr",
+  "captured_utc": "2026-11-21T02:20:00Z",
+  "claim_state": "OBSERVED",
+  "claim_class": "bounded_model",
+  "qualification": {
+    "isolated_bare_metal": false,
+    "qualified_for_plan_19_1_ratification": false,
+    "open_ratification_bead": "fln-544",
+    "failures_disclosed": [
+      "shared multi-agent development host (concurrent load observed 3.1-18.2 on 64 hardware threads)",
+      "perf_event_paranoid=4 prevents hardware PMU cycle sampling; stack profile uses 120-sample gdb parent sampling",
+      "S26 Mathlib corpus run (92.8 GiB RSS, --jobs 24) ran under shared host load; live Reference replay over all 11,083 modules in one parallel leanchecker process was not run to avoid OOM on 251 GiB RAM (leanchecker spawns all module tasks concurrently; stdlib alone took 59.4 GiB peak RSS)"
+    ]
+  },
+  "host": {
+    "uname": "Linux sensedemobox 7.0.0-43-generic #43-Ubuntu SMP PREEMPT_DYNAMIC Fri Oct 23 13:25:25 UTC 2026 x86_64 GNU/Linux",
+    "cpu_model": "AMD EPYC 7282 16-Core Processor",
+    "sockets": 2,
+    "cores_per_socket": 16,
+    "threads_per_core": 2,
+    "hardware_threads": 64,
+    "ram_gib": 251,
+    "cache_state": "warm OS page cache (~124 GiB buff/cache); cold in-process Environment/WhnfMemo/ArgumentMemo per invocation"
+  },
+  "pin": {
+    "reference_tag": "v4.32.0",
+    "reference_commit": "8c9756b28d64dab099da31a4c09229a9e6a2ef35",
+    "corpus_tag": "v4.32.0",
+    "corpus_commit": "81a5d257c8e410db227a6665ed08f64fea08e997"
+  },
+  "reference_baselines": {
+    "leanchecker_full_stdlib_parallel_tripartite": {
+      "command": "LEAN_SYSROOT=$TC LEAN_PATH=$TC/lib/lean leanchecker Init Std Lean",
+      "modules": 2433,
+      "declarations": 215136,
+      "wall_s": 116.37,
+      "user_s": 982.65,
+      "sys_s": 769.98,
+      "total_cpu_s": 1752.63,
+      "peak_rss_kib": 62269912,
+      "aggregate_decls_per_s": 1848.7,
+      "loadavg_at_launch": "9.97 12.11 9.18"
+    },
+    "leanchecker_fresh_init_single_thread_public": {
+      "command": "LEAN_SYSROOT=$TC LEAN_PATH=$TC/lib/lean leanchecker --fresh Init",
+      "wall_s": 86.07,
+      "user_s": 84.38,
+      "sys_s": 1.67,
+      "peak_rss_kib": 529172
+    },
+    "leanchecker_single_module_samples": {
+      "Init.Prelude": {
+        "wall_s": 0.68,
+        "user_s": 0.32,
+        "sys_s": 0.36,
+        "peak_rss_kib": 108388
+      },
+      "Init.Data.Array.Extract": {
+        "wall_s": 5.02,
+        "user_s": 4.54,
+        "sys_s": 0.47,
+        "peak_rss_kib": 251768
+      }
+    }
+  },
+  "recorded_corpus_baselines": {
+    "stdlib_council_v4_32_0": {
+      "source_artifact": "crates/fln-conformance/evidence/stdlib_frontier/v4.32.0.json",
+      "source_commit": "a8d0032f039b02b0c7324008871505f58ee914b4",
+      "jobs": 16,
+      "modules": 2433,
+      "accepted": 2433,
+      "declarations": 215136,
+      "wall_s": 3908,
+      "summed_module_elapsed_s": 12812.2,
+      "top20_module_elapsed_s": 5639.7,
+      "top20_share_pct": 44.0,
+      "aggregate_decls_per_s": 55.1,
+      "wall_ratio_over_ref_leanchecker": 33.58,
+      "sum_elapsed_ratio_over_ref_user_cpu": 13.04
+    },
+    "stdlib_k1_only_thread_matrix": {
+      "source_artifact": "crates/fln-conformance/evidence/corpus_thread_matrix/v4.32.0.jsonl",
+      "modules": 2433,
+      "decoded_declarations": 215136,
+      "checked_units": 206867,
+      "wall_ms_1t": 1299918,
+      "wall_ms_8t": 303490,
+      "wall_ms_32t": 234491,
+      "scaling_32t_over_1t": 5.54,
+      "single_thread_ratio_over_ref_user_cpu": 1.32,
+      "note": "K1 only (no fln-checker); per-module barriers cap 32-thread scaling at 5.54x"
+    },
+    "combined_mathlib_council_S26": {
+      "source_artifact": "crates/fln-conformance/evidence/combined_frontier/S26.json",
+      "source_commit": "a3ee77e6",
+      "jobs": 24,
+      "modules_total": 11083,
+      "accepted": 9131,
+      "failed": 0,
+      "inconclusive": 12,
+      "blocked": 1940,
+      "accepted_declarations": 695958,
+      "wall_s": 9267,
+      "peak_maxrss_gib": 92.8,
+      "mathlib_measured_modules": 6296,
+      "mathlib_summed_elapsed_s": 91038.3,
+      "mathlib_top20_elapsed_s": 24503.8,
+      "mathlib_top20_share_pct": 26.9
+    }
+  },
+  "stdlib_prelude_and_top20_vs_ref": [
+    {
+      "module": "Init.Prelude",
+      "parts": 3,
+      "declarations": 2314,
+      "fln_v432_declarations": 2314,
+      "ref_read_ms": 5,
+      "ref_import_ms": 0,
+      "ref_replay_ms": 244,
+      "ref_total_ms": 250,
+      "fln_v432_elapsed_ms": 4612,
+      "ratio_fln_over_ref_replay": 18.9
+    },
+    {
+      "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Lemmas.Expr",
+      "parts": 3,
+      "declarations": 61,
+      "fln_v432_declarations": 61,
+      "ref_read_ms": 3,
+      "ref_import_ms": 649,
+      "ref_replay_ms": 3999,
+      "ref_total_ms": 4652,
+      "fln_v432_elapsed_ms": 973718,
+      "ratio_fln_over_ref_replay": 243.49
+    },
+    {
+      "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Lemmas.Operations.Udiv",
+      "parts": 3,
+      "declarations": 27,
+      "fln_v432_declarations": 27,
+      "ref_read_ms": 0,
+      "ref_import_ms": 595,
+      "ref_replay_ms": 674,
+      "ref_total_ms": 1270,
+      "fln_v432_elapsed_ms": 784434,
+      "ratio_fln_over_ref_replay": 1163.85
+    },
+    {
+      "module": "Init.Data.Array.Extract",
+      "parts": 3,
+      "declarations": 123,
+      "fln_v432_declarations": 123,
+      "ref_read_ms": 6,
+      "ref_import_ms": 150,
+      "ref_replay_ms": 4395,
+      "ref_total_ms": 4552,
+      "fln_v432_elapsed_ms": 466210,
+      "ratio_fln_over_ref_replay": 106.08
+    },
+    {
+      "module": "Init.Data.BitVec.Lemmas",
+      "parts": 3,
+      "declarations": 2040,
+      "fln_v432_declarations": 2040,
+      "ref_read_ms": 14,
+      "ref_import_ms": 143,
+      "ref_replay_ms": 9916,
+      "ref_total_ms": 10074,
+      "fln_v432_elapsed_ms": 434478,
+      "ratio_fln_over_ref_replay": 43.82
+    },
+    {
+      "module": "Init.Data.Vector.Extract",
+      "parts": 3,
+      "declarations": 69,
+      "fln_v432_declarations": 69,
+      "ref_read_ms": 5,
+      "ref_import_ms": 220,
+      "ref_replay_ms": 2811,
+      "ref_total_ms": 3037,
+      "fln_v432_elapsed_ms": 374092,
+      "ratio_fln_over_ref_replay": 133.08
+    },
+    {
+      "module": "Std.Data.DHashMap.Lemmas",
+      "parts": 3,
+      "declarations": 1100,
+      "fln_v432_declarations": 1100,
+      "ref_read_ms": 3,
+      "ref_import_ms": 243,
+      "ref_replay_ms": 1233,
+      "ref_total_ms": 1480,
+      "fln_v432_elapsed_ms": 346068,
+      "ratio_fln_over_ref_replay": 280.67
+    },
+    {
+      "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Impl.Expr",
+      "parts": 3,
+      "declarations": 258,
+      "fln_v432_declarations": 258,
+      "ref_read_ms": 4,
+      "ref_import_ms": 713,
+      "ref_replay_ms": 2807,
+      "ref_total_ms": 3526,
+      "fln_v432_elapsed_ms": 344819,
+      "ratio_fln_over_ref_replay": 122.84
+    },
+    {
+      "module": "Std.Data.DTreeMap.Internal.Balancing",
+      "parts": 3,
+      "declarations": 369,
+      "fln_v432_declarations": 369,
+      "ref_read_ms": 7,
+      "ref_import_ms": 167,
+      "ref_replay_ms": 4192,
+      "ref_total_ms": 4368,
+      "fln_v432_elapsed_ms": 235697,
+      "ratio_fln_over_ref_replay": 56.23
+    },
+    {
+      "module": "Std.Data.DTreeMap.Lemmas",
+      "parts": 3,
+      "declarations": 1419,
+      "fln_v432_declarations": 1419,
+      "ref_read_ms": 4,
+      "ref_import_ms": 313,
+      "ref_replay_ms": 991,
+      "ref_total_ms": 1309,
+      "fln_v432_elapsed_ms": 228720,
+      "ratio_fln_over_ref_replay": 230.8
+    },
+    {
+      "module": "Init.Data.BitVec.Bitblast",
+      "parts": 3,
+      "declarations": 795,
+      "fln_v432_declarations": 795,
+      "ref_read_ms": 7,
+      "ref_import_ms": 154,
+      "ref_replay_ms": 4439,
+      "ref_total_ms": 4601,
+      "fln_v432_elapsed_ms": 196679,
+      "ratio_fln_over_ref_replay": 44.31
+    },
+    {
+      "module": "Std.Data.ExtDHashMap.Lemmas",
+      "parts": 3,
+      "declarations": 867,
+      "fln_v432_declarations": 867,
+      "ref_read_ms": 4,
+      "ref_import_ms": 258,
+      "ref_replay_ms": 1824,
+      "ref_total_ms": 2087,
+      "fln_v432_elapsed_ms": 174653,
+      "ratio_fln_over_ref_replay": 95.75
+    },
+    {
+      "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Lemmas",
+      "parts": 3,
+      "declarations": 5,
+      "fln_v432_declarations": 5,
+      "ref_read_ms": 0,
+      "ref_import_ms": 653,
+      "ref_replay_ms": 40,
+      "ref_total_ms": 694,
+      "fln_v432_elapsed_ms": 152743,
+      "ratio_fln_over_ref_replay": 3818.57
+    },
+    {
+      "module": "Std.Data.HashMap.Lemmas",
+      "parts": 3,
+      "declarations": 750,
+      "fln_v432_declarations": 750,
+      "ref_read_ms": 2,
+      "ref_import_ms": 249,
+      "ref_replay_ms": 1030,
+      "ref_total_ms": 1281,
+      "fln_v432_elapsed_ms": 152139,
+      "ratio_fln_over_ref_replay": 147.71
+    },
+    {
+      "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Impl.Substructure",
+      "parts": 3,
+      "declarations": 50,
+      "fln_v432_declarations": 50,
+      "ref_read_ms": 1,
+      "ref_import_ms": 638,
+      "ref_replay_ms": 140,
+      "ref_total_ms": 780,
+      "fln_v432_elapsed_ms": 143828,
+      "ratio_fln_over_ref_replay": 1027.34
+    },
+    {
+      "module": "Init.Data.Int.DivMod.Lemmas",
+      "parts": 3,
+      "declarations": 957,
+      "fln_v432_declarations": 957,
+      "ref_read_ms": 6,
+      "ref_import_ms": 80,
+      "ref_replay_ms": 2420,
+      "ref_total_ms": 2507,
+      "fln_v432_elapsed_ms": 123384,
+      "ratio_fln_over_ref_replay": 50.99
+    },
+    {
+      "module": "Std.Data.DTreeMap.Internal.Operations",
+      "parts": 3,
+      "declarations": 744,
+      "fln_v432_declarations": 744,
+      "ref_read_ms": 7,
+      "ref_import_ms": 176,
+      "ref_replay_ms": 1993,
+      "ref_total_ms": 2177,
+      "fln_v432_elapsed_ms": 111388,
+      "ratio_fln_over_ref_replay": 55.89
+    },
+    {
+      "module": "Init.Data.String.Lemmas.Pattern.String.ForwardSearcher",
+      "parts": 3,
+      "declarations": 229,
+      "fln_v432_declarations": 229,
+      "ref_read_ms": 3,
+      "ref_import_ms": 329,
+      "ref_replay_ms": 1545,
+      "ref_total_ms": 1877,
+      "fln_v432_elapsed_ms": 101575,
+      "ratio_fln_over_ref_replay": 65.74
+    },
+    {
+      "module": "Std.Tactic.BVDecide.Bitblast.BVExpr.Circuit.Impl.Operations.Cpop",
+      "parts": 3,
+      "declarations": 168,
+      "fln_v432_declarations": 168,
+      "ref_read_ms": 2,
+      "ref_import_ms": 583,
+      "ref_replay_ms": 1200,
+      "ref_total_ms": 1787,
+      "fln_v432_elapsed_ms": 99210,
+      "ratio_fln_over_ref_replay": 82.67
+    },
+    {
+      "module": "Init.Data.Dyadic.Basic",
+      "parts": 3,
+      "declarations": 301,
+      "fln_v432_declarations": 301,
+      "ref_read_ms": 2,
+      "ref_import_ms": 167,
+      "ref_replay_ms": 1022,
+      "ref_total_ms": 1192,
+      "fln_v432_elapsed_ms": 98080,
+      "ratio_fln_over_ref_replay": 95.97
+    },
+    {
+      "module": "Std.Data.HashMap.RawLemmas",
+      "parts": 3,
+      "declarations": 736,
+      "fln_v432_declarations": 736,
+      "ref_read_ms": 2,
+      "ref_import_ms": 240,
+      "ref_replay_ms": 858,
+      "ref_total_ms": 1101,
+      "fln_v432_elapsed_ms": 97798,
+      "ratio_fln_over_ref_replay": 113.98
+    }
+  ],
+  "mathlib_top20_vs_ref": [
+    {
+      "module": "Mathlib.Algebra.Category.Ring.Limits",
+      "parts": 3,
+      "declarations": 380,
+      "s26_verdict": "inconclusive",
+      "s26_declarations": 0,
+      "ref_read_ms": 2,
+      "ref_import_ms": 2698,
+      "ref_replay_ms": 7812,
+      "ref_total_ms": 10513,
+      "s26_elapsed_ms": 2909882,
+      "ratio_s26_over_ref_replay": 372.49
+    },
+    {
+      "module": "Mathlib.RingTheory.TensorProduct.Maps",
+      "parts": 3,
+      "declarations": 283,
+      "s26_verdict": "inconclusive",
+      "s26_declarations": 0,
+      "ref_read_ms": 4,
+      "ref_import_ms": 3350,
+      "ref_replay_ms": 6716,
+      "ref_total_ms": 10072,
+      "s26_elapsed_ms": 2830971,
+      "ratio_s26_over_ref_replay": 421.53
+    },
+    {
+      "module": "Mathlib.LinearAlgebra.CliffordAlgebra.Contraction",
+      "parts": 3,
+      "declarations": 87,
+      "s26_verdict": "inconclusive",
+      "s26_declarations": 0,
+      "ref_read_ms": 2,
+      "ref_import_ms": 3983,
+      "ref_replay_ms": 987,
+      "ref_total_ms": 4973,
+      "s26_elapsed_ms": 2771568,
+      "ratio_s26_over_ref_replay": 2808.07
+    },
+    {
+      "module": "Mathlib.CategoryTheory.Monoidal.Internal.FunctorCategory",
+      "parts": 3,
+      "declarations": 175,
+      "s26_verdict": "accepted",
+      "s26_declarations": 175,
+      "ref_read_ms": 6,
+      "ref_import_ms": 2652,
+      "ref_replay_ms": 1339,
+      "ref_total_ms": 3997,
+      "s26_elapsed_ms": 2546312,
+      "ratio_s26_over_ref_replay": 1901.65
+    },
+    {
+      "module": "Mathlib.LinearAlgebra.TensorProduct.Tower",
+      "parts": 3,
+      "declarations": 296,
+      "s26_verdict": "accepted",
+      "s26_declarations": 296,
+      "ref_read_ms": 6,
+      "ref_import_ms": 2877,
+      "ref_replay_ms": 5126,
+      "ref_total_ms": 8009,
+      "s26_elapsed_ms": 1918046,
+      "ratio_s26_over_ref_replay": 374.18
+    },
+    {
+      "module": "Mathlib.FieldTheory.IntermediateField.Basic",
+      "parts": 3,
+      "declarations": 314,
+      "s26_verdict": "accepted",
+      "s26_declarations": 314,
+      "ref_read_ms": 3,
+      "ref_import_ms": 3071,
+      "ref_replay_ms": 1624,
+      "ref_total_ms": 4699,
+      "s26_elapsed_ms": 1914912,
+      "ratio_s26_over_ref_replay": 1179.13
+    },
+    {
+      "module": "Mathlib.LinearAlgebra.CliffordAlgebra.EvenEquiv",
+      "parts": 3,
+      "declarations": 57,
+      "s26_verdict": "accepted",
+      "s26_declarations": 57,
+      "ref_read_ms": 2,
+      "ref_import_ms": 3535,
+      "ref_replay_ms": 900,
+      "ref_total_ms": 4438,
+      "s26_elapsed_ms": 1153627,
+      "ratio_s26_over_ref_replay": 1281.81
+    },
+    {
+      "module": "Mathlib.RingTheory.Coalgebra.TensorProduct",
+      "parts": 3,
+      "declarations": 88,
+      "s26_verdict": "accepted",
+      "s26_declarations": 88,
+      "ref_read_ms": 4,
+      "ref_import_ms": 3014,
+      "ref_replay_ms": 2637,
+      "ref_total_ms": 5655,
+      "s26_elapsed_ms": 1117379,
+      "ratio_s26_over_ref_replay": 423.73
+    },
+    {
+      "module": "Mathlib.FieldTheory.IntermediateField.Adjoin.Defs",
+      "parts": 3,
+      "declarations": 213,
+      "s26_verdict": "accepted",
+      "s26_declarations": 213,
+      "ref_read_ms": 2,
+      "ref_import_ms": 3038,
+      "ref_replay_ms": 1255,
+      "ref_total_ms": 4296,
+      "s26_elapsed_ms": 1016762,
+      "ratio_s26_over_ref_replay": 810.17
+    },
+    {
+      "module": "Mathlib.CategoryTheory.Monoidal.Multifunctor",
+      "parts": 3,
+      "declarations": 102,
+      "s26_verdict": "accepted",
+      "s26_declarations": 102,
+      "ref_read_ms": 7,
+      "ref_import_ms": 2432,
+      "ref_replay_ms": 1982,
+      "ref_total_ms": 4422,
+      "s26_elapsed_ms": 751495,
+      "ratio_s26_over_ref_replay": 379.16
+    },
+    {
+      "module": "Mathlib.Algebra.Category.ModuleCat.Presheaf.Pushforward",
+      "parts": 3,
+      "declarations": 27,
+      "s26_verdict": "accepted",
+      "s26_declarations": 27,
+      "ref_read_ms": 1,
+      "ref_import_ms": 2264,
+      "ref_replay_ms": 2750,
+      "ref_total_ms": 5016,
+      "s26_elapsed_ms": 728778,
+      "ratio_s26_over_ref_replay": 265.01
+    },
+    {
+      "module": "Mathlib.LinearAlgebra.TensorProduct.Associator",
+      "parts": 3,
+      "declarations": 91,
+      "s26_verdict": "accepted",
+      "s26_declarations": 91,
+      "ref_read_ms": 1,
+      "ref_import_ms": 2804,
+      "ref_replay_ms": 3086,
+      "ref_total_ms": 5891,
+      "s26_elapsed_ms": 677078,
+      "ratio_s26_over_ref_replay": 219.4
+    },
+    {
+      "module": "Mathlib.Algebra.Category.Grp.Limits",
+      "parts": 3,
+      "declarations": 347,
+      "s26_verdict": "accepted",
+      "s26_declarations": 347,
+      "ref_read_ms": 0,
+      "ref_import_ms": 2723,
+      "ref_replay_ms": 2346,
+      "ref_total_ms": 5070,
+      "s26_elapsed_ms": 574883,
+      "ratio_s26_over_ref_replay": 245.05
+    },
+    {
+      "module": "Mathlib.LinearAlgebra.CliffordAlgebra.Even",
+      "parts": 3,
+      "declarations": 80,
+      "s26_verdict": "accepted",
+      "s26_declarations": 80,
+      "ref_read_ms": 0,
+      "ref_import_ms": 3142,
+      "ref_replay_ms": 1231,
+      "ref_total_ms": 4374,
+      "s26_elapsed_ms": 550860,
+      "ratio_s26_over_ref_replay": 447.49
+    },
+    {
+      "module": "Mathlib.RingTheory.PiTensorProduct",
+      "parts": 3,
+      "declarations": 114,
+      "s26_verdict": "accepted",
+      "s26_declarations": 114,
+      "ref_read_ms": 8,
+      "ref_import_ms": 2922,
+      "ref_replay_ms": 1241,
+      "ref_total_ms": 4171,
+      "s26_elapsed_ms": 520438,
+      "ratio_s26_over_ref_replay": 419.37
+    },
+    {
+      "module": "Mathlib.CategoryTheory.Limits.Cones",
+      "parts": 3,
+      "declarations": 796,
+      "s26_verdict": "accepted",
+      "s26_declarations": 796,
+      "ref_read_ms": 4,
+      "ref_import_ms": 2424,
+      "ref_replay_ms": 3626,
+      "ref_total_ms": 6055,
+      "s26_elapsed_ms": 518082,
+      "ratio_s26_over_ref_replay": 142.88
+    },
+    {
+      "module": "Mathlib.RingTheory.Coalgebra.Convolution",
+      "parts": 3,
+      "declarations": 67,
+      "s26_verdict": "inconclusive",
+      "s26_declarations": 0,
+      "ref_read_ms": 1,
+      "ref_import_ms": 3147,
+      "ref_replay_ms": 888,
+      "ref_total_ms": 4037,
+      "s26_elapsed_ms": 516453,
+      "ratio_s26_over_ref_replay": 581.59
+    },
+    {
+      "module": "Mathlib.LinearAlgebra.TensorProduct.Quotient",
+      "parts": 3,
+      "declarations": 79,
+      "s26_verdict": "accepted",
+      "s26_declarations": 79,
+      "ref_read_ms": 2,
+      "ref_import_ms": 3061,
+      "ref_replay_ms": 1181,
+      "ref_total_ms": 4245,
+      "s26_elapsed_ms": 498950,
+      "ratio_s26_over_ref_replay": 422.48
+    },
+    {
+      "module": "Mathlib.Algebra.Homology.ShortComplex.FunctorEquivalence",
+      "parts": 3,
+      "declarations": 54,
+      "s26_verdict": "accepted",
+      "s26_declarations": 54,
+      "ref_read_ms": 2,
+      "ref_import_ms": 2484,
+      "ref_replay_ms": 376,
+      "ref_total_ms": 2863,
+      "s26_elapsed_ms": 495040,
+      "ratio_s26_over_ref_replay": 1316.6
+    },
+    {
+      "module": "Mathlib.Combinatorics.SimpleGraph.Regularity.Chunk",
+      "parts": 3,
+      "declarations": 56,
+      "s26_verdict": "inconclusive",
+      "s26_declarations": 0,
+      "ref_read_ms": 4,
+      "ref_import_ms": 4024,
+      "ref_replay_ms": 2229,
+      "ref_total_ms": 6257,
+      "s26_elapsed_ms": 492318,
+      "ratio_s26_over_ref_replay": 220.87
+    }
+  ],
+  "phase_profile_and_ab_measurements": {
+    "harness": "crates/fln-admission/tests/pg1_phase_profile.rs",
+    "binaries": {
+      "baseline_before_wave1": {
+        "commit": "adf1d9292+steps_used",
+        "sha256_prefix": "1871ec08b8ef"
+      },
+      "wave1_core_wire_eq": {
+        "commit": "fdae8e3ee",
+        "sha256_prefix": "9365ea898b10"
+      },
+      "wave2_checker_clean": {
+        "commit": "52be87f73",
+        "sha256_prefix": "3114c3b8fdd3"
+      }
+    },
+    "init_prelude_3x_interleaved_same_invocation": {
+      "loadavg_start": "4.13 7.57 8.15",
+      "loadavg_end": "14.04 10.06 8.94",
+      "ref_replay_ms": 286,
+      "ref_total_ms": 294,
+      "k1_steps": 1348805,
+      "declarations": 2314,
+      "units": 2023,
+      "baseline_runs_ms": [
+        {
+          "total": 3407.8,
+          "decode_primary": 140.0,
+          "decode_checker": 174.3,
+          "plan": 29.3,
+          "k1": 1234.8,
+          "checker_proj_pub": 1829.4
+        },
+        {
+          "total": 3422.1,
+          "decode_primary": 152.7,
+          "decode_checker": 167.9,
+          "plan": 31.0,
+          "k1": 1235.2,
+          "checker_proj_pub": 1835.4
+        },
+        {
+          "total": 3401.7,
+          "decode_primary": 137.1,
+          "decode_checker": 174.2,
+          "plan": 29.6,
+          "k1": 1221.6,
+          "checker_proj_pub": 1839.2
+        }
+      ],
+      "wave1_runs_ms": [
+        {
+          "total": 3184.1,
+          "decode_primary": 140.6,
+          "decode_checker": 174.8,
+          "plan": 29.6,
+          "k1": 980.9,
+          "checker_proj_pub": 1858.1
+        },
+        {
+          "total": 3188.7,
+          "decode_primary": 135.9,
+          "decode_checker": 174.1,
+          "plan": 29.5,
+          "k1": 1001.8,
+          "checker_proj_pub": 1847.3
+        },
+        {
+          "total": 3140.6,
+          "decode_primary": 133.6,
+          "decode_checker": 174.9,
+          "plan": 29.2,
+          "k1": 961.3,
+          "checker_proj_pub": 1841.6
+        }
+      ],
+      "wave2_clean_runs_ms": [
+        {
+          "total": 3073.4,
+          "decode_primary": 143.5,
+          "decode_checker": 173.5,
+          "plan": 29.8,
+          "k1": 975.5,
+          "checker_proj_pub": 1751.0
+        },
+        {
+          "total": 3147.1,
+          "decode_primary": 160.2,
+          "decode_checker": 162.2,
+          "plan": 32.8,
+          "k1": 1033.9,
+          "checker_proj_pub": 1758.0
+        },
+        {
+          "total": 3110.9,
+          "decode_primary": 144.0,
+          "decode_checker": 231.3,
+          "plan": 29.5,
+          "k1": 962.1,
+          "checker_proj_pub": 1744.0
+        }
+      ],
+      "medians_ms": {
+        "baseline": {
+          "total": 3407.8,
+          "k1": 1234.8,
+          "checker_proj_pub": 1835.4
+        },
+        "wave1": {
+          "total": 3184.1,
+          "k1": 980.9,
+          "checker_proj_pub": 1847.3
+        },
+        "wave2_clean": {
+          "total": 3110.9,
+          "k1": 975.5,
+          "checker_proj_pub": 1751.0
+        }
+      }
+    },
+    "init_data_array_extract": {
+      "declarations": 123,
+      "units": 123,
+      "dep_modules": 139,
+      "k1_steps": 23504368,
+      "baseline": {
+        "ref_replay_ms": 4096,
+        "closure_16t_s": 179.9,
+        "total_ms": 149599.4,
+        "decode_primary_ms": 137.4,
+        "decode_checker_ms": 204.9,
+        "plan_ms": 33.4,
+        "k1_ms": 16114.2,
+        "checker_proj_pub_ms": 133109.5,
+        "top_unit_ms": {
+          "name": "Array.extract_append._proof_1_1",
+          "council": 28031.9,
+          "k1": 2210.8,
+          "chk_pub": 25821.2
+        }
+      },
+      "wave1": {
+        "ref_replay_ms": 4096,
+        "closure_16t_s": 175.2,
+        "total_ms": 141429.4,
+        "decode_primary_ms": 144.1,
+        "decode_checker_ms": 189.0,
+        "plan_ms": 31.9,
+        "k1_ms": 12399.6,
+        "checker_proj_pub_ms": 128664.7,
+        "top_unit_ms": {
+          "name": "Array.extract_append._proof_1_1",
+          "council": 27408.3,
+          "k1": 1714.4,
+          "chk_pub": 25694.0
+        }
+      },
+      "wave2_clean": {
+        "ref_replay_ms": 4475,
+        "closure_16t_s": 149.3,
+        "total_ms": 120324.5,
+        "decode_primary_ms": 131.7,
+        "decode_checker_ms": 198.7,
+        "plan_ms": 30.8,
+        "k1_ms": 13234.8,
+        "checker_proj_pub_ms": 106728.4,
+        "top_unit_ms": {
+          "name": "Array.extract_append._proof_1_1",
+          "council": 22090.6,
+          "k1": 1745.0,
+          "chk_pub": 20345.6
+        }
+      }
+    },
+    "reverted_experiment": {
+      "description": "Inline [Option<Arc<ExprNode>>; 8] small stack in fln-core Expr::drop",
+      "measured_result": "Regressed K1 by +7.4% on Init.Prelude (947.5ms -> 1,017.5ms) and +19.0% on Init.Data.Array.Extract (12,399.6ms -> 14,757.4ms) due to 64-byte stack zeroing + drop-glue on the 95% shared-clone fast path.",
+      "action": "Reverted before commit 52be87f73."
+    }
+  },
+  "gdb_stack_profile_wave1_array_extract": {
+    "samples": 120,
+    "interval_s": 0.45,
+    "inclusive_pct": {
+      "fln_checker::admit::admit": 84.2,
+      "fln_checker::defeq::def_eq_scoped_with": 76.7,
+      "fln_checker::defeq::regular_same_head_apps_def_eq": 70.8,
+      "fln_checker::whnf::whnf_input_at_mode_with": 64.2,
+      "fln_checker::whnf::Reducer::finish": 39.2,
+      "fln_checker::whnf::Reducer::build_spine": 32.5,
+      "fln_checker::whnf::Composer::copy_cursor": 27.5,
+      "fln_checker::term::Transformer::run": 18.3,
+      "fln_checker::whnf::Composer::copy_plain": 15.0,
+      "fln_kernel::tc::TypeChecker::infer_core_mode": 10.8,
+      "fln_checker::whnf::Composer::push_expression_charged": 10.8
+    },
+    "self_leaf_pct": {
+      "allocator_malloc_free_realloc_grow": 14.2,
+      "siphash_and_randomstate_u64": 8.3,
+      "fln_core::expr::Expr::drop": 6.7,
+      "fln_checker::wire::expression_owned_units": 5.0,
+      "fln_checker::term::Transformer::run": 5.0,
+      "fln_checker::whnf::Composer::copy_cursor": 5.0,
+      "fln_checker::whnf::Composer::push_expression_charged": 4.2
+    }
+  },
+  "optimization_lever_ladder": [
+    {
+      "rung": 1,
+      "status": "LANDED (commit fdae8e3ee)",
+      "lever": "Pointer-identity structural equality & inline stack worklists in fln-core (Expr/Level/Name) + single-Arc precomputed-hash WireExpr/WireName",
+      "measured_delta": "K1 -20.6% on Init.Prelude (1,234.8ms -> 980.9ms) and -23.1% on Init.Data.Array.Extract (16,114.2ms -> 12,399.6ms); 0 fln-kernel LOC added"
+    },
+    {
+      "rung": 2,
+      "status": "LANDED (commit 52be87f73)",
+      "lever": "fln-checker WHNF double-copy elimination (Reducer::finish), zero-copy in-place quick-eq in regular_same_head_apps_def_eq, sparse/dense SlotMap & Visited::CopySparse, single-source sharing bypass, PrehashedMap/FastHashMap removing SipHash/RandomState, shared WhnfMemo in Inferer::proof_conversion",
+      "measured_delta": "fln-checker -19.8% on Init.Data.Array.Extract (133.1s -> 106.7s), 139-module parallel dep closure -17.0% (179.9s -> 149.3s), Init.Prelude total -8.7% vs baseline; 0 fln-kernel LOC added"
+    },
+    {
+      "rung": 3,
+      "status": "NEXT (beads fln-9908, fln-r15-decision-vgwl)",
+      "lever": "Plan \u00a78.3c council verification policy (standard content-seeded checker sample + high-risk forms) AND/OR conversion-witness replay so fln-checker validates K1 conversion witnesses instead of re-searching",
+      "projected_gain": "5x-15x aggregate council wall reduction; eliminates 100x-3,800x checker re-search outliers (BVDecide Circuit.Lemmas, Mathlib Ring.Limits / CliffordAlgebra / FunctorCategory) while keeping K1 at 1.3x-3.0x Reference CPU"
+    },
+    {
+      "rung": 4,
+      "status": "OPEN (beads fln-f0ux, fln-frontier-rows-depend-on-jobs-2g96)",
+      "lever": "Shared immutable Environment image across frontier workers + cross-module decode reuse + intra-module declaration-DAG parallelism",
+      "projected_gain": "Removes 92.8 GiB peak RSS ceiling (unlocking 32+ jobs) and removes per-module parallel barriers (corpus_thread_matrix scaled only 5.54x at 32t despite 159.1 decls/s K1 single-thread)"
+    },
+    {
+      "rung": 5,
+      "status": "OPEN (bead franken_lean-z8j.1.13)",
+      "lever": "Global hash-consed term interning + interned-id WHNF/defeq caches + cold-path Expr::drop drain (post-Arc::into_inner only)",
+      "projected_gain": "2x-3x further K1 reduction (bringing K1 from ~1.3x-3.0x Reference CPU to parity or faster than Reference C++ kernel)"
+    }
+  ]
+}
