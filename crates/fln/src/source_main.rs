@@ -438,6 +438,16 @@ impl Engine {
             value = Expr::app(value, self::arguments(arguments, &mut visited, limits)?);
         }
         let candidate = generated_name(self.environment(), &mut visited, limits)?;
+        // An `unsafe def main` already passed kernel admission and executable-body
+        // validation above; its transient runner thunk must carry `Unsafe` safety so
+        // K1 admits the call to `main` (just as `#eval` admits unsafe entries) without
+        // mutating `self` or relaxing safe-to-unsafe boundaries for user declarations.
+        let safety = match info {
+            ConstantInfo::Defn(definition) if definition.safety == DefinitionSafety::Unsafe => {
+                DefinitionSafety::Unsafe
+            }
+            _ => DefinitionSafety::Safe,
+        };
         let declaration = Declaration::Defn(DefinitionVal {
             base: ConstantVal {
                 name: candidate.clone(),
@@ -446,7 +456,7 @@ impl Engine {
             },
             value,
             hints: ReducibilityHints::Opaque,
-            safety: DefinitionSafety::Safe,
+            safety,
             all: vec![candidate],
         });
         Ok(

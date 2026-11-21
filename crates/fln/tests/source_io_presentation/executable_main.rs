@@ -58,6 +58,12 @@ fn admitted_main_signatures_preserve_arguments_full_exit_codes_and_once_only_act
                 ("def main : IO UInt32 := pure 0", 0),
                 ("def main : IO UInt32 := pure 256", 256),
                 ("def main : IO UInt32 := pure 4294967295", u32::MAX),
+                ("unsafe def main : IO Unit := pure ()", 0),
+                ("unsafe def main : IO UInt32 := pure 7", 7),
+                (
+                    "unsafe def main (_args : List String) : IO UInt32 := pure 9",
+                    9,
+                ),
             ] {
                 let candidate = checked(engine, source);
                 let root = candidate.logical_root(&KVMap::new());
@@ -349,6 +355,13 @@ fn admitted_main_selection_refuses_before_effects_and_retains_typed_exceptions()
             assert!(matches!(invalid.execute_main(&arguments, &KVMap::new(), limits()),
                 Err(MainExecutionError::InvalidMainType)));
             assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged\n");
+
+            // An unsafe axiom has no executable body and must still refuse before execution.
+            let unsafe_axiom_main = checked(engine, "unsafe axiom main : IO Unit");
+            assert!(matches!(
+                unsafe_axiom_main.execute_main(&arguments, &KVMap::new(), limits()),
+                Err(MainExecutionError::UnsupportedMain { .. })
+            ));
 
             let action = checked(engine, &format!(r#"def main : IO Unit := do
   let h ← IO.FS.Handle.mk {} IO.FS.Mode.append

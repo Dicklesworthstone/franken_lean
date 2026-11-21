@@ -84,24 +84,29 @@ fn unsafe_code_cannot_become_a_safe_definition_or_theorem() {
         "unsafe def value : Nat := 7\nunsafe def absurd (n : Nat) : False := absurd n",
     );
     let root = base.logical_root(&KVMap::new());
-    for source in [
-        "def leak : Nat := value",
-        "theorem leak : False := absurd 0",
-        "def leak : False := absurd 0",
-        "theorem leak : value = value := by rfl",
-        "unsafe theorem leak : True := by constructor",
-        "unsafe partial def leak (n : Nat) : Nat := leak n",
-        "unsafe def leak (n : Nat) : Nat := true",
+    for (source, expect_safety_violation) in [
+        ("def leak : Nat := value", true),
+        ("theorem leak : False := absurd 0", true),
+        ("def leak : False := absurd 0", true),
+        ("theorem leak : value = value := by rfl", false),
+        ("unsafe theorem leak : True := by constructor", false),
+        ("unsafe partial def leak (n : Nat) : Nat := leak n", false),
+        ("unsafe def leak (n : Nat) : Nat := true", false),
     ] {
-        assert!(
-            base.check_source_files(
+        let error = base
+            .check_source_files(
                 &[source.as_bytes()],
                 &KVMap::new(),
-                SourceCheckLimits::new(EngineAdmissionLimits::new(budget()))
+                SourceCheckLimits::new(EngineAdmissionLimits::new(budget())),
             )
-            .is_err(),
-            "{source}"
-        );
+            .expect_err(source);
+        if expect_safety_violation {
+            let rendered = format!("{error:?}");
+            assert!(
+                rendered.contains("SafetyViolation"),
+                "expected kernel SafetyViolation for `{source}`, got: {rendered}"
+            );
+        }
         assert_eq!(base.logical_root(&KVMap::new()), root);
         assert!(
             !base
