@@ -690,6 +690,7 @@ impl Context {
                     holes.push(id.clone());
                     if inside_out && *binder_info == BinderInfo::InstImplicit {
                         rule_instances.push(id.clone());
+                        template.pending_synth_holes.insert(id.clone());
                     }
                 }
                 rule.type_ = template.substitute(&body, &argument)?;
@@ -1086,6 +1087,7 @@ impl Context {
             self.charge_rewrite_trial(&trial);
             match attempt {
                 Ok(Some(rule)) => {
+                    trial.pending_synth_holes = self.pending_synth_holes.clone();
                     *self = trial;
                     return Ok(Some(rule));
                 }

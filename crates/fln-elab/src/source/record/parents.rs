@@ -45,6 +45,9 @@ pub(super) struct Inheritance {
     pub direct: Vec<(Name, Name, bool)>,
     pub defaults: Vec<InheritedDefault>,
     pub labels: HashSet<Name>,
+    /// Subset of `labels` naming subobject or copied parent projections (never leaf fields),
+    /// matching `StructFieldKind.isParent` in vendored `Lean/Elab/Structure.lean:145,765`.
+    pub parent_labels: HashSet<Name>,
     pub level: Level,
 }
 
@@ -87,6 +90,7 @@ impl Context {
             direct: Vec::new(),
             defaults: Vec::new(),
             labels: HashSet::new(),
+            parent_labels: HashSet::new(),
             level: Level::one(),
         };
         let syntax = match expect_null_args(syntax, "optional parent clause")? {
@@ -144,7 +148,11 @@ impl Context {
             if label.is_anonymous() || !label.parent().is_anonymous() {
                 return Err(record_error(RecordError::InvalidName));
             }
-            if !result.labels.insert(label.clone()) {
+            if result
+                .direct
+                .iter()
+                .any(|(_, existing_label, _)| existing_label == &label)
+            {
                 return Err(record_error(RecordError::DuplicateField));
             }
             let sort = self
@@ -159,6 +167,45 @@ impl Context {
             let level = self.sort_level(&completed)?;
             result.level = Level::max(result.level, level)
                 .map_err(|_| record_error(RecordError::ResourceLimit))?;
+            // `withStruct` (vendored `Lean/Elab/Structure.lean:763-778`): if the parent
+            // projection name already names an earlier parent (indirect subobject or promoted
+            // ancestor), reuse it after a defeq check instead of refusing as duplicate field.
+            if result.labels.contains(&label) {
+                if !result.parent_labels.contains(&label) {
+                    return Err(record_error(RecordError::DuplicateField));
+                }
+                let existing = self
+                    .txn
+                    .lctx
+                    .find_by_user_name(&label)
+                    .cloned()
+                    .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                if !self.defeq_guarded(&existing.type_, &completed.value)? {
+                    return Err(record_error(RecordError::ParentFieldMismatch));
+                }
+                let is_subobject = result.parents.iter().any(|parent| {
+                    parent.record == *record
+                        && parent.parent == name
+                        && result
+                            .fields
+                            .get(parent.field as usize)
+                            .is_some_and(|field| field.id == existing.id)
+                });
+                if is_subobject {
+                    result.direct.push((name, label, true));
+                } else {
+                    result.direct.push((name.clone(), label.clone(), false));
+                    result.copied.push(CopiedParent {
+                        parent: name,
+                        label,
+                        type_: completed.value,
+                        value: Expr::fvar(existing.id),
+                    });
+                }
+                continue;
+            }
+            result.labels.insert(label.clone());
+            result.parent_labels.insert(label.clone());
             let fields = registry
                 .fields(&self.txn.env, &name, budget)
                 .map_err(record_error)?;
@@ -202,6 +249,7 @@ impl Context {
                 completed.value,
                 style,
                 fields,
+                &registry,
                 budget,
                 &mut result,
             )?;
@@ -220,9 +268,11 @@ impl Context {
         type_: Expr,
         style: BinderInfo,
         fields: Vec<crate::records::inheritance::FieldPath>,
+        registry: &RecordParents,
         budget: RecordBudget,
         result: &mut Inheritance,
     ) -> Result<Expr, NatDefinitionElabError> {
+        result.parent_labels.insert(label.clone());
         let id = FVarId(self.fresh_name()?);
         let local = self
             .txn
@@ -243,6 +293,14 @@ impl Context {
             self.tick()?;
             if !result.labels.insert(field.name.clone()) {
                 return Err(record_error(RecordError::DuplicateField));
+            }
+            if let Some((owner, field_index)) = field.path.last()
+                && registry
+                    .parents(owner)
+                    .iter()
+                    .any(|row| row.field == *field_index)
+            {
+                result.parent_labels.insert(field.name.clone());
             }
             let value = self.record_field(receiver.clone(), &field.name)?;
             let id = FVarId(self.fresh_name()?);
@@ -347,6 +405,7 @@ impl Context {
                     .fields(&self.txn.env, &grandparent, budget)
                     .map_err(record_error)?;
                 result.labels.insert(field.clone());
+                result.parent_labels.insert(field.clone());
                 if nested.iter().any(|leaf| result.labels.contains(&leaf.name))
                     || (nested.is_empty() && !result.fields.is_empty())
                 {
@@ -368,6 +427,7 @@ impl Context {
                         field_type,
                         style,
                         nested,
+                        registry,
                         budget,
                         result,
                     )?

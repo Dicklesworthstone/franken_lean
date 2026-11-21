@@ -829,3 +829,59 @@ example : grandchild.value = grandchild.value := grandchild.proof
         }
     }
 }
+
+#[test]
+fn direct_extends_reusing_promoted_ancestor_checks_defeq_and_keeps_leaf_collision_refusal() {
+    let base = check(
+        &engine(),
+        r#"
+structure Base (α : Type) where
+  x : α
+structure Mid (α : Type) extends Base α where
+  y : Nat
+structure Left (α : Type) where
+  z : Nat
+structure Right (α : Type) extends Mid α, Left α
+structure Diamond (α : Type) extends Left α, Right α, Base α
+def d : Diamond Nat := { x := 1, y := 2, z := 3 }
+example : d.x = 1 := by rfl
+example : d.toBase.x = 1 := by rfl
+example : d.toRight.toMid.toBase.x = 1 := by rfl
+"#,
+    )
+    .engine;
+    let root = base.logical_root(&KVMap::new());
+    // Reusing the same parent label `toBase` at a non-defeq type argument must fail atomically.
+    let mismatch = r#"
+structure BadMismatch extends Left Nat, Right Nat, Base Bool
+"#;
+    let result = base.check_source_files(
+        &[mismatch.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits()),
+    );
+    assert!(result.is_err(), "{mismatch}\n{result:?}");
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(
+        !base
+            .environment()
+            .contains(&Name::from_components(["BadMismatch"]))
+    );
+    // Declaring a non-parent leaf field colliding with an inherited parent projection must still fail.
+    let leaf_collision = r#"
+structure BadLeaf extends Mid Nat where
+  toBase : Nat
+"#;
+    let result = base.check_source_files(
+        &[leaf_collision.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits()),
+    );
+    assert!(result.is_err(), "{leaf_collision}\n{result:?}");
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(
+        !base
+            .environment()
+            .contains(&Name::from_components(["BadLeaf"]))
+    );
+}

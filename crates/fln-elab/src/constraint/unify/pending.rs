@@ -143,20 +143,36 @@ impl Engine<'_> {
         if definition.base.level_params.len() != levels.len() {
             return Ok(false);
         }
-        let Some(projection) =
+        if let Some(projection) =
             crate::records::projection::class_projection(&self.work.env, definition, || {
                 self.meter.node()
             })?
-        else {
-            return Ok(false);
-        };
-        if projection.parameters.checked_add(1) != Some(arity)
-            || !self
+        {
+            if projection.parameters.checked_add(1) != Some(arity)
+                || !self
+                    .projection_registry
+                    .read(&self.work.env)
+                    .map_err(UnificationError::InstanceRegistry)?
+                    .is_class(&projection.structure)
+            {
+                return Ok(false);
+            }
+        } else if let Some(aux) =
+            crate::records::projection::aux_parent_projection(&self.work.env, definition, || {
+                self.meter.node()
+            })?
+        {
+            let registry = self
                 .projection_registry
                 .read(&self.work.env)
-                .map_err(UnificationError::InstanceRegistry)?
-                .is_class(&projection.structure)
-        {
+                .map_err(UnificationError::InstanceRegistry)?;
+            if aux.parameters.checked_add(1) != Some(arity)
+                || !registry.is_class(&aux.structure)
+                || !registry.is_class(&aux.parent)
+            {
+                return Ok(false);
+            }
+        } else {
             return Ok(false);
         }
         let ExprNode::App { a: receiver, .. } = expr.node() else {
@@ -427,24 +443,44 @@ impl Engine<'_> {
                     if definition.base.level_params.len() != levels.len() {
                         return Ok(None);
                     }
-                    let Some(projection) = crate::records::projection::class_projection(
+                    let parameters = if let Some(projection) =
+                        crate::records::projection::class_projection(
+                            &self.work.env,
+                            definition,
+                            || self.meter.node(),
+                        )? {
+                        if arguments.len() <= projection.parameters
+                            || !self
+                                .projection_registry
+                                .read(&self.work.env)
+                                .map_err(UnificationError::InstanceRegistry)?
+                                .is_class(&projection.structure)
+                        {
+                            return Ok(None);
+                        }
+                        projection.parameters
+                    } else if let Some(aux) = crate::records::projection::aux_parent_projection(
                         &self.work.env,
                         definition,
                         || self.meter.node(),
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    if arguments.len() <= projection.parameters
-                        || !self
+                    )? {
+                        // `getStuckMVar?` (vendored `Lean/Meta/WHNF.lean:367-372`):
+                        // follow auxiliary diamond parent coercions between classes.
+                        let registry = self
                             .projection_registry
                             .read(&self.work.env)
-                            .map_err(UnificationError::InstanceRegistry)?
-                            .is_class(&projection.structure)
-                    {
+                            .map_err(UnificationError::InstanceRegistry)?;
+                        if arguments.len() <= aux.parameters
+                            || !registry.is_class(&aux.structure)
+                            || !registry.is_class(&aux.parent)
+                        {
+                            return Ok(None);
+                        }
+                        aux.parameters
+                    } else {
                         return Ok(None);
-                    }
-                    current = arguments[arguments.len() - projection.parameters - 1].clone();
+                    };
+                    current = arguments[arguments.len() - parameters - 1].clone();
                 }
                 _ => return Ok(None),
             }

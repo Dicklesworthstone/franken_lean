@@ -1556,6 +1556,14 @@ impl Engine<'_> {
                     // application, but cannot repair discarded head equations.
                     return Err(UnificationError::Deferred(reason));
                 }
+                if let Some(outcome) = self.try_instance_arg_congruence(&left, &right, locals)? {
+                    return match outcome {
+                        application_congruence::CongruenceResult::Solved => Ok(()),
+                        application_congruence::CongruenceResult::Refused { .. } => {
+                            Err(UnificationError::Deferred(reason))
+                        }
+                    };
+                }
                 pending.push_front((b.clone(), d.clone(), locals.clone()));
                 pending.push_front((a.clone(), c.clone(), locals.clone()));
             }
@@ -1646,7 +1654,53 @@ impl Engine<'_> {
                     idx: j,
                     expr: y,
                 },
-            ) if a == b && i == j => pending.push_front((x.clone(), y.clone(), locals.clone())),
+            ) if a == b && i == j => {
+                // Reducible class projections (`OfNat.ofNat`, `HMul.hMul`, `LE.le`, …)
+                // unfold to primitive `Expr::proj` at `Abbreviations` transparency, so
+                // their receivers are the class instances compared under `withImplicitConfig`
+                // (`withAtLeastTransparency .instances`, `Lean/Meta/ExprDefEq.lean:351-396`,
+                // `Lean/Meta/WHNF.lean:820-831`).
+                let bare_assignable = |expr: &Expr| -> bool {
+                    matches!(
+                        expr.node(),
+                        ExprNode::MVar { id }
+                            if !self.work.mvars.is_assigned(id)
+                                && self.work.mvars.get_decl(id).is_some_and(|decl| {
+                                    decl.kind != MetavarKind::SyntheticOpaque
+                                        && decl.depth <= self.budget.max_metavar_depth
+                                })
+                    )
+                };
+                if self.budget.transparency == UnificationTransparency::Abbreviations
+                    && self.congruence_depth < application_congruence::MAX_CONGRUENCE_DEPTH
+                    && !bare_assignable(x)
+                    && !bare_assignable(y)
+                    && self
+                        .projection_registry
+                        .read(&self.work.env)
+                        .map_err(UnificationError::InstanceRegistry)?
+                        .is_class(a)
+                {
+                    if self.same_up_to_assignment(x, y)? {
+                        return Ok(());
+                    }
+                    let saved_transparency = self.budget.transparency;
+                    self.budget.transparency = UnificationTransparency::Instances;
+                    let result = self.try_congruence_equations(
+                        &[(x.clone(), y.clone(), locals.clone())],
+                        self.fail_fast,
+                        true,
+                    );
+                    self.budget.transparency = saved_transparency;
+                    return match result? {
+                        application_congruence::CongruenceResult::Solved => Ok(()),
+                        application_congruence::CongruenceResult::Refused { .. } => {
+                            Err(UnificationError::Deferred(reason))
+                        }
+                    };
+                }
+                pending.push_front((x.clone(), y.clone(), locals.clone()));
+            }
             _ => return Err(UnificationError::Deferred(reason)),
         }
         Ok(())

@@ -486,6 +486,107 @@ impl ImportedStructures {
         self.entries.get(name)
     }
 
+    /// Relaxed C3 parent resolution order for `root` (`getStructureResolutionOrder`,
+    /// vendored `Lean/Structure.lean`), starting with `root` itself.
+    pub fn resolution_order(
+        &self,
+        root: &Name,
+        budget: RecordBudget,
+    ) -> Result<Vec<Name>, RecordError> {
+        let mut remaining = budget.max_nodes;
+        let mut orders: BTreeMap<Name, Vec<Name>> = BTreeMap::new();
+        let mut visiting = BTreeSet::new();
+        let mut work = vec![(root.clone(), false)];
+        while let Some((name, finish)) = work.pop() {
+            tick(&mut remaining)?;
+            if orders.contains_key(&name) {
+                continue;
+            }
+            let Some(entry) = self.entries.get(&name) else {
+                return Err(RecordError::InvalidTelescope);
+            };
+            let direct: Vec<Name> = entry
+                .parents
+                .iter()
+                .map(|parent| parent.name.clone())
+                .collect();
+            if !finish {
+                if !visiting.insert(name.clone()) {
+                    return Err(RecordError::InvalidTelescope);
+                }
+                if visiting.len() >= budget.max_binders {
+                    return Err(RecordError::ResourceLimit);
+                }
+                work.push((name, true));
+                for parent in direct.iter().rev() {
+                    tick(&mut remaining)?;
+                    if !orders.contains_key(parent) {
+                        work.push((parent.clone(), false));
+                    }
+                }
+                continue;
+            }
+            let mut rows = vec![direct.clone()];
+            for parent in direct {
+                tick(&mut remaining)?;
+                rows.push(
+                    orders
+                        .get(&parent)
+                        .cloned()
+                        .ok_or(RecordError::InvalidTelescope)?,
+                );
+            }
+            rows.retain(|row| !row.is_empty());
+            let mut order = vec![name.clone()];
+            while !rows.is_empty() {
+                tick(&mut remaining)?;
+                let mut selected = None;
+                'selection: for dropped in 0..rows.len() {
+                    let high = rows.len() - dropped;
+                    for index in 0..high {
+                        tick(&mut remaining)?;
+                        let candidate = &rows[index][0];
+                        let mut consistent = true;
+                        for (other, row) in rows.iter().take(high).enumerate() {
+                            if other == index {
+                                continue;
+                            }
+                            for inherited in row.iter().skip(1) {
+                                tick(&mut remaining)?;
+                                if inherited == candidate {
+                                    consistent = false;
+                                    break;
+                                }
+                            }
+                            if !consistent {
+                                break;
+                            }
+                        }
+                        if consistent {
+                            selected = Some(candidate.clone());
+                            break 'selection;
+                        }
+                    }
+                }
+                let selected = selected.ok_or(RecordError::InvalidTelescope)?;
+                if order.len() >= budget.max_binders {
+                    return Err(RecordError::ResourceLimit);
+                }
+                order.push(selected.clone());
+                for row in &mut rows {
+                    for _ in row.iter() {
+                        tick(&mut remaining)?;
+                    }
+                    row.retain(|item| item != &selected);
+                }
+                rows.retain(|row| !row.is_empty());
+            }
+            visiting.remove(&name);
+            orders.insert(name, order);
+        }
+        orders.remove(root).ok_or(RecordError::InvalidTelescope)
+    }
+
     pub fn read(env: &Environment) -> Result<Self, RecordError> {
         let mut registry = Self::read_all(env)?;
         registry.entries.retain(|name, _| env.contains(name));

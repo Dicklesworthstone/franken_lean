@@ -282,3 +282,162 @@ fn empty_braces_are_ambiguous_where_an_empty_collection_exists() {
         assert_eq!(code, 1, "the pin moved");
     }
 }
+
+/// Upstream `elab/diamond8.lean`: direct `extends` naming an ancestor already promoted
+/// (`One R` inside `MonoidWithZero R`) reuses the existing parent without duplicating
+/// constructor fields, `#print Semiring` matches the pin byte-for-byte, and `mul_one := by simp`
+/// matches `Nat.mul_one` across the `Mul`/`One` instance diamond.
+#[test]
+fn diamond8_reuses_ancestor_parent_prints_structure_and_simplifies_instance_diamond() {
+    let Some(lib) = pinned_lib() else { return };
+    if !lib.join("Init/Data/Zero.olean").is_file()
+        || !lib.join("Init/Data/Nat/Basic.olean").is_file()
+        || !lib.join("Init/SimpLemmas.olean").is_file()
+    {
+        return;
+    }
+    let root = workspace();
+    let program = r#"prelude
+import Init.Data.Zero
+import Init.Data.Nat.Basic
+import Init.SimpLemmas
+class Monoid (M : Type u) extends Mul M, One M where
+  mul_one (m : M) : m * 1 = m
+
+class AddCommMonoid (A : Type u) extends Add A, Zero A
+
+class MonoidWithZero (M₀ : Type u) extends Monoid M₀, Zero M₀
+
+class Semiring (R : Type u) extends AddCommMonoid R, MonoidWithZero R, One R
+
+#print Semiring
+
+def oneViaMonoid {M} [Monoid M] : M := 1
+example {R} [Semiring R] : (1 : R) = oneViaMonoid := rfl
+
+example : Semiring Nat where
+  mul_one := by simp
+  zero := 0
+  one := 1
+"#;
+    let expected = "class Semiring.{u} (R : Type u) : Type u\n\
+number of parameters: 1\n\
+parents:\n\
+  Semiring.toAddCommMonoid : AddCommMonoid R\n\
+  Semiring.toMonoidWithZero : MonoidWithZero R\n\
+  Semiring.toOne : One R\n\
+fields:\n\
+  Add.add : R → R → R\n\
+  Zero.zero : R\n\
+  Mul.mul : R → R → R\n\
+  One.one : R\n\
+  Monoid.mul_one : ∀ (m : R), m * 1 = m\n\
+constructor:\n\
+  Semiring.mk.{u} {R : Type u} [toAddCommMonoid : AddCommMonoid R] [toMonoid : Monoid R] : Semiring R\n\
+field notation resolution order:\n\
+  Semiring, AddCommMonoid, MonoidWithZero, Add, Monoid, Zero, Mul, One\n";
+    let (code, stdout, stderr) = ours(&lib, &root, program);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(stdout, expected);
+    if let Some((code, stdout)) = pinned(&lib, &root.join("Diamonds.lean")) {
+        assert_eq!((code, stdout.as_str()), (0, expected), "the pin moved");
+    }
+}
+
+/// Upstream `elab/auxParentProj.lean` and `elab/1951.lean`: `rw` and `simp` resolve
+/// stuck class metavariables through auxiliary copied-parent coercions and compare
+/// class-projection instance receivers at `Instances` transparency.
+#[test]
+fn rw_and_simp_resolve_auxiliary_copied_parent_coercions() {
+    let Some(lib) = pinned_lib() else { return };
+    if !lib.join("Init/Data/Zero.olean").is_file()
+        || !lib.join("Init/Data/Int/Basic.olean").is_file()
+        || !lib.join("Init/SimpLemmas.olean").is_file()
+    {
+        return;
+    }
+    let root = workspace();
+    let aux_parent = r#"prelude
+import Init.Data.Zero
+import Init.Data.Int.Basic
+class AddZero' (M : Type u_2) extends Zero M, Add M where
+
+class AddMonoid' (M : Type u) extends Add M, AddZero' M where
+
+instance : AddZero' Int where
+instance : AddMonoid' Int where
+
+theorem sub_nonneg' {α : Type u} [AddMonoid' α] [Sub α] [LE α] {a b : α} :
+  0 ≤ a - b ↔ b ≤ a := sorry
+
+example (a b : Int) : 0 ≤ a - b ↔ b ≤ a := by rw [sub_nonneg']
+"#;
+    let (code, stdout, stderr) = ours(&lib, &root, aux_parent);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    if let Some((pin_code, pin_stdout)) = pinned(&lib, &root.join("Diamonds.lean")) {
+        assert_eq!((code, stdout), (Some(pin_code), pin_stdout));
+    }
+
+    let issue_1951 = r#"prelude
+import Init.Data.Zero
+import Init.SimpLemmas
+class FunLike (F : Type _) (A : outParam (Type _)) (B : outParam (A → Type _)) where toFun : F → ∀ a, B a
+instance [FunLike F A B] : CoeFun F fun _ => ∀ a, B a where coe := FunLike.toFun
+class OneHomClass (F) (A B : outParam _) [One A] [One B] extends FunLike F A fun _ => B where
+  map_one (f : F) : f 1 = 1
+class MulHomClass (F) (A B : outParam _) [Mul A] [Mul B] extends FunLike F A fun _ => B
+class Monoid (M) extends Mul M, One M
+class MonoidHomClass (F) (A B : outParam _) [Monoid A] [Monoid B] extends MulHomClass F A B, OneHomClass F A B
+
+theorem map_one [Monoid A] [Monoid B] [OneHomClass F A B] (f : F) : f 1 = 1 := OneHomClass.map_one f
+example [Monoid M] [Monoid N] [MonoidHomClass F M N] (f : F) : f 1 = 1 := by
+  simp only [map_one]
+"#;
+    let (code, stdout, stderr) = ours(&lib, &root, issue_1951);
+    assert_eq!((code, stdout.as_str()), (Some(0), ""), "stderr: {stderr}");
+    if let Some((pin_code, pin_stdout)) = pinned(&lib, &root.join("Diamonds.lean")) {
+        assert_eq!((pin_code, pin_stdout.as_str()), (0, ""), "the pin moved");
+    }
+}
+
+/// Polymorphic/instance update sources (`{ Synonym.zero with }`, `{ pi.instSMul with }`)
+/// instantiate leading implicit and instance binders, and `maxSynthPendingDepth` is honored.
+#[test]
+fn polymorphic_update_sources_and_max_synth_pending_depth_match_pin() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let program = r#"prelude
+import Init.Core
+class AddCommGroup (α : Type) extends Zero α where
+class Ring (α : Type) extends Zero α, AddCommGroup α
+class Module (R : Type) (M : Type) [Zero R] [Zero M] where
+instance (R : Type) [Zero R] : Module R R := ⟨⟩
+structure Submodule (R : Type) (M : Type) [Zero R] [Zero M] [Module R M] : Type where
+class HasQuotient (A : outParam <| Type) (B : Type) where
+  quotient' : B → Type
+instance Submodule.hasQuotient {R : Type} {M : Type} [Ring R] [AddCommGroup M]
+  [Module R M] : HasQuotient M (Submodule R M) := ⟨fun _ => M⟩
+def Synonym (M : Type) [Zero M] := M
+instance Synonym.zero {G : Type} [Zero G] : Zero (Synonym G) := ⟨(Zero.zero : G)⟩
+instance Synonym.addCommGroup {G : Type} [AddCommGroup G] : AddCommGroup (Synonym G) :=
+  { Synonym.zero with }
+instance Synonym.module (M : Type) {R : Type} [Zero R] [Zero M] [Module R M] :
+    Module R (Synonym M) := { }
+variable (R : Type) [Ring R]
+set_option maxSynthPendingDepth 2 in
+#synth HasQuotient (Synonym (Synonym R)) (Submodule R (Synonym (Synonym R)))
+"#;
+    let (code, stdout, stderr) = ours(&lib, &root, program);
+    assert_eq!(
+        (code, stdout.as_str()),
+        (Some(0), "Submodule.hasQuotient\n"),
+        "stderr: {stderr}"
+    );
+    if let Some((pin_code, pin_stdout)) = pinned(&lib, &root.join("Diamonds.lean")) {
+        assert_eq!(
+            (pin_code, pin_stdout.as_str()),
+            (0, "Submodule.hasQuotient\n"),
+            "the pin moved"
+        );
+    }
+}

@@ -6,6 +6,10 @@
 //! of `Init` constants), and a header without them would be text the pin does not print. A
 //! structure, a recursor and anything the term printer refuses are refused here too.
 use super::*;
+use fln_elab::instances::InstanceRegistry;
+use fln_elab::records::RecordBudget;
+use fln_elab::records::defaults::RecordDefaults;
+use fln_elab::records::imported::ImportedStructures;
 use fln_elab::reducibility::{Reducibility, ReducibilityTable};
 
 /// Whether `value` shows how this engine compiles a `match` or a recursive definition, which
@@ -169,7 +173,7 @@ impl<'a> Printer<'a> {
     /// parameters, and each constructor by its whole name with its type.
     fn print_inductive(&mut self, name: &Name, value: &InductiveVal) -> Doc {
         if self.structure_like(value) {
-            return Err(Unsupported("a structure"));
+            return self.print_structure(name, value);
         }
         let mut doc = self
             .print_header(name, "inductive", unsafe_word(value.is_unsafe), true)?
@@ -195,6 +199,294 @@ impl<'a> Printer<'a> {
                 .then(type_);
         }
         Ok(doc)
+    }
+
+    /// `printStructure` (vendored `Lean/Elab/Print.lean:125-196`): header with signature,
+    /// parameter count, parents, flattened fields with origin projections, constructor
+    /// signature, and relaxed-C3 field notation resolution order. Fails closed (`Unsupported`)
+    /// when structure metadata is absent or a field carries a default/autoParam this printer
+    /// does not yet format.
+    fn print_structure(&mut self, name: &Name, value: &InductiveVal) -> Doc {
+        let structures = ImportedStructures::read(self.env)
+            .map_err(|_| Unsupported("an unreadable structure journal"))?;
+        let Some(entry) = structures.get(name) else {
+            return Err(Unsupported("a structure"));
+        };
+        let [ctor] = value.ctors.as_slice() else {
+            return Err(Unsupported("a structure"));
+        };
+        let Some(ConstantInfo::Ctor(ctor_info)) = self.env.find(ctor) else {
+            return Err(Unsupported("a structure without its constructor"));
+        };
+        let instances = InstanceRegistry::read(self.env)
+            .map_err(|_| Unsupported("an unreadable instance registry"))?;
+        let defaults = RecordDefaults::read(self.env)
+            .map_err(|_| Unsupported("an unreadable record defaults journal"))?;
+        let flat_ctor_name = Name::str(ctor.clone(), "_flat_ctor");
+        if let Some(ConstantInfo::Defn(flat_ctor)) = self.env.find(&flat_ctor_name) {
+            let mut cursor = &flat_ctor.base.type_;
+            for index in 0..u64::from(value.num_params) + 1024 {
+                let ExprNode::ForallE {
+                    binder_type, body, ..
+                } = cursor.node()
+                else {
+                    break;
+                };
+                if index >= u64::from(value.num_params)
+                    && annotation(binder_type, "autoParam").is_some()
+                {
+                    return Err(Unsupported("a structure with an autoParam field"));
+                }
+                cursor = body;
+            }
+        }
+        let kind = if instances.is_class(name) {
+            "class"
+        } else {
+            "structure"
+        };
+        let header = self.print_header(name, kind, unsafe_word(value.is_unsafe), false)?;
+        let sig = self.signature(name, &value.base.type_)?;
+        let mut doc = header
+            .then(Format::text(" "))
+            .then(Format::text(sig))
+            .then(Format::Line)
+            .then(Format::text(format!(
+                "number of parameters: {}",
+                value.num_params
+            )));
+
+        let num_params = usize::try_from(value.num_params)
+            .map_err(|_| Unsupported("a structure with too many parameters"))?;
+        let levels: Vec<Level> = value
+            .base
+            .level_params
+            .iter()
+            .cloned()
+            .map(Level::param)
+            .collect();
+        let depth = self.names.len();
+        let mut cursor = &value.base.type_;
+        for _ in 0..num_params {
+            let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            } = cursor.node()
+            else {
+                self.unbind_to(depth);
+                return Err(Unsupported("a structure with an unexpected telescope"));
+            };
+            let shown = self.parameter_name(binder_name);
+            self.bind(shown, binder_type);
+            cursor = body;
+        }
+        let mut self_type = Expr::const_(name.clone(), levels.clone());
+        let mut param_exprs = Vec::with_capacity(num_params);
+        for index in 0..num_params {
+            // `self` will be bound at BVar(0), so parameter `index` sits at `num_params - index`.
+            let bvar = Expr::bvar((num_params - index) as u32)
+                .map_err(|_| Unsupported("a structure with too many parameters"))?;
+            let ty_bvar = Expr::bvar((num_params - 1 - index) as u32)
+                .map_err(|_| Unsupported("a structure with too many parameters"))?;
+            self_type = Expr::app(self_type, ty_bvar);
+            param_exprs.push(bvar);
+        }
+        self.bind("self".to_owned(), &self_type);
+        let self_expr = Expr::bvar(0).map_err(|_| Unsupported("bound variable out of range"))?;
+
+        let body_result = (|| -> Result<Format, Unsupported> {
+            let mut body_doc = Format::Nil;
+            if !entry.parents.is_empty() {
+                let mut parents_doc = Format::Nil;
+                let mut proj_args = param_exprs.clone();
+                proj_args.push(self_expr.clone());
+                for parent in &entry.parents {
+                    let ptype = self.application_type(&parent.projection, &levels, &proj_args)?;
+                    let ptype_doc = self.doc(&ptype, 0)?;
+                    parents_doc = parents_doc.then(
+                        Format::Line
+                            .then(Format::text(format!(
+                                "{} : ",
+                                self.full_name(&parent.projection)
+                            )))
+                            .then(ptype_doc)
+                            .nest(2),
+                    );
+                }
+                body_doc = body_doc
+                    .then(Format::Line)
+                    .then(Format::text("parents:"))
+                    .then(parents_doc);
+            }
+
+            let mut flattened = Vec::new();
+            let mut seen_fields = std::collections::HashSet::new();
+            self.collect_structure_print_fields(
+                &structures,
+                name,
+                name,
+                &levels,
+                &param_exprs,
+                &self_expr,
+                &defaults,
+                &mut seen_fields,
+                &mut flattened,
+                0,
+            )?;
+            if flattened.is_empty() {
+                body_doc = body_doc
+                    .then(Format::Line)
+                    .then(Format::text("fields: (none)"));
+            } else {
+                let mut fields_doc = Format::Nil;
+                for (origin_proj, ftype) in flattened {
+                    let modifier = if is_private(&origin_proj) {
+                        if self.pp.private_names {
+                            return Err(Unsupported("a private field under `pp.privateNames`"));
+                        }
+                        "private "
+                    } else {
+                        ""
+                    };
+                    let ftype_doc = self.doc(&ftype, 0)?;
+                    fields_doc = fields_doc.then(
+                        Format::Line
+                            .then(Format::text(format!(
+                                "{modifier}{} : ",
+                                self.full_name(&origin_proj)
+                            )))
+                            .then(ftype_doc.nest(2))
+                            .nest(2),
+                    );
+                }
+                body_doc = body_doc
+                    .then(Format::Line)
+                    .then(Format::text("fields:"))
+                    .then(fields_doc);
+            }
+            Ok(body_doc)
+        })();
+        self.unbind_to(depth);
+        doc = doc.then(body_result?);
+
+        let ctor_modifier = if is_private(ctor) {
+            if self.pp.private_names {
+                return Err(Unsupported("a private constructor under `pp.privateNames`"));
+            }
+            "private "
+        } else {
+            ""
+        };
+        let ctor_sig = self.signature(ctor, &ctor_info.base.type_)?;
+        doc = doc
+            .then(Format::Line)
+            .then(Format::text("constructor:"))
+            .then(
+                Format::Line
+                    .then(Format::text(format!("{ctor_modifier}{ctor_sig}")))
+                    .nest(2),
+            );
+
+        let res_order = structures
+            .resolution_order(name, RecordBudget::default())
+            .map_err(|_| Unsupported("an unreadable structure resolution order"))?;
+        if res_order.len() > 1 {
+            let order_text = res_order
+                .iter()
+                .map(|item| self.full_name(item))
+                .collect::<Vec<_>>()
+                .join(", ");
+            doc = doc
+                .then(Format::Line)
+                .then(Format::text("field notation resolution order:"))
+                .then(Format::Line.then(Format::text(order_text)).nest(2));
+        }
+        Ok(doc)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_structure_print_fields(
+        &self,
+        structures: &ImportedStructures,
+        root: &Name,
+        current: &Name,
+        levels: &[Level],
+        args: &[Expr],
+        receiver: &Expr,
+        defaults: &RecordDefaults,
+        seen: &mut std::collections::HashSet<Name>,
+        out: &mut Vec<(Name, Expr)>,
+        depth: usize,
+    ) -> Result<(), Unsupported> {
+        if depth > 64 {
+            return Err(Unsupported("deeply nested structure parents"));
+        }
+        let Some(entry) = structures.get(current) else {
+            return Err(Unsupported("a parent without structure metadata"));
+        };
+        let mut proj_args = args.to_vec();
+        proj_args.push(receiver.clone());
+        for (index, field) in entry.fields.iter().enumerate() {
+            if let Some(sub_parent) = &field.subobject {
+                let sub_type = self.application_type(&field.projection, levels, &proj_args)?;
+                let (head, sub_args) = spine(&sub_type);
+                let ExprNode::Const {
+                    name: head_name,
+                    levels: sub_levels,
+                } = head.node()
+                else {
+                    return Err(Unsupported("a non-constant subobject parent type"));
+                };
+                if head_name != sub_parent {
+                    return Err(Unsupported("a mismatched subobject parent type"));
+                }
+                let sub_receiver = proj_args.iter().cloned().fold(
+                    Expr::const_(field.projection.clone(), levels.to_vec()),
+                    Expr::app,
+                );
+                self.collect_structure_print_fields(
+                    structures,
+                    root,
+                    sub_parent,
+                    sub_levels,
+                    &sub_args,
+                    &sub_receiver,
+                    defaults,
+                    seen,
+                    out,
+                    depth + 1,
+                )?;
+                continue;
+            }
+            if !seen.insert(field.name.clone()) {
+                continue;
+            }
+            let has_default = self
+                .env
+                .find(&Name::str(root.append_core(&field.name), "_default"))
+                .is_some()
+                || self
+                    .env
+                    .find(&Name::str(
+                        root.append_core(&field.name),
+                        "_inherited_default",
+                    ))
+                    .is_some()
+                || u32::try_from(index)
+                    .ok()
+                    .and_then(|idx| defaults.helper(current, idx))
+                    .is_some();
+            if has_default {
+                return Err(Unsupported("a structure with field defaults"));
+            }
+            let ftype = self.application_type(&field.projection, levels, &proj_args)?;
+            let origin = structure_field_origin(structures, root, &field.name, 0)
+                .ok_or(Unsupported("a structure field without a known origin"))?;
+            out.push((origin, ftype));
+        }
+        Ok(())
     }
 
     /// Whether `value` may be a structure, which `#print` prints with its fields
@@ -333,6 +625,55 @@ impl<'a> Printer<'a> {
             format!("'{shown}' depends on axioms: [{}]", names.join(", "))
         })
     }
+}
+
+/// `getFieldOrigin` (vendored `Lean/Elab/Print.lean:115-122`): the originating structure's
+/// projection name for `field`, following the first parent that provides `field`.
+fn structure_field_origin(
+    structures: &ImportedStructures,
+    struct_name: &Name,
+    field: &Name,
+    depth: usize,
+) -> Option<Name> {
+    if depth > 64 {
+        return None;
+    }
+    let entry = structures.get(struct_name)?;
+    for parent in &entry.parents {
+        if structure_has_field(structures, &parent.name, field, depth + 1) {
+            return structure_field_origin(structures, &parent.name, field, depth + 1);
+        }
+    }
+    entry
+        .fields
+        .iter()
+        .find(|item| &item.name == field)
+        .map(|item| item.projection.clone())
+}
+
+fn structure_has_field(
+    structures: &ImportedStructures,
+    struct_name: &Name,
+    field: &Name,
+    depth: usize,
+) -> bool {
+    if depth > 64 {
+        return false;
+    }
+    let Some(entry) = structures.get(struct_name) else {
+        return false;
+    };
+    if entry
+        .fields
+        .iter()
+        .any(|item| item.subobject.is_none() && &item.name == field)
+    {
+        return true;
+    }
+    entry
+        .parents
+        .iter()
+        .any(|parent| structure_has_field(structures, &parent.name, field, depth + 1))
 }
 
 /// Whether a definition or theorem's value is `rfl` under its binders. The pin tags a

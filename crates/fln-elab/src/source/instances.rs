@@ -117,7 +117,10 @@ impl crate::constraint::unify::PendingSynthesis for PendingInstances<'_> {
         spent: u64,
     ) -> crate::constraint::unify::PendingAnswer {
         use crate::constraint::unify::PendingAnswer;
-        if self.fault.is_some() || !self.context.instance_goals.contains(goal) {
+        if self.fault.is_some()
+            || (!self.context.instance_goals.contains(goal)
+                && !self.context.pending_synth_holes.contains(goal))
+        {
             return PendingAnswer {
                 result: Ok(None),
                 spent: 0,

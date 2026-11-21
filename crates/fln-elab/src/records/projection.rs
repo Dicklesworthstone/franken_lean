@@ -5,6 +5,7 @@
 //! and exact projection body; an ordinary function that returns a field does
 //! not acquire the Reference's `unfoldProjInst?` behavior.
 
+use crate::records::imported::ImportedStructures;
 use fln_core::expr::{BinderInfo, ExprNode};
 use fln_core::name::Name;
 use fln_env::constants::{ConstantInfo, DefinitionSafety, DefinitionVal};
@@ -14,6 +15,76 @@ pub(crate) struct ClassProjection {
     pub structure: Name,
     pub index: u64,
     pub parameters: usize,
+}
+
+/// Non-subobject (copied) parent projection between classes (`mkCoercionToCopiedParent` +
+/// `addAuxParentProjectionInfo`, vendored `Lean/Elab/Structure.lean:1439`).
+pub(crate) struct AuxParentProjection {
+    pub structure: Name,
+    pub parent: Name,
+    pub parameters: usize,
+}
+
+/// Identify an admitted auxiliary parent projection for diamond inheritance so
+/// `reduction_blocker` (`getStuckMVar?`, vendored `Lean/Meta/WHNF.lean:367-372`)
+/// can look through copied parent coercions to find a stuck class metavariable.
+pub(crate) fn aux_parent_projection<E>(
+    environment: &Environment,
+    definition: &DefinitionVal,
+    mut tick: impl FnMut() -> Result<(), E>,
+) -> Result<Option<AuxParentProjection>, E> {
+    if definition.safety != DefinitionSafety::Safe {
+        return Ok(None);
+    }
+    let struct_name = definition.base.name.parent();
+    let Some(ConstantInfo::Induct(family)) = environment.find(&struct_name) else {
+        return Ok(None);
+    };
+    let Ok(parameters) = usize::try_from(family.num_params) else {
+        return Ok(None);
+    };
+    if family.is_unsafe
+        || family.num_indices != 0
+        || family.ctors.len() != 1
+        || definition.base.level_params != family.base.level_params
+    {
+        return Ok(None);
+    }
+    // Cheap shape guard before consulting the structure journal: the type must
+    // bind `num_params` parameters followed by an instance-implicit receiver.
+    let mut cursor = &definition.base.type_;
+    for _ in 0..parameters {
+        tick()?;
+        let ExprNode::ForallE { body, .. } = cursor.node() else {
+            return Ok(None);
+        };
+        cursor = body;
+    }
+    tick()?;
+    let ExprNode::ForallE { binder_info, .. } = cursor.node() else {
+        return Ok(None);
+    };
+    if *binder_info != BinderInfo::InstImplicit {
+        return Ok(None);
+    }
+    let Ok(structures) = ImportedStructures::read(environment) else {
+        return Ok(None);
+    };
+    let Some(entry) = structures.get(&struct_name) else {
+        return Ok(None);
+    };
+    let Some(parent) = entry
+        .parents
+        .iter()
+        .find(|parent| !parent.subobject && parent.projection == definition.base.name)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(AuxParentProjection {
+        structure: struct_name,
+        parent: parent.name.clone(),
+        parameters,
+    }))
 }
 
 pub(crate) fn class_projection<E>(

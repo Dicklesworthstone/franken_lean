@@ -207,6 +207,14 @@ pub const ROWS: &[Row] = &[
         "Lean/Meta/SynthInstance.lean:24",
         Honored,
     ),
+    // Read by `Context::unify_pending` (`source.rs`) and `synthesize_instance_input`
+    // (`instances/parameters.rs`).
+    row(
+        "maxSynthPendingDepth",
+        Nat(1),
+        "Lean/Meta/Basic.lean:456",
+        Honored,
+    ),
     row(
         "maxRecDepth",
         Nat(512),
@@ -1081,6 +1089,7 @@ mod tests {
                 "stderrAsMessages",
                 "maxHeartbeats",
                 "synthInstance.maxSize",
+                "maxSynthPendingDepth",
                 "autoImplicit",
                 "Elab.async",
                 "linter.all",

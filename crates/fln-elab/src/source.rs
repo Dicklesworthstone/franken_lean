@@ -764,6 +764,11 @@ struct Context {
     equations: Vec<SourceEquation>,
     stalled_flush: Option<StalledFlush>,
     instance_goals: Vec<MVarId>,
+    /// Natural metavariables belonging to a `simp` rule's `[..]` parameters that
+    /// unification may synthesize via `synthPending` when a class projection is
+    /// stuck on them (`Lean/Meta/SynthInstance.lean:949-959`), without making
+    /// them `SyntheticOpaque` or forcing synthesis before matching.
+    pending_synth_holes: std::collections::HashSet<MVarId>,
     instance_origins: std::collections::HashMap<MVarId, instances::InstanceGoalOrigin>,
     // Generated untyped binders can acquire a class type only after their
     // introduction, without becoming local instances. Ordinary typed locals
@@ -772,8 +777,8 @@ struct Context {
     // Inference/instance goals closed over before they were solved (`instances.rs`).
     bound_metavars: Vec<instances::BoundMetavar>,
     // Nesting of pending instance synthesis started by unification, the pin's
-    // `synthPendingDepth`. Bounded by `MAX_SYNTH_PENDING_DEPTH`.
-    synth_pending_depth: u8,
+    // `synthPendingDepth`. Bounded by `maxSynthPendingDepth`.
+    synth_pending_depth: u64,
     // Nesting of overload trials (`overload.rs`). Bounded by `MAX_OVERLOAD_DEPTH`.
     overload_depth: u8,
     level_params: Vec<Name>,
@@ -997,6 +1002,7 @@ impl Context {
             equations: Vec::new(),
             stalled_flush: None,
             instance_goals: Vec::new(),
+            pending_synth_holes: std::collections::HashSet::new(),
             instance_origins: std::collections::HashMap::new(),
             excluded_local_instances: Default::default(),
             bound_metavars: Vec::new(),
@@ -1854,6 +1860,13 @@ impl Context {
         Ok(result.map(|report| assert!(report.awakened.is_empty(), "private source queue")))
     }
 
+    fn max_synth_pending_depth(&self) -> u64 {
+        self.txn.options.get_nat(
+            &Name::from_components(["maxSynthPendingDepth"]),
+            u64::from(instances::MAX_SYNTH_PENDING_DEPTH),
+        )
+    }
+
     /// One source unification request. A fixed point blocked on one of this
     /// context's instance holes may synthesize it and continue, as the pin's
     /// `isDefEq` calls `synthPending` (vendored Meta/ExprDefEq.lean
@@ -1865,8 +1878,8 @@ impl Context {
         pairs: &[(Expr, Expr)],
         budget: UnificationBudget,
     ) -> Result<Result<UnificationReport, UnificationError>, NatDefinitionElabError> {
-        if self.synth_pending_depth > instances::MAX_SYNTH_PENDING_DEPTH
-            || self.instance_goals.is_empty()
+        if self.synth_pending_depth > self.max_synth_pending_depth()
+            || (self.instance_goals.is_empty() && self.pending_synth_holes.is_empty())
         {
             return Ok(self.txn.unify_many_with(pairs, budget, &|| false));
         }
@@ -4268,7 +4281,10 @@ impl Context {
                                 }
                             }
                             Task::RecordSource(parts, expected, mut sources) => {
-                                sources.push(values.pop().expect("record update source visit"));
+                                let source = values.pop().expect("record update source visit");
+                                let source = self
+                                    .insert_implicits(source, ImplicitInsertion::FieldReceiver)?;
+                                sources.push(source);
                                 tasks.push(Task::RecordPrepare(parts, expected, sources));
                             }
                             Task::RecordNext(mut state) => {

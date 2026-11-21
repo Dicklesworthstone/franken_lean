@@ -34,7 +34,7 @@ impl Context {
         let ExprNode::MVar { id } = argument.node() else {
             return Ok(());
         };
-        if self.synth_pending_depth > MAX_SYNTH_PENDING_DEPTH {
+        if self.synth_pending_depth > self.max_synth_pending_depth() {
             return Ok(());
         }
         let declaration = self
