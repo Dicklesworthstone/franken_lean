@@ -1,12 +1,13 @@
 //! Source record signatures elaborate through the same bidirectional context as
 //! ordinary definitions. Result universes follow field domains unless explicit.
 use super::*;
+mod constructor;
 mod flat;
 mod parents;
 use crate::records::defaults::{RecordDefault, helper_name, inherited_helper_name};
 use crate::records::imported::{StructureEntry, StructureField, StructureParent};
 use crate::records::inheritance::RecordParent;
-use crate::records::{RecordBudget, RecordSpec, record_declarations};
+use crate::records::{RecordBudget, RecordSpec, record_declarations_with_constructor};
 
 #[derive(Debug)]
 pub struct SourceRecord {
@@ -220,6 +221,10 @@ pub(super) fn elaborate_record_scoped(
     )?;
     let own = super::own_short_name(name);
     let mut context = Context::scoped(environment, kernel, &scope)?;
+    let user_name = context
+        .source_scope
+        .user_declaration_name(name)
+        .map_err(|error| failure(SourceInferenceError::NameScope(error)))?;
     let name = &context.enter_declaration(name)?;
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
@@ -260,25 +265,29 @@ pub(super) fn elaborate_record_scoped(
     let mut inheritance = context.record_parents(&parts[3], name, is_class, budget)?;
     let mut labels = std::mem::take(&mut inheritance.labels);
     let mut inferred = inheritance.level.clone();
-    let fields = match expect_null_args(&parts[4], "record body")? {
-        [] => &[][..],
+    let (constructor, fields) = match expect_null_args(&parts[4], "record body")? {
+        [] => (Name::from_components(["mk"]), &[][..]),
         [keyword, ctor, fields] => {
             // `where`, or the pin's older `:=` (`" := " <|> " where "`), for which the pin's
             // `expandFields` only logs a deprecation lint, a warning.
             if expect_atom(keyword, ":=", "record body keyword").is_err() {
                 expect_atom(keyword, "where", "record body keyword")?;
             }
-            expect_empty_null(ctor, "unsupported custom constructor")?;
+            let constructor = constructor::name(ctor, &root[0])?;
             let fields = expect_node(
                 fields,
                 &parser_kind(&["Command", "structFields"]),
                 1,
                 "record fields",
             )?;
-            expect_null_args(&fields[0], "record field array")?
+            (
+                constructor,
+                expect_null_args(&fields[0], "record field array")?,
+            )
         }
         _ => return Err(failure(SourceInferenceError::Scope)),
     };
+    let constructor_name = context.record_constructor_name(name, &user_name, &constructor)?;
     let fields = &simple_fields(fields)?;
     if parameters.len().saturating_add(fields.len()) > budget.max_binders {
         return Err(failure(SourceInferenceError::Record(
@@ -619,8 +628,13 @@ pub(super) fn elaborate_record_scoped(
             is_class,
         };
         let saved = std::mem::replace(&mut context.txn.lctx, record_header);
-        let generated =
-            context.record_default_overrides(&provisional, &inheritance, &overrides, budget);
+        let generated = context.record_default_overrides(
+            &provisional,
+            &constructor_name,
+            &inheritance,
+            &overrides,
+            budget,
+        );
         context.txn.lctx = saved;
         for helper in generated? {
             if let Declaration::Defn(definition) = &helper {
@@ -755,12 +769,24 @@ pub(super) fn elaborate_record_scoped(
         result_level,
         is_class,
     };
-    context.record_flat_defaults(&spec, &inheritance, &mut helpers, &mut defaults, budget)?;
-    let mut declarations =
-        record_declarations(&spec, budget).map_err(|e| failure(SourceInferenceError::Record(e)))?;
-    let flat_constructor = Name::str(Name::str(name.clone(), "mk"), "_flat_ctor");
-    let flat_declarations =
-        context.record_flat_constructor(&spec, &inheritance, &declared_defaults, budget)?;
+    context.record_flat_defaults(
+        &spec,
+        &constructor_name,
+        &inheritance,
+        &mut helpers,
+        &mut defaults,
+        budget,
+    )?;
+    let mut declarations = record_declarations_with_constructor(&spec, &constructor, budget)
+        .map_err(|e| failure(SourceInferenceError::Record(e)))?;
+    let flat_constructor = Name::str(constructor_name.clone(), "_flat_ctor");
+    let flat_declarations = context.record_flat_constructor(
+        &spec,
+        &constructor_name,
+        &inheritance,
+        &declared_defaults,
+        budget,
+    )?;
     let mut default_helpers = Vec::new();
     for helper in &helpers {
         context.tick()?;

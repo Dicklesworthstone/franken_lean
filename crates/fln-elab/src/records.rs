@@ -356,7 +356,25 @@ pub fn record_declarations(
     spec: &RecordSpec,
     budget: RecordBudget,
 ) -> Result<Vec<Declaration>, RecordError> {
-    if spec.name.is_anonymous() {
+    record_declarations_with_constructor(spec, &Name::from_components(["mk"]), budget)
+}
+
+/// Generate a record using the constructor name written after its header.
+/// The name is a suffix relative to the record, as in the pin's `expandCtor`;
+/// qualified suffixes retain every component in the recursor's minor binder.
+/// The ordinary builder above retains the default `mk` API for callers that
+/// do not elaborate an explicit source constructor.
+pub fn record_declarations_with_constructor(
+    spec: &RecordSpec,
+    constructor_name: &Name,
+    budget: RecordBudget,
+) -> Result<Vec<Declaration>, RecordError> {
+    if spec.name.is_anonymous() || constructor_name.is_anonymous() {
+        return Err(RecordError::InvalidName);
+    }
+    let ctor = spec.name.append_core(constructor_name);
+    let rec = Name::str(spec.name.clone(), "rec");
+    if ctor == rec {
         return Err(RecordError::InvalidName);
     }
     if spec.parameters.len().saturating_add(spec.fields.len()) > budget.max_binders
@@ -387,7 +405,8 @@ pub fn record_declarations(
         };
         if !field.user_name.parent().is_anonymous()
             || label.is_empty()
-            || matches!(label, "mk" | "rec")
+            || spec.name.append_core(&field.user_name) == ctor
+            || label == "rec"
         {
             return Err(RecordError::InvalidName);
         }
@@ -397,8 +416,6 @@ pub fn record_declarations(
     }
     let params = u32::try_from(spec.parameters.len()).map_err(|_| RecordError::ResourceLimit)?;
     let fields = u32::try_from(spec.fields.len()).map_err(|_| RecordError::ResourceLimit)?;
-    let ctor = Name::str(spec.name.clone(), "mk");
-    let rec = Name::str(spec.name.clone(), "rec");
     let levels: Vec<_> = spec
         .level_params
         .iter()
@@ -437,7 +454,9 @@ pub fn record_declarations(
         false,
         false,
     )?;
-    let minor = fresh(&mut used, "mk", minor_type, BinderInfo::Default);
+    let mut minor = fresh(&mut used, "mk", minor_type, BinderInfo::Default);
+    // kernel/inductive.cpp uses the complete suffix after the family name.
+    minor.user_name = constructor_name.clone();
     let rec_type = builder.close(
         std::slice::from_ref(&major),
         Expr::app(fv(&motive), fv(&major)),

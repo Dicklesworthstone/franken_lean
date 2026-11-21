@@ -1167,31 +1167,29 @@ fn tactic_pattern_bindings_are_refused_after_parsing() {
 }
 
 /// Constructor docs: an `inductive` without `where` whose constructors carry doc comments is
-/// admitted (a doc has no meaning to the kernel); a structure's named constructor after its doc or
-/// `private` (`structCtor`) is refused, as a named constructor always is.
+/// admitted (a doc has no meaning to the kernel). A structure's named constructor
+/// retains its doc slot; constructor-only visibility remains a typed nonanswer.
 #[test]
 fn constructor_docs_lead_their_constructors() {
     check(
         "inductive CD3\n  /-- One. -/\n  | one\n  /-- Two. -/\n  | two\n\
          def cd3 : CD3 := CD3.two\n",
     );
+    check(
+        "structure CD1 where\n  /-- The constructor. -/\n  mk ::\n  x : Nat\n\
+         def cd1 : CD1 := CD1.mk 7\n\
+         theorem cd1_value : cd1.x = 7 := rfl\n",
+    );
     let (engine, limits) = engine();
-    for source in [
-        "structure CD1 where\n  /-- The constructor. -/\n  mk ::\n  x : Nat\n",
-        "structure CD2 where\n  private mk ::\n  x : Nat\n",
-    ] {
-        assert!(
-            !matches!(
-                engine.check_source_files(
-                    &[source.as_bytes()],
-                    &KVMap::new(),
-                    SourceCheckLimits::new(limits),
-                ),
-                Ok(fln::Outcome::Complete(_))
-            ),
-            "{source}"
-        );
-    }
+    let source = "structure CD2 where\n  private mk ::\n  x : Nat\n";
+    let error = engine
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .expect_err("private constructor publication is not yet supported");
+    assert_eq!(error.disposition(), ("capability", false, 5), "{error:?}");
 }
 
 /// A structure's or class's modifiers (`private`, `@[ext]`, `public`) build the pin's

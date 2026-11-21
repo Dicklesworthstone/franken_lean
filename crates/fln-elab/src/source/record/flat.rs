@@ -73,6 +73,7 @@ impl Context {
     fn record_flat_fields(
         &mut self,
         spec: &RecordSpec,
+        constructor: &Name,
         inheritance: &Inheritance,
         budget: RecordBudget,
     ) -> Result<(Vec<LocalDecl>, Expr), NatDefinitionElabError> {
@@ -95,10 +96,9 @@ impl Context {
             .iter()
             .cloned()
             .fold(Expr::const_(spec.name.clone(), levels.clone()), Expr::app);
-        let ctor_name = Name::str(spec.name.clone(), "mk");
         let value = parameters
             .into_iter()
-            .fold(Expr::const_(ctor_name.clone(), levels), Expr::app);
+            .fold(Expr::const_(constructor.clone(), levels), Expr::app);
         let type_ = closer
             .close(&spec.fields, target.clone(), false, false)
             .map_err(problem)?;
@@ -211,6 +211,7 @@ impl Context {
     pub(super) fn record_default_overrides(
         &mut self,
         spec: &RecordSpec,
+        constructor_name: &Name,
         inheritance: &Inheritance,
         overrides: &[DefaultOverride],
         budget: RecordBudget,
@@ -232,7 +233,8 @@ impl Context {
             };
             pending.extend(entry.parents.iter().map(|parent| parent.name.clone()));
         }
-        let (fields, constructor) = self.record_flat_fields(spec, inheritance, budget)?;
+        let (fields, constructor) =
+            self.record_flat_fields(spec, constructor_name, inheritance, budget)?;
         let (_, arguments) = operators::spine(&constructor);
         let physical = arguments
             .get(spec.parameters.len()..)
@@ -546,6 +548,7 @@ impl Context {
     pub(super) fn record_flat_defaults(
         &mut self,
         spec: &RecordSpec,
+        constructor_name: &Name,
         inheritance: &Inheritance,
         helpers: &mut [Declaration],
         defaults: &mut Vec<RecordDefault>,
@@ -560,7 +563,8 @@ impl Context {
         }
         let saved = self.txn.lctx.clone();
         let result = (|| {
-            let (fields, constructor) = self.record_flat_fields(spec, inheritance, budget)?;
+            let (fields, constructor) =
+                self.record_flat_fields(spec, constructor_name, inheritance, budget)?;
             let (_, arguments) = operators::spine(&constructor);
             if arguments.len() != spec.parameters.len().saturating_add(spec.fields.len()) {
                 return Err(problem(crate::records::RecordError::InvalidTelescope));
@@ -626,13 +630,15 @@ impl Context {
     pub(super) fn record_flat_constructor(
         &mut self,
         spec: &RecordSpec,
+        constructor_name: &Name,
         inheritance: &Inheritance,
         declared_defaults: &[Name],
         budget: RecordBudget,
     ) -> Result<Vec<Declaration>, NatDefinitionElabError> {
         let saved = self.txn.lctx.clone();
         let result = (|| {
-            let (fields, value) = self.record_flat_fields(spec, inheritance, budget)?;
+            let (fields, value) =
+                self.record_flat_fields(spec, constructor_name, inheritance, budget)?;
             let mut closer = crate::records::Builder {
                 remaining: budget.max_nodes,
             };
@@ -647,7 +653,6 @@ impl Context {
                 ),
                 |target, parameter| Expr::app(target, Expr::fvar(parameter.id.clone())),
             );
-            let ctor_name = Name::str(spec.name.clone(), "mk");
             let mut declarations = self.record_flat_inherited_defaults(
                 spec,
                 inheritance,
@@ -666,7 +671,7 @@ impl Context {
             let value = closer
                 .close(&spec.parameters, value, true, true)
                 .map_err(problem)?;
-            let name = Name::str(ctor_name, "_flat_ctor");
+            let name = Name::str(constructor_name.clone(), "_flat_ctor");
             declarations.insert(
                 0,
                 Declaration::Defn(DefinitionVal {

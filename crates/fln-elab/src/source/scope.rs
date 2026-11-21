@@ -385,7 +385,7 @@ impl SourceScope {
         Name::from_components(suffix.iter().rev().map(String::as_str))
     }
 
-    fn user_declaration_name(&self, name: &Name) -> Result<Name, ScopeError> {
+    pub(super) fn user_declaration_name(&self, name: &Name) -> Result<Name, ScopeError> {
         // A literal name in a command quotation carries a fresh macro scope.
         // Validate only its source-name portion, qualify that portion in the
         // invocation namespace, and retain the complete hygiene identity.
@@ -967,29 +967,41 @@ impl Context {
             .source_scope
             .user_declaration_name(name)
             .map_err(error)?;
-        if self.source_scope.private_module.is_some()
-            && !self.source_scope.public_declarations
-            && self.txn.env.contains(&user_name)
-        {
-            return Err(error(ScopeError::PrivateShadowsPublic(user_name)));
-        }
-        self.source_scope
-            .check_public_name(&user_name, &self.txn.env)?;
         let name = self.source_scope.declaration_name(name).map_err(error)?;
-        let private = self.source_scope.private_name(&user_name);
-        if reserved::is_declared_auxiliary(&self.txn.env, &name)
-            || reserved::is_declared_auxiliary(&self.txn.env, &user_name)
-        {
-            return Err(error(ScopeError::AuxiliaryDeclared(name)));
-        }
-        if reserved::is_reserved(&self.txn.env, &user_name)
-            || reserved::is_reserved(&self.txn.env, &private)
-        {
-            return Err(error(ScopeError::ReservedName(name)));
-        }
+        self.check_qualified_declaration_name(&name, &user_name)?;
         // Hygiene is attached to the declaration name, not its lexical namespace.
         self.source_scope.namespace = user_name.erase_macro_scopes().parent();
         Ok(name)
+    }
+
+    /// Generated members already have a qualified name. Reuse the declaration
+    /// policy without parsing their scoped parent as a fresh source identifier:
+    /// a constructor suffix may follow the parent's numeric macro-scope tags.
+    pub(super) fn check_qualified_declaration_name(
+        &mut self,
+        name: &Name,
+        user_name: &Name,
+    ) -> Result<(), NatDefinitionElabError> {
+        if self.source_scope.private_module.is_some()
+            && !self.source_scope.public_declarations
+            && self.txn.env.contains(user_name)
+        {
+            return Err(error(ScopeError::PrivateShadowsPublic(user_name.clone())));
+        }
+        self.source_scope
+            .check_public_name(user_name, &self.txn.env)?;
+        let private = self.source_scope.private_name(user_name);
+        if reserved::is_declared_auxiliary(&self.txn.env, name)
+            || reserved::is_declared_auxiliary(&self.txn.env, user_name)
+        {
+            return Err(error(ScopeError::AuxiliaryDeclared(name.clone())));
+        }
+        if reserved::is_reserved(&self.txn.env, user_name)
+            || reserved::is_reserved(&self.txn.env, &private)
+        {
+            return Err(error(ScopeError::ReservedName(name.clone())));
+        }
+        Ok(())
     }
 
     /// `ensureEqnReservedNamesAvailable`, which the pin runs for every definition, theorem,
