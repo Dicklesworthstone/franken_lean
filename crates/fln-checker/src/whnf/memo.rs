@@ -29,10 +29,43 @@
 //!   would have;
 //! - only complete results are recorded.
 use super::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::Mutex;
+
+/// Zero-overhead pass-through hasher for tables whose keys are already
+/// 64-bit fingerprints mixed by `Fingerprinter` (never iterated for semantics).
+#[derive(Default)]
+pub(crate) struct IdentityU64Hasher(u64);
+
+impl Hasher for IdentityU64Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut fp = Fingerprinter(self.0);
+        fp.write(bytes);
+        self.0 = fp.finish();
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.0 = value as u64;
+    }
+}
+
+pub(crate) type PrehashedMap<V> = HashMap<u64, V, BuildHasherDefault<IdentityU64Hasher>>;
+pub(crate) type FastHashMap<K, V> = HashMap<K, V, BuildHasherDefault<Fingerprinter>>;
+pub(crate) type FastHashSet<K> = HashSet<K, BuildHasherDefault<Fingerprinter>>;
 
 struct Entry {
     input: Arc<WireExpr>,
@@ -104,10 +137,10 @@ struct GateEntry {
 struct Table {
     /// Keyed by a fixed fingerprint, so the order of results never depends on the
     /// process; entries in a bucket are compared exactly.
-    buckets: HashMap<u64, Vec<Entry>>,
+    buckets: PrehashedMap<Vec<Entry>>,
     /// KR-317 gate outcomes by conversion, keyed the same way (see
     /// `WhnfMemo::recall_k_gate`). They share the entry and node bounds.
-    k_gate: HashMap<u64, Vec<GateEntry>>,
+    k_gate: PrehashedMap<Vec<GateEntry>>,
     entries: usize,
     stored_nodes: usize,
 }
@@ -139,7 +172,7 @@ impl fmt::Debug for WhnfMemo {
 /// declaration's check. The materialization sharing table uses it for the same
 /// reason (`sharing::fingerprint`).
 #[derive(Default)]
-pub(super) struct Fingerprinter(u64);
+pub(crate) struct Fingerprinter(u64);
 
 impl Fingerprinter {
     fn add(&mut self, word: u64) {

@@ -605,9 +605,13 @@ type ScopeMemo = std::collections::HashMap<
 /// Per-output-node subject `ExprId` for closed (`external == 0`) subterms.
 pub(crate) type ClosedOrigins = Vec<Option<ExprId>>;
 
-/// Past this many subject nodes a pure copy keys its visits in the map, so its
-/// table never costs more than the arena it indexes could.
-const DENSE_COPY_MAX_NODES: usize = 1 << 22;
+/// Past this many subject nodes a pure copy keys its visits in a sparse map
+/// keyed only by `ExprId`, avoiding allocating and zeroing large dense tables
+/// when copying a small subterm from a large arena.
+const DENSE_COPY_MAX_NODES: usize = 512;
+
+type SparseCopyMemo =
+    std::collections::HashMap<ExprId, ExprId, std::hash::BuildHasherDefault<KeyHasher>>;
 
 /// The visits already rewritten, keyed by what their output depends on.
 enum Visited {
@@ -615,6 +619,8 @@ enum Visited {
     /// binder context. One slot per subject node (its output index plus one; 0 is
     /// unvisited) keeps all of the input's sharing and costs no hashing.
     Copy(Vec<u32>),
+    /// Pure copy from a large arena: pay only for reachable nodes.
+    CopySparse(SparseCopyMemo),
     Keyed(VisitMemo),
 }
 
@@ -624,8 +630,12 @@ impl Visited {
             && matches!(plan.operation, Operation::Raise)
             && matches!(plan.root_mode, Mode::Rewrite { .. });
         let slots = subject_root.index().saturating_add(1);
-        if pure_copy && slots <= DENSE_COPY_MAX_NODES {
-            Visited::Copy(vec![0; slots])
+        if pure_copy {
+            if slots <= DENSE_COPY_MAX_NODES {
+                Visited::Copy(vec![0; slots])
+            } else {
+                Visited::CopySparse(SparseCopyMemo::default())
+            }
         } else {
             Visited::Keyed(VisitMemo::default())
         }
@@ -637,6 +647,7 @@ impl Visited {
                 .get(key.1.index())
                 .and_then(|slot| slot.checked_sub(1))
                 .and_then(|index| ExprId::from_index(index as usize)),
+            Visited::CopySparse(memo) => memo.get(&key.1).copied(),
             Visited::Keyed(memo) => memo.get(key).copied(),
         }
     }
@@ -649,6 +660,9 @@ impl Visited {
                 {
                     *slot = index.saturating_add(1);
                 }
+            }
+            Visited::CopySparse(memo) => {
+                memo.insert(key.1, done);
             }
             Visited::Keyed(memo) => {
                 memo.insert(key, done);
@@ -814,7 +828,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
         }
     }
 
-    fn expression(&self, input: TermInput, id: ExprId) -> Result<&ExprNode, Halt> {
+    fn expression(&self, input: TermInput, id: ExprId) -> Result<&'a ExprNode, Halt> {
         self.input(input)?
             .node(id)
             .ok_or(Halt::Fault(TermFault::MissingExpression {
@@ -972,14 +986,14 @@ impl<'a, 'c> Transformer<'a, 'c> {
                     index: id.index(),
                 }))?
                 .clone();
-            let children = match &node {
-                LevelNode::Succ(child) => vec![*child],
+            let children: [Option<LevelId>; 2] = match &node {
+                LevelNode::Succ(child) => [Some(*child), None],
                 LevelNode::Max(left, right) | LevelNode::IMax(left, right) => {
-                    vec![*left, *right]
+                    [Some(*left), Some(*right)]
                 }
-                LevelNode::Zero | LevelNode::Parameter(_) | LevelNode::Meta(_) => Vec::new(),
+                LevelNode::Zero | LevelNode::Parameter(_) | LevelNode::Meta(_) => [None, None],
             };
-            for child in &children {
+            for child in children.into_iter().flatten() {
                 if child.index() >= id.index() {
                     return Err(Halt::Fault(TermFault::NonBackwardLevelReference {
                         input,
@@ -987,7 +1001,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
                         child: child.index(),
                     }));
                 }
-                if self.input(input)?.level(*child).is_none() {
+                if self.input(input)?.level(child).is_none() {
                     return Err(Halt::Fault(TermFault::MissingLevel {
                         input,
                         index: child.index(),
@@ -996,7 +1010,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
             }
             if !expanded {
                 stack.push((id, true));
-                for child in children.into_iter().rev() {
+                for child in children.into_iter().rev().flatten() {
                     if !self.compact_level_maps[map_index].contains(child.index()) {
                         stack.push((child, false));
                     }
@@ -1307,30 +1321,11 @@ impl<'a, 'c> Transformer<'a, 'c> {
 
         let output_units = expression_owned_units(self.expression(input, id)?);
         self.control.output(output_units, id.index())?;
-        let node = self.expression(input, id)?.clone();
-        match node {
-            ExprNode::Bound { .. } | ExprNode::Free { .. } => {
-                unreachable!("handled before payload reservation")
-            }
-            ExprNode::Meta { name } => self.retain_reserved(ExprNode::Meta { name }, id.index()),
-            ExprNode::Sort { level } => {
-                let level = self.mapped_level(input, level)?;
-                self.retain_reserved(ExprNode::Sort { level }, id.index())
-            }
-            ExprNode::Constant { name, levels } => {
-                let mut mapped = Vec::new();
-                for level in levels {
-                    mapped.push(self.mapped_level(input, level)?);
-                }
-                self.retain_reserved(
-                    ExprNode::Constant {
-                        name,
-                        levels: mapped,
-                    },
-                    id.index(),
-                )
-            }
+        // Avoid cloning `ExprNode` (notably `Constant { levels: Vec<LevelId> }`)
+        // on the hot `Apply`, `Sort`, and `Constant` arms.
+        match self.expression(input, id)? {
             ExprNode::Apply { function, argument } => {
+                let (function, argument) = (*function, *argument);
                 self.tasks.push(Task::Build(Frame::Apply));
                 self.tasks.push(Task::Visit {
                     input,
@@ -1342,8 +1337,40 @@ impl<'a, 'c> Transformer<'a, 'c> {
                     id: function,
                     mode,
                 });
-                Ok(())
+                return Ok(());
             }
+            ExprNode::Sort { level } => {
+                let level = *level;
+                let level = self.mapped_level(input, level)?;
+                return self.retain_reserved(ExprNode::Sort { level }, id.index());
+            }
+            ExprNode::Constant { name, levels } => {
+                let name = name.clone();
+                let source_levels: &[LevelId] = levels;
+                let mut mapped = Vec::with_capacity(source_levels.len());
+                for &level in source_levels {
+                    mapped.push(self.mapped_level(input, level)?);
+                }
+                return self.retain_reserved(
+                    ExprNode::Constant {
+                        name,
+                        levels: mapped,
+                    },
+                    id.index(),
+                );
+            }
+            _ => {}
+        }
+        let node = self.expression(input, id)?.clone();
+        match node {
+            ExprNode::Bound { .. }
+            | ExprNode::Free { .. }
+            | ExprNode::Apply { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Constant { .. } => {
+                unreachable!("handled before cloning")
+            }
+            ExprNode::Meta { name } => self.retain_reserved(ExprNode::Meta { name }, id.index()),
             ExprNode::Lambda {
                 binder_name,
                 binder_type,

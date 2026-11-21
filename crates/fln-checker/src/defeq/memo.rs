@@ -16,8 +16,8 @@
 //! - "equal" is recorded only when the comparison proved it;
 //! - a stop is never recorded.
 use super::*;
-use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use crate::whnf::memo::{Fingerprinter, PrehashedMap};
+use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Remembered {
@@ -41,13 +41,13 @@ const MAX_STORED_NODES: usize = 1 << 20;
 pub(super) struct ArgumentMemo {
     /// Keyed by a fixed-key fingerprint, so the order of answers never depends on
     /// the process; entries in a bucket are compared exactly.
-    buckets: HashMap<u64, Vec<Entry>>,
+    buckets: PrehashedMap<Vec<Entry>>,
     entries: usize,
     stored_nodes: usize,
 }
 
 fn fingerprint(left: &WireExpr, right: &WireExpr, nat_scope: NatReductionScope) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = Fingerprinter::default();
     left.hash(&mut hasher);
     right.hash(&mut hasher);
     nat_scope.hash(&mut hasher);

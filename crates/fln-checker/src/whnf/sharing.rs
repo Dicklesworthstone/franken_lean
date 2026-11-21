@@ -7,8 +7,9 @@
 //! recover that sharing. No recursive comparison or semantic conversion occurs.
 //! Only copies from different input arenas are merged: one input's occurrence
 //! shape and newly built application nodes retain their original behavior.
-use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
+
+use super::memo::PrehashedMap;
 
 // Retention is optional: a full table or bucket declines new entries, never
 // changes a term's meaning or raises a semantic checking limit. The table owns
@@ -18,7 +19,7 @@ const MAX_BUCKET: usize = 8;
 
 #[derive(Default)]
 pub(super) struct Interned {
-    buckets: BTreeMap<u64, Vec<(usize, usize)>>,
+    buckets: PrehashedMap<Vec<(usize, usize)>>,
     entries: usize,
 }
 

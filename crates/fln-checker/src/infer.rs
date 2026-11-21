@@ -281,6 +281,32 @@ impl InferenceContext {
             reduction: Arc::clone(&self.reduction),
         })
     }
+
+    /// Build a scoped child context sharing an already-populated `WhnfContext`
+    /// (preserving its `WhnfMemo`, projection rules, constants, and scope).
+    fn with_shared_reduction(
+        &self,
+        locals: Vec<LocalDeclaration>,
+        reduction: Arc<WhnfContext>,
+    ) -> Result<InferenceContext, InferenceContextRefusal> {
+        let mut local_indexes = BTreeMap::new();
+        for (index, local) in locals.iter().enumerate() {
+            if let Some(first) = local_indexes.insert(local.name().clone(), index) {
+                return Err(InferenceContextRefusal::DuplicateLocal {
+                    name: local.name().clone(),
+                    first,
+                    second: index,
+                });
+            }
+        }
+        Ok(InferenceContext {
+            locals: Arc::new(locals),
+            local_indexes: Arc::new(local_indexes),
+            level_parameters: Arc::clone(&self.level_parameters),
+            level_parameter_set: Arc::clone(&self.level_parameter_set),
+            reduction,
+        })
+    }
 }
 
 /// `InferOnly` omits admission-only quarantine checks. Constant arity remains
@@ -2362,12 +2388,12 @@ struct InferenceEngine<'a> {
     continuations: Vec<Continuation>,
     /// Per-node facts of each arena, derived once per arena rather than once
     /// per subterm dispatched from it.
-    arena_facts: std::collections::HashMap<ArenaSource, Arc<Vec<TermFacts>>>,
+    arena_facts: crate::whnf::memo::FastHashMap<ArenaSource, Arc<Vec<TermFacts>>>,
     /// The type of every reference already inferred in this run. Arenas are
     /// immutable and append-only, so a reference denotes one term for the whole
     /// run, and it is dispatched only inside the scope of the locals it names:
     /// a subterm shared in the input is inferred once, not once per occurrence.
-    inferred_types: std::collections::HashMap<TermReference, WireExpr>,
+    inferred_types: crate::whnf::memo::FastHashMap<TermReference, WireExpr>,
 }
 
 enum TelescopeSchedule {
@@ -4054,14 +4080,10 @@ impl<'a> InferenceEngine<'a> {
             };
             locals.push(local);
         }
-        let context = InferenceContext::new_with_projection_rules(
-            locals,
-            self.context.level_parameters().to_vec(),
-            self.reduction.projection_rules().to_vec(),
-            self.context.constants().clone(),
-        )
-        .map_err(|_| LeafHalt::Fault(InferenceFault::EmptyWorklist))?
-        .admitting(self.context.scope());
+        let context = self
+            .context
+            .with_shared_reduction(locals, Arc::new(self.reduction.as_ref().clone()))
+            .map_err(|_| LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
         let mut budget = self.control.budget;
         budget.max_steps = budget.max_steps.saturating_sub(self.control.progress.steps);
         match proof_conversion_with(
@@ -4416,8 +4438,8 @@ fn infer_policy(
         reserved_names: None,
         next_local_identity: 0,
         continuations: Vec::new(),
-        arena_facts: std::collections::HashMap::new(),
-        inferred_types: std::collections::HashMap::new(),
+        arena_facts: crate::whnf::memo::FastHashMap::default(),
+        inferred_types: crate::whnf::memo::FastHashMap::default(),
     }
     .run();
     finish(result, control.progress)

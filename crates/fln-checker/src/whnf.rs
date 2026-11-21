@@ -11,7 +11,7 @@
 //! their constructor rule is applied. Native extensions remain outside this layer.
 
 mod free_bindings;
-mod memo;
+pub(crate) mod memo;
 mod quotient;
 mod sharing;
 
@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
-use memo::WhnfMemo;
+use memo::{FastHashMap, WhnfMemo};
 
 /// Work the KR-317 gate's conversion may spend (see
 /// `Reducer::k_constructor_types_convert`): comparisons, normalizations, WHNF
@@ -1080,17 +1080,17 @@ struct Reducer<'a, 'c> {
     /// of offering it again.
     skip_nat: bool,
     /// `ArenaFacts` by arena address; each entry holds its arena.
-    facts: std::collections::HashMap<usize, ArenaFacts>,
+    facts: FastHashMap<usize, ArenaFacts>,
     /// Each String literal's shared expansion (`expand_string`).
-    string_expansions: std::collections::HashMap<String, Cursor>,
+    string_expansions: FastHashMap<String, Cursor>,
     /// Instantiated definition bodies and recursor rules by subject address and
     /// universe values (`Reducer::instantiated`).
-    bodies: std::collections::HashMap<(usize, String), Arc<WireExpr>>,
+    bodies: FastHashMap<(usize, String), Arc<WireExpr>>,
     /// Shared evaluations by pointer structure (`Reducer::keyed`). Each entry
     /// holds the cursor its key was taken from, which keeps every address in the
     /// key alive, so an address can never be reused for another term while it
     /// is a key.
-    keyed_thunks: std::collections::HashMap<WhnfKey, (Cursor, Arc<Thunk>)>,
+    keyed_thunks: FastHashMap<WhnfKey, (Cursor, Arc<Thunk>)>,
     /// This run's materialized input, which a result that changed nothing
     /// reuses (`Reducer::unchanged_input`).
     entry: Option<Arc<WireExpr>>,
@@ -1274,15 +1274,24 @@ impl<'a, 'c> Reducer<'a, 'c> {
         I: IntoIterator<Item = &'b Cursor>,
     {
         self.control.step(function.root.index(), self.cancelled)?;
+        let args: Vec<&'b Cursor> = arguments.into_iter().collect();
+        // Cross-source sharing can only ever match nodes from two distinct
+        // source arenas; skip the sharing table when every input lives in one
+        // closed arena.
+        let single_closed_source = function.env.is_empty()
+            && args
+                .iter()
+                .all(|arg| arg.env.is_empty() && Arc::ptr_eq(&arg.arena, &function.arena));
         let mut composer = Composer::new(
             self.control.budget.materialization,
             WhnfPhase::RebuildApplication,
             self.control.steps,
             self.control.reductions,
             self.cancelled,
-        );
+        )
+        .with_sharing(!single_closed_source);
         let mut root = composer.copy_cursor(function, 0)?;
-        for (index, argument) in arguments.into_iter().enumerate() {
+        for (index, argument) in args.into_iter().enumerate() {
             let argument = composer.copy_cursor(argument, index.saturating_add(1))?;
             root = composer.push_expression(
                 ExprNode::Apply {
@@ -1321,7 +1330,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
             self.control.steps,
             self.control.reductions,
             self.cancelled,
-        );
+        )
+        .with_sharing(!expression.env.is_empty());
         let expression = composer.copy_cursor(expression, 0)?;
         composer
             .control
@@ -1747,11 +1757,14 @@ impl<'a, 'c> Reducer<'a, 'c> {
         if !potential {
             return Ok(spine);
         }
-        let cursor = self.build_spine(spine)?;
-        let term = if cursor.env.is_empty() {
-            self.materialize_wire(&cursor.arena, cursor.root, WhnfPhase::Iota)?
+        let term = if !spine.args.is_empty() {
+            let cursor = self.compose_application(&spine.head, &spine.args)?;
+            self.control.step(cursor.root.index(), self.cancelled)?;
+            WireExpr::clone(&cursor.arena)
+        } else if spine.head.env.is_empty() {
+            self.materialize_wire(&spine.head.arena, spine.head.root, WhnfPhase::Iota)?
         } else {
-            self.close(&cursor, WhnfPhase::Iota)?
+            self.close(&spine.head, WhnfPhase::Iota)?
         };
         let reduced = self.reduce_demanded_nat(term)?;
         let (head, args) = self.peel_application(&reduced)?;
@@ -1811,7 +1824,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
             self.control.steps,
             self.control.reductions,
             self.cancelled,
-        );
+        )
+        .with_sharing(!cursor.env.is_empty());
         let root = composer.copy_cursor(cursor, 0)?;
         Ok(composer.finish(root))
     }
@@ -2842,7 +2856,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
             self.control.steps,
             self.control.reductions,
             &mut *self.cancelled,
-        );
+        )
+        .with_sharing(false);
         // Admit the largest output before allocating its limb storage.
         composer
             .control
@@ -3911,12 +3926,20 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 WireExpr::clone(&input)
             }
             None => {
-                let current = self.build_spine(stuck)?;
-                if current.env.is_empty() {
+                if !stuck.args.is_empty() {
+                    // `compose_application` already constructs a compact, closed,
+                    // materialization-budgeted arena with `current.root == current.arena.root()`;
+                    // skip the redundant `copy_subterm_with` pass while keeping the
+                    // exact step charge.
+                    let current = self.compose_application(&stuck.head, &stuck.args)?;
+                    self.control.step(current.root.index(), self.cancelled)?;
                     self.copied_result = true;
-                    self.materialize_wire(&current.arena, current.root, WhnfPhase::Final)?
+                    WireExpr::clone(&current.arena)
+                } else if stuck.head.env.is_empty() {
+                    self.copied_result = true;
+                    self.materialize_wire(&stuck.head.arena, stuck.head.root, WhnfPhase::Final)?
                 } else {
-                    self.close(&current, WhnfPhase::Final)?
+                    self.close(&stuck.head, WhnfPhase::Final)?
                 }
             }
         };
@@ -4027,6 +4050,48 @@ impl<'c> Materialization<'c> {
     }
 }
 
+const DENSE_SOURCE_MAX_NODES: usize = 256;
+
+/// Per-source node/level translation table: dense `Vec` for small arenas,
+/// sparse `FastHashMap` for large arenas so copying a small subterm from a
+/// large proof arena never allocates and zeroes hundreds of kilobytes.
+enum SlotMap<T: Copy> {
+    Dense(Vec<Option<T>>),
+    Sparse(FastHashMap<usize, T>),
+}
+
+impl<T: Copy> SlotMap<T> {
+    fn for_len(len: usize) -> Self {
+        if len <= DENSE_SOURCE_MAX_NODES {
+            Self::Dense(vec![None; len])
+        } else {
+            Self::Sparse(FastHashMap::default())
+        }
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> Option<T> {
+        match self {
+            Self::Dense(slots) => slots.get(index).copied().flatten(),
+            Self::Sparse(map) => map.get(&index).copied(),
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, index: usize, value: T) {
+        match self {
+            Self::Dense(slots) => {
+                if let Some(slot) = slots.get_mut(index) {
+                    *slot = Some(value);
+                }
+            }
+            Self::Sparse(map) => {
+                map.insert(index, value);
+            }
+        }
+    }
+}
+
 struct Composer<'c> {
     control: Materialization<'c>,
     phase: WhnfPhase,
@@ -4036,23 +4101,24 @@ struct Composer<'c> {
     expressions: Vec<ExprNode>,
     sources: Vec<SourceCopy>,
     /// `sources` by arena address.
-    source_lookup: std::collections::HashMap<usize, usize>,
+    source_lookup: FastHashMap<usize, usize>,
     /// Environment copies, shared by every cursor this composer copies: one
     /// closure reached from two arguments is copied once.
     open_contexts: OpenContexts,
-    open_memo: std::collections::HashMap<OpenKey, ExprId>,
+    open_memo: FastHashMap<OpenKey, ExprId>,
+    enable_sharing: bool,
     shared_levels: sharing::Interned,
     shared_expressions: sharing::Interned,
 }
 
 struct SourceCopy {
     arena: Arc<WireExpr>,
-    levels: Vec<Option<LevelId>>,
-    expressions: Vec<Option<ExprId>>,
+    levels: SlotMap<LevelId>,
+    expressions: SlotMap<ExprId>,
     /// Loose bound-variable range of each node reached by an environment copy:
     /// a node below that many binders is closed there, so its copy is the plain
     /// one whatever the environment.
-    loose: std::collections::HashMap<usize, u32>,
+    loose: FastHashMap<usize, u32>,
 }
 
 /// One node of an environment copy: `node` of `context`'s arena, at `depth`
@@ -4081,7 +4147,7 @@ enum OpenWork {
 #[derive(Default)]
 struct OpenContexts {
     list: Vec<(usize, Env)>,
-    lookup: std::collections::HashMap<(usize, usize), usize>,
+    lookup: FastHashMap<(usize, usize), usize>,
 }
 
 impl OpenContexts {
@@ -4141,16 +4207,22 @@ impl<'c> Composer<'c> {
             levels: Vec::new(),
             expressions: Vec::new(),
             sources: Vec::new(),
-            source_lookup: std::collections::HashMap::new(),
+            source_lookup: FastHashMap::default(),
             open_contexts: OpenContexts::default(),
-            open_memo: std::collections::HashMap::new(),
+            open_memo: FastHashMap::default(),
+            enable_sharing: true,
             shared_levels: sharing::Interned::default(),
             shared_expressions: sharing::Interned::default(),
         }
     }
 
+    fn with_sharing(mut self, enable_sharing: bool) -> Self {
+        self.enable_sharing = enable_sharing;
+        self
+    }
+
     fn prior_level(
-        mapping: &[Option<LevelId>],
+        mapping: &SlotMap<LevelId>,
         input: usize,
         parent: usize,
         child: LevelId,
@@ -4164,8 +4236,6 @@ impl<'c> Composer<'c> {
         }
         mapping
             .get(child.index())
-            .copied()
-            .flatten()
             .ok_or(ComposeHalt::Fault(WhnfFault::MissingLevel {
                 input,
                 index: child.index(),
@@ -4173,7 +4243,7 @@ impl<'c> Composer<'c> {
     }
 
     fn prior_expression(
-        mapping: &[Option<ExprId>],
+        mapping: &SlotMap<ExprId>,
         input: usize,
         parent: usize,
         child: ExprId,
@@ -4189,8 +4259,6 @@ impl<'c> Composer<'c> {
         }
         mapping
             .get(child.index())
-            .copied()
-            .flatten()
             .ok_or(ComposeHalt::Fault(WhnfFault::MissingExpression {
                 input,
                 index: child.index(),
@@ -4203,14 +4271,19 @@ impl<'c> Composer<'c> {
         at: usize,
         source: usize,
     ) -> Result<LevelId, ComposeHalt> {
-        let hash = sharing::fingerprint(&node);
-        if let Some(id) = self
-            .shared_levels
-            .find(hash, &node, &self.levels, source)
-            .and_then(LevelId::from_index)
-        {
-            return Ok(id);
-        }
+        let hash = if self.enable_sharing {
+            let hash = sharing::fingerprint(&node);
+            if let Some(id) = self
+                .shared_levels
+                .find(hash, &node, &self.levels, source)
+                .and_then(LevelId::from_index)
+            {
+                return Ok(id);
+            }
+            Some(hash)
+        } else {
+            None
+        };
         let observed = usize_units(self.levels.len()).saturating_add(1);
         self.control.admit_arena_node(observed, at)?;
         let id = LevelId::from_index(self.levels.len()).ok_or(ComposeHalt::Stop(
@@ -4223,7 +4296,9 @@ impl<'c> Composer<'c> {
             },
         ))?;
         self.levels.push(node);
-        self.shared_levels.record(hash, id.index(), source);
+        if let Some(hash) = hash {
+            self.shared_levels.record(hash, id.index(), source);
+        }
         Ok(id)
     }
 
@@ -4246,16 +4321,23 @@ impl<'c> Composer<'c> {
         // arena. Equality here is exact syntax equality, including every name,
         // binder style and metadata value; it is not a conversion judgment.
         // The payload was charged before cloning, even on a sharing hit.
-        let hash = sharing::fingerprint(&node);
-        if let Some(id) = source
-            .and_then(|source| {
-                self.shared_expressions
-                    .find(hash, &node, &self.expressions, source)
-            })
-            .and_then(ExprId::from_index)
-        {
-            return Ok(id);
-        }
+        let hash = if self.enable_sharing {
+            if let Some(source_id) = source {
+                let hash = sharing::fingerprint(&node);
+                if let Some(id) = self
+                    .shared_expressions
+                    .find(hash, &node, &self.expressions, source_id)
+                    .and_then(ExprId::from_index)
+                {
+                    return Ok(id);
+                }
+                Some((hash, source_id))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let observed = usize_units(self.expressions.len()).saturating_add(1);
         self.control.admit_arena_node(observed, at)?;
         let id = ExprId::from_index(self.expressions.len()).ok_or(ComposeHalt::Stop(
@@ -4268,8 +4350,8 @@ impl<'c> Composer<'c> {
             },
         ))?;
         self.expressions.push(node);
-        if let Some(source) = source {
-            self.shared_expressions.record(hash, id.index(), source);
+        if let Some((hash, source_id)) = hash {
+            self.shared_expressions.record(hash, id.index(), source_id);
         }
         Ok(id)
     }
@@ -4283,9 +4365,9 @@ impl<'c> Composer<'c> {
         let index = self.sources.len();
         self.sources.push(SourceCopy {
             arena: Arc::clone(arena),
-            levels: vec![None; arena.levels().len()],
-            expressions: vec![None; arena.nodes().len()],
-            loose: std::collections::HashMap::new(),
+            levels: SlotMap::for_len(arena.levels().len()),
+            expressions: SlotMap::for_len(arena.nodes().len()),
+            loose: FastHashMap::default(),
         });
         self.source_lookup.insert(address, index);
         index
@@ -4362,7 +4444,7 @@ impl<'c> Composer<'c> {
         cursor: &Cursor,
         input: usize,
         contexts: &mut OpenContexts,
-        memo: &mut std::collections::HashMap<OpenKey, ExprId>,
+        memo: &mut FastHashMap<OpenKey, ExprId>,
     ) -> Result<ExprId, Halt> {
         let root = OpenKey {
             context: contexts.of(self.source_index(&cursor.arena), &cursor.env),
@@ -4574,17 +4656,14 @@ impl<'c> Composer<'c> {
         root: LevelId,
         input: usize,
     ) -> Result<LevelId, Halt> {
+        if let Some(mapped) = self.sources[source_index].levels.get(root.index()) {
+            return Ok(mapped);
+        }
         let source = Arc::clone(&self.sources[source_index].arena);
         let mut work = vec![(root, false)];
         while let Some((level_id, built)) = work.pop() {
             let index = level_id.index();
-            if self.sources[source_index]
-                .levels
-                .get(index)
-                .copied()
-                .flatten()
-                .is_some()
-            {
+            if self.sources[source_index].levels.get(index).is_some() {
                 continue;
             }
             let node = source
@@ -4651,13 +4730,11 @@ impl<'c> Composer<'c> {
             let copied = self
                 .push_level(mapped, index, source_index)
                 .map_err(|halt| self.map_halt(halt))?;
-            self.sources[source_index].levels[index] = Some(copied);
+            self.sources[source_index].levels.insert(index, copied);
         }
         self.sources[source_index]
             .levels
             .get(root.index())
-            .copied()
-            .flatten()
             .ok_or(Halt::Fault(WhnfFault::MissingLevel {
                 input,
                 index: root.index(),
@@ -4675,17 +4752,17 @@ impl<'c> Composer<'c> {
     /// Copy a subterm as written: loose indices stay as they are.
     fn copy_plain(&mut self, cursor: &Cursor, input: usize) -> Result<ExprId, Halt> {
         let source_index = self.source_index(&cursor.arena);
+        if let Some(mapped) = self.sources[source_index]
+            .expressions
+            .get(cursor.root.index())
+        {
+            return Ok(mapped);
+        }
         let source = Arc::clone(&self.sources[source_index].arena);
         let mut work = vec![(cursor.root, false)];
         while let Some((expression_id, built)) = work.pop() {
             let index = expression_id.index();
-            if self.sources[source_index]
-                .expressions
-                .get(index)
-                .copied()
-                .flatten()
-                .is_some()
-            {
+            if self.sources[source_index].expressions.get(index).is_some() {
                 continue;
             }
             let node = source
@@ -4827,14 +4904,12 @@ impl<'c> Composer<'c> {
             let id = self
                 .push_expression_charged(mapped, index, Some(source_index))
                 .map_err(|halt| self.map_halt(halt))?;
-            self.sources[source_index].expressions[index] = Some(id);
+            self.sources[source_index].expressions.insert(index, id);
         }
 
         self.sources[source_index]
             .expressions
             .get(cursor.root.index())
-            .copied()
-            .flatten()
             .ok_or(Halt::Fault(WhnfFault::MissingExpression {
                 input,
                 index: cursor.root.index(),
@@ -5168,10 +5243,10 @@ fn whnf_input_at_mode_with(
         string_progress: StringExpansionProgress::default(),
         force_string_delta: false,
         skip_nat: false,
-        facts: std::collections::HashMap::new(),
-        string_expansions: std::collections::HashMap::new(),
-        bodies: std::collections::HashMap::new(),
-        keyed_thunks: std::collections::HashMap::new(),
+        facts: FastHashMap::default(),
+        string_expansions: FastHashMap::default(),
+        bodies: FastHashMap::default(),
+        keyed_thunks: FastHashMap::default(),
         entry: None,
         copied_result: false,
     };

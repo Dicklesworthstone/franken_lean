@@ -67,7 +67,7 @@ struct Probe<'a> {
 /// the run, as `taken` and `answers` require.
 #[derive(Default)]
 struct OpenedLocals {
-    buckets: std::collections::HashMap<u64, Vec<(Taken, WireExpr, WireExpr, WireName)>>,
+    buckets: crate::whnf::memo::PrehashedMap<Vec<(Taken, WireExpr, WireExpr, WireName)>>,
     nodes: usize,
 }
 impl OpenedLocals {
@@ -127,7 +127,7 @@ struct InferredTypes {
 }
 #[derive(Default)]
 struct InferredTypeTable {
-    buckets: std::collections::HashMap<u64, Vec<(WireExpr, Option<WireExpr>)>>,
+    buckets: crate::whnf::memo::PrehashedMap<Vec<(WireExpr, Option<WireExpr>)>>,
     nodes: usize,
 }
 impl InferredTypeTable {
@@ -143,8 +143,8 @@ impl InferredTypes {
     const MAX_GENERATION_NODES: usize = 1 << 20;
     const MAX_BUCKET: usize = 8;
     fn fingerprint(term: &WireExpr) -> u64 {
-        use std::hash::{DefaultHasher, Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        let mut hasher = crate::whnf::memo::Fingerprinter::default();
         term.hash(&mut hasher);
         hasher.finish()
     }
@@ -179,12 +179,12 @@ fn all_free_locals_in_context(term: &WireExpr, context: &InferenceContext) -> bo
 /// A set of term pairs, looked up without copying the terms.
 #[derive(Default)]
 struct PairSet {
-    buckets: std::collections::HashMap<u64, Vec<(WireExpr, WireExpr)>>,
+    buckets: crate::whnf::memo::PrehashedMap<Vec<(WireExpr, WireExpr)>>,
 }
 impl PairSet {
     fn fingerprint(left: &WireExpr, right: &WireExpr) -> u64 {
-        use std::hash::{DefaultHasher, Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        let mut hasher = crate::whnf::memo::Fingerprinter::default();
         left.hash(&mut hasher);
         right.hash(&mut hasher);
         hasher.finish()
@@ -232,7 +232,7 @@ struct PairAnswers {
 }
 #[derive(Default)]
 struct PairTable {
-    buckets: std::collections::HashMap<u64, Vec<(WireExpr, WireExpr, Option<bool>)>>,
+    buckets: crate::whnf::memo::PrehashedMap<Vec<(WireExpr, WireExpr, Option<bool>)>>,
     nodes: usize,
 }
 impl PairTable {
@@ -1305,8 +1305,8 @@ impl Probe<'_> {
         // terms means the same thing in every context of one run. Binder and
         // eta tasks are keyed before they open a fresh local, since the pairs
         // they produce then differ in that local's name.
-        let mut taken: std::collections::HashSet<(Taken, WireExpr, WireExpr)> =
-            std::collections::HashSet::new();
+        let mut taken: crate::whnf::memo::FastHashSet<(Taken, WireExpr, WireExpr)> =
+            crate::whnf::memo::FastHashSet::default();
         // A congruence attempt only proposes obligations: when one fails, the
         // attempt is abandoned and the tasks it took on are not established.
         // `trail` records what was taken while an attempt is open, so that

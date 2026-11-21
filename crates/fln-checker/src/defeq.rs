@@ -523,10 +523,22 @@ fn run(
     budget: QuickDefEqBudget,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<QuickDefEqOutcome, Halt> {
+    run_at(left, left.root(), right, right.root(), budget, cancelled)
+}
+
+fn run_at(
+    left: &WireExpr,
+    left_root: ExprId,
+    right: &WireExpr,
+    right_root: ExprId,
+    budget: QuickDefEqBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<QuickDefEqOutcome, Halt> {
     let mut control = Control::new(budget);
     control.admit_levels(left, right, cancelled)?;
-    let mut pending = vec![(left.root(), right.root())];
-    let mut seen = BTreeSet::new();
+    let mut pending = vec![(left_root, right_root)];
+    let mut seen: crate::whnf::memo::FastHashSet<(ExprId, ExprId)> =
+        crate::whnf::memo::FastHashSet::default();
 
     while let Some((left_id, right_id)) = pending.pop() {
         if !seen.insert((left_id, right_id)) {
@@ -3375,13 +3387,13 @@ fn nested_mismatch(
     })
 }
 
-fn materialize_subterm_wire(
-    term: DefEqTerm,
+fn materialize_visible_wire(
+    visible: DefEqTerm,
+    original: DefEqTerm,
     sources: TermSources<'_>,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<WireExpr, SlowHalt> {
-    let visible = eta_visible(term, sources, control, cancelled)?;
     let arena = sources.source(visible)?;
     match copy_compact_subterm_with(arena, visible.root, TermBudget::unlimited(), cancelled) {
         TermOutcome::Complete(wire) => {
@@ -3403,9 +3415,20 @@ fn materialize_subterm_wire(
             },
         }))),
         TermOutcome::InternalFault(_) => Err(SlowHalt::Fault(DefEqFault::MissingExpression {
-            location: term.location(),
+            location: original.location(),
         })),
     }
+}
+
+#[cfg(test)]
+fn materialize_subterm_wire(
+    term: DefEqTerm,
+    sources: TermSources<'_>,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<WireExpr, SlowHalt> {
+    let visible = eta_visible(term, sources, control, cancelled)?;
+    materialize_visible_wire(visible, term, sources, control, cancelled)
 }
 
 /// What conversion does with two applications of one regular definition whose
@@ -3548,9 +3571,71 @@ fn regular_same_head_apps_def_eq(
 
     for (&left_arg, &right_arg) in left_args.iter().zip(&right_args) {
         let sources = TermSources::new(left, right, generated);
-        let left_wire = materialize_subterm_wire(left_arg, sources, control, cancelled)?;
-        let sources = TermSources::new(left, right, generated);
-        let right_wire = materialize_subterm_wire(right_arg, sources, control, cancelled)?;
+        let left_visible = eta_visible(left_arg, sources, control, cancelled)?;
+        let right_visible = eta_visible(right_arg, sources, control, cancelled)?;
+        let left_arena = sources.source(left_visible)?;
+        let right_arena = sources.source(right_visible)?;
+
+        let remaining = control.remaining_defeq_budget();
+        let (sub_budget, bounded) = match scope.arguments {
+            UndecidedArguments::Defer => deferred_shortcut_budget(remaining),
+            UndecidedArguments::Unfold => (remaining, false),
+        };
+        // Fast zero-copy structural/alpha check directly in the existing arenas:
+        // identical type and instance arguments on polymorphic regular calls no
+        // longer copy two compact `WireExpr` arenas only to discover quick equality.
+        {
+            let mut quick_cancelled = false;
+            let mut observed = || {
+                let stop = cancelled();
+                quick_cancelled |= stop;
+                stop
+            };
+            match run_at(
+                left_arena,
+                left_visible.root,
+                right_arena,
+                right_visible.root,
+                sub_budget.quick,
+                &mut observed,
+            ) {
+                Ok(QuickDefEqOutcome::Equal(res)) => {
+                    control.progress.quick_comparisons = control
+                        .progress
+                        .quick_comparisons
+                        .saturating_add(res.comparisons);
+                    continue;
+                }
+                Err(Halt::Stop(QuickDefEqStop::Cancelled {
+                    polls,
+                    completed_comparisons,
+                })) => {
+                    control.progress.quick_comparisons = control
+                        .progress
+                        .quick_comparisons
+                        .saturating_add(completed_comparisons);
+                    return Err(SlowHalt::Stop(Box::new(DefEqStop::Cancelled {
+                        polls: control.polls.saturating_add(polls),
+                        progress: control.progress,
+                    })));
+                }
+                Err(Halt::Fault(fault)) => {
+                    return Err(SlowHalt::Fault(DefEqFault::Quick(fault)));
+                }
+                _ if quick_cancelled => {
+                    return Err(SlowHalt::Stop(Box::new(DefEqStop::Cancelled {
+                        polls: control.polls,
+                        progress: control.progress,
+                    })));
+                }
+                _ => {}
+            }
+        }
+
+        let left_wire =
+            materialize_visible_wire(left_visible, left_arg, sources, control, cancelled)?;
+        let right_wire =
+            materialize_visible_wire(right_visible, right_arg, sources, control, cancelled)?;
 
         // This conversion may have put exactly this pair to the shortcut
         // before, at an earlier unfolding step or deeper in a nested comparison.
@@ -3560,7 +3645,7 @@ fn regular_same_head_apps_def_eq(
             None => {}
         }
         let remaining = control.remaining_defeq_budget();
-        let (sub_budget, bounded) = match scope.arguments {
+        let (sub_budget, _bounded_recheck) = match scope.arguments {
             UndecidedArguments::Defer => deferred_shortcut_budget(remaining),
             UndecidedArguments::Unfold => (remaining, false),
         };
