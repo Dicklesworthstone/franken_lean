@@ -186,7 +186,10 @@ fn serial_import_cancellation_before_publication_returns_no_successor() {
         );
         assert_eq!(recovered.modules.len(), 2);
         assert_eq!(
-            recovered.modules[1].declarations[0].checker.ground,
+            recovered.modules[1].declarations[0]
+                .checker
+                .expect("release agreement")
+                .ground,
             CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
         );
         assert_eq!(engine.logical_root(&options), root);

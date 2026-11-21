@@ -6,6 +6,8 @@
 //! coverage. Version 1 therefore has no entropy source and no dynamic rate setter:
 //! identical declaration content and risk facts produce the same recorded decision.
 
+use std::fmt;
+
 /// Frozen policy schema. A semantic change requires a new versioned policy type.
 pub const POLICY_SCHEMA: &str = "fln.checker.policy/1";
 
@@ -23,9 +25,49 @@ pub enum VerificationPolicy {
 }
 
 impl VerificationPolicy {
+    /// Every registered verification policy in canonical order.
+    pub const ALL: [VerificationPolicy; 4] = [
+        VerificationPolicy::Standard,
+        VerificationPolicy::Release,
+        VerificationPolicy::Paranoid,
+        VerificationPolicy::CompatBench,
+    ];
+
+    /// Stable CLI and receipt identifier for this policy.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            VerificationPolicy::Standard => "standard",
+            VerificationPolicy::Release => "release",
+            VerificationPolicy::Paranoid => "paranoid",
+            VerificationPolicy::CompatBench => "compat-bench",
+        }
+    }
+
+    /// Parse a registered policy name. Unknown names return `None`.
+    pub fn parse_name(text: &str) -> Option<Self> {
+        match text {
+            "standard" => Some(VerificationPolicy::Standard),
+            "release" => Some(VerificationPolicy::Release),
+            "paranoid" => Some(VerificationPolicy::Paranoid),
+            "compat-bench" => Some(VerificationPolicy::CompatBench),
+            _ => None,
+        }
+    }
+
     /// Whether a decision under this policy may contribute to an attested receipt.
     pub const fn is_attestable(self) -> bool {
         !matches!(self, VerificationPolicy::CompatBench)
+    }
+
+    /// Whether evidence generated under this policy satisfies G1's full-closure requirement.
+    pub const fn is_g1_eligible(self) -> bool {
+        matches!(self, VerificationPolicy::Release)
+    }
+}
+
+impl fmt::Display for VerificationPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

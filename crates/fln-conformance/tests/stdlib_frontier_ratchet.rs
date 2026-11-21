@@ -213,6 +213,52 @@ fn a_document_that_disagrees_with_itself_is_refused_not_compared() {
     ));
 }
 
+#[test]
+fn non_release_or_unattestable_frontier_cannot_be_presented_as_g1_evidence() {
+    let base = receipt().to_json();
+    let with_fields = |extra: &str| {
+        base.replacen(
+            "\"trust\":\"recheck\",",
+            &format!("\"trust\":\"recheck\",{extra},"),
+            1,
+        )
+    };
+
+    // Release + attestable passes cleanly.
+    let release = with_fields("\"policy\":\"release\",\"attestable\":true");
+    assert_ne!(release, base);
+    parse(&release).expect("release attestable frontier must be accepted as G1 evidence");
+
+    // Standard, compat-bench, and paranoid frontiers are all refused as G1 evidence.
+    for rejected in ["standard", "compat-bench", "paranoid"] {
+        let doc = with_fields(&format!(
+            "\"policy\":\"{rejected}\",\"attestable\":{}",
+            rejected != "compat-bench"
+        ));
+        let err = parse(&doc).expect_err(&format!("{rejected} frontier must be refused"));
+        assert!(
+            matches!(err, FrontierError::Shape(ref msg) if msg.contains("requires \"release\"")),
+            "{rejected}: unexpected error {err:?}"
+        );
+    }
+
+    // Even with policy="release", attestable=false is refused.
+    let non_attestable = with_fields("\"policy\":\"release\",\"attestable\":false");
+    let err = parse(&non_attestable).expect_err("attestable=false must be refused");
+    assert!(
+        matches!(err, FrontierError::Shape(ref msg) if msg.contains("attestable is false")),
+        "unexpected error {err:?}"
+    );
+
+    // authority=false (e.g., compat-bench) is also refused.
+    let no_authority = base.replacen("\"authority\":true,", "\"authority\":false,", 1);
+    let err = parse(&no_authority).expect_err("authority=false must be refused");
+    assert!(
+        matches!(err, FrontierError::Shape(ref msg) if msg.contains("authority is false")),
+        "unexpected error {err:?}"
+    );
+}
+
 /// A later binary may hash declarations differently (a new digest tag such as
 /// `decl-content-dag/1` changes every digest and logical root). The receipt stays bound to its
 /// own binary, so the ratchet reads only format-independent fields: this rewrites the receipt

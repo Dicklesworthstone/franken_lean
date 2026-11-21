@@ -195,7 +195,7 @@ const MERGE_SORT_COMPANION_ONLY_UNSAFE_REC_RESIDUALS: [&str; 3] = [
 
 const USAGE: &str = concat!(
     "Usage:\n",
-    "  fln check-olean [--json] [--receipts PATH | --continue [--progress] [--jobs N]] [--max-bytes BYTES] PATH [ROOT...]\n",
+    "  fln check-olean [--json] [--policy standard|release|paranoid|compat-bench] [--receipts PATH | --continue [--progress] [--jobs N]] [--max-bytes BYTES] PATH [ROOT...]\n",
     "  fln check-source [--json] [--max-bytes BYTES] [--jobs N] [--import-posture P] [--imported-macros PARTITION.tsv [--macro-max-bytes BYTES] [--imported-syntax MODULE]...] PATH...\n",
     "    Check definitions and theorems without executing code. An import with no\n",
     "    source file under the entry's directory is read as an .olean from\n",
@@ -343,6 +343,12 @@ const USAGE: &str = concat!(
     "inductive/quotient/mutual shapes, interpret extensions, run\n",
     "K2, or satisfy G1. Module-system inputs load complete .olean.server and\n",
     ".olean.private companion chains and refuse an incomplete chain.\n",
+    "--policy selects plan §8.3c council sampling: release (default; fln-checker\n",
+    "on 100% of declarations, G1-eligible), standard (K1 on every declaration;\n",
+    "fln-checker on a deterministic content-seeded 1/16 sample plus all high-risk\n",
+    "forms and declarations exceeding K1's step floor), paranoid (requires K2 or\n",
+    "an external witness; returns inconclusive exit 3 when unavailable), and\n",
+    "compat-bench (sampled observation only; never attestable, authority=false).\n",
     "With --receipts, a successful closed-module-set run (a directory root)\n",
     "also writes one hash-chained JSONL receipt set recording per-module\n",
     "verdict accounting and the independent-checker agreement grounds. Rows\n",
@@ -559,6 +565,7 @@ enum MultiplexerCommand {
         roots: Vec<PathBuf>,
         max_bytes: usize,
         json: bool,
+        policy: fln::VerificationPolicy,
         receipts: Option<PathBuf>,
         continue_on_failure: bool,
         progress: bool,
@@ -1186,8 +1193,23 @@ fn output_paths_alias(left: &Path, right: &Path) -> bool {
         .is_some_and(|pair| pair.0 == pair.1)
 }
 
+fn parse_verification_policy(value: &OsString) -> Result<fln::VerificationPolicy, UsageError> {
+    let Some(text) = value.to_str() else {
+        return Err(UsageError(
+            "--policy requires UTF-8 policy name: standard, release, paranoid, or compat-bench"
+                .to_owned(),
+        ));
+    };
+    fln::VerificationPolicy::parse_name(text).ok_or_else(|| {
+        UsageError(format!(
+            "unknown --policy value {text:?}; expected one of: standard, release, paranoid, compat-bench"
+        ))
+    })
+}
+
 fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     let mut receipts = None;
+    let mut policy: Option<fln::VerificationPolicy> = None;
     let mut continue_on_failure = false;
     let mut progress = false;
     let mut jobs: Option<std::num::NonZeroUsize> = None;
@@ -1216,6 +1238,30 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
                 ));
             }
             progress = true;
+            continue;
+        }
+        let policy_value = if options && argument == "--policy" {
+            Some(arguments.next().ok_or_else(|| {
+                UsageError(
+                    "--policy requires a value: standard, release, paranoid, or compat-bench"
+                        .to_owned(),
+                )
+            })?)
+        } else if options {
+            argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--policy="))
+                .map(OsString::from)
+        } else {
+            None
+        };
+        if let Some(value) = policy_value {
+            if policy.is_some() {
+                return Err(UsageError(
+                    "--policy may be supplied at most once".to_owned(),
+                ));
+            }
+            policy = Some(parse_verification_policy(&value)?);
             continue;
         }
         let jobs_value =
@@ -1291,6 +1337,7 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
         roots: paths,
         max_bytes,
         json,
+        policy: policy.unwrap_or(fln::VerificationPolicy::Release),
         receipts,
         continue_on_failure,
         progress,
@@ -5064,25 +5111,37 @@ fn check_olean_error_disposition(error: &fln::OleanCheckError) -> (&'static str,
     }
 }
 
-fn check_olean_failure(
+fn check_olean_failure_with_policy(
     class: &'static str,
     detail: &str,
     authority: bool,
+    policy: Option<fln::VerificationPolicy>,
     json: bool,
     exit_code: u8,
 ) -> MultiplexerOutput {
     let detail = BoundedText::new(detail.to_owned());
     let stderr = if json {
+        let policy_fields = match policy {
+            Some(policy) => format!(
+                ",\"policy\":{},\"policySchema\":{},\"attestable\":{},\"g1Eligible\":{}",
+                json_string(policy.as_str()),
+                json_string(fln::CHECKER_POLICY_SCHEMA),
+                policy.is_attestable(),
+                policy.is_g1_eligible(),
+            ),
+            None => String::new(),
+        };
         format!(
             concat!(
                 "{{\"schema\":{},\"outcome\":\"error\",\"authority\":{},",
-                "\"class\":{},\"detail\":{},\"detailTruncated\":{}}}\n"
+                "\"class\":{},\"detail\":{},\"detailTruncated\":{}{}}}\n"
             ),
             json_string(CHECK_OLEAN_SCHEMA),
             authority,
             json_string(class),
             json_string(detail.text()),
             detail.truncated(),
+            policy_fields,
         )
     } else {
         let truncation = if detail.truncated() {
@@ -5093,6 +5152,50 @@ fn check_olean_failure(
         format!("fln check-olean: {class}: {}{truncation}\n", detail.text())
     };
     MultiplexerOutput::failure(stderr, exit_code)
+}
+
+fn checker_policy_summary_json(summary: &fln::CheckerPolicySummary) -> String {
+    format!(
+        concat!(
+            "{{\"schema\":{},\"policy\":{},\"attestable\":{},\"g1Eligible\":{},",
+            "\"k1Checked\":{},\"checkerSelected\":{},\"fullPolicy\":{},",
+            "\"highRisk\":{},\"highRiskK1Steps\":{},\"sampled\":{},\"skipped\":{},",
+            "\"selectionDigest\":{}}}"
+        ),
+        json_string(summary.schema),
+        json_string(summary.policy.as_str()),
+        summary.attestable,
+        summary.policy.is_g1_eligible(),
+        summary.k1_checked,
+        summary.checker_selected,
+        summary.checker_full_policy,
+        summary.checker_high_risk,
+        summary.checker_high_risk_k1_steps,
+        summary.checker_sampled,
+        summary.checker_skipped,
+        json_string(&summary.selection_digest.to_hex()),
+    )
+}
+
+fn checker_policy_summary_human(summary: &fln::CheckerPolicySummary) -> String {
+    format!(
+        "verification policy: {} (attestable: {}, g1-eligible: {})\nchecker selection: k1={}, selected={} (full={}, high-risk={}, k1-step-floor={}, sampled={}), skipped={}, selection-digest={}\n",
+        summary.policy.as_str(),
+        if summary.attestable { "yes" } else { "no" },
+        if summary.policy.is_g1_eligible() {
+            "yes"
+        } else {
+            "no"
+        },
+        summary.k1_checked,
+        summary.checker_selected,
+        summary.checker_full_policy,
+        summary.checker_high_risk,
+        summary.checker_high_risk_k1_steps,
+        summary.checker_sampled,
+        summary.checker_skipped,
+        summary.selection_digest.to_hex(),
+    )
 }
 
 /// Count declarations whose logical name is rooted at Lean's `_private`
@@ -5679,8 +5782,10 @@ fn render_named_residuals_human(residuals: &mut DecodedNamedResiduals) -> String
 fn render_check_olean_success(
     bytes: usize,
     checked: &fln::CheckedOlean,
+    policy: fln::VerificationPolicy,
     json: bool,
 ) -> MultiplexerOutput {
+    let policy_summary = checked.policy_summary(policy);
     let constants = checked.declarations.len();
     let extensions = checked.decoded.module.extensions.len();
     let private_auxiliaries = decoded_private_auxiliaries(&checked.decoded.constants);
@@ -6639,7 +6744,8 @@ fn render_check_olean_success(
     let stdout = if json {
         format!(
             concat!(
-                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,\"trust\":\"recheck\",",
+                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":{},\"trust\":\"recheck\",",
+                "\"policy\":{},\"policySchema\":{},\"attestable\":{},\"g1Eligible\":{},\"checkerPolicy\":{},",
                 "\"scope\":\"decoded-declarations\",\"artifactBytes\":{},",
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
                 "\"decodedPrivateAuxiliaries\":{},",
@@ -6715,6 +6821,12 @@ fn render_check_olean_success(
                 "\"k2Checked\":false,\"g1Satisfied\":false}}\n"
             ),
             json_string(CHECK_OLEAN_SCHEMA),
+            policy_summary.attestable,
+            json_string(policy_summary.policy.as_str()),
+            json_string(policy_summary.schema),
+            policy_summary.attestable,
+            policy_summary.policy.is_g1_eligible(),
+            checker_policy_summary_json(&policy_summary),
             bytes,
             constants,
             private_auxiliaries,
@@ -7124,6 +7236,7 @@ fn render_check_olean_success(
                 "result logical root: {}\n",
                 "extension blocks observed: {} (not interpreted)\n",
                 "companion artifact parts loaded: {}\n",
+                "{}",
                 "K2 checked: no\n",
                 "G1 satisfied: no\n"
             ),
@@ -7330,6 +7443,7 @@ fn render_check_olean_success(
             } else {
                 "no"
             },
+            checker_policy_summary_human(&policy_summary),
         )
     };
     MultiplexerOutput::success(stdout)
@@ -7337,7 +7451,14 @@ fn render_check_olean_success(
 
 #[cfg(test)]
 fn check_olean_bytes(bytes: Vec<u8>, max_bytes: usize, json: bool) -> MultiplexerOutput {
-    check_olean_part_bytes(bytes, None, None, max_bytes, json)
+    check_olean_part_bytes(
+        bytes,
+        None,
+        None,
+        max_bytes,
+        fln::VerificationPolicy::Release,
+        json,
+    )
 }
 
 fn check_olean_part_bytes(
@@ -7345,6 +7466,7 @@ fn check_olean_part_bytes(
     server_bytes: Option<Vec<u8>>,
     private_bytes: Option<Vec<u8>>,
     max_bytes: usize,
+    policy: fln::VerificationPolicy,
     json: bool,
 ) -> MultiplexerOutput {
     let total_bytes = [
@@ -7368,29 +7490,48 @@ fn check_olean_part_bytes(
                 fln::OleanCheckLimits::new(
                     max_bytes,
                     fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
-                ),
+                )
+                .with_policy(policy),
             ) {
                 Ok(fln::Outcome::Complete(checked)) => {
-                    render_check_olean_success(total_bytes, &checked, json)
+                    render_check_olean_success(total_bytes, &checked, policy, json)
                 }
-                Ok(fln::Outcome::Inconclusive(reason)) => {
-                    check_olean_failure("inconclusive", &format!("{reason:?}"), false, json, 3)
-                }
-                Ok(fln::Outcome::InternalFault(fault)) => {
-                    check_olean_failure("internal-fault", &format!("{fault:?}"), false, json, 4)
-                }
+                Ok(fln::Outcome::Inconclusive(reason)) => check_olean_failure_with_policy(
+                    "inconclusive",
+                    &format!("{reason:?}"),
+                    false,
+                    Some(policy),
+                    json,
+                    3,
+                ),
+                Ok(fln::Outcome::InternalFault(fault)) => check_olean_failure_with_policy(
+                    "internal-fault",
+                    &format!("{fault:?}"),
+                    false,
+                    Some(policy),
+                    json,
+                    4,
+                ),
                 Err(error) => {
                     let (class, authority, exit_code) = check_olean_error_disposition(&error);
-                    check_olean_failure(class, &error.to_string(), authority, json, exit_code)
+                    check_olean_failure_with_policy(
+                        class,
+                        &error.to_string(),
+                        authority && policy.is_attestable(),
+                        Some(policy),
+                        json,
+                        exit_code,
+                    )
                 }
             }
         }) {
         Ok(worker) => worker,
         Err(error) => {
-            return check_olean_failure(
+            return check_olean_failure_with_policy(
                 "internal-fault",
                 &format!("could not start bounded kernel worker: {error}"),
                 false,
+                Some(policy),
                 json,
                 4,
             );
@@ -7398,10 +7539,11 @@ fn check_olean_part_bytes(
     };
     match worker.join() {
         Ok(output) => output,
-        Err(_) => check_olean_failure(
+        Err(_) => check_olean_failure_with_policy(
             "internal-fault",
             "bounded kernel worker panicked",
             false,
+            Some(policy),
             json,
             4,
         ),
@@ -7631,9 +7773,11 @@ fn collect_olean_directory(
 fn render_check_olean_set_success(
     bytes: usize,
     checked: &fln::CheckedOleanSet,
+    policy: fln::VerificationPolicy,
     json: bool,
     receipts: Option<&WrittenReceiptSet>,
 ) -> MultiplexerOutput {
+    let policy_summary = checked.policy_summary(policy);
     let receipts_json_fragment = match receipts {
         Some(written) => format!(",\"receipts\":{}", written.summary_json()),
         None => String::new(),
@@ -8749,7 +8893,8 @@ fn render_check_olean_set_success(
     let stdout = if json {
         format!(
             concat!(
-                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,\"trust\":\"recheck\",",
+                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":{},\"trust\":\"recheck\",",
+                "\"policy\":{},\"policySchema\":{},\"attestable\":{},\"g1Eligible\":{},\"checkerPolicy\":{},",
                 "\"scope\":\"closed-module-set-declarations\",\"artifactBytes\":{},",
                 "\"modulesChecked\":{},\"importsResolved\":{},",
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
@@ -8825,6 +8970,12 @@ fn render_check_olean_set_success(
                 "\"k2Checked\":false,\"g1Satisfied\":false{}}}\n"
             ),
             json_string(CHECK_OLEAN_SCHEMA),
+            policy_summary.attestable,
+            json_string(policy_summary.policy.as_str()),
+            json_string(policy_summary.schema),
+            policy_summary.attestable,
+            policy_summary.policy.is_g1_eligible(),
+            checker_policy_summary_json(&policy_summary),
             bytes,
             checked.modules.len(),
             imports,
@@ -9239,6 +9390,7 @@ fn render_check_olean_set_success(
                 "result logical root: {}\n",
                 "extension blocks observed: {} (not interpreted)\n",
                 "complete module companion chains loaded: {}\n",
+                "{}",
                 "K2 checked: no\n",
                 "G1 satisfied: no\n{}"
             ),
@@ -9443,6 +9595,7 @@ fn render_check_olean_set_success(
             checked.result_logical_root,
             extensions,
             companion_modules,
+            checker_policy_summary_human(&policy_summary),
             receipts_human_line,
         )
     };
@@ -9531,6 +9684,7 @@ fn add_module_set_roots(
 fn check_olean_module_frontier(
     modules: Vec<NamedOleanBytes>,
     max_bytes: usize,
+    policy: fln::VerificationPolicy,
     json: bool,
     progress: bool,
     jobs: std::num::NonZeroUsize,
@@ -9615,7 +9769,8 @@ fn check_olean_module_frontier(
                 fln::OleanCheckLimits::new(
                     max_bytes,
                     fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
-                ),
+                )
+                .with_policy(policy),
                 fln::OleanFrontierJobs {
                     threads: jobs,
                     worker_stack_bytes: OLEAN_CHECK_KERNEL_STACK_BYTES,
@@ -9625,16 +9780,24 @@ fn check_olean_module_frontier(
                 Ok(frontier) => render_check_olean_frontier(&frontier, json),
                 Err(error) => {
                     let (class, authority, exit_code) = check_olean_error_disposition(&error);
-                    check_olean_failure(class, &error.to_string(), authority, json, exit_code)
+                    check_olean_failure_with_policy(
+                        class,
+                        &error.to_string(),
+                        authority && policy.is_attestable(),
+                        Some(policy),
+                        json,
+                        exit_code,
+                    )
                 }
             }
         }) {
         Ok(worker) => worker,
         Err(error) => {
-            return check_olean_failure(
+            return check_olean_failure_with_policy(
                 "internal-fault",
                 &format!("could not start bounded kernel worker: {error}"),
                 false,
+                Some(policy),
                 json,
                 4,
             );
@@ -9642,10 +9805,11 @@ fn check_olean_module_frontier(
     };
     match worker.join() {
         Ok(output) => output,
-        Err(_) => check_olean_failure(
+        Err(_) => check_olean_failure_with_policy(
             "internal-fault",
             "bounded kernel worker panicked",
             false,
+            Some(policy),
             json,
             4,
         ),
@@ -9664,6 +9828,7 @@ struct FrontierRowFields {
     memory_retry: Option<(u128, BoundedText)>,
     decode_memory_retry: Option<FrontierDecodeRetryFields>,
     memory: fln::OleanFrontierMemoryAttribution,
+    policy_summary: fln::CheckerPolicySummary,
 }
 
 struct FrontierDecodeRetryFields {
@@ -9706,7 +9871,8 @@ impl FrontierRowFields {
         let mut members = format!(
             concat!(
                 "\"module\":{},\"verdict\":{},\"declarations\":{},\"elapsedMs\":{},",
-                "\"attempt\":{},\"detail\":{},\"detailTruncated\":{},\"blockedBy\":{},\"memory\":{}"
+                "\"attempt\":{},\"detail\":{},\"detailTruncated\":{},\"blockedBy\":{},\"memory\":{},",
+                "\"checkerPolicy\":{}"
             ),
             json_string(&self.module),
             json_string(self.verdict),
@@ -9721,6 +9887,7 @@ impl FrontierRowFields {
                 json_string(&self.blocked_by)
             },
             self.memory_json_object(),
+            checker_policy_summary_json(&self.policy_summary),
         );
         if let Some((first_elapsed_ms, first_refusal)) = &self.memory_retry {
             members.push_str(&format!(
@@ -9812,6 +9979,7 @@ fn frontier_row_fields(row: &fln::OleanFrontierRow) -> FrontierRowFields {
             }
         }),
         memory: row.memory,
+        policy_summary: row.policy_summary,
     }
 }
 
@@ -9944,14 +10112,16 @@ fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> Mul
     } else {
         0
     };
+    let policy_summary = &frontier.policy_summary;
     let summary = format!(
         "council modules: {accepted}/{total} accepted, {declarations} declarations; {failed} failed, {inconclusive} inconclusive, {faulted} internal-fault, {blocked} blocked"
     );
     let output = if json {
         format!(
             concat!(
-                "{{\"schema\":{},\"outcome\":{},\"authority\":true,\"trust\":\"recheck\",\"modules\":{},",
-                "\"accepted\":{},\"failed\":{},\"inconclusive\":{},\"internalFault\":{},",
+                "{{\"schema\":{},\"outcome\":{},\"authority\":{},\"trust\":\"recheck\",",
+                "\"policy\":{},\"policySchema\":{},\"attestable\":{},\"g1Eligible\":{},\"checkerPolicy\":{},",
+                "\"modules\":{},\"accepted\":{},\"failed\":{},\"inconclusive\":{},\"internalFault\":{},",
                 "\"blocked\":{},\"acceptedDeclarations\":{},\"topMemoryRows\":[{}],\"rows\":[{}]}}\n"
             ),
             json_string(CHECK_OLEAN_FRONTIER_SCHEMA),
@@ -9960,6 +10130,12 @@ fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> Mul
             } else {
                 "frontier"
             }),
+            policy_summary.attestable,
+            json_string(policy_summary.policy.as_str()),
+            json_string(policy_summary.schema),
+            policy_summary.attestable,
+            policy_summary.policy.is_g1_eligible(),
+            checker_policy_summary_json(policy_summary),
             total,
             accepted,
             failed,
@@ -9972,7 +10148,8 @@ fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> Mul
         )
     } else {
         format!(
-            "fln check-olean --continue: {summary}\n{}\n",
+            "fln check-olean --continue: {summary}\n{}{}\n",
+            checker_policy_summary_human(policy_summary),
             lines.join("\n")
         )
     };
@@ -9990,6 +10167,7 @@ fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> Mul
 fn check_olean_module_bytes(
     modules: Vec<NamedOleanBytes>,
     max_bytes: usize,
+    policy: fln::VerificationPolicy,
     json: bool,
     receipts_path: Option<PathBuf>,
 ) -> MultiplexerOutput {
@@ -10023,18 +10201,20 @@ fn check_olean_module_bytes(
                 fln::OleanCheckLimits::new(
                     max_bytes,
                     fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
-                ),
+                )
+                .with_policy(policy),
             ) {
                 Ok(fln::Outcome::Complete(checked)) => {
                     let written = match receipts_path {
-                        Some(path) => match write_receipt_set(&path, &modules, &checked) {
+                        Some(path) => match write_receipt_set(&path, &modules, &checked, policy) {
                             Ok(written) => Some(written),
                             Err(error) => {
                                 let (class, exit_code) = error.disposition();
-                                return check_olean_failure(
+                                return check_olean_failure_with_policy(
                                     class,
                                     &error.to_string(),
                                     false,
+                                    Some(policy),
                                     json,
                                     exit_code,
                                 );
@@ -10042,26 +10222,50 @@ fn check_olean_module_bytes(
                         },
                         None => None,
                     };
-                    render_check_olean_set_success(total_bytes, &checked, json, written.as_ref())
+                    render_check_olean_set_success(
+                        total_bytes,
+                        &checked,
+                        policy,
+                        json,
+                        written.as_ref(),
+                    )
                 }
-                Ok(fln::Outcome::Inconclusive(reason)) => {
-                    check_olean_failure("inconclusive", &format!("{reason:?}"), false, json, 3)
-                }
-                Ok(fln::Outcome::InternalFault(fault)) => {
-                    check_olean_failure("internal-fault", &format!("{fault:?}"), false, json, 4)
-                }
+                Ok(fln::Outcome::Inconclusive(reason)) => check_olean_failure_with_policy(
+                    "inconclusive",
+                    &format!("{reason:?}"),
+                    false,
+                    Some(policy),
+                    json,
+                    3,
+                ),
+                Ok(fln::Outcome::InternalFault(fault)) => check_olean_failure_with_policy(
+                    "internal-fault",
+                    &format!("{fault:?}"),
+                    false,
+                    Some(policy),
+                    json,
+                    4,
+                ),
                 Err(error) => {
                     let (class, authority, exit_code) = check_olean_error_disposition(&error);
-                    check_olean_failure(class, &error.to_string(), authority, json, exit_code)
+                    check_olean_failure_with_policy(
+                        class,
+                        &error.to_string(),
+                        authority && policy.is_attestable(),
+                        Some(policy),
+                        json,
+                        exit_code,
+                    )
                 }
             }
         }) {
         Ok(worker) => worker,
         Err(error) => {
-            return check_olean_failure(
+            return check_olean_failure_with_policy(
                 "internal-fault",
                 &format!("could not start bounded kernel worker: {error}"),
                 false,
+                Some(policy),
                 json,
                 4,
             );
@@ -10069,19 +10273,22 @@ fn check_olean_module_bytes(
     };
     match worker.join() {
         Ok(output) => output,
-        Err(_) => check_olean_failure(
+        Err(_) => check_olean_failure_with_policy(
             "internal-fault",
             "bounded kernel worker panicked",
             false,
+            Some(policy),
             json,
             4,
         ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_olean(
     roots: &[PathBuf],
     max_bytes: usize,
+    policy: fln::VerificationPolicy,
     json: bool,
     receipts: Option<&Path>,
     continue_on_failure: bool,
@@ -10089,13 +10296,21 @@ fn check_olean(
     jobs: std::num::NonZeroUsize,
 ) -> MultiplexerOutput {
     let Some((path, extra_roots)) = roots.split_first() else {
-        return check_olean_failure("input", "no input path", false, json, 1);
+        return check_olean_failure_with_policy(
+            "input",
+            "no input path",
+            false,
+            Some(policy),
+            json,
+            1,
+        );
     };
     if continue_on_failure && receipts.is_some() {
-        return check_olean_failure(
+        return check_olean_failure_with_policy(
             "input",
             "--continue reports a per-module frontier, which is not a complete checked set, so it writes no receipt set; drop --receipts",
             false,
+            Some(policy),
             json,
             1,
         );
@@ -10103,20 +10318,22 @@ fn check_olean(
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => {
-            return check_olean_failure(
+            return check_olean_failure_with_policy(
                 "input",
                 &format!("cannot inspect {}: {error}", path.display()),
                 false,
+                Some(policy),
                 json,
                 1,
             );
         }
     };
     if metadata.file_type().is_symlink() {
-        return check_olean_failure(
+        return check_olean_failure_with_policy(
             "input",
             &format!("refusing symlink {} as a check root", path.display()),
             false,
+            Some(policy),
             json,
             1,
         );
@@ -10124,13 +10341,14 @@ fn check_olean(
     if let Some(receipts) = receipts
         && !metadata.is_dir()
     {
-        return check_olean_failure(
+        return check_olean_failure_with_policy(
             "input",
             &format!(
                 "--receipts {} requires a closed module-set root (a directory); a single import-free artifact writes no receipt set",
                 receipts.display()
             ),
             false,
+            Some(policy),
             json,
             1,
         );
@@ -10140,10 +10358,11 @@ fn check_olean(
             Ok(modules) => modules,
             Err(error) => {
                 let class = error.class();
-                return check_olean_failure(
+                return check_olean_failure_with_policy(
                     class,
                     &error.to_string(),
                     false,
+                    Some(policy),
                     json,
                     if class == "resource" { 3 } else { 1 },
                 );
@@ -10153,39 +10372,48 @@ fn check_olean(
             let modules = match add_module_set_roots(modules, extra_roots, max_bytes) {
                 Ok(modules) => modules,
                 Err((class, detail)) => {
-                    return check_olean_failure(
+                    return check_olean_failure_with_policy(
                         class,
                         &detail,
                         false,
+                        Some(policy),
                         json,
                         if class == "resource" { 3 } else { 1 },
                     );
                 }
             };
-            return check_olean_module_frontier(modules, max_bytes, json, progress, jobs);
+            return check_olean_module_frontier(modules, max_bytes, policy, json, progress, jobs);
         }
-        return check_olean_module_bytes(modules, max_bytes, json, receipts.map(Path::to_path_buf));
+        return check_olean_module_bytes(
+            modules,
+            max_bytes,
+            policy,
+            json,
+            receipts.map(Path::to_path_buf),
+        );
     }
     if continue_on_failure {
-        return check_olean_failure(
+        return check_olean_failure_with_policy(
             "input",
             &format!(
                 "--continue requires a closed module-set root (a directory); {} is a single artifact",
                 path.display()
             ),
             false,
+            Some(policy),
             json,
             1,
         );
     }
     if !metadata.is_file() {
-        return check_olean_failure(
+        return check_olean_failure_with_policy(
             "input",
             &format!(
                 "{} is neither a regular file nor a directory",
                 path.display()
             ),
             false,
+            Some(policy),
             json,
             1,
         );
@@ -10194,10 +10422,11 @@ fn check_olean(
         Ok(bytes) => bytes,
         Err(error) => {
             let class = error.class();
-            return check_olean_failure(
+            return check_olean_failure_with_policy(
                 class,
                 &error.to_string(),
                 false,
+                Some(policy),
                 json,
                 if class == "resource" { 3 } else { 1 },
             );
@@ -10217,10 +10446,11 @@ fn check_olean(
         Ok(bytes) => bytes,
         Err(error) => {
             let class = error.class();
-            return check_olean_failure(
+            return check_olean_failure_with_policy(
                 class,
                 &error.to_string(),
                 false,
+                Some(policy),
                 json,
                 if class == "resource" { 3 } else { 1 },
             );
@@ -10231,16 +10461,17 @@ fn check_olean(
         Ok(bytes) => bytes,
         Err(error) => {
             let class = error.class();
-            return check_olean_failure(
+            return check_olean_failure_with_policy(
                 class,
                 &error.to_string(),
                 false,
+                Some(policy),
                 json,
                 if class == "resource" { 3 } else { 1 },
             );
         }
     };
-    check_olean_part_bytes(bytes, server_bytes, private_bytes, max_bytes, json)
+    check_olean_part_bytes(bytes, server_bytes, private_bytes, max_bytes, policy, json)
 }
 
 // ---- trust surfaces: identity, audit --tcb, why-trusts, run receipts -----
@@ -11419,6 +11650,8 @@ fn receipt_u64(buffer: &mut Vec<u8>, value: u64) {
 
 struct WrittenReceiptSet {
     path: PathBuf,
+    policy: fln::VerificationPolicy,
+    attestable: bool,
     module_rows: usize,
     declarations_checked: usize,
     chain: Digest,
@@ -11427,8 +11660,12 @@ struct WrittenReceiptSet {
 impl WrittenReceiptSet {
     fn summary_json(&self) -> String {
         format!(
-            "{{\"path\":{},\"moduleRows\":{},\"declarationsChecked\":{},\"chain\":{}}}",
+            "{{\"path\":{},\"policy\":{},\"policySchema\":{},\"attestable\":{},\"g1Eligible\":{},\"moduleRows\":{},\"declarationsChecked\":{},\"chain\":{}}}",
             json_string(&self.path.to_string_lossy()),
+            json_string(self.policy.as_str()),
+            json_string(fln::CHECKER_POLICY_SCHEMA),
+            self.attestable,
+            self.policy.is_g1_eligible(),
             self.module_rows,
             self.declarations_checked,
             json_string(&self.chain.to_hex()),
@@ -11437,7 +11674,9 @@ impl WrittenReceiptSet {
 
     fn human_line(&self) -> String {
         format!(
-            "receipts: {} module rows, {} declarations checked, chained to {}, written to {}\n",
+            "receipts: policy={} (attestable={}), {} module rows, {} declarations checked, chained to {}, written to {}\n",
+            self.policy.as_str(),
+            if self.attestable { "yes" } else { "no" },
             self.module_rows,
             self.declarations_checked,
             self.chain.to_hex(),
@@ -11452,12 +11691,14 @@ impl WrittenReceiptSet {
 /// fln-hash's registered domains, with the first `prev` at zero. Rows carry NO
 /// clock values, so an identical module set and byte content reproduce the
 /// receipt file byte-for-byte; wall-clock timing belongs to the caller's
-/// telemetry, not to a verifiable chain. The set is published no-clobber via a
-/// sibling partial file and one rename.
+/// telemetry, not to a verifiable chain. Every row binds the active plan §8.3c
+/// verification policy and attestability into the hash chain. The set is
+/// published no-clobber via a sibling partial file and one rename.
 fn write_receipt_set(
     path: &Path,
     modules: &[NamedOleanBytes],
     checked: &fln::CheckedOleanSet,
+    policy: fln::VerificationPolicy,
 ) -> Result<WrittenReceiptSet, ReceiptWriteError> {
     if path.exists() {
         return Err(ReceiptWriteError::Input {
@@ -11483,6 +11724,7 @@ fn write_receipt_set(
     let mut jsonl = String::new();
     let mut prev = [0u8; 32];
     let mut declarations_checked = 0_usize;
+    let set_policy_summary = checked.policy_summary(policy);
     for module in modules {
         let Some(checked_module) = checked
             .modules
@@ -11496,11 +11738,14 @@ fn write_receipt_set(
                 ),
             });
         };
+        let module_policy_summary = checked_module.policy_summary(policy);
         let mut grounds: BTreeMap<&'static str, usize> = BTreeMap::new();
         for declaration in &checked_module.declarations {
-            *grounds
-                .entry(checker_ground_name(declaration.checker.ground))
-                .or_insert(0) += 1;
+            let label = match declaration.checker {
+                Some(agreement) => checker_ground_name(agreement.ground),
+                None => "policy-skipped",
+            };
+            *grounds.entry(label).or_insert(0) += 1;
         }
         declarations_checked += checked_module.declarations.len();
 
@@ -11521,9 +11766,17 @@ fn write_receipt_set(
         let mut canon = Vec::new();
         receipt_u64(&mut canon, 1); // row kind: module
         receipt_field(&mut canon, prev.as_slice());
+        receipt_field(&mut canon, policy.as_str().as_bytes());
+        receipt_u64(&mut canon, u64::from(policy.is_attestable()));
         receipt_field(&mut canon, module.name.to_display_string().as_bytes());
         receipt_field(&mut canon, artifact_root.to_hex().as_bytes());
         receipt_u64(&mut canon, checked_module.declarations.len() as u64);
+        receipt_u64(&mut canon, module_policy_summary.checker_selected);
+        receipt_u64(&mut canon, module_policy_summary.checker_skipped);
+        receipt_field(
+            &mut canon,
+            module_policy_summary.selection_digest.to_hex().as_bytes(),
+        );
         for (ground, count) in &grounds {
             receipt_field(&mut canon, ground.as_bytes());
             receipt_u64(&mut canon, *count as u64);
@@ -11538,12 +11791,17 @@ fn write_receipt_set(
             .collect::<Vec<_>>()
             .join(",");
         jsonl.push_str(&format!(
-            "{{\"schema\":{schema},\"kind\":\"module\",\"prev\":\"{prev}\",\"module\":{module},\"artifactRoot\":\"{root}\",\"declarationsChecked\":{decls},\"agreementGrounds\":{{{grounds}}},\"rowHash\":\"{hash}\"}}\n",
+            "{{\"schema\":{schema},\"kind\":\"module\",\"prev\":\"{prev}\",\"policy\":{policy},\"policySchema\":{policy_schema},\"attestable\":{attestable},\"g1Eligible\":{g1_eligible},\"module\":{module},\"artifactRoot\":\"{root}\",\"declarationsChecked\":{decls},\"checkerPolicy\":{checker_policy},\"agreementGrounds\":{{{grounds}}},\"rowHash\":\"{hash}\"}}\n",
             schema = json_string(RECEIPT_SET_SCHEMA),
             prev = Digest(prev).to_hex(),
+            policy = json_string(policy.as_str()),
+            policy_schema = json_string(fln::CHECKER_POLICY_SCHEMA),
+            attestable = policy.is_attestable(),
+            g1_eligible = policy.is_g1_eligible(),
             module = json_string(&module.name.to_display_string()),
             root = artifact_root.to_hex(),
             decls = checked_module.declarations.len(),
+            checker_policy = checker_policy_summary_json(&module_policy_summary),
             grounds = grounds_json,
             hash = row_hash.to_hex(),
         ));
@@ -11553,17 +11811,30 @@ fn write_receipt_set(
     let mut summary_canon = Vec::new();
     receipt_u64(&mut summary_canon, 2); // row kind: summary
     receipt_field(&mut summary_canon, prev.as_slice());
+    receipt_field(&mut summary_canon, policy.as_str().as_bytes());
+    receipt_u64(&mut summary_canon, u64::from(policy.is_attestable()));
     receipt_u64(&mut summary_canon, modules.len() as u64);
     receipt_u64(&mut summary_canon, declarations_checked as u64);
+    receipt_u64(&mut summary_canon, set_policy_summary.checker_selected);
+    receipt_u64(&mut summary_canon, set_policy_summary.checker_skipped);
+    receipt_field(
+        &mut summary_canon,
+        set_policy_summary.selection_digest.to_hex().as_bytes(),
+    );
     let chain = DomainHasher::new(Domain::TransparencyLeaf)
         .update(&summary_canon)
         .finalize();
     jsonl.push_str(&format!(
-        "{{\"schema\":{},\"kind\":\"summary\",\"prev\":\"{}\",\"moduleRows\":{},\"declarationsChecked\":{},\"chain\":\"{}\"}}\n",
+        "{{\"schema\":{},\"kind\":\"summary\",\"prev\":\"{}\",\"policy\":{},\"policySchema\":{},\"attestable\":{},\"g1Eligible\":{},\"moduleRows\":{},\"declarationsChecked\":{},\"checkerPolicy\":{},\"chain\":\"{}\"}}\n",
         json_string(RECEIPT_SET_SCHEMA),
         Digest(prev).to_hex(),
+        json_string(policy.as_str()),
+        json_string(fln::CHECKER_POLICY_SCHEMA),
+        policy.is_attestable(),
+        policy.is_g1_eligible(),
         modules.len(),
         declarations_checked,
+        checker_policy_summary_json(&set_policy_summary),
         chain.to_hex(),
     ));
 
@@ -11579,6 +11850,8 @@ fn write_receipt_set(
     }
     Ok(WrittenReceiptSet {
         path: path.to_path_buf(),
+        policy,
+        attestable: policy.is_attestable(),
         module_rows: modules.len(),
         declarations_checked,
         chain,
@@ -14661,6 +14934,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             roots,
             max_bytes,
             json,
+            policy,
             receipts,
             continue_on_failure,
             progress,
@@ -14668,6 +14942,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
         }) => check_olean(
             &roots,
             max_bytes,
+            policy,
             json,
             receipts.as_deref(),
             continue_on_failure,
@@ -17279,6 +17554,7 @@ mod tests {
             memory: fln::OleanFrontierMemoryAttribution::from_components(
                 1024, 200, 500, 400, 150, 1,
             ),
+            policy_summary: fln::CheckerPolicySummary::empty(fln::VerificationPolicy::Release),
         };
         for (verdict, expected_exit, expected_count) in [
             (
@@ -17297,6 +17573,7 @@ mod tests {
             let frontier = fln::OleanFrontier {
                 engine: Ok(fln::Engine::from_environment(fln::Environment::new())),
                 rows: vec![row(verdict)],
+                policy_summary: fln::CheckerPolicySummary::empty(fln::VerificationPolicy::Release),
             };
             let output = super::render_check_olean_frontier(&frontier, true);
             assert_eq!(output.exit_code, expected_exit);
@@ -17394,7 +17671,11 @@ mod tests {
                         retry_result,
                     }),
                     memory: fln::OleanFrontierMemoryAttribution::default(),
+                    policy_summary: fln::CheckerPolicySummary::empty(
+                        fln::VerificationPolicy::Release,
+                    ),
                 }],
+                policy_summary: fln::CheckerPolicySummary::empty(fln::VerificationPolicy::Release),
             };
             let output = super::render_check_olean_frontier(&frontier, true);
             assert_eq!(output.exit_code, exit_code);
@@ -17463,11 +17744,13 @@ mod tests {
                     (index + 1) * 400,
                     u64::from(retried),
                 ),
+                policy_summary: fln::CheckerPolicySummary::empty(fln::VerificationPolicy::Release),
             });
         }
         let frontier = fln::OleanFrontier {
             engine: Ok(fln::Engine::from_environment(fln::Environment::new())),
             rows,
+            policy_summary: fln::CheckerPolicySummary::empty(fln::VerificationPolicy::Release),
         };
         let json_out = super::render_check_olean_frontier(&frontier, true);
         assert_eq!(json_out.exit_code, 3);
@@ -17589,6 +17872,7 @@ mod tests {
                 },
             ],
             total,
+            fln::VerificationPolicy::Release,
             true,
             None,
         );
@@ -19729,11 +20013,16 @@ mod tests {
                 },
             ],
             total,
+            fln::VerificationPolicy::Release,
             false,
             Some(receipts.clone()),
         );
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
-        assert!(output.stdout.contains("receipts: 2 module rows"));
+        assert!(
+            output
+                .stdout
+                .contains("receipts: policy=release (attestable=yes), 2 module rows")
+        );
         assert!(receipts.is_file(), "the receipt set must be published");
 
         let text = std::fs::read_to_string(&receipts).expect("read the receipt set");
@@ -19782,6 +20071,7 @@ mod tests {
                 },
             ],
             total,
+            fln::VerificationPolicy::Release,
             true,
             Some(receipts),
         );

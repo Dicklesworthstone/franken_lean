@@ -178,15 +178,18 @@ use fln_admission::{
     collect_constant_references, display_names, merge_frontier_entry, plan_olean_declarations,
 };
 pub use fln_admission::{
-    CheckedOleanModule, CheckerAgreement, CheckerExecutionLimits, DecodedOlean,
-    EngineAdmissionError, EngineAdmissionLimits, FrontierEstimateDirection, FrontierMemorySample,
-    FrontierMemorySource, FrontierRunHooks, HostAllocationFailure, HostProcessMemorySource,
-    IndependentReading, OleanCheckError, OleanCheckLimits, OleanCheckedDeclaration,
-    OleanCompanionPart, OleanDecodeError, OleanDecodeLimits, OleanDecodeMemoryRetry,
-    OleanFrontierEvent, OleanFrontierJobs, OleanFrontierMemoryAttribution,
-    OleanFrontierMemoryRetry, OleanFrontierRow, OleanModuleInput, OleanModulePart,
-    OleanModuleVerdict, decode_olean_artifact, decode_olean_module_artifacts,
-    install_host_allocation_failure_hook, olean_module_imports,
+    CHECKER_POLICY_SCHEMA, CheckedOleanModule, CheckerAgreement, CheckerContentDigest,
+    CheckerExecutionLimits, CheckerHighRiskForm, CheckerPolicySummary, CheckerPolicyV1,
+    CheckerRiskProfile, CheckerSelectionDecision, CheckerSelectionReason,
+    DEFAULT_HIGH_RISK_K1_STEPS, DeclarationPolicyOutcome, DecodedOlean, EngineAdmissionError,
+    EngineAdmissionLimits, FrontierEstimateDirection, FrontierMemorySample, FrontierMemorySource,
+    FrontierRunHooks, HostAllocationFailure, HostProcessMemorySource, IndependentReading,
+    OleanCheckError, OleanCheckLimits, OleanCheckedDeclaration, OleanCompanionPart,
+    OleanDecodeError, OleanDecodeLimits, OleanDecodeMemoryRetry, OleanFrontierEvent,
+    OleanFrontierJobs, OleanFrontierMemoryAttribution, OleanFrontierMemoryRetry, OleanFrontierRow,
+    OleanModuleInput, OleanModulePart, OleanModuleVerdict, VerificationPolicy,
+    classify_declaration_risks, declaration_content_digest, decode_olean_artifact,
+    decode_olean_module_artifacts, install_host_allocation_failure_hook, olean_module_imports,
 };
 // Council internals that `fln`'s own unit tests still drive through an `Engine`.
 #[cfg(test)]
@@ -2240,7 +2243,7 @@ impl Engine {
         options: &KVMap,
         limits: EngineAdmissionLimits,
         reading: ReadingCheck<'_>,
-    ) -> Result<Outcome<(Engine, Vec<CheckerAgreement>)>, EngineAdmissionError> {
+    ) -> Result<Outcome<(Engine, Vec<DeclarationPolicyOutcome>)>, EngineAdmissionError> {
         self.admitted()
             .admit_declarations_unrooted(declarations, options, limits, reading)
             .map(|outcome| {
@@ -8077,6 +8080,8 @@ impl EngineExecutionLimits {
             checker: self.checker,
             declaration: self.declaration,
             collisions: self.collisions,
+            policy: VerificationPolicy::Release,
+            high_risk_k1_steps: DEFAULT_HIGH_RISK_K1_STEPS,
         }
     }
 }
@@ -10964,7 +10969,9 @@ mod tests {
         assert_eq!(checked.decoded.constants, constants);
         assert_ne!(checked.base_logical_root, checked.result_logical_root);
         assert!(checked.declarations.iter().all(|declaration| {
-            declaration.checker.schema == fln_checker::admit::ADMISSION_SCHEMA
+            declaration
+                .checker
+                .is_some_and(|c| c.schema == fln_checker::admit::ADMISSION_SCHEMA)
         }));
     }
 
@@ -11348,7 +11355,10 @@ mod tests {
         assert_eq!(checked.engine.environment().len(), 3);
         assert_eq!(checked.decoded.constants, constants);
         assert_eq!(
-            checked.declarations[0].checker.ground,
+            checked.declarations[0]
+                .checker
+                .expect("release agreement")
+                .ground,
             CheckerAdmissionGround::AxiomPreamble
         );
         assert_eq!(
@@ -11356,7 +11366,10 @@ mod tests {
             "one mutual authority transition reports its agreement on every member"
         );
         assert_eq!(
-            checked.declarations[1].checker.ground,
+            checked.declarations[1]
+                .checker
+                .expect("release agreement")
+                .ground,
             CheckerAdmissionGround::PartialQuarantine
         );
     }
@@ -11408,8 +11421,8 @@ mod tests {
                 .declarations
                 .iter()
                 .find(|declaration| declaration.name.to_display_string() == name)
-                .map(|declaration| declaration.checker)
-                .expect("every row is reported")
+                .and_then(|declaration| declaration.checker)
+                .expect("every row is reported under release policy")
         };
         assert_eq!(
             checker_of("Fixture.mutualLeft"),
@@ -11609,7 +11622,9 @@ mod tests {
         assert_eq!(checked.declarations.len(), constants.len());
         assert_eq!(checked.engine.environment().len(), constants.len());
         assert!(checked.declarations.iter().all(|declaration| {
-            declaration.checker.schema == fln_checker::admit::ADMISSION_SCHEMA
+            declaration
+                .checker
+                .is_some_and(|c| c.schema == fln_checker::admit::ADMISSION_SCHEMA)
         }));
 
         let environment = checked.engine.environment();
@@ -11855,13 +11870,11 @@ mod tests {
             .expect("both checkers complete the fixed quotient judgment");
 
         assert_eq!(checked.declarations.len(), 4);
-        assert!(
-            checked
-                .declarations
-                .iter()
-                .all(|declaration| declaration.checker.ground
-                    == CheckerAdmissionGround::QuotientPrimitiveChecked)
-        );
+        assert!(checked.declarations.iter().all(|declaration| {
+            declaration
+                .checker
+                .is_some_and(|c| c.ground == CheckerAdmissionGround::QuotientPrimitiveChecked)
+        }));
         for name in [
             Name::from_components(["Quot"]),
             Name::from_components(["Quot", "mk"]),
@@ -11931,7 +11944,9 @@ mod tests {
 
         assert_eq!(checked.declarations.len(), 4);
         assert!(checked.declarations.iter().all(|declaration| {
-            declaration.checker.ground == CheckerAdmissionGround::InductiveNonrecursiveChecked
+            declaration
+                .checker
+                .is_some_and(|c| c.ground == CheckerAdmissionGround::InductiveNonrecursiveChecked)
         }));
         for name in [
             Name::from_components(["Fixture", "Color"]),
@@ -11961,7 +11976,9 @@ mod tests {
 
         assert_eq!(checked.declarations.len(), 3);
         assert!(checked.declarations.iter().all(|declaration| {
-            declaration.checker.ground == CheckerAdmissionGround::InductiveNonrecursiveChecked
+            declaration
+                .checker
+                .is_some_and(|c| c.ground == CheckerAdmissionGround::InductiveNonrecursiveChecked)
         }));
         for name in [
             Name::from_components(["Fixture", "Witness"]),
@@ -12567,6 +12584,9 @@ mod tests {
                                 elapsed: started.elapsed(),
                                 retained: None,
                                 memory: super::OleanFrontierMemoryAttribution::default(),
+                                policy_summary: super::CheckerPolicySummary::empty(
+                                    super::VerificationPolicy::Release,
+                                ),
                             };
                         }
                         drop(job);
@@ -15140,7 +15160,7 @@ mod tests {
         assert_eq!(rechecked.len(), 1);
         assert_eq!(rechecked[0].name, Name::from_components(["t"]));
         assert_eq!(
-            rechecked[0].checker.ground,
+            rechecked[0].checker.expect("release agreement").ground,
             CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
         );
         assert_eq!(
@@ -19538,6 +19558,9 @@ mod tests {
                     elapsed: std::time::Duration::ZERO,
                     retained: None,
                     memory: super::OleanFrontierMemoryAttribution::default(),
+                    policy_summary: super::CheckerPolicySummary::empty(
+                        super::VerificationPolicy::Release,
+                    ),
                 }
             });
             assert_eq!(done.index, 7);

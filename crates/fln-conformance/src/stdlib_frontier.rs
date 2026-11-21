@@ -276,6 +276,34 @@ pub fn parse(text: &str) -> Result<Frontier, FrontierError> {
             ));
         }
     };
+    if !authority {
+        return Err(FrontierError::Shape(
+            "authority is false; a non-authoritative frontier cannot serve as G1 evidence"
+                .to_owned(),
+        ));
+    }
+    if let Some((_, policy_value)) = top.iter().find(|(name, _)| name == "policy") {
+        let Value::String(policy) = policy_value else {
+            return Err(FrontierError::Shape("policy is not a string".to_owned()));
+        };
+        if policy != "release" {
+            return Err(FrontierError::Shape(format!(
+                "policy is {policy:?}; G1 frontier evidence requires \"release\""
+            )));
+        }
+    }
+    if let Some((_, attestable_value)) = top.iter().find(|(name, _)| name == "attestable") {
+        let Value::Bool(attestable) = attestable_value else {
+            return Err(FrontierError::Shape(
+                "attestable is not a boolean".to_owned(),
+            ));
+        };
+        if !attestable {
+            return Err(FrontierError::Shape(
+                "attestable is false; non-attestable output cannot serve as G1 evidence".to_owned(),
+            ));
+        }
+    }
     let Value::Array(items) = field(top, "rows")? else {
         return Err(FrontierError::Shape("rows is not an array".to_owned()));
     };

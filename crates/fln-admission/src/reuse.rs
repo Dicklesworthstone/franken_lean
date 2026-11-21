@@ -599,7 +599,12 @@ impl RecordedModule {
         let mut rows = Vec::with_capacity(declarations.len());
         let mut seen = BTreeSet::new();
         for row in declarations {
-            if schema_code(row.checker.schema).is_none() {
+            let Some(agreement) = row.checker else {
+                return Err(ImportReuseRefusal::Unrecordable(
+                    "a policy-skipped declaration cannot be recorded for import reuse",
+                ));
+            };
+            if schema_code(agreement.schema).is_none() {
                 return Err(ImportReuseRefusal::Unrecordable(
                     "a checker row carries an unknown schema",
                 ));
@@ -614,7 +619,7 @@ impl RecordedModule {
                     "two checker rows name one declaration",
                 ));
             }
-            rows.push((at, row.checker));
+            rows.push((at, agreement));
         }
         if rows.len() != decoded.constants.len() {
             return Err(ImportReuseRefusal::Unrecordable(
@@ -1731,7 +1736,9 @@ impl Admitted {
             }
             declarations.push(OleanCheckedDeclaration {
                 name: decoded.constants[at].name().clone(),
-                checker,
+                checker: Some(checker),
+                policy_decision: None,
+                k1_step_floor: false,
             });
         }
         if covered.iter().any(|covered| !covered) {
@@ -2180,7 +2187,9 @@ impl Admitted {
                 }
                 declarations.push(OleanCheckedDeclaration {
                     name: decoded.constants[at].name().clone(),
-                    checker,
+                    checker: Some(checker),
+                    policy_decision: None,
+                    k1_step_floor: false,
                 });
             }
             if covered.iter().any(|covered| !covered) {

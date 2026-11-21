@@ -350,12 +350,10 @@ fn native_olean_decode_planning_and_council_reconstruct_the_complete_mutual_unit
         assert_eq!(checked.decoded.constants, rows);
         assert_eq!(checked.declarations.len(), rows.len());
         assert_eq!(checked.engine.environment().len(), rows.len());
-        assert!(
-            checked
-                .declarations
-                .iter()
-                .all(|d| d.checker.schema == fln_checker::admit::ADMISSION_SCHEMA)
-        );
+        assert!(checked.declarations.iter().all(|d| {
+            d.checker
+                .is_some_and(|c| c.schema == fln_checker::admit::ADMISSION_SCHEMA)
+        }));
         assert!(predecessor.environment().is_empty());
     }
 }

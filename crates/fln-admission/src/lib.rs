@@ -60,13 +60,19 @@ use fln_checker::environment::{
     RecursorDeclaration as CheckerRecursorDeclaration, RecursorRule as CheckerRecursorRule,
     ReducibilityHint as CheckerReducibilityHint,
 };
+pub use fln_checker::policy::{
+    ContentDigest as CheckerContentDigest, HighRiskForm as CheckerHighRiskForm,
+    POLICY_SCHEMA as CHECKER_POLICY_SCHEMA, PolicyV1 as CheckerPolicyV1,
+    RiskProfile as CheckerRiskProfile, SelectionDecision as CheckerSelectionDecision,
+    SelectionReason as CheckerSelectionReason, VerificationPolicy,
+};
 pub use fln_checker::wire::DecodeBudget as CheckerDecodeBudget;
 use fln_checker::wire::{
     DecodeOutcome as CheckerDecodeOutcome, WireExpr as CheckerExpr, WireName as CheckerName,
     decode_expr_dag as checker_decode_expr_dag, decode_name as checker_decode_name,
 };
 use fln_core::expr::{Expr, ExprNode, Literal};
-use fln_core::name::Name;
+use fln_core::name::{LeafView, Name};
 use fln_core::options::KVMap;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
 use fln_env::constants::{
@@ -77,6 +83,7 @@ use fln_env::environment::{DeclarationCommitted, EnvironmentEntry};
 use fln_env::modules::CancellationProbe;
 use fln_env::pmap::CollisionBudget;
 use fln_hash::canon::{CanonWriter, Canonical};
+use fln_hash::domain::{Digest, Domain, DomainHasher};
 use fln_hash::root::LogicalRoot;
 use fln_kernel::Declaration;
 use fln_kernel::capability::{Published, admit};
@@ -955,6 +962,11 @@ pub struct OleanCheckLimits {
     pub max_dependency_presentations: usize,
 }
 
+/// Default K1 step threshold above which the `standard` and `compat-bench`
+/// verification policies treat a declaration as high-risk and unconditionally
+/// route it to the independent checker (plan §8.3c, bead `fln-9908`).
+pub const DEFAULT_HIGH_RISK_K1_STEPS: u64 = 10_000;
+
 impl OleanCheckLimits {
     /// Construct conservative product limits around explicit artifact and
     /// kernel-stack ceilings.
@@ -968,14 +980,193 @@ impl OleanCheckLimits {
             max_dependency_presentations: 100_000_000,
         }
     }
+
+    /// Select the plan §8.3c council verification policy for this check.
+    pub fn with_policy(mut self, policy: VerificationPolicy) -> Self {
+        self.admission = self.admission.with_policy(policy);
+        self
+    }
+
+    /// Override the K1 step threshold for the high-risk checker floor.
+    pub fn with_high_risk_k1_steps(mut self, steps: u64) -> Self {
+        self.admission = self.admission.with_high_risk_k1_steps(steps);
+        self
+    }
 }
 
-/// One declaration whose K1 verdict and independent-checker veto both
-/// completed while checking an `.olean`.
+/// Deterministic summary of how a [`VerificationPolicy`] routed declarations to
+/// K1 and `fln-checker` during a check run (plan §8.3c, bead `fln-9908`).
+///
+/// Every counter and `selection_digest` depend only on declaration content,
+/// deterministic risk facts, and deterministic K1 step counts — never on clocks,
+/// randomness, or thread count (FL-INV-01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckerPolicySummary {
+    pub schema: &'static str,
+    pub policy: VerificationPolicy,
+    pub attestable: bool,
+    pub k1_checked: u64,
+    pub checker_selected: u64,
+    pub checker_full_policy: u64,
+    pub checker_high_risk: u64,
+    pub checker_high_risk_k1_steps: u64,
+    pub checker_sampled: u64,
+    pub checker_skipped: u64,
+    pub selection_digest: Digest,
+}
+
+impl CheckerPolicySummary {
+    /// Empty summary for a run or row that routed zero declarations through the council.
+    pub fn empty(policy: VerificationPolicy) -> Self {
+        let mut hasher = DomainHasher::new(Domain::ShadowSampling);
+        hasher.update(b"fln.policy.summary/1\0");
+        hasher.update(policy.as_str().as_bytes());
+        hasher.update(&[u8::from(policy.is_attestable())]);
+        Self {
+            schema: CHECKER_POLICY_SCHEMA,
+            policy,
+            attestable: policy.is_attestable(),
+            k1_checked: 0,
+            checker_selected: 0,
+            checker_full_policy: 0,
+            checker_high_risk: 0,
+            checker_high_risk_k1_steps: 0,
+            checker_sampled: 0,
+            checker_skipped: 0,
+            selection_digest: hasher.finalize(),
+        }
+    }
+
+    /// Aggregate a deterministic summary over one module's checked declarations.
+    pub fn from_declarations(
+        policy: VerificationPolicy,
+        declarations: &[OleanCheckedDeclaration],
+    ) -> Self {
+        let mut hasher = DomainHasher::new(Domain::ShadowSampling);
+        hasher.update(b"fln.policy.summary/1\0");
+        hasher.update(policy.as_str().as_bytes());
+        hasher.update(&[u8::from(policy.is_attestable())]);
+        let mut k1_checked = 0_u64;
+        let mut checker_selected = 0_u64;
+        let mut checker_full_policy = 0_u64;
+        let mut checker_high_risk = 0_u64;
+        let mut checker_high_risk_k1_steps = 0_u64;
+        let mut checker_sampled = 0_u64;
+        let mut checker_skipped = 0_u64;
+        for row in declarations {
+            let Some(decision) = row.policy_decision else {
+                continue;
+            };
+            k1_checked = k1_checked.saturating_add(1);
+            let reason_tag = match decision.reason {
+                CheckerSelectionReason::FullPolicy => {
+                    checker_selected = checker_selected.saturating_add(1);
+                    checker_full_policy = checker_full_policy.saturating_add(1);
+                    1_u8
+                }
+                CheckerSelectionReason::HighRiskFloor => {
+                    checker_selected = checker_selected.saturating_add(1);
+                    checker_high_risk = checker_high_risk.saturating_add(1);
+                    if row.k1_step_floor {
+                        checker_high_risk_k1_steps = checker_high_risk_k1_steps.saturating_add(1);
+                    }
+                    2_u8
+                }
+                CheckerSelectionReason::ContentBucket => {
+                    checker_selected = checker_selected.saturating_add(1);
+                    checker_sampled = checker_sampled.saturating_add(1);
+                    3_u8
+                }
+                CheckerSelectionReason::OutsideContentBucket => {
+                    checker_skipped = checker_skipped.saturating_add(1);
+                    4_u8
+                }
+            };
+            hasher.update(&decision.content.bytes());
+            hasher.update(&[
+                u8::from(decision.selected),
+                reason_tag,
+                decision.risks.bits(),
+                u8::from(row.k1_step_floor),
+            ]);
+        }
+        Self {
+            schema: CHECKER_POLICY_SCHEMA,
+            policy,
+            attestable: policy.is_attestable(),
+            k1_checked,
+            checker_selected,
+            checker_full_policy,
+            checker_high_risk,
+            checker_high_risk_k1_steps,
+            checker_sampled,
+            checker_skipped,
+            selection_digest: hasher.finalize(),
+        }
+    }
+
+    /// Merge module summaries in deterministic topological order.
+    pub fn merge<'a>(
+        policy: VerificationPolicy,
+        summaries: impl IntoIterator<Item = &'a CheckerPolicySummary>,
+    ) -> Self {
+        let mut hasher = DomainHasher::new(Domain::ShadowSampling);
+        hasher.update(b"fln.policy.summary-merge/1\0");
+        hasher.update(policy.as_str().as_bytes());
+        hasher.update(&[u8::from(policy.is_attestable())]);
+        let mut out = Self::empty(policy);
+        for summary in summaries {
+            out.k1_checked = out.k1_checked.saturating_add(summary.k1_checked);
+            out.checker_selected = out
+                .checker_selected
+                .saturating_add(summary.checker_selected);
+            out.checker_full_policy = out
+                .checker_full_policy
+                .saturating_add(summary.checker_full_policy);
+            out.checker_high_risk = out
+                .checker_high_risk
+                .saturating_add(summary.checker_high_risk);
+            out.checker_high_risk_k1_steps = out
+                .checker_high_risk_k1_steps
+                .saturating_add(summary.checker_high_risk_k1_steps);
+            out.checker_sampled = out.checker_sampled.saturating_add(summary.checker_sampled);
+            out.checker_skipped = out.checker_skipped.saturating_add(summary.checker_skipped);
+            hasher.update(&summary.selection_digest.0);
+        }
+        out.selection_digest = hasher.finalize();
+        out
+    }
+}
+
+/// Per-declaration policy decision and optional independent-checker agreement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclarationPolicyOutcome {
+    pub checker: Option<CheckerAgreement>,
+    pub policy_decision: CheckerSelectionDecision,
+    pub k1_step_floor: bool,
+}
+
+/// One declaration whose K1 verdict completed while checking an `.olean`,
+/// together with its independent-checker agreement (when selected by policy)
+/// and the deterministic [`CheckerSelectionDecision`] recorded for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OleanCheckedDeclaration {
     pub name: Name,
-    pub checker: CheckerAgreement,
+    /// `Some` when the independent checker reviewed this declaration; `None`
+    /// when `standard` or `compat-bench` policy skipped it (`OutsideContentBucket`).
+    pub checker: Option<CheckerAgreement>,
+    /// Deterministic policy decision for units routed through the council;
+    /// `None` for constants already admitted by an imported module.
+    pub policy_decision: Option<CheckerSelectionDecision>,
+    /// Whether this declaration exceeded the K1 step threshold high-risk floor.
+    pub k1_step_floor: bool,
+}
+
+impl OleanCheckedDeclaration {
+    /// Whether the independent checker reviewed this declaration.
+    pub const fn is_checker_reviewed(&self) -> bool {
+        self.checker.is_some()
+    }
 }
 
 /// Authoritative result of checking every decoded declaration in one
@@ -1003,6 +1194,11 @@ impl<E> CheckedOlean<E> {
             result_logical_root: self.result_logical_root,
             declarations: self.declarations,
         }
+    }
+
+    /// Deterministic verification-policy summary over this artifact's checked declarations.
+    pub fn policy_summary(&self, policy: VerificationPolicy) -> CheckerPolicySummary {
+        CheckerPolicySummary::from_declarations(policy, &self.declarations)
     }
 }
 
@@ -1033,6 +1229,13 @@ pub struct CheckedOleanModule {
     pub base_logical_root: LogicalRoot,
     pub result_logical_root: LogicalRoot,
     pub declarations: Vec<OleanCheckedDeclaration>,
+}
+
+impl CheckedOleanModule {
+    /// Deterministic verification-policy summary for this module.
+    pub fn policy_summary(&self, policy: VerificationPolicy) -> CheckerPolicySummary {
+        CheckerPolicySummary::from_declarations(policy, &self.declarations)
+    }
 }
 
 /// Whether a module stopped because the host refused memory. An explicit
@@ -1192,6 +1395,7 @@ pub fn frontier_guarded(
             elapsed: started.elapsed(),
             retained: retain.then_some(FrontierRetained::Failed(error)),
             memory: OleanFrontierMemoryAttribution::default(),
+            policy_summary: CheckerPolicySummary::empty(VerificationPolicy::Release),
         }
     })
 }
@@ -1446,6 +1650,8 @@ pub struct OleanFrontierRow {
     pub decode_memory_retry: Option<OleanDecodeMemoryRetry>,
     /// Closure-decoded estimate and four-component memory peak attribution.
     pub memory: OleanFrontierMemoryAttribution,
+    /// Deterministic plan §8.3c checker-selection summary for this module.
+    pub policy_summary: CheckerPolicySummary,
 }
 
 /// The first attempt of a module checked again in isolation. Its final attempt
@@ -1517,6 +1723,8 @@ pub struct OleanFrontier<E = Admitted> {
     /// `DuplicateDeclaration` that stops the merge, and every row still stands.
     pub engine: Result<E, OleanCheckError>,
     pub rows: Vec<OleanFrontierRow>,
+    /// Deterministic aggregate plan §8.3c checker-selection summary across all rows.
+    pub policy_summary: CheckerPolicySummary,
 }
 
 impl<E> OleanFrontier<E> {
@@ -1525,6 +1733,7 @@ impl<E> OleanFrontier<E> {
         OleanFrontier {
             engine: self.engine.map(map),
             rows: self.rows,
+            policy_summary: self.policy_summary,
         }
     }
 }
@@ -1611,6 +1820,8 @@ pub struct FrontierDone {
     pub retained: Option<FrontierRetained>,
     /// Component memory peaks observed during this module's check.
     pub memory: OleanFrontierMemoryAttribution,
+    /// Deterministic plan §8.3c checker-selection summary for this module.
+    pub policy_summary: CheckerPolicySummary,
 }
 
 /// A retaining frontier job's own record: what the serial result is reassembled
@@ -1623,7 +1834,7 @@ pub enum FrontierRetained {
         decoded: Box<DecodedOlean>,
         declarations: Vec<OleanCheckedDeclaration>,
         closure_digests: Vec<Option<fln_hash::domain::Digest>>,
-        checker_entries: BTreeMap<Name, Result<CheckerConstantEntry, &'static str>>,
+        checker_entries: BTreeMap<Name, Result<Option<CheckerConstantEntry>, &'static str>>,
     },
     Failed(OleanCheckError),
 }
@@ -1650,29 +1861,38 @@ pub fn frontier_base_of(
 }
 
 /// Each admitted constant's checker entry in `engine`'s retained projection,
-/// which a scheduled module set reassembles its serial projection from. A
-/// constant without one is recorded as the invariant the reassembly reports.
+/// which a scheduled module set reassembles its serial projection from. Under
+/// `VerificationPolicy::Release`, a constant without one is recorded as the
+/// invariant the reassembly reports; under sampled policies (`Standard`,
+/// `CompatBench`), skipped declarations carry `Ok(None)`.
 pub fn frontier_checker_entries(
     engine: &Admitted,
     admitted: &[EnvironmentEntry],
     limits: OleanCheckLimits,
-) -> BTreeMap<Name, Result<CheckerConstantEntry, &'static str>> {
+) -> BTreeMap<Name, Result<Option<CheckerConstantEntry>, &'static str>> {
+    let full_policy = limits.admission.policy == VerificationPolicy::Release;
     admitted
         .iter()
         .map(|entry| {
             let name = entry.declaration().name().clone();
-            let checker = engine
-                .checker_environment
-                .as_ref()
-                .ok_or("a module that admitted constants retains no checker projection")
-                .and_then(|projection| {
-                    let wire = decode_checker_name(&name, limits.admission.checker.decode)
-                        .map_err(|_| "an admitted constant has no checker name")?;
-                    let declaration = projection
-                        .find(&wire)
-                        .ok_or("an admitted constant is missing from its checker projection")?;
-                    Ok(CheckerConstantEntry::new(wire, declaration.clone()))
-                });
+            let checker = match engine.checker_environment.as_ref() {
+                None if !full_policy => Ok(None),
+                None => Err("a module that admitted constants retains no checker projection"),
+                Some(projection) => {
+                    match decode_checker_name(&name, limits.admission.checker.decode) {
+                        Err(_) => Err("an admitted constant has no checker name"),
+                        Ok(wire) => match projection.find(&wire) {
+                            Some(declaration) => {
+                                Ok(Some(CheckerConstantEntry::new(wire, declaration.clone())))
+                            }
+                            None if !full_policy => Ok(None),
+                            None => {
+                                Err("an admitted constant is missing from its checker projection")
+                            }
+                        },
+                    }
+                }
+            };
             (name, checker)
         })
         .collect()
@@ -1757,7 +1977,7 @@ pub struct ScheduledOleanModule {
     /// For each of `decoded.constants`, the digest the module's own engine held
     /// under that name after its check.
     pub closure_digests: Vec<Option<fln_hash::domain::Digest>>,
-    pub checker_entries: BTreeMap<Name, Result<CheckerConstantEntry, &'static str>>,
+    pub checker_entries: BTreeMap<Name, Result<Option<CheckerConstantEntry>, &'static str>>,
 }
 
 /// The rows the serial planner gives a module checked after `before`, the
@@ -1772,8 +1992,22 @@ pub fn serial_olean_rows(
     limits: OleanCheckLimits,
 ) -> Result<Vec<OleanCheckedDeclaration>, OleanCheckError> {
     let plan = plan_olean_declarations(before, &decoded.constants, limits)?;
-    let agreements: BTreeMap<Name, CheckerAgreement> =
-        own.into_iter().map(|row| (row.name, row.checker)).collect();
+    let agreements: BTreeMap<
+        Name,
+        (
+            Option<CheckerAgreement>,
+            Option<CheckerSelectionDecision>,
+            bool,
+        ),
+    > = own
+        .into_iter()
+        .map(|row| {
+            (
+                row.name,
+                (row.checker, row.policy_decision, row.k1_step_floor),
+            )
+        })
+        .collect();
     let agreement = |name: &Name| {
         agreements
             .get(name)
@@ -1795,30 +2029,47 @@ pub fn serial_olean_rows(
             });
         };
         for name in &unit.names {
+            let (checker, policy_decision, k1_step_floor) = agreement(name)?;
             rows.push(OleanCheckedDeclaration {
                 name: name.clone(),
-                checker: agreement(name)?,
+                checker,
+                policy_decision,
+                k1_step_floor,
             });
         }
     }
     for (name, checker) in plan.already_present {
-        rows.push(OleanCheckedDeclaration { name, checker });
+        rows.push(OleanCheckedDeclaration {
+            name,
+            checker: Some(checker),
+            policy_decision: None,
+            k1_step_floor: false,
+        });
     }
     for repeat in plan.subsumed {
         let name = repeat.name().clone();
-        let checker = match repeat {
+        let (checker, policy_decision, k1_step_floor) = match repeat {
             ConstantInfo::Thm(_) => agreement(&name)?,
-            ConstantInfo::Axiom(_) => CheckerAgreement {
-                schema: "fln-checker/v1",
-                ground: CheckerAdmissionGround::AxiomPreamble,
-            },
+            ConstantInfo::Axiom(_) => (
+                Some(CheckerAgreement {
+                    schema: "fln-checker/v1",
+                    ground: CheckerAdmissionGround::AxiomPreamble,
+                }),
+                None,
+                false,
+            ),
             _ => {
                 return Err(OleanCheckError::InternalInvariant {
                     detail: "only theorems and axioms can subsume an admitted repeat",
                 });
             }
         };
-        rows.push(OleanCheckedDeclaration { name, checker });
+        rows.push(OleanCheckedDeclaration {
+            name,
+            checker,
+            policy_decision,
+            k1_step_floor,
+        });
     }
     if rows.len() != decoded.constants.len() {
         return Err(OleanCheckError::InternalInvariant {
@@ -1874,6 +2125,16 @@ impl<E> CheckedOleanSet<E> {
             result_logical_root: self.result_logical_root,
             modules: self.modules,
         }
+    }
+
+    /// Deterministic verification-policy summary across every module in this set.
+    pub fn policy_summary(&self, policy: VerificationPolicy) -> CheckerPolicySummary {
+        let summaries: Vec<CheckerPolicySummary> = self
+            .modules
+            .iter()
+            .map(|module| module.policy_summary(policy))
+            .collect();
+        CheckerPolicySummary::merge(policy, &summaries)
     }
 }
 
@@ -3655,6 +3916,7 @@ impl Admitted {
                         elapsed: started.elapsed(),
                         retained: None,
                         memory: OleanFrontierMemoryAttribution::default(),
+                        policy_summary: CheckerPolicySummary::empty(limits.admission.policy),
                     },
                 }
             })
@@ -3742,6 +4004,7 @@ impl Admitted {
                         estimated_bytes[row_index],
                         admission_deferrals[row_index],
                     ),
+                    policy_summary: done.policy_summary,
                 });
             };
             loop {
@@ -3803,6 +4066,7 @@ impl Admitted {
                             0,
                             admission_deferrals[index],
                         ),
+                        policy_summary: CheckerPolicySummary::empty(limits.admission.policy),
                     });
                     on_event(OleanFrontierEvent::Settled {
                         position: position[index] + 1,
@@ -4036,7 +4300,15 @@ impl Admitted {
         // whole --json to two executables' `main`).
         let engine = self
             .frontier_union_engine(order.iter().filter_map(|index| accepted[*index].as_deref()));
-        Ok(OleanFrontier { engine, rows })
+        let policy_summary = CheckerPolicySummary::merge(
+            limits.admission.policy,
+            rows.iter().map(|row| &row.policy_summary),
+        );
+        Ok(OleanFrontier {
+            engine,
+            rows,
+            policy_summary,
+        })
     }
 
     /// One engine holding exactly these accepted modules, merged in this order by
@@ -4425,7 +4697,8 @@ impl Admitted {
                 root = environment.logical_root(options);
                 for name in added {
                     match checker_entries.get(&name) {
-                        Some(Ok(entry)) => candidates.push(entry.clone()),
+                        Some(Ok(Some(entry))) => candidates.push(entry.clone()),
+                        Some(Ok(None)) => {}
                         Some(Err(detail)) => return Err(invariant(detail)),
                         None => {
                             return Err(invariant(
@@ -4446,7 +4719,7 @@ impl Admitted {
 
         // Serially, every admission extends the retained projection with its own
         // candidate; over an empty base nothing else is ever covered.
-        let checker_environment = if admitted_any {
+        let checker_environment = if admitted_any && !candidates.is_empty() {
             let mut projection = self.checker_environment.clone().unwrap_or_default();
             for entry in candidates {
                 projection = match projection.extend(entry, limits.admission.checker.environment) {
@@ -4528,7 +4801,8 @@ impl Admitted {
         let finish = |verdict: OleanModuleVerdict,
                       accepted: Option<(FrontierAccepted, Admitted)>,
                       retained: Option<FrontierRetained>,
-                      memory: OleanFrontierMemoryAttribution| {
+                      memory: OleanFrontierMemoryAttribution,
+                      policy_summary: CheckerPolicySummary| {
             let (accepted, engine) = accepted.unzip();
             FrontierDone {
                 index,
@@ -4539,8 +4813,10 @@ impl Admitted {
                 elapsed: started.elapsed(),
                 retained,
                 memory,
+                policy_summary,
             }
         };
+        let empty_policy_summary = CheckerPolicySummary::empty(limits.admission.policy);
         let failed = |error: OleanCheckError, k1_delta: u64, checker_bytes: u64| {
             let host_memory_refusal = olean_host_memory_refusal(&error);
             let retained = retain.then(|| FrontierRetained::Failed(error.clone()));
@@ -4556,6 +4832,7 @@ impl Admitted {
                     0,
                     0,
                 ),
+                empty_policy_summary,
             );
             done.host_memory_refusal = host_memory_refusal;
             done
@@ -4574,6 +4851,10 @@ impl Admitted {
         ) {
             Ok(Outcome::Complete(checked)) => {
                 let declarations = checked.declarations.len();
+                let policy_summary = CheckerPolicySummary::from_declarations(
+                    limits.admission.policy,
+                    &checked.declarations,
+                );
                 let admitted: Vec<EnvironmentEntry> = checked
                     .decoded
                     .constants
@@ -4620,6 +4901,7 @@ impl Admitted {
                         admitted_bytes,
                         0,
                     ),
+                    policy_summary,
                 )
             }
             Ok(Outcome::Inconclusive(reason)) => finish(
@@ -4634,6 +4916,7 @@ impl Admitted {
                     0,
                     0,
                 ),
+                empty_policy_summary,
             ),
             Ok(Outcome::InternalFault(fault)) => finish(
                 OleanModuleVerdict::InternalFault(fault),
@@ -4647,6 +4930,7 @@ impl Admitted {
                     0,
                     0,
                 ),
+                empty_policy_summary,
             ),
             Err(error) => failed(error, closure_delta_bytes, checker_bytes),
         }
@@ -4960,10 +5244,20 @@ impl Admitted {
         }
         let reading = ReadingCheck::Artifact(&readings);
         if plan.order.is_empty() {
+            if limits.admission.policy == VerificationPolicy::Paranoid {
+                return Ok(Outcome::Inconclusive(Inconclusive::dependency_unavailable(
+                    PARANOID_WITNESS_UNAVAILABLE_REASON,
+                )));
+            }
             let mut checked: Vec<OleanCheckedDeclaration> = plan
                 .already_present
                 .into_iter()
-                .map(|(name, checker)| OleanCheckedDeclaration { name, checker })
+                .map(|(name, checker)| OleanCheckedDeclaration {
+                    name,
+                    checker: Some(checker),
+                    policy_decision: None,
+                    k1_step_floor: false,
+                })
                 .collect();
             match self.recheck_subsumed_repeats_measured(
                 plan.subsumed,
@@ -5025,7 +5319,7 @@ impl Admitted {
                 resource: ".olean completed declaration records",
                 requested: decoded.constants.len(),
             })?;
-        for (unit_index, checker) in plan.order.iter().zip(&checkers) {
+        for (unit_index, outcome) in plan.order.iter().zip(&checkers) {
             let Some(unit) = plan.units.get(*unit_index) else {
                 return Err(OleanCheckError::InternalInvariant {
                     detail: "completed declaration unit is outside the unit table",
@@ -5034,12 +5328,19 @@ impl Admitted {
             for name in &unit.names {
                 checked.push(OleanCheckedDeclaration {
                     name: name.clone(),
-                    checker: *checker,
+                    checker: outcome.checker,
+                    policy_decision: Some(outcome.policy_decision),
+                    k1_step_floor: outcome.k1_step_floor,
                 });
             }
         }
         for (name, checker) in plan.already_present {
-            checked.push(OleanCheckedDeclaration { name, checker });
+            checked.push(OleanCheckedDeclaration {
+                name,
+                checker: Some(checker),
+                policy_decision: None,
+                k1_step_floor: false,
+            });
         }
         match engine.recheck_subsumed_repeats_measured(
             plan.subsumed,
@@ -5111,7 +5412,7 @@ impl Admitted {
                 }
                 ReadingCheck::Unread | ReadingCheck::Settled(_) => None,
             };
-            let checker = match repeat {
+            let (checker, policy_decision, k1_step_floor) = match repeat {
                 ConstantInfo::Thm(mut theorem) => {
                     let mut scratch = Name::str(name.clone(), "_fln_subsumed_repeat");
                     let mut suffix = 0_u64;
@@ -5146,7 +5447,11 @@ impl Admitted {
                         Outcome::Complete(admission) => {
                             *checker_bytes = (*checker_bytes)
                                 .max(repeat_retained.saturating_add(repeat_transient));
-                            admission.checker
+                            (
+                                admission.checker,
+                                Some(admission.policy_decision),
+                                admission.k1_step_floor,
+                            )
                         }
                         Outcome::Inconclusive(reason) => {
                             *checker_bytes = (*checker_bytes)
@@ -5164,10 +5469,14 @@ impl Admitted {
                     if let Some(objection) = objection {
                         return unreviewed_reading_refusal(&name, objection);
                     }
-                    CheckerAgreement {
-                        schema: "fln-checker/v1",
-                        ground: CheckerAdmissionGround::AxiomPreamble,
-                    }
+                    (
+                        Some(CheckerAgreement {
+                            schema: "fln-checker/v1",
+                            ground: CheckerAdmissionGround::AxiomPreamble,
+                        }),
+                        None,
+                        false,
+                    )
                 }
                 _ => {
                     return Err(OleanCheckError::InternalInvariant {
@@ -5175,7 +5484,12 @@ impl Admitted {
                     });
                 }
             };
-            checked.push(OleanCheckedDeclaration { name, checker });
+            checked.push(OleanCheckedDeclaration {
+                name,
+                checker,
+                policy_decision,
+                k1_step_floor,
+            });
         }
         Ok(Outcome::Complete(checked))
     }
@@ -5210,6 +5524,9 @@ impl Admitted {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        let checker = admitted.checker.ok_or_else(|| EngineAdmissionError::CheckerBridge {
+            detail: "admit_declaration requires a full-policy independent-checker agreement; use check_olean_* or admit_declaration_unrooted for sampled policies".to_owned(),
+        })?;
         // No artifact metadata exists for a handed declaration, so its value is
         // what the pin's compiler runs (`toDecl`, `value? (allowOpaque := true)`).
         if let Declaration::Opaque(value) = &admitted.declaration {
@@ -5225,7 +5542,7 @@ impl Admitted {
             declaration: admitted.declaration,
             base_logical_root,
             result_logical_root,
-            checker: admitted.checker,
+            checker,
         }))
     }
 
@@ -5280,57 +5597,125 @@ impl Admitted {
             });
         }
 
-        let checker_review = review_with_independent_checker(
-            &self.environment,
-            self.checker_environment.as_ref(),
-            &declaration,
-            limits.checker,
-            reading,
-        );
-        *retained_checker_bytes =
-            retained_checker_bytes.saturating_add(checker_review.retained_delta_bytes);
-        *transient_checker_bytes = (*transient_checker_bytes).max(checker_review.candidate_bytes);
+        // Run K1 first so its deterministic step count feeds the §8.3c
+        // high-risk floor (`k1_steps_used > limits.high_risk_k1_steps`) and
+        // K1 rejections stop immediately without spending checker CPU.
         let admitted = match admit(&self.environment, declaration.clone(), limits.kernel) {
             Outcome::Complete(admitted) => admitted,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let checked = match convene(&checker_review.council, admitted) {
-            CouncilOutcome::Agreed(checked) => checked,
-            CouncilOutcome::KernelRejected { class, message, .. } => {
-                return Err(EngineAdmissionError::KernelRejected { class, message });
+        let k1_steps_used = match &admitted {
+            fln_kernel::capability::Admitted::Accepted(reviewable) => {
+                reviewable.consumption().steps_used
             }
-            // A halt with no disagreement is a non-answer about the declaration
-            // (FL-INV-07); only a disagreement is evidence against it.
-            CouncilOutcome::Halted(halt) if halt.is_purely_resource() => {
-                if let Some((resource, requested)) = checker_review.allocation_failure {
-                    return Err(EngineAdmissionError::AllocationFailure {
-                        resource,
-                        requested,
-                    });
-                }
-                return Err(EngineAdmissionError::CouncilNoAnswer {
-                    summary: halt.summary(),
-                });
-            }
-            CouncilOutcome::Halted(halt) => {
-                return Err(EngineAdmissionError::CouncilHalted {
-                    summary: halt.summary(),
-                });
+            fln_kernel::capability::Admitted::Rejected { .. } => {
+                return match convene(&Council::nobody_was_asked(), admitted) {
+                    CouncilOutcome::KernelRejected { class, message, .. } => {
+                        Err(EngineAdmissionError::KernelRejected { class, message })
+                    }
+                    _ => Err(EngineAdmissionError::CheckerBridge {
+                        detail: "rejected kernel verdict did not produce KernelRejected".to_owned(),
+                    }),
+                };
             }
         };
-        let checker =
-            checker_review
-                .agreement
-                .ok_or_else(|| EngineAdmissionError::CheckerBridge {
-                    detail: "the checker council agreed without an admission record".to_owned(),
-                })?;
-        let checker_environment = checker_review.successor_environment.ok_or_else(|| {
-            EngineAdmissionError::CheckerBridge {
-                detail: "the checker council agreed without a retained successor environment"
-                    .to_owned(),
+
+        let (selected, sampled_decision, k1_step_floor) = match limits.policy {
+            VerificationPolicy::Release | VerificationPolicy::Paranoid => (true, None, false),
+            VerificationPolicy::Standard | VerificationPolicy::CompatBench => {
+                let content = declaration_content_digest(&declaration);
+                let risks = classify_declaration_risks(&declaration);
+                let mut decision = CheckerPolicyV1.decide(limits.policy, content, risks);
+                let k1_step_floor = k1_steps_used > limits.high_risk_k1_steps;
+                if k1_step_floor && !decision.selected {
+                    decision.selected = true;
+                    decision.reason = CheckerSelectionReason::HighRiskFloor;
+                }
+                (decision.selected, Some(decision), k1_step_floor)
             }
-        })?;
+        };
+
+        let (checked, checker, checker_environment) = if selected {
+            let checker_review = review_with_independent_checker(
+                &self.environment,
+                self.checker_environment.as_ref(),
+                &declaration,
+                limits.checker,
+                reading,
+            );
+            *retained_checker_bytes =
+                retained_checker_bytes.saturating_add(checker_review.retained_delta_bytes);
+            *transient_checker_bytes =
+                (*transient_checker_bytes).max(checker_review.candidate_bytes);
+            let council = if limits.policy == VerificationPolicy::Paranoid {
+                let mut seats = checker_review.council.seats().to_vec();
+                seats.push(Seat::new(
+                    "paranoid-second-witness",
+                    SeatOrigin::FrankenLeanEngine,
+                    SeatBounds::not_established(
+                        "paranoid policy requires a second kernel lane (K2) or external witness",
+                    ),
+                    SeatVerdict::NoAnswer {
+                        reason: PARANOID_WITNESS_UNAVAILABLE_REASON.to_owned(),
+                    },
+                ));
+                Council::of(seats)
+            } else {
+                checker_review.council
+            };
+            let checked = match convene(&council, admitted) {
+                CouncilOutcome::Agreed(checked) => checked,
+                CouncilOutcome::KernelRejected { class, message, .. } => {
+                    return Err(EngineAdmissionError::KernelRejected { class, message });
+                }
+                // A halt with no disagreement is a non-answer about the declaration
+                // (FL-INV-07); only a disagreement is evidence against it.
+                CouncilOutcome::Halted(halt) if halt.is_purely_resource() => {
+                    if let Some((resource, requested)) = checker_review.allocation_failure {
+                        return Err(EngineAdmissionError::AllocationFailure {
+                            resource,
+                            requested,
+                        });
+                    }
+                    return Err(EngineAdmissionError::CouncilNoAnswer {
+                        summary: halt.summary(),
+                    });
+                }
+                CouncilOutcome::Halted(halt) => {
+                    return Err(EngineAdmissionError::CouncilHalted {
+                        summary: halt.summary(),
+                    });
+                }
+            };
+            let checker =
+                checker_review
+                    .agreement
+                    .ok_or_else(|| EngineAdmissionError::CheckerBridge {
+                        detail: "the checker council agreed without an admission record".to_owned(),
+                    })?;
+            let checker_environment = checker_review.successor_environment.ok_or_else(|| {
+                EngineAdmissionError::CheckerBridge {
+                    detail: "the checker council agreed without a retained successor environment"
+                        .to_owned(),
+                }
+            })?;
+            (checked, Some(checker), Some(checker_environment))
+        } else {
+            let checked = match convene(&Council::nobody_was_asked(), admitted) {
+                CouncilOutcome::Agreed(checked) => checked,
+                CouncilOutcome::KernelRejected { class, message, .. } => {
+                    return Err(EngineAdmissionError::KernelRejected { class, message });
+                }
+                CouncilOutcome::Halted(halt) => {
+                    return Err(EngineAdmissionError::CouncilNoAnswer {
+                        summary: halt.summary(),
+                    });
+                }
+            };
+            (checked, None, self.checker_environment.clone())
+        };
+
         let expects_block = matches!(
             declaration,
             Declaration::Mutual(_) | Declaration::Inductive(_) | Declaration::Quotient(_)
@@ -5364,10 +5749,19 @@ impl Admitted {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
 
+        let policy_decision = match sampled_decision {
+            Some(decision) => decision,
+            None => CheckerPolicyV1.decide(
+                limits.policy,
+                published_declaration_content_digest(&environment, &declaration),
+                CheckerRiskProfile::none(),
+            ),
+        };
+
         Ok(Outcome::Complete(UnrootedAdmission {
             engine: Admitted {
                 environment,
-                checker_environment: Some(checker_environment),
+                checker_environment,
                 imported_modules: std::sync::Arc::clone(&self.imported_modules),
                 imported_environment: self.imported_environment.clone(),
                 imported_module_dependencies: std::sync::Arc::clone(
@@ -5379,6 +5773,8 @@ impl Admitted {
             },
             declaration,
             checker,
+            policy_decision,
+            k1_step_floor,
         }))
     }
 
@@ -5392,7 +5788,7 @@ impl Admitted {
         options: &KVMap,
         limits: EngineAdmissionLimits,
         reading: ReadingCheck<'_>,
-    ) -> Result<Outcome<(Admitted, Vec<CheckerAgreement>)>, EngineAdmissionError> {
+    ) -> Result<Outcome<(Admitted, Vec<DeclarationPolicyOutcome>)>, EngineAdmissionError> {
         let mut checker_bytes = 0_u64;
         self.admit_declarations_unrooted_measured(
             declarations,
@@ -5410,7 +5806,7 @@ impl Admitted {
         limits: EngineAdmissionLimits,
         reading: ReadingCheck<'_>,
         checker_bytes: &mut u64,
-    ) -> Result<Outcome<(Admitted, Vec<CheckerAgreement>)>, EngineAdmissionError> {
+    ) -> Result<Outcome<(Admitted, Vec<DeclarationPolicyOutcome>)>, EngineAdmissionError> {
         if declarations.is_empty() {
             return Err(EngineAdmissionError::EmptyBatch);
         }
@@ -5451,10 +5847,345 @@ impl Admitted {
                 }
             };
             engine = admitted.engine;
-            checkers.push(admitted.checker);
+            checkers.push(DeclarationPolicyOutcome {
+                checker: admitted.checker,
+                policy_decision: admitted.policy_decision,
+                k1_step_floor: admitted.k1_step_floor,
+            });
         }
         *checker_bytes = (*checker_bytes).max(retained.saturating_add(transient));
         Ok(Outcome::Complete((engine, checkers)))
+    }
+}
+
+const PARANOID_WITNESS_UNAVAILABLE_REASON: &str = "paranoid policy requires an independent second kernel lane (K2) or external witness, which is not available in this build";
+
+/// Deterministic domain-separated content digest of one authority unit for
+/// [`CheckerPolicyV1`] sampling (plan §8.3c, bead `fln-9908`).
+///
+/// Uses the same Merkle-DAG `Domain::DeclContent` digest as [`Environment`], so
+/// heavily shared expressions hash in O(distinct nodes) with zero runtime
+/// randomness and zero dependence on iteration order or thread count.
+pub fn declaration_content_digest(declaration: &Declaration) -> CheckerContentDigest {
+    let digest = match declaration {
+        Declaration::Axiom(v) => Environment::decl_content_digest(&ConstantInfo::Axiom(v.clone())),
+        Declaration::Defn(v) => Environment::decl_content_digest(&ConstantInfo::Defn(v.clone())),
+        Declaration::Thm(v) => Environment::decl_content_digest(&ConstantInfo::Thm(v.clone())),
+        Declaration::Opaque(v) => {
+            Environment::decl_content_digest(&ConstantInfo::Opaque(v.clone()))
+        }
+        Declaration::Mutual(defs) => {
+            let mut hasher = DomainHasher::new(Domain::ShadowSampling);
+            hasher.update(b"fln.policy.mutual/1\0");
+            for def in defs {
+                hasher
+                    .update(&Environment::decl_content_digest(&ConstantInfo::Defn(def.clone())).0);
+            }
+            hasher.finalize()
+        }
+        Declaration::Inductive(block) => {
+            let mut hasher = DomainHasher::new(Domain::ShadowSampling);
+            hasher.update(b"fln.policy.inductive/1\0");
+            for ind in &block.types {
+                hasher.update(
+                    &Environment::decl_content_digest(&ConstantInfo::Induct(ind.clone())).0,
+                );
+            }
+            for ctor in &block.ctors {
+                hasher
+                    .update(&Environment::decl_content_digest(&ConstantInfo::Ctor(ctor.clone())).0);
+            }
+            for rec in &block.recursors {
+                hasher.update(&Environment::decl_content_digest(&ConstantInfo::Rec(rec.clone())).0);
+            }
+            hasher.finalize()
+        }
+        Declaration::Quotient(quots) => {
+            let mut hasher = DomainHasher::new(Domain::ShadowSampling);
+            hasher.update(b"fln.policy.quotient/1\0");
+            for quot in quots {
+                hasher
+                    .update(&Environment::decl_content_digest(&ConstantInfo::Quot(quot.clone())).0);
+            }
+            hasher.finalize()
+        }
+    };
+    CheckerContentDigest::new(digest.0)
+}
+
+/// Fast zero-rehash content digest for `Release` / `Paranoid` after publication,
+/// reusing the `EnvironmentEntry::digest()` already computed by `publish`.
+fn published_declaration_content_digest(
+    environment: &Environment,
+    declaration: &Declaration,
+) -> CheckerContentDigest {
+    let single = |name: &Name| environment.entry(name).map(|entry| entry.digest());
+    let digest = match declaration {
+        Declaration::Axiom(v) => single(&v.base.name),
+        Declaration::Defn(v) => single(&v.base.name),
+        Declaration::Thm(v) => single(&v.base.name),
+        Declaration::Opaque(v) => single(&v.base.name),
+        Declaration::Mutual(defs) => {
+            let mut hasher = DomainHasher::new(Domain::ShadowSampling);
+            hasher.update(b"fln.policy.mutual/1\0");
+            let mut complete = true;
+            for def in defs {
+                match single(&def.base.name) {
+                    Some(d) => {
+                        hasher.update(&d.0);
+                    }
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            complete.then(|| hasher.finalize())
+        }
+        Declaration::Inductive(block) => {
+            let mut hasher = DomainHasher::new(Domain::ShadowSampling);
+            hasher.update(b"fln.policy.inductive/1\0");
+            let mut complete = true;
+            for ind in &block.types {
+                match single(&ind.base.name) {
+                    Some(d) => {
+                        hasher.update(&d.0);
+                    }
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete {
+                for ctor in &block.ctors {
+                    match single(&ctor.base.name) {
+                        Some(d) => {
+                            hasher.update(&d.0);
+                        }
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if complete {
+                for rec in &block.recursors {
+                    match single(&rec.base.name) {
+                        Some(d) => {
+                            hasher.update(&d.0);
+                        }
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            complete.then(|| hasher.finalize())
+        }
+        Declaration::Quotient(quots) => {
+            let mut hasher = DomainHasher::new(Domain::ShadowSampling);
+            hasher.update(b"fln.policy.quotient/1\0");
+            let mut complete = true;
+            for quot in quots {
+                match single(&quot.base.name) {
+                    Some(d) => {
+                        hasher.update(&d.0);
+                    }
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            complete.then(|| hasher.finalize())
+        }
+    };
+    match digest {
+        Some(digest) => CheckerContentDigest::new(digest.0),
+        None => declaration_content_digest(declaration),
+    }
+}
+
+const HIGH_RISK_UNIVERSE_DEPTH: u32 = 8;
+
+/// Classify a declaration's static plan §8.3c high-risk forms using an
+/// iterative, DAG-memoized expression walk (O(distinct nodes), immune to shared
+/// expression blowup).
+pub fn classify_declaration_risks(declaration: &Declaration) -> CheckerRiskProfile {
+    let mut risks = CheckerRiskProfile::none();
+    let mut roots: Vec<&Expr> = Vec::new();
+    match declaration {
+        Declaration::Axiom(axiom) => {
+            if axiom.is_unsafe {
+                risks = risks.with(CheckerHighRiskForm::NativeReduction);
+            }
+            roots.push(&axiom.base.type_);
+        }
+        Declaration::Defn(def) => {
+            if def.safety != DefinitionSafety::Safe {
+                risks = risks.with(CheckerHighRiskForm::NativeReduction);
+            }
+            roots.push(&def.base.type_);
+            roots.push(&def.value);
+        }
+        Declaration::Thm(thm) => {
+            roots.push(&thm.base.type_);
+            roots.push(&thm.value);
+        }
+        Declaration::Opaque(opaque) => {
+            if opaque.is_unsafe {
+                risks = risks.with(CheckerHighRiskForm::NativeReduction);
+            }
+            roots.push(&opaque.base.type_);
+            roots.push(&opaque.value);
+        }
+        Declaration::Mutual(defs) => {
+            risks = risks.with(CheckerHighRiskForm::NestedOrMutualInductive);
+            for def in defs {
+                if def.safety != DefinitionSafety::Safe {
+                    risks = risks.with(CheckerHighRiskForm::NativeReduction);
+                }
+                roots.push(&def.base.type_);
+                roots.push(&def.value);
+            }
+        }
+        Declaration::Inductive(block) => {
+            risks = risks.with(CheckerHighRiskForm::Recursor);
+            if block.types.len() > 1
+                || block
+                    .types
+                    .iter()
+                    .any(|ind| ind.num_nested > 0 || ind.is_rec || ind.is_reflexive)
+            {
+                risks = risks.with(CheckerHighRiskForm::NestedOrMutualInductive);
+            }
+            if block.types.iter().any(|ind| ind.is_unsafe) {
+                risks = risks.with(CheckerHighRiskForm::NativeReduction);
+            }
+            for ind in &block.types {
+                roots.push(&ind.base.type_);
+            }
+            for ctor in &block.ctors {
+                roots.push(&ctor.base.type_);
+            }
+            for rec in &block.recursors {
+                roots.push(&rec.base.type_);
+                for rule in &rec.rules {
+                    roots.push(&rule.rhs);
+                }
+            }
+        }
+        Declaration::Quotient(quots) => {
+            risks = risks.with(CheckerHighRiskForm::QuotientPrimitive);
+            for quot in quots {
+                roots.push(&quot.base.type_);
+            }
+        }
+    }
+
+    let mut seen: std::collections::HashSet<*const ExprNode> = std::collections::HashSet::new();
+    let mut stack = roots;
+    while let Some(expr) = stack.pop() {
+        if !seen.insert(std::ptr::from_ref(expr.node())) {
+            continue;
+        }
+        match expr.node() {
+            ExprNode::Sort { level } => {
+                if level.depth() > HIGH_RISK_UNIVERSE_DEPTH {
+                    risks = risks.with(CheckerHighRiskForm::DeepUniverse);
+                }
+            }
+            ExprNode::Const { name, levels } => {
+                if levels
+                    .iter()
+                    .any(|level| level.depth() > HIGH_RISK_UNIVERSE_DEPTH)
+                {
+                    risks = risks.with(CheckerHighRiskForm::DeepUniverse);
+                }
+                if is_native_reduction_symbol(name) {
+                    risks = risks.with(CheckerHighRiskForm::NativeReduction);
+                } else if is_quotient_primitive_symbol(name) {
+                    risks = risks.with(CheckerHighRiskForm::QuotientPrimitive);
+                }
+            }
+            ExprNode::Lit {
+                literal: Literal::Nat(n),
+            } => {
+                if n.to_u64().is_none_or(|value| value > 1) {
+                    risks = risks.with(CheckerHighRiskForm::LiteralArithmetic);
+                }
+            }
+            ExprNode::App { f, a } => {
+                stack.push(f);
+                stack.push(a);
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                stack.push(binder_type);
+                stack.push(body);
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                stack.push(type_);
+                stack.push(value);
+                stack.push(body);
+            }
+            ExprNode::Proj { expr, .. } | ExprNode::MData { expr, .. } => {
+                stack.push(expr);
+            }
+            ExprNode::BVar { .. }
+            | ExprNode::FVar { .. }
+            | ExprNode::MVar { .. }
+            | ExprNode::Lit {
+                literal: Literal::Str(_),
+            } => {}
+        }
+    }
+    risks
+}
+
+fn name_matches_components(name: &Name, expected: &[&str]) -> bool {
+    let mut cursor = name.clone();
+    for &part in expected.iter().rev() {
+        match cursor.leaf_view() {
+            LeafView::Str(actual) if actual == part => {}
+            _ => return false,
+        }
+        cursor = cursor.parent();
+    }
+    cursor.is_anonymous()
+}
+
+fn is_native_reduction_symbol(name: &Name) -> bool {
+    match name.leaf_view() {
+        LeafView::Str("ofReduceBool") => name_matches_components(name, &["Lean", "ofReduceBool"]),
+        LeafView::Str("ofReduceNat") => name_matches_components(name, &["Lean", "ofReduceNat"]),
+        LeafView::Str("trustCompiler") => name_matches_components(name, &["Lean", "trustCompiler"]),
+        LeafView::Str("reduceBool") => name_matches_components(name, &["Lean", "reduceBool"]),
+        LeafView::Str("reduceNat") => name_matches_components(name, &["Lean", "reduceNat"]),
+        LeafView::Str("eagerReduce") => name_matches_components(name, &["eagerReduce"]),
+        LeafView::Str("decide") => {
+            name_matches_components(name, &["decide"])
+                || name_matches_components(name, &["Decidable", "decide"])
+        }
+        _ => false,
+    }
+}
+
+fn is_quotient_primitive_symbol(name: &Name) -> bool {
+    match name.leaf_view() {
+        LeafView::Str("lift") => name_matches_components(name, &["Quot", "lift"]),
+        LeafView::Str("ind") => name_matches_components(name, &["Quot", "ind"]),
+        LeafView::Str("sound") => name_matches_components(name, &["Quot", "sound"]),
+        _ => false,
     }
 }
 
@@ -6953,6 +7684,11 @@ pub struct EngineAdmissionLimits {
     pub checker: CheckerExecutionLimits,
     pub declaration: DeclarationBudget,
     pub collisions: CollisionBudget,
+    /// Plan §8.3c council verification policy (default [`VerificationPolicy::Release`]).
+    pub policy: VerificationPolicy,
+    /// K1 step threshold above which `standard` and `compat-bench` treat a
+    /// declaration as high-risk and unconditionally route it to `fln-checker`.
+    pub high_risk_k1_steps: u64,
 }
 
 impl EngineAdmissionLimits {
@@ -6963,12 +7699,26 @@ impl EngineAdmissionLimits {
             checker: CheckerExecutionLimits::default(),
             declaration: DeclarationBudget::default(),
             collisions: CollisionBudget::default(),
+            policy: VerificationPolicy::Release,
+            high_risk_k1_steps: DEFAULT_HIGH_RISK_K1_STEPS,
         }
     }
 
     /// Calibrate admission limits to the specified thread stack size in bytes.
     pub fn for_stack_bytes(bytes: usize) -> Self {
         Self::new(Budget::for_stack_bytes(bytes))
+    }
+
+    /// Select the plan §8.3c council verification policy.
+    pub fn with_policy(mut self, policy: VerificationPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Override the K1 step threshold for the high-risk checker floor.
+    pub fn with_high_risk_k1_steps(mut self, steps: u64) -> Self {
+        self.high_risk_k1_steps = steps;
+        self
     }
 }
 
@@ -7012,7 +7762,9 @@ impl<E> DeclarationAdmission<E> {
 pub struct UnrootedAdmission<E = Admitted> {
     pub engine: E,
     pub declaration: Declaration,
-    pub checker: CheckerAgreement,
+    pub checker: Option<CheckerAgreement>,
+    pub policy_decision: CheckerSelectionDecision,
+    pub k1_step_floor: bool,
 }
 
 impl<E> UnrootedAdmission<E> {
@@ -7022,6 +7774,8 @@ impl<E> UnrootedAdmission<E> {
             engine: map(self.engine),
             declaration: self.declaration,
             checker: self.checker,
+            policy_decision: self.policy_decision,
+            k1_step_floor: self.k1_step_floor,
         }
     }
 }
