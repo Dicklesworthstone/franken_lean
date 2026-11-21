@@ -280,6 +280,15 @@ fn shape(expr: &Expr) -> String {
             format!("({} {})", shape(head), arguments.join(" "))
         }
         ExprNode::Lam { body, .. } => format!("(fun {})", shape(body)),
+        ExprNode::Proj {
+            struct_name,
+            idx,
+            expr,
+        } => format!(
+            "({}.{idx} {})",
+            struct_name.to_display_string(),
+            shape(expr)
+        ),
         _ => "?".to_owned(),
     }
 }
