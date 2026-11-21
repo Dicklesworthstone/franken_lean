@@ -84,7 +84,8 @@ use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::scratch::{REFDIFF_PREFIX, ScratchRoot};
 use fln_env::constants::{
-    AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, TheoremVal,
+    AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, DefinitionSafety, DefinitionVal,
+    InductiveVal, ReducibilityHints, TheoremVal,
 };
 use fln_env::environment::Environment;
 use fln_kernel::verdict::{Budget, RejectClass, Verdict};
@@ -1041,6 +1042,216 @@ theorem same_head_unequal_proof_arg : Eq (dropProof a t5) (dropProof b s5) := Eq
             oracle,
             OracleVerdict::Accepted,
             "pinned Reference v4.32.0 must accept the reduced fixture"
+        );
+    } else {
+        eprintln!("SKIP (typed limitation): pinned Reference {PIN_TAG} absent");
+    }
+}
+
+/// Regression for stale projection replay across `whnf_core_cheap_sensitive_cache`
+/// and `lazy_delta_outcomes` (the root cause of the 37x-169x unfold blowup on
+/// `Mathlib.Algebra.Category.ModuleCat.Presheaf.Free::PresheafOfModules.freeObj._proof_2`).
+///
+/// Once full `whnf_core` has reduced `Box.1 boxD` to `a` in `whnf_core_cache`,
+/// subsequent defeq comparisons of `((fun b : Box => b.1) boxD)` against distinct
+/// rhs terms must reuse that cached projection result instead of replaying a stale
+/// stuck `Box.1 boxD` and re-unfolding `boxD`.
+#[test]
+fn cached_projection_reduction_is_reused_across_cheap_defeq_queries() {
+    let source = "\
+axiom A : Type
+axiom a : A
+axiom comb4 : A → A → A → A → A
+structure Box where
+  val : A
+noncomputable def boxD : Box := Box.mk a
+noncomputable def u1 : A := a
+noncomputable def u2 : A := u1
+noncomputable def u3 : A := u2
+noncomputable def u4 : A := u3
+theorem reuse_cached_proj :
+    comb4 ((fun b : Box => b.1) boxD) ((fun b : Box => b.1) boxD)
+          ((fun b : Box => b.1) boxD) ((fun b : Box => b.1) boxD)
+    = comb4 u1 u2 u3 u4 := rfl
+";
+
+    let type0 = Expr::sort(Level::one());
+    let eq_ty = Expr::forall_e(
+        nm("α"),
+        type0.clone(),
+        Expr::forall_e(
+            nm("x"),
+            bv(0),
+            Expr::forall_e(nm("y"), bv(1), prop(), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let refl_ty = Expr::forall_e(
+        nm("α"),
+        type0.clone(),
+        Expr::forall_e(
+            nm("x"),
+            bv(0),
+            Expr::app(Expr::app(Expr::app(cst("Eq"), bv(1)), bv(0)), bv(0)),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let comb4_ty = Expr::forall_e(
+        nm("x1"),
+        cst("A"),
+        Expr::forall_e(
+            nm("x2"),
+            cst("A"),
+            Expr::forall_e(
+                nm("x3"),
+                cst("A"),
+                Expr::forall_e(nm("x4"), cst("A"), cst("A"), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+
+    let mut env = Environment::new();
+    env = with_axiom(&env, "Eq", eq_ty);
+    env = with_axiom(&env, "Eq.refl", refl_ty);
+    env = with_axiom(&env, "A", type0.clone());
+    env = with_axiom(&env, "a", cst("A"));
+    env = with_axiom(&env, "comb4", comb4_ty);
+    env = env
+        .add_decl(ConstantInfo::Induct(InductiveVal {
+            base: ConstantVal {
+                name: nm("Box"),
+                level_params: Vec::new(),
+                type_: type0,
+            },
+            num_params: 0,
+            num_indices: 0,
+            all: vec![nm("Box")],
+            ctors: vec![nm("Box.mk")],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        }))
+        .expect("admit Box");
+    env = env
+        .add_decl(ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: nm("Box.mk"),
+                level_params: Vec::new(),
+                type_: Expr::forall_e(nm("val"), cst("A"), cst("Box"), BinderInfo::Default),
+            },
+            induct: nm("Box"),
+            cidx: 0,
+            num_params: 0,
+            num_fields: 1,
+            is_unsafe: false,
+        }))
+        .expect("admit Box.mk");
+
+    let add_def = |env: &Environment, name: &str, ty: Expr, val: Expr, h: u32| -> Environment {
+        let defn = DefinitionVal {
+            base: ConstantVal {
+                name: nm(name),
+                level_params: Vec::new(),
+                type_: ty,
+            },
+            value: val,
+            hints: ReducibilityHints::Regular(h),
+            safety: DefinitionSafety::Safe,
+            all: vec![nm(name)],
+        };
+        let outcome = check(
+            env,
+            &Declaration::Defn(defn.clone()),
+            Budget::for_stack_bytes(32 * 1024 * 1024),
+        );
+        assert!(
+            matches!(
+                outcome,
+                fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+            ),
+            "fixture def {name} must be accepted: {outcome:?}"
+        );
+        env.add_decl(ConstantInfo::Defn(defn))
+            .expect("admit fixture def")
+    };
+
+    env = add_def(
+        &env,
+        "boxD",
+        cst("Box"),
+        Expr::app(cst("Box.mk"), cst("a")),
+        1,
+    );
+    env = add_def(&env, "u1", cst("A"), cst("a"), 1);
+    env = add_def(&env, "u2", cst("A"), cst("u1"), 2);
+    env = add_def(&env, "u3", cst("A"), cst("u2"), 3);
+    env = add_def(&env, "u4", cst("A"), cst("u3"), 4);
+
+    let proj_redex = Expr::app(
+        Expr::lam(
+            nm("b"),
+            cst("Box"),
+            Expr::proj(nm("Box"), 0, bv(0)),
+            BinderInfo::Default,
+        ),
+        cst("boxD"),
+    );
+    let mk_comb4 = |a1: Expr, a2: Expr, a3: Expr, a4: Expr| {
+        Expr::app(
+            Expr::app(Expr::app(Expr::app(cst("comb4"), a1), a2), a3),
+            a4,
+        )
+    };
+    let lhs = mk_comb4(
+        proj_redex.clone(),
+        proj_redex.clone(),
+        proj_redex.clone(),
+        proj_redex,
+    );
+    let rhs = mk_comb4(cst("u1"), cst("u2"), cst("u3"), cst("u4"));
+    let goal = Declaration::Thm(TheoremVal {
+        base: ConstantVal {
+            name: nm("reuse_cached_proj"),
+            level_params: Vec::new(),
+            type_: Expr::app(Expr::app(Expr::app(cst("Eq"), cst("A")), lhs), rhs.clone()),
+        },
+        value: Expr::app(Expr::app(cst("Eq.refl"), cst("A")), rhs),
+        all: vec![nm("reuse_cached_proj")],
+    });
+
+    let obs = fln_kernel::observe_unfolds(
+        &env,
+        &goal,
+        Budget::for_stack_bytes(32 * 1024 * 1024),
+        false,
+    );
+    assert!(
+        matches!(
+            obs.outcome,
+            fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+        ),
+        "K1 must accept reuse_cached_proj: {:?}",
+        obs.outcome
+    );
+    assert_eq!(
+        obs.unfolds.get(&nm("boxD")).copied().unwrap_or(0),
+        1,
+        "boxD must unfold only once once Box.1 boxD is reduced in whnf_core_cache: {:?}",
+        obs.unfolds
+    );
+
+    if let Some(lean) = pinned_lean() {
+        let oracle = ask_reference(&lean, "cached-proj-reuse", source);
+        assert_eq!(
+            oracle,
+            OracleVerdict::Accepted,
+            "pinned Reference v4.32.0 must accept the reduced projection-cache fixture"
         );
     } else {
         eprintln!("SKIP (typed limitation): pinned Reference {PIN_TAG} absent");

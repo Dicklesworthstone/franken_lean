@@ -48,7 +48,6 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut pin_lean: Option<PathBuf> = None;
     let mut workspace = PathBuf::from(".");
     let mut force_left_delta = false;
-    let mut trace_unfold: Option<String> = None;
     let mut roots: Vec<PathBuf> = Vec::new();
 
     let mut i = 1;
@@ -88,14 +87,6 @@ fn run(args: &[String]) -> Result<(), String> {
                 workspace = PathBuf::from(args.get(i).ok_or("--workspace requires a value")?);
             }
             "--force-left-delta" => force_left_delta = true,
-            "--trace-unfold" => {
-                i += 1;
-                trace_unfold = Some(
-                    args.get(i)
-                        .ok_or("--trace-unfold requires a value")?
-                        .clone(),
-                );
-            }
             other if other.starts_with("--") => {
                 return Err(format!("unknown option `{other}`"));
             }
@@ -146,12 +137,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 .join(":");
             let pin_table =
                 run_pin_unfold_counts(&workspace, &pin_lean, &lean_path, &module, &decl)?;
-            let k1_run = loaded.observe_declaration_traced(
-                &decl,
-                budget,
-                force_left_delta,
-                trace_unfold.as_deref(),
-            )?;
+            let k1_run = loaded.observe_declaration(&decl, budget, force_left_delta)?;
             let k1_counts = k1_run.display_counts();
             let report = join_and_rank(&k1_counts, &pin_table.counts);
             println!(
@@ -166,9 +152,6 @@ fn run(args: &[String]) -> Result<(), String> {
             );
             if !k1_run.observation.cache_summary.is_empty() {
                 println!("CACHES {}", k1_run.observation.cache_summary);
-            }
-            for line in &k1_run.observation.unfold_trace {
-                println!("TRACE {line}");
             }
             print!("{}", report.render_top(top));
             Ok(())

@@ -134,7 +134,6 @@ pub struct UnfoldObservation {
     pub steps_used: u64,
     pub unfolds: std::collections::BTreeMap<Name, u64>,
     pub cache_summary: String,
-    pub unfold_trace: Vec<String>,
 }
 
 /// Check `decl` while recording every delta unfold and recursor/quotient
@@ -147,25 +146,12 @@ pub fn observe_unfolds(
     budget: Budget,
     force_left_delta: bool,
 ) -> UnfoldObservation {
-    observe_unfolds_traced(env, decl, budget, force_left_delta, None)
-}
-
-/// Like [`observe_unfolds`], plus captures up to 40 diagnostic unfold lines for
-/// `trace_target`.
-pub fn observe_unfolds_traced(
-    env: &Environment,
-    decl: &Declaration,
-    budget: Budget,
-    force_left_delta: bool,
-    trace_target: Option<Name>,
-) -> UnfoldObservation {
     if let Some(refusal) = refuse_uncalibrated_budget(budget) {
         return UnfoldObservation {
             outcome: refusal,
             steps_used: 0,
             unfolds: std::collections::BTreeMap::new(),
             cache_summary: String::new(),
-            unfold_trace: Vec::new(),
         };
     }
     match decl {
@@ -183,7 +169,6 @@ pub fn observe_unfolds_traced(
                 steps_used,
                 unfolds: std::collections::BTreeMap::new(),
                 cache_summary: String::new(),
-                unfold_trace: Vec::new(),
             }
         }
         Declaration::Defn(v) if v.safety == DefinitionSafety::Unsafe => {
@@ -200,23 +185,20 @@ pub fn observe_unfolds_traced(
                 steps_used,
                 unfolds: std::collections::BTreeMap::new(),
                 cache_summary: String::new(),
-                unfold_trace: Vec::new(),
             }
         }
         _ => {
             let mut checker = TypeChecker::new(env, decl.level_params(), budget);
-            checker.enable_unfold_observation(force_left_delta, trace_target);
+            checker.enable_unfold_observation(force_left_delta);
             let outcome = check_inner(env, decl, &mut checker);
             let consumption = checker.consumption();
             let unfolds = checker.take_unfold_counts();
             let cache_summary = checker.cache_diagnostic_summary();
-            let unfold_trace = checker.take_unfold_trace();
             UnfoldObservation {
                 outcome: check_result_to_outcome(outcome, consumption, budget),
                 steps_used: consumption.steps_used,
                 unfolds,
                 cache_summary,
-                unfold_trace,
             }
         }
     }

@@ -586,17 +586,6 @@ impl LoadedOleanModule {
         budget: Budget,
         force_left_delta: bool,
     ) -> Result<K1UnfoldRun, String> {
-        self.observe_declaration_traced(declaration, budget, force_left_delta, None)
-    }
-
-    /// Run `fln_kernel::observe_unfolds_traced` on one named declaration in this module.
-    pub fn observe_declaration_traced(
-        &self,
-        declaration: &str,
-        budget: Budget,
-        force_left_delta: bool,
-        trace_target: Option<&str>,
-    ) -> Result<K1UnfoldRun, String> {
         let target_decl_name = Name::from_components(declaration.split('.'));
         let target_pos = self
             .constants
@@ -630,12 +619,11 @@ impl LoadedOleanModule {
         };
 
         let started = Instant::now();
-        let observation = fln_kernel::observe_unfolds_traced(
+        let observation = fln_kernel::observe_unfolds(
             env.as_check_environment(),
             &decl,
             budget,
             force_left_delta,
-            trace_target.map(|s| Name::from_components(s.split('.'))),
         );
         let wall = started.elapsed();
 

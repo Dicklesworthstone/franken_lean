@@ -2782,9 +2782,6 @@ pub(crate) struct TypeChecker<'a> {
     /// Non-authoritative diagnostic unfold histogram for `observe_unfolds`
     /// (`fln-kernel-unfold-differential-tfvw`). Always `None` in `check`.
     unfold_counts: Option<std::collections::BTreeMap<Name, u64>>,
-    unfold_trace_target: Option<Name>,
-    unfold_trace: Vec<String>,
-    trace_defeq_outer: Option<(u64, u64, Name, Name)>,
     /// Diagnostic negative-control switch (`observe_unfolds` only): force
     /// left-first lazy delta unfolding regardless of hint priority.
     force_left_delta: bool,
@@ -2839,29 +2836,17 @@ impl<'a> TypeChecker<'a> {
             eager_reduction: false,
             unfolding: None,
             unfold_counts: None,
-            unfold_trace_target: None,
-            unfold_trace: Vec::new(),
-            trace_defeq_outer: None,
             force_left_delta: false,
         }
     }
 
-    pub(crate) fn enable_unfold_observation(
-        &mut self,
-        force_left_delta: bool,
-        trace_target: Option<Name>,
-    ) {
+    pub(crate) fn enable_unfold_observation(&mut self, force_left_delta: bool) {
         self.unfold_counts = Some(std::collections::BTreeMap::new());
-        self.unfold_trace_target = trace_target;
         self.force_left_delta = force_left_delta;
     }
 
     pub(crate) fn take_unfold_counts(&mut self) -> std::collections::BTreeMap<Name, u64> {
         self.unfold_counts.take().unwrap_or_default()
-    }
-
-    pub(crate) fn take_unfold_trace(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.unfold_trace)
     }
 
     pub(crate) fn cache_diagnostic_summary(&self) -> String {
@@ -3821,7 +3806,7 @@ impl<'a> TypeChecker<'a> {
             if let Some(value) = self.reduce_nat(&current, depth).map_err(clear_whnf_head)? {
                 break value;
             }
-            match self.unfold_definition(&current, depth, "whnf")? {
+            match self.unfold_definition(&current, depth)? {
                 Some(next) => current = self.whnf_core(&next, depth)?,
                 None => break current,
             }
@@ -4230,12 +4215,7 @@ impl<'a> TypeChecker<'a> {
     /// Slice note: theorems and opaques are NOT unfolded here (proof irrelevance
     /// covers theorem bodies; opaque unfolding is a follow-up refinement) — an
     /// under-unfolding can only under-accept, never over-accept.
-    fn unfold_definition(
-        &mut self,
-        e: &Expr,
-        depth: u32,
-        site: &'static str,
-    ) -> KResult<Option<Expr>> {
+    fn unfold_definition(&mut self, e: &Expr, depth: u32) -> KResult<Option<Expr>> {
         let mut args: Vec<Expr> = Vec::new();
         let mut head = e.clone();
         while let ExprNode::App { f, a } = head.node() {
@@ -4295,49 +4275,6 @@ impl<'a> TypeChecker<'a> {
             | None => return Ok(None),
         };
         self.record_unfold(name);
-        if self.unfold_trace_target.as_ref() == Some(name) && self.unfold_trace.len() < 40 {
-            let last_arg = args.last().map_or_else(
-                || "-".to_owned(),
-                |a| match a.node() {
-                    ExprNode::Const { name, .. } => name.to_display_string(),
-                    ExprNode::FVar { id } => format!("fvar({})", id.0.to_display_string()),
-                    ExprNode::App { f, .. } => {
-                        let (h, sp) = app_spine(a);
-                        let hn = match h.node() {
-                            ExprNode::Const { name, .. } => name.to_display_string(),
-                            ExprNode::FVar { id } => format!("fvar({})", id.0.to_display_string()),
-                            ExprNode::Proj {
-                                struct_name, idx, ..
-                            } => {
-                                format!("{}.{}", struct_name.to_display_string(), idx)
-                            }
-                            _ => format!("{:?}", std::mem::discriminant(f.node())),
-                        };
-                        format!("({hn} [{}])", sp.len())
-                    }
-                    ExprNode::Proj {
-                        struct_name, idx, ..
-                    } => {
-                        format!("{}.{}", struct_name.to_display_string(), idx)
-                    }
-                    _ => "other".to_owned(),
-                },
-            );
-            self.unfold_trace.push(format!(
-                "#{:02} step={} depth={} locals={} eager={} site={} wcore_scan={} inf_only_scan={} hash={:016x} nargs={} last_arg={}",
-                self.unfold_trace.len() + 1,
-                self.used.steps_used,
-                depth,
-                self.locals.len(),
-                u8::from(self.eager_reduction),
-                site,
-                self.whnf_core_cache.local_dependency_scan_nodes,
-                self.infer_only_cache.local_dependency_scan_nodes,
-                e.data().0,
-                args.len(),
-                last_arg,
-            ));
-        }
         let levels = levels.clone();
         let mut unfolded = self.instantiate_lparams(&value, &params, &levels, depth + 1)?;
         for arg in args {
@@ -5163,44 +5100,7 @@ impl<'a> TypeChecker<'a> {
         // as it does outside any chain.
         let deferral = self.defer_recursor_major.take();
         let chain_cache = self.recursor_chain_cache.take();
-        let saved_outer = if self.unfold_trace_target.is_some() {
-            let head_name = |e: &Expr| -> Name {
-                let (h, _) = app_spine(e);
-                match h.node() {
-                    ExprNode::Const { name, .. } => name.clone(),
-                    ExprNode::Proj { struct_name, .. } => struct_name.clone(),
-                    ExprNode::FVar { id } => id.0.clone(),
-                    _ => Name::anonymous(),
-                }
-            };
-            self.trace_defeq_outer
-                .replace((t.data().0, s.data().0, head_name(t), head_name(s)))
-        } else {
-            None
-        };
-        let trace_len_before = self.unfold_trace.len();
         let result = self.is_def_eq_core(t, s, depth);
-        if self.unfold_trace_target.is_some() {
-            if self.unfold_trace.len() > trace_len_before && self.unfold_trace.len() < 80 {
-                let verdict = match &result {
-                    Ok(true) => "TRUE",
-                    Ok(false) => "FALSE",
-                    Err(_) => "ERR",
-                };
-                if let Some((th, sh, tn, sn)) = &self.trace_defeq_outer {
-                    self.unfold_trace.push(format!(
-                        "  END step={} depth={} verdict={verdict} outer_t={}:{:016x} outer_s={}:{:016x}",
-                        self.used.steps_used,
-                        depth,
-                        tn.to_display_string(),
-                        th,
-                        sn.to_display_string(),
-                        sh,
-                    ));
-                }
-            }
-            self.trace_defeq_outer = saved_outer;
-        }
         self.defer_recursor_major = deferral;
         self.recursor_chain_cache = chain_cache;
         if matches!(result, Ok(true)) {
@@ -5891,14 +5791,14 @@ impl<'a> TypeChecker<'a> {
             (None, None) => return Ok(ReductionStatus::DefUnknown),
             (Some(_), None) => match self.try_unfold_proj_app(s, depth)? {
                 Some(next) => *s = next,
-                None => match self.unfold_definition(t, depth, "ld_l")? {
+                None => match self.unfold_definition(t, depth)? {
                     Some(next) => *t = self.whnf_core_for_defeq(&next, depth)?,
                     None => return Ok(ReductionStatus::DefUnknown),
                 },
             },
             (None, Some(_)) => match self.try_unfold_proj_app(t, depth)? {
                 Some(next) => *t = next,
-                None => match self.unfold_definition(s, depth, "ld_r")? {
+                None => match self.unfold_definition(s, depth)? {
                     Some(next) => *s = self.whnf_core_for_defeq(&next, depth)?,
                     None => return Ok(ReductionStatus::DefUnknown),
                 },
@@ -5908,11 +5808,11 @@ impl<'a> TypeChecker<'a> {
             } else {
                 a.cmp_priority(b)
             } {
-                std::cmp::Ordering::Greater => match self.unfold_definition(t, depth, "ld_gt")? {
+                std::cmp::Ordering::Greater => match self.unfold_definition(t, depth)? {
                     Some(next) => *t = self.whnf_core_for_defeq(&next, depth)?,
                     None => return Ok(ReductionStatus::DefUnknown),
                 },
-                std::cmp::Ordering::Less => match self.unfold_definition(s, depth, "ld_lt")? {
+                std::cmp::Ordering::Less => match self.unfold_definition(s, depth)? {
                     Some(next) => *s = self.whnf_core_for_defeq(&next, depth)?,
                     None => return Ok(ReductionStatus::DefUnknown),
                 },
@@ -5920,46 +5820,11 @@ impl<'a> TypeChecker<'a> {
                     if same_regular_app && self.regular_same_head_apps_def_eq(t, s, depth + 1)? {
                         return Ok(ReductionStatus::DefEqual);
                     }
-                    if self.unfold_trace_target.is_some()
-                        && self.unfold_trace.len() < 80
-                        && matches!(app_spine(t).0.node(), ExprNode::Const { name, .. } if self.unfold_trace_target.as_ref() == Some(name))
-                    {
-                        let (sh, sargs) = app_spine(s);
-                        let sname = match sh.node() {
-                            ExprNode::Const { name, .. } => name.to_display_string(),
-                            _ => "nonconst".to_owned(),
-                        };
-                        let in_pos = self.positive_def_eq_cache.contains(
-                            t,
-                            s,
-                            &self.locals,
-                            &self.local_positions,
-                        );
-                        let in_eqv = self.equiv_manager.is_equiv(
-                            t,
-                            s,
-                            false,
-                            self.eager_reduction,
-                            &self.locals,
-                            &self.local_positions,
-                        );
-                        self.unfold_trace.push(format!(
-                            "  PAIR step={} depth={} t_hash={:016x} s_head={}({}) s_hash={:016x} in_pos={} in_eqv={}",
-                            self.used.steps_used,
-                            depth,
-                            t.data().0,
-                            sname,
-                            sargs.len(),
-                            s.data().0,
-                            in_pos,
-                            in_eqv,
-                        ));
-                    }
-                    match self.unfold_definition(t, depth, "ld_eq_l")? {
+                    match self.unfold_definition(t, depth)? {
                         Some(next) => *t = self.whnf_core_for_defeq(&next, depth)?,
                         None => return Ok(ReductionStatus::DefUnknown),
                     }
-                    match self.unfold_definition(s, depth, "ld_eq_r")? {
+                    match self.unfold_definition(s, depth)? {
                         Some(next) => *s = self.whnf_core_for_defeq(&next, depth)?,
                         None => return Ok(ReductionStatus::DefUnknown),
                     }
