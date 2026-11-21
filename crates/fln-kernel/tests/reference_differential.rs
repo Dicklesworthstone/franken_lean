@@ -1075,6 +1075,8 @@ theorem reuse_cached_proj :
     = comb4 u1 u2 u3 u4 := rfl
 ";
 
+    let nm = n;
+    let bv = |i: u32| Expr::bvar(i).expect("bvar");
     let type0 = Expr::sort(Level::one());
     let eq_ty = Expr::forall_e(
         nm("α"),
