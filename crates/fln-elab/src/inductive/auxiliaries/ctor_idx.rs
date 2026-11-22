@@ -72,7 +72,7 @@ pub struct CtorIdxCandidates {
     pub to_ctor_idx: Option<DefinitionVal>,
 }
 
-fn is_prop_former(work: &mut Builder, type_: &Expr) -> Result<bool, AuxiliaryError> {
+pub(super) fn is_prop_former(work: &mut Builder, type_: &Expr) -> Result<bool, AuxiliaryError> {
     let mut current = type_;
     loop {
         work.tick()?;
@@ -85,7 +85,7 @@ fn is_prop_former(work: &mut Builder, type_: &Expr) -> Result<bool, AuxiliaryErr
     }
 }
 
-fn bounded_telescope(
+pub(super) fn bounded_telescope(
     build: &mut Build,
     type_: &Expr,
     count: usize,
@@ -118,7 +118,7 @@ fn bounded_telescope(
     Ok((locals, current))
 }
 
-fn instantiate_forall(
+pub(super) fn instantiate_forall(
     work: &mut Builder,
     type_: &Expr,
     args: &[Expr],
@@ -144,7 +144,7 @@ fn instantiate_forall(
 
 /// Iterative walk collecting maximum regular definition height and whether any
 /// referenced constant is unsafe (`Environment.getMaxHeight` + `hasUnsafe`).
-fn scan_const_meta<F>(
+pub(super) fn scan_const_meta<F>(
     work: &mut Builder,
     roots: &[&Expr],
     lookup: &F,
