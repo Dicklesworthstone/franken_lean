@@ -4,6 +4,15 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/native-lake-integrity.yml'
+      - 'scripts/ci/checkout_asupersync.sh'
+      - 'SUITE.lock'
+      - 'Cargo.lock'
+      - 'crates/fln-vm/**'
+      - 'crates/fln-rt/**'
+      - 'crates/fln-unsafe-abi/**'
+      - 'crates/fln/src/runtime/**'
+      - 'crates/fln/src/source_check/modules/**'
+      - 'crates/fln/src/source_check/inspect/**'
       - 'crates/fln-lake/**'
       - 'crates/fln-cli/**'
       - 'crates/fln-parse/**'
@@ -30,6 +39,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Provision the locked suite dependency
+        run: bash scripts/ci/checkout_asupersync.sh
       - name: Install repository toolchain
         run: |
           channel=$(sed -n 's/^channel = "\([^" ]*\)".*/\1/p' rust-toolchain.toml)
@@ -38,7 +49,8 @@ jobs:
       - name: Check Git cancellation and transactional dependency resolution
         run: |
           set -euo pipefail
-          cargo test --locked -p fln-unsafe-abi --lib process::tests -- --test-threads=1
+          cargo test --locked -p fln-unsafe-abi --lib --no-fail-fast -- --test-threads=1
+          cargo test --locked -p fln-vm --all-targets --no-fail-fast
           cargo test --locked -p fln-lake --all-targets --no-fail-fast
       - name: Check real command outcomes and nonpublication
         run: |
@@ -60,6 +72,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Provision the locked suite dependency
+        run: bash scripts/ci/checkout_asupersync.sh
       - name: Install repository toolchain
         run: |
           set -euo pipefail
@@ -100,6 +114,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Provision the locked suite dependency
+        run: bash scripts/ci/checkout_asupersync.sh
       - name: Install repository toolchain
         run: |
           set -euo pipefail
