@@ -6,6 +6,8 @@ use super::*;
 use std::collections::HashSet;
 mod instance_args;
 
+type KnownTypePair = (Option<Expr>, Option<Expr>);
+
 /// Where a rule instantiation looks for its occurrence.
 #[derive(Clone, Copy)]
 enum Occurrences<'a> {
@@ -198,15 +200,18 @@ impl Context {
     /// and `Sort (succ _)` are disjoint under every universe assignment; without
     /// this, a lambda-headed `Type u` rule (`List.cons_append_fun`) eta-expands
     /// a pending proof `?h x y` whose type is a defined proposition (`WellFoundedRelation.rel`).
-    fn rewrite_types_have_disjoint_sorts(
+    /// Returns `Ok(None)` when disjoint, or `Ok(Some((left_sort, right_sort)))` with
+    /// the already-reconstructed sorts so the caller does not recompute them.
+    fn rewrite_type_sorts_compatible(
         &mut self,
         left: &Expr,
         right: &Expr,
-    ) -> Result<bool, NatDefinitionElabError> {
-        let (Some(mut left_sort), Some(mut right_sort)) =
-            (self.known_type(left)?, self.known_type(right)?)
+    ) -> Result<Option<KnownTypePair>, NatDefinitionElabError> {
+        let left_raw = self.known_type(left)?;
+        let right_raw = self.known_type(right)?;
+        let (Some(mut left_sort), Some(mut right_sort)) = (left_raw.clone(), right_raw.clone())
         else {
-            return Ok(false);
+            return Ok(Some((left_raw, right_raw)));
         };
         if !matches!(left_sort.node(), ExprNode::Sort { .. }) {
             left_sort = self.whnf_with_transparency(
@@ -225,17 +230,17 @@ impl Context {
         let (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) =
             (left_sort.node(), right_sort.node())
         else {
-            return Ok(false);
+            return Ok(Some((left_raw, right_raw)));
         };
         let a = a.clone();
         let b = b.clone();
         if self.level_is_always_zero(&a)? && self.level_is_always_nonzero(&b)? {
-            return Ok(true);
+            return Ok(None);
         }
         if self.level_is_always_nonzero(&a)? && self.level_is_always_zero(&b)? {
-            return Ok(true);
+            return Ok(None);
         }
-        Ok(false)
+        Ok(Some((left_raw, right_raw)))
     }
 
     /// Reject an `apply` candidate only when its eventual conclusion and the
@@ -243,17 +248,15 @@ impl Context {
     /// change an admitted inductive head, so no premise holes are needed to
     /// detect that mismatch. A function target may match a partial application;
     /// aliases, projections and other uncertain conclusions need the solver.
-    pub(in crate::source::tactics) fn apply_conclusion_has_distinct_head(
+    /// When `default_transparency` is set and the candidate's conclusion already
+    /// has a rigid head (`Induct`/`Sort`), unfold a non-rigid target at Default
+    /// transparency so e.g. `apply Prod.Lex.right` rejects `Nat.lt` immediately.
+    pub(in crate::source::tactics) fn apply_conclusion_has_distinct_head_at(
         &mut self,
         type_: &Expr,
         target: &Expr,
+        default_transparency: bool,
     ) -> Result<bool, NatDefinitionElabError> {
-        let Some(target_head) = self.rigid_rewrite_type_head(target)? else {
-            return Ok(false);
-        };
-        if target_head == RigidTypeHead::Forall {
-            return Ok(false);
-        }
         let mut conclusion = type_;
         loop {
             self.tick()?;
@@ -263,9 +266,34 @@ impl Context {
                 _ => break,
             }
         }
-        Ok(self
-            .rigid_rewrite_type_head(conclusion)?
-            .is_some_and(|head| head != target_head))
+        let Some(conclusion_head) = self.rigid_rewrite_type_head(conclusion)? else {
+            return Ok(false);
+        };
+        let target_head = match self.rigid_rewrite_type_head(target)? {
+            Some(head) => Some(head),
+            None if default_transparency && conclusion_head != RigidTypeHead::Forall => {
+                let unfolded =
+                    self.whnf_with_transparency(target, UnificationTransparency::Default, true)?;
+                self.rigid_rewrite_type_head(&unfolded)?
+            }
+            None => None,
+        };
+        let Some(target_head) = target_head else {
+            return Ok(false);
+        };
+        if target_head == RigidTypeHead::Forall {
+            return Ok(false);
+        }
+        Ok(conclusion_head != target_head)
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::source::tactics) fn apply_conclusion_has_distinct_head(
+        &mut self,
+        type_: &Expr,
+        target: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        self.apply_conclusion_has_distinct_head_at(type_, target, false)
     }
 
     /// Inspect the type skeleton after EXACTLY the supplied arguments. A bare
@@ -390,10 +418,12 @@ impl Context {
     /// first running ordinary source inference. `constrain` flushes immediately
     /// and may retry at Default transparency before a selection marker exists.
     /// That can unfold an irrelevant rule or change which occurrence it matches.
-    fn queue_rewrite_selection(
+    fn queue_rewrite_selection_with_types(
         &mut self,
         left: &Expr,
         right: &Expr,
+        known_left: Option<Option<Expr>>,
+        known_right: Option<Option<Expr>>,
         rewrite: bool,
     ) -> Result<(), NatDefinitionElabError> {
         self.tick()?;
@@ -404,7 +434,15 @@ impl Context {
         } else {
             SourceEquation::selection
         };
-        if let (Some(a), Some(b)) = (self.known_type(&left)?, self.known_type(&right)?)
+        let a = match known_left {
+            Some(known) => known,
+            None => self.known_type(&left)?,
+        };
+        let b = match known_right {
+            Some(known) => known,
+            None => self.known_type(&right)?,
+        };
+        if let (Some(a), Some(b)) = (a, b)
             && (a.has_level_mvar() || b.has_level_mvar())
         {
             self.equations.push(equation(a, b));
@@ -447,9 +485,10 @@ impl Context {
         if self.rewrite_types_have_distinct_heads(&type_, alpha)? {
             return Ok(false);
         }
-        if self.rewrite_types_have_disjoint_sorts(&type_, alpha)? {
+        let Some((left_sort, right_sort)) = self.rewrite_type_sorts_compatible(&type_, alpha)?
+        else {
             return Ok(false);
-        }
+        };
         if self.is_unwrapped_lambda(pattern)? && !self.is_unwrapped_lambda(occurrence)? {
             // `isDefEqEta` (vendored `Lean/Meta/ExprDefEq.lean:176-184`) only
             // eta-expands a non-lambda occurrence when `whnfD (inferType b)` is
@@ -464,8 +503,20 @@ impl Context {
                 return Ok(false);
             }
         }
-        self.queue_rewrite_selection(&type_, alpha, rewrite)?;
-        self.queue_rewrite_selection(occurrence, pattern, rewrite)?;
+        self.queue_rewrite_selection_with_types(
+            &type_,
+            alpha,
+            Some(left_sort),
+            Some(right_sort),
+            rewrite,
+        )?;
+        self.queue_rewrite_selection_with_types(
+            occurrence,
+            pattern,
+            Some(Some(type_)),
+            None,
+            rewrite,
+        )?;
         self.flush(true)?;
         Ok(true)
     }

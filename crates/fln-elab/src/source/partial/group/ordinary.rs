@@ -45,6 +45,7 @@ fn fork_scoped_with_caches(
     child.txn.budget = meter.txn.budget.clone();
     child.txn.nat_sub_model_cache = meter.txn.nat_sub_model_cache.clone();
     child.registry_cache = meter.registry_cache.clone();
+    child.txn.registry_cache = meter.registry_cache.clone();
     child.alias_cache = meter.alias_cache.clone();
     child.protected_cache = meter.protected_cache.clone();
     child.auxiliary_cache = meter.auxiliary_cache.clone();
@@ -57,6 +58,7 @@ fn absorb_child_caches(meter: &mut Context, child: &Context) {
     meter.txn.budget = child.txn.budget.clone();
     meter.txn.nat_sub_model_cache = child.txn.nat_sub_model_cache.clone();
     meter.registry_cache = child.registry_cache.clone();
+    meter.txn.registry_cache = child.registry_cache.clone();
     meter.alias_cache = child.alias_cache.clone();
     meter.protected_cache = child.protected_cache.clone();
     meter.auxiliary_cache = child.auxiliary_cache.clone();
@@ -1063,21 +1065,14 @@ fn mutual_well_founded(
                 ctx.txn.budget = meter.txn.budget.clone();
                 ctx.txn.nat_sub_model_cache = meter.txn.nat_sub_model_cache.clone();
                 ctx.registry_cache = meter.registry_cache.clone();
+                ctx.txn.registry_cache = meter.registry_cache.clone();
                 ctx.alias_cache = meter.alias_cache.clone();
                 ctx.protected_cache = meter.protected_cache.clone();
                 ctx.auxiliary_cache = meter.auxiliary_cache.clone();
                 ctx.deprecation_cache = meter.deprecation_cache.clone();
                 ctx.simp_key_cache = meter.simp_key_cache.clone();
-                let before_hb = meter.txn.budget.heartbeats_consumed;
                 let probed = ctx.probe_mutual_calls(snapshot, &measure_sum, &missing);
                 absorb_child_caches(meter, ctx);
-                if std::env::var_os("FLN_TRACE_WF").is_some() {
-                    eprintln!(
-                        "WF_PROBE slot={slot} pos={position} missing={missing:?} hb={before_hb}->{} ok={}",
-                        meter.txn.budget.heartbeats_consumed,
-                        probed.is_ok()
-                    );
-                }
                 let total = counts[position].expect("captured total");
                 for (call, relation) in probed? {
                     meter.tick()?;

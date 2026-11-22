@@ -970,6 +970,7 @@ impl Context {
     fn new(env: &Environment, kernel: Budget) -> Self {
         let mut txn = ElabTxn::new(env.clone(), KVMap::new(), 0);
         txn.budget.max_heartbeats = 1_000_000;
+        let registry_cache = txn.registry_cache.clone();
         Self {
             inspection: None,
             traces: trace::TraceLog::default(),
@@ -1020,7 +1021,7 @@ impl Context {
             matrix_record_projections: std::collections::HashMap::new(),
             matrix_shared_columns: std::collections::HashSet::new(),
             pattern_typing_checks: std::collections::HashMap::new(),
-            registry_cache: crate::instances::RegistryCache::default(),
+            registry_cache,
             alias_cache: crate::aliases::AliasCache::default(),
             protected_cache: crate::protected_names::ProtectedCache::default(),
             auxiliary_cache: crate::aux_recursors::AuxRecursorCache::default(),
@@ -6536,6 +6537,7 @@ impl Context {
         // policy, but use the private world's provider once its body is entered.
         self.source_scope.computability = scope.computability;
         self.registry_cache = crate::instances::RegistryCache::default();
+        self.txn.registry_cache = self.registry_cache.clone();
         self.alias_cache = crate::aliases::AliasCache::default();
         self.protected_cache = crate::protected_names::ProtectedCache::default();
         self.auxiliary_cache = crate::aux_recursors::AuxRecursorCache::default();

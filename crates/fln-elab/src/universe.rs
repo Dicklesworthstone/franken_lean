@@ -256,6 +256,34 @@ fn visit(remaining: &mut usize, limit: usize) -> Result<(), UniverseInstantiatio
     Ok(())
 }
 
+#[derive(Debug)]
+struct UniverseUndo {
+    id: LMVarId,
+    prev: Option<Level>,
+}
+
+/// Operational undo log for speculative in-place unifier trials. Cloned stores
+/// start outside any trial, and semantic equality ignores the trail.
+#[derive(Debug, Default)]
+struct UniverseUndoTrail {
+    active: usize,
+    entries: Vec<UniverseUndo>,
+}
+
+impl Clone for UniverseUndoTrail {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for UniverseUndoTrail {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for UniverseUndoTrail {}
+
 /// Tracks universe metavariable assignments and instantiation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UniverseStore {
@@ -263,6 +291,8 @@ pub struct UniverseStore {
     /// Temporary scopes may assign only universe holes allocated inside them.
     /// Unlike the assignment map, this includes fresh, still-unassigned holes.
     assignment_scope: Option<HashSet<LMVarId>>,
+    /// Operational O(delta) undo log active only during speculative unifier trials.
+    undo: UniverseUndoTrail,
 }
 
 impl UniverseStore {
@@ -270,11 +300,50 @@ impl UniverseStore {
         Self::default()
     }
 
+    pub(crate) fn begin_trial(&mut self) -> usize {
+        self.undo.active += 1;
+        self.undo.entries.len()
+    }
+
+    pub(crate) fn commit_trial(&mut self, mark: usize) {
+        debug_assert!(self.undo.active > 0);
+        debug_assert!(mark <= self.undo.entries.len());
+        self.undo.active -= 1;
+        if self.undo.active == 0 {
+            self.undo.entries.clear();
+        }
+    }
+
+    pub(crate) fn rollback_trial(&mut self, mark: usize) -> usize {
+        debug_assert!(self.undo.active > 0);
+        debug_assert!(mark <= self.undo.entries.len());
+        let mut undone = 0usize;
+        while self.undo.entries.len() > mark {
+            let entry = self.undo.entries.pop().expect("trail above mark");
+            match entry.prev {
+                Some(level) => {
+                    self.assignments.insert(entry.id, level);
+                }
+                None => {
+                    self.assignments.remove(&entry.id);
+                }
+            }
+            undone += 1;
+        }
+        self.undo.active -= 1;
+        if self.undo.active == 0 {
+            self.undo.entries.clear();
+        }
+        undone
+    }
+
     pub(crate) fn restrict_assignments_to_new(&mut self) {
+        debug_assert_eq!(self.undo.active, 0);
         self.assignment_scope = Some(HashSet::new());
     }
 
     pub(crate) fn register_fresh(&mut self, id: LMVarId) {
+        debug_assert_eq!(self.undo.active, 0);
         if let Some(fresh) = &mut self.assignment_scope {
             fresh.insert(id);
         }
@@ -319,11 +388,25 @@ impl UniverseStore {
     /// candidate store, not an admission gate: instantiation validates the
     /// reachable assignment graph and reports cycles explicitly.
     pub fn assign(&mut self, uvar: LMVarId, level: Level) -> Option<Level> {
-        self.assignments.insert(uvar, level)
+        let prev = self.assignments.insert(uvar.clone(), level);
+        if self.undo.active > 0 {
+            self.undo.entries.push(UniverseUndo {
+                id: uvar,
+                prev: prev.clone(),
+            });
+        }
+        prev
     }
 
     pub fn remove(&mut self, uvar: &LMVarId) -> Option<Level> {
-        self.assignments.remove(uvar)
+        let prev = self.assignments.remove(uvar);
+        if self.undo.active > 0 && prev.is_some() {
+            self.undo.entries.push(UniverseUndo {
+                id: uvar.clone(),
+                prev: prev.clone(),
+            });
+        }
+        prev
     }
 
     pub fn assignments(&self) -> &HashMap<LMVarId, Level> {
@@ -741,5 +824,33 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn trial_rollback_and_commit_restore_exact_universe_store_state() {
+        let u = uvar("u");
+        let v = uvar("v");
+        let mut store = UniverseStore::new();
+        store.assign(u.clone(), Level::zero());
+        let baseline = store.clone();
+
+        let outer = store.begin_trial();
+        store.assign(u.clone(), Level::one());
+        let inner = store.begin_trial();
+        store.assign(v.clone(), Level::one());
+        let undone_inner = store.rollback_trial(inner);
+        assert_eq!(undone_inner, 1);
+        assert!(!store.is_assigned(&v));
+        assert_eq!(store.get_assignment(&u), Some(&Level::one()));
+
+        let undone_outer = store.rollback_trial(outer);
+        assert_eq!(undone_outer, 1);
+        assert_eq!(store, baseline);
+
+        let mark = store.begin_trial();
+        store.assign(v.clone(), Level::one());
+        store.commit_trial(mark);
+        assert_eq!(store.get_assignment(&u), Some(&Level::zero()));
+        assert_eq!(store.get_assignment(&v), Some(&Level::one()));
     }
 }

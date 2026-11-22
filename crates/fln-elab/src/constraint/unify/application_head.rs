@@ -244,7 +244,7 @@ impl Engine<'_> {
             if self.budget.proof_irrelevance {
                 let mut obligations = VecDeque::new();
                 match self.proof_irrelevance(&left, &right, locals, &mut obligations) {
-                    Ok(true) => {
+                    Ok(proof_irrelevance::ProofIrrelevance::Solved) => {
                         // K1 validates BOTH original proofs, but may unfold more
                         // than this caller allows. Retain every type equation
                         // and compare it here without assigning argument holes.
@@ -256,7 +256,10 @@ impl Engine<'_> {
                         }
                         continue;
                     }
-                    Ok(false) => {}
+                    Ok(
+                        proof_irrelevance::ProofIrrelevance::NotAProof
+                        | proof_irrelevance::ProofIrrelevance::Unresolved,
+                    ) => {}
                     Err(UnificationError::Deferred(_)) => return Ok(false),
                     Err(error) => return Err(error),
                 }

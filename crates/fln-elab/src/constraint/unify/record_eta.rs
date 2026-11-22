@@ -250,8 +250,12 @@ impl Engine<'_> {
         let mut remaining = arguments;
         while let Some((argument, rest)) = remaining.split_first() {
             self.meter.node()?;
-            type_ = self.instantiate(&type_)?;
-            type_ = self.whnf(&type_, locals)?;
+            if type_.has_expr_mvar() || type_.has_level_mvar() {
+                type_ = self.instantiate(&type_)?;
+            }
+            if !matches!(type_.node(), ExprNode::ForallE { .. }) {
+                type_ = self.whnf(&type_, locals)?;
+            }
             let ExprNode::ForallE { body, .. } = type_.node() else {
                 return Ok(None);
             };
@@ -274,8 +278,14 @@ impl Engine<'_> {
                 values => self.substitute_many(body, values)?,
             };
         }
-        type_ = self.instantiate(&type_)?;
-        Ok(Some(self.whnf(&type_, locals)?))
+        if type_.has_expr_mvar() || type_.has_level_mvar() {
+            type_ = self.instantiate(&type_)?;
+        }
+        Ok(Some(if matches!(type_.node(), ExprNode::Sort { .. }) {
+            type_
+        } else {
+            self.whnf(&type_, locals)?
+        }))
     }
 
     fn eta_constructor(
@@ -410,7 +420,13 @@ impl Engine<'_> {
             self.meter.node()?;
             let next = match frame {
                 NeutralTypeFrame::Application(argument) => {
-                    self.eta_apply_type(type_, std::slice::from_ref(&argument), locals)?
+                    let mut batch = vec![argument];
+                    while matches!(frames.last(), Some(NeutralTypeFrame::Application(_))) {
+                        if let Some(NeutralTypeFrame::Application(next_arg)) = frames.pop() {
+                            batch.push(next_arg);
+                        }
+                    }
+                    self.eta_apply_type(type_, &batch, locals)?
                 }
                 NeutralTypeFrame::Projection {
                     structure,

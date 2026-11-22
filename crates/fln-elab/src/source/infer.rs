@@ -106,7 +106,11 @@ impl Context {
                 }
                 Task::Apply(argument) => {
                     let type_ = types.pop().expect("function type precedes application");
-                    let type_ = self.whnf(&type_)?;
+                    let type_ = if matches!(type_.node(), ExprNode::ForallE { .. }) {
+                        type_
+                    } else {
+                        self.whnf(&type_)?
+                    };
                     let ExprNode::ForallE { body, .. } = type_.node() else {
                         return Ok(None);
                     };
@@ -133,7 +137,11 @@ impl Context {
                     lambda,
                 } => {
                     let type_ = types.pop().expect("domain type precedes binder opening");
-                    let type_ = self.whnf(&type_)?;
+                    let type_ = if matches!(type_.node(), ExprNode::Sort { .. }) {
+                        type_
+                    } else {
+                        self.whnf(&type_)?
+                    };
                     let ExprNode::Sort { level } = type_.node() else {
                         return Ok(None);
                     };
@@ -170,7 +178,11 @@ impl Context {
                             .map_err(|_| failure(SourceInferenceError::Scope))?;
                         Expr::forall_e(name, domain, body, style)
                     } else {
-                        let body_type = self.whnf(&body_type)?;
+                        let body_type = if matches!(body_type.node(), ExprNode::Sort { .. }) {
+                            body_type
+                        } else {
+                            self.whnf(&body_type)?
+                        };
                         let ExprNode::Sort { level: body_level } = body_type.node() else {
                             return Ok(None);
                         };

@@ -234,94 +234,197 @@ impl Engine<'_> {
         fail_fast: bool,
         allow_pending: bool,
     ) -> Result<CongruenceResult, UnificationError> {
-        // Account for copying the mutable stores and per-batch identities.
-        // Immutable environment/registry data are shared; syntax facts start
-        // empty so a large cache is not repeatedly copied by nested trials.
-        for _ in 0..self.work.mvars.len()
-            + self.work.universes.len()
-            + self.reserved.len()
-            + self.assigned.len()
-            + self.assigned_levels.len()
-            + self.residuals.len()
-            + self.awakened.len()
-            + self.checked_assignments.len()
-        {
-            self.meter.node()?;
-        }
+        // In-place speculative trial with O(delta) undo trails: only mutations
+        // actually performed inside this trial are rolled back and metered,
+        // avoiding O(mvars.len() + universes.len()) cloning per congruence call.
+        self.meter.node()?;
+        let saved_constraints = if self.work.constraints.is_empty() {
+            None
+        } else {
+            for _ in 0..self.work.constraints.len() {
+                self.meter.node()?;
+            }
+            Some(self.work.constraints.clone())
+        };
         let generation = self.generation();
-        let pending = if allow_pending {
+        let mvar_mark = self.work.mvars.begin_trial();
+        let uvar_mark = self.work.universes.begin_trial();
+        let reserved_mark = self.reserved_trail.len();
+        let checked_mark = self.checked_trail.len();
+        let saved_assigned = self.assigned.len();
+        let saved_assigned_levels = self.assigned_levels.len();
+        let saved_residuals = self.residuals.len();
+        let saved_awakened = self.awakened.len();
+        let saved_next_local = self.next_local;
+        let saved_nat_literals_valid = self.nat_literals_valid;
+        let saved_nat_sub_model_valid = self.nat_sub_model_valid;
+        let saved_fail_fast = self.fail_fast;
+        // Same-head definition congruence mirrors the pin's `checkpointDefEq`
+        // around `isDefEqArgs` (`Lean/Meta/ExprDefEq.lean:1510-1512`), where
+        // `synthPending` can discharge an instance hole whose carrier an earlier
+        // argument just fixed (e.g. `Nat.succ 3 =?= @OfNat.ofNat ?α 4 ?inst`
+        // after `?α := Nat`). Record-eta and first-order trials pass
+        // `allow_pending = false` so failed probes do not pre-ask the owner.
+        let subtrial_pending = if allow_pending {
             self.pending.take_for_subtrial()
         } else {
             pending::PendingState::new(None, u64::MAX)
         };
-        let mut trial = Engine {
-            work: self.work.clone(),
-            budget: self.budget,
-            meter: Meter {
-                steps: self.meter.steps,
-                nodes: self.meter.nodes,
-                max_steps: self.meter.max_steps,
-                max_nodes: self.meter.max_nodes,
-                heartbeat_bound: self.meter.heartbeat_bound,
-                cancelled: self.meter.cancelled,
-            },
-            reserved: self.reserved.clone(),
-            next_local: self.next_local,
-            assigned: self.assigned.clone(),
-            assigned_levels: self.assigned_levels.clone(),
-            residuals: self.residuals.clone(),
-            awakened: self.awakened.clone(),
-            kernel_checks: self.kernel_checks,
-            checked_assignments: self.checked_assignments.clone(),
-            fact_cache: HashMap::new(),
-            local_facts: local_facts::Cache::default(),
-            nat_literals_valid: self.nat_literals_valid,
-            nat_sub_model_valid: self.nat_sub_model_valid,
-            projection_registry: self.projection_registry.clone(),
-            // Same-head definition congruence mirrors the pin's `checkpointDefEq`
-            // around `isDefEqArgs` (`Lean/Meta/ExprDefEq.lean:1510-1512`), where
-            // `synthPending` can discharge an instance hole whose carrier an earlier
-            // argument just fixed (e.g. `Nat.succ 3 =?= @OfNat.ofNat ?α 4 ?inst`
-            // after `?α := Nat`). Record-eta and first-order trials pass
-            // `allow_pending = false` so failed probes do not pre-ask the owner.
-            pending,
-            congruence_depth: self.congruence_depth + 1,
-            first_order_trial: self.first_order_trial,
-            fail_fast: self.fail_fast || fail_fast,
-        };
-        let result = trial.solve(equations, &[], &[]);
-        self.pending.restore_from_subtrial(&mut trial.pending);
-        self.work.nat_sub_model_cache = trial.work.nat_sub_model_cache.clone();
-        let made_assignments = trial.generation() != generation;
-        // Failed speculation consumes real work. Never reset cancellation,
-        // unifier/node limits or the assignment check's typed non-answer.
-        self.meter = trial.meter;
-        self.kernel_checks = trial.kernel_checks;
+        let saved_pending = std::mem::replace(&mut self.pending, subtrial_pending);
+        self.congruence_depth += 1;
+        self.fail_fast = saved_fail_fast || fail_fast;
+
+        let result = self.solve(equations, &[], &[]);
+
+        self.congruence_depth -= 1;
+        self.fail_fast = saved_fail_fast;
+        let mut used_pending = std::mem::replace(&mut self.pending, saved_pending);
+        self.pending.restore_from_subtrial(&mut used_pending);
+        let made_assignments = self.generation() != generation;
+
         match result {
             Ok(()) => {
-                self.work = trial.work;
-                self.reserved = trial.reserved;
-                self.next_local = trial.next_local;
-                self.assigned = trial.assigned;
-                self.assigned_levels = trial.assigned_levels;
-                self.residuals = trial.residuals;
-                self.awakened = trial.awakened;
-                self.checked_assignments = trial.checked_assignments;
-                self.fact_cache = trial.fact_cache;
-                self.local_facts = trial.local_facts;
-                self.nat_literals_valid = trial.nat_literals_valid;
-                self.nat_sub_model_valid = trial.nat_sub_model_valid;
-                self.projection_registry = trial.projection_registry;
+                self.work.mvars.commit_trial(mvar_mark);
+                self.work.universes.commit_trial(uvar_mark);
+                if self.congruence_depth == 0 {
+                    self.reserved_trail.clear();
+                    self.checked_trail.clear();
+                }
                 Ok(CongruenceResult::Solved)
             }
-            Err(UnificationError::Deferred(_))
-            | Err(UnificationError::Metavariable(MetavarError::OccursCheckFailed { .. })) => {
-                Ok(CongruenceResult::Refused { made_assignments })
+            Err(error) => {
+                let mut undone = self.work.mvars.rollback_trial(mvar_mark);
+                undone += self.work.universes.rollback_trial(uvar_mark);
+                while self.reserved_trail.len() > reserved_mark {
+                    if let Some(id) = self.reserved_trail.pop() {
+                        self.reserved.remove(&id);
+                        undone += 1;
+                    }
+                }
+                while self.checked_trail.len() > checked_mark {
+                    if let Some(id) = self.checked_trail.pop() {
+                        self.checked_assignments.remove(&id);
+                        undone += 1;
+                    }
+                }
+                self.assigned.truncate(saved_assigned);
+                self.assigned_levels.truncate(saved_assigned_levels);
+                self.residuals.truncate(saved_residuals);
+                self.awakened.truncate(saved_awakened);
+                self.next_local = saved_next_local;
+                self.nat_literals_valid = saved_nat_literals_valid;
+                self.nat_sub_model_valid = saved_nat_sub_model_valid;
+                if let Some(constraints) = saved_constraints {
+                    self.work.constraints = constraints;
+                }
+                let recoverable = matches!(
+                    &error,
+                    UnificationError::Deferred(_)
+                        | UnificationError::Metavariable(MetavarError::OccursCheckFailed { .. })
+                ) || matches!(
+                    &error,
+                    UnificationError::AssignmentCheck { outcome, .. }
+                        if matches!(&**outcome, Outcome::Complete(Verdict::Rejected { .. }))
+                );
+                if recoverable {
+                    for _ in 0..undone {
+                        self.meter.node()?;
+                    }
+                    Ok(CongruenceResult::Refused { made_assignments })
+                } else {
+                    Err(error)
+                }
             }
-            Err(UnificationError::AssignmentCheck { outcome, .. })
-                if matches!(*outcome, Outcome::Complete(Verdict::Rejected { .. })) =>
-            {
-                Ok(CongruenceResult::Refused { made_assignments })
+        }
+    }
+
+    /// Run a read-only (`max_assignments = 0`, `Instances` transparency)
+    /// definitional-equality check in-place without cloning `self.work.mvars`
+    /// or `self.work.universes`, rolling back any scratch state afterwards.
+    pub(super) fn try_frozen_instance_query(
+        &mut self,
+        left: Expr,
+        right: Expr,
+        locals: LocalContext,
+    ) -> Result<bool, UnificationError> {
+        self.meter.node()?;
+        let saved_budget = self.budget;
+        let mut query_budget = self.budget;
+        query_budget.transparency = UnificationTransparency::Instances;
+        query_budget.max_assignments = 0;
+
+        let saved_constraints = if self.work.constraints.is_empty() {
+            None
+        } else {
+            for _ in 0..self.work.constraints.len() {
+                self.meter.node()?;
+            }
+            Some(self.work.constraints.clone())
+        };
+        let mvar_mark = self.work.mvars.begin_trial();
+        let uvar_mark = self.work.universes.begin_trial();
+        let reserved_mark = self.reserved_trail.len();
+        let saved_next_local = self.next_local;
+        let saved_assigned = std::mem::take(&mut self.assigned);
+        let saved_assigned_levels = std::mem::take(&mut self.assigned_levels);
+        let saved_residuals = std::mem::take(&mut self.residuals);
+        let saved_awakened = std::mem::take(&mut self.awakened);
+        let saved_checked = std::mem::take(&mut self.checked_assignments);
+        let saved_checked_trail = std::mem::take(&mut self.checked_trail);
+        let saved_fail_fast = self.fail_fast;
+        let saved_first_order = self.first_order_trial;
+        let saved_pending = std::mem::replace(
+            &mut self.pending,
+            pending::PendingState::new(None, u64::MAX),
+        );
+
+        self.budget = query_budget;
+        self.fail_fast = false;
+        self.first_order_trial = false;
+        self.congruence_depth += 1;
+
+        let result = self.solve(&[(left, right, locals)], &[], &[]);
+
+        self.congruence_depth -= 1;
+        self.budget = saved_budget;
+        self.fail_fast = saved_fail_fast;
+        self.first_order_trial = saved_first_order;
+        self.pending = saved_pending;
+        let mut undone = self.work.mvars.rollback_trial(mvar_mark);
+        undone += self.work.universes.rollback_trial(uvar_mark);
+        while self.reserved_trail.len() > reserved_mark {
+            if let Some(id) = self.reserved_trail.pop() {
+                self.reserved.remove(&id);
+                undone += 1;
+            }
+        }
+        self.next_local = saved_next_local;
+        self.assigned = saved_assigned;
+        self.assigned_levels = saved_assigned_levels;
+        self.residuals = saved_residuals;
+        self.awakened = saved_awakened;
+        self.checked_assignments = saved_checked;
+        self.checked_trail = saved_checked_trail;
+        if let Some(constraints) = saved_constraints {
+            self.work.constraints = constraints;
+        }
+
+        match result {
+            Ok(()) => {
+                for _ in 0..undone {
+                    self.meter.node()?;
+                }
+                Ok(true)
+            }
+            Err(UnificationError::Deferred(_))
+            // This zero is the query's deliberate freeze, not exhaustion of
+            // the caller's assignment allowance.
+            | Err(UnificationError::AssignmentLimit { limit: 0 })
+            | Err(UnificationError::Metavariable(MetavarError::OccursCheckFailed { .. })) => {
+                for _ in 0..undone {
+                    self.meter.node()?;
+                }
+                Ok(false)
             }
             Err(error) => Err(error),
         }

@@ -2618,8 +2618,14 @@ impl Context {
         // a metavariable: no assignment makes such a target a `∀`. Each failed
         // `apply PSigma.Lex.right` of the default `decreasing_by` compared every `∀`-prefix of
         // the lemma with `x < x + 1`, unfolding the target each time.
+        let default_transparency = self.tactic_transparency
+            == Some(UnificationTransparency::SafeDefinitions)
+            || self
+                .well_founded
+                .as_ref()
+                .is_some_and(|state| state.proving);
         let target = self.whnf(&goal.target)?;
-        if self.apply_conclusion_has_distinct_head(&term.type_, &target)? {
+        if self.apply_conclusion_has_distinct_head_at(&term.type_, &target, default_transparency)? {
             return Err(error(TacticError::ApplyMismatch));
         }
         let mut target_head = &target;

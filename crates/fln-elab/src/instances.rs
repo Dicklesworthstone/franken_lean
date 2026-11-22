@@ -541,11 +541,19 @@ fn append(env: &Environment, payload: Vec<u8>) -> Result<Environment, InstanceRe
 /// Shared persistent-map roots make an unchanged snapshot's comparison O(1),
 /// without hashing the whole environment. Unrelated changes may cause a harmless
 /// extra read. A failed read is never kept.
+type UnscopedEntry = Option<(Environment, std::sync::Arc<InstanceRegistry>)>;
+
 #[derive(Clone, Default)]
 pub(crate) struct RegistryCache {
-    last: std::cell::RefCell<Option<(Environment, std::sync::Arc<InstanceRegistry>)>>,
+    last: std::sync::Arc<std::sync::Mutex<UnscopedEntry>>,
     /// The last [`InstanceRegistry::read_with_scopes`] view, keyed also by the scopes it read.
-    scoped: std::cell::RefCell<ScopedEntry>,
+    scoped: std::sync::Arc<std::sync::Mutex<ScopedEntry>>,
+}
+
+impl std::fmt::Debug for RegistryCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryCache").finish()
+    }
 }
 
 type ScopedEntry = Option<(
@@ -572,13 +580,23 @@ impl RegistryCache {
         &self,
         env: &Environment,
     ) -> Result<std::sync::Arc<InstanceRegistry>, InstanceRegistryError> {
-        if let Some((cached, registry)) = self.last.borrow().as_ref()
-            && cached == env
         {
-            return Ok(std::sync::Arc::clone(registry));
+            let guard = self
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((cached, registry)) = guard.as_ref()
+                && cached == env
+            {
+                return Ok(std::sync::Arc::clone(registry));
+            }
         }
         let registry = std::sync::Arc::new(InstanceRegistry::read(env)?);
-        *self.last.borrow_mut() = Some((env.clone(), std::sync::Arc::clone(&registry)));
+        let mut guard = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some((env.clone(), std::sync::Arc::clone(&registry)));
         Ok(registry)
     }
 
@@ -590,14 +608,24 @@ impl RegistryCache {
         env: &Environment,
         scopes: &scoped::ActiveScopes,
     ) -> Result<std::sync::Arc<InstanceRegistry>, InstanceRegistryError> {
-        if let Some((cached, cached_scopes, registry)) = self.scoped.borrow().as_ref()
-            && cached == env
-            && cached_scopes == scopes
         {
-            return Ok(std::sync::Arc::clone(registry));
+            let guard = self
+                .scoped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((cached, cached_scopes, registry)) = guard.as_ref()
+                && cached == env
+                && cached_scopes == scopes
+            {
+                return Ok(std::sync::Arc::clone(registry));
+            }
         }
         let registry = InstanceRegistry::read_cached_with_scopes(self, env, scopes)?;
-        *self.scoped.borrow_mut() = Some((
+        let mut guard = self
+            .scoped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some((
             env.clone(),
             scopes.clone(),
             std::sync::Arc::clone(&registry),

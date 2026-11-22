@@ -578,6 +578,7 @@ struct Engine<'a> {
     budget: UnificationBudget,
     meter: Meter<'a>,
     reserved: HashSet<FVarId>,
+    reserved_trail: Vec<FVarId>,
     next_local: u64,
     assigned: Vec<MVarId>,
     assigned_levels: Vec<LMVarId>,
@@ -588,6 +589,7 @@ struct Engine<'a> {
     // assignment is never revised, and its check abstracts every residual it still reads, so a
     // later instantiation cannot invalidate it: one check per assignment suffices.
     checked_assignments: HashSet<MVarId>,
+    checked_trail: Vec<MVarId>,
     // Facts describe immutable syntax, not its interpretation under assignments
     // or a local context. Pin every key's allocation until this batch ends so a
     // freed temporary cannot donate its address to an unrelated expression.
@@ -605,9 +607,28 @@ struct Engine<'a> {
     // argument outright: the first equation it cannot solve now refuses the trial, rather
     // than entering the worklist's retries, instance synthesis and head recovery.
     fail_fast: bool,
+    // Set at congruence depth 0 once `self.work.lctx` has been reserved (and validated if an
+    // equation used it). Depth-0 reservations are never rolled back and `self.work.lctx` is
+    // immutable inside `Engine`, so nested congruence trials need not re-walk it.
+    lctx_reserved: bool,
+    work_lctx_validated: bool,
 }
 
 impl Engine<'_> {
+    fn reserve_id(&mut self, id: FVarId) -> bool {
+        let inserted = self.reserved.insert(id.clone());
+        if inserted && self.congruence_depth > 0 {
+            self.reserved_trail.push(id);
+        }
+        inserted
+    }
+
+    fn mark_checked_assignment(&mut self, id: MVarId) {
+        if self.checked_assignments.insert(id.clone()) && self.congruence_depth > 0 {
+            self.checked_trail.push(id);
+        }
+    }
+
     fn generation(&self) -> usize {
         self.assigned
             .len()
@@ -629,7 +650,9 @@ impl Engine<'_> {
             Some(facts) => facts,
             None => facts(expr, &mut self.meter)?,
         };
-        self.reserved.extend(found.fvars.iter().cloned());
+        for id in &found.fvars {
+            self.reserve_id(id.clone());
+        }
         for _ in 0..found.fvars.len() + found.params.len() + found.uvars.len() {
             self.meter.node()?;
         }
@@ -669,7 +692,7 @@ impl Engine<'_> {
                 .checked_add(1)
                 .ok_or(UnificationError::ExpressionScope)?;
             let id = FVarId(Name::from_components(["_fln_unify_local", suffix.as_str()]));
-            if self.reserved.insert(id.clone()) {
+            if self.reserve_id(id.clone()) {
                 return Ok(id);
             }
         }
@@ -682,6 +705,10 @@ impl Engine<'_> {
     /// pass only closed values, for which this equals the binder-by-binder substitution.
     fn substitute_many(&mut self, body: &Expr, values: &[Expr]) -> Result<Expr, UnificationError> {
         debug_assert!(values.iter().all(|value| !value.has_loose_bvars()));
+        if !body.has_loose_bvars() {
+            self.meter.tick()?;
+            return Ok(body.clone());
+        }
         self.scan(body)?;
         for value in values {
             self.scan(value)?;
@@ -694,6 +721,10 @@ impl Engine<'_> {
     }
 
     fn substitute(&mut self, body: &Expr, value: &Expr) -> Result<Expr, UnificationError> {
+        if !body.has_loose_bvars() {
+            self.meter.tick()?;
+            return Ok(body.clone());
+        }
         self.scan(body)?;
         self.scan(value)?;
         let result = body
@@ -1493,11 +1524,15 @@ impl Engine<'_> {
                 return Ok(());
             }
         }
-        if self.budget.proof_irrelevance
-            && self.proof_irrelevance(&left, &right, locals, pending)?
-        {
-            return Ok(());
-        }
+        let not_a_proof = if self.budget.proof_irrelevance {
+            match self.proof_irrelevance(&left, &right, locals, pending)? {
+                proof_irrelevance::ProofIrrelevance::Solved => return Ok(()),
+                proof_irrelevance::ProofIrrelevance::NotAProof => true,
+                proof_irrelevance::ProofIrrelevance::Unresolved => false,
+            }
+        } else {
+            true
+        };
         if let Some((left, right)) = self.nat_offset_equation(&left, &right, locals)? {
             pending.push_front((left, right, locals.clone()));
             return Ok(());
@@ -1560,6 +1595,13 @@ impl Engine<'_> {
                             Err(UnificationError::Deferred(reason))
                         }
                     };
+                }
+                if not_a_proof
+                    && matches!(a.node(), ExprNode::App { .. })
+                    && matches!(c.node(), ExprNode::App { .. })
+                    && self.decompose_same_head_spine(&left, &right, locals, pending)?
+                {
+                    return Ok(());
                 }
                 pending.push_front((b.clone(), d.clone(), locals.clone()));
                 pending.push_front((a.clone(), c.clone(), locals.clone()));
@@ -1703,6 +1745,80 @@ impl Engine<'_> {
         Ok(())
     }
 
+    /// When two non-proof applications share the same non-unfoldable rigid head
+    /// and arity, decompose the whole spine at once instead of re-entering
+    /// `compare` (WHNF, proof irrelevance, record eta) for every prefix.
+    /// By impredicativity of `Prop`, a term whose type lives in `Sort (succ _)`
+    /// cannot have any prefix living in `Prop`, and none of the intermediate
+    /// function prefixes can trigger record eta, Nat offsets, or lazy delta
+    /// once the full application did not.
+    fn decompose_same_head_spine(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        locals: &LocalContext,
+        pending: &mut VecDeque<Equation>,
+    ) -> Result<bool, UnificationError> {
+        let mut left_head = left;
+        let mut left_args = Vec::new();
+        while let ExprNode::App { f, a } = left_head.node() {
+            self.meter.tick()?;
+            left_args.push(a);
+            left_head = f;
+        }
+        let mut right_head = right;
+        let mut right_args = Vec::new();
+        while let ExprNode::App { f, a } = right_head.node() {
+            self.meter.tick()?;
+            right_args.push(a);
+            right_head = f;
+        }
+        if left_args.len() != right_args.len() || left_args.len() < 2 {
+            return Ok(false);
+        }
+        let heads_compatible = match (left_head.node(), right_head.node()) {
+            (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) => a == b,
+            (
+                ExprNode::Const {
+                    name: a,
+                    levels: ua,
+                },
+                ExprNode::Const {
+                    name: b,
+                    levels: ub,
+                },
+            ) => a == b && ua.len() == ub.len(),
+            (
+                ExprNode::Proj {
+                    struct_name: a,
+                    idx: i,
+                    ..
+                },
+                ExprNode::Proj {
+                    struct_name: b,
+                    idx: j,
+                    ..
+                },
+            ) => a == b && i == j,
+            _ => false,
+        };
+        if !heads_compatible {
+            return Ok(false);
+        }
+        // `left_args` and `right_args` are in reverse (outermost-first) order,
+        // so pushing them in order leaves the leftmost argument at the front
+        // of `pending` — identical to peeling one `App` per `compare` call.
+        for (lhs, rhs) in left_args.into_iter().zip(right_args) {
+            if !self.same_up_to_assignment(lhs, rhs)? {
+                pending.push_front((lhs.clone(), rhs.clone(), locals.clone()));
+            }
+        }
+        if !self.same_up_to_assignment(left_head, right_head)? {
+            pending.push_front((left_head.clone(), right_head.clone(), locals.clone()));
+        }
+        Ok(true)
+    }
+
     fn solve(
         &mut self,
         equations: &[Equation],
@@ -1710,13 +1826,22 @@ impl Engine<'_> {
         delayed: &[DelayedConstraint],
     ) -> Result<(), UnificationError> {
         let mut pending = VecDeque::new();
+        let mut prev_locals: Option<&LocalContext> = None;
         for (left, right, locals) in equations {
             if left.has_loose_bvars() || right.has_loose_bvars() {
                 return Err(UnificationError::LooseBoundVariable);
             }
             self.scan(left)?;
             self.scan(right)?;
-            self.reserve_context(locals)?;
+            let already_reserved = prev_locals.is_some_and(|prev| prev == locals)
+                || (self.work_lctx_validated && locals == &self.work.lctx);
+            if !already_reserved {
+                self.reserve_context(locals)?;
+                if self.congruence_depth == 0 && locals == &self.work.lctx {
+                    self.work_lctx_validated = true;
+                }
+                prev_locals = Some(locals);
+            }
             pending.push_back((left.clone(), right.clone(), locals.clone()));
         }
         for typing in typings {
@@ -1725,18 +1850,34 @@ impl Engine<'_> {
             }
             self.scan(&typing.expr)?;
             self.scan(&typing.expected_type)?;
-            self.reserve_context(&typing.locals)?;
+            let already_reserved = prev_locals.is_some_and(|prev| prev == &typing.locals)
+                || (self.work_lctx_validated && typing.locals == self.work.lctx);
+            if !already_reserved {
+                self.reserve_context(&typing.locals)?;
+                if self.congruence_depth == 0 && typing.locals == self.work.lctx {
+                    self.work_lctx_validated = true;
+                }
+                prev_locals = Some(&typing.locals);
+            }
         }
         for obligation in delayed {
             self.scan(&Expr::mvar(obligation.mvar.clone()))?;
             self.scan(&obligation.val)?;
-            self.reserve_context(&obligation.locals)?;
+            let already_reserved = prev_locals.is_some_and(|prev| prev == &obligation.locals)
+                || (self.work_lctx_validated && obligation.locals == self.work.lctx);
+            if !already_reserved {
+                self.reserve_context(&obligation.locals)?;
+                if self.congruence_depth == 0 && obligation.locals == self.work.lctx {
+                    self.work_lctx_validated = true;
+                }
+                prev_locals = Some(&obligation.locals);
+            }
             if obligation.val.has_loose_bvars() {
                 return Err(UnificationError::LooseBoundVariable);
             }
             for local in &obligation.fvars {
                 self.meter.node()?;
-                self.reserved.insert(local.clone());
+                self.reserve_id(local.clone());
             }
         }
         // Reserve the pre-existing identities a fresh local could meet before
@@ -1749,23 +1890,47 @@ impl Engine<'_> {
         // the whole store keeps a batch proportional to what it can touch.
         let mut roots = Vec::new();
         for (left, right, _) in equations {
-            roots.push(left.clone());
-            roots.push(right.clone());
+            if left.has_fvar() || left.has_expr_mvar() {
+                roots.push(left.clone());
+            }
+            if right.has_fvar() || right.has_expr_mvar() {
+                roots.push(right.clone());
+            }
         }
         for typing in typings {
-            roots.push(typing.expr.clone());
-            roots.push(typing.expected_type.clone());
+            if typing.expr.has_fvar() || typing.expr.has_expr_mvar() {
+                roots.push(typing.expr.clone());
+            }
+            if typing.expected_type.has_fvar() || typing.expected_type.has_expr_mvar() {
+                roots.push(typing.expected_type.clone());
+            }
         }
         for obligation in delayed {
             roots.push(Expr::mvar(obligation.mvar.clone()));
-            roots.push(obligation.val.clone());
+            if obligation.val.has_fvar() || obligation.val.has_expr_mvar() {
+                roots.push(obligation.val.clone());
+            }
         }
-        for local in self.work.lctx.decls() {
-            self.reserved.insert(local.id.clone());
-            roots.push(local.type_.clone());
-            roots.extend(local.value.iter().cloned());
+        if !self.lctx_reserved {
+            let lctx_decls: Vec<_> = self.work.lctx.decls().to_vec();
+            for local in lctx_decls {
+                self.reserve_id(local.id);
+                if local.type_.has_fvar() || local.type_.has_expr_mvar() {
+                    roots.push(local.type_);
+                }
+                if let Some(value) = local.value
+                    && (value.has_fvar() || value.has_expr_mvar())
+                {
+                    roots.push(value);
+                }
+            }
         }
-        self.reserve_reachable(roots)?;
+        if !roots.is_empty() {
+            self.reserve_reachable(roots)?;
+        }
+        if self.congruence_depth == 0 {
+            self.lctx_reserved = true;
+        }
         // Revisit assignment-derived typing at most once per generation. A
         // missing Pi/sort at assignment time may become known through a later
         // equation. Rechecking is worklist production, never kernel admission.
@@ -1892,7 +2057,7 @@ impl Engine<'_> {
                 continue;
             }
             self.check_assignment(&id)?;
-            self.checked_assignments.insert(id);
+            self.mark_checked_assignment(id);
         }
         let mut checked_delayed = HashSet::new();
         for obligation in delayed {
@@ -1938,27 +2103,45 @@ impl Engine<'_> {
                 continue;
             }
             self.meter.node()?;
-            match current.node() {
-                ExprNode::FVar { id } => {
-                    self.reserved.insert(id.clone());
-                }
-                ExprNode::MVar { id } => {
-                    if reached.insert(id.clone()) {
-                        if let Some(decl) = self.work.mvars.get_decl(id) {
-                            pending.push(decl.type_.clone());
-                            for local in decl.lctx.decls() {
-                                self.meter.node()?;
-                                self.reserved.insert(local.id.clone());
-                                pending.push(local.type_.clone());
-                                pending.extend(local.value.iter().cloned());
+            if current.has_fvar() || current.has_expr_mvar() {
+                match current.node() {
+                    ExprNode::FVar { id } => {
+                        self.reserve_id(id.clone());
+                    }
+                    ExprNode::MVar { id } => {
+                        if reached.insert(id.clone()) {
+                            if let Some(decl) = self.work.mvars.get_decl(id).cloned() {
+                                if decl.type_.has_fvar() || decl.type_.has_expr_mvar() {
+                                    pending.push(decl.type_);
+                                }
+                                for local in decl.lctx.decls() {
+                                    self.meter.node()?;
+                                    self.reserve_id(local.id.clone());
+                                    if local.type_.has_fvar() || local.type_.has_expr_mvar() {
+                                        pending.push(local.type_.clone());
+                                    }
+                                    if let Some(value) = &local.value
+                                        && (value.has_fvar() || value.has_expr_mvar())
+                                    {
+                                        pending.push(value.clone());
+                                    }
+                                }
+                            }
+                            if let Some(assignment) = self.work.mvars.get_assignment(id)
+                                && (assignment.expr.has_fvar() || assignment.expr.has_expr_mvar())
+                            {
+                                pending.push(assignment.expr.clone());
                             }
                         }
-                        if let Some(assignment) = self.work.mvars.get_assignment(id) {
-                            pending.push(assignment.expr.clone());
+                    }
+                    _ => {
+                        for child in children(&current).into_iter().flatten() {
+                            if child.has_fvar() || child.has_expr_mvar() {
+                                pending.push(child.clone());
+                            }
                         }
                     }
                 }
-                _ => pending.extend(children(&current).into_iter().flatten().cloned()),
             }
             kept.push(current);
         }
@@ -1977,7 +2160,7 @@ impl Engine<'_> {
                     UnificationDeferred::InvalidLocalContext,
                 ));
             }
-            self.reserved.insert(local.id.clone());
+            self.reserve_id(local.id.clone());
             self.scan(&local.type_)?;
             if let Some(value) = &local.value {
                 self.scan(value)?;
@@ -2113,6 +2296,7 @@ impl ElabTxn {
                 cancelled,
             },
             reserved: HashSet::new(),
+            reserved_trail: Vec::new(),
             next_local: self.mvars.unify_locals(),
             assigned: Vec::new(),
             assigned_levels: Vec::new(),
@@ -2120,15 +2304,18 @@ impl ElabTxn {
             awakened: Vec::new(),
             kernel_checks: 0,
             checked_assignments: HashSet::new(),
+            checked_trail: Vec::new(),
             fact_cache: HashMap::new(),
             local_facts: local_facts::Cache::default(),
             nat_literals_valid: None,
             nat_sub_model_valid: None,
-            projection_registry: crate::instances::RegistryCache::default(),
+            projection_registry: self.registry_cache.clone(),
             pending: pending::PendingState::new(pending, remaining),
             congruence_depth: 0,
             first_order_trial: false,
             fail_fast: false,
+            lctx_reserved: false,
+            work_lctx_validated: false,
         }
     }
 

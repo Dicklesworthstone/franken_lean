@@ -325,17 +325,27 @@ pub(in crate::source) fn decreasing_tactic_expansion() -> &'static Syntax {
 
 fn direct_decreasing_proof() -> &'static Syntax {
     static DIRECT: std::sync::OnceLock<Syntax> = std::sync::OnceLock::new();
-    DIRECT.get_or_init(|| build_decreasing_proof(false))
+    DIRECT.get_or_init(|| build_decreasing_proof(false, true, true))
+}
+
+fn direct_prod_decreasing_proof() -> &'static Syntax {
+    static DIRECT_PROD: std::sync::OnceLock<Syntax> = std::sync::OnceLock::new();
+    DIRECT_PROD.get_or_init(|| build_decreasing_proof(false, true, false))
+}
+
+fn direct_scalar_decreasing_proof() -> &'static Syntax {
+    static DIRECT_SCALAR: std::sync::OnceLock<Syntax> = std::sync::OnceLock::new();
+    DIRECT_SCALAR.get_or_init(|| build_decreasing_proof(false, false, false))
 }
 
 /// The pin's lexicographic constructor prefix and Nat base-case fragment of
 /// decreasing_tactic after the checked continuation has exposed its measure.
 /// This is native syntax expansion; no Reference metaprogram is executed.
 fn automatic_decreasing_proof() -> Syntax {
-    build_decreasing_proof(true)
+    build_decreasing_proof(true, true, true)
 }
 
-fn build_decreasing_proof(include_simp: bool) -> Syntax {
+fn build_decreasing_proof(include_simp: bool, include_prod: bool, include_psigma: bool) -> Syntax {
     fn null(args: Vec<Syntax>) -> Syntax {
         Syntax::node(Name::from_components(["null"]), args)
     }
@@ -428,8 +438,12 @@ fn build_decreasing_proof(include_simp: bool) -> Syntax {
             vec![atom("try"), sequence(vec![simp])],
         ));
     }
-    steps.push(lexicographic_constructors("Prod"));
-    steps.push(lexicographic_constructors("PSigma"));
+    if include_prod {
+        steps.push(lexicographic_constructors("Prod"));
+    }
+    if include_psigma {
+        steps.push(lexicographic_constructors("PSigma"));
+    }
     steps.push(first(alternatives));
     sequence(steps)
 }
@@ -1432,17 +1446,81 @@ impl Context {
         goal: &tactics::ProofGoal,
     ) -> Result<bool, NatDefinitionElabError> {
         let snapshot = self.clone();
-        let syntax = direct_decreasing_proof();
-        let result = (|| {
-            let state = self.start_decreasing_proof(syntax, vec![goal.clone()])?;
+        let target = self.instantiate(&goal.target)?;
+        let (head, _) = operators::spine(&target);
+        let syntax = match head.node() {
+            ExprNode::Const { name, .. }
+                if name == &Name::from_components(["Nat", "lt"])
+                    || name == &Name::from_components(["Nat", "le"])
+                    || name == &Name::from_components(["LT", "lt"])
+                    || name == &Name::from_components(["LE", "le"])
+                    || name == &Name::from_components(["GT", "gt"])
+                    || name == &Name::from_components(["GE", "ge"]) =>
+            {
+                direct_scalar_decreasing_proof()
+            }
+            ExprNode::Const { name, .. } if name == &Name::from_components(["Prod", "Lex"]) => {
+                direct_prod_decreasing_proof()
+            }
+            _ => direct_decreasing_proof(),
+        };
+        let closed_goal = self.txn.mvars.len() > 1
+            && !target.has_expr_mvar()
+            && !target.has_level_mvar()
+            && goal.lctx.decls().iter().all(|local| {
+                !local.type_.has_expr_mvar()
+                    && !local.type_.has_level_mvar()
+                    && local
+                        .value
+                        .as_ref()
+                        .is_none_or(|v| !v.has_expr_mvar() && !v.has_level_mvar())
+            });
+        let result = (|| -> Result<Option<Expr>, NatDefinitionElabError> {
+            let mut active_goal = goal.clone();
+            active_goal.target = target;
+            if closed_goal {
+                let next_unify_local = self.txn.mvars.unify_locals();
+                self.txn.mvars = MetavarStore::default();
+                self.txn.mvars.advance_unify_locals(next_unify_local);
+                self.txn.universes = UniverseStore::default();
+                self.equations.clear();
+                self.stalled_flush = None;
+                self.instance_goals.clear();
+                self.pending_synth_holes.clear();
+                self.instance_origins.clear();
+                self.bound_metavars.clear();
+                self.postponed_eliminators.clear();
+                self.postponed_fields.clear();
+                self.postponed_coercions.clear();
+                self.postponed_application_errors.clear();
+                self.txn.mvars.declare(
+                    active_goal.id.clone(),
+                    active_goal.id.0.clone(),
+                    active_goal.target.clone(),
+                    active_goal.lctx.clone(),
+                    MetavarKind::SyntheticOpaque,
+                    0,
+                    None,
+                );
+            }
+            let state = self.start_decreasing_proof(syntax, vec![active_goal])?;
             self.run_decreasing_proof(syntax, state)?;
-            Ok(true)
+            if closed_goal {
+                let proof = self.instantiate(&Expr::mvar(goal.id.clone()))?;
+                if proof.has_expr_mvar() || proof.has_level_mvar() {
+                    return Ok(None);
+                }
+                Ok(Some(proof))
+            } else {
+                Ok(Some(Expr::mvar(goal.id.clone())))
+            }
         })();
-        if matches!(result, Ok(true)) {
+        if !closed_goal && matches!(result, Ok(Some(_))) {
             self.txn.lctx = snapshot.txn.lctx;
-            return result;
+            return Ok(true);
         }
         let spent = self.txn.budget.heartbeats_consumed;
+        let next_unify_local = self.txn.mvars.unify_locals();
         let model_cache = self.txn.nat_sub_model_cache.clone();
         let registry_cache = self.registry_cache.clone();
         let alias_cache = self.alias_cache.clone();
@@ -1452,14 +1530,32 @@ impl Context {
         let simp_key_cache = self.simp_key_cache.clone();
         *self = snapshot;
         self.txn.budget.heartbeats_consumed = spent;
+        self.txn.mvars.advance_unify_locals(next_unify_local);
         self.txn.nat_sub_model_cache = model_cache;
         self.registry_cache = registry_cache;
+        self.txn.registry_cache = self.registry_cache.clone();
         self.alias_cache = alias_cache;
         self.protected_cache = protected_cache;
         self.auxiliary_cache = auxiliary_cache;
         self.deprecation_cache = deprecation_cache;
         self.simp_key_cache = simp_key_cache;
         match result {
+            Ok(Some(proof)) => {
+                // `closed_goal` branch: assign the kernel-validated closed proof
+                // back into the parent transaction's metavar store.
+                self.txn
+                    .mvars
+                    .assign(
+                        goal.id.clone(),
+                        proof,
+                        AssignmentJustification::Tactic {
+                            tactic_name: Name::from_components(["decreasing_tactic"]),
+                        },
+                    )
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
             Err(problem)
                 if tactics::backtrack::recoverable(&problem)
                     || matches!(
@@ -1471,7 +1567,7 @@ impl Context {
             {
                 Ok(false)
             }
-            result => result,
+            Err(problem) => Err(problem),
         }
     }
 
@@ -2106,6 +2202,36 @@ impl Context {
             let locals = self.clean_decreasing_context(&goal.lctx, &target)?;
             self.txn.lctx = locals.clone();
             let target = self.reduce_decreasing_comparison(&target, true)?;
+            // A closed GuessLex comparison cannot read any metavariable from
+            // the enclosing mutual capture. Isolate it from those dead stores
+            // so speculative tactic trials do not clone hundreds of unrelated
+            // metavariables on every simp rule attempt.
+            let closed_probe = !target.has_expr_mvar()
+                && !target.has_level_mvar()
+                && locals.decls().iter().all(|local| {
+                    !local.type_.has_expr_mvar()
+                        && !local.type_.has_level_mvar()
+                        && local
+                            .value
+                            .as_ref()
+                            .is_none_or(|v| !v.has_expr_mvar() && !v.has_level_mvar())
+                });
+            if closed_probe {
+                let next_unify_local = self.txn.mvars.unify_locals();
+                self.txn.mvars = MetavarStore::default();
+                self.txn.mvars.advance_unify_locals(next_unify_local);
+                self.txn.universes = UniverseStore::default();
+                self.equations.clear();
+                self.stalled_flush = None;
+                self.instance_goals.clear();
+                self.pending_synth_holes.clear();
+                self.instance_origins.clear();
+                self.bound_metavars.clear();
+                self.postponed_eliminators.clear();
+                self.postponed_fields.clear();
+                self.postponed_coercions.clear();
+                self.postponed_application_errors.clear();
+            }
             let name = self.fresh_name()?;
             let id = MVarId(name.clone());
             self.txn.mvars.declare(
@@ -2130,17 +2256,8 @@ impl Context {
             {
                 return Ok(());
             }
-            let before_fallback = self.txn.budget.heartbeats_consumed;
             let state = self.start_decreasing_proof(proof, vec![fresh])?;
-            let fallback_res = self.run_decreasing_proof(proof, state).map(|_| ());
-            if std::env::var_os("FLN_TRACE_WF").is_some() {
-                eprintln!(
-                    "WF_FALLBACK default={default} hb={before_fallback}->{} res={:?}",
-                    self.txn.budget.heartbeats_consumed,
-                    fallback_res.as_ref().err()
-                );
-            }
-            fallback_res
+            self.run_decreasing_proof(proof, state).map(|_| ())
         })();
         let spent = self.txn.budget.heartbeats_consumed;
         let model_cache = self.txn.nat_sub_model_cache.clone();

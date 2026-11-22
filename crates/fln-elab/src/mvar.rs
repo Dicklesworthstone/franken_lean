@@ -121,7 +121,46 @@ pub struct MetavarStore {
     unify_locals: FreshLocalCounter,
     /// Monotone counter incremented on every accepted metavariable assignment.
     revision: AssignmentRevision,
+    /// Operational O(delta) undo log active only during speculative unifier trials.
+    undo: MVarUndoTrail,
 }
+
+#[derive(Debug)]
+enum MVarUndo {
+    Declared {
+        id: MVarId,
+        prev_decl: Option<MetavarDecl>,
+        added_to_scope: bool,
+        added_readers: Vec<MVarId>,
+    },
+    Assigned {
+        id: MVarId,
+        prev_revision: u64,
+        added_readers: Vec<MVarId>,
+    },
+}
+
+/// Operational undo log for speculative in-place trials. Cloned stores start
+/// outside any trial, and semantic equality ignores the trail.
+#[derive(Debug, Default)]
+struct MVarUndoTrail {
+    active: usize,
+    entries: Vec<MVarUndo>,
+}
+
+impl Clone for MVarUndoTrail {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for MVarUndoTrail {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for MVarUndoTrail {}
 
 /// A name generator, like the pin's `ngen`: it only ever advances, and it travels
 /// with every copy of the store, so no unification batch reuses an identity an
@@ -291,12 +330,88 @@ impl MetavarStore {
     /// Insert a generalized dependency only into a saved scope that already
     /// contains its auto-bound anchor. Other scopes and all metavariable
     /// metadata stay intact. The caller meters the declaration/context walks.
+    pub(crate) fn begin_trial(&mut self) -> usize {
+        self.undo.active += 1;
+        self.undo.entries.len()
+    }
+
+    pub(crate) fn commit_trial(&mut self, mark: usize) {
+        debug_assert!(self.undo.active > 0);
+        debug_assert!(mark <= self.undo.entries.len());
+        self.undo.active -= 1;
+        if self.undo.active == 0 {
+            self.undo.entries.clear();
+        }
+    }
+
+    pub(crate) fn rollback_trial(&mut self, mark: usize) -> usize {
+        debug_assert!(self.undo.active > 0);
+        debug_assert!(mark <= self.undo.entries.len());
+        let mut undone = 0usize;
+        while self.undo.entries.len() > mark {
+            let entry = self.undo.entries.pop().expect("trail above mark");
+            undone += 1;
+            match entry {
+                MVarUndo::Declared {
+                    id,
+                    prev_decl,
+                    added_to_scope,
+                    added_readers,
+                } => {
+                    match prev_decl {
+                        Some(decl) => {
+                            self.decls.insert(id.clone(), decl);
+                        }
+                        None => {
+                            self.decls.remove(&id);
+                        }
+                    }
+                    if added_to_scope && let Some(fresh) = &mut self.assignment_scope {
+                        fresh.remove(&id);
+                    }
+                    for read in added_readers {
+                        undone += 1;
+                        if let Some(readers) = self.readers.get_mut(&read) {
+                            readers.remove(&id);
+                            if readers.is_empty() {
+                                self.readers.remove(&read);
+                            }
+                        }
+                    }
+                }
+                MVarUndo::Assigned {
+                    id,
+                    prev_revision,
+                    added_readers,
+                } => {
+                    self.assignments.remove(&id);
+                    self.revision = AssignmentRevision(prev_revision);
+                    for dep in added_readers {
+                        undone += 1;
+                        if let Some(readers) = self.readers.get_mut(&dep) {
+                            readers.remove(&id);
+                            if readers.is_empty() {
+                                self.readers.remove(&dep);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.undo.active -= 1;
+        if self.undo.active == 0 {
+            self.undo.entries.clear();
+        }
+        undone
+    }
+
     pub(crate) fn insert_local_before(
         &mut self,
         id: &MVarId,
         anchor: &FVarId,
         local: &LocalDecl,
     ) -> Result<bool, MetavarError> {
+        debug_assert_eq!(self.undo.active, 0);
         let declaration = self
             .decls
             .get(id)
@@ -341,6 +456,7 @@ impl MetavarStore {
 
     /// Change inference policy without replacing scope, dependencies, or assignments.
     pub(crate) fn set_kind(&mut self, id: &MVarId, kind: MetavarKind) -> Result<(), MetavarError> {
+        debug_assert_eq!(self.undo.active, 0);
         self.decls
             .get_mut(id)
             .ok_or_else(|| MetavarError::NotDeclared { id: id.clone() })?
@@ -349,6 +465,7 @@ impl MetavarStore {
     }
 
     pub(crate) fn set_scope_args(&mut self, id: &MVarId, count: usize) -> Result<(), MetavarError> {
+        debug_assert_eq!(self.undo.active, 0);
         self.decls
             .get_mut(id)
             .ok_or_else(|| MetavarError::NotDeclared { id: id.clone() })?
@@ -385,11 +502,13 @@ impl MetavarStore {
         depth: u32,
         origin: Option<Name>,
     ) -> &MetavarDecl {
-        if !self.decls.contains_key(&id)
+        let added_to_scope = if !self.decls.contains_key(&id)
             && let Some(fresh) = &mut self.assignment_scope
         {
-            fresh.insert(id.clone());
-        }
+            fresh.insert(id.clone())
+        } else {
+            false
+        };
         let mut read_mvars = self.collect_mvars(&type_);
         for local in lctx.decls() {
             read_mvars.extend(self.collect_mvars(&local.type_));
@@ -397,10 +516,18 @@ impl MetavarStore {
                 read_mvars.extend(self.collect_mvars(value));
             }
         }
+        let mut added_readers = Vec::new();
         for read in read_mvars {
-            self.readers.entry(read).or_default().insert(id.clone());
+            let inserted = self
+                .readers
+                .entry(read.clone())
+                .or_default()
+                .insert(id.clone());
+            if inserted && self.undo.active > 0 {
+                added_readers.push(read);
+            }
         }
-        self.decls.insert(
+        let prev_decl = self.decls.insert(
             id.clone(),
             MetavarDecl {
                 id: id.clone(),
@@ -414,6 +541,14 @@ impl MetavarStore {
                 scope_args: None,
             },
         );
+        if self.undo.active > 0 {
+            self.undo.entries.push(MVarUndo::Declared {
+                id: id.clone(),
+                prev_decl,
+                added_to_scope,
+                added_readers,
+            });
+        }
         self.decls.get(&id).unwrap()
     }
 
@@ -452,25 +587,39 @@ impl MetavarStore {
             return Err(MetavarError::OccursCheckFailed { id });
         }
         let wake_ups = self.targeted_wake_up(&id);
+        let mut added_readers = Vec::new();
         for dependency in dependencies {
-            self.readers
-                .entry(dependency)
+            let inserted = self
+                .readers
+                .entry(dependency.clone())
                 .or_default()
                 .insert(id.clone());
+            if inserted && self.undo.active > 0 {
+                added_readers.push(dependency);
+            }
         }
+        let prev_revision = self.revision.0;
         self.assignments.insert(
-            id,
+            id.clone(),
             MetavarAssignment {
                 expr: val,
                 justification,
             },
         );
         self.revision.0 = self.revision.0.saturating_add(1);
+        if self.undo.active > 0 {
+            self.undo.entries.push(MVarUndo::Assigned {
+                id,
+                prev_revision,
+                added_readers,
+            });
+        }
         Ok(wake_ups)
     }
 
     /// Register a dependency: `reader` reads / depends on `read`.
     pub fn register_reader(&mut self, read: MVarId, reader: MVarId) {
+        debug_assert_eq!(self.undo.active, 0);
         self.readers.entry(read).or_default().insert(reader);
     }
 
@@ -1144,5 +1293,68 @@ mod tests {
         assert_eq!(child.targeted_wake_up(&b), HashSet::from([a.clone()]));
         assert!(parent.targeted_wake_up(&b).is_empty());
         assert!(!parent.is_assigned(&a));
+    }
+
+    #[test]
+    fn trial_rollback_and_commit_preserve_exact_store_state() {
+        let mut store = MetavarStore::new();
+        let a = declare(&mut store, "a");
+        let b = declare(&mut store, "b");
+        let baseline = store.clone();
+
+        // Outer trial with a nested rolled-back inner trial and a committed inner trial.
+        let outer = store.begin_trial();
+        let c = declare(&mut store, "c");
+        store
+            .assign(
+                a.clone(),
+                Expr::mvar(c.clone()),
+                AssignmentJustification::DirectDefEq,
+            )
+            .unwrap();
+        let inner = store.begin_trial();
+        let d = declare(&mut store, "d");
+        store
+            .assign(
+                b.clone(),
+                Expr::mvar(d.clone()),
+                AssignmentJustification::DirectDefEq,
+            )
+            .unwrap();
+        let undone_inner = store.rollback_trial(inner);
+        assert!(undone_inner >= 2);
+        assert!(!store.is_assigned(&b));
+        assert!(store.get_decl(&d).is_none());
+        assert!(store.targeted_wake_up(&d).is_empty());
+        assert!(store.is_assigned(&a));
+        assert_eq!(store.targeted_wake_up(&c), HashSet::from([a.clone()]));
+
+        // Rolling back outer restores the exact pre-trial baseline (decls, assignments, readers, revision).
+        let undone_outer = store.rollback_trial(outer);
+        assert!(undone_outer >= 2);
+        assert_eq!(store, baseline);
+        assert!(store.targeted_wake_up(&c).is_empty());
+        assert!(store.targeted_wake_up(&b).is_empty());
+
+        // Committing a trial retains its mutations identically to non-trial execution.
+        let mut direct = baseline.clone();
+        direct
+            .assign(
+                a.clone(),
+                Expr::mvar(b.clone()),
+                AssignmentJustification::DirectDefEq,
+            )
+            .unwrap();
+        let mark = store.begin_trial();
+        store
+            .assign(
+                a.clone(),
+                Expr::mvar(b.clone()),
+                AssignmentJustification::DirectDefEq,
+            )
+            .unwrap();
+        store.commit_trial(mark);
+        assert_eq!(store, direct);
+        assert_eq!(store.targeted_wake_up(&b), HashSet::from([a]));
     }
 }

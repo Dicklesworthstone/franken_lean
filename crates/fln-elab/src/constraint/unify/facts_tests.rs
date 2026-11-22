@@ -247,3 +247,37 @@ fn cancellation_step_and_node_limits_are_checked_before_the_ground_shortcut() {
         &legacy_facts(&open, &mut meter(&|| false)).unwrap(),
     );
 }
+
+#[test]
+fn reserve_reachable_skips_closed_subtrees_and_retains_fvars_through_mvars() {
+    let env = fln_env::environment::Environment::new();
+    let mut txn = ElabTxn::new(env, KVMap::new(), 0);
+    let hidden_fvar = FVarId(name("hidden"));
+    let mut mvar_lctx = LocalContext::new();
+    mvar_lctx.add_param(
+        hidden_fvar.clone(),
+        name("hidden"),
+        tower(512, Expr::sort(Level::one())),
+        BinderInfo::Default,
+    );
+    let hole = MVarId(name("hole"));
+    txn.mvars.declare(
+        hole.clone(),
+        name("hole"),
+        tower(512, Expr::sort(Level::one())),
+        mvar_lctx,
+        MetavarKind::Natural,
+        0,
+        None,
+    );
+    let root = Expr::app(tower(512, Expr::sort(Level::one())), Expr::mvar(hole));
+    let budget = UnificationBudget::new(Budget::for_stack_bytes(1024 * 1024));
+    let mut engine = txn.engine(budget, &|| false, None);
+    engine.reserve_reachable(vec![root]).unwrap();
+    assert!(engine.reserved.contains(&hidden_fvar));
+    assert!(
+        engine.meter.nodes < 64,
+        "closed towers should not be traversed: visited {} nodes",
+        engine.meter.nodes
+    );
+}

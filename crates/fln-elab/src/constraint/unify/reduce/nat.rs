@@ -914,46 +914,7 @@ impl Engine<'_> {
         if self.congruence_depth >= super::super::application_congruence::MAX_CONGRUENCE_DEPTH {
             return Ok(false);
         }
-        // Charge the mutable stores before cloning; immutable environment data
-        // are shared. The child starts with no assignment or wake-up products.
-        for _ in 0..self
-            .work
-            .mvars
-            .len()
-            .saturating_add(self.work.universes.len())
-        {
-            self.meter.node()?;
-        }
-        let mut budget = self.budget;
-        budget.transparency = UnificationTransparency::Instances;
-        budget.max_assignments = 0;
-        let mut trial = self.work.engine(budget, self.meter.cancelled, None);
-        trial.meter = Meter {
-            steps: self.meter.steps,
-            nodes: self.meter.nodes,
-            max_steps: self.meter.max_steps,
-            max_nodes: self.meter.max_nodes,
-            heartbeat_bound: self.meter.heartbeat_bound,
-            cancelled: self.meter.cancelled,
-        };
-        trial.congruence_depth = self.congruence_depth + 1;
-        trial.nat_literals_valid = self.nat_literals_valid;
-        let result = trial.solve(&[(dictionary.clone(), expected, locals.clone())], &[], &[]);
-        // Both successful and unsuccessful queries spend the parent's budget.
-        // In particular, cancellation and resource exhaustion stay nonanswers.
-        self.meter = trial.meter;
-        self.kernel_checks += trial.kernel_checks;
-        match result {
-            Ok(()) => Ok(true),
-            Err(UnificationError::Deferred(_))
-            // This zero is the query's deliberate freeze, not exhaustion of
-            // the caller's assignment allowance.
-            | Err(UnificationError::AssignmentLimit { limit: 0 })
-            | Err(UnificationError::Metavariable(MetavarError::OccursCheckFailed { .. })) => {
-                Ok(false)
-            }
-            Err(error) => Err(error),
-        }
+        self.try_frozen_instance_query(dictionary.clone(), expected, locals.clone())
     }
 
     /// The pin's `isOffset?` (Offset.lean:87-106): `succ`, `Nat.add`, `Add.add` and

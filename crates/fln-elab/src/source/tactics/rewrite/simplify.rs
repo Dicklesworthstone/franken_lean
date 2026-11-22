@@ -2003,46 +2003,16 @@ impl Context {
                 continue;
             }
             let index = self.simp_target_index(&target)?;
-            let before_rewrite = self.txn.budget.heartbeats_consumed;
-            let mut admitted_count = 0usize;
             let transition = self.simp_first_rewrite(
                 rules,
                 permute,
                 |this, rule| {
-                    let ok = !matches!(rule, SimpRule::Conditional { .. })
+                    Ok(!matches!(rule, SimpRule::Conditional { .. })
                         && this.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite)
-                        && !this.simp_definition_absent(rule, index.as_ref());
-                    if ok {
-                        admitted_count += 1;
-                    }
-                    Ok(ok)
+                        && !this.simp_definition_absent(rule, index.as_ref()))
                 },
-                |this, rule| {
-                    let b = this.txn.budget.heartbeats_consumed;
-                    let r = this.simp_step(&goal, rule, rules);
-                    let cost = this.txn.budget.heartbeats_consumed.saturating_sub(b);
-                    if cost > 1000 && std::env::var_os("FLN_TRACE_WF").is_some() {
-                        let rname = match rule {
-                            SimpRule::Global(e) => e.declaration.to_display_string(),
-                            SimpRule::Simprocs(_) => "Simprocs".to_owned(),
-                            _ => "other".to_owned(),
-                        };
-                        eprintln!(
-                            "  SIMP_RULE_HOT rule={rname} cost={cost} matched={}",
-                            matches!(r, Ok(Some(_)))
-                        );
-                    }
-                    r
-                },
+                |this, rule| this.simp_step(&goal, rule, rules),
             )?;
-            if std::env::var_os("FLN_TRACE_WF").is_some() {
-                eprintln!(
-                    "SIMP_STEP step={steps} total_rules={} admitted={admitted_count} hb={before_rewrite}->{} hit={}",
-                    rules.len(),
-                    self.txn.budget.heartbeats_consumed,
-                    transition.is_some()
-                );
-            }
             if let Some((_, (next_goal, value))) = transition {
                 if steps >= MAX_SIMPLIFICATION_STEPS {
                     return Err(failure(SourceInferenceError::ResourceLimit));

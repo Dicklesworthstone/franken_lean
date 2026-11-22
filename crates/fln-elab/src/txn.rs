@@ -271,11 +271,13 @@ pub struct ElabTxn {
     /// eliminator under-application set it, as the pin's `approxDefEq`/`fullApproxDefEq` do.
     pub quasi_pattern_approx: bool,
     pub(crate) nat_sub_model_cache: crate::constraint::unify::NatSubModelCache,
+    pub(crate) registry_cache: crate::instances::RegistryCache,
 }
 
-// The model memo is operational state, like an already encoded digest. It
-// cannot change transaction meaning; its own reuse test binds declarations.
-// Exhaustive destructuring forces every future state field to be considered.
+// The model and registry memos are operational state, like an already encoded
+// digest. They cannot change transaction meaning; each cache binds the exact
+// environment snapshot. Exhaustive destructuring forces every future state
+// field to be considered.
 impl PartialEq for ElabTxn {
     fn eq(&self, other: &Self) -> bool {
         let Self {
@@ -293,6 +295,7 @@ impl PartialEq for ElabTxn {
             exposed_candidate,
             quasi_pattern_approx,
             nat_sub_model_cache: _,
+            registry_cache: _,
         } = self;
         env == &other.env
             && lctx == &other.lctx
@@ -327,6 +330,7 @@ impl ElabTxn {
             exposed_candidate: None,
             quasi_pattern_approx: false,
             nat_sub_model_cache: crate::constraint::unify::NatSubModelCache::default(),
+            registry_cache: crate::instances::RegistryCache::default(),
         }
     }
 

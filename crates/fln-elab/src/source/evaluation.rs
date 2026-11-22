@@ -338,6 +338,7 @@ impl PreparedEvaluation {
                 )))
             })?;
         self.context.registry_cache = crate::instances::RegistryCache::default();
+        self.context.txn.registry_cache = self.context.registry_cache.clone();
         Ok(())
     }
 

@@ -9,6 +9,18 @@
 use super::*;
 use fln_core::expr::BinderInfo;
 
+pub(super) enum ProofIrrelevance {
+    Solved,
+    NotAProof,
+    Unresolved,
+}
+
+enum PropClassification {
+    Prop,
+    NonProp,
+    Unknown,
+}
+
 impl Engine<'_> {
     pub(super) fn proof_irrelevance(
         &mut self,
@@ -16,7 +28,7 @@ impl Engine<'_> {
         right: &Expr,
         locals: &LocalContext,
         pending: &mut VecDeque<Equation>,
-    ) -> Result<bool, UnificationError> {
+    ) -> Result<ProofIrrelevance, UnificationError> {
         // Neutral synthesis is a hint; the final guard still checks BOTH original
         // proofs. In particular, synthesizing an application type does not prove
         // that its arguments are well-typed.
@@ -26,18 +38,22 @@ impl Engine<'_> {
         // reconstruct the other side's entire recursor telescope for each
         // impossible rewrite occurrence. The final guard is unchanged for
         // every pair that can actually select proof irrelevance.
-        if let Some(type_) = &left_type
-            && !self.proof_type_is_prop(type_, locals)?
-        {
-            return Ok(false);
+        if let Some(type_) = &left_type {
+            match self.classify_proof_type(type_, locals)? {
+                PropClassification::Prop => {}
+                PropClassification::NonProp => return Ok(ProofIrrelevance::NotAProof),
+                PropClassification::Unknown => return Ok(ProofIrrelevance::Unresolved),
+            }
         }
         let mut right_type = self.eta_neutral_type(right, locals)?;
         if left_type.is_none() {
             let Some(right_type) = &right_type else {
-                return Ok(false);
+                return Ok(ProofIrrelevance::Unresolved);
             };
-            if !self.proof_type_is_prop(right_type, locals)? {
-                return Ok(false);
+            match self.classify_proof_type(right_type, locals)? {
+                PropClassification::Prop => {}
+                PropClassification::NonProp => return Ok(ProofIrrelevance::NotAProof),
+                PropClassification::Unknown => return Ok(ProofIrrelevance::Unresolved),
             }
         }
         // A proof lambda has no neutral type hint. Infer its actual telescope
@@ -50,20 +66,27 @@ impl Engine<'_> {
             right_type = self.assignment_value_type(right, locals)?;
         }
         let (Some(proposition), Some(_)) = (left_type.as_ref(), right_type.as_ref()) else {
-            return Ok(false);
+            return Ok(ProofIrrelevance::Unresolved);
         };
         // A Pi can itself be a proposition by impredicativity. Opening its
         // codomain also lets type-directed inference work below dependent binders.
-        if !left_neutral && !self.proof_type_is_prop(proposition, locals)? {
-            return Ok(false);
+        if !left_neutral {
+            match self.classify_proof_type(proposition, locals)? {
+                PropClassification::Prop => {}
+                PropClassification::NonProp => return Ok(ProofIrrelevance::NotAProof),
+                PropClassification::Unknown => return Ok(ProofIrrelevance::Unresolved),
+            }
         }
         let mut closed_type_equation = None;
         if let (Some(left_type), Some(right_type)) = (&left_type, &right_type) {
             let left_type = self.instantiate(left_type)?;
             let right_type = self.instantiate(right_type)?;
             if !same_terms(&left_type, &right_type, &mut self.meter)? {
-                if !self.proof_type_is_prop(&right_type, locals)? {
-                    return Ok(false);
+                if !matches!(
+                    self.classify_proof_type(&right_type, locals)?,
+                    PropClassification::Prop
+                ) {
+                    return Ok(ProofIrrelevance::Unresolved);
                 }
                 if left_type.has_expr_mvar()
                     || left_type.has_level_mvar()
@@ -88,7 +111,7 @@ impl Engine<'_> {
             .any(|term| term.has_expr_mvar() || term.has_level_mvar() || term.has_loose_bvars())
         {
             // Type inference cannot erase a residual proof obligation.
-            return Ok(false);
+            return Ok(ProofIrrelevance::Unresolved);
         }
         let checked = self.check_typed_pair(proposition, Level::zero(), left, right, locals)?;
         if checked && let Some(equation) = closed_type_equation {
@@ -97,22 +120,39 @@ impl Engine<'_> {
             // transparency, through the same transactional worklist.
             pending.push_front(equation);
         }
-        Ok(checked)
+        Ok(if checked {
+            ProofIrrelevance::Solved
+        } else {
+            ProofIrrelevance::Unresolved
+        })
     }
 
     /// A metered selection hint, never a typing judgment. A definite Prop result
     /// is required: this cannot default an unknown universe to zero. Domains and
     /// application arguments are validated later by the ordinary K1 guard.
-    fn proof_type_is_prop(
+    fn classify_proof_type(
         &mut self,
         proposition: &Expr,
         locals: &LocalContext,
-    ) -> Result<bool, UnificationError> {
-        let mut type_ = self.instantiate(proposition)?;
+    ) -> Result<PropClassification, UnificationError> {
+        let mut type_ = if proposition.has_expr_mvar() || proposition.has_level_mvar() {
+            self.instantiate(proposition)?
+        } else {
+            proposition.clone()
+        };
         let mut context = locals.clone();
         loop {
             self.meter.node()?;
-            type_ = self.whnf(&type_, &context)?;
+            if !matches!(
+                type_.node(),
+                ExprNode::Sort { .. } | ExprNode::ForallE { .. }
+            ) {
+                type_ = self.whnf(&type_, &context)?;
+            }
+            if let ExprNode::Sort { .. } = type_.node() {
+                // `Sort u : Sort (succ u)`, which is never `Prop`.
+                return Ok(PropClassification::NonProp);
+            }
             if let ExprNode::ForallE {
                 binder_type,
                 body,
@@ -120,6 +160,10 @@ impl Engine<'_> {
                 ..
             } = type_.node()
             {
+                if !body.has_loose_bvars() {
+                    type_ = body.clone();
+                    continue;
+                }
                 let id = self.fresh()?;
                 let argument = Expr::fvar(id.clone());
                 let domain = self.instantiate(binder_type)?;
@@ -129,12 +173,19 @@ impl Engine<'_> {
                 continue;
             }
             let Some(sort) = self.eta_neutral_type(&type_, &context)? else {
-                return Ok(false);
+                return Ok(PropClassification::Unknown);
             };
             let ExprNode::Sort { level } = sort.node() else {
-                return Ok(false);
+                return Ok(PropClassification::Unknown);
             };
-            return Ok(normalize::simplify(level, &mut self.meter)?.is_zero());
+            let simplified = normalize::simplify(level, &mut self.meter)?;
+            return Ok(if simplified.is_zero() {
+                PropClassification::Prop
+            } else if simplified.is_never_zero() {
+                PropClassification::NonProp
+            } else {
+                PropClassification::Unknown
+            });
         }
     }
 
