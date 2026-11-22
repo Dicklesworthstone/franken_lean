@@ -41,6 +41,7 @@ fn raw_pin_environment() -> Option<Environment> {
     for module in [
         "Init/Prelude",
         "Init/Coe",
+        "Init/Data/Int/Basic",
         "Init/System/ST",
         "Init/System/IOError",
         "Init/System/IO",
