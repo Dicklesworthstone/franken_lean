@@ -527,9 +527,15 @@ fn real_prelude_source_inductives_publish_ctor_elim_family_for_enum_recursive_an
                    | nil : Vec A 0\n  \
                    | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\n\
                  structure Pair where\n  fst : Nat\n  snd : Nat\n\
+                 inductive ProofChain : Prop where | nil | cons : ProofChain -> ProofChain\n\
                  theorem color_elim_ok : Color.green.elim (motive := fun _ => Nat) Color.green rfl 42 = 42 := rfl\n\
                  theorem chain_elim_ok : Chain.cons.elim (motive := fun _ => Nat) (Chain.cons 9 Chain.nil) rfl (fun h _ => h) = 9 := rfl\n\
-                 theorem vec_elim_ok : @Vec.cons.elim Nat (fun _ _ => Nat) (Nat.succ 0) (@Vec.cons Nat 0 11 (@Vec.nil Nat)) rfl (fun _ h _ => h) = 11 := rfl";
+                 theorem vec_elim_ok : @Vec.cons.elim Nat (fun _ _ => Nat) (Nat.succ 0) (@Vec.cons Nat 0 11 (@Vec.nil Nat)) rfl (fun _ h _ => h) = 11 := rfl\n\
+                 theorem color_nc_disjoint (h : Color.red = Color.blue) : False := Color.noConfusion h\n\
+                 theorem chain_nc_disjoint (h : Chain.nil = Chain.cons 1 Chain.nil) : False := Chain.noConfusion h\n\
+                 theorem chain_nc_inj (h : Chain.cons 7 Chain.nil = Chain.cons 7 Chain.nil) : 7 = 7 := Chain.noConfusion h (fun h1 _ => h1)\n\
+                 theorem vec_nc_inj (h : @Vec.cons Nat 0 11 (@Vec.nil Nat) = @Vec.cons Nat 0 11 (@Vec.nil Nat)) : 11 = 11 := @Vec.noConfusion (11 = 11) Nat (Nat.succ 0) (@Vec.cons Nat 0 11 (@Vec.nil Nat)) Nat (Nat.succ 0) (@Vec.cons Nat 0 11 (@Vec.nil Nat)) rfl rfl (heq_of_eq h) (fun _ h_head _ => eq_of_heq h_head)\n\
+                 theorem pair_nc_inj (h : Pair.mk 1 2 = Pair.mk 1 2) : 1 = 1 := Pair.noConfusion h (fun h1 _ => h1)";
             let out = prelude_engine
                 .check_source_files(
                     &[source.as_bytes()],
@@ -574,7 +580,36 @@ fn real_prelude_source_inductives_publish_ctor_elim_family_for_enum_recursive_an
                 assert!(tagged.contains(&n), "{elim_aux} must be aux_recursor");
                 assert_eq!(reducibility.get(&n), Some(Reducibility::Reducible));
             }
-            // Single-constructor structure gets `ctorIdx` but not `ctorElim*`.
+            // Under Init.Prelude (before Init.Core's `noConfusionEnum`), all four
+            // non-Prop families use `mkNoConfusionCore` (protected + reducible,
+            // not aux_recursor).
+            for nc_def in [
+                "Color.noConfusionType",
+                "Color.noConfusion",
+                "Chain.noConfusionType",
+                "Chain.noConfusion",
+                "Vec.noConfusionType",
+                "Vec.noConfusion",
+                "Pair.noConfusionType",
+                "Pair.noConfusion",
+            ] {
+                let n = name(nc_def);
+                let Some(ConstantInfo::Defn(def)) = env.find(&n) else {
+                    panic!("missing {nc_def}");
+                };
+                assert_eq!(def.hints, ReducibilityHints::Abbrev, "{nc_def}");
+                assert!(protected.contains(&n), "{nc_def} must be protected");
+                assert!(!tagged.contains(&n), "{nc_def} must not be aux_recursor");
+                assert_eq!(
+                    reducibility.get(&n),
+                    Some(Reducibility::Reducible),
+                    "{nc_def}"
+                );
+            }
+            // Prop-former inductives must not receive `noConfusionType`/`noConfusion`.
+            assert!(!env.contains(&name("ProofChain.noConfusionType")));
+            assert!(!env.contains(&name("ProofChain.noConfusion")));
+            // Single-constructor structure gets `ctorIdx` and `noConfusion*`, not `ctorElim*`.
             assert!(env.contains(&name("Pair.ctorIdx")));
             assert!(!env.contains(&name("Pair.ctorElimType")));
             assert!(!env.contains(&name("Pair.ctorElim")));

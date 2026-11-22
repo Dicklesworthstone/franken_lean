@@ -4,7 +4,8 @@
 use super::*;
 use fln_elab::inductive::auxiliaries::{
     AuxiliaryError, CtorIdxConstMeta, below_declaration, brec_on_declarations,
-    cases_on_declaration, ctor_elim_declarations, ctor_idx_declarations, rec_on_declaration,
+    cases_on_declaration, ctor_elim_declarations, ctor_idx_declarations, no_confusion_declarations,
+    rec_on_declaration,
 };
 use fln_elab::source::SourceInferenceError;
 use fln_env::constants::{DefinitionVal, InductiveVal, RecursorVal};
@@ -50,6 +51,31 @@ fn has_ctor_elim_deps(env: &fln_env::environment::Environment) -> bool {
         &["PULift"],
         &["PULift", "up"],
         &["PULift", "down"],
+    ]
+    .into_iter()
+    .all(|parts| env.contains(&Name::from_components(parts.iter().copied())))
+}
+
+fn has_no_confusion_deps(env: &fln_env::environment::Environment) -> bool {
+    [
+        ["PUnit"].as_slice(),
+        &["Eq"],
+        &["Eq", "refl"],
+        &["Eq", "ndrec"],
+        &["HEq"],
+        &["HEq", "refl"],
+        &["eq_of_heq"],
+    ]
+    .into_iter()
+    .all(|parts| env.contains(&Name::from_components(parts.iter().copied())))
+}
+
+fn has_no_confusion_enum_deps(env: &fln_env::environment::Environment) -> bool {
+    [
+        ["noConfusionEnum"].as_slice(),
+        &["noConfusionTypeEnum"],
+        &["Nat"],
+        &["instDecidableEqNat"],
     ]
     .into_iter()
     .all(|parts| env.contains(&Name::from_components(parts.iter().copied())))
@@ -253,6 +279,16 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        batch = match self.finish_source_inductive_no_confusion(
+            batch,
+            &mut metadata,
+            options,
+            limits,
+        )? {
+            Outcome::Complete(batch) => batch,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         // Apply all auxiliary metadata journals once after every auxiliary
         // declaration has passed both checking seats, preserving an unbroken
         // chain of kernel declaration transitions (`pair[0].result == pair[1].base`)
@@ -441,6 +477,80 @@ impl Engine {
         match self.admit_auxiliary_declarations(
             &mut batch,
             elim_candidates,
+            metadata,
+            options,
+            limits,
+        )? {
+            Outcome::Complete(()) => Ok(Outcome::Complete(batch)),
+            Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
+        }
+    }
+
+    /// Generate and admit `<T>.noConfusionType` and `<T>.noConfusion` for newly
+    /// admitted inductive blocks once `PUnit`, `Eq`, and `HEq` exist in the
+    /// environment, matching pinned `Lean/Elab/MutualInductive.lean:1554` and
+    /// `Lean/Meta/Constructions/NoConfusion.lean`.
+    fn finish_source_inductive_no_confusion(
+        &self,
+        mut batch: DeclarationBatchAdmission,
+        metadata: &mut AuxiliaryMetadata,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        if !has_no_confusion_deps(batch.engine.environment()) {
+            return Ok(Outcome::Complete(batch));
+        }
+        let use_enum_helper = has_no_confusion_enum_deps(batch.engine.environment());
+        let budget = fln_elab::records::RecordBudget::default();
+        let inductives: Vec<InductiveVal> = batch
+            .admissions
+            .iter()
+            .filter_map(|admission| match &admission.declaration {
+                Declaration::Inductive(block) => Some(block.types.iter().cloned()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let mut nc_candidates = Candidates::default();
+        for inductive in &inductives {
+            let cases_on_name = Name::str(inductive.base.name.clone(), "casesOn");
+            let Some(ConstantInfo::Defn(cases_on)) =
+                batch.engine.environment().find(&cases_on_name)
+            else {
+                continue;
+            };
+            let mut ctors = Vec::with_capacity(inductive.ctors.len());
+            for ctor_name in &inductive.ctors {
+                let Some(ConstantInfo::Ctor(ctor)) = batch.engine.environment().find(ctor_name)
+                else {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "an admitted source inductive is missing a checked constructor",
+                    });
+                };
+                ctors.push(ctor.clone());
+            }
+            let generated = no_confusion_declarations(
+                inductive,
+                &ctors,
+                cases_on,
+                use_enum_helper,
+                budget,
+                |n| batch.engine.environment().find(n),
+            )
+            .map_err(|error| frontend(SourceInferenceError::Auxiliary(error)))?;
+            let Some(cands) = generated else {
+                continue;
+            };
+            // `NoConfusion.lean:144-145, 254-259` (core: protected + reducible)
+            // vs `NoConfusion.lean:392-430` (enum: reducible, not protected).
+            let protected = !cands.is_enum_construction;
+            nc_candidates.push(cands.no_confusion_type, true, false, protected);
+            nc_candidates.push(cands.no_confusion, true, false, protected);
+        }
+        match self.admit_auxiliary_declarations(
+            &mut batch,
+            nc_candidates,
             metadata,
             options,
             limits,

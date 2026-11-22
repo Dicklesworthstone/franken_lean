@@ -1004,8 +1004,11 @@ where
     cases_v_levels.push(v.clone());
     cases_v_levels.extend(us.iter().cloned());
 
-    let use_linear =
-        constructors.len() > 2 && lookup_const(&Name::str(family.clone(), "ctorElim")).is_some();
+    let use_linear = constructors.len() > 2
+        && lookup_const(&Name::str(family.clone(), "ctorElim")).is_some()
+        && lookup_const(&Name::from_components(["dite"])).is_some()
+        && lookup_const(&Name::from_components(["Nat", "decEq"])).is_some()
+        && lookup_const(&Name::from_components(["Not"])).is_some();
 
     let num_params = inductive.num_params as usize;
     let num_indices = inductive.num_indices as usize;
