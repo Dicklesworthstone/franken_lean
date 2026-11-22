@@ -1068,8 +1068,16 @@ fn mutual_well_founded(
                 ctx.auxiliary_cache = meter.auxiliary_cache.clone();
                 ctx.deprecation_cache = meter.deprecation_cache.clone();
                 ctx.simp_key_cache = meter.simp_key_cache.clone();
+                let before_hb = meter.txn.budget.heartbeats_consumed;
                 let probed = ctx.probe_mutual_calls(snapshot, &measure_sum, &missing);
                 absorb_child_caches(meter, ctx);
+                if std::env::var_os("FLN_TRACE_WF").is_some() {
+                    eprintln!(
+                        "WF_PROBE slot={slot} pos={position} missing={missing:?} hb={before_hb}->{} ok={}",
+                        meter.txn.budget.heartbeats_consumed,
+                        probed.is_ok()
+                    );
+                }
                 let total = counts[position].expect("captured total");
                 for (call, relation) in probed? {
                     meter.tick()?;

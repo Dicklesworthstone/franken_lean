@@ -2130,8 +2130,17 @@ impl Context {
             {
                 return Ok(());
             }
+            let before_fallback = self.txn.budget.heartbeats_consumed;
             let state = self.start_decreasing_proof(proof, vec![fresh])?;
-            self.run_decreasing_proof(proof, state).map(|_| ())
+            let fallback_res = self.run_decreasing_proof(proof, state).map(|_| ());
+            if std::env::var_os("FLN_TRACE_WF").is_some() {
+                eprintln!(
+                    "WF_FALLBACK default={default} hb={before_fallback}->{} res={:?}",
+                    self.txn.budget.heartbeats_consumed,
+                    fallback_res.as_ref().err()
+                );
+            }
+            fallback_res
         })();
         let spent = self.txn.budget.heartbeats_consumed;
         let model_cache = self.txn.nat_sub_model_cache.clone();
