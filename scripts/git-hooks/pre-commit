@@ -120,6 +120,7 @@ D3_ATTR_PATTERN='^[[:space:]]*#![[:space:]]*\[[[:space:]]*forbid[[:space:]]*\([^
 
 say() { printf 'projection-guard: %s\n' "$1" >&2; }
 coverage_say() { printf 'verification-coverage-guard: %s\n' "$1" >&2; }
+transition_say() { printf 'tracker-transition-guard: %s\n' "$1" >&2; }
 d3_say() { printf 'd3-root-attr-guard: %s\n' "$1" >&2; }
 
 # This hook is reached through core.hooksPath, which makes git ignore
@@ -173,6 +174,19 @@ coverage_refuse() {
     coverage_say 'Check the exact prospective-tree obligation with:'
     coverage_say "  python3 -I -S ${VERIFICATION_VALIDATOR_RELATIVE} validate-verification-manifest \\"
     coverage_say "    --manifest ${VERIFICATION_MANIFEST_RELATIVE} --beads ${SOURCE_RELATIVE}"
+    exit 1
+}
+
+transition_refuse() {
+    transition_say "REFUSED — $1"
+    transition_say ''
+    transition_say 'A tracker commit or merge may not introduce duplicate comment ids (within'
+    transition_say 'a bead or across beads) and may not silently reopen a closed bead without'
+    transition_say 'advancing updated_at and adding a comment explaining the reopen'
+    transition_say '(bead fln-beads-stale-merge-guard-xzxt).'
+    transition_say ''
+    transition_say 'If this came from a stale-lineage sync merge, re-import from origin instead:'
+    transition_say '  br sync --import-only'
     exit 1
 }
 
@@ -415,6 +429,50 @@ verification_validator_changed=false
 if path_changes_in_prospective_tree "$SOURCE_RELATIVE"; then
     source_changed=true
 fi
+
+# Collect every secondary merge parent SHA. Two git paths exist:
+#   * post-conflict / `--no-commit` merge (`git commit`): `.git/MERGE_HEAD` exists;
+#   * clean auto-merge (`git merge` / `git merge -s ours` running pre-merge-commit):
+#     git has not yet written `.git/MERGE_HEAD`, and instead exports each merged
+#     head as `GITHEAD_<oid>=<name>` in the hook environment.
+merge_parents=()
+collect_merge_parents() {
+    local merge_head_file sha var seen_list=' '
+    merge_head_file=$(git rev-parse --git-path MERGE_HEAD 2>/dev/null || true)
+    if [ -n "$merge_head_file" ] && [ -f "$merge_head_file" ]; then
+        while IFS= read -r sha; do
+            [ -n "$sha" ] || continue
+            if [[ "$seen_list" != *" $sha "* ]]; then
+                seen_list="${seen_list}${sha} "
+                merge_parents+=("$sha")
+            fi
+        done < "$merge_head_file"
+    fi
+    for var in "${!GITHEAD_@}"; do
+        sha="${var#GITHEAD_}"
+        if [[ "$sha" =~ ^[0-9a-f]{40,64}$ ]] \
+            && git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+            if [[ "$seen_list" != *" $sha "* ]]; then
+                seen_list="${seen_list}${sha} "
+                merge_parents+=("$sha")
+            fi
+        fi
+    done
+}
+collect_merge_parents
+
+# During a merge, a stale-ours resolution leaves the staged tracker byte-identical
+# to HEAD while silently reverting closed beads from a merged parent (a6520040
+# shape). Treat any difference against a merge parent as a prospective tracker
+# change so the transition guard still inspects it.
+if [ "$source_changed" = false ] && [ "${#merge_parents[@]}" -gt 0 ]; then
+    for merge_parent in "${merge_parents[@]}"; do
+        if ! git diff --cached --quiet "$merge_parent" -- "$SOURCE_RELATIVE" 2>/dev/null; then
+            source_changed=true
+            break
+        fi
+    done
+fi
 if path_changes_in_prospective_tree "$VERIFICATION_MANIFEST_RELATIVE"; then
     verification_manifest_changed=true
 fi
@@ -535,6 +593,9 @@ coverage_scratch=$(mktemp -d "${TMPDIR:-/tmp}/fln-verification-coverage-guard.XX
     || undecided 'cannot create a verification-coverage scratch directory'
 
 coverage_cleanup() {
+    if [ "${#transition_temp_files[@]}" -gt 0 ]; then
+        rm -f -- "${transition_temp_files[@]}" >/dev/null 2>&1 || true
+    fi
     rm -f -- \
         "$coverage_scratch/$SOURCE_RELATIVE" \
         "$coverage_scratch/$VERIFICATION_MANIFEST_RELATIVE" \
@@ -545,6 +606,7 @@ coverage_cleanup() {
         "$coverage_scratch/scripts" \
         "$coverage_scratch" >/dev/null 2>&1 || true
 }
+transition_temp_files=()
 trap coverage_cleanup EXIT
 
 mkdir -p -- \
@@ -570,6 +632,51 @@ coverage_output=$(
 ) || coverage_status=$?
 if [ "$coverage_status" -ne 0 ]; then
     coverage_refuse "prospective verification coverage is invalid (exit ${coverage_status}): ${coverage_output}"
+fi
+
+# --- fln-beads-stale-merge-guard-xzxt: tracker transition guard --------------
+# Runs against HEAD and every MERGE_HEAD parent so a stale-lineage merge (such
+# as a6520040, where HEAD was stale and MERGE_HEAD held the closed beads) cannot
+# duplicate comment ids or silently reopen closed beads.
+if [ "$source_changed" = true ]; then
+    transition_parent_args=()
+    if git rev-parse --verify --quiet HEAD >/dev/null \
+        && git cat-file -e "HEAD:$SOURCE_RELATIVE" 2>/dev/null; then
+        head_tracker_file="$coverage_scratch/parent-head.jsonl"
+        git cat-file blob "HEAD:$SOURCE_RELATIVE" > "$head_tracker_file" \
+            || undecided "cannot read HEAD:$SOURCE_RELATIVE"
+        transition_temp_files+=("$head_tracker_file")
+        transition_parent_args+=(--parent "HEAD=$head_tracker_file")
+    fi
+    if [ "${#merge_parents[@]}" -gt 0 ]; then
+        merge_idx=0
+        for merge_parent in "${merge_parents[@]}"; do
+            if git cat-file -e "${merge_parent}:$SOURCE_RELATIVE" 2>/dev/null; then
+                merge_tracker_file="$coverage_scratch/parent-merge-${merge_idx}.jsonl"
+                git cat-file blob "${merge_parent}:$SOURCE_RELATIVE" > "$merge_tracker_file" \
+                    || undecided "cannot read ${merge_parent}:$SOURCE_RELATIVE"
+                transition_temp_files+=("$merge_tracker_file")
+                transition_parent_args+=(--parent "MERGE_HEAD(${merge_parent:0:12})=$merge_tracker_file")
+                merge_idx=$((merge_idx + 1))
+            fi
+        done
+    fi
+    transition_status=0
+    transition_output=$(
+        python3 -I -S "$coverage_scratch/$VERIFICATION_VALIDATOR_RELATIVE" \
+            validate-tracker-transition \
+            --beads "$coverage_scratch/$SOURCE_RELATIVE" \
+            "${transition_parent_args[@]}" 2>&1
+    ) || transition_status=$?
+    if [ "${#transition_temp_files[@]}" -gt 0 ]; then
+        rm -f -- "${transition_temp_files[@]}" >/dev/null 2>&1 || true
+        transition_temp_files=()
+    fi
+    case "$transition_status" in
+        0) ;;
+        1) transition_refuse "${transition_output}" ;;
+        *) undecided "tracker transition guard failed unexpectedly (exit ${transition_status}): ${transition_output}" ;;
+    esac
 fi
 
 # --- fln-ehb5: the granularity delta, judged on the PROSPECTIVE tree ----------

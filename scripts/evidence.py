@@ -219,6 +219,12 @@ CLOSURE_CITATION_PREFIX = "bead-comment"
 UTC_INSTANT_PATTERN = re.compile(
     r"\A(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z\Z"
 )
+RFC3339_INSTANT_PATTERN = re.compile(
+    r"\A(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})"
+    r"(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})\Z"
+)
+TRACKER_TRANSITION_SCHEMA = "fln.tracker-transition/1"
+_UNIX_EPOCH_UTC = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
 
 # --- Sealed compiler environment (bead fln-evidence-runner-bootstrap-btk) ----
 # Ambient channels that can alter what the pinned compiler does (cap-lints
@@ -5096,6 +5102,7 @@ def bead_tracker_projection(path: Path) -> dict[str, dict[str, Any]]:
     """
     records, _digest = load_ndjson_snapshot(path)
     beads: dict[str, dict[str, Any]] = {}
+    seen_comment_ids: dict[int, tuple[str, int]] = {}
     for number, record in enumerate(records, 1):
         bead_id = record.get("id")
         status = record.get("status")
@@ -5130,11 +5137,19 @@ def bead_tracker_projection(path: Path) -> dict[str, dict[str, Any]]:
                     f"{path}:{number}: bead {bead_id!r} has a comment without an "
                     f"integer id"
                 )
-            if comment_id in comments:
+            if comment_id in seen_comment_ids:
+                first_bead, first_line = seen_comment_ids[comment_id]
+                if first_bead == bead_id:
+                    raise EvidenceError(
+                        f"{path}:{number}: bead {bead_id!r} has duplicate comment id "
+                        f"{comment_id}"
+                    )
                 raise EvidenceError(
                     f"{path}:{number}: bead {bead_id!r} has duplicate comment id "
-                    f"{comment_id}"
+                    f"{comment_id} (already used by bead {first_bead!r} at line "
+                    f"{first_line})"
                 )
+            seen_comment_ids[comment_id] = (bead_id, number)
             comments[comment_id] = comment.get("created_at")
         beads[bead_id] = {
             "status": status,
@@ -5142,6 +5157,286 @@ def bead_tracker_projection(path: Path) -> dict[str, dict[str, Any]]:
             "comments": comments,
         }
     return beads
+
+
+class TrackerParentUnavailable(EvidenceError):
+    """Typed non-answer when a commit parent object is absent (e.g. shallow clone)."""
+
+
+def utc_instant_nanos(label: str, value: Any) -> int:
+    """Parse an RFC3339 instant into UTC epoch nanoseconds for exact ordering.
+
+    Unlike raw string comparison (where `'Z' > '.'` misorders whole-second and
+    fractional instants within the same second), epoch nanoseconds compare
+    chronologically across both whole-second and nanosecond timestamps and
+    timezone offsets.
+    """
+    if not isinstance(value, str):
+        raise EvidenceError(f"{label} is missing")
+    match = RFC3339_INSTANT_PATTERN.match(value)
+    if match is None:
+        raise EvidenceError(f"{label} is not an RFC3339 instant: {value!r}")
+    year, month, day, hour, minute, second = (int(match.group(i)) for i in range(1, 7))
+    frac = match.group(7) or ""
+    tz_raw = match.group(8)
+    if tz_raw == "Z":
+        tz = dt.timezone.utc
+    else:
+        sign = 1 if tz_raw[0] == "+" else -1
+        tz_hours = int(tz_raw[1:3])
+        tz_minutes = int(tz_raw[4:6])
+        tz = dt.timezone(dt.timedelta(minutes=sign * (tz_hours * 60 + tz_minutes)))
+    try:
+        parsed = dt.datetime(year, month, day, hour, minute, second, tzinfo=tz)
+    except ValueError as error:
+        raise EvidenceError(f"{label} is not a valid calendar instant: {value!r}") from error
+    epoch_seconds = int((parsed - _UNIX_EPOCH_UTC).total_seconds())
+    nanos = int(frac.ljust(9, "0"))
+    return epoch_seconds * 1_000_000_000 + nanos
+
+
+def _parse_tracker_snapshot_bytes(
+    raw: bytes, label: str
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Decode a tracker JSONL blob into per-id records and raw lines."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(f"{label}: invalid UTF-8 in tracker snapshot") from error
+    records: dict[str, dict[str, Any]] = {}
+    raw_lines: dict[str, str] = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise EvidenceError(f"{label}:{number}: invalid JSON: {error}") from error
+        if not isinstance(record, dict):
+            raise EvidenceError(f"{label}:{number}: tracker line is not a JSON object")
+        bead_id = record.get("id")
+        if isinstance(bead_id, str) and bead_id:
+            records[bead_id] = record
+            raw_lines[bead_id] = line
+    return records, raw_lines
+
+
+def _extract_comment_ids(record: Mapping[str, Any]) -> set[int]:
+    raw_comments = record.get("comments")
+    if not isinstance(raw_comments, list):
+        return set()
+    ids: set[int] = set()
+    for comment in raw_comments:
+        if isinstance(comment, dict):
+            cid = comment.get("id")
+            if isinstance(cid, int) and not isinstance(cid, bool):
+                ids.add(cid)
+    return ids
+
+
+def validate_tracker_transition(
+    beads_path: Path,
+    parent_paths: Sequence[tuple[str, Path]] = (),
+    *,
+    parent_blobs: Sequence[tuple[str, bytes]] = (),
+) -> dict[str, Any]:
+    """Enforce global comment-id uniqueness and refuse silent stale-lineage reopens.
+
+    Guards against the two corruption modes measured in commit a6520040
+    (bead fln-beads-stale-merge-guard-xzxt):
+    1. Duplicate comment ids anywhere in the tracker (intra-bead or cross-bead),
+       enforced through `bead_tracker_projection` so every validator shares one
+       authority.
+    2. A `closed` -> `open` | `in_progress` transition against any parent
+       snapshot (including `MERGE_HEAD` during a merge) whose `updated_at` did
+       not strictly advance past the parent's `updated_at` and `closed_at`, or
+       which dropped prior comments or added no comment explaining the reopen.
+    """
+    projected = bead_tracker_projection(beads_path)
+    total_comments = sum(len(entry["comments"]) for entry in projected.values())
+    current_records, current_raw = _parse_tracker_snapshot_bytes(
+        beads_path.read_bytes(), str(beads_path)
+    )
+
+    loaded_parents: list[tuple[str, dict[str, dict[str, Any]], dict[str, str]]] = []
+    for label, ppath in parent_paths:
+        prec, praw = _parse_tracker_snapshot_bytes(ppath.read_bytes(), f"{label} ({ppath})")
+        loaded_parents.append((label, prec, praw))
+    for label, pbytes in parent_blobs:
+        prec, praw = _parse_tracker_snapshot_bytes(pbytes, label)
+        loaded_parents.append((label, prec, praw))
+
+    violations: list[str] = []
+    admitted_reopens: list[dict[str, Any]] = []
+    for parent_label, parent_records, _parent_raw in loaded_parents:
+        for bead_id in sorted(parent_records):
+            parent_rec = parent_records[bead_id]
+            if parent_rec.get("status") != "closed":
+                continue
+            cur_rec = current_records.get(bead_id)
+            if cur_rec is None:
+                continue
+            cur_status = cur_rec.get("status")
+            if cur_status not in {"open", "in_progress"}:
+                continue
+
+            bead_reasons: list[str] = []
+            cur_upd_raw = cur_rec.get("updated_at")
+            cur_upd_ns: int | None = None
+            try:
+                cur_upd_ns = utc_instant_nanos(
+                    f"bead {bead_id!r} updated_at", cur_upd_raw
+                )
+            except EvidenceError as error:
+                bead_reasons.append(str(error))
+
+            par_upd_raw = parent_rec.get("updated_at")
+            if cur_upd_ns is not None and isinstance(par_upd_raw, str):
+                try:
+                    par_upd_ns = utc_instant_nanos(
+                        f"{parent_label} bead {bead_id!r} updated_at", par_upd_raw
+                    )
+                except EvidenceError:
+                    par_upd_ns = None
+                if par_upd_ns is not None and cur_upd_ns <= par_upd_ns:
+                    bead_reasons.append(
+                        f"updated_at did not advance ({par_upd_raw!r} -> {cur_upd_raw!r})"
+                    )
+
+            par_closed_raw = parent_rec.get("closed_at")
+            if cur_upd_ns is not None and isinstance(par_closed_raw, str):
+                try:
+                    par_closed_ns = utc_instant_nanos(
+                        f"{parent_label} bead {bead_id!r} closed_at", par_closed_raw
+                    )
+                except EvidenceError:
+                    par_closed_ns = None
+                if par_closed_ns is not None and cur_upd_ns <= par_closed_ns:
+                    bead_reasons.append(
+                        f"updated_at is not after parent closed_at "
+                        f"({par_closed_raw!r} -> {cur_upd_raw!r})"
+                    )
+
+            par_cids = _extract_comment_ids(parent_rec)
+            cur_cids = _extract_comment_ids(cur_rec)
+            dropped = sorted(par_cids - cur_cids)
+            added = sorted(cur_cids - par_cids)
+            if dropped:
+                bead_reasons.append(
+                    f"dropped prior comment id(s) {dropped}"
+                )
+            if not added:
+                bead_reasons.append(
+                    "added no comment explaining the reopen"
+                )
+
+            if bead_reasons:
+                violations.append(
+                    f"bead {bead_id!r} silently reopened closed -> {cur_status} "
+                    f"relative to {parent_label}: {'; '.join(bead_reasons)}"
+                )
+            else:
+                admitted_reopens.append(
+                    {
+                        "added_comment_ids": added,
+                        "bead": bead_id,
+                        "parent": parent_label,
+                        "status": cur_status,
+                        "updated_at": cur_upd_raw,
+                    }
+                )
+
+    if violations:
+        raise EvidenceError(
+            "tracker transition refused (fln-beads-stale-merge-guard-xzxt): "
+            + " | ".join(violations)
+        )
+
+    byte_changed_records = 0
+    semantically_changed_records = 0
+    if loaded_parents:
+        _first_label, first_records, first_raw = loaded_parents[0]
+        all_ids = set(current_records) | set(first_records)
+        for bead_id in all_ids:
+            if current_raw.get(bead_id) != first_raw.get(bead_id):
+                byte_changed_records += 1
+            if current_records.get(bead_id) != first_records.get(bead_id):
+                semantically_changed_records += 1
+
+    return {
+        "schema": TRACKER_TRANSITION_SCHEMA,
+        "valid": True,
+        "beads": len(current_records),
+        "comments": total_comments,
+        "parents_checked": [label for label, _prec, _praw in loaded_parents],
+        "admitted_reopens": admitted_reopens,
+        "byte_changed_records": byte_changed_records,
+        "semantically_changed_records": semantically_changed_records,
+        "reserialization_noise_records": max(
+            0, byte_changed_records - semantically_changed_records
+        ),
+    }
+
+
+def validate_tracker_transition_git_parents(
+    beads_path: Path,
+    repo_root: Path,
+    commit: str,
+    *,
+    tracker_relpath: str = ".beads/issues.jsonl",
+) -> dict[str, Any]:
+    """Validate `beads_path` against every git parent of `commit`."""
+    rev_list = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-list", "--parents", "-n", "1", commit],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if rev_list.returncode != 0:
+        raise TrackerParentUnavailable(
+            f"cannot resolve git parents for {commit!r}: "
+            f"{rev_list.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    parts = rev_list.stdout.decode("ascii", "replace").strip().split()
+    parent_shas = parts[1:] if len(parts) > 1 else []
+    parent_blobs: list[tuple[str, bytes]] = []
+    for idx, sha in enumerate(parent_shas, 1):
+        commit_check = subprocess.run(
+            ["git", "-C", str(repo_root), "cat-file", "-e", f"{sha}^{{commit}}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if commit_check.returncode != 0:
+            raise TrackerParentUnavailable(
+                f"parent commit {sha} of {commit} is unavailable in {repo_root} "
+                f"(shallow checkout? use fetch-depth >= 2)"
+            )
+        blob_check = subprocess.run(
+            ["git", "-C", str(repo_root), "cat-file", "-e", f"{sha}:{tracker_relpath}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if blob_check.returncode != 0:
+            continue
+        blob_read = subprocess.run(
+            ["git", "-C", str(repo_root), "cat-file", "blob", f"{sha}:{tracker_relpath}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if blob_read.returncode != 0:
+            raise TrackerParentUnavailable(
+                f"cannot read {sha}:{tracker_relpath}: "
+                f"{blob_read.stderr.decode('utf-8', 'replace').strip()}"
+            )
+        parent_blobs.append((f"parent#{idx}({sha[:12]})", blob_read.stdout))
+    return validate_tracker_transition(beads_path, parent_blobs=parent_blobs)
 
 
 def utc_second_prefix(label: str, value: Any) -> str:
@@ -21178,6 +21473,60 @@ def cmd_validate_verification_manifest(args: argparse.Namespace) -> int:
     return PASS
 
 
+def cmd_validate_tracker_transition(args: argparse.Namespace) -> int:
+    beads_path = Path(args.beads)
+    explicit_parents: list[tuple[str, Path]] = []
+    for raw_spec in args.parent or ():
+        if "=" in raw_spec:
+            label, raw_path = raw_spec.split("=", 1)
+        else:
+            label, raw_path = raw_spec, raw_spec
+        if not label or not raw_path:
+            print(
+                f"tracker-transition: invalid --parent specification {raw_spec!r}",
+                file=sys.stderr,
+            )
+            return FAIL
+        explicit_parents.append((label, Path(raw_path)))
+
+    try:
+        if args.git_parents_of:
+            repo_root = Path(args.repo) if args.repo else Path(".")
+            report = validate_tracker_transition_git_parents(
+                beads_path, repo_root, args.git_parents_of
+            )
+        else:
+            report = validate_tracker_transition(beads_path, explicit_parents)
+    except TrackerParentUnavailable as error:
+        print(f"tracker-transition: typed absence: {error}", file=sys.stderr)
+        return INCONCLUSIVE
+    except (
+        EvidenceError,
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        IndexError,
+    ) as error:
+        print(f"tracker-transition: {error}", file=sys.stderr)
+        return FAIL
+
+    noise = report.get("reserialization_noise_records", 0)
+    if noise > 0:
+        print(
+            f"tracker-transition: note: {report['byte_changed_records']} records "
+            f"changed bytes vs {report['semantically_changed_records']} semantically "
+            f"({noise} re-serialization-only record(s); consider minimal-diff publishing "
+            f"so real tracker edits remain reviewable)",
+            file=sys.stderr,
+        )
+    if args.output:
+        write_new(Path(args.output), canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
 def cmd_verify_coverage_granularity_delta(args: argparse.Namespace) -> int:
     manifest = Path(args.manifest)
     root = Path(args.root) if args.root else lexical_absolute(manifest).parent.parent
@@ -25655,6 +26004,20 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "duplicate-row",
         lambda records, _beads: records.insert(2, dict(records[1])),
     )
+    reject_verification_case(
+        "intra-bead-duplicate-comment-id",
+        lambda _records, beads: beads[1]["comments"].append(
+            {"id": 41, "created_at": "2026-07-26T21:10:00Z"}
+        ),
+        because=("'rur'", "duplicate comment id 41"),
+    )
+    reject_verification_case(
+        "cross-bead-duplicate-comment-id",
+        lambda _records, beads: beads[2]["comments"].append(
+            {"id": 41, "created_at": "2026-07-26T21:10:00Z"}
+        ),
+        because=("'rur-consumer'", "duplicate comment id 41", "'rur'"),
+    )
 
     duplicate_root = verification_root / "duplicate-key"
     duplicate_root.mkdir()
@@ -25706,7 +26069,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     else:
         raise EvidenceError("truncated verification manifest was accepted")
     require(
-        verification_mutants == 46,
+        verification_mutants == 48,
         "verification manifest mutation matrix is incomplete",
     )
     cases.append(
@@ -25717,6 +26080,159 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "artifact_classification_checks": len(
                 classification_expectations
             ),
+        }
+    )
+
+    # --- Stale-lineage tracker transition guard (fln-beads-stale-merge-guard-xzxt) ---
+    transition_root = case_dir("tracker-transition-guard")
+    transition_parent_closed = transition_root / "parent-closed.jsonl"
+    transition_parent_stale = transition_root / "parent-stale.jsonl"
+    parent_closed_records = [
+        {
+            "id": "fln-t1",
+            "status": "closed",
+            "updated_at": "2026-10-17T10:00:00.500000000Z",
+            "closed_at": "2026-10-17T10:00:00.500000000Z",
+            "comments": [{"id": 100, "created_at": "2026-10-17T10:00:05Z", "text": "closed"}],
+        },
+        {
+            "id": "fln-t2",
+            "status": "open",
+            "updated_at": "2026-10-17T09:00:00Z",
+            "comments": [{"id": 101, "created_at": "2026-10-17T09:00:00Z", "text": "open"}],
+        },
+    ]
+    parent_stale_records = [
+        {
+            "id": "fln-t1",
+            "status": "open",
+            "updated_at": "2026-10-09T08:00:00Z",
+            "comments": [],
+        },
+        parent_closed_records[1],
+    ]
+    write_new(
+        transition_parent_closed,
+        b"".join(canonical_json(r) for r in parent_closed_records),
+    )
+    write_new(
+        transition_parent_stale,
+        b"".join(canonical_json(r) for r in parent_stale_records),
+    )
+
+    def _run_transition_mutant(
+        name: str,
+        prospective_records: list[dict[str, Any]],
+        parents: Sequence[tuple[str, Path]],
+        because: tuple[str, ...],
+    ) -> None:
+        candidate = transition_root / f"{name}.jsonl"
+        write_new(candidate, b"".join(canonical_json(r) for r in prospective_records))
+        try:
+            validate_tracker_transition(candidate, parents)
+        except EvidenceError as error:
+            missing = [needle for needle in because if needle not in str(error)]
+            if missing:
+                raise EvidenceError(
+                    f"tracker transition mutant {name} refused for wrong reason "
+                    f"(missing {missing!r}): {error}"
+                ) from error
+        else:
+            raise EvidenceError(f"tracker transition mutant survived: {name}")
+
+    # 1. Silent reopen closed -> open with unchanged updated_at
+    m_unchanged = clone_records(parent_closed_records)
+    m_unchanged[0]["status"] = "open"
+    _run_transition_mutant(
+        "silent-reopen-unchanged-updated-at",
+        m_unchanged,
+        [("HEAD", transition_parent_closed)],
+        ("'fln-t1'", "updated_at did not advance", "added no comment"),
+    )
+    # 2. Silent reopen closed -> in_progress with older updated_at
+    m_older = clone_records(parent_closed_records)
+    m_older[0]["status"] = "in_progress"
+    m_older[0]["updated_at"] = "2026-10-17T09:59:59Z"
+    _run_transition_mutant(
+        "silent-reopen-older-updated-at",
+        m_older,
+        [("HEAD", transition_parent_closed)],
+        ("'fln-t1'", "closed -> in_progress", "updated_at did not advance"),
+    )
+    # 3. Reopen advancing updated_at but without adding a comment
+    m_no_comment = clone_records(parent_closed_records)
+    m_no_comment[0]["status"] = "open"
+    m_no_comment[0]["updated_at"] = "2026-10-18T12:00:00Z"
+    _run_transition_mutant(
+        "silent-reopen-no-comment",
+        m_no_comment,
+        [("HEAD", transition_parent_closed)],
+        ("'fln-t1'", "added no comment"),
+    )
+    # 4. Reopen advancing updated_at and adding comment, but dropping prior comment
+    m_dropped = clone_records(parent_closed_records)
+    m_dropped[0]["status"] = "open"
+    m_dropped[0]["updated_at"] = "2026-10-18T12:00:00Z"
+    m_dropped[0]["comments"] = [
+        {"id": 102, "created_at": "2026-10-18T12:00:01Z", "text": "reopen"}
+    ]
+    _run_transition_mutant(
+        "silent-reopen-dropped-prior-comment",
+        m_dropped,
+        [("HEAD", transition_parent_closed)],
+        ("'fln-t1'", "dropped prior comment id(s) [100]"),
+    )
+    # 5. Stale-lineage multi-parent merge (a6520040 shape): HEAD is stale open,
+    # MERGE_HEAD is closed, merge keeps stale open status.
+    _run_transition_mutant(
+        "stale-lineage-merge-against-merge-head",
+        clone_records(parent_stale_records),
+        [("HEAD", transition_parent_stale), ("MERGE_HEAD", transition_parent_closed)],
+        ("'fln-t1'", "MERGE_HEAD", "updated_at did not advance"),
+    )
+    # 6. Cross-bead duplicate comment id
+    m_dup_cid = clone_records(parent_closed_records)
+    m_dup_cid[1]["comments"].append(
+        {"id": 100, "created_at": "2026-10-18T12:00:02Z", "text": "dup"}
+    )
+    _run_transition_mutant(
+        "cross-bead-duplicate-comment-id",
+        m_dup_cid,
+        [("HEAD", transition_parent_closed)],
+        ("duplicate comment id 100", "'fln-t1'"),
+    )
+    # Positive control: legitimate reopen with strictly advanced updated_at + new comment
+    # AND re-serialized unchanged record to verify byte-vs-semantic noise reporting.
+    legit_reopen = clone_records(parent_closed_records)
+    legit_reopen[0]["status"] = "open"
+    legit_reopen[0]["updated_at"] = "2026-10-18T12:00:00Z"
+    legit_reopen[0]["comments"].append(
+        {"id": 102, "created_at": "2026-10-18T12:00:01Z", "text": "reopened with evidence"}
+    )
+    legit_path = transition_root / "legit-reopen.jsonl"
+    # Second record is semantically identical but formatted with spaces (byte noise).
+    write_new(
+        legit_path,
+        canonical_json(legit_reopen[0])
+        + (json.dumps(legit_reopen[1], sort_keys=True) + "\n").encode("utf-8"),
+    )
+    legit_report = validate_tracker_transition(
+        legit_path, [("HEAD", transition_parent_closed)]
+    )
+    require(
+        legit_report["valid"] is True
+        and len(legit_report["admitted_reopens"]) == 1
+        and legit_report["admitted_reopens"][0]["bead"] == "fln-t1"
+        and legit_report["byte_changed_records"] == 2
+        and legit_report["semantically_changed_records"] == 1
+        and legit_report["reserialization_noise_records"] == 1,
+        f"legitimate reopen control produced unexpected report: {legit_report!r}",
+    )
+    cases.append(
+        {
+            "case": "tracker_transition_guard",
+            "ok": True,
+            "mutants_killed": 6,
         }
     )
     cases.extend(
@@ -33404,6 +33920,31 @@ def build_parser() -> argparse.ArgumentParser:
     verification_manifest_parser.set_defaults(
         func=cmd_validate_verification_manifest
     )
+
+    tracker_transition_parser = subparsers.add_parser(
+        "validate-tracker-transition",
+        help=(
+            "refuse intra/cross-bead duplicate comment ids and silent closed -> "
+            "open/in_progress reopens against parent snapshots "
+            "(bead fln-beads-stale-merge-guard-xzxt)"
+        ),
+    )
+    tracker_transition_parser.add_argument("--beads", required=True)
+    tracker_transition_parser.add_argument(
+        "--parent",
+        action="append",
+        help="parent tracker snapshot as LABEL=PATH (repeatable, e.g. HEAD=... MERGE_HEAD=...)",
+    )
+    tracker_transition_parser.add_argument(
+        "--git-parents-of",
+        help="validate against every git parent of this commit (requires --repo or CWD git repo)",
+    )
+    tracker_transition_parser.add_argument(
+        "--repo",
+        help="git repository root for --git-parents-of (defaults to current working directory)",
+    )
+    tracker_transition_parser.add_argument("--output")
+    tracker_transition_parser.set_defaults(func=cmd_validate_tracker_transition)
 
     granularity_delta_parser = subparsers.add_parser(
         "verify-coverage-granularity-delta",

@@ -123,6 +123,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+          fetch-depth: 2
 
       # The publisher's existing host-wide lock is persistent across its fixture
       # processes. A fresh hosted runner has no development-host /data/tmp.
@@ -496,7 +497,19 @@ jobs:
             printf 'artifact_path=%s\n' "$artifact"
             printf 'command_exit=%s\n' "$command_rc"
           } >> "$GITHUB_OUTPUT"
-          exit "$command_rc"
+          if (( command_rc != 0 )); then
+            exit "$command_rc"
+          fi
+          exit 0
+
+      - name: tracker stale-merge guard (fln-beads-stale-merge-guard-xzxt)
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          python3 -I -S scripts/evidence.py validate-tracker-transition \
+            --beads .beads/issues.jsonl \
+            --repo . \
+            --git-parents-of HEAD
 
       - name: tribunal epoch-lab nested workspace
         id: epoch_lab

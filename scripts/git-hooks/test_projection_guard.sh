@@ -94,7 +94,7 @@ republish() {
 # real scripts/evidence.py and live adoption authority to exercise coverage.
 printf '%s\n' \
     'import sys' \
-    'if len(sys.argv) < 2 or sys.argv[1] != "validate-verification-manifest":' \
+    'if len(sys.argv) < 2 or sys.argv[1] not in ("validate-verification-manifest", "validate-tracker-transition"):' \
     '    raise SystemExit(2)' \
     'print("{\"schema\":\"fln.validation/1\",\"valid\":true}")' \
     > scripts/evidence.py
@@ -706,6 +706,133 @@ out=$(git merge --no-ff -q -m 'merge stale projection' beads-side 2>&1); code=$?
 check 'a merge that moves the id set without the projection is refused' 1 \
     'projection-guard: REFUSED' "$code" "$out"
 git merge --abort >/dev/null 2>&1 || true
+
+# --- stale-lineage merge & duplicate comment id guard -------------------------
+# Bead fln-beads-stale-merge-guard-xzxt. Exercises both pre-commit and
+# pre-merge-commit against the real scripts/evidence.py validator.
+#
+# 1. Cross-bead duplicate comment id is refused.
+jq -c '
+    if .id == "franken_lean-hook-coverage-plant" then
+        .comments = ((.comments // []) + [{
+            "id": 999999999,
+            "author": "guard-test",
+            "text": "cross-bead duplicate of franken_lean-e5k7 comment 999999999",
+            "created_at": "2026-07-26T22:05:00Z"
+        }])
+    else .
+    end
+' .beads/issues.jsonl > .beads/issues.jsonl.next
+mv .beads/issues.jsonl.next .beads/issues.jsonl
+out=$(run_commit -q -o .beads/issues.jsonl -m 'cross-bead dup comment id' 2>&1); code=$?
+check 'a cross-bead duplicate comment id is refused' 1 \
+    'duplicate comment id 999999999' "$code" "$out"
+git checkout -- .beads/issues.jsonl
+
+# 2. Intra-bead duplicate comment id is refused.
+jq -c '
+    if .id == "franken_lean-hook-coverage-plant" then
+        .comments = ((.comments // []) + [{
+            "id": 999999998,
+            "author": "guard-test",
+            "text": "intra-bead duplicate of own comment 999999998",
+            "created_at": "2026-07-26T22:05:00Z"
+        }])
+    else .
+    end
+' .beads/issues.jsonl > .beads/issues.jsonl.next
+mv .beads/issues.jsonl.next .beads/issues.jsonl
+out=$(run_commit -q -o .beads/issues.jsonl -m 'intra-bead dup comment id' 2>&1); code=$?
+check 'an intra-bead duplicate comment id is refused' 1 \
+    'duplicate comment id 999999998' "$code" "$out"
+git checkout -- .beads/issues.jsonl
+
+# Stamp updated_at on the closed fixture bead so reopen timestamp comparisons
+# match real `br` records.
+jq -c '
+    if .id == "franken_lean-hook-coverage-plant" then
+        .updated_at = "2026-07-26T22:00:30Z"
+    else .
+    end
+' .beads/issues.jsonl > .beads/issues.jsonl.next
+mv .beads/issues.jsonl.next .beads/issues.jsonl
+out=$(run_commit -q -o .beads/issues.jsonl -m 'stamp closed fixture updated_at' 2>&1); code=$?
+check 'stamping updated_at on closed fixture is accepted' 0 '' "$code" "$out"
+
+# 3. Silent reopen (closed -> open, updated_at unchanged) is refused.
+jq -c '
+    if .id == "franken_lean-hook-coverage-plant" then
+        .status = "open"
+    else .
+    end
+' .beads/issues.jsonl > .beads/issues.jsonl.next
+mv .beads/issues.jsonl.next .beads/issues.jsonl
+out=$(run_commit -q -o .beads/issues.jsonl -m 'silent reopen unchanged updated_at' 2>&1); code=$?
+check 'a silent reopen with unchanged updated_at is refused' 1 \
+    'tracker-transition-guard: REFUSED' "$code" "$out"
+git checkout -- .beads/issues.jsonl
+
+# 4. Silent reopen (closed -> in_progress, older updated_at) is refused.
+jq -c '
+    if .id == "franken_lean-hook-coverage-plant" then
+        .status = "in_progress" | .updated_at = "2026-07-26T21:59:59Z"
+    else .
+    end
+' .beads/issues.jsonl > .beads/issues.jsonl.next
+mv .beads/issues.jsonl.next .beads/issues.jsonl
+out=$(run_commit -q -o .beads/issues.jsonl -m 'silent reopen older updated_at' 2>&1); code=$?
+check 'a silent reopen closed -> in_progress with older updated_at is refused' 1 \
+    'updated_at did not advance' "$code" "$out"
+git checkout -- .beads/issues.jsonl
+
+# 5. Stale-lineage merge reproducing a6520040: stale branch has the bead open
+# with old updated_at, newer main has it closed and has diverged; merging main
+# into stale with `-s ours` keeps stale open bytes (HEAD == staged!) and must
+# still be refused against MERGE_HEAD.
+git checkout -q -b stale-lineage
+jq -c '
+    if .id == "franken_lean-hook-coverage-plant" then
+        .status = "open" | .updated_at = "2026-07-26T21:00:00Z" | del(.closed_at)
+    else .
+    end
+' .beads/issues.jsonl > .beads/issues.jsonl.next
+mv .beads/issues.jsonl.next .beads/issues.jsonl
+git add .beads/issues.jsonl
+git commit -q --no-verify -m 'stale-lineage: pre-close snapshot'
+git checkout -q main
+printf 'main diverges from stale-lineage\n' >> README.md
+git add README.md
+run_commit -q -m 'main advances past stale-lineage branch point' >/dev/null 2>&1
+git checkout -q stale-lineage
+out=$(git merge --no-ff -s ours -q -m 'stale-lineage merge keeping ours' main 2>&1); code=$?
+check 'a stale-lineage merge reverting a closed bead from MERGE_HEAD is refused' 1 \
+    'MERGE_HEAD' "$code" "$out"
+# After pre-merge-commit refuses, git writes .git/MERGE_HEAD and leaves the
+# merge pending; trying to finalize it with `git commit` exercises the
+# post-conflict MERGE_HEAD path in pre-commit too.
+out=$(run_commit -q -m 'stale-lineage merge commit after pause' 2>&1); code=$?
+check 'finalizing that stale-lineage merge via git commit is also refused' 1 \
+    'MERGE_HEAD' "$code" "$out"
+git merge --abort >/dev/null 2>&1 || true
+git checkout -q main
+
+# 6. Legitimate reopen (updated_at advances strictly + adds a comment) is admitted.
+jq -c '
+    if .id == "franken_lean-hook-coverage-plant" then
+        .status = "open"
+        | .updated_at = "2026-07-26T22:10:00Z"
+        | .comments = ((.comments // []) + [{
+            "id": 999999997,
+            "author": "guard-test",
+            "text": "legitimate reopen with new evidence",
+            "created_at": "2026-07-26T22:10:00Z"
+        }])
+    else .
+    end
+' .beads/issues.jsonl > .beads/issues.jsonl.next
+mv .beads/issues.jsonl.next .beads/issues.jsonl
+out=$(run_commit -q -o .beads/issues.jsonl -m 'legitimate reopen' 2>&1); code=$?
+check 'a legitimate reopen with advanced updated_at and comment is accepted' 0 '' "$code" "$out"
 
 printf '\n%s passed, %s failed\n' "$PASSES" "$FAILS"
 [ "$FAILS" -eq 0 ]
