@@ -52,6 +52,182 @@ fn node<'a>(syntax: &'a Syntax, expected: &str) -> &'a [Syntax] {
     panic!("missing {expected:?}: {syntax:?}")
 }
 
+fn custom_leaf(declaration: &str) -> ImportedSyntaxEntry {
+    parser(
+        declaration,
+        "artifactItem",
+        None,
+        Descr::Node {
+            kind: name(declaration),
+            prec: MAX_PREC,
+            body: Box::new(symbol("v")),
+        },
+    )
+}
+
+fn custom_trailing(declaration: &str) -> ImportedSyntaxEntry {
+    parser(
+        declaration,
+        "artifactItem",
+        None,
+        Descr::TrailingNode {
+            kind: name(declaration),
+            prec: 65,
+            lhs_prec: 65,
+            body: Box::new(sequence(symbol("%%"), Descr::Cat(name("artifactItem"), 66))),
+        },
+    )
+}
+
+fn custom_reader() -> ImportedSyntaxEntry {
+    term(
+        "Library.inspect",
+        LEAD_PREC,
+        sequence(
+            symbol("inspectArtifact"),
+            sequence(
+                symbol("["),
+                sequence(Descr::Cat(name("artifactItem"), 0), symbol("]")),
+            ),
+        ),
+    )
+}
+
+fn choice_kinds(syntax: &Syntax) -> Vec<Name> {
+    node(syntax, "choice")
+        .iter()
+        .map(|syntax| {
+            let Syntax::Node { kind, .. } = syntax else {
+                panic!("expected a parser node: {syntax:?}")
+            };
+            kind.clone()
+        })
+        .collect()
+}
+
+#[test]
+fn imported_category_choices_keep_order_priority_and_lexical_scope() {
+    let mut file = grammar();
+    file.import_artifact(&ImportedSyntaxModule {
+        entries: vec![
+            category(IdentBehavior::Default),
+            token("v", None),
+            token("inspectArtifact", None),
+            custom_leaf("Library.older"),
+            custom_reader(),
+        ],
+    })
+    .unwrap();
+    let source = "#check inspectArtifact [v]";
+    assert!(!contains(&parse(&file, source).unwrap(), "choice"));
+    file.import_artifact(&ImportedSyntaxModule {
+        entries: vec![
+            configured(custom_leaf("Library.low"), DEFAULT_PRIORITY - 1, None),
+            custom_leaf("Library.newer"),
+            configured(
+                custom_leaf("Library.scoped"),
+                DEFAULT_PRIORITY,
+                Some("OnlyScopedRows"),
+            ),
+        ],
+    })
+    .unwrap();
+    let syntax = parse(&file, source).unwrap();
+    assert_eq!(
+        choice_kinds(&syntax),
+        vec![name("Library.newer"), name("Library.older")]
+    );
+    assert!(!contains(&syntax, "Library.low"));
+    assert!(!contains(&syntax, "Library.scoped"));
+
+    file.apply(&ScopeCommand::Section(None));
+    file.apply(&ScopeCommand::OpenScoped(vec![name("OnlyScopedRows")]));
+    assert_eq!(
+        choice_kinds(&parse(&file, source).unwrap()),
+        vec![
+            name("Library.scoped"),
+            name("Library.newer"),
+            name("Library.older")
+        ]
+    );
+    file.apply(&ScopeCommand::End(None));
+    assert_eq!(
+        choice_kinds(&parse(&file, source).unwrap()),
+        choice_kinds(&syntax)
+    );
+}
+
+#[test]
+fn identical_imported_category_trailing_bodies_retain_all_readings() {
+    let mut file = grammar();
+    file.import_artifact(&ImportedSyntaxModule {
+        entries: vec![
+            category(IdentBehavior::Default),
+            token("v", None),
+            token("%%", None),
+            token("inspectArtifact", None),
+            custom_leaf("Library.value"),
+            custom_trailing("Library.older"),
+            custom_trailing("Library.newer"),
+            custom_reader(),
+        ],
+    })
+    .unwrap();
+    let syntax = parse(&file, "#check inspectArtifact [v %% v %% v]").unwrap();
+    assert_eq!(
+        choice_kinds(&syntax),
+        vec![name("Library.newer"), name("Library.older")]
+    );
+    for reading in node(&syntax, "choice") {
+        let Syntax::Node { args, .. } = reading else {
+            unreachable!()
+        };
+        assert_eq!(
+            choice_kinds(&args[0]),
+            vec![name("Library.newer"), name("Library.older")]
+        );
+        assert!(!contains(&args[2], "choice"));
+    }
+    assert!(parse(&file, "#check inspectArtifact [v %%]").is_err());
+}
+
+#[test]
+fn incompatible_custom_category_overlaps_still_refuse_transactionally() {
+    let mut file = grammar();
+    file.import_artifact(&ImportedSyntaxModule {
+        entries: vec![
+            category(IdentBehavior::Default),
+            token("v", None),
+            custom_leaf("Library.older"),
+        ],
+    })
+    .unwrap();
+    let before = file.grammar();
+    let generation = file.generation;
+    let work = file.artifact.work;
+    let incompatible = parser(
+        "Library.incompatible",
+        "artifactItem",
+        None,
+        Descr::Node {
+            kind: name("Library.incompatible"),
+            prec: MAX_PREC,
+            body: Box::new(sequence(symbol("v"), symbol("mustNotLeak!"))),
+        },
+    );
+    assert_eq!(
+        file.import_artifact(&ImportedSyntaxModule {
+            entries: vec![token("mustNotLeak!", None), incompatible],
+        }),
+        Err("overlapping artifact parser productions")
+    );
+    assert!(Rc::ptr_eq(&before, &file.grammar()));
+    assert_eq!(file.generation, generation);
+    assert_eq!(file.artifact.work, work);
+    assert!(!file.constants.contains(&name("Library.incompatible")));
+    assert!(!file.grammar().table().contains("mustNotLeak!"));
+}
+
 fn assert_overlap_refused(first: ImportedSyntaxEntry, second: ImportedSyntaxEntry) {
     let mut file = grammar();
     file.import_artifact(&ImportedSyntaxModule {

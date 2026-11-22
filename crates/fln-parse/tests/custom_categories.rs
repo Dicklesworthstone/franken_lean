@@ -41,6 +41,39 @@ fn contains(syntax: &Syntax, name: &str) -> bool {
     }
     false
 }
+
+fn node<'a>(syntax: &'a Syntax, name: &str) -> &'a [Syntax] {
+    let expected = Name::from_components([name]);
+    let mut pending = vec![syntax];
+    while let Some(syntax) = pending.pop() {
+        if let Syntax::Node { kind, args, .. } = syntax {
+            if *kind == expected {
+                return args;
+            }
+            pending.extend(args.iter().rev());
+        }
+    }
+    panic!("missing {name}: {syntax:?}")
+}
+
+fn assert_kinds(syntax: &[Syntax], expected: &[&str]) {
+    let kinds: Vec<_> = syntax
+        .iter()
+        .map(|syntax| {
+            let Syntax::Node { kind, .. } = syntax else {
+                panic!("expected parser node: {syntax:?}");
+            };
+            kind.clone()
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        expected
+            .iter()
+            .map(|name| Name::from_components([*name]))
+            .collect::<Vec<_>>()
+    );
+}
 #[test]
 fn longest_match_precedes_priority_and_equal_matches_use_priority() {
     let grammar = grammar(&[
@@ -57,16 +90,140 @@ fn longest_match_precedes_priority_and_equal_matches_use_priority() {
     assert!(parse(&grammar, "#check inspectItem [v x x]").is_err());
 }
 #[test]
-fn unresolved_equal_priority_ambiguity_never_selects_an_arbitrary_kind() {
+fn equal_priority_readings_survive_in_newest_first_choice_nodes() {
     let grammar = grammar(&[
         "declare_syntax_cat item",
         "syntax (name := one) \"v\" : item",
+        "syntax (name := low) (priority := low) \"v\" : item",
         "syntax (name := two) \"v\" : item",
         "syntax \"inspectItem \" \"[\" item \"]\" : term",
     ]);
-    assert!(parse(&grammar, "#check inspectItem [v]").is_err());
+    let syntax = parse(&grammar, "#check inspectItem [v]").unwrap();
+    assert_kinds(node(&syntax, "choice"), &["two", "one"]);
+    assert!(!contains(&syntax, "low"));
+    assert!(parse(&grammar, "#check inspectItem [v v]").is_err());
     assert!(parse(&grammar, "#check (42 : Nat)").is_ok());
 }
+
+#[test]
+fn trailing_choices_preserve_both_readings_and_left_association() {
+    let grammar = grammar(&[
+        "declare_syntax_cat item",
+        "syntax (name := value) \"v\" : item",
+        "syntax:70 (name := older) item:70 \"++\" item:71 : item",
+        "syntax:70 (name := newer) item:70 \"++\" item:71 : item",
+        "syntax \"inspectItem \" \"[\" item \"]\" : term",
+    ]);
+    let syntax = parse(&grammar, "#check inspectItem [v ++ v ++ v]").unwrap();
+    let choices = node(&syntax, "choice");
+    assert_kinds(choices, &["newer", "older"]);
+    for choice in choices {
+        let Syntax::Node { args, .. } = choice else {
+            unreachable!()
+        };
+        assert_kinds(node(&args[0], "choice"), &["newer", "older"]);
+        assert!(contains(&args[2], "value"));
+        assert!(!contains(&args[2], "choice"));
+    }
+    assert!(parse(&grammar, "#check inspectItem [v ++]").is_err());
+}
+
+#[test]
+fn choices_use_the_minimum_precedence_of_only_the_winning_readings() {
+    let grammar = grammar(&[
+        "declare_syntax_cat item",
+        "syntax:90 (name := high) \"v\" : item",
+        "syntax:80 (name := low) \"v\" : item",
+        "syntax:10 (name := ignored) (priority := low) \"v\" : item",
+        "syntax:70 (name := allowed) item:80 \"!!\" : item",
+        "syntax:70 (name := forbidden) item:81 \"??\" : item",
+        "syntax \"inspectItem \" \"[\" item \"]\" : term",
+        "syntax \"inspectHigh \" \"[\" item:85 \"]\" : term",
+    ]);
+    let syntax = parse(&grammar, "#check inspectItem [v !!]").unwrap();
+    assert!(contains(&syntax, "allowed"));
+    assert_kinds(node(&syntax, "choice"), &["low", "high"]);
+    assert!(!contains(&syntax, "ignored"));
+    assert!(parse(&grammar, "#check inspectItem [v ??]").is_err());
+    let high = parse(&grammar, "#check inspectHigh [v]").unwrap();
+    assert!(contains(&high, "high"));
+    assert!(!contains(&high, "choice"));
+}
+
+#[test]
+fn ambiguous_trailing_tree_copies_share_the_category_work_budget() {
+    let grammar = grammar(&[
+        "declare_syntax_cat item",
+        "syntax (name := value) \"v\" : item",
+        "syntax:70 (name := older) item:70 \"++\" item:71 : item",
+        "syntax:70 (name := newer) item:70 \"++\" item:71 : item",
+        "syntax \"inspectItem \" \"[\" item \"]\" : term",
+    ]);
+    // Copying each left-hand choice into both trailing readings would otherwise
+    // build an exponential tree from a linear number of parser descriptions.
+    let expression = std::iter::repeat_n("v", 32)
+        .collect::<Vec<_>>()
+        .join(" ++ ");
+    assert!(parse(&grammar, &format!("#check inspectItem [{expression}]")).is_err());
+    assert!(parse(&grammar, "#check inspectItem [v ++ v]").is_ok());
+}
+#[test]
+fn failed_leading_candidates_cannot_hide_behind_a_shorter_choice() {
+    let grammar = grammar(&[
+        "declare_syntax_cat item",
+        "syntax (name := older) \"v\" : item",
+        "syntax (name := newer) \"v\" : item",
+        "syntax (name := longer) \"v\" \"x\" \"y\" : item",
+        "syntax \"inspectItem \" \"[\" item \"x\" \"]\" : term",
+    ]);
+    // The longer parser reaches the closing bracket expecting y. Its error
+    // outranks both short v readings at the pin; the outer x cannot rescue them.
+    assert!(parse(&grammar, "#check inspectItem [v x]").is_err());
+    assert!(parse(&grammar, "#check (42 : Nat)").is_ok());
+}
+
+#[test]
+fn failed_trailing_candidates_cannot_hide_behind_leading_choices() {
+    let grammar = grammar(&[
+        "declare_syntax_cat item",
+        "syntax (name := older) \"v\" : item",
+        "syntax (name := newer) \"v\" : item",
+        "syntax:70 item:70 \"x\" \"y\" : item",
+        "syntax \"inspectItem \" \"[\" item \"x\" \"]\" : term",
+        "syntax \"plainItem \" \"[\" item \"]\" : term",
+    ]);
+    assert!(parse(&grammar, "#check inspectItem [v x]").is_err());
+    let safe = parse(&grammar, "#check plainItem [v]").unwrap();
+    assert_kinds(node(&safe, "choice"), &["newer", "older"]);
+}
+
+#[test]
+fn failed_candidates_cannot_hide_behind_nested_choices() {
+    let grammar = grammar(&[
+        "declare_syntax_cat leaf",
+        "declare_syntax_cat item",
+        "syntax (name := older) \"v\" : leaf",
+        "syntax (name := newer) \"v\" : leaf",
+        "syntax \"box\" leaf : item",
+        "syntax \"box\" leaf \"x\" \"y\" : item",
+        "syntax \"inspectItem \" \"[\" item \"x\" \"]\" : term",
+    ]);
+    assert!(parse(&grammar, "#check inspectItem [box v x]").is_err());
+}
+
+#[test]
+fn earlier_failures_remain_visible_when_a_trailing_parser_adds_choices() {
+    let grammar = grammar(&[
+        "declare_syntax_cat item",
+        "syntax \"v\" : item",
+        "syntax \"v\" \"++\" \"v\" \"x\" \"y\" : item",
+        "syntax:70 (name := older) item:70 \"++\" item:71 : item",
+        "syntax:70 (name := newer) item:70 \"++\" item:71 : item",
+        "syntax \"inspectItem \" \"[\" item \"x\" \"]\" : term",
+    ]);
+    assert!(parse(&grammar, "#check inspectItem [v ++ v x]").is_err());
+}
+
 #[test]
 fn local_and_scoped_productions_remain_lexical() {
     let mut grammar = grammar(&[

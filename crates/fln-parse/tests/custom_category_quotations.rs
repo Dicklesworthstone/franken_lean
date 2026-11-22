@@ -66,6 +66,25 @@ fn generated_and_dynamic_quotations_have_distinct_exact_envelopes() {
     assert_eq!(node(&dynamic[3], &["num"]).len(), 1);
 }
 #[test]
+fn category_quotations_keep_ambiguous_payloads_for_their_macro_consumer() {
+    let grammar = grammar(&[
+        "declare_syntax_cat item",
+        "syntax (name := older) \"v\" : item",
+        "syntax (name := newer) \"v\" : item",
+    ]);
+    for source in ["def q := `(item| v)", "def q := `(item | v)"] {
+        let syntax = parse(&grammar, source).unwrap();
+        let readings = node(&syntax, &["choice"]);
+        assert_eq!(readings.len(), 2);
+        for (reading, expected) in readings.iter().zip(["newer", "older"]) {
+            assert!(
+                matches!(reading, Syntax::Node { kind, .. } if *kind == Name::from_components([expected]))
+            );
+        }
+    }
+}
+
+#[test]
 fn empty_categories_accept_only_pseudo_captures_in_quotations() {
     let grammar = grammar(&["declare_syntax_cat emptyCategory"]);
     for prefix in ["`(emptyCategory|", "`(emptyCategory |"] {

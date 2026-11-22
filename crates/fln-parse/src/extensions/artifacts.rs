@@ -94,20 +94,53 @@ impl ArtifactGrammar {
     }
 }
 
-/// Leading-term routes whose competing declarations can share one head.
+/// Parser routes whose competing declarations can share one head.
 #[derive(Clone, Copy)]
-enum TermDispatch<'a> {
-    Description { precedence: u32, body: &'a Descr },
-    Prefix { precedence: u32, operand: u32 },
+enum ParserDispatch<'a> {
+    Description {
+        precedence: u32,
+        body: &'a Descr,
+    },
+    Prefix {
+        precedence: u32,
+        operand: u32,
+    },
+    Category {
+        precedence: u32,
+        lhs_precedence: Option<u32>,
+        body: &'a Descr,
+    },
 }
 
 /// The scalar prefix stack reads one common operand. General leading terms
 /// instead run their descriptions independently. Mixing those routes would
 /// let the prefix stack hide a longer description.
-fn term_dispatch(declaration: &SyntaxDecl) -> Option<TermDispatch<'_>> {
-    if !declaration.leading
-        || declaration.category.as_ref() != Some(&Name::from_components(["term"]))
-    {
+fn parser_dispatch(declaration: &SyntaxDecl) -> Option<ParserDispatch<'_>> {
+    let category = declaration.category.as_ref()?;
+    if !builtin_category(category) {
+        return match (&declaration.descr, declaration.leading) {
+            (Descr::Node { prec, body, .. }, true) => Some(ParserDispatch::Category {
+                precedence: *prec,
+                lhs_precedence: None,
+                body,
+            }),
+            (
+                Descr::TrailingNode {
+                    prec,
+                    lhs_prec,
+                    body,
+                    ..
+                },
+                false,
+            ) => Some(ParserDispatch::Category {
+                precedence: *prec,
+                lhs_precedence: Some(*lhs_prec),
+                body,
+            }),
+            _ => None,
+        };
+    }
+    if !declaration.leading || *category != Name::from_components(["term"]) {
         return None;
     }
     let Descr::Node { kind, prec, body } = &declaration.descr else {
@@ -124,13 +157,13 @@ fn term_dispatch(declaration: &SyntaxDecl) -> Option<TermDispatch<'_>> {
         && simple(category).as_deref() == Some("term")
         && *minimum < 256
     {
-        return Some(TermDispatch::Prefix {
+        return Some(ParserDispatch::Prefix {
             precedence: *prec,
             operand: *minimum,
         });
     }
     (*prec >= LEAD_PREC && (ends_with_atom(body, 0) || ends_with_term(body, 0))).then_some(
-        TermDispatch::Description {
+        ParserDispatch::Description {
             precedence: *prec,
             body,
         },
@@ -188,28 +221,28 @@ fn literal_prefix<'a>(descr: &'a Descr, prefix: &mut Vec<Vec<&'a str>>) -> bool 
 }
 
 fn compatible_dispatch(
-    left: TermDispatch<'_>,
-    right: TermDispatch<'_>,
+    left: ParserDispatch<'_>,
+    right: ParserDispatch<'_>,
     remaining: &mut usize,
 ) -> Result<bool, &'static str> {
     charge(remaining)?;
     match (left, right) {
         (
-            TermDispatch::Prefix {
+            ParserDispatch::Prefix {
                 precedence: left,
                 operand: left_operand,
             },
-            TermDispatch::Prefix {
+            ParserDispatch::Prefix {
                 precedence: right,
                 operand: right_operand,
             },
         ) => Ok(left == right && left_operand == right_operand),
         (
-            TermDispatch::Description {
+            ParserDispatch::Description {
                 precedence: left_precedence,
                 body: left,
             },
-            TermDispatch::Description {
+            ParserDispatch::Description {
                 precedence: right_precedence,
                 body: right,
             },
@@ -231,11 +264,30 @@ fn compatible_dispatch(
                 .zip(&right_prefix)
                 .any(|(left, right)| left.iter().all(|token| !right.contains(token))))
         }
+        (
+            ParserDispatch::Category {
+                precedence: left_precedence,
+                lhs_precedence: left_lhs,
+                body: left,
+            },
+            ParserDispatch::Category {
+                precedence: right_precedence,
+                lhs_precedence: right_lhs,
+                body: right,
+            },
+        ) if left_precedence == right_precedence && left_lhs == right_lhs => {
+            // Identical bodies agree on both successful and failed progress.
+            // Root kinds may differ: the category Pratt parser preserves their
+            // equally successful readings as a choice for the macro consumer.
+            charge_comparison(left, remaining)?;
+            charge_comparison(right, remaining)?;
+            Ok(left == right)
+        }
         _ => Ok(false),
     }
 }
 
-type HeadDispatches<'a> = BTreeMap<String, Vec<Option<TermDispatch<'a>>>>;
+type HeadDispatches<'a> = BTreeMap<String, Vec<Option<ParserDispatch<'a>>>>;
 
 /// A primitive production without a first-token set cannot coexist with
 /// another leading production: their possible overlap is not established.
@@ -259,7 +311,7 @@ impl<'a> Heads<'a> {
         if tokens.is_empty() {
             self.primitive.insert(key);
         } else {
-            let dispatch = term_dispatch(declaration);
+            let dispatch = parser_dispatch(declaration);
             let occupied = self.tokens.entry(key).or_default();
             for token in tokens {
                 occupied.entry(token).or_default().push(dispatch);
@@ -292,7 +344,7 @@ impl<'a> Heads<'a> {
             self.primitive.insert(key);
         } else {
             let occupied = self.tokens.entry(key).or_default();
-            let dispatch = term_dispatch(declaration);
+            let dispatch = parser_dispatch(declaration);
             for token in &tokens {
                 if let Some(previous) = occupied.get(token) {
                     for previous in previous {
@@ -327,6 +379,8 @@ impl FileGrammar {
     /// Leading terms with equal precedence may share identical bodies or
     /// disjoint mandatory literal prefixes. Simple prefixes must share both
     /// binding powers. Priority and tied readings follow native dispatch.
+    /// Custom-category productions may share identical bodies and binding
+    /// powers; their distinct root kinds remain available to macro consumers.
     /// Unknown closures/aliases, scoped categories, unproved shared heads,
     /// contextual column checks and unsupported precedence forms are refused.
     /// The exact category quotation shape emitted by `declare_syntax_cat` uses

@@ -249,6 +249,57 @@ theorem rules_work : trip (2 : Nat) = 6 := by checked_rfl
 }
 
 #[test]
+fn custom_category_choices_survive_macro_captures_and_module_replay() {
+    let base = engine();
+    let library = r#"
+declare_syntax_cat item
+syntax (name := olderItem) "v" : item
+syntax (name := newerItem) "v" : item
+syntax:70 (name := olderJoin) item:70 "++" item:71 : item
+syntax:70 (name := newerJoin) item:70 "++" item:71 : item
+macro "discardItem " "[" _x:item "]" : term => `(42)
+macro "relayItem " "[" x:item "]" : term => `(discardItem [$x])
+"#;
+    let main = r#"import Lib
+theorem ambiguousDsl : relayItem [v ++ v ++ v] = (42 : Nat) := rfl
+"#;
+    let result = checked(&base, &[("Main", main), ("Lib", library)]);
+    assert_eq!(result.checked.theorems, 1);
+    assert!(
+        result
+            .checked
+            .engine
+            .environment()
+            .contains(&name("ambiguousDsl"))
+    );
+
+    let imported = result.checked.engine;
+    let options = KVMap::new();
+    let before = imported.logical_root(&options);
+    let checked = imported
+        .check_source_files(
+            &[b"theorem afterReplay : relayItem [v] = (42 : Nat) := rfl"],
+            &options,
+            limits().source,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked.theorems, 1);
+    for source in [
+        b"theorem wrong : relayItem [v ++ v] = (43 : Nat) := rfl".as_slice(),
+        b"def malformed := discardItem [v ++]",
+    ] {
+        assert!(
+            imported
+                .check_source_files(&[source], &options, limits().source)
+                .is_err()
+        );
+    }
+    assert_eq!(imported.logical_root(&options), before);
+}
+
+#[test]
 fn transitive_diamonds_keep_shared_rules_once_and_distinct_module_macro_identities() {
     let files = [
         (

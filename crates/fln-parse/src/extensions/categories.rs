@@ -74,12 +74,52 @@ pub(super) fn tick() -> bool {
     })
 }
 
+/// Every trailing reading owns its left operand. Charge the whole copy before
+/// allocating it: repeated ambiguous operators otherwise double the previous
+/// choice tree while visiting only a constant number of parser descriptions.
+fn clone_operand(syntax: &Syntax) -> Option<Syntax> {
+    let mut pending = vec![syntax];
+    while let Some(syntax) = pending.pop() {
+        if !tick() {
+            return None;
+        }
+        if let Syntax::Node { args, .. } = syntax {
+            pending.extend(args);
+        }
+    }
+    Some(syntax.clone())
+}
+
+/// Run reports successful endpoints, but not failed parser positions. A failed
+/// same-head candidate may have consumed farther than a success and therefore
+/// win at the pin. Do not introduce a newly accepted choice without knowing
+/// that every competing candidate was scored. Check nested choices too, and
+/// failures of trailing parsers after an earlier leading choice.
+fn check_choice_progress(syntax: &Syntax, failed_candidate: bool) -> Option<()> {
+    if !failed_candidate {
+        return Some(());
+    }
+    let choice = Name::from_components(["choice"]);
+    let mut pending = vec![syntax];
+    while let Some(syntax) = pending.pop() {
+        if !tick() {
+            return None;
+        }
+        if let Syntax::Node { kind, args, .. } = syntax {
+            if *kind == choice {
+                return None;
+            }
+            pending.extend(args);
+        }
+    }
+    Some(())
+}
+
 struct Candidate {
-    syntax: Syntax,
+    readings: Vec<Syntax>,
     next: usize,
     precedence: u32,
     priority: u32,
-    tied: bool,
 }
 impl Candidate {
     fn retain(best: &mut Option<Self>, candidate: Self) {
@@ -89,9 +129,23 @@ impl Candidate {
             Some(previous)
                 if (previous.next, previous.priority) == (candidate.next, candidate.priority) =>
             {
-                previous.tied = true;
+                // `longestMatchStep` retains every equally successful reading.
+                // A following operator must be legal for all of them, so the
+                // choice inherits the minimum precedence, as at the pin.
+                previous.readings.extend(candidate.readings);
+                previous.precedence = previous.precedence.min(candidate.precedence);
             }
             _ => *best = Some(candidate),
+        }
+    }
+
+    fn into_syntax(mut self) -> Syntax {
+        if self.readings.len() == 1 {
+            self.readings
+                .pop()
+                .expect("a successful parser has a reading")
+        } else {
+            Syntax::node(Name::from_components(["choice"]), self.readings)
         }
     }
 }
@@ -134,14 +188,18 @@ impl Run<'_> {
         .ok()
         .flatten()
         .map(|(syntax, next)| Candidate {
-            syntax,
+            readings: vec![syntax],
             next,
             precedence: MAX_PREC,
             priority: DEFAULT_PRIORITY,
-            tied: false,
         });
+        // Keep earlier failures visible if a later trailing parser adds a choice.
+        let mut failed_candidate = false;
         if best.is_none() {
-            for &index in declarations {
+            // The pin conses parser registrations onto its tables. Equal
+            // readings therefore occur newest first, including local/scoped
+            // registrations and productions replayed from imports.
+            for &index in declarations.iter().rev() {
                 let declaration = &grammar.decls[index];
                 if !tick() {
                     return None;
@@ -159,31 +217,33 @@ impl Run<'_> {
                 if !starts.is_empty() && !self.text(at).is_some_and(|head| starts.contains(&head)) {
                     continue;
                 }
-                if let Some((items, next)) =
+                if let Some((mut items, next)) =
                     self.parse(&declaration.descr, at, end, follow, depth + 1)
                     && next > at
-                    && let [syntax] = items.as_slice()
+                    && items.len() == 1
                 {
                     Candidate::retain(
                         &mut best,
                         Candidate {
-                            syntax: syntax.clone(),
+                            readings: vec![items.pop().expect("one parser reading")],
                             next,
                             precedence: *prec,
                             priority: declaration.priority,
-                            tied: false,
                         },
                     );
+                } else {
+                    failed_candidate = true;
                 }
             }
         }
-        let mut current = best?;
-        if current.tied {
-            return None;
-        }
+        let current = best?;
+        let mut next = current.next;
+        let mut current_precedence = current.precedence;
+        let mut syntax = current.into_syntax();
+        check_choice_progress(&syntax, failed_candidate)?;
         loop {
             let mut best = None;
-            for &index in declarations {
+            for &index in declarations.iter().rev() {
                 let declaration = &grammar.decls[index];
                 if !tick() {
                     return None;
@@ -200,46 +260,47 @@ impl Run<'_> {
                 else {
                     continue;
                 };
-                if *prec < precedence || current.precedence < *lhs_prec {
+                if *prec < precedence || current_precedence < *lhs_prec {
                     continue;
                 }
                 let starts = heads(body, 0);
-                if !starts.is_empty()
-                    && !self
-                        .text(current.next)
-                        .is_some_and(|head| starts.contains(&head))
+                if !starts.is_empty() && !self.text(next).is_some_and(|head| starts.contains(&head))
                 {
                     continue;
                 }
-                if let Some((items, next)) = self.parse(body, current.next, end, follow, depth + 1)
-                    && next > current.next
+                if let Some((items, parsed_end)) = self.parse(body, next, end, follow, depth + 1)
+                    && parsed_end > next
                 {
-                    let args = std::iter::once(current.syntax.clone())
+                    let args = std::iter::once(clone_operand(&syntax)?)
                         .chain(items)
                         .collect();
                     Candidate::retain(
                         &mut best,
                         Candidate {
-                            syntax: Syntax::node(kind.clone(), args),
-                            next,
+                            readings: vec![Syntax::node(kind.clone(), args)],
+                            next: parsed_end,
                             precedence: *prec,
                             priority: declaration.priority,
-                            tied: false,
                         },
                     );
+                } else {
+                    failed_candidate = true;
                 }
             }
-            match best {
-                Some(next) if !next.tied => current = next,
-                Some(_) => return None,
-                None => break,
-            }
+            let Some(candidate) = best else {
+                check_choice_progress(&syntax, failed_candidate)?;
+                break;
+            };
+            next = candidate.next;
+            current_precedence = candidate.precedence;
+            syntax = candidate.into_syntax();
+            check_choice_progress(&syntax, failed_candidate)?;
         }
         // A failing recursive candidate cannot reset or hide the shared budget.
         if WORK.with(|work| work.borrow().exhausted) {
             return None;
         }
-        Some((vec![current.syntax], current.next))
+        Some((vec![syntax], next))
     }
 }
 
