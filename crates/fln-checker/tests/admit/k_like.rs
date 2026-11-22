@@ -481,3 +481,101 @@ fn a_projected_k_recursor_stays_stuck_when_the_major_type_differs() {
         "a projected cast whose indices differ must not reduce: {outcome:?}"
     );
 }
+
+/// `F4 ((KEq.rec (motive := fun _ _ => Pair) (Pair.mk dv y.2) x major).2)` for
+/// `a := S.mk first p`, in an environment with `y : Pair` (`y.1 ≢ dv`) and
+/// `wy : F4 (y.2)` where `B : Type` is neither a proposition nor unit-like.
+/// Both sides share the projection head `(Pair, 1)`, so stripping `.2` before
+/// reducing the K recursor would compare `y ≟ Pair.mk dv y.2` and fail on
+/// field `0` (`y.1 ≢ dv`). Matches `OpensLeCover._proof_2` (`f.hom.right ≟
+/// (eqToHom h).hom.right`).
+fn shared_projected_cast(first: Expr, major: &str) -> (ConstantEnvironment, Expr) {
+    let mut rows = vec![
+        axiom("A", ty()),
+        axiom("B", ty()),
+        axiom("Pp", prop()),
+        axiom("p", c("Pp")),
+        axiom("a0", c("A")),
+        axiom("dv", c("A")),
+        ConstantEntry::new(
+            checker_name("Pair"),
+            ConstantDeclaration::inductive(
+                vec![],
+                decoded(&ty()),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![checker_name("Pair")],
+                    vec![checker_qualified(&["Pair", "mk"])],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Pair", "mk"]),
+            ConstantDeclaration::constructor(
+                vec![],
+                decoded(&pi(c("A"), pi(c("B"), c("Pair")))),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(checker_name("Pair"), 0, 0, 2),
+            ),
+        ),
+        axiom("y", c("Pair")),
+        axiom("F4", pi(c("B"), ty())),
+        axiom(
+            "wy",
+            app(c("F4"), [Expr::proj(primary_name("Pair"), 1, c("y"))]),
+        ),
+    ];
+    rows.extend(keq_entries());
+    rows.extend(structure_entries());
+    rows.extend([
+        axiom("x", c("S")),
+        axiom("h", keq(c("S"), rebuilt(first_of_x()), c("x"))),
+        axiom("h_other", keq(c("S"), rebuilt(c("a0")), c("x"))),
+    ]);
+    let a = rebuilt(first);
+    let pair_val = app(
+        qualified("Pair", "mk"),
+        [c("dv"), Expr::proj(primary_name("Pair"), 1, c("y"))],
+    );
+    let cast = app(
+        Expr::const_(Name::from_components(["KEq", "rec"]), vec![Level::one()]),
+        [
+            c("S"),
+            a.clone(),
+            lam(c("S"), lam(keq(c("S"), a, bv(0)), c("Pair"))),
+            pair_val,
+            c("x"),
+            c(major),
+        ],
+    );
+    let projected = Expr::proj(primary_name("Pair"), 1, cast);
+    (environment_of(rows), app(c("F4"), [projected]))
+}
+
+#[test]
+fn a_k_recursor_under_a_shared_projection_reduces_without_comparing_other_fields() {
+    let (env, declared) = shared_projected_cast(first_of_x(), "h");
+    let candidate = definition("shared_projected_k", decoded(&declared), decoded(&c("wy")));
+    let outcome = admit(&env, &candidate, AdmissionBudget::unlimited());
+    assert!(matches!(outcome, Verdict::Admitted(_)), "{outcome:?}");
+}
+
+#[test]
+fn a_shared_projected_k_recursor_stays_stuck_when_the_major_type_differs() {
+    let (env, declared) = shared_projected_cast(c("a0"), "h_other");
+    let candidate = definition(
+        "shared_projected_k_other",
+        decoded(&declared),
+        decoded(&c("wy")),
+    );
+    let outcome = admit(&env, &candidate, AdmissionBudget::unlimited());
+    assert!(
+        !matches!(outcome, Verdict::Admitted(_)),
+        "a shared projected cast whose indices differ must not reduce: {outcome:?}"
+    );
+}

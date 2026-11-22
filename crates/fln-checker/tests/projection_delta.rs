@@ -312,3 +312,99 @@ fn structure_eta_rejects_swapped_fields_or_wrong_structure() {
         DefEqOutcome::Equal(_)
     ));
 }
+
+#[test]
+fn same_projection_over_reducible_structures_reduces_before_congruence() {
+    // Two reducible structures share field 0 (7) while differing on unrelated
+    // fields (1 vs 2, and outer field 1: 10 vs 20). Prematurely decomposing
+    // matching `(Projection, Projection)` heads would compare the whole
+    // structures and fail on the unrelated fields (SheafCohomology.Basic root).
+    let pair = |a: u64, b: u64| {
+        Expr::app(
+            Expr::app(constant("MkPair"), nat_literal(a)),
+            nat_literal(b),
+        )
+    };
+    let outer = |inner: Expr, extra: u64| {
+        Expr::app(Expr::app(constant("MkOuter"), inner), nat_literal(extra))
+    };
+    let env = definition_context(vec![
+        definition_entry(
+            "pairLeft",
+            decoded(&pair(7, 1)),
+            ReducibilityHint::Regular(3),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "pairRight",
+            decoded(&pair(7, 2)),
+            ReducibilityHint::Regular(3),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "outerLeft",
+            decoded(&outer(constant("pairLeft"), 10)),
+            ReducibilityHint::Regular(4),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "outerRight",
+            decoded(&outer(constant("pairRight"), 20)),
+            ReducibilityHint::Regular(4),
+            DefinitionSafety::Safe,
+        ),
+    ]);
+    let context = WhnfContext::new(
+        Vec::new(),
+        vec![
+            ProjectionRule::new(checker_name("Pair"), checker_name("MkPair"), 0),
+            ProjectionRule::new(checker_name("Outer"), checker_name("MkOuter"), 0),
+        ],
+        env.constants().clone(),
+    );
+
+    let left0 = decoded(&Expr::proj(name("Pair"), 0, constant("pairLeft")));
+    let right0 = decoded(&Expr::proj(name("Pair"), 0, constant("pairRight")));
+    slow_equal(&left0, &right0, &context);
+    slow_equal(&right0, &left0, &context);
+
+    let left1 = decoded(&Expr::proj(name("Pair"), 1, constant("pairLeft")));
+    let right1 = decoded(&Expr::proj(name("Pair"), 1, constant("pairRight")));
+    assert!(matches!(
+        def_eq(&left1, &right1, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::NotEqual { .. }
+    ));
+
+    let nested_left0 = decoded(&Expr::proj(
+        name("Pair"),
+        0,
+        Expr::proj(name("Outer"), 0, constant("outerLeft")),
+    ));
+    let nested_right0 = decoded(&Expr::proj(
+        name("Pair"),
+        0,
+        Expr::proj(name("Outer"), 0, constant("outerRight")),
+    ));
+    slow_equal(&nested_left0, &nested_right0, &context);
+    slow_equal(&nested_right0, &nested_left0, &context);
+
+    let nested_left1 = decoded(&Expr::proj(
+        name("Pair"),
+        1,
+        Expr::proj(name("Outer"), 0, constant("outerLeft")),
+    ));
+    let nested_right1 = decoded(&Expr::proj(
+        name("Pair"),
+        1,
+        Expr::proj(name("Outer"), 0, constant("outerRight")),
+    ));
+    assert!(matches!(
+        def_eq(
+            &nested_left1,
+            &nested_right1,
+            &context,
+            DefEqBudget::unlimited()
+        ),
+        DefEqOutcome::NotEqual { .. }
+    ));
+}

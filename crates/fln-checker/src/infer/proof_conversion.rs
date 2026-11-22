@@ -285,11 +285,15 @@ const MAX_NESTED_K_DEPTH: usize = 8;
 enum Reach {
     /// Recursor majors only: the eager rule, tried on every pair that gets there.
     Majors,
-    /// Recursor majors and projected structures: only from a side whose spine
-    /// head is a projection the other side's spine head does not share. Run on
-    /// every projection-headed pair, whnf-ing the projected structure cost
-    /// BVDecide's `Udiv` lemmas 21% and `DHashMap.Lemmas` 11% (sequential, same
-    /// base); a shared projection head goes to congruence instead.
+    /// Recursor majors and projected structures: tried whenever the spine head
+    /// is a projection whose in-place chain reaches a K-like recursor
+    /// (`reaches_k_recursor`), including when both sides share the same
+    /// projection head. Skipping shared projection heads would strip the
+    /// projection irrevocably and force equality on unrelated fields of the
+    /// projected structure (`TopCat.Presheaf.generateEquivalenceOpensLe._proof_2`:
+    /// `f.hom.right ≟ (eqToHom h).hom.right`). Keeping the zero-WHNF
+    /// `reaches_k_recursor` guard avoids the projection-WHNF cost on BVDecide
+    /// and DHashMap.
     MajorsAndProjections,
 }
 
@@ -1034,23 +1038,6 @@ impl Probe<'_> {
         }
         Ok(false)
     }
-    /// The structure name and field index of the projection at the head of
-    /// `s`'s spine, when that head is a projection.
-    fn projection_head(&mut self, s: &WireExpr) -> Result<Option<(WireName, u64)>> {
-        let mut id = s.root();
-        while let Some(ExprNode::Apply { function, .. }) = s.node(id) {
-            self.tick()?;
-            id = *function;
-        }
-        Ok(match s.node(id) {
-            Some(ExprNode::Projection {
-                structure_name,
-                index,
-                ..
-            }) => Some((structure_name.clone(), *index)),
-            _ => None,
-        })
-    }
     /// The structure of the projection at the head of `s`'s spine, when that
     /// head is a projection.
     fn projected_structure(&mut self, s: &WireExpr) -> Result<Option<ExprId>> {
@@ -1323,13 +1310,6 @@ impl Probe<'_> {
                         .iter()
                         .rposition(|task| matches!(task, Work::Attempt { .. }))
                     else {
-                        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
-                            eprintln!(
-                                "PROOF_CONV_ROOT_FAIL remaining_work={} taken_len={}",
-                                work.len(),
-                                taken.len(),
-                            );
-                        }
                         return Ok(false);
                     };
                     work.truncate(marker + 1);
@@ -1523,16 +1503,7 @@ impl Probe<'_> {
             if !skip {
                 match self.equal(&left, &right, &context)? {
                     Some(true) => continue,
-                    Some(false) => {
-                        if std::env::var_os("FLN_CHECKER_TRACE").is_some() && attempts == 0 {
-                            eprintln!(
-                                "PROOF_CONV_EQUAL_FALSE attempts=0 l_root={:?} r_root={:?}",
-                                left.node(left.root()),
-                                right.node(right.root()),
-                            );
-                        }
-                        fail!()
-                    }
+                    Some(false) => fail!(),
                     None => {}
                 }
             }
@@ -1541,21 +1512,9 @@ impl Probe<'_> {
                 continue;
             }
             let Some(l) = self.whnf_comparand(&left, &context)? else {
-                if std::env::var_os("FLN_CHECKER_TRACE").is_some() && attempts == 0 {
-                    eprintln!(
-                        "PROOF_CONV_WHNF_L_NONE attempts=0 l_root={:?}",
-                        left.node(left.root())
-                    );
-                }
                 fail!()
             };
             let Some(r) = self.whnf_comparand(&right, &context)? else {
-                if std::env::var_os("FLN_CHECKER_TRACE").is_some() && attempts == 0 {
-                    eprintln!(
-                        "PROOF_CONV_WHNF_R_NONE attempts=0 r_root={:?}",
-                        right.node(right.root())
-                    );
-                }
                 fail!()
             };
             // A changed head may expose ordinary conversion or proof evidence.
@@ -1611,13 +1570,12 @@ impl Probe<'_> {
                     continue 'work;
                 }
             }
-            // KR-317 through a projection (see `Reach`): only from a side whose
-            // spine head is a projection the other side's does not share.
+            // KR-317 through a projection (see `Reach`): reduce a K recursor
+            // stuck beneath a projection before structural projection congruence,
+            // as the pin's `reduce_proj` normalizes the projected structure with
+            // `to_cnstr_when_K` before comparing projections.
             for (s, t, s_on_left) in [(&l, &r, true), (&r, &l, false)] {
-                let Some(head) = self.projection_head(s)? else {
-                    continue;
-                };
-                if self.projection_head(t)? == Some(head)
+                if self.projected_structure(s)?.is_none()
                     || !self.reaches_k_recursor(s, &context)?
                 {
                     continue;
@@ -1722,18 +1680,7 @@ impl Probe<'_> {
                     });
                     work.push(Work::Pair(other_domain, domain, context));
                 }
-                _ => {
-                    if std::env::var_os("FLN_CHECKER_TRACE").is_some() && attempts == 0 {
-                        eprintln!(
-                            "PROOF_CONV_FALLTHROUGH attempts=0 l_root={:?} r_root={:?} l_nodes={:?} r_nodes_len={}",
-                            l.node(l.root()),
-                            r.node(r.root()),
-                            &l.nodes()[..l.nodes().len().min(12)],
-                            r.nodes().len(),
-                        );
-                    }
-                    fail!()
-                }
+                _ => fail!(),
             }
         }
         Ok(true)
