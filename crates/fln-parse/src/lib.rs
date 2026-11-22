@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 pub mod build;
+pub mod builtin_table;
 pub mod category;
 pub mod command_scope;
 pub mod extensions;
