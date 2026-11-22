@@ -1754,6 +1754,26 @@ fn compare_pair(
                 expression: right_expression,
             },
         ) if left_structure == right_structure && left_index == right_index => {
+            if control.spine_head_reduces(
+                left_reference,
+                sources,
+                context,
+                !after_core,
+                cancelled,
+            )? || control.spine_head_reduces(
+                right_reference,
+                sources,
+                context,
+                !after_core,
+                cancelled,
+            )? {
+                return Ok(defer_pair(
+                    left_reference,
+                    right_reference,
+                    left_node,
+                    right_node,
+                ));
+            }
             Ok(PairAction::Push1((
                 child(left_reference, *left_expression)?,
                 child(right_reference, *right_expression)?,
@@ -4007,7 +4027,7 @@ fn run_slow(
                 // had an opportunity to fire. If both weak heads stayed stuck,
                 // congruence is still a valid sufficient proof; do not turn
                 // equal arguments beneath a neutral recursor into a deferral.
-                if let PairAction::Push2(first, second) = compare_pair(
+                match compare_pair(
                     left_reference,
                     right_reference,
                     TermSources::new(left, right, &generated),
@@ -4016,9 +4036,16 @@ fn run_slow(
                     &mut control,
                     cancelled,
                 )? {
-                    pending.push((second.0, second.1, offset_context, string_context, true));
-                    pending.push((first.0, first.1, offset_context, string_context, true));
-                    continue;
+                    PairAction::Push1((first, second)) => {
+                        pending.push((first, second, offset_context, string_context, true));
+                        continue;
+                    }
+                    PairAction::Push2(first, second) => {
+                        pending.push((second.0, second.1, offset_context, string_context, true));
+                        pending.push((first.0, first.1, offset_context, string_context, true));
+                        continue;
+                    }
+                    _ => {}
                 }
 
                 if let Some((side, term)) = string_expansion(
