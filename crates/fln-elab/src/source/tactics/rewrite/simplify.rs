@@ -1102,8 +1102,7 @@ impl Context {
         // malformed registry therefore cannot silently become an empty success.
         let mut erased = HashSet::new();
         let mut defaults = if use_default {
-            let (mut rules, default_erased) = scope::simp::read_with_erased(&self.txn.env)
-                .map_err(|e| failure(SourceInferenceError::SimpSet(e)))?;
+            let (mut rules, default_erased) = self.cached_default_simp_set()?;
             erased.extend(default_erased);
             // The enclosing scope's `attribute [local simp]` rules, after the registered ones; a
             // rule already registered is not read twice.
@@ -1140,9 +1139,6 @@ impl Context {
             }
             builtins
         };
-        for _ in &defaults {
-            self.tick()?;
-        }
         // The default set's procedures; `simp only` and `dsimp only` start with none
         // (`mkSimpContext`, `Lean/Elab/Tactic/Simp.lean:568`).
         let mut procedures = if use_default {
@@ -1380,6 +1376,42 @@ impl Context {
         Err(failure(SourceInferenceError::ResourceLimit))
     }
 
+    /// Read the registered default simp set for the current environment, reusing
+    /// the decoded rows and erasure set from `SimpKeyCache` when the environment
+    /// is unchanged. Malformed registries are never cached.
+    fn cached_default_simp_set(
+        &mut self,
+    ) -> Result<
+        (
+            Vec<scope::simp::SimpEntry>,
+            std::collections::BTreeSet<Name>,
+        ),
+        NatDefinitionElabError,
+    > {
+        self.tick()?;
+        let environment = simp_key_environment(&self.txn.env);
+        let cache = Arc::clone(&self.simp_key_cache.0);
+        {
+            let memo = cache.lock().unwrap_or_else(PoisonError::into_inner);
+            if memo.environment.as_ref() == Some(&environment)
+                && let Some(defaults) = &memo.defaults
+            {
+                return Ok(defaults.clone());
+            }
+        }
+        let decoded = scope::simp::read_with_erased(&self.txn.env)
+            .map_err(|e| failure(SourceInferenceError::SimpSet(e)))?;
+        let mut memo = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if memo.environment.as_ref() != Some(&environment) {
+            *memo = SimpKeyMemo {
+                environment: Some(environment),
+                ..SimpKeyMemo::default()
+            };
+        }
+        memo.defaults = Some(decoded.clone());
+        Ok(decoded)
+    }
+
     fn simp_selected_proof(
         &mut self,
         target: &Expr,
@@ -1389,6 +1421,23 @@ impl Context {
         for rule in rules {
             if !self.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Prove) {
                 continue;
+            }
+            if let SimpRule::Global(entry) = rule
+                && let Some(info) = self
+                    .txn
+                    .env
+                    .find(entry.proof.as_ref().unwrap_or(&entry.declaration))
+            {
+                // Unfolding definitions inside a `∀` cannot remove the outer
+                // quantifier, which line 1404 unconditionally rejects; skip
+                // before instantiating or normalizing its type.
+                let mut admitted = &info.constant_val().type_;
+                while let ExprNode::MData { expr, .. } = admitted.node() {
+                    admitted = expr;
+                }
+                if matches!(admitted.node(), ExprNode::ForallE { .. }) {
+                    continue;
+                }
             }
             self.tick()?;
             if !self.simp_rule_may_prove(rule, target)? {
@@ -2170,6 +2219,11 @@ pub(in crate::source) struct SimpKeyCache(Arc<Mutex<SimpKeyMemo>>);
 #[derive(Default)]
 struct SimpKeyMemo {
     environment: Option<SimpKeyEnvironment>,
+    /// Decoded default registered rules and erased names for `environment`.
+    defaults: Option<(
+        Vec<scope::simp::SimpEntry>,
+        std::collections::BTreeSet<Name>,
+    )>,
     rules: HashMap<(Name, Option<Name>, bool), [Option<SimpKey>; 2]>,
     /// Whether a registered theorem's statement is a permutation (`aclt.rs`).
     perms: HashMap<Name, bool>,
