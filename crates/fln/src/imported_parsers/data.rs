@@ -266,12 +266,13 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    fn child(&mut self, parent: &Value, expression: Expr) -> Result<Value, DataError> {
+    fn child_at(
+        &mut self,
+        parent: &Value,
+        expression: Expr,
+        depth: usize,
+    ) -> Result<Value, DataError> {
         self.tick()?;
-        let depth = parent
-            .depth
-            .checked_add(1)
-            .ok_or(DataError::Resource("parser-description data depth"))?;
         self.depth(depth)?;
         Ok(Value {
             expression,
@@ -279,6 +280,14 @@ impl<'a> Reader<'a> {
             universes: parent.universes.clone(),
             depth,
         })
+    }
+
+    fn child(&mut self, parent: &Value, expression: Expr) -> Result<Value, DataError> {
+        let depth = parent
+            .depth
+            .checked_add(1)
+            .ok_or(DataError::Resource("parser-description data depth"))?;
+        self.child_at(parent, expression, depth)
     }
 
     fn bind(&mut self, parent: &Value, body: Expr, argument: Value) -> Result<Value, DataError> {
@@ -428,10 +437,23 @@ impl<'a> Reader<'a> {
                     value = self.child(&value, expr.clone())?;
                     continue;
                 }
-                ExprNode::App { f, a } => {
-                    self.depth(arguments.len().saturating_add(1))?;
-                    arguments.push(self.child(&value, a.clone())?);
-                    value = self.child(&value, f.clone())?;
+                ExprNode::App { .. } => {
+                    // Unroll the full curried application spine as one nesting level so a
+                    // multi-argument constructor (`ParserDescr.binary`, `trailingNode`, ...)
+                    // charges +1 depth to all arguments instead of +arity to its head/first arg.
+                    // Spine width itself stays bounded by `self.depth(arguments.len() + 1)`.
+                    let next_depth = value
+                        .depth
+                        .checked_add(1)
+                        .ok_or(DataError::Resource("parser-description data depth"))?;
+                    self.depth(next_depth)?;
+                    let mut head_expr = value.expression.clone();
+                    while let ExprNode::App { f, a } = head_expr.node() {
+                        self.depth(arguments.len().saturating_add(1))?;
+                        arguments.push(self.child_at(&value, a.clone(), next_depth)?);
+                        head_expr = f.clone();
+                    }
+                    value = self.child_at(&value, head_expr, next_depth)?;
                     continue;
                 }
                 ExprNode::LetE {

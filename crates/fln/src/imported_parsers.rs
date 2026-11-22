@@ -11,6 +11,7 @@ use fln_core::name::Name;
 use fln_env::constants::{ConstantInfo, DefinitionSafety};
 use fln_olean::region::OpaqueExtensionBlock;
 use fln_olean::source_extensions::{DecodeError, DecodeLimits, parsers};
+use fln_parse::closure_registry::ClosureSyntaxRegistry;
 use fln_parse::extensions::{ImportedSyntaxEntry, ImportedSyntaxModule, SyntaxDecl};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -57,7 +58,7 @@ impl Default for ParserRegistryLimits {
             max_modules: 4096,
             max_declarations: 1 << 20,
             max_steps: 1 << 22,
-            max_depth: 64,
+            max_depth: 128,
             max_bytes: 16 << 20,
             max_description_nodes: 1 << 18,
             metadata: DecodeLimits::default(),
@@ -518,6 +519,18 @@ impl RegisteredParsers {
                 .extend(prepared.syntax.entries.iter().cloned());
         }
         Ok(result)
+    }
+
+    /// Build the canonical per-closure syntax registry (extracted builtin baseline plus
+    /// decoded `.olean` entries in replay order, with a deterministic BLAKE3 digest) for
+    /// `ordered_imports`.
+    pub fn closure_syntax_registry(
+        &self,
+        ordered_imports: &[Name],
+        engine: &Engine,
+    ) -> Result<ClosureSyntaxRegistry, ParserRegistrationError> {
+        let imported = self.project_imports(ordered_imports, engine)?;
+        Ok(ClosureSyntaxRegistry::from_imported(&imported))
     }
 }
 

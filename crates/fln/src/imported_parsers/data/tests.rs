@@ -501,3 +501,33 @@ fn deep_lexical_scopes_are_released_on_a_small_host_stack() {
         .unwrap();
     assert_eq!(result.unwrap(), "kept");
 }
+
+#[test]
+fn curried_application_spine_charges_one_depth_level_not_arity() {
+    let engine = base();
+    let permitted = allowed(engine);
+    // A 4-argument constructor (`ParserDescr.trailingNode` applied to kind, prec, lhs_prec, body)
+    // would exceed `max_depth = 3` if every curried App link incremented depth.
+    let mut reader = Reader::new(
+        engine.environment(),
+        &permitted,
+        DataLimits {
+            max_depth: 4,
+            ..limits()
+        },
+    );
+    let expr = app(
+        "Lean.ParserDescr.trailingNode",
+        [
+            c("Lean.Name.anonymous"),
+            number(65),
+            number(65),
+            app("Lean.ParserDescr.symbol", [text("+")]),
+        ],
+    );
+    let (ctor, args) = reader.constructor(Value::closed(expr)).unwrap();
+    assert_eq!(ctor, name("Lean.ParserDescr.trailingNode"));
+    assert_eq!(args.len(), 4);
+    assert_eq!(reader.nat_u32(args[1].clone()).unwrap(), 65);
+    assert_eq!(reader.nat_u32(args[2].clone()).unwrap(), 65);
+}

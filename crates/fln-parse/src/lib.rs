@@ -25,6 +25,7 @@ pub mod build;
 pub mod builtin_interpreter;
 pub mod builtin_table;
 pub mod category;
+pub mod closure_registry;
 pub mod command_scope;
 pub mod extensions;
 pub mod g3_ladder;
