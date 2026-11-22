@@ -1,0 +1,164 @@
+{
+ "bead": "fln-r0yh",
+ "provisional_bead": "fln-provisional-frontier-vf32",
+ "run": "S27",
+ "why": "first combined stdlib + Mathlib provisional frontier (--continue --provisional) over all 11,083 modules on main bed1e25ec4bb1a795ccbaa20ef0de7637c7b2024; advances Phase-1 accepted modules by +1,775 over S26 (9,131 -> 10,906, zero S26 regressions, 11 of 12 S26 roots now Phase-1 accepted) and exercises Phase 2 across all 170 eligible blocked modules (135 accepted-under-assumptions, 35 blocked behind 3 host-memory roots, 0 failed, 0 internalFault)",
+ "command": "fln check-olean --continue --provisional --jobs 24 --progress --json --max-bytes 17179869184 /home/ubuntu/.elan/toolchains/leanprover--lean4---v4.32.0/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/LeanSearchClient/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/Qq/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/aesop/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/batteries/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/importGraph/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/plausible/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/proofwidgets/.lake/build/lib/lean",
+ "limits": "ulimit -v 188743680 (KiB: 180 GiB)",
+ "corpus": "/data/corpus/restored-20261026/mathlib4-v4.32.0, restored 2026-10-26 from the off-host archive, archive sha256 da255177... verified before use (bead franken_lean-z8j.1.15)",
+ "binary": {
+  "sha256": "8c78dc90692fbbfafb73575876d108823e149d9d95313f216e9a0ae7b139feb1",
+  "build_command": "rch exec --base HEAD --clean-overlay --no-overlay --dependency-base /data/projects/asupersync=d6364ac476b51b5dea9abeb10d7897d96ac8fba3 -- cargo build -j 1 --release -p fln-cli --bin fln",
+  "source_commit": "bed1e25ec4bb1a795ccbaa20ef0de7637c7b2024",
+  "profile": "release"
+ },
+ "launched_utc": "2026-11-21T17:07:48Z",
+ "exit": "exit=1 elapsed=45960s (12:46:00)",
+ "peak_maxrss_kib": 154244176,
+ "peak_maxrss_gib": 147.1,
+ "result": {
+  "schema": "fln.check-olean-frontier/1",
+  "outcome": "frontier",
+  "provisional": true,
+  "authority": false,
+  "attestable": false,
+  "g1Eligible": false,
+  "trust": "recheck",
+  "policy": "release",
+  "modules": 11083,
+  "accepted": 10906,
+  "acceptedUnderAssumptions": 135,
+  "failed": 0,
+  "inconclusive": 7,
+  "internalFault": 0,
+  "blocked": 35,
+  "acceptedDeclarations": 791033,
+  "acceptedUnderAssumptionsDeclarations": 8947,
+  "eligibleBlocked": 170,
+  "ineligibleBlocked": 0,
+  "checkerPolicy": {
+   "policy": "release",
+   "k1Checked": 800113,
+   "checkerSelected": 800113,
+   "fullPolicy": 800113,
+   "skipped": 0,
+   "selectionDigest": "501b1b5e8051fc9263095edc3ab7f60bd193506f168db7a22d7f75b9f6b8f6e8"
+  }
+ },
+ "result_sha256": "402743883d006be20c81bb66dc1dc026201816d98e2a48400291dac7f03f8fdc",
+ "result_file": "S27.json (the run's --json, verbatim)",
+ "roots": [
+  {
+   "module": "Mathlib.Topology.Sheaves.SheafCondition.OpensLeCover",
+   "unlockValue": 130,
+   "firstBlockerCount": 144,
+   "acceptedDeclarations": 61,
+   "totalDeclarations": 62,
+   "assumedDeclarations": 1,
+   "assumedDeclarationNames": [
+    "TopCat.Presheaf.generateEquivalenceOpensLe._proof_2"
+   ],
+   "stopClass": "fln-checker DefEqDeferred (Projection vs Apply)"
+  },
+  {
+   "module": "Mathlib.RingTheory.Etale.Field",
+   "unlockValue": 10,
+   "firstBlockerCount": 10,
+   "acceptedDeclarations": 0,
+   "totalDeclarations": 0,
+   "assumedDeclarations": 0,
+   "assumedDeclarationNames": [],
+   "stopClass": "host memory allocation refusal (69,206,032 bytes under ulimit -v 180 GiB)"
+  },
+  {
+   "module": "Mathlib.Algebra.Category.ModuleCat.Sheaf.PushforwardContinuous",
+   "unlockValue": 4,
+   "firstBlockerCount": 5,
+   "acceptedDeclarations": 0,
+   "totalDeclarations": 0,
+   "assumedDeclarations": 0,
+   "assumedDeclarationNames": [],
+   "stopClass": "host memory allocation refusal (69,206,032 bytes under ulimit -v 180 GiB)"
+  },
+  {
+   "module": "Mathlib.Algebra.Category.ModuleCat.Presheaf.Free",
+   "unlockValue": 2,
+   "firstBlockerCount": 6,
+   "acceptedDeclarations": 30,
+   "totalDeclarations": 31,
+   "assumedDeclarations": 1,
+   "assumedDeclarationNames": [
+    "PresheafOfModules.freeObj._proof_2"
+   ],
+   "stopClass": "K1 ExecutionSteps exhaustion (500,000,001 / 500,000,000)"
+  },
+  {
+   "module": "Mathlib.NumberTheory.ModularForms.LevelOne.DimensionFormula",
+   "unlockValue": 2,
+   "firstBlockerCount": 2,
+   "acceptedDeclarations": 74,
+   "totalDeclarations": 75,
+   "assumedDeclarations": 1,
+   "assumedDeclarationNames": [
+    "_private.Mathlib.NumberTheory.ModularForms.LevelOne.DimensionFormula.0.ModularForm.E\u2086_qExpansion_coeff_one._proof_1_1"
+   ],
+   "stopClass": "fln-checker NatReduction MaterializedOwnedUnits exhaustion (199,937,251 / 199,936,371)"
+  },
+  {
+   "module": "Mathlib.LinearAlgebra.CliffordAlgebra.Contraction",
+   "unlockValue": 2,
+   "firstBlockerCount": 2,
+   "acceptedDeclarations": 0,
+   "totalDeclarations": 0,
+   "assumedDeclarations": 0,
+   "assumedDeclarationNames": [],
+   "stopClass": "host memory allocation refusal (10,240 bytes under ulimit -v 180 GiB)"
+  },
+  {
+   "module": "Mathlib.CategoryTheory.Sites.SheafCohomology.Basic",
+   "unlockValue": 1,
+   "firstBlockerCount": 1,
+   "acceptedDeclarations": 27,
+   "totalDeclarations": 30,
+   "assumedDeclarations": 3,
+   "assumedDeclarationNames": [
+    "CategoryTheory.Sheaf.H.equiv\u2080",
+    "CategoryTheory.Sheaf.H.equiv\u2080_naturality",
+    "CategoryTheory.Sheaf.H.equiv\u2080.eq_1"
+   ],
+   "stopClass": "fln-checker DefEq MaterializedOwnedUnits exhaustion (200,000,398 / 200,000,000)"
+  }
+ ],
+ "against_S26": {
+  "transitions": {
+   "accepted->p1:accepted": 9131,
+   "blocked->p1:accepted": 1764,
+   "blocked->p2:accepted-under-assumptions": 135,
+   "blocked->p2:blocked": 35,
+   "blocked->p2:inconclusive": 6,
+   "inconclusive->p1:accepted": 11,
+   "inconclusive->p2:inconclusive": 1
+  },
+  "s26_regressions": 0,
+  "s26_roots_now_phase1_accepted": [
+   "Mathlib.CategoryTheory.Bicategory.Functor.LocallyDiscrete",
+   "Mathlib.Algebra.Category.Ring.Limits",
+   "Mathlib.CategoryTheory.Limits.FilteredColimitCommutesFiniteLimit",
+   "Mathlib.Algebra.Category.ModuleCat.Monoidal.Basic",
+   "Mathlib.RingTheory.Morita.Matrix",
+   "Mathlib.RingTheory.Coalgebra.Convolution",
+   "Mathlib.RingTheory.TensorProduct.Maps",
+   "Mathlib.Algebra.Polynomial.Derivative",
+   "Mathlib.Combinatorics.SimpleGraph.Regularity.Chunk",
+   "Mathlib.Algebra.Homology.LocalCohomology",
+   "Mathlib.Algebra.Homology.DerivedCategory.Ext.ExactSequences"
+  ],
+  "s26_root_still_inconclusive": "Mathlib.LinearAlgebra.CliffordAlgebra.Contraction"
+ },
+ "not_established": [
+  "Phase-2 accepted-under-assumptions rows (135 modules, 8,947 declarations) carry authority:false, attestable:false, g1Eligible:false and do not satisfy G1 acceptance; they establish absence of failures across the unlocked tail under explicit recorded assumptions",
+  "35 eligible blocked modules downstream of the three host-memory roots (CliffordAlgebra.Contraction, RingTheory.Etale.Field, PushforwardContinuous) remained blocked in Phase 2 because those three roots could not decode/check under ulimit -v 180 GiB (0/0 declarations available to assume); they have not yet been judged",
+  "binary was built from bed1e25ec4bb1a795ccbaa20ef0de7637c7b2024; later commits on main (including ce83e50c1 fixing DimensionFormula's checker NatReduction materialization stop) are not reflected in S27.json",
+  "peak_maxrss_kib (154,244,176 KiB = 147.1 GiB) and wall time (12:46:00, 419% CPU) are from /usr/bin/time -v on this shared host under concurrent load, not a clean-host throughput benchmark"
+ ]
+}
