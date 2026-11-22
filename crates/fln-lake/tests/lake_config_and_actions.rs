@@ -87,6 +87,106 @@ defaultTargets = ["foo"]
 }
 
 #[test]
+fn module_globs_preserve_empty_settings_and_pinned_buildable_module_semantics() {
+    use fln_core::name::Name;
+    use fln_lake::library_module_is_buildable;
+
+    // Lake/Config/LeanLibConfig.lean: roots grant their descendants only when
+    // some glob selects the root itself. A glob can also select outside roots.
+    for (fields, accepted, excluded) in [
+        (
+            "roots = [\"Lib\"]\nglobs = [\"Lib.Selected\", \"Other.*\"]\n",
+            vec!["Lib.Selected", "Other", "Other.Deep.Module"],
+            vec!["Lib", "Lib.Sibling", "Lib.Selected.Child", "Otherwise"],
+        ),
+        (
+            "roots = [\"Lib\"]\nglobs = \"Lib\"\n",
+            vec!["Lib", "Lib.Child", "Lib.Child.Deep"],
+            vec!["Library", "Other.Lib"],
+        ),
+        (
+            "roots = []\nglobs = [\"Lib.+\", \"Main\"]\n",
+            vec!["Lib.Child", "Lib.Child.Deep", "Main"],
+            vec!["Lib", "Main.Child", "Target", "Library.Child"],
+        ),
+        (
+            "roots = [\"Lib\"]\nglobs = []\n",
+            vec![],
+            vec!["Lib", "Lib.Child", "Target"],
+        ),
+        ("roots = []\n", vec![], vec!["Target", "Target.Child"]),
+        (
+            "",
+            vec!["Target", "Target.Child"],
+            vec!["Targets", "Other.Target"],
+        ),
+    ] {
+        // A preceding roots=[] is not replaced when `name` is parsed later.
+        let text = format!("name = \"p\"\n[[lean_lib]]\n{fields}name = \"Target\"\n");
+        let config = LakeConfig::parse_toml_for_build(&text).unwrap();
+        assert_eq!(config, LakeConfig::parse_toml_for_execution(&text).unwrap());
+        let target = &config.targets[0];
+        let roots: Vec<_> = target
+            .roots
+            .iter()
+            .map(|name| Name::from_components(name.split('.')))
+            .collect();
+        for (expected, names) in [(true, accepted), (false, excluded)] {
+            for name in names {
+                assert_eq!(
+                    library_module_is_buildable(
+                        &Name::from_components(name.split('.')),
+                        &roots,
+                        target.globs.as_deref(),
+                    ),
+                    expected,
+                    "{name}: {fields}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn malformed_module_globs_never_become_unrestricted_libraries() {
+    for setting in [
+        "globs = 42",
+        "globs = [\"Lib.*\", false]",
+        "globs = [\"\"]",
+        "globs = [\".Lib\"]",
+        "globs = [\"Lib..Child\"]",
+        "globs = [\"Lib/Child\"]",
+        "globs = [\"../Lib\"]",
+        "globs = [\"Lib.*.Child\"]",
+    ] {
+        let text = format!("name = \"p\"\n[[lean_lib]]\nname = \"Lib\"\n{setting}\n");
+        assert!(
+            matches!(
+                LakeConfig::parse_toml_for_build(&text),
+                Err(LakeParseError::InvalidSyntax(_)),
+            ),
+            "{setting}",
+        );
+    }
+    for setting in ["globs = [\"42.Bad\"]", "globs = [\"«quoted.name».*\"]"] {
+        let text = format!("name = \"p\"\n[[lean_lib]]\nname = \"Lib\"\n{setting}\n");
+        assert!(
+            matches!(
+                LakeConfig::parse_toml_for_build(&text),
+                Err(LakeParseError::UnsupportedBuildSetting(_)),
+            ),
+            "{setting}",
+        );
+    }
+    assert!(matches!(
+        LakeConfig::parse_toml_for_build(
+            "name = \"p\"\n[[lean_exe]]\nname = \"run\"\nglobs = [\"Main\"]\n"
+        ),
+        Err(LakeParseError::UnsupportedBuildSetting(_)),
+    ));
+}
+
+#[test]
 fn local_requirements_are_retained_for_checked_execution_and_artifact_builds() {
     let source = concat!(
         "name = \"program\"\n",

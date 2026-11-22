@@ -6,7 +6,7 @@ use fln::source_check::modules::persisted::{ModuleProvenance, PersistedModules};
 use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
 use fln::source_check::modules::{SourceModuleCheckLimits, parse_source_header};
 use fln::{Name, Outcome};
-use fln_lake::{LakeConfig, TargetKind};
+use fln_lake::{LakeConfig, ModuleGlob, TargetKind, library_module_is_buildable};
 use std::path::Component;
 
 mod environment;
@@ -96,7 +96,13 @@ impl From<BoundedReadFailure> for Failure {
 #[derive(Clone)]
 struct Library {
     roots: Vec<Name>,
+    globs: Option<Vec<ModuleGlob>>,
     directory: PathBuf,
+}
+impl Library {
+    fn contains(&self, module: &Name) -> bool {
+        library_module_is_buildable(module, &self.roots, self.globs.as_deref())
+    }
 }
 struct Module {
     source: Vec<u8>,
@@ -163,17 +169,6 @@ fn check_path(root: &Path, path: &Path, allow_missing: bool) -> Result<(), Failu
     Ok(())
 }
 
-fn belongs(module: &Name, root: &Name) -> bool {
-    let mut cursor = module.clone();
-    while !cursor.is_anonymous() {
-        if &cursor == root {
-            return true;
-        }
-        cursor = cursor.parent();
-    }
-    false
-}
-
 fn source_path(module: &Name, libraries: &[Library]) -> Result<Option<PathBuf>, Failure> {
     let components = source_module_components(module)
         .ok_or_else(|| Failure::input("module names require textual components"))?;
@@ -190,7 +185,7 @@ fn source_path(module: &Name, libraries: &[Library]) -> Result<Option<PathBuf>, 
     }
     let mut found = None;
     for library in libraries {
-        if library.roots.iter().any(|root| belongs(module, root)) {
+        if library.contains(module) {
             let candidate = library.directory.join(source_import_relative_path(module)?);
             if found
                 .as_ref()
@@ -268,6 +263,7 @@ fn library_sources(root: &Path, config: &LakeConfig) -> Result<Vec<Library>, Fai
                 .iter()
                 .map(|root| name(root))
                 .collect::<Result<_, _>>()?,
+            globs: target.globs.clone(),
             directory: root.join(&config.src_dir).join(directory),
         });
     }

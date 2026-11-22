@@ -507,7 +507,7 @@ impl Sources {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let module = Name::from_components(components);
-                if !library.roots.iter().any(|root| belongs(&module, root)) {
+                if !library.contains(&module) {
                     continue;
                 }
                 if let Some(candidate) = source_path(&module, std::slice::from_ref(library))?
@@ -1098,6 +1098,7 @@ mod tests {
                 name: root_module.to_owned(),
                 kind: TargetKind::Library,
                 roots: vec![root_module.to_owned()],
+                globs: None,
                 src_dir: None,
             }],
             format,

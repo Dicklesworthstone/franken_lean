@@ -723,6 +723,7 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                         TargetKind::Library
                     },
                     roots: vec![declaration.clone()],
+                    globs: None,
                     src_dir: None,
                 });
                 if default_target {

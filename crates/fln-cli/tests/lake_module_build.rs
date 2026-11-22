@@ -1927,6 +1927,89 @@ fn respects_declared_roots_directories_and_does_not_check_unrelated_source() {
 }
 
 #[test]
+fn library_globs_build_explicit_facets_outside_roots_and_preserve_failed_outputs() {
+    let package = Package::new(concat!(
+        "name = \"globbed\"\nsrcDir = \"sources\"\n",
+        "[[lean_lib]]\nname = \"Library\"\nroots = []\n",
+        "srcDir = \"proofs\"\nglobs = [\"Lib.Base\", \"Lib.Top\"]\n",
+    ));
+    package.write("sources/proofs/Lib/Base.lean", BASE);
+    package.write("sources/proofs/Lib/Top.lean", TOP);
+    package.write("sources/proofs/Lib/Excluded.lean", "not valid Lean !!!\n");
+    let targets = ["+Lib.Top:olean", "+Lib.Top:ilean"];
+    let report = success(&package.build(&targets));
+    assert!(report.contains("\"modules_built\":2"), "{report}");
+    assert!(report.contains("\"metadata_modules\":2"), "{report}");
+    let top = package.artifact("Lib.Top");
+    let original = std::fs::read(&top).unwrap();
+    let metadata = std::fs::read(top.with_extension("ilean")).unwrap();
+    assert!(!package.artifact("Lib.Excluded").exists());
+    let error = failure(&package.build(&["+Lib.Excluded:olean"]));
+    assert!(error.contains("declared lean_lib"), "{error}");
+    package.write(
+        "sources/proofs/Lib/Top.lean",
+        "prelude\nimport Lib.Base\nimport Lib.Excluded\n",
+    );
+    let error = failure(&package.build(&targets));
+    assert!(error.contains("Lib.Excluded"), "{error}");
+    assert_eq!(std::fs::read(&top).unwrap(), original);
+    assert_eq!(
+        std::fs::read(top.with_extension("ilean")).unwrap(),
+        metadata
+    );
+    assert!(!package.artifact("Lib.Excluded").exists());
+    package.write("sources/proofs/Lib/Top.lean", TOP);
+    success(&package.build(&targets));
+}
+
+#[test]
+fn library_globs_distinguish_exact_descendant_and_root_selection() {
+    for (fields, selected, excluded) in [
+        (
+            "roots = []\nglobs = [\"Lib.*\"]\n",
+            vec!["Lib", "Lib.Child", "Lib.Child.Deep"],
+            vec!["Library", "Other"],
+        ),
+        (
+            "roots = [\"Lib\"]\nglobs = \"Lib.+\"\n",
+            vec!["Lib.Child", "Lib.Child.Deep"],
+            vec!["Lib", "Library"],
+        ),
+        (
+            "roots = [\"Lib\"]\nglobs = [\"Lib.Child\"]\n",
+            vec!["Lib.Child"],
+            vec!["Lib", "Lib.Child.Deep"],
+        ),
+        (
+            "roots = [\"Lib\"]\nglobs = [\"Lib\"]\n",
+            vec!["Lib", "Lib.Child", "Lib.Child.Deep"],
+            vec!["Library"],
+        ),
+        (
+            "roots = [\"Lib\"]\nglobs = []\n",
+            vec![],
+            vec!["Lib", "Lib.Child"],
+        ),
+    ] {
+        let package = Package::new(&format!(
+            "name = \"globbed\"\n[[lean_lib]]\nname = \"Library\"\n{fields}",
+        ));
+        for module in selected.iter().chain(&excluded) {
+            package.write(&format!("{}.lean", module.replace('.', "/")), BASE);
+        }
+        for module in &selected {
+            success(&package.build(&[&format!("+{module}:olean")]));
+            assert!(package.artifact(module).is_file(), "{module}: {fields}");
+        }
+        for module in &excluded {
+            let error = failure(&package.build(&[&format!("+{module}:olean")]));
+            assert!(error.contains("declared lean_lib"), "{module}: {error}");
+            assert!(!package.artifact(module).exists(), "{module}: {fields}");
+        }
+    }
+}
+
+#[test]
 fn refuses_incomplete_facets_unhandled_settings_and_missing_implicit_init() {
     let package = library();
     for args in [
@@ -1955,7 +2038,6 @@ fn refuses_incomplete_facets_unhandled_settings_and_missing_implicit_init() {
     );
     assert!(!package.0.join(".lake").exists());
     for setting in [
-        "globs = [\"Lib.*\"]",
         "precompileModules = true",
         "moreLeanArgs = [\"-DautoImplicit=false\"]",
     ] {

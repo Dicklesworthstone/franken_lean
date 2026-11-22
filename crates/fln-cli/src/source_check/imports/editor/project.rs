@@ -1,12 +1,18 @@
 //! Bounded declarative package discovery for editor source closures.
 //! Never execute a lakefile while answering a read-only editor query.
 use super::*;
-use fln_lake::{LakeConfig, TargetKind};
+use fln_lake::{LakeConfig, ModuleGlob, TargetKind, library_module_is_buildable};
 use std::path::Component;
 
 struct Library {
     directory: PathBuf,
     roots: Vec<Name>,
+    globs: Option<Vec<ModuleGlob>>,
+}
+impl Library {
+    fn contains(&self, module: &Name) -> bool {
+        library_module_is_buildable(module, &self.roots, self.globs.as_deref())
+    }
 }
 pub(super) struct Project {
     pub(super) root: PathBuf,
@@ -64,16 +70,6 @@ fn module_name(parts: impl IntoIterator<Item = String>) -> Result<Name, Failure>
     }
     Ok(Name::from_components(parts.iter().map(String::as_str)))
 }
-fn belongs(module: &Name, root: &Name) -> bool {
-    let mut module = module.clone();
-    while !module.is_anonymous() {
-        if &module == root {
-            return true;
-        }
-        module = module.parent();
-    }
-    false
-}
 impl Project {
     pub(super) fn discover(entry: &Path) -> Result<Option<(Self, Name)>, Failure> {
         for (depth, root) in entry
@@ -121,8 +117,11 @@ impl Project {
             {
                 roots = roots
                     .checked_add(target.roots.len())
+                    .and_then(|n| n.checked_add(target.globs.as_ref().map_or(0, Vec::len)))
                     .filter(|n| *n <= MAX_IMPORTS)
-                    .ok_or_else(|| Failure::resource("editor library root count exceeds 4096"))?;
+                    .ok_or_else(|| {
+                        Failure::resource("editor library root/glob count exceeds 4096")
+                    })?;
                 libraries.push(Library {
                     directory: directory(
                         root,
@@ -134,6 +133,7 @@ impl Project {
                         .iter()
                         .map(|s| module_name(s.split('.').map(str::to_owned)))
                         .collect::<Result<_, _>>()?,
+                    globs: target.globs.clone(),
                 });
             }
             let project = Self {
@@ -157,7 +157,7 @@ impl Project {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let candidate = Name::from_components(parts.iter().map(String::as_str));
-                if !library.roots.iter().any(|root| belongs(&candidate, root)) {
+                if !library.contains(&candidate) {
                     continue;
                 }
                 let name = module_name(parts)?;
@@ -177,7 +177,7 @@ impl Project {
     pub(super) fn source_root(&self, name: &Name) -> Result<Option<&Path>, Failure> {
         let mut found: Option<&Path> = None;
         for library in &self.libraries {
-            if library.roots.iter().any(|root| belongs(name, root)) {
+            if library.contains(name) {
                 if found.is_some_and(|old| old != library.directory) {
                     return Err(Failure::input(format!(
                         "module {} has ambiguous source directories",

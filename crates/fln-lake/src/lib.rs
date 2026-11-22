@@ -90,8 +90,65 @@ pub struct LakeTarget {
     pub kind: TargetKind,
     /// Dotted root module names. A `lean_exe` has exactly one.
     pub roots: Vec<String>,
+    /// Explicit library module globs. `None` selects each root; `Some([])`
+    /// selects nothing, as in the pinned Lake configuration.
+    pub globs: Option<Vec<ModuleGlob>>,
     /// Per-target source directory, relative to the package source directory.
     pub src_dir: Option<PathBuf>,
+}
+
+/// A module-name selection from Lake's `Glob` type (Config/Glob.lean).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleGlob {
+    /// `Foo`: only the named module.
+    One(Name),
+    /// `Foo.+`: strict descendants of the named module.
+    Submodules(Name),
+    /// `Foo.*`: the named module and all of its descendants.
+    AndSubmodules(Name),
+}
+
+impl ModuleGlob {
+    /// Match hierarchical name components, never textual prefixes.
+    pub fn matches(&self, module: &Name) -> bool {
+        match self {
+            Self::One(root) => root == module,
+            Self::Submodules(root) => root != module && module_prefix(root, module),
+            Self::AndSubmodules(root) => module_prefix(root, module),
+        }
+    }
+}
+
+fn module_prefix(root: &Name, module: &Name) -> bool {
+    let mut cursor = module.clone();
+    loop {
+        if &cursor == root {
+            return true;
+        }
+        if cursor.is_anonymous() {
+            return false;
+        }
+        cursor = cursor.parent();
+    }
+}
+
+/// Lake's `LeanLibConfig.isBuildableModule`: an explicit glob selects a module
+/// directly; selecting a declared root also makes all of its descendants
+/// buildable. A root excluded by the glob set does not grant blanket access.
+/// CLI builds, source execution and editor imports share this predicate.
+pub fn library_module_is_buildable(
+    module: &Name,
+    roots: &[Name],
+    globs: Option<&[ModuleGlob]>,
+) -> bool {
+    let Some(globs) = globs else {
+        // The omitted setting is `roots.map Glob.one`.
+        return roots.iter().any(|root| module_prefix(root, module));
+    };
+    globs.iter().any(|glob| glob.matches(module))
+        || roots
+            .iter()
+            .any(|root| module_prefix(root, module) && globs.iter().any(|glob| glob.matches(root)))
 }
 
 // ---------------------------------------------------------------------------
@@ -574,9 +631,60 @@ fn parse_string_array(s: &str) -> Option<Vec<String>> {
     Some(result)
 }
 
+/// Lake accepts a singleton string or an array for `globs`. Keep the same
+/// distinction between a missing setting and an explicitly empty array.
+fn parse_module_globs(value: &str) -> Result<Vec<ModuleGlob>, LakeParseError> {
+    use fln_core::name::identifier::{is_id_first, is_id_rest};
+
+    let values = parse_string_array(value)
+        .or_else(|| parse_string_val(value).map(|value| vec![value]))
+        .ok_or_else(|| LakeParseError::InvalidSyntax(format!("invalid module globs: {value}")))?;
+    values
+        .into_iter()
+        .map(|text| {
+            let (prefix, descendants) = if let Some(prefix) = text.strip_suffix(".*") {
+                (prefix, Some(true))
+            } else if let Some(prefix) = text.strip_suffix(".+") {
+                (prefix, Some(false))
+            } else {
+                (text.as_str(), None)
+            };
+            if prefix.is_empty() || prefix.split('.').count() > 128 {
+                return Err(LakeParseError::InvalidSyntax(format!(
+                    "module glob is empty or exceeds 128 components: {text}"
+                )));
+            }
+            if prefix.contains(['«', '»']) {
+                return Err(LakeParseError::UnsupportedBuildSetting(format!(
+                    "quoted module components in glob {text}"
+                )));
+            }
+            for part in prefix.split('.') {
+                if !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(LakeParseError::UnsupportedBuildSetting(format!(
+                        "numeric module components in glob {text}"
+                    )));
+                }
+                let mut chars = part.chars();
+                if !chars.next().is_some_and(is_id_first) || !chars.all(is_id_rest) {
+                    return Err(LakeParseError::InvalidSyntax(format!(
+                        "invalid module glob: {text}"
+                    )));
+                }
+            }
+            let name = Name::from_components(prefix.split('.'));
+            Ok(match descendants {
+                None => ModuleGlob::One(name),
+                Some(false) => ModuleGlob::Submodules(name),
+                Some(true) => ModuleGlob::AndSubmodules(name),
+            })
+        })
+        .collect()
+}
+
 impl LakeConfig {
     /// The artifact-producing path must not silently ignore compiler options,
-    /// custom globs, dependency jobs or native facets. Other configuration-only
+    /// dependency jobs or native facets. Other configuration-only
     /// commands retain their existing permissive discovery surface.
     pub fn parse_toml_for_build(content: &str) -> Result<Self, LakeParseError> {
         Self::parse_toml_strict(content)
@@ -624,6 +732,10 @@ impl LakeConfig {
                     index + 1
                 )));
             }
+            if (section, key) == ("lean_lib", "globs") {
+                parse_module_globs(value)?;
+                continue;
+            }
             let array = match (section, key) {
                 (
                     "package",
@@ -651,12 +763,6 @@ impl LakeConfig {
                 parse_string_val(value).is_none()
             } {
                 return Err(invalid());
-            }
-            if key == "roots" && parse_string_array(value).is_some_and(|roots| roots.is_empty()) {
-                return Err(LakeParseError::UnsupportedBuildSetting(format!(
-                    "line {}: an empty library roots array",
-                    index + 1
-                )));
             }
         }
         let config = Self::parse_toml(content)?;
@@ -709,6 +815,7 @@ impl LakeConfig {
         let mut build_dir = PathBuf::from(".lake/build");
         let mut requires: Vec<LakeRequire> = Vec::new();
         let mut targets: Vec<LakeTarget> = Vec::new();
+        let mut explicit_target_roots = Vec::new();
 
         #[derive(PartialEq)]
         enum Section {
@@ -748,8 +855,10 @@ impl LakeConfig {
                             TargetKind::Executable
                         },
                         roots: Vec::new(),
+                        globs: None,
                         src_dir: None,
                     });
+                    explicit_target_roots.push(false);
                 } else {
                     current_section = Section::Other;
                 }
@@ -872,10 +981,17 @@ impl LakeConfig {
                                 "root" if target.kind == TargetKind::Executable => {
                                     target.roots =
                                         vec![parse_string_val(val).ok_or_else(|| invalid("root"))?];
+                                    *explicit_target_roots.last_mut().expect("target exists") =
+                                        true;
                                 }
                                 "roots" if target.kind == TargetKind::Library => {
                                     target.roots =
                                         parse_string_array(val).ok_or_else(|| invalid("roots"))?;
+                                    *explicit_target_roots.last_mut().expect("target exists") =
+                                        true;
+                                }
+                                "globs" if target.kind == TargetKind::Library => {
+                                    target.globs = Some(parse_module_globs(val)?);
                                 }
                                 "srcDir" | "src_dir" => {
                                     target.src_dir = Some(PathBuf::from(
@@ -892,12 +1008,12 @@ impl LakeConfig {
         }
 
         let name = name.ok_or(LakeParseError::MissingField("name"))?;
-        for target in &mut targets {
+        for (target, explicit_roots) in targets.iter_mut().zip(explicit_target_roots) {
             if target.name.is_empty() {
                 return Err(LakeParseError::MissingField("lean_lib/lean_exe name"));
             }
             // Lake's defaults: a library's roots and an executable's root are its name.
-            if target.roots.is_empty() {
+            if !explicit_roots {
                 target.roots.push(target.name.clone());
             }
         }

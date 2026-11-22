@@ -265,6 +265,52 @@ fn declared_roots_and_space_containing_source_directories_are_respected() {
 }
 
 #[test]
+fn custom_library_globs_are_shared_by_editor_identity_and_import_resolution() {
+    let root = scratch();
+    let configuration = concat!(
+        "name = \"editor\"\nsrcDir = \"sources\"\n",
+        "[[lean_lib]]\nname = \"Application\"\nroots = []\n",
+        "globs = [\"App.Deep.+\"]\nsrcDir = \"app sources\"\n",
+        "[[lean_lib]]\nname = \"Library\"\nroots = [\"Lib\"]\n",
+        "globs = [\"Lib.Base\"]\nsrcDir = \"lib sources\"\n",
+    );
+    let main = write(&root, "sources/app sources/App/Deep/Main.lean", MAIN);
+    let dependency = write(&root, "sources/lib sources/Lib/Base.lean", "prelude\n");
+    for (binary, args) in [
+        (env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        (env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        write(&root, "lakefile.toml", configuration);
+        let messages = run(
+            binary,
+            args,
+            &[open(&dependency, BASE), open(&main, MAIN), goal(&main, 1)],
+        );
+        succeeds(&messages, 1);
+
+        // Being under a declared root does not authorize an excluded import.
+        // Even an open unsaved buffer cannot override the package's glob set.
+        write(
+            &root,
+            "lakefile.toml",
+            &configuration.replace("[\"Lib.Base\"]", "[\"Lib.Other\"]"),
+        );
+        let messages = run(
+            binary,
+            args,
+            &[open(&dependency, BASE), open(&main, MAIN), goal(&main, 2)],
+        );
+        assert!(result(&messages, 2).contains("\"error\":"), "{messages:#?}");
+        assert!(
+            !messages.iter().any(|message| {
+                message.contains("$/frankenLean/sourceCheck") && message.contains(&q(&uri(&main)))
+            }),
+            "excluded source must never be reported checked: {messages:#?}",
+        );
+    }
+}
+
+#[test]
 fn malformed_and_oversized_configuration_cannot_fall_back_to_another_root() {
     for config in ["name = false".to_owned(), " ".repeat(65537)] {
         let root = scratch();
