@@ -904,7 +904,10 @@ enum IntrinsicImplementation {
     FileHandleRead,
     FileHandleWrite,
     FileHandleFlush,
+    FileHandleIsTty,
     FilePathReadDir,
+    FilePathMetadata,
+    FilePathSymlinkMetadata,
     IoCurrentDir,
     FileRealPath,
     FileCreateDir,
@@ -1306,7 +1309,10 @@ impl IntrinsicImplementation {
             "extern:IO.FS.Handle.read" => Self::FileHandleRead,
             "extern:IO.FS.Handle.write" => Self::FileHandleWrite,
             "extern:IO.FS.Handle.flush" => Self::FileHandleFlush,
+            "extern:IO.FS.Handle.isTty" => Self::FileHandleIsTty,
             "extern:System.FilePath.readDir" => Self::FilePathReadDir,
+            "extern:System.FilePath.metadata" => Self::FilePathMetadata,
+            "extern:System.FilePath.symlinkMetadata" => Self::FilePathSymlinkMetadata,
             "extern:IO.currentDir" => Self::IoCurrentDir,
             "extern:IO.FS.realPath" => Self::FileRealPath,
             "extern:IO.FS.createDir" => Self::FileCreateDir,
@@ -7698,6 +7704,26 @@ fn dispatch_intrinsic(
                 .map(IntrinsicResult::owned)
                 .map_err(|error| VmRefusal::NativeFileIo { error }.into())
         }
+        IntrinsicImplementation::FileHandleIsTty => {
+            expect_arity(row, args, 1)?;
+            args[0]
+                .try_file_is_tty(&Obj::mk_nat(0))
+                .map(|value| IntrinsicResult::owned(Obj::mk_nat(usize::from(value))))
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
+        IntrinsicImplementation::FilePathMetadata
+        | IntrinsicImplementation::FilePathSymlinkMetadata => {
+            expect_arity(row, args, 1)?;
+            let world = Obj::mk_nat(0);
+            let result = if implementation == IntrinsicImplementation::FilePathMetadata {
+                Obj::try_file_metadata(&args[0], &world)
+            } else {
+                Obj::try_file_symlink_metadata(&args[0], &world)
+            };
+            result
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
         IntrinsicImplementation::FilePathReadDir => {
             expect_arity(row, args, 1)?;
             Obj::try_file_read_dir(&args[0], &Obj::mk_nat(0))
@@ -8395,6 +8421,9 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::FileHandleRead
         | IntrinsicImplementation::FileHandleWrite
         | IntrinsicImplementation::FileHandleFlush
+        | IntrinsicImplementation::FileHandleIsTty
+        | IntrinsicImplementation::FilePathMetadata
+        | IntrinsicImplementation::FilePathSymlinkMetadata
         | IntrinsicImplementation::FilePathReadDir
         | IntrinsicImplementation::IoCurrentDir
         | IntrinsicImplementation::FileRealPath

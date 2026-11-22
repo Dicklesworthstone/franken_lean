@@ -80,8 +80,8 @@ fn ilean_facets_publish_resolved_references_and_repair_changed_metadata() {
             module: "Lib.Top".to_owned(),
             name: "Lib.proof".to_owned(),
         }]
-        .definition
-        .is_some(),
+            .definition
+            .is_some(),
     );
     assert_eq!(metadata.direct_imports.len(), 1);
     assert_eq!(metadata.direct_imports[0].module, "Lib.Base");
@@ -115,7 +115,11 @@ fn ilean_facets_publish_resolved_references_and_repair_changed_metadata() {
     let changed = explain();
     assert!(changed.contains("\"kind\":\"output\""), "{changed}");
     assert!(changed.contains("Top.ilean"), "{changed}");
-    std::fs::rename(&metadata_path, metadata_path.with_extension("ilean.retained")).unwrap();
+    std::fs::rename(
+        &metadata_path,
+        metadata_path.with_extension("ilean.retained"),
+    )
+    .unwrap();
     let missing = explain();
     assert!(
         missing.contains("\"reference_decision\":\"rebuild\""),

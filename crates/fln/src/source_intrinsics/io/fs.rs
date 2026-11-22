@@ -33,6 +33,9 @@ pub(crate) enum Operation {
     RemoveFile,
     Rename,
     HardLink,
+    Metadata,
+    SymlinkMetadata,
+    IsTty,
 }
 
 impl Operation {
@@ -52,6 +55,9 @@ impl Operation {
             Self::RemoveFile,
             Self::Rename,
             Self::HardLink,
+            Self::Metadata,
+            Self::SymlinkMetadata,
+            Self::IsTty,
         ]
         .into_iter()
         .find(|operation| requested == &operation.source_name())
@@ -73,6 +79,9 @@ impl Operation {
             Self::RemoveFile => "IO.FS.removeFile",
             Self::Rename => "IO.FS.rename",
             Self::HardLink => "IO.FS.hardLink",
+            Self::Metadata => "System.FilePath.metadata",
+            Self::SymlinkMetadata => "System.FilePath.symlinkMetadata",
+            Self::IsTty => "IO.FS.Handle.isTty",
         };
         Name::from_components(label.split('.'))
     }
@@ -86,7 +95,10 @@ impl Operation {
             | Self::RealPath
             | Self::CreateDir
             | Self::RemoveDir
-            | Self::RemoveFile => 1,
+            | Self::RemoveFile
+            | Self::Metadata
+            | Self::SymlinkMetadata
+            | Self::IsTty => 1,
             _ => 2,
         }
     }
@@ -99,7 +111,15 @@ impl Operation {
     }
 
     pub(crate) fn is_path_operation(self) -> bool {
-        self.is_path_mutation() || matches!(self, Self::ReadDir | Self::CurrentDir | Self::RealPath)
+        self.is_path_mutation()
+            || matches!(
+                self,
+                Self::ReadDir
+                    | Self::CurrentDir
+                    | Self::RealPath
+                    | Self::Metadata
+                    | Self::SymlinkMetadata
+            )
     }
 
     pub(crate) fn private_name(self) -> Name {
@@ -168,6 +188,10 @@ pub(crate) fn primitive_matches(
     {
         models.extend(model::path_layout());
     }
+    if matches!(operation, Operation::Metadata | Operation::SymlinkMetadata) {
+        models.extend(model::metadata_layout());
+        models.extend(crate::source_intrinsics::string_internal::scalar_records());
+    }
     if operation == Operation::Read {
         bytes::contract_matches(environment, externs, visited, limits)?;
     }
@@ -198,6 +222,7 @@ pub(crate) fn assert_pin_models(environment: &Environment) {
     for expected in model::open_layout()
         .into_iter()
         .chain(model::directory_layout())
+        .chain(model::metadata_layout())
         .chain([
             model::handle(),
             model::primitive(Operation::Open),
@@ -214,6 +239,9 @@ pub(crate) fn assert_pin_models(environment: &Environment) {
             model::primitive(Operation::RemoveFile),
             model::primitive(Operation::Rename),
             model::primitive(Operation::HardLink),
+            model::primitive(Operation::Metadata),
+            model::primitive(Operation::SymlinkMetadata),
+            model::primitive(Operation::IsTty),
         ])
     {
         assert!(

@@ -127,9 +127,8 @@ impl ModuleBuildContext {
         max_bytes: usize,
         cancellation: Option<&dyn fln::CancellationProbe>,
     ) -> Result<fln::Outcome<Vec<u8>>, BuildBaseFailure> {
-        let cancelled = || {
-            fln::Outcome::Inconclusive(fln::Inconclusive::cancelled("lake-build/ilean"))
-        };
+        let cancelled =
+            || fln::Outcome::Inconclusive(fln::Inconclusive::cancelled("lake-build/ilean"));
         if cancellation.is_some_and(fln::CancellationProbe::is_cancelled) {
             return Ok(cancelled());
         }

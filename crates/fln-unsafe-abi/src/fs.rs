@@ -606,21 +606,15 @@ const S_IFDIR_BITS: u32 = 16384;
 const S_IFREG_BITS: u32 = 32768;
 const S_IFLNK_BITS: u32 = 40960;
 
-/// `lean_int64_to_int`'s small arm (`lean.h:1618-1623`): a value inside
-/// [INT_MIN, INT_MAX] boxes as `lean_box((unsigned)(int)n)`. The big arm is
-/// `lean_big_int64_to_int`, which is the bignum shim's Unsupported census
-/// row — unreachable for any real filesystem timestamp before the year
-/// 2038 rolls st_atim past INT_MAX, and refused typed rather than
-/// fabricated when it is.
+/// `lean_int64_to_int` (`lean.h:1618-1623`): preserve the small scalar
+/// representation and use the existing bignum shim outside it. Filesystem
+/// timestamps can precede 1901 or exceed 2038; neither is a runtime panic.
 fn int64_to_int(n: i64) -> *mut LeanObject {
     if (i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&n) {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         tagged::boxi((n as i32) as u32 as usize)
     } else {
-        crate::export::internal_panic_impl(
-            "metadata: timestamp outside the small-Int range needs the bignum shim \
-             (lean_big_int64_to_int, Unsupported census row)",
-        )
+        crate::export::export_lean_big_int64_to_int(n)
     }
 }
 

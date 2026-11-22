@@ -16,6 +16,8 @@ mod bytes;
 #[cfg(test)]
 mod flush;
 #[cfg(test)]
+mod metadata_observations;
+#[cfg(test)]
 mod mutations;
 #[cfg(test)]
 mod read;

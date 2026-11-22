@@ -596,10 +596,7 @@ struct CompileFacets<'a> {
 
 /// Every local dependency of an executable or editor target needs its companion.
 /// Other requested admission-only targets keep their independent facet contract.
-fn companion_modules(
-    entries: &BTreeSet<Name>,
-    modules: &BTreeMap<Name, Module>,
-) -> BTreeSet<Name> {
+fn companion_modules(entries: &BTreeSet<Name>, modules: &BTreeMap<Name, Module>) -> BTreeSet<Name> {
     let mut pending: Vec<_> = entries.iter().cloned().collect();
     let mut executable = BTreeSet::new();
     while let Some(name) = pending.pop() {
@@ -2110,7 +2107,9 @@ mod publication_tests {
                     std::fs::read(directory.0.join("A.ilean"))?,
                     b"new editor metadata",
                 );
-                return Err(std::io::Error::other("failure after public root publication"));
+                return Err(std::io::Error::other(
+                    "failure after public root publication",
+                ));
             }
             Ok(())
         });

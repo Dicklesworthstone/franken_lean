@@ -64,6 +64,41 @@ fn mutation_succeeded(result: Result<Obj, FileIoError>) {
 }
 
 #[test]
+fn terminal_observation_checks_native_handles_worlds_and_borrowed_ownership() {
+    let _guard = lock();
+    let path = path("terminal-observation");
+    std::fs::write(&path, b"unchanged").unwrap();
+    shadow::enable();
+    {
+        let world = Obj::mk_nat(0);
+        let opened = open(&path, 0);
+        let handle = handle(&opened);
+        let alias = handle.clone_ref();
+        let before = handle.header().rc;
+        assert!(!handle.try_file_is_tty(&world).unwrap());
+        assert!(!alias.try_file_is_tty(&world).unwrap());
+        assert_eq!(handle.header().rc, before);
+        assert_eq!(
+            handle.try_file_is_tty(&Obj::mk_nat(1)),
+            Err(FileIoError::InvalidWorld)
+        );
+        for invalid in [
+            Obj::mk_nat(0),
+            Obj::mk_string("not a native Handle"),
+            Obj::mk_ctor(0, vec![], &[]),
+            Obj::mk_ref(Obj::mk_nat(0)),
+        ] {
+            assert_eq!(
+                invalid.try_file_is_tty(&world),
+                Err(FileIoError::InvalidHandle)
+            );
+        }
+    }
+    no_leaks();
+    assert_eq!(std::fs::read(path).unwrap(), b"unchanged");
+}
+
+#[test]
 fn path_mutations_preserve_borrows_and_native_filesystem_semantics() {
     let _guard = lock();
     let directory = path("mutations-λ🙂");

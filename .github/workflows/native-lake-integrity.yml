@@ -160,6 +160,9 @@ jobs:
       - name: Check fieldless enum ABI and live IR interchange
         if: ${{ !cancelled() }}
         run: cargo test --locked -p fln --test runtime_ir fieldless_enum --no-fail-fast -- --nocapture --test-threads=1
+      - name: Check filesystem metadata and terminal effects through source execution
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p fln --lib runtime::fs::tests::metadata_observations:: --no-fail-fast -- --nocapture --test-threads=1
       - name: Check conversion goal controls against the pinned Reference
         if: ${{ !cancelled() }}
         run: cargo test --locked -p fln-cli --test conv_mode --no-fail-fast -- --nocapture --test-threads=1

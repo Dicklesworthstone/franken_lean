@@ -128,6 +128,82 @@ pub(super) fn directory_layout() -> Vec<ConstantInfo> {
     output
 }
 
+pub(super) fn metadata_layout() -> Vec<ConstantInfo> {
+    let mut output = path_layout();
+    output.push(inductive(
+        "Int",
+        vec![name("Int.ofNat"), name("Int.negSucc")],
+    ));
+    output.push(constructor("Int.ofNat", "Int", 0, vec![c("Nat")]));
+    output.push(constructor("Int.negSucc", "Int", 1, vec![c("Nat")]));
+    let width = Expr::lit(fln_core::expr::Literal::Nat(
+        fln_core::expr::NatLit::from_u64(64),
+    ));
+    let width = apply(
+        Expr::const_(name("OfNat.ofNat"), vec![Level::zero()]),
+        [c("Nat"), width.clone(), Expr::app(c("instOfNatNat"), width)],
+    );
+    output.push(inductive("UInt64", vec![name("UInt64.ofBitVec")]));
+    output.push(constructor(
+        "UInt64.ofBitVec",
+        "UInt64",
+        0,
+        vec![Expr::app(c("BitVec"), width)],
+    ));
+    let types = ["dir", "file", "symlink", "other"];
+    output.push(inductive(
+        "IO.FS.FileType",
+        types
+            .iter()
+            .map(|label| name(&format!("IO.FS.FileType.{label}")))
+            .collect(),
+    ));
+    for (index, label) in types.into_iter().enumerate() {
+        output.push(constructor(
+            &format!("IO.FS.FileType.{label}"),
+            "IO.FS.FileType",
+            index as u32,
+            Vec::new(),
+        ));
+    }
+    for (family, fields) in [
+        (
+            "IO.FS.SystemTime",
+            vec![("sec", c("Int")), ("nsec", c("UInt32"))],
+        ),
+        (
+            "IO.FS.Metadata",
+            vec![
+                ("accessed", c("IO.FS.SystemTime")),
+                ("modified", c("IO.FS.SystemTime")),
+                ("byteSize", c("UInt64")),
+                ("type", c("IO.FS.FileType")),
+                ("numLinks", c("UInt64")),
+            ],
+        ),
+    ] {
+        let ctor = format!("{family}.mk");
+        output.push(inductive(family, vec![name(&ctor)]));
+        output.push(constructor(
+            &ctor,
+            family,
+            0,
+            fields.iter().map(|(_, type_)| type_.clone()).collect(),
+        ));
+        for (index, (field, type_)) in fields.into_iter().enumerate() {
+            let label = format!("{family}.{field}");
+            output.push(ConstantInfo::Defn(DefinitionVal {
+                base: base(&label, pi(c(family), type_, BinderInfo::Default)),
+                value: lam(c(family), Expr::proj(name(family), index as u64, b(0))),
+                hints: ReducibilityHints::Abbrev,
+                safety: DefinitionSafety::Safe,
+                all: vec![name(&label)],
+            }));
+        }
+    }
+    output
+}
+
 pub(super) fn open_layout() -> Vec<ConstantInfo> {
     let mut output = path_layout();
     let labels = ["read", "write", "writeNew", "readWrite", "append"];
@@ -206,6 +282,10 @@ pub(super) fn primitive(operation: Operation) -> ConstantInfo {
         ),
         Operation::PutStr => (vec![c("IO.FS.Handle"), c("String")], c("Unit")),
         Operation::Flush => (vec![c("IO.FS.Handle")], c("Unit")),
+        Operation::IsTty => (vec![c("IO.FS.Handle")], c("Bool")),
+        Operation::Metadata | Operation::SymlinkMetadata => {
+            (vec![c("System.FilePath")], c("IO.FS.Metadata"))
+        }
         Operation::CurrentDir => (vec![], c("System.FilePath")),
         Operation::RealPath => (vec![c("System.FilePath")], c("System.FilePath")),
         Operation::CreateDir | Operation::RemoveDir | Operation::RemoveFile => {
@@ -225,17 +305,40 @@ pub(super) fn primitive(operation: Operation) -> ConstantInfo {
             ),
         ),
     };
-    let action = Expr::app(c("IO"), result.clone());
-    let instance = apply(
-        c("instInhabitedEIO"),
-        [c("IO.Error"), result, c("instInhabitedError")],
+    let action = Expr::app(
+        c(if operation == Operation::IsTty {
+            "BaseIO"
+        } else {
+            "IO"
+        }),
+        result.clone(),
     );
+    let instance = if operation == Operation::IsTty {
+        apply(
+            Expr::const_(name("instInhabitedOfMonad"), vec![Level::zero(); 2]),
+            [
+                result,
+                c("BaseIO"),
+                c("instMonadBaseIO"),
+                c("instInhabitedBool"),
+            ],
+        )
+    } else {
+        apply(
+            c("instInhabitedEIO"),
+            [c("IO.Error"), result, c("instInhabitedError")],
+        )
+    };
     let type_ = domains.iter().rev().fold(action.clone(), |body, domain| {
         pi(domain.clone(), body, BinderInfo::Default)
     });
     let value = if matches!(
         operation,
-        Operation::ReadDir | Operation::CreateDir | Operation::RemoveDir
+        Operation::ReadDir
+            | Operation::CreateDir
+            | Operation::RemoveDir
+            | Operation::Metadata
+            | Operation::SymlinkMetadata
     ) {
         // The pin declares these entire function types after the colon.
         // Its opaque default therefore inhabits that function through Pi,

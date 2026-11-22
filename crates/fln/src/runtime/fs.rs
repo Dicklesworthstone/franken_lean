@@ -13,6 +13,7 @@ use io_result::{ErrorLayout, choose};
 use std::collections::BTreeMap;
 mod bytes;
 mod directory;
+mod metadata;
 
 const HANDLE: &str = "_fln_runtime_fs_handle";
 const PAYLOAD: &str = "_fln_runtime_fs_payload";
@@ -22,6 +23,7 @@ const BYTES_TRANSPORT: &str = "_fln_runtime_fs_bytes_result";
 const DIRECTORY_TRANSPORT: &str = "_fln_runtime_fs_directory_result";
 const PATH_TRANSPORT: &str = "_fln_runtime_fs_path_result";
 const PATH_UNIT_TRANSPORT: &str = "_fln_runtime_fs_path_unit_result";
+const METADATA_TRANSPORT: &str = "_fln_runtime_fs_metadata_result";
 
 #[derive(Default)]
 pub(super) struct Store {
@@ -34,6 +36,7 @@ pub(super) struct Store {
     directory_layout: Option<Layout>,
     path_layout: Option<Layout>,
     path_unit_layout: Option<Layout>,
+    metadata_layout: Option<Layout>,
     word: Option<bytes::WordLayout>,
     word_repr_checked: bool,
     word_platform_checked: bool,
@@ -41,6 +44,7 @@ pub(super) struct Store {
     bytes: Option<bytes::Layout>,
     write_bytes: Option<bytes::WriteLayout>,
     directory: Option<directory::Layout>,
+    metadata: Option<metadata::Layout>,
 }
 
 #[derive(Clone)]
@@ -173,6 +177,7 @@ impl Preparation<'_> {
             Operation::GetLine => &self.fs.read_layout,
             Operation::Read => &self.fs.bytes_layout,
             Operation::ReadDir => &self.fs.directory_layout,
+            Operation::Metadata | Operation::SymlinkMetadata => &self.fs.metadata_layout,
             Operation::CurrentDir | Operation::RealPath => &self.fs.path_layout,
             Operation::CreateDir
             | Operation::RemoveDir
@@ -199,6 +204,7 @@ impl Preparation<'_> {
             Operation::GetLine => READ_TRANSPORT,
             Operation::Read => BYTES_TRANSPORT,
             Operation::ReadDir => DIRECTORY_TRANSPORT,
+            Operation::Metadata | Operation::SymlinkMetadata => METADATA_TRANSPORT,
             Operation::CurrentDir | Operation::RealPath => PATH_TRANSPORT,
             Operation::CreateDir
             | Operation::RemoveDir
@@ -230,6 +236,9 @@ impl Preparation<'_> {
             Operation::GetLine => self.fs.read_layout = Some(layout.clone()),
             Operation::Read => self.fs.bytes_layout = Some(layout.clone()),
             Operation::ReadDir => self.fs.directory_layout = Some(layout.clone()),
+            Operation::Metadata | Operation::SymlinkMetadata => {
+                self.fs.metadata_layout = Some(layout.clone())
+            }
             Operation::CurrentDir | Operation::RealPath => {
                 self.fs.path_layout = Some(layout.clone())
             }
@@ -278,7 +287,7 @@ impl Preparation<'_> {
                 vec![ValueType::Abi, ValueType::String],
                 vec![layout.receiver.clone(), c("String")],
             ),
-            Operation::GetLine | Operation::Flush => {
+            Operation::GetLine | Operation::Flush | Operation::IsTty => {
                 (vec![ValueType::Abi], vec![layout.receiver.clone()])
             }
             Operation::Read => {
@@ -299,7 +308,11 @@ impl Preparation<'_> {
             | Operation::RealPath
             | Operation::CreateDir
             | Operation::RemoveDir
-            | Operation::RemoveFile => (vec![ValueType::String], vec![layout.receiver.clone()]),
+            | Operation::RemoveFile
+            | Operation::Metadata
+            | Operation::SymlinkMetadata => {
+                (vec![ValueType::String], vec![layout.receiver.clone()])
+            }
             Operation::Rename | Operation::HardLink => (
                 vec![ValueType::String, ValueType::String],
                 vec![layout.receiver.clone(), layout.receiver.clone()],
@@ -315,11 +328,22 @@ impl Preparation<'_> {
                     row: row.id.to_owned(),
                     arguments,
                     argument_ownership: vec![ArgumentOwnership::Borrowed; domains.len()],
-                    result: ValueType::Constructor,
+                    result: if operation == Operation::IsTty {
+                        ValueType::Bool
+                    } else {
+                        ValueType::Constructor
+                    },
                     result_ownership: ResultOwnership::Owned,
                     effect: EffectClass::Io,
                 },
-                function(&domains, layout.transport.clone()),
+                function(
+                    &domains,
+                    if operation == Operation::IsTty {
+                        c("Bool")
+                    } else {
+                        layout.transport.clone()
+                    },
+                ),
             ),
         );
         Ok(private)
@@ -375,6 +399,10 @@ impl Preparation<'_> {
             Operation::GetLine => field(layout, 0)?,
             Operation::Read => self.fs_materialize_bytes(field(layout, 0)?)?,
             Operation::ReadDir => self.fs_materialize_directory(field(layout, 0)?)?,
+            Operation::Metadata | Operation::SymlinkMetadata => {
+                self.fs_materialize_metadata(field(layout, 0)?)?
+            }
+            Operation::IsTty => return Err(unsupported("terminal observation requires BaseIO")),
             Operation::CurrentDir | Operation::RealPath => {
                 let path = self.io_checked_shape(c("System.FilePath"))?;
                 if path.constructors.len() != 1 || path.constructors[0].fields != [c("String")] {
@@ -450,6 +478,9 @@ impl Preparation<'_> {
         }
         let layout = self.fs_layout(operation)?;
         let primitive = self.fs_bind_primitive(operation, &layout)?;
+        if operation == Operation::IsTty {
+            return self.fs_is_tty_call(arguments, &layout, primitive).map(Some);
+        }
         let result_type = match operation {
             Operation::Open => c("IO.FS.Handle"),
             Operation::PutStr
@@ -461,6 +492,8 @@ impl Preparation<'_> {
             | Operation::Rename
             | Operation::HardLink => c("Unit"),
             Operation::GetLine => c("String"),
+            Operation::IsTty => c("Bool"),
+            Operation::Metadata | Operation::SymlinkMetadata => c("IO.FS.Metadata"),
             Operation::Read => c("ByteArray"),
             Operation::ReadDir => directory::result_type(),
             Operation::CurrentDir | Operation::RealPath => c("System.FilePath"),
@@ -510,7 +543,9 @@ impl Preparation<'_> {
                 vec![layout.receiver.clone(), c("String")],
                 vec![b(2)?, b(1)?],
             ),
-            Operation::GetLine | Operation::Flush => (vec![layout.receiver.clone()], vec![b(1)?]),
+            Operation::GetLine | Operation::Flush | Operation::IsTty => {
+                (vec![layout.receiver.clone()], vec![b(1)?])
+            }
             Operation::Read => {
                 let bytes = self.fs_bytes_layout()?;
                 (
@@ -526,7 +561,9 @@ impl Preparation<'_> {
             | Operation::RealPath
             | Operation::CreateDir
             | Operation::RemoveDir
-            | Operation::RemoveFile => {
+            | Operation::RemoveFile
+            | Operation::Metadata
+            | Operation::SymlinkMetadata => {
                 let path = self.io_checked_shape(c("System.FilePath"))?;
                 if path.constructors.len() != 1 || path.constructors[0].fields != [c("String")] {
                     return Err(unsupported("directory checked FilePath layout"));

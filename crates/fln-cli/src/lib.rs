@@ -16103,7 +16103,8 @@ const LAKE_HELP_QUERY: &str = concat!(
     "output configured will be printed as an empty string or `null`.\n",
     "\n",
     "See `lake help build` for information on and examples of targets.\n",
-    "\nFrankenLean queries checked +Module:olean and supported +Module:ir facets,\n",
+    "\nFrankenLean queries checked +Module:olean, +Module:ilean and supported\n",
+    "+Module:ir facets,\n",
     "including package-qualified modules. Results retain request order and\n",
     "duplicates; JSON output contains one path string per line.\n",
 );

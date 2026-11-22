@@ -89,7 +89,10 @@ impl ModuleRow {
             files.push((artifact.with_extension("ir").display().to_string(), digest));
         }
         if let Some(digest) = &self.ilean_digest {
-            files.push((artifact.with_extension("ilean").display().to_string(), digest));
+            files.push((
+                artifact.with_extension("ilean").display().to_string(),
+                digest,
+            ));
         }
         files
     }
@@ -470,7 +473,12 @@ mod tests {
     fn whole_families_round_trip_and_legacy_snapshots_remain_readable() {
         let mut snapshot = sample();
         snapshot.configurations.clear();
-        for schema in [LEGACY_SCHEMA, COMPANION_SCHEMA, IR_SCHEMA, CONFIGURATION_SCHEMA] {
+        for schema in [
+            LEGACY_SCHEMA,
+            COMPANION_SCHEMA,
+            IR_SCHEMA,
+            CONFIGURATION_SCHEMA,
+        ] {
             assert_eq!(
                 Snapshot::parse(&snapshot.to_text().replace(SCHEMA, schema)).unwrap(),
                 snapshot
@@ -544,10 +552,11 @@ mod tests {
         let text = snapshot.to_text();
         assert_eq!(Snapshot::parse(&text).unwrap(), snapshot);
         let artifact = Path::new("current/Lib/Top.olean");
-        assert!(snapshot.modules[0].output_files(artifact).contains(&(
-            "current/Lib/Top.ilean".to_owned(),
-            digest.as_str(),
-        )));
+        assert!(
+            snapshot.modules[0]
+                .output_files(artifact)
+                .contains(&("current/Lib/Top.ilean".to_owned(), digest.as_str(),))
+        );
         let row = format!("ilean\t{digest}");
         for broken in [
             text.replace(SCHEMA, CONFIGURATION_SCHEMA),
