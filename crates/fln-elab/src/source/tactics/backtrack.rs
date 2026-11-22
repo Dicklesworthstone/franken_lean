@@ -88,9 +88,17 @@ impl<'a> Checkpoint<'a> {
         // generator (`Core.SavedState.restore`, vendored Lean/CoreM.lean:407-410), so a name
         // an abandoned branch used is not handed out again.
         let aux_names = context.aux_names.take();
+        // A tactic alternative restores its semantic state but retains InfoState
+        // (`Tactic.SavedState.restore`, Lean/Elab/Tactic/Basic.lean, defaults to
+        // `restoreInfo := false`; Term/TermElabM.lean:393-400). References observed
+        // in a failed branch remain editor uses. Keep the collector itself so
+        // failed attempts cannot refund its budget or erase an incomplete span.
+        // Term/overload checkpoints deliberately keep their own rollback policy.
+        let references = context.references.take();
         *context = (*self.context).clone();
         context.txn.budget.heartbeats_consumed = spent;
         context.aux_names = aux_names;
+        context.references = references;
     }
     pub fn retry(&self) -> bool {
         self.next < self.spec.branches.len()

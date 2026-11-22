@@ -72,10 +72,10 @@ fn tactic_ilean_facets_preserve_imported_references_through_rebuild_and_query() 
     let base = BASE.replacen("prelude\n", "prelude\nimport Init.Tactics\n", 1);
     let source = TOP
         .replace("import Lib.Base", "import Init.Tactics\nimport Lib.Base")
-        .replace(": P := h", ": P := by exact h")
+        .replace(": P := h", ": P := by\n  try exact Lib.identity\n  exact h")
         .replace(
             ": A := Lib.identity A a",
-            ": A := by\n  apply Lib.identity A\n  exact a",
+            ": A := by\n  first\n  | exact Lib.identity\n  | apply Lib.identity A\n    exact a",
         );
     check_ilean_build_repair_and_query(&base, &source, Some(&reference));
 }
@@ -151,8 +151,19 @@ fn check_ilean_build_repair_and_query(base: &str, source: &str, reference: Optio
         module: "Lib.Base".to_owned(),
         name: "Lib.identity".to_owned(),
     }];
-    assert_eq!(identity.usages.len(), 1);
-    assert_eq!(identity.usages[0].parent_decl.as_deref(), Some("Lib.again"));
+    let expected_identity_uses: &[&str] = if reference.is_some() {
+        &["Lib.again", "Lib.again", "Lib.proof"]
+    } else {
+        &["Lib.again"]
+    };
+    assert_eq!(
+        identity
+            .usages
+            .iter()
+            .map(|usage| usage.parent_decl.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        expected_identity_uses
+    );
     assert!(base_path.is_file() && top_path.is_file());
     assert!(base_path.with_extension("ilean").is_file());
     let previous_olean = std::fs::read(&top_path).unwrap();
@@ -231,7 +242,7 @@ fn unsupported_ilean_keeps_previous_artifacts_and_does_not_leave_stale_reference
         .iter()
         .map(|path| std::fs::read(path).unwrap())
         .collect();
-    let with_unobserved_control = TOP.replace(": P := h", ": P := by first | exact h");
+    let with_unobserved_control = TOP.replace(": P := h", ": P := by focus exact h");
     package.write("Lib/Top.lean", &with_unobserved_control);
     let error = failure(&package.build(&targets));
     assert!(error.contains("\"class\":\"capability\""), "{error}");

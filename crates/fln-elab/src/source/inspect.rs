@@ -179,8 +179,9 @@ pub struct SourceReference {
     pub range: Range<usize>,
 }
 
-/// This log is ordinary transactional elaborator state. Speculative branches
-/// clone and restore it together with their constraints and name resolution.
+/// Term speculation clones and restores this log with elaborator state. Tactic
+/// alternatives retain it across their semantic rollback, matching the pin's
+/// `restoreInfo := false`: even a failed proof branch has editor references.
 #[derive(Clone)]
 pub(super) struct ReferenceCollector {
     references: Vec<SourceReference>,

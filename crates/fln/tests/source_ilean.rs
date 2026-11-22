@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const BASIC: &str = "prelude\naxiom T : Type\naxiom first : T\nnoncomputable def identity (x : T) : T := x\nnoncomputable def result : T := identity first\nnoncomputable def shadow (first : T) : T := first\n";
 const TACTICS: &str = "prelude\nimport Init.Tactics\naxiom P : Prop\naxiom Q : Prop\naxiom witness : P\naxiom conclude : P → Q\ntheorem direct : P := by exact witness\ntheorem applied : Q := by\n  apply conclude\n  exact witness\ntheorem refined : Q := by\n  refine conclude ?_\n  exact witness\ntheorem introduced : P → P := by\n  intro h\n  exact h\ntheorem assumed : P → P := by\n  intros h\n  assumption\ntheorem nested : P := by exact (by exact witness)\ntheorem shadow (witness : P) : P := by exact witness\ntheorem grouped : P := by (exact witness)\ntheorem bracketed : P := by { exact witness }\n";
+const BRANCHES: &str = "prelude\nimport Init.Tactics\naxiom P : Prop\naxiom Q : Prop\naxiom witness : P\naxiom wrong : Q\ntheorem selected : P := by\n  first\n  | exact wrong\n  | exact witness\ntheorem tried : P := by\n  try exact wrong\n  exact witness\ntheorem ignored : P := by\n  first\n  | exact witness\n  | exact wrong\ntheorem nested : P := by\n  first\n  | first\n    | exact wrong\n    | exact wrong\n  | exact witness\ntheorem rollback : P → P := by\n  first\n  | intro temporary\n    exact wrong\n  | intro witness\n    exact witness\ntheorem retried : P → P := by\n  try (intro temporary; exact wrong)\n  intro witness\n  exact witness\n";
 
 fn metadata(
     sources: &[(&str, &str)],
@@ -147,7 +148,7 @@ fn metadata_limits_and_unsupported_forms_never_return_partial_success() {
         ));
     }
     let source =
-        "prelude\naxiom P : Prop\naxiom proof : P\ntheorem t : P := by first | exact proof\n";
+        "prelude\naxiom P : Prop\naxiom proof : P\ntheorem t : P := by focus exact proof\n";
     let error = metadata(
         &[("Unsupported", source)],
         "Unsupported",
@@ -406,6 +407,71 @@ fn actual_reference_tactic_metadata_matches_checked_imports_and_private_proofs()
                 ),
                 Ok(Outcome::Complete(_))
             ));
+            let branches = native(
+                &[("Branches", BRANCHES)],
+                "Branches",
+                SourceIleanLimits::default(),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+            for (name, expected) in [
+                ("witness", vec!["selected", "tried", "ignored", "nested"]),
+                (
+                    "wrong",
+                    vec!["selected", "tried", "nested", "nested", "rollback", "retried"],
+                ),
+            ] {
+                let usages = &branches.references[&IleanRefIdent::Const {
+                    module: "Branches".into(),
+                    name: name.into(),
+                }]
+                    .usages;
+                assert_eq!(
+                    usages
+                        .iter()
+                        .map(|usage| usage.parent_decl.as_deref().unwrap())
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "failed branches retain observations; unvisited branches and locals do not"
+                );
+            }
+            assert_eq!(
+                branches,
+                fixture.oracle(&reference, "Branches", BRANCHES),
+                "nested first/try observations differ from Reference"
+            );
+            let reference_count = branches
+                .references
+                .values()
+                .map(|reference| reference.usages.len() + usize::from(reference.definition.is_some()))
+                .sum::<usize>();
+            assert!(!matches!(
+                native(
+                    &[("Branches", BRANCHES)],
+                    "Branches",
+                    SourceIleanLimits {
+                        max_references: reference_count - 1,
+                        ..Default::default()
+                    }
+                ),
+                Ok(Outcome::Complete(_))
+            ));
+            // A failed field lookup has a real field-only reference in the pin.
+            // Semantic rollback must not erase the native collector's refusal.
+            let unobserved = "prelude\nimport Init.Tactics\ndef field (b : Prod Nat Bool) : Bool := by\n  first\n  | exact b.fst\n  | exact true\n";
+            let oracle = fixture.oracle(&reference, "Unobserved", unobserved);
+            assert!(oracle.references.keys().any(|key| {
+                matches!(key, IleanRefIdent::Const { name, .. } if name == "Prod.fst")
+            }));
+            let error = native(
+                &[("Unobserved", unobserved)],
+                "Unobserved",
+                SourceIleanLimits::default(),
+            )
+            .unwrap_err();
+            assert_eq!(error.disposition().2, 5, "{error}");
+            assert!(error.to_string().contains("field notation"), "{error}");
             for (name, source) in [
                 (
                     "TacticPublic",

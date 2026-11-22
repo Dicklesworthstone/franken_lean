@@ -506,7 +506,7 @@ fn location(
 
 // These forms resolve their original global identifiers through the atom door,
 // including terms elaborated by the checked proof driver. Tactic-selected lemmas,
-// backtracking controls, patterns, record fields, nested declarations and user
+// unsupported tactic controls, patterns, record fields, nested declarations and user
 // macros need their own source observations before they can join this artifact.
 fn supported_syntax(
     syntax: &Syntax,
@@ -521,6 +521,7 @@ fn supported_syntax(
         if let Syntax::Node { kind, args, .. } = node {
             let kind = kind.to_display_string();
             let allowed = kind == "null"
+                || kind == "group"
                 || kind.is_empty()
                 || matches!(kind.as_str(), "num" | "str" | "char" | "scientific")
                 || kind
@@ -597,6 +598,8 @@ fn supported_syntax(
                                 | "intro"
                                 | "intros"
                                 | "assumption"
+                                | "first"
+                                | "tacticTry_"
                         )
                     })
                 || kind.strip_prefix("Lean.Parser.Level.").is_some()
