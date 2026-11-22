@@ -170,6 +170,127 @@ pub(super) struct Probe {
     result: Option<SourceObservation>,
 }
 
+/// An original identifier resolved by the ordinary elaborator, before implicit
+/// arguments are inserted. Local variables are deliberately absent: the pinned
+/// frontend writes `.ilean` with `findModuleRefs (localVars := false)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceReference {
+    pub name: Name,
+    pub range: Range<usize>,
+}
+
+/// This log is ordinary transactional elaborator state. Speculative branches
+/// clone and restore it together with their constraints and name resolution.
+#[derive(Clone)]
+pub(super) struct ReferenceCollector {
+    references: Vec<SourceReference>,
+    complete: bool,
+    limit: usize,
+}
+
+/// Reconstruct references in an already checked declaration using its exact
+/// prefix world. This returns metadata only, never an admission token. `None`
+/// means a field/projection reference needs source information not yet retained
+/// by this collector; callers must refuse the artifact rather than omit it.
+pub fn declaration_references(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+    max_references: usize,
+) -> Result<Option<Vec<SourceReference>>, NatDefinitionElabError> {
+    let scope = scope.for_declaration(syntax)?;
+    let mut context = Context::scoped(environment, kernel, &scope)?;
+    collect_references(syntax, &mut context, max_references)
+}
+
+/// Preserve admission's exported-header/private-body transition for public
+/// theorems, instances and definitions whose implementation is hidden.
+pub fn public_declaration_references(
+    syntax: &Syntax,
+    worlds: &TheoremWorlds<'_>,
+    kernel: Budget,
+    max_references: usize,
+) -> Result<Option<Vec<SourceReference>>, NatDefinitionElabError> {
+    let mut context = if is_theorem(syntax) {
+        Context::public_theorem(syntax, worlds, kernel)?
+    } else if is_instance(syntax) {
+        Context::public_instance(syntax, worlds, kernel)?
+    } else {
+        Context::public_definition(syntax, worlds, kernel)?
+    };
+    collect_references(syntax, &mut context, max_references)
+}
+
+fn collect_references(
+    syntax: &Syntax,
+    context: &mut Context,
+    max_references: usize,
+) -> Result<Option<Vec<SourceReference>>, NatDefinitionElabError> {
+    context.references = Some(ReferenceCollector {
+        references: Vec::new(),
+        complete: true,
+        limit: max_references,
+    });
+    definition_in_context(syntax, context)?;
+    let collected = context
+        .references
+        .take()
+        .expect("reference collection enabled");
+    Ok(collected.complete.then_some(collected.references))
+}
+
+impl Context {
+    pub(super) fn refuse_reference_metadata(&mut self) {
+        if let Some(collector) = &mut self.references {
+            collector.complete = false;
+        }
+    }
+
+    pub(super) fn record_reference(
+        &mut self,
+        syntax: &Syntax,
+        term: &Typed,
+    ) -> Result<(), NatDefinitionElabError> {
+        let Some(collector) = &mut self.references else {
+            return Ok(());
+        };
+        let identifier = match syntax {
+            Syntax::Ident { .. } => syntax,
+            Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Term", "explicitUniv"]) => {
+                let Some(identifier @ Syntax::Ident { .. }) = args.first() else {
+                    collector.complete = false;
+                    return Ok(());
+                };
+                identifier
+            }
+            _ => return Ok(()),
+        };
+        let fln_syntax::source::SourceInfo::Original { pos, end_pos, .. } = identifier.info()
+        else {
+            return Ok(());
+        };
+        let name = match term.value.node() {
+            ExprNode::Const { name, .. } => name,
+            ExprNode::FVar { .. } => return Ok(()),
+            // A qualified field identifier is an application/projection, whose
+            // field-only source span must not be guessed from its spelling.
+            _ => {
+                collector.complete = false;
+                return Ok(());
+            }
+        };
+        if collector.references.len() >= collector.limit {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        collector.references.push(SourceReference {
+            name: name.clone(),
+            range: pos.0..end_pos.0,
+        });
+        Ok(())
+    }
+}
+
 /// Observe one parsed native declaration at a UTF-8 byte position in the syntax's coordinate system.
 /// The caller supplies its checked prefix environment and lexical name scope.
 /// No candidate, environment successor, or admission token is returned.

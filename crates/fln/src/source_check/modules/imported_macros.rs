@@ -945,6 +945,7 @@ impl imported::SourceOleanImport {
             cache::RunOptions {
                 cache: None,
                 collect_artifacts: true,
+                implicit_init: true,
                 contexts: Some(&self.contexts),
                 records: None,
                 macros: Some(&mut session),
@@ -1030,6 +1031,7 @@ impl imported::SourceOleanImport {
             cache::RunOptions {
                 cache: None,
                 collect_artifacts: false,
+                implicit_init: false,
                 contexts: Some(&self.contexts),
                 records: None,
                 macros: Some(&mut session),

@@ -3,6 +3,7 @@
 //! engine and is never installed into a cache as a completely checked module.
 use super::*;
 mod completion;
+mod ilean;
 mod navigation;
 mod symbols;
 mod tokens;
@@ -13,6 +14,7 @@ pub use fln_elab::source::inspect::{
     ExpressionInspector, ObservationKind, ObservedGoal, SourceObservation,
 };
 pub use fln_elab::source::scope::SourceScope;
+pub use ilean::SourceIleanLimits;
 use modules::{
     SourceModuleCheckError, SourceModuleCheckLimits, SourceModuleSession, SourceModuleSessionCheck,
 };

@@ -1018,6 +1018,7 @@ impl Engine {
             cache::RunOptions {
                 cache: None,
                 collect_artifacts: true,
+                implicit_init: true,
                 contexts: None,
                 records: None,
                 macros: None,
