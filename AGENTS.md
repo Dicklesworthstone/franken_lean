@@ -1281,6 +1281,12 @@ The predicates are **borrowed rather than re-implemented**: `crates/fln-conforma
 
 ---
 
+## Tracker Health & Wedged-DB Recovery (`fln-kyo0`)
+
+Run `bash scripts/check_beads_health.sh` at pane start (passes in ~100 ms on a healthy workspace; never rely on `br doctor health` alone, which reads only the SQLite header and exited 0 on a planted torn `beads.db-shm` while real `br` opens failed with `database is busy (recovery in progress)`). Forensic inspection of `.doctor/manual-20260927T2230Z/beads.db-shm` established the 2026-09-24 wedge cause: a stock C-SQLite reader wrote a zeroed WAL-index header with C-SQLite read-marks (`0x68..0x77`) beside FrankenSQLite's 32-byte header-only `beads.db-wal`, which pre-0.7.3 `br` refused on every command (fixed upstream in `beads_rust` v0.7.3/v0.7.4; `br 0.7.6` reads that archive cleanly). If `br` reports `database is busy (recovery in progress)` or `scripts/check_beads_health.sh` fails, first run `br doctor migrate-schema recover` (rebuilds `.beads/beads.db-shm` without altering issue data, saving pre-recovery sidecars under `.beads/.br_recovery/schema-migrations/`). If that fails or the DB stays wedged, preserve the entire `.beads/beads.db*` family (never delete!) via `ts=$(date -u +%Y%m%dT%H%M%SZ) && mkdir -p ".doctor/manual-${ts}" && mv .beads/beads.db* ".doctor/manual-${ts}/"` and rebuild from canonical `.beads/issues.jsonl` with `br doctor --repair --allow-repeated-repair`.
+
+---
+
 ## Note for Codex/GPT agents — unexpected working-tree changes
 
 If `git status` shows edits you did not make (in `Cargo.toml`, `crates/**/*.rs`, etc.), those are from the **other agents working on this project concurrently** — a normal, frequent occurrence. **NEVER** stash, revert, or overwrite another agent's work. Treat those changes exactly as if you made them yourself. Do not stop to ask about them.
