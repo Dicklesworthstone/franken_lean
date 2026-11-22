@@ -29,6 +29,7 @@ fn check(source: &str) -> Result<(), String> {
 }
 
 const TOWER: &str = "def Tower : Nat → Type\n  | 0 => Nat\n  | n + 1 => Tower n → Tower n\n";
+const MUT_STRUCT: &str = "mutual\n  def meven : Nat → Bool\n    | 0 => true\n    | n + 1 => modd n\n  def modd : Nat → Bool\n    | 0 => false\n    | n + 1 => meven n\nend\n";
 
 #[test]
 fn a_reserved_name_is_refused_with_the_pins_message() {
@@ -236,5 +237,71 @@ fn names_no_predicate_claims_stay_free() {
         "structure S where\n  congr_simp : Nat\n",
     ] {
         check(source).unwrap_or_else(|error| panic!("{source}\n{error}"));
+    }
+}
+
+#[test]
+fn mutual_structural_reserved_and_auxiliary_names_match_the_pin() {
+    // Verified against pinned `lean` v4.32.0 (2026-11-22):
+    // Meta/Tactic/FunInd.lean:1500-1520 (`induct`, `induct_unfolding`, `mutual_induct`,
+    // `mutual_induct_unfolding`) and structural auxiliary declarations (`_f`, `_sunfold`,
+    // `_unsafe_rec`). Well-founded and mutual well-founded end-to-end pin differentials live in
+    // `source_mutual_well_founded.rs` where `Init.WFTactics` is imported.
+    for (source, message) in [
+        (
+            format!("{MUT_STRUCT}def meven.mutual_induct : Nat := 1\n"),
+            "`meven.mutual_induct` is a reserved name",
+        ),
+        (
+            format!("{MUT_STRUCT}def meven.mutual_induct_unfolding : Nat := 1\n"),
+            "`meven.mutual_induct_unfolding` is a reserved name",
+        ),
+        (
+            format!("{MUT_STRUCT}def meven.induct : Nat := 1\n"),
+            "`meven.induct` is a reserved name",
+        ),
+        (
+            format!("{MUT_STRUCT}def modd.induct : Nat := 1\n"),
+            "`modd.induct` is a reserved name",
+        ),
+        (
+            format!("{MUT_STRUCT}def modd.induct_unfolding : Nat := 1\n"),
+            "`modd.induct_unfolding` is a reserved name",
+        ),
+        (
+            format!("{MUT_STRUCT}def meven._sunfold : Nat := 1\n"),
+            "`meven._sunfold` has already been declared",
+        ),
+        (
+            format!("{MUT_STRUCT}def meven._f : Nat := 1\n"),
+            "`meven._f` has already been declared",
+        ),
+        (
+            format!("{MUT_STRUCT}def meven._unsafe_rec : Nat := 1\n"),
+            "`meven._unsafe_rec` has already been declared",
+        ),
+        (
+            format!("{MUT_STRUCT}def modd._sunfold : Nat := 1\n"),
+            "`modd._sunfold` has already been declared",
+        ),
+        (
+            format!("{MUT_STRUCT}def modd._f : Nat := 1\n"),
+            "`modd._f` has already been declared",
+        ),
+        (
+            format!("{MUT_STRUCT}def modd._unsafe_rec : Nat := 1\n"),
+            "`modd._unsafe_rec` has already been declared",
+        ),
+    ] {
+        let error = check(&source).expect_err(&source);
+        assert!(error.contains(message), "{source}\n{error}");
+    }
+    // Pin-verified negative control: only the first member of a mutual block reserves
+    // `mutual_induct` / `mutual_induct_unfolding`.
+    for source in [
+        format!("{MUT_STRUCT}def modd.mutual_induct : Nat := 1\n"),
+        format!("{MUT_STRUCT}def modd.mutual_induct_unfolding : Nat := 1\n"),
+    ] {
+        check(&source).unwrap_or_else(|error| panic!("{source}\n{error}"));
     }
 }

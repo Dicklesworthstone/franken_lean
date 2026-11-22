@@ -1701,3 +1701,106 @@ end
         }
     });
 }
+
+#[test]
+fn well_founded_and_mutual_reserved_and_auxiliary_names_match_pin() {
+    let wf = "def wf (n : Nat) : Nat :=\n  match n with\n  | 0 => 0\n  | k + 1 => wf k\ntermination_by n\n";
+    let manual_wf =
+        "def manualWf (n : Nat) : Nat :=\n  WellFounded.fix Nat.lt_wfRel.wf (fun k _ => k) n\n";
+    let mut_wf = "mutual\n  def mwfA (n : Nat) : Nat :=\n    match n with\n    | 0 => 0\n    | k + 1 => mwfB k\n  termination_by n\n  def mwfB (n : Nat) : Nat :=\n    match n with\n    | 0 => 1\n    | k + 1 => mwfA k\n  termination_by n\nend\n";
+    on_generic_stack(move |base| {
+        let wf_engine = check(base, wf);
+        let manual_engine = check(base, manual_wf);
+        let mut_wf_engine = check(base, mut_wf);
+        for (prefix, engine, decl, pin_expected, fln_expected) in [
+            (
+                wf,
+                &wf_engine,
+                "def wf.induct : Nat := 1\n",
+                "`wf.induct` is a reserved name",
+                "`wf.induct` is a reserved name",
+            ),
+            (
+                wf,
+                &wf_engine,
+                "def wf.induct_unfolding : Nat := 1\n",
+                "`wf.induct_unfolding` is a reserved name",
+                "`wf.induct_unfolding` is a reserved name",
+            ),
+            (
+                wf,
+                &wf_engine,
+                "def wf._unsafe_rec : Nat := 1\n",
+                "`wf._unsafe_rec` has already been declared",
+                "`wf._unsafe_rec` is already declared",
+            ),
+            (
+                mut_wf,
+                &mut_wf_engine,
+                "def mwfA.mutual_induct : Nat := 1\n",
+                "`mwfA.mutual_induct` is a reserved name",
+                "`mwfA.mutual_induct` is a reserved name",
+            ),
+            (
+                mut_wf,
+                &mut_wf_engine,
+                "def mwfA.mutual_induct_unfolding : Nat := 1\n",
+                "`mwfA.mutual_induct_unfolding` is a reserved name",
+                "`mwfA.mutual_induct_unfolding` is a reserved name",
+            ),
+            (
+                mut_wf,
+                &mut_wf_engine,
+                "def mwfA.induct : Nat := 1\n",
+                "`mwfA.induct` is a reserved name",
+                "`mwfA.induct` is a reserved name",
+            ),
+            (
+                mut_wf,
+                &mut_wf_engine,
+                "def mwfB.induct : Nat := 1\n",
+                "`mwfB.induct` is a reserved name",
+                "`mwfB.induct` is a reserved name",
+            ),
+            (
+                mut_wf,
+                &mut_wf_engine,
+                "def mwfB._unsafe_rec : Nat := 1\n",
+                "`mwfB._unsafe_rec` has already been declared",
+                "`mwfB._unsafe_rec` is already declared",
+            ),
+        ] {
+            let pin_msg = oracle(&format!("{prefix}{decl}"), false);
+            assert!(pin_msg.contains(pin_expected), "{prefix}{decl}\n{pin_msg}");
+            let error = engine
+                .check_source_files(
+                    &[decl.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits()),
+                )
+                .expect_err(decl)
+                .to_string();
+            assert!(error.contains(fln_expected), "{decl}\n{error}");
+        }
+        for (prefix, engine, decl) in [
+            (wf, &wf_engine, "def wf.mutual_induct : Nat := 1\n"),
+            (wf, &wf_engine, "def wf._sunfold : Nat := 1\n"),
+            (wf, &wf_engine, "def wf._f : Nat := 1\n"),
+            (
+                manual_wf,
+                &manual_engine,
+                "def manualWf.induct : Nat := 1\n",
+            ),
+            (
+                mut_wf,
+                &mut_wf_engine,
+                "def mwfB.mutual_induct : Nat := 1\n",
+            ),
+            (mut_wf, &mut_wf_engine, "def mwfA._sunfold : Nat := 1\n"),
+            (mut_wf, &mut_wf_engine, "def mwfB._f : Nat := 1\n"),
+        ] {
+            oracle(&format!("{prefix}{decl}"), true);
+            check(engine, decl);
+        }
+    });
+}
