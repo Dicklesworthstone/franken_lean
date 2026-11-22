@@ -402,10 +402,14 @@ fln build explain --json +Proofs:ilean
 Metadata generation uses its own bounded source observations; an existing
 `.ilean` file or a cached module artifact cannot supply missing reference data.
 Supported forms include the native declaration, binder, application, lambda,
-and let paths. Tactic-selected references, imported macro execution, patterns,
-and other unsupported reference forms refuse the requested facet before any
-output is replaced. The native metadata path's existing restrictions still
-apply; this is not complete InfoTree or source-language coverage.
+and let paths, plus proof scripts using `exact`, `apply`, `refine`, `intro`,
+`intros`, and `assumption`. Nested proofs and indented, parenthesized, or braced
+tactic sequences retain the resolved global references from their checked
+terms; local hypotheses are excluded from the metadata. Backtracking controls,
+tactic-selected lemmas, imported macro execution, patterns, and other unsupported
+reference forms refuse the requested facet before any output is replaced. The
+native metadata path's existing restrictions still apply; this is not complete
+InfoTree or source-language coverage.
 
 Mixed `:olean`, `:ilean`, and `:ir` requests share the same checked build and
 publication rollback unit. A later build that would replace a module's logical

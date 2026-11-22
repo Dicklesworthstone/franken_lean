@@ -26,12 +26,15 @@ impl Package {
         std::fs::write(path, bytes).unwrap();
     }
     fn build(&self, targets: &[&str]) -> Output {
+        self.build_with_lean_path(targets, &self.0.join("no-imports"))
+    }
+    fn build_with_lean_path(&self, targets: &[&str], lean_path: &Path) -> Output {
         Command::new(env!("CARGO_BIN_EXE_lake"))
             .arg("--dir")
             .arg(&self.0)
             .args(["--json", "build"])
             .args(targets)
-            .env("LEAN_PATH", self.0.join("no-imports"))
+            .env("LEAN_PATH", lean_path)
             // A store of the package's own, never the user's (bead `franken_lean-z8j.1.1`).
             .env("FLN_IMPORT_REUSE_DIR", self.0.join(".records"))
             .output()
@@ -58,14 +61,44 @@ const FAMILY_PARTS: [&str; 3] = ["olean", "olean.server", "olean.private"];
 
 #[test]
 fn ilean_facets_publish_resolved_references_and_repair_changed_metadata() {
-    let package = library();
+    check_ilean_build_repair_and_query(BASE, TOP, None);
+}
+
+#[test]
+fn tactic_ilean_facets_preserve_imported_references_through_rebuild_and_query() {
+    let Some(reference) = pinned_family_reference() else {
+        return;
+    };
+    let base = BASE.replacen("prelude\n", "prelude\nimport Init.Tactics\n", 1);
+    let source = TOP
+        .replace("import Lib.Base", "import Init.Tactics\nimport Lib.Base")
+        .replace(": P := h", ": P := by exact h")
+        .replace(
+            ": A := Lib.identity A a",
+            ": A := by\n  apply Lib.identity A\n  exact a",
+        );
+    check_ilean_build_repair_and_query(&base, &source, Some(&reference));
+}
+
+fn check_ilean_build_repair_and_query(base: &str, source: &str, reference: Option<&Path>) {
+    let package = Package::new(CONFIG);
+    package.write("Lib/Base.lean", base);
+    package.write("Lib/Top.lean", source);
+    let lean_path = reference.map_or_else(
+        || package.0.join("no-imports"),
+        |reference| {
+            std::env::var_os("FLN_REFERENCE_LIB")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| reference.parent().unwrap().join("../lib/lean"))
+        },
+    );
     let targets = [
         "+Lib.Top:olean",
         "+Lib.Top:ilean",
         "+Lib.Base:ilean",
         "+Lib.Top:ilean",
     ];
-    let report = success(&package.build(&targets));
+    let report = success(&package.build_with_lean_path(&targets, &lean_path));
     assert!(report.contains("\"metadata_modules\":2"), "{report}");
     assert!(report.contains("\"snapshot\":\"written\""), "{report}");
     let base_path = package.artifact("Lib.Base");
@@ -73,6 +106,24 @@ fn ilean_facets_publish_resolved_references_and_repair_changed_metadata() {
     let metadata_path = top_path.with_extension("ilean");
     let original = std::fs::read(&metadata_path).unwrap();
     let metadata = fln::decode_ilean(&original, fln::IleanBudget::default()).unwrap();
+    if let Some(reference) = reference {
+        let oracle = Command::new(reference)
+            .current_dir(&package.0)
+            .args(["-i", "ReferenceTop.ilean", "Lib/Top.lean"])
+            .env("LEAN_PATH", package.0.join(".lake/build/lib/lean"))
+            .output()
+            .unwrap();
+        assert!(oracle.status.success(), "{oracle:?}");
+        assert_eq!(
+            metadata,
+            fln::decode_ilean(
+                &std::fs::read(package.0.join("ReferenceTop.ilean")).unwrap(),
+                fln::IleanBudget::default()
+            )
+            .unwrap(),
+            "Lake tactic metadata differs from the actual pinned producer"
+        );
+    }
     assert_eq!(metadata.module, "Lib.Top");
     assert!(metadata.decls.contains_key("Lib.again"));
     assert!(
@@ -83,8 +134,19 @@ fn ilean_facets_publish_resolved_references_and_repair_changed_metadata() {
             .definition
             .is_some(),
     );
-    assert_eq!(metadata.direct_imports.len(), 1);
-    assert_eq!(metadata.direct_imports[0].module, "Lib.Base");
+    let expected_imports: &[&str] = if reference.is_some() {
+        &["Init.Tactics", "Lib.Base"]
+    } else {
+        &["Lib.Base"]
+    };
+    assert_eq!(
+        metadata
+            .direct_imports
+            .iter()
+            .map(|import| import.module.as_str())
+            .collect::<Vec<_>>(),
+        expected_imports
+    );
     let identity = &metadata.references[&fln::IleanRefIdent::Const {
         module: "Lib.Base".to_owned(),
         name: "Lib.identity".to_owned(),
@@ -101,7 +163,7 @@ fn ilean_facets_publish_resolved_references_and_repair_changed_metadata() {
                 .args(["build", "explain", "--json", "--dir"])
                 .arg(&package.0)
                 .arg("+Lib.Top:ilean")
-                .env("LEAN_PATH", package.0.join("no-imports"))
+                .env("LEAN_PATH", &lean_path)
                 .output()
                 .unwrap(),
         )
@@ -125,7 +187,7 @@ fn ilean_facets_publish_resolved_references_and_repair_changed_metadata() {
         missing.contains("\"reference_decision\":\"rebuild\""),
         "{missing}",
     );
-    success(&package.build(&targets));
+    success(&package.build_with_lean_path(&targets, &lean_path));
     assert_eq!(std::fs::read(&metadata_path).unwrap(), original);
     assert_eq!(std::fs::read(&top_path).unwrap(), previous_olean);
 
@@ -136,7 +198,7 @@ fn ilean_facets_publish_resolved_references_and_repair_changed_metadata() {
         .arg(&package.0)
         .arg("query")
         .args(targets)
-        .env("LEAN_PATH", package.0.join("no-imports"))
+        .env("LEAN_PATH", &lean_path)
         .env("FLN_IMPORT_REUSE_DIR", package.0.join(".records"))
         .output()
         .unwrap();
@@ -169,8 +231,8 @@ fn unsupported_ilean_keeps_previous_artifacts_and_does_not_leave_stale_reference
         .iter()
         .map(|path| std::fs::read(path).unwrap())
         .collect();
-    let with_tactic = TOP.replace(": P := h", ": P := by exact h");
-    package.write("Lib/Top.lean", &with_tactic);
+    let with_unobserved_control = TOP.replace(": P := h", ": P := by first | exact h");
+    package.write("Lib/Top.lean", &with_unobserved_control);
     let error = failure(&package.build(&targets));
     assert!(error.contains("\"class\":\"capability\""), "{error}");
     assert!(error.contains(".ilean"), "{error}");
@@ -180,7 +242,7 @@ fn unsupported_ilean_keeps_previous_artifacts_and_does_not_leave_stale_reference
     // Admission still supports the program. It is metadata extraction, not
     // theorem checking, that refuses this explicitly requested facet.
     let admission_only = library();
-    admission_only.write("Lib/Top.lean", &with_tactic);
+    admission_only.write("Lib/Top.lean", &with_unobserved_control);
     success(&admission_only.build(&["+Lib.Top:olean"]));
     let error = failure(&package.build(&["+Lib.Top:olean"]));
     assert!(error.contains("coordinated replacement"), "{error}");

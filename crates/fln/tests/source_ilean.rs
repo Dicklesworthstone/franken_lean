@@ -3,13 +3,14 @@
 use fln::source_check::inspect::SourceIleanLimits;
 use fln::source_check::modules::{
     SourceModuleCacheLimits, SourceModuleCheckError, SourceModuleCheckLimits, SourceModuleSession,
-    imported::SourceOleanImport,
+    imported::{SourceOleanImport, SourceOleanImportLimits},
 };
 use fln::{Ilean, IleanBudget, IleanRefIdent, Name, Outcome, SourceModuleInput};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const BASIC: &str = "prelude\naxiom T : Type\naxiom first : T\nnoncomputable def identity (x : T) : T := x\nnoncomputable def result : T := identity first\nnoncomputable def shadow (first : T) : T := first\n";
+const TACTICS: &str = "prelude\nimport Init.Tactics\naxiom P : Prop\naxiom Q : Prop\naxiom witness : P\naxiom conclude : P → Q\ntheorem direct : P := by exact witness\ntheorem applied : Q := by\n  apply conclude\n  exact witness\ntheorem refined : Q := by\n  refine conclude ?_\n  exact witness\ntheorem introduced : P → P := by\n  intro h\n  exact h\ntheorem assumed : P → P := by\n  intros h\n  assumption\ntheorem nested : P := by exact (by exact witness)\ntheorem shadow (witness : P) : P := by exact witness\ntheorem grouped : P := by (exact witness)\ntheorem bracketed : P := by { exact witness }\n";
 
 fn metadata(
     sources: &[(&str, &str)],
@@ -92,6 +93,42 @@ fn resolved_references_roundtrip_and_exclude_shadowed_locals() {
     );
 }
 
+fn assert_tactic_references_exclude_local_hypotheses(data: &Ilean) {
+    let usages = |name: &str| {
+        data.references[&IleanRefIdent::Const {
+            module: "Tactics".into(),
+            name: name.into(),
+        }]
+            .usages
+            .iter()
+            .map(|usage| usage.parent_decl.as_deref().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        usages("witness"),
+        [
+            "direct",
+            "applied",
+            "refined",
+            "nested",
+            "grouped",
+            "bracketed"
+        ]
+    );
+    assert_eq!(usages("conclude"), ["applied", "refined"]);
+    assert!(
+        !data
+            .references
+            .keys()
+            .any(|key| matches!(key, IleanRefIdent::FVar { .. }))
+    );
+    let encoded = fln::encode_ilean(data, IleanBudget::default()).unwrap();
+    assert_eq!(
+        &fln::decode_ilean(&encoded, IleanBudget::default()).unwrap(),
+        data
+    );
+}
+
 #[test]
 fn metadata_limits_and_unsupported_forms_never_return_partial_success() {
     for limits in [
@@ -109,7 +146,8 @@ fn metadata_limits_and_unsupported_forms_never_return_partial_success() {
             Ok(Outcome::Complete(_))
         ));
     }
-    let source = "prelude\naxiom P : Prop\naxiom proof : P\ntheorem t : P := by exact proof\n";
+    let source =
+        "prelude\naxiom P : Prop\naxiom proof : P\ntheorem t : P := by first | exact proof\n";
     let error = metadata(
         &[("Unsupported", source)],
         "Unsupported",
@@ -158,15 +196,14 @@ impl Drop for Fixture {
     }
 }
 
-#[test]
-fn actual_reference_metadata_matches_native_positions_names_and_source_imports() {
+fn reference() -> Option<PathBuf> {
     let Some(reference) = std::env::var_os("FLN_REFERENCE_LEAN").map(PathBuf::from) else {
         assert!(
             std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
             "FLN_REQUIRE_REFERENCE requires FLN_REFERENCE_LEAN"
         );
         eprintln!("SKIP: set FLN_REFERENCE_LEAN for pinned .ilean production");
-        return;
+        return None;
     };
     let pin = include_str!("../../../SUITE.lock")
         .lines()
@@ -186,6 +223,14 @@ fn actual_reference_metadata_matches_native_positions_names_and_source_imports()
         pin,
         "configured Reference differs from SUITE.lock"
     );
+    Some(reference)
+}
+
+#[test]
+fn actual_reference_metadata_matches_native_positions_names_and_source_imports() {
+    let Some(reference) = reference() else {
+        return;
+    };
     let fixture = Fixture::new();
     for (name, source) in [
         ("Native", BASIC),
@@ -259,4 +304,155 @@ fn actual_reference_metadata_matches_native_positions_names_and_source_imports()
         fixture.oracle(&reference, "Imports", modern),
         "module-system import flags and worlds"
     );
+}
+
+#[test]
+fn actual_reference_tactic_metadata_matches_checked_imports_and_private_proofs() {
+    let Some(reference) = reference() else {
+        return;
+    };
+    let library = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| reference.parent().unwrap().join("../lib/lean"));
+    const STACK: usize = 256 * 1024 * 1024;
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            // `prelude` alone does not install the pin's tactic elaborators.
+            // Both producers import the actual complete Init.Tactics closure.
+            let names: Vec<_> = ["Init.Prelude", "Init.Coe", "Init.Notation", "Init.Tactics"]
+                .into_iter()
+                .map(|name| Name::from_components(name.split('.')))
+                .collect();
+            let parts: Vec<[Vec<u8>; 3]> = names
+                .iter()
+                .map(|name| {
+                    let path = library
+                        .join(name.to_display_string().replace('.', "/"))
+                        .with_extension("olean");
+                    [
+                        std::fs::read(&path).unwrap(),
+                        std::fs::read(path.with_extension("olean.server")).unwrap(),
+                        std::fs::read(path.with_extension("olean.private")).unwrap(),
+                    ]
+                })
+                .collect();
+            let inputs: Vec<_> = names
+                .iter()
+                .zip(&parts)
+                .map(|(name, [public, server, private])| fln::OleanModuleInput {
+                    name,
+                    artifact: public,
+                    server_artifact: Some(server),
+                    private_artifact: Some(private),
+                })
+                .collect();
+            let options = fln::KVMap::new();
+            let admission = fln::EngineAdmissionLimits::new(fln::Budget::for_stack_bytes(STACK));
+            let imported = fln::Engine::builder()
+                .build_empty()
+                .import_olean_modules_for_source(
+                    &inputs,
+                    &[Name::from_components(["Init", "Tactics"])],
+                    &options,
+                    SourceOleanImportLimits::new(fln::OleanCheckLimits::new(
+                        STACK,
+                        admission.kernel,
+                    )),
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            let mut session = SourceModuleSession::from_lean_imports(
+                imported,
+                options,
+                SourceModuleCheckLimits::new(fln::SourceCheckLimits::new(admission)),
+                SourceModuleCacheLimits::default(),
+            );
+            let mut native = |sources: &[(&str, &str)], entry: &str, limits| {
+                let names: Vec<_> = sources
+                    .iter()
+                    .map(|(name, _)| Name::from_components([*name]))
+                    .collect();
+                let inputs: Vec<_> = names
+                    .iter()
+                    .zip(sources)
+                    .map(|(name, (_, source))| SourceModuleInput {
+                        name,
+                        source: source.as_bytes(),
+                    })
+                    .collect();
+                session.ilean(&inputs, &Name::from_components([entry]), limits)
+            };
+            let fixture = Fixture::new();
+            let tactics = native(&[("Tactics", TACTICS)], "Tactics", SourceIleanLimits::default())
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            assert_tactic_references_exclude_local_hypotheses(&tactics);
+            assert_eq!(
+                tactics,
+                fixture.oracle(&reference, "Tactics", TACTICS),
+                "direct, refining and nested tactics differ from Reference"
+            );
+            assert!(!matches!(
+                native(
+                    &[("Tactics", TACTICS)],
+                    "Tactics",
+                    SourceIleanLimits {
+                        max_references: 1,
+                        ..Default::default()
+                    }
+                ),
+                Ok(Outcome::Complete(_))
+            ));
+            for (name, source) in [
+                (
+                    "TacticPublic",
+                    "module\nprelude\npublic import Init.Tactics\npublic axiom P : Prop\nprivate axiom hidden : P\npublic theorem checked : P := by exact hidden\n",
+                ),
+                (
+                    "TacticUnicode",
+                    "prelude\r\nimport Init.Tactics\r\naxiom «P😀» : Prop\r\naxiom «p😀» : «P😀»\r\ntheorem «δ😀» : «P😀» := by exact «p😀»\r\n",
+                ),
+            ] {
+                assert_eq!(
+                    native(&[(name, source)], name, SourceIleanLimits::default())
+                        .unwrap()
+                        .into_complete()
+                        .unwrap(),
+                    fixture.oracle(&reference, name, source),
+                    "{name} tactic .ilean differs from Reference"
+                );
+            }
+            let dependency = "prelude\naxiom T : Type\naxiom source : T\n";
+            std::fs::write(fixture.0.join("Dep.lean"), dependency).unwrap();
+            let compiled = std::process::Command::new(&reference)
+                .current_dir(&fixture.0)
+                .args(["-o", "Dep.olean", "Dep.lean"])
+                .output()
+                .unwrap();
+            assert!(
+                compiled.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&compiled.stdout),
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+            let entry = "prelude\nimport Init.Tactics\nimport Dep\nnoncomputable def copy : T := by exact source\n";
+            assert_eq!(
+                native(
+                    &[("TacticMain", entry), ("Dep", dependency)],
+                    "TacticMain",
+                    SourceIleanLimits::default()
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap(),
+                fixture.oracle(&reference, "TacticMain", entry),
+                "tactic references preserve imported declaration owners"
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

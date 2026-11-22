@@ -22,6 +22,7 @@ on:
       - 'crates/fln/src/source_check/modules/artifacts/ir.rs'
       - 'crates/fln/tests/source_notation.rs'
       - 'crates/fln/tests/source_import_aliases.rs'
+      - 'crates/fln/tests/source_ilean.rs'
       - 'crates/fln/tests/runtime_ir.rs'
   workflow_dispatch:
 permissions:
@@ -157,6 +158,9 @@ jobs:
       - name: Check overloaded notation against the pinned Reference
         if: ${{ !cancelled() }}
         run: cargo test --locked -p fln --test source_notation --test source_import_aliases --no-fail-fast -- --nocapture --test-threads=1
+      - name: Compare checked source editor metadata with the pinned Reference
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p fln --test source_ilean --no-fail-fast -- --nocapture --test-threads=1
       - name: Check fieldless enum ABI and live IR interchange
         if: ${{ !cancelled() }}
         run: cargo test --locked -p fln --test runtime_ir fieldless_enum --no-fail-fast -- --nocapture --test-threads=1

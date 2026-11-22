@@ -504,8 +504,9 @@ fn location(
     })
 }
 
-// These forms resolve their original global identifiers through the atom door.
-// Tactic-selected lemmas, patterns, record fields, nested declarations and user
+// These forms resolve their original global identifiers through the atom door,
+// including terms elaborated by the checked proof driver. Tactic-selected lemmas,
+// backtracking controls, patterns, record fields, nested declarations and user
 // macros need their own source observations before they can join this artifact.
 fn supported_syntax(
     syntax: &Syntax,
@@ -578,8 +579,26 @@ fn supported_syntax(
                             | "letVal"
                             | "optType"
                             | "quotedName"
+                            | "byTactic"
                     )
                 })
+                || kind
+                    .strip_prefix("Lean.Parser.Tactic.")
+                    .is_some_and(|kind| {
+                        matches!(
+                            kind,
+                            "tacticSeq"
+                                | "tacticSeq1Indented"
+                                | "tacticSeqBracketed"
+                                | "paren"
+                                | "exact"
+                                | "apply"
+                                | "refine"
+                                | "intro"
+                                | "intros"
+                                | "assumption"
+                        )
+                    })
                 || kind.strip_prefix("Lean.Parser.Level.").is_some()
                 || kind == "Lean.Parser.Termination.suffix"
                 || matches!(
