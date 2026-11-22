@@ -78,8 +78,8 @@ fn source_command_admits_wrappers_and_their_exact_elaborator_tags() {
         .unwrap();
     assert_eq!(
         batch.admissions.len(),
-        3,
-        "family plus two checked definitions"
+        4,
+        "family plus recOn, casesOn, and ctorIdx"
     );
     assert_eq!(batch.base_logical_root, root);
     assert_eq!(base.logical_root(&KVMap::new()), root);
@@ -98,6 +98,14 @@ fn source_command_admits_wrappers_and_their_exact_elaborator_tags() {
         assert_eq!(reducibility.get(&n), Some(Reducibility::Reducible));
         assert_eq!(protected.contains(&n), suffix == "recOn");
     }
+    let ctor_idx_name = name("Chain.ctorIdx");
+    let Some(ConstantInfo::Defn(ctor_idx)) = env.find(&ctor_idx_name) else {
+        panic!("generated Chain.ctorIdx must be an admitted definition");
+    };
+    assert_eq!(ctor_idx.hints, ReducibilityHints::Regular(1));
+    assert!(!tagged.contains(&ctor_idx_name));
+    assert_eq!(reducibility.get(&ctor_idx_name), None);
+    assert!(protected.contains(&ctor_idx_name));
     assert!(!tagged.contains(&name("Chain.rec")));
 }
 
@@ -229,7 +237,7 @@ fn recursive_source_families_publish_checked_course_of_values_with_exact_tags() 
         .unwrap()
         .into_complete()
         .unwrap();
-    assert_eq!(batch.admissions.len(), 6);
+    assert_eq!(batch.admissions.len(), 7);
     assert_eq!(base.logical_root(&KVMap::new()), root);
     assert!(!base.environment().contains(&name("Chain")));
     let env = batch.engine.environment();
@@ -366,4 +374,213 @@ fn course_of_values_collisions_refuse_the_whole_command() {
                 .contains(&name(&format!("Collision.{suffix}")))
         );
     }
+}
+
+#[test]
+fn source_inductives_publish_ctor_idx_and_to_ctor_idx_with_pin_guards_and_tags() {
+    let base = engine();
+    let checked_env = checked(
+        &base,
+        "inductive Color where | red | green | blue\n\
+         inductive Chain where | nil | cons (head : Nat) (tail : Chain)\n\
+         inductive Vec (A : Type) : Nat -> Type where\n  \
+           | nil : Vec A 0\n  \
+           | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\n\
+         inductive ProofChain : Prop where | nil | cons : ProofChain -> ProofChain\n\
+         theorem color_idx : Color.ctorIdx Color.green = 1 := rfl\n\
+         theorem color_to_idx : Color.toCtorIdx Color.blue = 2 := rfl\n\
+         theorem chain_idx : Chain.ctorIdx (Chain.cons 7 Chain.nil) = 1 := rfl\n\
+         theorem vec_idx : Vec.ctorIdx (@Vec.cons Nat 0 7 (@Vec.nil Nat)) = 1 := rfl",
+    );
+    let env = checked_env.environment();
+    let tagged = AuxRecursors::read(env).unwrap();
+    let protected = ProtectedNames::read(env).unwrap();
+    let reducibility = ReducibilityTable::read(env).unwrap();
+
+    for idx_name in ["Color.ctorIdx", "Chain.ctorIdx", "Vec.ctorIdx"] {
+        let n = name(idx_name);
+        let Some(ConstantInfo::Defn(def)) = env.find(&n) else {
+            panic!("missing {idx_name}");
+        };
+        assert!(
+            matches!(def.hints, ReducibilityHints::Regular(_)),
+            "{idx_name}"
+        );
+        assert!(protected.contains(&n), "{idx_name} must be protected");
+        assert!(!tagged.contains(&n), "{idx_name} must not be aux_recursor");
+        assert_eq!(
+            reducibility.get(&n),
+            None,
+            "{idx_name} must not be reducible"
+        );
+    }
+    let to_idx = name("Color.toCtorIdx");
+    let Some(ConstantInfo::Defn(def)) = env.find(&to_idx) else {
+        panic!("missing Color.toCtorIdx");
+    };
+    assert_eq!(def.hints, ReducibilityHints::Abbrev);
+    assert!(protected.contains(&to_idx));
+    assert!(!tagged.contains(&to_idx));
+    assert_eq!(reducibility.get(&to_idx), Some(Reducibility::Reducible));
+
+    for absent in [
+        "Chain.toCtorIdx",
+        "Vec.toCtorIdx",
+        "ProofChain.ctorIdx",
+        "ProofChain.toCtorIdx",
+    ] {
+        assert!(
+            !env.contains(&name(absent)),
+            "{absent} must not be generated"
+        );
+    }
+
+    // Live VM execution of generated `ctorIdx` and `toCtorIdx`.
+    evaluates(
+        "inductive Color where | red | green | blue\n\
+         #eval Color.ctorIdx Color.blue + Color.toCtorIdx Color.green",
+        "3",
+    );
+
+    // Pin `CtorIdx.lean:47`: a pre-existing `<T>.ctorIdx` skips generation without error.
+    let preexisting = checked(
+        &base,
+        "def Collision.ctorIdx : Nat := 7\n\
+         inductive Collision where | mk\n\
+         theorem kept : Collision.ctorIdx = 7 := rfl",
+    );
+    assert!(
+        preexisting
+            .environment()
+            .contains(&name("Collision.ctorIdx"))
+    );
+
+    // Pin `CtorIdx.lean:45`: `genCtorIdx = false` suppresses generation.
+    let mut disabled = KVMap::new();
+    disabled.insert(
+        name("genCtorIdx"),
+        fln_core::options::DataValue::OfBool(false),
+    );
+    let suppressed = base
+        .admit_source_command(
+            b"inductive Color where | red | green | blue",
+            &disabled,
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(
+        !suppressed
+            .engine
+            .environment()
+            .contains(&name("Color.ctorIdx"))
+    );
+    assert!(
+        !suppressed
+            .engine
+            .environment()
+            .contains(&name("Color.toCtorIdx"))
+    );
+}
+
+#[test]
+fn real_prelude_source_inductives_publish_ctor_elim_family_for_enum_recursive_and_indexed() {
+    use fln::source_check::modules::imported::SourceOleanImportLimits;
+    use fln::{OleanCheckLimits, OleanModuleInput};
+    const STACK: usize = 128 * 1024 * 1024;
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let module = name("Init.Prelude");
+            let inputs = [OleanModuleInput {
+                name: &module,
+                artifact: include_bytes!(
+                    "../../fln-conformance/fixtures/tag_attributes/prelude.olean"
+                ),
+                server_artifact: Some(include_bytes!(
+                    "../../fln-conformance/fixtures/tag_attributes/prelude.olean.server"
+                )),
+                private_artifact: Some(include_bytes!(
+                    "../../fln-conformance/fixtures/tag_attributes/prelude.olean.private"
+                )),
+            }];
+            let prelude_limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK));
+            let prelude_engine = Engine::builder()
+                .build_empty()
+                .import_olean_modules_for_source(
+                    &inputs,
+                    std::slice::from_ref(&module),
+                    &KVMap::new(),
+                    SourceOleanImportLimits::new(OleanCheckLimits::new(
+                        16 << 20,
+                        prelude_limits.kernel,
+                    )),
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap()
+                .engine;
+            let source = "inductive Color where | red | green | blue\n\
+                 inductive Chain where | nil | cons (head : Nat) (tail : Chain)\n\
+                 inductive Vec (A : Type) : Nat -> Type where\n  \
+                   | nil : Vec A 0\n  \
+                   | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\n\
+                 structure Pair where\n  fst : Nat\n  snd : Nat\n\
+                 theorem color_elim_ok : Color.green.elim (motive := fun _ => Nat) Color.green rfl 42 = 42 := rfl\n\
+                 theorem chain_elim_ok : Chain.cons.elim (motive := fun _ => Nat) (Chain.cons 9 Chain.nil) rfl (fun h _ => h) = 9 := rfl\n\
+                 theorem vec_elim_ok : @Vec.cons.elim Nat (fun _ _ => Nat) (Nat.succ 0) (@Vec.cons Nat 0 11 (@Vec.nil Nat)) rfl (fun _ h _ => h) = 11 := rfl";
+            let out = prelude_engine
+                .check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(prelude_limits),
+                )
+                .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+                .into_complete()
+                .unwrap();
+            let env = out.engine.environment();
+            let tagged = AuxRecursors::read(env).unwrap();
+            let protected = ProtectedNames::read(env).unwrap();
+            let reducibility = ReducibilityTable::read(env).unwrap();
+            for elim_type in ["Color.ctorElimType", "Chain.ctorElimType", "Vec.ctorElimType"] {
+                let n = name(elim_type);
+                let Some(ConstantInfo::Defn(def)) = env.find(&n) else {
+                    panic!("missing {elim_type}");
+                };
+                assert_eq!(def.hints, ReducibilityHints::Abbrev);
+                assert!(protected.contains(&n), "{elim_type}");
+                assert!(!tagged.contains(&n), "{elim_type}");
+                assert_eq!(reducibility.get(&n), Some(Reducibility::Reducible));
+            }
+            for elim_aux in [
+                "Color.ctorElim",
+                "Color.red.elim",
+                "Color.green.elim",
+                "Color.blue.elim",
+                "Chain.ctorElim",
+                "Chain.nil.elim",
+                "Chain.cons.elim",
+                "Vec.ctorElim",
+                "Vec.nil.elim",
+                "Vec.cons.elim",
+            ] {
+                let n = name(elim_aux);
+                let Some(ConstantInfo::Defn(def)) = env.find(&n) else {
+                    panic!("missing {elim_aux}");
+                };
+                assert_eq!(def.hints, ReducibilityHints::Abbrev);
+                assert!(protected.contains(&n), "{elim_aux}");
+                assert!(tagged.contains(&n), "{elim_aux} must be aux_recursor");
+                assert_eq!(reducibility.get(&n), Some(Reducibility::Reducible));
+            }
+            // Single-constructor structure gets `ctorIdx` but not `ctorElim*`.
+            assert!(env.contains(&name("Pair.ctorIdx")));
+            assert!(!env.contains(&name("Pair.ctorElimType")));
+            assert!(!env.contains(&name("Pair.ctorElim")));
+            assert!(!env.contains(&name("Pair.mk.elim")));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

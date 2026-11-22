@@ -3,33 +3,56 @@
 //! every generated definition still pass both checking seats, in order.
 use super::*;
 use fln_elab::inductive::auxiliaries::{
-    AuxiliaryError, below_declaration, brec_on_declarations, cases_on_declaration,
-    rec_on_declaration,
+    AuxiliaryError, CtorIdxConstMeta, below_declaration, brec_on_declarations,
+    cases_on_declaration, ctor_elim_declarations, ctor_idx_declarations, rec_on_declaration,
 };
 use fln_elab::source::SourceInferenceError;
 use fln_env::constants::{DefinitionVal, InductiveVal, RecursorVal};
 use std::collections::HashSet;
 
 #[derive(Default)]
-struct Candidates {
-    declarations: Vec<Declaration>,
+struct AuxiliaryMetadata {
     reducible: Vec<Name>,
     tagged: Vec<Name>,
     protected: Vec<Name>,
 }
 
+#[derive(Default)]
+struct Candidates {
+    declarations: Vec<Declaration>,
+    metadata: AuxiliaryMetadata,
+}
+
 impl Candidates {
-    fn push(&mut self, definition: DefinitionVal, tagged: bool, protected: bool) {
+    fn push(&mut self, definition: DefinitionVal, reducible: bool, tagged: bool, protected: bool) {
         let name = definition.base.name.clone();
-        self.reducible.push(name.clone());
+        if reducible {
+            self.metadata.reducible.push(name.clone());
+        }
         if tagged {
-            self.tagged.push(name.clone());
+            self.metadata.tagged.push(name.clone());
         }
         if protected {
-            self.protected.push(name);
+            self.metadata.protected.push(name);
         }
         self.declarations.push(Declaration::Defn(definition));
     }
+}
+
+fn has_ctor_elim_deps(env: &fln_env::environment::Environment) -> bool {
+    [
+        ["Nat"].as_slice(),
+        &["Nat", "ble"],
+        &["cond"],
+        &["Eq"],
+        &["Eq", "ndrec"],
+        &["Eq", "symm"],
+        &["PULift"],
+        &["PULift", "up"],
+        &["PULift", "down"],
+    ]
+    .into_iter()
+    .all(|parts| env.contains(&Name::from_components(parts.iter().copied())))
 }
 
 fn is_prop_former(inductive: &InductiveVal, mut remaining: usize) -> Result<bool, AuxiliaryError> {
@@ -143,11 +166,11 @@ impl Engine {
                 };
                 let rec_on = rec_on_declaration(recursor, budget)
                     .map_err(|error| frontend(SourceInferenceError::Auxiliary(error)))?;
-                candidates.push(rec_on, true, true);
+                candidates.push(rec_on, true, true, true);
                 if has_unit {
                     let cases_on = cases_on_declaration(inductive, recursor, &block.types, budget)
                         .map_err(|error| frontend(SourceInferenceError::Auxiliary(error)))?;
-                    candidates.push(cases_on, true, false);
+                    candidates.push(cases_on, true, true, false);
                 }
                 // The pin's mkBelow/mkBRecOn guard excludes nonrecursive and
                 // Prop-valued families, even those with large elimination.
@@ -191,7 +214,7 @@ impl Engine {
                     .map_err(|error| frontend(SourceInferenceError::Auxiliary(error)))?;
                     let below = below_declaration(recursor, &families, budget)
                         .map_err(|error| frontend(SourceInferenceError::Auxiliary(error)))?;
-                    candidates.push(below, true, true);
+                    candidates.push(below, true, true, true);
                     course_recursors.push((recursor, families));
                 }
             }
@@ -202,24 +225,41 @@ impl Engine {
         for (recursor, families) in course_recursors {
             let [go, brec_on] = brec_on_declarations(recursor, &families, budget)
                 .map_err(|error| frontend(SourceInferenceError::Auxiliary(error)))?;
-            candidates.push(go, false, true);
-            candidates.push(brec_on, true, true);
+            candidates.push(go, true, false, true);
+            candidates.push(brec_on, true, true, true);
         }
         if candidates.declarations.is_empty() {
             return Ok(Outcome::Complete(batch));
         }
-        let mut successor = match batch
-            .engine
-            .admit_declarations(&candidates.declarations, options, limits)
-            .map_err(EngineExecutionError::from)?
-        {
-            Outcome::Complete(successor) => successor,
+        let mut metadata = AuxiliaryMetadata::default();
+        match self.admit_auxiliary_declarations(
+            &mut batch,
+            candidates,
+            &mut metadata,
+            options,
+            limits,
+        )? {
+            Outcome::Complete(()) => {}
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        }
+        batch = match self.finish_source_inductive_ctor_auxiliaries(
+            batch,
+            &mut metadata,
+            options,
+            limits,
+        )? {
+            Outcome::Complete(batch) => batch,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        for name in &candidates.reducible {
-            successor.engine.environment = fln_elab::reducibility::register(
-                successor.engine.environment(),
+        // Apply all auxiliary metadata journals once after every auxiliary
+        // declaration has passed both checking seats, preserving an unbroken
+        // chain of kernel declaration transitions (`pair[0].result == pair[1].base`)
+        // before `sizeOf` elaboration runs.
+        for name in &metadata.reducible {
+            batch.engine.environment = fln_elab::reducibility::register(
+                batch.engine.environment(),
                 name,
                 fln_elab::reducibility::Reducibility::Reducible,
             )
@@ -229,21 +269,20 @@ impl Engine {
                 )))
             })?;
         }
-        successor.engine.environment = fln_elab::aux_recursors::register_module(
-            successor.engine.environment(),
-            &candidates.tagged,
-        )
-        .map_err(|error| frontend(SourceInferenceError::AuxiliaryJournal(error)))?;
-        successor.engine.environment = fln_elab::protected_names::register_module(
-            successor.engine.environment(),
-            &candidates.protected,
-        )
-        .map_err(|error| frontend(SourceInferenceError::ProtectedJournal(error)))?;
-        // Keep every council receipt in the command's admission stream so
-        // module export and replay carry the actual generated definitions.
-        // A late collision, budget stop, or journal error exposes no prefix.
-        batch.admissions.extend(successor.admissions);
-        batch.engine = successor.engine;
+        if !metadata.tagged.is_empty() {
+            batch.engine.environment = fln_elab::aux_recursors::register_module(
+                batch.engine.environment(),
+                &metadata.tagged,
+            )
+            .map_err(|error| frontend(SourceInferenceError::AuxiliaryJournal(error)))?;
+        }
+        if !metadata.protected.is_empty() {
+            batch.engine.environment = fln_elab::protected_names::register_module(
+                batch.engine.environment(),
+                &metadata.protected,
+            )
+            .map_err(|error| frontend(SourceInferenceError::ProtectedJournal(error)))?;
+        }
         batch = match self.finish_source_inductive_size_of(batch, options, limits)? {
             Outcome::Complete(batch) => batch,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -251,6 +290,165 @@ impl Engine {
         };
         batch.result_logical_root = batch.engine.logical_root(options);
         Ok(Outcome::Complete(batch))
+    }
+
+    fn admit_auxiliary_declarations(
+        &self,
+        batch: &mut DeclarationBatchAdmission,
+        candidates: Candidates,
+        metadata: &mut AuxiliaryMetadata,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<()>, EngineExecutionError> {
+        if candidates.declarations.is_empty() {
+            return Ok(Outcome::Complete(()));
+        }
+        let successor = match batch
+            .engine
+            .admit_declarations(&candidates.declarations, options, limits)
+            .map_err(EngineExecutionError::from)?
+        {
+            Outcome::Complete(successor) => successor,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        // Keep every council receipt in the command's admission stream so
+        // module export and replay carry the actual generated definitions.
+        // A late collision, budget stop, or journal error exposes no prefix.
+        batch.admissions.extend(successor.admissions);
+        batch.engine = successor.engine;
+        metadata.reducible.extend(candidates.metadata.reducible);
+        metadata.tagged.extend(candidates.metadata.tagged);
+        metadata.protected.extend(candidates.metadata.protected);
+        Ok(Outcome::Complete(()))
+    }
+
+    /// Generate and admit `<T>.ctorIdx`, enumeration `<T>.toCtorIdx`, and
+    /// `<T>.ctorElimType`/`<T>.ctorElim`/`<ctor>.elim` for newly admitted
+    /// inductive blocks, matching pinned `Lean/Elab/MutualInductive.lean:1552-1553`,
+    /// `Lean/Meta/Constructions/CtorIdx.lean`, and `CtorElim.lean`.
+    fn finish_source_inductive_ctor_auxiliaries(
+        &self,
+        mut batch: DeclarationBatchAdmission,
+        metadata: &mut AuxiliaryMetadata,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        if !options.get_bool(&Name::from_components(["genCtorIdx"]), true)
+            || !batch
+                .engine
+                .environment()
+                .contains(&Name::from_components(["Nat"]))
+        {
+            return Ok(Outcome::Complete(batch));
+        }
+        let budget = fln_elab::records::RecordBudget::default();
+        let inductives: Vec<InductiveVal> = batch
+            .admissions
+            .iter()
+            .filter_map(|admission| match &admission.declaration {
+                Declaration::Inductive(block) => Some(block.types.iter().cloned()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let mut idx_candidates = Candidates::default();
+        let mut elim_targets = Vec::new();
+        for inductive in &inductives {
+            let ctor_idx_name = Name::str(inductive.base.name.clone(), "ctorIdx");
+            // `CtorIdx.lean:47`: `if (← hasConst declName) then return`
+            if batch.engine.environment().contains(&ctor_idx_name) {
+                continue;
+            }
+            let cases_on_name = Name::str(inductive.base.name.clone(), "casesOn");
+            let Some(ConstantInfo::Defn(cases_on)) =
+                batch.engine.environment().find(&cases_on_name)
+            else {
+                continue;
+            };
+            let mut ctors = Vec::with_capacity(inductive.ctors.len());
+            for ctor_name in &inductive.ctors {
+                let Some(ConstantInfo::Ctor(ctor)) = batch.engine.environment().find(ctor_name)
+                else {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "an admitted source inductive is missing a checked constructor",
+                    });
+                };
+                ctors.push(ctor.clone());
+            }
+            let generated = ctor_idx_declarations(inductive, &ctors, cases_on, budget, |n| {
+                batch
+                    .engine
+                    .environment()
+                    .find(n)
+                    .map(CtorIdxConstMeta::from_constant)
+            })
+            .map_err(|error| frontend(SourceInferenceError::Auxiliary(error)))?;
+            let Some(cands) = generated else {
+                continue;
+            };
+            // `CtorIdx.lean:81-97`: `ctorIdx` uses `Regular(h+1)` hints and is
+            // protected, not `@[reducible]` and not an auxiliary recursor.
+            idx_candidates.push(cands.ctor_idx, false, false, true);
+            if let Some(to_ctor_idx) = cands.to_ctor_idx
+                && !batch.engine.environment().contains(&to_ctor_idx.base.name)
+            {
+                // `CtorIdx.lean:100-115`: `toCtorIdx` is protected and `@[reducible]`.
+                idx_candidates.push(to_ctor_idx, true, false, true);
+            }
+            if inductive.ctors.len() > 1 {
+                elim_targets.push((inductive.clone(), ctors));
+            }
+        }
+        match self.admit_auxiliary_declarations(
+            &mut batch,
+            idx_candidates,
+            metadata,
+            options,
+            limits,
+        )? {
+            Outcome::Complete(()) => {}
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        }
+        if elim_targets.is_empty() || !has_ctor_elim_deps(batch.engine.environment()) {
+            return Ok(Outcome::Complete(batch));
+        }
+        let mut elim_candidates = Candidates::default();
+        for (inductive, ctors) in &elim_targets {
+            let cases_on_name = Name::str(inductive.base.name.clone(), "casesOn");
+            let Some(ConstantInfo::Defn(cases_on)) =
+                batch.engine.environment().find(&cases_on_name)
+            else {
+                continue;
+            };
+            let generated = ctor_elim_declarations(inductive, ctors, cases_on, budget, |n| {
+                batch.engine.environment().find(n)
+            })
+            .map_err(|error| frontend(SourceInferenceError::Auxiliary(error)))?;
+            let Some(cands) = generated else {
+                continue;
+            };
+            // `CtorElim.lean:105-106, 157-160, 205-210`:
+            // `ctorElimType` is protected + reducible; `ctorElim` and each
+            // `<ctor>.elim` are protected + reducible + `markAuxRecursor`.
+            elim_candidates.push(cands.ctor_elim_type, true, false, true);
+            elim_candidates.push(cands.ctor_elim, true, true, true);
+            for ctor_elim in cands.constructor_elims {
+                elim_candidates.push(ctor_elim, true, true, true);
+            }
+        }
+        match self.admit_auxiliary_declarations(
+            &mut batch,
+            elim_candidates,
+            metadata,
+            options,
+            limits,
+        )? {
+            Outcome::Complete(()) => Ok(Outcome::Complete(batch)),
+            Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
+        }
     }
 
     /// Generate and admit `<first>._sizeOf_<k>`, `<I>._sizeOf_inst`, and

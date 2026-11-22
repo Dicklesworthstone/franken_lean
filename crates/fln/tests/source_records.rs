@@ -301,8 +301,8 @@ fn source_command_report_retains_every_checked_declaration_transition() {
         .unwrap()
         .into_complete()
         .unwrap();
-    // The block, two projections, the flat constructor, and two recursor auxiliaries.
-    assert_eq!(result.admissions.len(), 6);
+    // The block, two projections, the flat constructor, two recursor auxiliaries, and ctorIdx.
+    assert_eq!(result.admissions.len(), 7);
     assert!(result.admissions.iter().any(|admission| {
         matches!(
             &admission.declaration,

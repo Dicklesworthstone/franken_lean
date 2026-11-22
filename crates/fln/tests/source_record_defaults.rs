@@ -530,8 +530,8 @@ fn admission_root_includes_the_structure_interface_and_default_helpers() {
             .is_none()
     );
     assert!(result.engine.environment().contains(&helper));
-    // The block, projection, flat constructor, default helper, recOn, and casesOn.
-    assert_eq!(result.admissions.len(), 6);
+    // The block, projection, flat constructor, default helper, recOn, casesOn, and ctorIdx.
+    assert_eq!(result.admissions.len(), 7);
     assert!(
         result
             .engine
