@@ -9,6 +9,7 @@
 //! as fixed must be the original locals or their domain-checked eta expansions;
 //! changed arguments are generalized without conversion erasing their contents.
 use super::*;
+use fln_env::constants::ConstantInfo;
 mod constrained;
 mod context;
 mod course;
@@ -291,6 +292,498 @@ pub(super) fn structural_companion(definition: &DefinitionVal) -> Option<Definit
         value,
         hints: ReducibilityHints::Opaque,
         safety: fln_env::constants::DefinitionSafety::Partial,
+        all: vec![name],
+    })
+}
+
+const MAX_SUNFOLD_WORK: usize = 500_000;
+
+fn sunfold_mdata(tag: &str, expr: Expr) -> Expr {
+    let mut data = fln_core::options::KVMap::new();
+    data.insert(
+        Name::from_components([tag]),
+        fln_core::options::DataValue::OfBool(true),
+    );
+    Expr::mdata(data, expr)
+}
+
+fn has_sunfold_match(expr: &Expr, budget: &mut usize) -> bool {
+    let mut stack = vec![expr];
+    let mut seen = HashSet::new();
+    while let Some(cur) = stack.pop() {
+        let Some(next) = budget.checked_sub(1) else {
+            return false;
+        };
+        *budget = next;
+        if !seen.insert(cur.allocation_identity()) {
+            continue;
+        }
+        match cur.node() {
+            ExprNode::MData { data, expr: inner } => {
+                if data.get_bool(&Name::from_components(["sunfoldMatch"]), false) {
+                    return true;
+                }
+                stack.push(inner);
+            }
+            ExprNode::App { f, a } => {
+                stack.push(a);
+                stack.push(f);
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                stack.push(body);
+                stack.push(binder_type);
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                stack.push(body);
+                stack.push(value);
+                stack.push(type_);
+            }
+            ExprNode::Proj { expr: inner, .. } => stack.push(inner),
+            _ => {}
+        }
+    }
+    false
+}
+
+fn mentions_any_const(expr: &Expr, targets: &[Name], budget: &mut usize) -> bool {
+    let mut stack = vec![expr];
+    let mut seen = HashSet::new();
+    while let Some(cur) = stack.pop() {
+        let Some(next) = budget.checked_sub(1) else {
+            return false;
+        };
+        *budget = next;
+        if !seen.insert(cur.allocation_identity()) {
+            continue;
+        }
+        match cur.node() {
+            ExprNode::Const { name, .. } => {
+                if targets.contains(name) {
+                    return true;
+                }
+            }
+            ExprNode::App { f, a } => {
+                stack.push(a);
+                stack.push(f);
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                stack.push(body);
+                stack.push(binder_type);
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                stack.push(body);
+                stack.push(value);
+                stack.push(type_);
+            }
+            ExprNode::MData { expr: inner, .. } | ExprNode::Proj { expr: inner, .. } => {
+                stack.push(inner);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn count_leading_foralls(mut expr: &Expr, budget: &mut usize) -> Option<usize> {
+    let mut count = 0usize;
+    loop {
+        *budget = budget.checked_sub(1)?;
+        match expr.node() {
+            ExprNode::ForallE { body, .. } => {
+                count += 1;
+                expr = body;
+            }
+            ExprNode::MData { expr: inner, .. } => expr = inner,
+            _ => return Some(count),
+        }
+    }
+}
+
+/// Locate the `(minor_start, minor_binder_counts)` of a safe recursor or
+/// `<T>.casesOn` eliminator application, if `head` is one and `arity` supplies
+/// all its arguments.
+fn eliminator_minor_layout(
+    env: &Environment,
+    head: &Name,
+    arity: usize,
+    budget: &mut usize,
+) -> Option<(usize, Vec<usize>)> {
+    match env.find(head)? {
+        ConstantInfo::Rec(rec) => {
+            if rec.is_unsafe || rec.all.is_empty() || rec.num_motives as usize != rec.all.len() {
+                return None;
+            }
+            let minor_start = (rec.num_params as usize).checked_add(rec.num_motives as usize)?;
+            let num_minors = rec.num_minors as usize;
+            let needed = minor_start
+                .checked_add(num_minors)?
+                .checked_add(rec.num_indices as usize)?
+                .checked_add(1)?;
+            if arity < needed {
+                return None;
+            }
+            let mut cursor = &rec.base.type_;
+            let mut binder_counts = Vec::with_capacity(num_minors);
+            for idx in 0..minor_start + num_minors {
+                *budget = budget.checked_sub(1)?;
+                while let ExprNode::MData { expr: inner, .. } = cursor.node() {
+                    *budget = budget.checked_sub(1)?;
+                    cursor = inner;
+                }
+                let ExprNode::ForallE {
+                    binder_type, body, ..
+                } = cursor.node()
+                else {
+                    return None;
+                };
+                if idx >= minor_start {
+                    binder_counts.push(count_leading_foralls(binder_type, budget)?);
+                }
+                cursor = body;
+            }
+            Some((minor_start, binder_counts))
+        }
+        ConstantInfo::Defn(defn) if defn.safety == DefinitionSafety::Safe => {
+            if !matches!(head.leaf_view(), fln_core::name::LeafView::Str("casesOn")) {
+                return None;
+            }
+            let ConstantInfo::Induct(ind) = env.find(&head.parent())? else {
+                return None;
+            };
+            let minor_start = (ind.num_params as usize)
+                .checked_add(1)?
+                .checked_add(ind.num_indices as usize)?
+                .checked_add(1)?;
+            let needed = minor_start.checked_add(ind.ctors.len())?;
+            if arity < needed {
+                return None;
+            }
+            let mut binder_counts = Vec::with_capacity(ind.ctors.len());
+            for ctor_name in &ind.ctors {
+                let ConstantInfo::Ctor(ctor) = env.find(ctor_name)? else {
+                    return None;
+                };
+                binder_counts.push(ctor.num_fields as usize);
+            }
+            Some((minor_start, binder_counts))
+        }
+        _ => None,
+    }
+}
+
+/// Annotate recursive eliminator applications with `sunfoldMatch` and leaf
+/// alternatives with `sunfoldMatchAlt`, mirroring
+/// `Lean/Elab/PreDefinition/Structural/SmartUnfolding.lean:17-64`.
+fn annotate_sunfold_expr(
+    env: &Environment,
+    expr: &Expr,
+    targets: &[Name],
+    budget: &mut usize,
+) -> Option<Expr> {
+    *budget = budget.checked_sub(1)?;
+    match expr.node() {
+        ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => {
+            let body = annotate_sunfold_expr(env, body, targets, budget)?;
+            Some(Expr::lam(
+                binder_name.clone(),
+                binder_type.clone(),
+                body,
+                *binder_info,
+            ))
+        }
+        ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => {
+            let binder_type = annotate_sunfold_expr(env, binder_type, targets, budget)?;
+            let body = annotate_sunfold_expr(env, body, targets, budget)?;
+            Some(Expr::forall_e(
+                binder_name.clone(),
+                binder_type,
+                body,
+                *binder_info,
+            ))
+        }
+        ExprNode::LetE {
+            decl_name,
+            type_,
+            value,
+            body,
+            non_dep,
+        } => {
+            let value = annotate_sunfold_expr(env, value, targets, budget)?;
+            let body = annotate_sunfold_expr(env, body, targets, budget)?;
+            Some(Expr::let_e(
+                decl_name.clone(),
+                type_.clone(),
+                value,
+                body,
+                *non_dep,
+            ))
+        }
+        ExprNode::MData { data, expr: inner } => {
+            let inner = annotate_sunfold_expr(env, inner, targets, budget)?;
+            Some(Expr::mdata(data.clone(), inner))
+        }
+        ExprNode::Proj {
+            struct_name,
+            idx,
+            expr: inner,
+        } => {
+            let inner = annotate_sunfold_expr(env, inner, targets, budget)?;
+            Some(Expr::proj(struct_name.clone(), *idx, inner))
+        }
+        ExprNode::App { .. } => {
+            let mut head = expr;
+            let mut rev_args = Vec::new();
+            while let ExprNode::App { f, a } = head.node() {
+                *budget = budget.checked_sub(1)?;
+                rev_args.push(a.clone());
+                head = f;
+            }
+            rev_args.reverse();
+            if let ExprNode::Const { name, .. } = head.node()
+                && let Some((minor_start, binder_counts)) =
+                    eliminator_minor_layout(env, name, rev_args.len(), budget)
+                && mentions_any_const(expr, targets, budget)
+            {
+                let mut new_args = rev_args;
+                for (offset, num_binders) in binder_counts.into_iter().enumerate() {
+                    let arg_idx = minor_start + offset;
+                    let mut binders = Vec::with_capacity(num_binders);
+                    let mut cursor = new_args[arg_idx].clone();
+                    let mut peeled = 0usize;
+                    while peeled < num_binders {
+                        *budget = budget.checked_sub(1)?;
+                        let ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } = cursor.node()
+                        else {
+                            break;
+                        };
+                        binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+                        cursor = body.clone();
+                        peeled += 1;
+                    }
+                    let mut alt_body = annotate_sunfold_expr(env, &cursor, targets, budget)?;
+                    if !has_sunfold_match(&alt_body, budget) {
+                        alt_body = sunfold_mdata("sunfoldMatchAlt", alt_body);
+                    }
+                    for (bn, bt, bi) in binders.into_iter().rev() {
+                        alt_body = Expr::lam(bn, bt, alt_body, bi);
+                    }
+                    new_args[arg_idx] = alt_body;
+                }
+                let rebuilt = new_args.into_iter().fold(head.clone(), Expr::app);
+                return Some(sunfold_mdata("sunfoldMatch", rebuilt));
+            }
+            let new_head = annotate_sunfold_expr(env, head, targets, budget)?;
+            let mut rebuilt = new_head;
+            for arg in &rev_args {
+                let new_arg = annotate_sunfold_expr(env, arg, targets, budget)?;
+                rebuilt = Expr::app(rebuilt, new_arg);
+            }
+            Some(rebuilt)
+        }
+        _ => Some(expr.clone()),
+    }
+}
+
+fn sunfold_regular_height(
+    env: &Environment,
+    expr: &Expr,
+    targets: &[Name],
+    target_height: u32,
+) -> ReducibilityHints {
+    let mut max_height = 0u32;
+    let mut stack = vec![expr];
+    let mut seen = HashSet::new();
+    let mut remaining = MAX_SUNFOLD_WORK;
+    while let Some(cur) = stack.pop() {
+        let Some(next) = remaining.checked_sub(1) else {
+            break;
+        };
+        remaining = next;
+        if !seen.insert(cur.allocation_identity()) {
+            continue;
+        }
+        match cur.node() {
+            ExprNode::Const { name, .. } => {
+                let h = if targets.contains(name) {
+                    target_height
+                } else {
+                    match env.find(name) {
+                        Some(ConstantInfo::Defn(d)) => match d.hints {
+                            ReducibilityHints::Regular(h) => h,
+                            ReducibilityHints::Opaque | ReducibilityHints::Abbrev => 0,
+                        },
+                        _ => 0,
+                    }
+                };
+                max_height = max_height.max(h);
+            }
+            ExprNode::App { f, a } => {
+                stack.push(a);
+                stack.push(f);
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                stack.push(body);
+                stack.push(binder_type);
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                stack.push(body);
+                stack.push(value);
+                stack.push(type_);
+            }
+            ExprNode::MData { expr: inner, .. } | ExprNode::Proj { expr: inner, .. } => {
+                stack.push(inner);
+            }
+            _ => {}
+        }
+    }
+    ReducibilityHints::Regular(max_height.saturating_add(1))
+}
+
+/// Construct `<f>._sunfold` (`Lean/Elab/PreDefinition/Structural/SmartUnfolding.lean`)
+/// for a standalone safe structurally recursive definition whose type is not a `Prop`.
+///
+/// The resulting definition carries `DefinitionSafety::Safe`, calls `f` directly
+/// (so it must be admitted after `f`), annotates recursive eliminators with
+/// `sunfoldMatch`/`sunfoldMatchAlt`, and must pass both checking seats through
+/// ordinary admission.
+pub(super) fn structural_smart_unfolding(
+    env: &Environment,
+    definition: &DefinitionVal,
+) -> Option<DefinitionVal> {
+    if definition.safety != DefinitionSafety::Safe {
+        return None;
+    }
+    let mut binders = Vec::new();
+    let mut body = &definition.value;
+    while let ExprNode::Lam {
+        binder_name,
+        binder_type,
+        body: inner,
+        binder_info,
+    } = body.node()
+    {
+        binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+        body = inner;
+    }
+    let ExprNode::LetE {
+        decl_name, value, ..
+    } = body.node()
+    else {
+        return None;
+    };
+    let header = structural_obligation_parameters(decl_name)?;
+    let ExprNode::Lam { body: checked, .. } = value.node() else {
+        return None;
+    };
+    let ExprNode::LetE {
+        value: original, ..
+    } = checked.node()
+    else {
+        return None;
+    };
+    let lambdas = u32::try_from(binders.len()).ok()?;
+    let outer = binders.len().checked_sub(header)?;
+    let levels = definition
+        .base
+        .level_params
+        .iter()
+        .cloned()
+        .map(Level::param)
+        .collect();
+    let mut reference = Expr::const_(definition.base.name.clone(), levels);
+    for position in 0..u32::try_from(outer).ok()? {
+        reference = Expr::app(reference, Expr::bvar(lambdas - 1 - position).ok()?);
+    }
+    let substituted = original.subst_loose(0, &[reference]).ok()?;
+    let targets = std::slice::from_ref(&definition.base.name);
+    let mut budget = MAX_SUNFOLD_WORK;
+    let mut value = annotate_sunfold_expr(env, &substituted, targets, &mut budget)?;
+    for (binder_name, binder_type, binder_info) in binders.into_iter().rev() {
+        value = Expr::lam(binder_name, binder_type, value, binder_info);
+    }
+    if value.has_loose_bvars() || value.has_fvar() {
+        return None;
+    }
+    let target_height = match definition.hints {
+        ReducibilityHints::Regular(h) => h,
+        ReducibilityHints::Opaque | ReducibilityHints::Abbrev => 0,
+    };
+    let hints = sunfold_regular_height(env, &value, targets, target_height);
+    let name = Name::str(definition.base.name.clone(), "_sunfold");
+    Some(DefinitionVal {
+        base: ConstantVal {
+            name: name.clone(),
+            level_params: definition.base.level_params.clone(),
+            type_: definition.base.type_.clone(),
+        },
+        value,
+        hints,
+        safety: DefinitionSafety::Safe,
+        all: vec![name],
+    })
+}
+
+/// Construct `<m>._sunfold` for one member of a mutual structurally recursive
+/// block (`partial/group/ordinary.rs`), admitted after all mutual wrappers so
+/// cross-member calls resolve against the admitted safe definitions.
+pub(in crate::source) fn mutual_smart_unfolding(
+    env: &Environment,
+    original_body: &DefinitionVal,
+    component_names: &[Name],
+    target_height: u32,
+) -> Option<DefinitionVal> {
+    let mut budget = MAX_SUNFOLD_WORK;
+    let value = annotate_sunfold_expr(env, &original_body.value, component_names, &mut budget)?;
+    if value.has_loose_bvars() || value.has_fvar() {
+        return None;
+    }
+    let hints = sunfold_regular_height(env, &value, component_names, target_height);
+    let name = Name::str(original_body.base.name.clone(), "_sunfold");
+    Some(DefinitionVal {
+        base: ConstantVal {
+            name: name.clone(),
+            level_params: original_body.base.level_params.clone(),
+            type_: original_body.base.type_.clone(),
+        },
+        value,
+        hints,
+        safety: DefinitionSafety::Safe,
         all: vec![name],
     })
 }

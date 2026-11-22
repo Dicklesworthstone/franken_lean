@@ -395,11 +395,40 @@ fn elaborate_with_meter(
                 )?,
             };
             declarations.push(Declaration::Defn(mutual));
+            let component_names: Vec<Name> = component
+                .iter()
+                .map(|&index| names[index].clone())
+                .collect();
+            let mut max_wrapper_height = 0u32;
             for definition in members_published {
                 if !is_structural {
                     irreducible.insert(definition.base.name.clone());
+                } else if let ReducibilityHints::Regular(h) = definition.hints {
+                    max_wrapper_height = max_wrapper_height.max(h);
                 }
                 declarations.push(Declaration::Defn(definition));
+            }
+            if is_structural {
+                for &index in &component {
+                    let is_prop_type = meter
+                        .known_type(&bodies[index].base.type_)
+                        .ok()
+                        .flatten()
+                        .and_then(|sort| meter.whnf(&sort).ok())
+                        .is_some_and(|sort| {
+                            matches!(sort.node(), ExprNode::Sort { level } if level.is_always_zero())
+                        });
+                    if !is_prop_type
+                        && let Some(sunfold) = recursion::mutual_smart_unfolding(
+                            environment,
+                            &bodies[index],
+                            &component_names,
+                            max_wrapper_height,
+                        )
+                    {
+                        declarations.push(Declaration::Defn(sunfold));
+                    }
+                }
             }
             declarations.push(Declaration::Mutual(executable));
             for &index in &component {
@@ -509,6 +538,7 @@ fn mutual_structural(
                 .iter()
                 .map(|name| Name::str(name.clone(), "_unsafe_rec")),
         )
+        .chain(names.iter().map(|name| Name::str(name.clone(), "_sunfold")))
         .any(|name| environment.contains(&name) || parts.names.contains(&name))
     {
         return Err(refusal("fresh distinct ordinary mutual names"));

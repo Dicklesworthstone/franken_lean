@@ -305,3 +305,124 @@ fn mutual_structural_reserved_and_auxiliary_names_match_the_pin() {
         check(&source).unwrap_or_else(|error| panic!("{source}\n{error}"));
     }
 }
+
+#[test]
+fn structural_definitions_admit_first_class_sunfold_declarations() {
+    use fln_core::expr::ExprNode;
+    use fln_core::name::Name;
+    use fln_env::constants::{ConstantInfo, DefinitionSafety, ReducibilityHints};
+
+    fn n(path: &str) -> Name {
+        Name::from_components(path.split('.'))
+    }
+    fn has_tag(expr: &fln_core::expr::Expr, tag: &str) -> bool {
+        let mut stack = vec![expr];
+        while let Some(cur) = stack.pop() {
+            match cur.node() {
+                ExprNode::MData { data, expr } => {
+                    if data.get_bool(&n(tag), false) {
+                        return true;
+                    }
+                    stack.push(expr);
+                }
+                ExprNode::App { f, a } => {
+                    stack.push(a);
+                    stack.push(f);
+                }
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    stack.push(body);
+                    stack.push(binder_type);
+                }
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => {
+                    stack.push(body);
+                    stack.push(value);
+                    stack.push(type_);
+                }
+                ExprNode::Proj { expr, .. } => stack.push(expr),
+                _ => {}
+            }
+        }
+        false
+    }
+
+    let source = format!(
+        "{TOWER}\
+         def P : Nat → Prop\n  | 0 => True\n  | n + 1 => P n\n\
+         def myAdd (x : Nat) : Nat → Nat\n  | 0 => x\n  | n + 1 => Nat.succ (myAdd x n)\n\
+         def plain (n : Nat) : Nat := match n with | 0 => 1 | k + 1 => k\n\
+         theorem t : ∀ n : Nat, n + 0 = n\n  | 0 => rfl\n  | _ + 1 => rfl\n\
+         def propDef : ∀ n : Nat, n = n\n  | 0 => rfl\n  | _ + 1 => rfl\n\
+         {MUT_STRUCT}\
+         theorem tower_sunfold_0 : Tower._sunfold 0 = Nat := rfl\n\
+         theorem p_sunfold_0 : P._sunfold 0 = True := rfl\n\
+         theorem add_sunfold_ok : myAdd._sunfold 2 3 = 5 := rfl\n\
+         theorem meven_sunfold_ok : meven._sunfold 4 = true := rfl\n\
+         theorem modd_sunfold_ok : modd._sunfold 3 = true := rfl\n"
+    );
+    let checked = engine()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap_or_else(|error| panic!("{source}\n{error}"))
+        .into_complete()
+        .unwrap();
+    let check_cmd = checked
+        .engine
+        .execute_source_commands_with_checks(
+            b"#check @Tower._sunfold\n#check @P._sunfold\n#check @myAdd._sunfold\n#check @meven._sunfold\n#check @modd._sunfold\n",
+            &KVMap::new(),
+            fln::EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap_or_else(|error| panic!("#check _sunfold failed: {error}"))
+        .into_complete()
+        .unwrap();
+    assert_eq!(check_cmd.checks.len(), 5);
+    let env = checked.engine.environment();
+    for (owner, sunfold) in [
+        ("Tower", "Tower._sunfold"),
+        ("P", "P._sunfold"),
+        ("myAdd", "myAdd._sunfold"),
+        ("meven", "meven._sunfold"),
+        ("modd", "modd._sunfold"),
+    ] {
+        let Some(ConstantInfo::Defn(owner_def)) = env.find(&n(owner)) else {
+            panic!("missing owner {owner}");
+        };
+        let Some(ConstantInfo::Defn(sunfold_def)) = env.find(&n(sunfold)) else {
+            panic!("missing admitted {sunfold}");
+        };
+        assert_eq!(sunfold_def.safety, DefinitionSafety::Safe, "{sunfold}");
+        assert!(
+            matches!(sunfold_def.hints, ReducibilityHints::Regular(_)),
+            "{sunfold}: {:?}",
+            sunfold_def.hints
+        );
+        assert_eq!(
+            sunfold_def.base.type_, owner_def.base.type_,
+            "{sunfold} type must match owner"
+        );
+        assert_eq!(sunfold_def.all, vec![n(sunfold)], "{sunfold}");
+        assert!(
+            has_tag(&sunfold_def.value, "sunfoldMatch"),
+            "{sunfold} must carry sunfoldMatch annotation"
+        );
+        assert!(
+            has_tag(&sunfold_def.value, "sunfoldMatchAlt"),
+            "{sunfold} must carry sunfoldMatchAlt annotation"
+        );
+    }
+    // Pin `SmartUnfolding.lean:69` negative controls: non-recursive, theorem,
+    // and Prop-typed definitions do not admit `_sunfold`.
+    for absent in ["plain._sunfold", "t._sunfold", "propDef._sunfold"] {
+        assert!(!env.contains(&n(absent)), "{absent} must not be admitted");
+    }
+}

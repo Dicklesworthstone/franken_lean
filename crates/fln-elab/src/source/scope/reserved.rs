@@ -172,10 +172,11 @@ pub fn is_reserved(env: &Environment, name: &Name) -> bool {
 /// mutual): `f._f` (the `brecOn` functional), `f._sunfold` (smart unfolding) and `f._unsafe_rec`
 /// (the compiler's copy), listed from the pin's environment (v4.32.0, 2026-10-11, re-verified for
 /// mutual blocks 2026-11-22). Well-founded definitions do not declare `_f` or `_sunfold` at the
-/// pin, and their `_unsafe_rec` is already admitted directly into the environment. FrankenLean
-/// keeps `_f` and `_sunfold` inside the checked definition, so a source declaration of one is
-/// refused here as already declared. The `f.match_<n>` matchers are not: the pin shares a matcher
-/// between declarations of the same shape, so their names depend on the whole file.
+/// pin, and their `_unsafe_rec` is already admitted directly into the environment. Non-Prop
+/// structural definitions now admit `_sunfold` directly into the environment; this predicate
+/// continues to guard `_f` (and `_unsafe_rec` where no course-of-values companion is admitted),
+/// refusing re-declaration as already declared. The `f.match_<n>` matchers are not: the pin shares
+/// a matcher between declarations of the same shape, so their names depend on the whole file.
 pub(super) fn is_declared_auxiliary(env: &Environment, name: &Name) -> bool {
     let LeafView::Str(suffix) = name.leaf_view() else {
         return false;

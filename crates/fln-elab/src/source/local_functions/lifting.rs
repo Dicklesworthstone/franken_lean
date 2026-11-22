@@ -162,6 +162,31 @@ impl Context {
                 }));
             }
         }
+        // Admit `<f>._sunfold` beside every non-Prop-typed safe structurally recursive
+        // definition (`Lean/Elab/PreDefinition/Structural/SmartUnfolding.lean:66-74`),
+        // after the owner itself has been admitted so self-calls resolve against `f`.
+        if let Declaration::Defn(definition) = owner
+            && definition.safety == DefinitionSafety::Safe
+            && !self
+                .txn
+                .env
+                .contains(&Name::str(definition.base.name.clone(), "_sunfold"))
+        {
+            let is_prop_type = self
+                .known_type(&definition.base.type_)
+                .ok()
+                .flatten()
+                .and_then(|sort| self.whnf(&sort).ok())
+                .is_some_and(
+                    |sort| matches!(sort.node(), ExprNode::Sort { level } if level.is_always_zero()),
+                );
+            if !is_prop_type
+                && let Some(sunfold) =
+                    super::super::recursion::structural_smart_unfolding(&self.txn.env, definition)
+            {
+                result.push(Declaration::Defn(sunfold));
+            }
+        }
         // A course-of-values definition's executable companion is admitted after every
         // lifted helper its original body may call.
         if let Declaration::Defn(definition) = owner
