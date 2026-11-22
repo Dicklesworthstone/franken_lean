@@ -125,7 +125,7 @@ impl SourceModuleSession {
         environment: &Environment,
         budget: &mut SourceOriginBudget,
     ) -> Result<Outcome<Vec<SourceDeclarationOrigin>>, SourceModuleCheckError> {
-        let mut prefix_inputs = source_closure(inputs, entry)?;
+        let mut prefix_inputs = source_closure(inputs, entry, self.uses_implicit_init())?;
         let input_index = prefix_inputs
             .iter()
             .position(|input| input.name == entry)
@@ -375,6 +375,7 @@ impl SourceModuleSession {
 pub(super) fn source_closure<'a>(
     inputs: &[SourceModuleInput<'a>],
     entry: &Name,
+    implicit_init: bool,
 ) -> Result<Vec<SourceModuleInput<'a>>, SourceModuleCheckError> {
     let by_name: std::collections::BTreeMap<_, _> = inputs
         .iter()
@@ -398,7 +399,7 @@ pub(super) fn source_closure<'a>(
                 error,
             }
         })?;
-        if header.module_system && !header.prelude {
+        if (header.module_system || implicit_init) && !header.prelude {
             header.imports.push(Name::from_components(["Init"]));
         }
         // An absent source edge can be supplied by a checked .olean context.

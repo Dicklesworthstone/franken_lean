@@ -448,6 +448,212 @@ fn kr102_free_variables_are_telescope_bound_or_rejected() {
 }
 
 #[test]
+fn declaration_headers_cannot_capture_checker_locals() {
+    // The input's free variable remains free even when its name is also used
+    // while opening the first binder. Only a bound-variable occurrence may
+    // refer to that binder in a declaration submitted for admission.
+    let free = Expr::fvar(FVarId(Name::num(n("_kernel"), 1)));
+    let open_type = Expr::forall_e(n("A"), sort1(), free, BinderInfo::Default);
+    let closed_type = Expr::forall_e(
+        n("A"),
+        sort1(),
+        Expr::bvar(0).expect("packs"),
+        BinderInfo::Default,
+    );
+    let base = |type_: Expr| ConstantVal {
+        name: n("header"),
+        level_params: vec![],
+        type_,
+    };
+    let mut declarations = vec![Declaration::Axiom(AxiomVal {
+        base: base(open_type.clone()),
+        is_unsafe: false,
+    })];
+    for safety in [
+        DefinitionSafety::Safe,
+        DefinitionSafety::Partial,
+        DefinitionSafety::Unsafe,
+    ] {
+        let definition = DefinitionVal {
+            base: base(open_type.clone()),
+            value: prop(),
+            hints: ReducibilityHints::Regular(1),
+            safety,
+            all: vec![n("header")],
+        };
+        declarations.push(Declaration::Defn(definition.clone()));
+        if safety != DefinitionSafety::Safe {
+            declarations.push(Declaration::Mutual(vec![definition]));
+        }
+    }
+    let env = Environment::new();
+    for declaration in declarations {
+        let verdict = check(&env, &declaration, Budget::DEFAULT);
+        assert_eq!(
+            reject_class(&verdict),
+            Some(RejectClass::UnknownFVar),
+            "{declaration:?}: {verdict:?}"
+        );
+    }
+    assert!(check(&env, &axiom("closed", closed_type), Budget::DEFAULT).is_accepted());
+}
+
+#[test]
+fn declaration_bodies_cannot_capture_checker_locals() {
+    let env = Environment::new();
+    let type_ = Expr::forall_e(n("A"), sort1(), sort1(), BinderInfo::Default);
+    for safety in [
+        DefinitionSafety::Safe,
+        DefinitionSafety::Partial,
+        DefinitionSafety::Unsafe,
+    ] {
+        // Safe/partial single declarations share a checker with their header;
+        // unsafe and mutual bodies have a fresh checker over the scratch env.
+        for mutual in [false, true] {
+            if mutual && safety == DefinitionSafety::Safe {
+                continue;
+            }
+            let ordinal = if mutual || safety == DefinitionSafety::Unsafe {
+                1
+            } else {
+                2
+            };
+            let definition = |value| DefinitionVal {
+                base: ConstantVal {
+                    name: n("body"),
+                    level_params: vec![],
+                    type_: type_.clone(),
+                },
+                value: Expr::lam(n("A"), sort1(), value, BinderInfo::Default),
+                hints: ReducibilityHints::Regular(1),
+                safety,
+                all: vec![n("body")],
+            };
+            let wrap = |definition| {
+                if mutual {
+                    Declaration::Mutual(vec![definition])
+                } else {
+                    Declaration::Defn(definition)
+                }
+            };
+            let open = definition(Expr::fvar(FVarId(Name::num(n("_kernel"), ordinal))));
+            let verdict = check(&env, &wrap(open), Budget::DEFAULT);
+            assert_eq!(
+                reject_class(&verdict),
+                Some(RejectClass::UnknownFVar),
+                "{safety:?}, mutual={mutual}: {verdict:?}"
+            );
+            let closed = definition(Expr::bvar(0).expect("packs"));
+            assert!(
+                check(&env, &wrap(closed), Budget::DEFAULT).is_accepted(),
+                "{safety:?}, mutual={mutual}"
+            );
+        }
+    }
+}
+
+#[test]
+fn theorem_opaque_and_let_values_require_closed_input() {
+    let env = admit(&Environment::new(), &axiom("P", prop()));
+    let p = Expr::const_(n("P"), vec![]);
+    let type_ = Expr::forall_e(n("h"), p.clone(), p.clone(), BinderInfo::Default);
+    for closed in [false, true] {
+        let value = Expr::mdata(
+            KVMap::new(),
+            Expr::lam(
+                n("h"),
+                p.clone(),
+                if closed {
+                    Expr::bvar(0).expect("packs")
+                } else {
+                    Expr::fvar(FVarId(Name::num(n("_kernel"), 2)))
+                },
+                BinderInfo::Default,
+            ),
+        );
+        let base = ConstantVal {
+            name: n("proof"),
+            level_params: vec![],
+            type_: type_.clone(),
+        };
+        for declaration in [
+            Declaration::Thm(TheoremVal {
+                base: base.clone(),
+                value: value.clone(),
+                all: vec![n("proof")],
+            }),
+            Declaration::Opaque(OpaqueVal {
+                base,
+                value,
+                is_unsafe: false,
+                all: vec![n("proof")],
+            }),
+        ] {
+            let verdict = check(&env, &declaration, Budget::DEFAULT);
+            if closed {
+                assert!(verdict.is_accepted(), "{declaration:?}: {verdict:?}");
+            } else {
+                assert_eq!(
+                    reject_class(&verdict),
+                    Some(RejectClass::UnknownFVar),
+                    "{declaration:?}: {verdict:?}"
+                );
+            }
+        }
+        let value = Expr::let_e(
+            n("A"),
+            sort1(),
+            prop(),
+            if closed {
+                Expr::bvar(0).expect("packs")
+            } else {
+                Expr::fvar(FVarId(Name::num(n("_kernel"), 1)))
+            },
+            false,
+        );
+        let verdict = check(&env, &defn("letValue", sort1(), value), Budget::DEFAULT);
+        if closed {
+            assert!(verdict.is_accepted(), "{verdict:?}");
+        } else {
+            assert_eq!(
+                reject_class(&verdict),
+                Some(RejectClass::UnknownFVar),
+                "{verdict:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unsafe_axiom_headers_use_the_declared_safety() {
+    let unsafe_axiom = |name: &str, type_: Expr, is_unsafe| {
+        Declaration::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n(name),
+                level_params: vec![],
+                type_,
+            },
+            is_unsafe,
+        })
+    };
+    let env = admit(
+        &Environment::new(),
+        &unsafe_axiom("UnsafeType", sort1(), true),
+    );
+    let type_ = Expr::const_(n("UnsafeType"), vec![]);
+    let safe = check(
+        &env,
+        &unsafe_axiom("safe", type_.clone(), false),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&safe), Some(RejectClass::SafetyViolation));
+    let allowed = unsafe_axiom("unsafe", type_, true);
+    assert!(check(&env, &allowed, Budget::DEFAULT).is_accepted());
+    let observed = fln_kernel::observe_unfolds(&env, &allowed, Budget::DEFAULT, false);
+    assert!(observed.outcome.is_accepted());
+}
+
+#[test]
 fn kr103_metavariables_are_a_typed_rejection() {
     let env = Environment::new();
     let mvar = Expr::mvar(fln_core::expr::MVarId(n("m")));

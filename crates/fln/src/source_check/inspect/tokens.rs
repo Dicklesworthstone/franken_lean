@@ -81,7 +81,7 @@ impl SourceModuleSession {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(reason) => return Ok(Outcome::InternalFault(reason)),
         }
-        let mut prefix_inputs = source_closure(inputs, entry)?;
+        let mut prefix_inputs = source_closure(inputs, entry, self.uses_implicit_init())?;
         let input_index = prefix_inputs
             .iter()
             .position(|input| input.name == entry)

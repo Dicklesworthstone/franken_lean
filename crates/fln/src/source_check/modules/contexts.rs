@@ -362,6 +362,22 @@ fn unavailable(module: &Name, reason: &'static str) -> SourceModuleCheckError {
 }
 
 impl ImportContexts {
+    /// Declaration ownership from retained checked entries, never from the
+    /// caller-editable diagnostic report or a namespace-prefix heuristic.
+    pub(super) fn declaration_owners(&self) -> impl Iterator<Item = (&Name, &Name)> {
+        self.declaration_order.iter().flat_map(|module| {
+            self.modules
+                .get(module)
+                .into_iter()
+                .flat_map(move |checked| {
+                    checked
+                        .entries
+                        .iter()
+                        .map(move |entry| (entry.declaration().name(), module))
+                })
+        })
+    }
+
     pub(super) fn has_inherited_imports(&self) -> bool {
         !self.origin.imported_modules().is_empty() || self.origin.has_checked_runtime_imports()
     }
@@ -1047,6 +1063,7 @@ impl imported::SourceOleanImport {
             cache::RunOptions {
                 cache: None,
                 collect_artifacts: false,
+                implicit_init: false,
                 contexts: Some(&self.contexts),
                 records: None,
                 macros: None,
@@ -1079,6 +1096,7 @@ impl imported::SourceOleanImport {
             cache::RunOptions {
                 cache: None,
                 collect_artifacts: true,
+                implicit_init: true,
                 contexts: Some(&self.contexts),
                 records: None,
                 macros: None,

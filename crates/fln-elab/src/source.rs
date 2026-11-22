@@ -701,6 +701,7 @@ impl SourceEquation {
 #[derive(Clone)]
 struct Context {
     inspection: Option<inspect::Probe>,
+    references: Option<inspect::ReferenceCollector>,
     traces: trace::TraceLog,
     // Information messages (`trace::Context::log_info`): elaboration state, restored with it.
     infos: Vec<trace::SourceTrace>,
@@ -973,6 +974,7 @@ impl Context {
         let registry_cache = txn.registry_cache.clone();
         Self {
             inspection: None,
+            references: None,
             traces: trace::TraceLog::default(),
             infos: Vec::new(),
             goal_tags: std::collections::HashMap::new(),
@@ -1296,6 +1298,16 @@ impl Context {
         syntax: &Syntax,
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        let term = self.atom_without_reference(syntax, expected)?;
+        self.record_reference(syntax, &term)?;
+        Ok(term)
+    }
+
+    fn atom_without_reference(
+        &mut self,
+        syntax: &Syntax,
+        expected: Option<&Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
         if let Some(literal) = self.character_literal(syntax)? {
             return Ok(literal);
         }
@@ -1464,6 +1476,7 @@ impl Context {
             if private_reference_allowed
                 && let Some(reference) = self.predefinition_reference(&resolved)
             {
+                self.refuse_reference_metadata();
                 return Ok(reference);
             }
             let name = &resolved;
@@ -1473,13 +1486,17 @@ impl Context {
                 .and_then(|state| state.reference.as_ref())
                 && &reference.name == name
             {
-                return Ok(reference.term.clone());
+                let term = reference.term.clone();
+                self.refuse_reference_metadata();
+                return Ok(term);
             }
             if private_reference_allowed
                 && let Some(recursion) = &self.recursion
                 && &recursion.name == name
             {
-                return Ok(recursion.reference.clone());
+                let term = recursion.reference.clone();
+                self.refuse_reference_metadata();
+                return Ok(term);
             }
             if private_reference_allowed
                 && let Some(recursion) = &self.well_founded
@@ -1490,7 +1507,9 @@ impl Context {
                         recursion::RecursionError::RecursionInDecreasingProof,
                     )));
                 }
-                return Ok(reference.clone());
+                let term = reference.clone();
+                self.refuse_reference_metadata();
+                return Ok(term);
             }
             let mut resolved = name.clone();
             if !self.txn.env.contains(name) {
@@ -4781,6 +4800,9 @@ impl Context {
                                         return Err(error);
                                     }
                                 };
+                                if receiver.is_some() {
+                                    self.refuse_reference_metadata();
+                                }
                                 match receiver {
                                     Some(record_terms::FieldReceiver::Syntax(
                                         receiver,

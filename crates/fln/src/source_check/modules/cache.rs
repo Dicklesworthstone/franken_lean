@@ -76,6 +76,7 @@ impl CachedModule {
 pub struct SourceModuleSession {
     base: Engine,
     contexts: Option<Box<contexts::ImportContexts>>,
+    implicit_init: bool,
     options: KVMap,
     limits: SourceModuleCheckLimits,
     retention: SourceModuleCacheLimits,
@@ -99,6 +100,7 @@ impl SourceModuleSession {
         Self {
             base,
             contexts: None,
+            implicit_init: false,
             options,
             limits,
             retention,
@@ -122,6 +124,24 @@ impl SourceModuleSession {
         session
     }
 
+    /// Bind source checking to the ordinary Lean frontend's implicit Init edge.
+    /// This policy is immutable for the life of the session, so a cached prefix
+    /// cannot cross from the explicit-import API into a different import world.
+    pub fn from_lean_imports(
+        imported: imported::SourceOleanImport,
+        options: KVMap,
+        limits: SourceModuleCheckLimits,
+        retention: SourceModuleCacheLimits,
+    ) -> Self {
+        let mut session = Self::from_imports(imported, options, limits, retention);
+        session.implicit_init = true;
+        session
+    }
+
+    pub(in crate::source_check) fn uses_implicit_init(&self) -> bool {
+        self.implicit_init
+    }
+
     /// Observe an unfinished declaration against the exact checked import and
     /// command prefix. The declaration at the cursor is never admitted.
     pub fn inspect(
@@ -137,6 +157,25 @@ impl SourceModuleSession {
     /// Header-only editor observations use this session's fixed checking budget.
     pub(in crate::source_check) fn inspection_kernel_budget(&self) -> Budget {
         self.limits.source.admission.kernel
+    }
+
+    pub(in crate::source_check) fn imported_declaration_owners(
+        &self,
+        limit: usize,
+    ) -> Result<BTreeMap<Name, Name>, SourceModuleCheckError> {
+        let mut owners = BTreeMap::new();
+        if let Some(contexts) = &self.contexts {
+            for (index, (name, module)) in contexts.declaration_owners().enumerate() {
+                if index >= limit {
+                    return Err(SourceModuleCheckError::Limit {
+                        resource: "ilean imported declaration owners",
+                        limit,
+                    });
+                }
+                owners.entry(name.clone()).or_insert_with(|| module.clone());
+            }
+        }
+        Ok(owners)
     }
 
     /// Check a module closure and encode its own checked declarations as real
@@ -197,6 +236,7 @@ impl SourceModuleSession {
                     limits: self.retention,
                 }),
                 collect_artifacts: true,
+                implicit_init: true,
                 contexts: self.contexts.as_deref(),
                 records: records.map(|persisted| RecordOptions {
                     persisted,
@@ -291,6 +331,7 @@ impl SourceModuleSession {
             RunOptions {
                 cache: Some(view),
                 collect_artifacts: false,
+                implicit_init: self.implicit_init,
                 contexts: self.contexts.as_deref(),
                 records: None,
                 macros: None,
@@ -315,6 +356,7 @@ pub(super) struct CacheView<'a> {
 pub(super) struct RunOptions<'a> {
     pub(super) cache: Option<CacheView<'a>>,
     pub(super) collect_artifacts: bool,
+    pub(super) implicit_init: bool,
     pub(super) contexts: Option<&'a contexts::ImportContexts>,
     /// Persisted module records; consulted only when collecting artifacts.
     pub(super) records: Option<RecordOptions<'a>>,
@@ -357,6 +399,7 @@ pub(super) fn run(
         RunOptions {
             cache,
             collect_artifacts: false,
+            implicit_init: false,
             contexts: None,
             records: None,
             macros: None,
@@ -376,6 +419,7 @@ pub(super) fn run_collecting(
     let RunOptions {
         cache,
         collect_artifacts,
+        implicit_init,
         contexts,
         records,
         mut macros,
@@ -397,7 +441,7 @@ pub(super) fn run_collecting(
         bytes: 0,
         limits,
     };
-    let plan = if collect_artifacts {
+    let plan = if collect_artifacts || implicit_init {
         graph::Plan::with_implicit_init(modules, entry, base.imported_modules(), &mut meter, true)?
     } else {
         graph::Plan::new(modules, entry, base.imported_modules(), &mut meter)?

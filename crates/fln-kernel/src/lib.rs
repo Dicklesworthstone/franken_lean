@@ -82,6 +82,16 @@ impl Declaration {
             Declaration::Mutual(_) | Declaration::Inductive(_) | Declaration::Quotient(_) => &[],
         }
     }
+
+    fn checking_safety(&self) -> DefinitionSafety {
+        // Pin add_axiom permits unsafe references only in an unsafe axiom.
+        // add_opaque deliberately uses a safe checker even for unsafe opaques;
+        // non-safe definitions have their own admission paths below.
+        match self {
+            Declaration::Axiom(v) if v.is_unsafe => DefinitionSafety::Unsafe,
+            _ => DefinitionSafety::Safe,
+        }
+    }
 }
 
 /// The kernel's one authority (§8.2b): checks the declaration against the
@@ -120,7 +130,8 @@ pub fn check(env: &Environment, decl: &Declaration, budget: Budget) -> Outcome<V
     {
         return check_nonsafe_definition(env, v, budget);
     }
-    let mut checker = TypeChecker::new(env, decl.level_params(), budget);
+    let mut checker =
+        TypeChecker::new_with_safety(env, decl.level_params(), budget, decl.checking_safety());
     let outcome = check_inner(env, decl, &mut checker);
     let consumption = checker.consumption();
     check_result_to_outcome(outcome, consumption, budget)
@@ -188,7 +199,12 @@ pub fn observe_unfolds(
             }
         }
         _ => {
-            let mut checker = TypeChecker::new(env, decl.level_params(), budget);
+            let mut checker = TypeChecker::new_with_safety(
+                env,
+                decl.level_params(),
+                budget,
+                decl.checking_safety(),
+            );
             checker.enable_unfold_observation(force_left_delta);
             let outcome = check_inner(env, decl, &mut checker);
             let consumption = checker.consumption();
@@ -278,6 +294,7 @@ fn check_nonsafe_definition(
     let mut body =
         TypeChecker::new_with_safety(&scratch, &v.base.level_params, remaining, v.safety);
     let outcome = (|| -> Result<(), Stop> {
+        check_closed_declaration_expr(&v.value)?;
         let value_type = body.infer(&v.value, 0)?;
         if !body.def_eq_public(&value_type, &v.base.type_, 0)? {
             return Err(Stop::Reject(
@@ -370,6 +387,7 @@ fn check_mutual_definitions(
                 safety,
             );
             let result = (|| -> Result<(), Stop> {
+                check_closed_declaration_expr(&definition.value)?;
                 let value_type = checker.infer(&definition.value, 0)?;
                 if !checker.def_eq_public(&value_type, &definition.base.type_, 0)? {
                     return Err(Stop::Reject(
@@ -487,6 +505,27 @@ fn exhaustion_outcome(
     }
 }
 
+/// Pin `check_no_metavar_no_fvar`: an input declaration must not refer to
+/// elaborator locals, including names that a checker will generate when it
+/// opens binders. Check the constructor-maintained flags before opening any
+/// telescope; rejecting free variables inside `infer` would also reject the
+/// legitimate locals used by inductive checking and conversion queries.
+fn check_closed_declaration_expr(expr: &fln_core::expr::Expr) -> Result<(), Stop> {
+    if expr.has_expr_mvar() || expr.has_level_mvar() {
+        return Err(Stop::Reject(
+            RejectClass::MVarInKernel,
+            "declaration contains metavariables".to_string(),
+        ));
+    }
+    if expr.has_fvar() {
+        return Err(Stop::Reject(
+            RejectClass::UnknownFVar,
+            "declaration contains free variables".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// The shared header laws (KR-970/971/972) for a single-constant declaration.
 fn check_header(
     env: &Environment,
@@ -512,6 +551,7 @@ fn check_header(
             ));
         }
     }
+    check_closed_declaration_expr(type_)?;
     let type_sort = checker.infer(type_, 0)?;
     let type_sort = checker.whnf_public(&type_sort, 0)?;
     if !matches!(type_sort.node(), fln_core::expr::ExprNode::Sort { .. }) {
@@ -561,6 +601,7 @@ fn check_inner(
             return Ok(());
         }
     };
+    check_closed_declaration_expr(type_)?;
     let type_sort = checker.infer(type_, 0)?;
     let type_sort = checker.whnf_public(&type_sort, 0)?;
     if !matches!(type_sort.node(), fln_core::expr::ExprNode::Sort { .. }) {
@@ -584,6 +625,7 @@ fn check_inner(
     }
     // KR-974 (bodies): the inferred body type must be defeq to the declared type.
     if let Some(body) = body {
+        check_closed_declaration_expr(body)?;
         let body_type = checker.infer(body, 0)?;
         if !checker.def_eq_public(&body_type, type_, 0)? {
             return Err(Stop::Reject(
