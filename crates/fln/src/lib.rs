@@ -213,10 +213,10 @@ pub type CheckedOlean = fln_admission::CheckedOlean<Engine>;
 pub type CheckedOleanSet = fln_admission::CheckedOleanSet<Engine>;
 /// Per-module result of checking a closed `.olean` set
 /// ([`fln_admission::OleanFrontier`]).
-pub type OleanFrontier = fln_admission::OleanFrontier<Engine>;
+pub type OleanFrontier<E = Engine> = fln_admission::OleanFrontier<E>;
 /// Provisional Phase-1 + Phase-2 result of checking a closed `.olean` set past
 /// inconclusive imports ([`fln_admission::ProvisionalFrontier`]).
-pub type ProvisionalFrontier = fln_admission::ProvisionalFrontier<Engine>;
+pub type ProvisionalFrontier<E = Engine> = fln_admission::ProvisionalFrontier<E>;
 /// The authoritative outputs of one completed admission-only transition
 /// ([`fln_admission::DeclarationAdmission`]).
 pub type DeclarationAdmission = fln_admission::DeclarationAdmission<Engine>;
@@ -2112,6 +2112,20 @@ impl Engine {
             .map(|frontier| frontier.map_engine(|engine| self.with_admitted(engine)))
     }
 
+    /// Memory-bounded streaming frontier check that reports rows without retaining
+    /// a merged union engine: [`Admitted::check_olean_frontier_rows_scheduled`].
+    pub fn check_olean_frontier_rows_scheduled(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+    ) -> Result<OleanFrontier<()>, OleanCheckError> {
+        self.admitted()
+            .check_olean_frontier_rows_scheduled(modules, options, limits, jobs, on_event)
+    }
+
     /// Check a closed `.olean` set with Phase-2 provisional exploration past
     /// inconclusive imports (`--continue --provisional`, bead
     /// `fln-provisional-frontier-vf32`).
@@ -2178,6 +2192,31 @@ impl Engine {
                 on_phase2,
             )
             .map(|frontier| frontier.map_engine(|engine| self.with_admitted(engine)))
+    }
+
+    /// Memory-bounded streaming provisional frontier check that reports Phase-1
+    /// and Phase-2 rows without retaining a merged Phase-1 union engine.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_olean_frontier_provisional_rows_scheduled_with_progress(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        cancellation: Option<&dyn CancellationProbe>,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+        on_phase2: Option<fln_admission::provisional::Phase2ProgressCallback<'_>>,
+    ) -> Result<ProvisionalFrontier<()>, OleanCheckError> {
+        self.admitted()
+            .check_olean_frontier_provisional_rows_scheduled_with_progress(
+                modules,
+                options,
+                limits,
+                jobs,
+                cancellation,
+                on_event,
+                on_phase2,
+            )
     }
 
     /// Hookable provisional frontier entry point for deterministic unit/fault tests.

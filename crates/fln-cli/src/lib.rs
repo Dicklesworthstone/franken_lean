@@ -9863,7 +9863,7 @@ fn check_olean_module_frontier(
                     let _ = stderr.write_all(line.as_bytes());
                     let _ = stderr.flush();
                 };
-                match engine.check_olean_frontier_provisional_scheduled_with_progress(
+                match engine.check_olean_frontier_provisional_rows_scheduled_with_progress(
                     &inputs,
                     &fln::KVMap::new(),
                     limits,
@@ -9886,7 +9886,7 @@ fn check_olean_module_frontier(
                     }
                 }
             } else {
-                match engine.check_olean_frontier_scheduled(
+                match engine.check_olean_frontier_rows_scheduled(
                     &inputs,
                     &fln::KVMap::new(),
                     limits,
@@ -10100,7 +10100,10 @@ fn frontier_row_fields(row: &fln::OleanFrontierRow) -> FrontierRowFields {
     }
 }
 
-fn render_check_olean_frontier(frontier: &fln::OleanFrontier, json: bool) -> MultiplexerOutput {
+fn render_check_olean_frontier<E>(
+    frontier: &fln::OleanFrontier<E>,
+    json: bool,
+) -> MultiplexerOutput {
     let (mut accepted, mut failed, mut inconclusive, mut faulted, mut blocked) = (0, 0, 0, 0, 0);
     let mut declarations = 0_usize;
     let mut rendered_fields = Vec::with_capacity(frontier.rows.len());
@@ -10289,8 +10292,8 @@ fn json_name_array(names: &[fln::Name]) -> String {
     format!("[{}]", items.join(","))
 }
 
-fn render_check_olean_provisional_frontier(
-    frontier: &fln::ProvisionalFrontier,
+fn render_check_olean_provisional_frontier<E>(
+    frontier: &fln::ProvisionalFrontier<E>,
     json: bool,
 ) -> MultiplexerOutput {
     let counts = frontier.counts();

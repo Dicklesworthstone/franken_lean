@@ -1648,6 +1648,47 @@ impl Admitted {
         )
     }
 
+    /// Memory-bounded streaming variant of
+    /// [`Self::check_olean_frontier_provisional_scheduled_with_progress`] for
+    /// callers that report rows without needing a merged Phase-1 union engine.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_olean_frontier_provisional_rows_scheduled_with_progress(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        cancellation: Option<&dyn CancellationProbe>,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+        on_phase2: Option<Phase2ProgressCallback<'_>>,
+    ) -> Result<ProvisionalFrontier<()>, OleanCheckError> {
+        let hooks = FrontierRunHooks {
+            check: &|job| self.frontier_check_module(job, options, limits),
+            decode: &|index| {
+                decode_olean_module_input_with(&modules[index], limits, CheckerReading::Read)
+            },
+            memory: &HostProcessMemorySource,
+        };
+        let phase1 = self.check_olean_frontier_phase1_core_with_options(
+            modules,
+            limits,
+            jobs,
+            on_event,
+            hooks,
+            FrontierExecutionOptions::STREAMING_PROVISIONAL_ROWS,
+        )?;
+        self.check_olean_frontier_provisional_after_phase1(
+            phase1,
+            modules,
+            limits,
+            jobs,
+            cancellation,
+            on_phase2,
+            hooks,
+        )
+        .map(|frontier| frontier.map_engine(|_| ()))
+    }
+
     /// Hookable entry point for deterministic unit, fault, and mutant tests.
     pub fn check_olean_frontier_provisional_using(
         &self,
@@ -1678,11 +1719,33 @@ impl Admitted {
         jobs: OleanFrontierJobs,
         cancellation: Option<&dyn CancellationProbe>,
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
-        mut on_phase2: Option<Phase2ProgressCallback<'_>>,
+        on_phase2: Option<Phase2ProgressCallback<'_>>,
         hooks: FrontierRunHooks<'_>,
     ) -> Result<ProvisionalFrontier, OleanCheckError> {
         let phase1 =
             self.check_olean_frontier_phase1_core(modules, limits, jobs, on_event, hooks)?;
+        self.check_olean_frontier_provisional_after_phase1(
+            phase1,
+            modules,
+            limits,
+            jobs,
+            cancellation,
+            on_phase2,
+            hooks,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_olean_frontier_provisional_after_phase1<E>(
+        &self,
+        phase1: Phase1FrontierOutput<E>,
+        modules: &[OleanModuleInput<'_>],
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        cancellation: Option<&dyn CancellationProbe>,
+        mut on_phase2: Option<Phase2ProgressCallback<'_>>,
+        hooks: FrontierRunHooks<'_>,
+    ) -> Result<ProvisionalFrontier<E>, OleanCheckError> {
         let count = modules.len();
         let order = &phase1.order;
         let position = &phase1.position;

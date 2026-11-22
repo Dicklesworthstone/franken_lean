@@ -1931,6 +1931,40 @@ impl FrontierEngines {
         }
     }
 
+    /// The cached base engine index that `index` starts from, if any.
+    pub fn base_of(&self, index: usize) -> Option<usize> {
+        self.base_of[index]
+    }
+
+    /// Remaining future users of `index`'s base engine, if `index` starts from one.
+    pub fn base_users(&self, index: usize) -> Option<usize> {
+        self.base_of[index].map(|base| self.users[base])
+    }
+
+    /// Drop retained independent-checker projections (`checker_environment`) on
+    /// idle cached base engines other than `keep_base`.
+    ///
+    /// `checker_environment` is purely a projection cache: dropping it releases
+    /// unshared `WireExpr` slices while keeping the K1 `Environment` (`PMap`)
+    /// structurally shared and leaving every logical verdict identical.
+    pub fn shed_idle_checker_environments(&mut self, keep_base: Option<usize>) -> usize {
+        let mut shed = 0_usize;
+        for (index, slot) in self.engines.iter_mut().enumerate() {
+            if Some(index) == keep_base {
+                continue;
+            }
+            if let Some(engine) = slot.as_ref()
+                && engine.checker_environment.is_some()
+            {
+                let mut trimmed = (**engine).clone();
+                trimmed.checker_environment = None;
+                *slot = Some(std::sync::Arc::new(trimmed));
+                shed += 1;
+            }
+        }
+        shed
+    }
+
     /// Keep an accepted module's engine if some later module starts from it.
     pub fn keep(&mut self, index: usize, engine: Option<Admitted>) {
         if self.users[index] > 0 {
@@ -3260,6 +3294,56 @@ pub fn decode_olean_module_input_with(
     })
 }
 
+/// Raw byte length of one `.olean` input chain (exported + optional server/private).
+fn olean_module_input_bytes(module: &OleanModuleInput<'_>) -> u64 {
+    (module.artifact.len() as u64)
+        .saturating_add(module.server_artifact.map_or(0, |part| part.len() as u64))
+        .saturating_add(module.private_artifact.map_or(0, |part| part.len() as u64))
+}
+
+/// Read only the header and `ModuleData.imports` of one `.olean` input so a
+/// streaming frontier run can construct the dependency graph without holding
+/// every module's decoded declarations and checker readings in RAM up front.
+///
+/// Full validation (region walk, companion parts, declaration decode, and
+/// `IndependentReading`) still runs on the worker before any declaration can
+/// be admitted.
+fn olean_module_input_imports(
+    module: &OleanModuleInput<'_>,
+    limits: OleanCheckLimits,
+) -> Result<Vec<Name>, OleanCheckError> {
+    let total_bytes = match (module.server_artifact, module.private_artifact) {
+        (Some(server), Some(private)) => module
+            .artifact
+            .len()
+            .checked_add(server.len())
+            .and_then(|n| n.checked_add(private.len()))
+            .ok_or_else(|| OleanCheckError::ModuleDecode {
+                module: module.name.clone(),
+                error: OleanDecodeError::ArtifactTooLarge {
+                    bytes: usize::MAX,
+                    limit: limits.decode.max_bytes,
+                },
+            })?,
+        _ => module.artifact.len(),
+    };
+    if total_bytes > limits.decode.max_bytes {
+        return Err(OleanCheckError::ModuleDecode {
+            module: module.name.clone(),
+            error: OleanDecodeError::ArtifactTooLarge {
+                bytes: total_bytes,
+                limit: limits.decode.max_bytes,
+            },
+        });
+    }
+    olean_module_imports(module.artifact, limits.decode).map_err(|error| {
+        OleanCheckError::ModuleDecode {
+            module: module.name.clone(),
+            error,
+        }
+    })
+}
+
 pub fn plan_olean_declarations(
     base: &Environment,
     constants: &[ConstantInfo],
@@ -3451,8 +3535,43 @@ pub struct FrontierRunHooks<'a> {
     pub memory: &'a (dyn FrontierMemorySource + Sync),
 }
 
-pub(crate) struct Phase1FrontierOutput {
-    pub frontier: OleanFrontier,
+#[derive(Clone, Copy)]
+pub(crate) struct FrontierExecutionOptions {
+    /// When true, Phase 0 parses only `.olean` headers/`ModuleData.imports` and
+    /// workers decode each module on demand right before checking, avoiding
+    /// holding every module's decoded constants and checker readings in RAM.
+    pub decode_on_demand: bool,
+    /// When false, skip building the final union `Admitted` engine and evict
+    /// `accepted[m]` entries as soon as their last consumer settles.
+    pub retain_union_engine: bool,
+    /// When true alongside `!retain_union_engine`, keep `accepted[m]` for any
+    /// module `m` in the transitive closure of a non-accepted Phase-1 module so
+    /// Phase-2 provisional exploration can still construct its environment.
+    pub retain_accepted_for_phase2: bool,
+}
+
+impl FrontierExecutionOptions {
+    pub(crate) const UPFRONT_FULL: Self = Self {
+        decode_on_demand: false,
+        retain_union_engine: true,
+        retain_accepted_for_phase2: true,
+    };
+
+    pub(crate) const STREAMING_ROWS: Self = Self {
+        decode_on_demand: true,
+        retain_union_engine: false,
+        retain_accepted_for_phase2: false,
+    };
+
+    pub(crate) const STREAMING_PROVISIONAL_ROWS: Self = Self {
+        decode_on_demand: true,
+        retain_union_engine: false,
+        retain_accepted_for_phase2: true,
+    };
+}
+
+pub(crate) struct Phase1FrontierOutput<E = Admitted> {
+    pub frontier: OleanFrontier<E>,
     pub order: Vec<usize>,
     pub position: Vec<usize>,
     pub dependencies: Vec<BTreeSet<usize>>,
@@ -3720,6 +3839,42 @@ impl Admitted {
         )
     }
 
+    /// Memory-bounded streaming variant of [`Self::check_olean_frontier_scheduled`]
+    /// for callers that report per-module verdicts without needing a single merged
+    /// union `Admitted` engine across all modules (such as `fln check-olean --continue`).
+    ///
+    /// Decodes each `.olean` on demand on its worker thread after a header-only
+    /// import-graph scan, evicts accepted module payloads as soon as their last
+    /// downstream delta consumer settles, prioritizes ready modules that drain
+    /// cached base engines, and sheds idle checker projections under memory pressure.
+    /// Every logical verdict, row order, and closure environment matches
+    /// [`Self::check_olean_frontier_scheduled`] (FL-INV-01).
+    pub fn check_olean_frontier_rows_scheduled(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+    ) -> Result<OleanFrontier<()>, OleanCheckError> {
+        let hooks = FrontierRunHooks {
+            check: &|job| self.frontier_check_module(job, options, limits),
+            decode: &|index| {
+                decode_olean_module_input_with(&modules[index], limits, CheckerReading::Read)
+            },
+            memory: &HostProcessMemorySource,
+        };
+        self.check_olean_frontier_phase1_core_with_options(
+            modules,
+            limits,
+            jobs,
+            on_event,
+            hooks,
+            FrontierExecutionOptions::STREAMING_ROWS,
+        )
+        .map(|output| output.frontier.map_engine(|_| ()))
+    }
+
     /// The scheduler's decoding and checking operations are private so fault
     /// tests can refuse a real job at its worker boundary without installing a
     /// global allocator or changing any successful declaration-admission path.
@@ -3768,59 +3923,148 @@ impl Admitted {
         jobs: OleanFrontierJobs,
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
         hooks: FrontierRunHooks<'_>,
-    ) -> Result<Phase1FrontierOutput, OleanCheckError> {
+    ) -> Result<Phase1FrontierOutput<Admitted>, OleanCheckError> {
+        let output = self.check_olean_frontier_phase1_core_with_options(
+            modules,
+            limits,
+            jobs,
+            on_event,
+            hooks,
+            FrontierExecutionOptions::UPFRONT_FULL,
+        )?;
+        let engine = output.frontier.engine.and_then(|engine| {
+            engine.ok_or(OleanCheckError::InternalInvariant {
+                detail: "full frontier phase 1 did not retain its merged union engine",
+            })
+        });
+        Ok(Phase1FrontierOutput {
+            frontier: OleanFrontier {
+                engine,
+                rows: output.frontier.rows,
+                policy_summary: output.frontier.policy_summary,
+            },
+            order: output.order,
+            position: output.position,
+            dependencies: output.dependencies,
+            closures: output.closures,
+            accepted: output.accepted,
+        })
+    }
+
+    pub(crate) fn check_olean_frontier_phase1_core_with_options(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        limits: OleanCheckLimits,
+        jobs: OleanFrontierJobs,
+        on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
+        hooks: FrontierRunHooks<'_>,
+        exec_options: FrontierExecutionOptions,
+    ) -> Result<Phase1FrontierOutput<Option<Admitted>>, OleanCheckError> {
+        enum FrontierDecodeSlot {
+            Upfront(Box<DecodedOlean>),
+            OnDemand,
+            Error(OleanCheckError),
+        }
+
         let FrontierRunHooks {
             check,
             decode,
             memory,
         } = hooks;
         let owners = olean_module_owners(modules, limits)?;
+        let count = modules.len();
         let mut decode_memory_retries = Vec::new();
         decode_memory_retries
-            .try_reserve_exact(modules.len())
+            .try_reserve_exact(count)
             .map_err(|_| OleanCheckError::AllocationFailure {
                 resource: ".olean decode retry records",
-                requested: modules.len(),
+                requested: count,
             })?;
-        let mut decoded: Vec<Option<Result<DecodedOlean, OleanCheckError>>> =
-            decode_olean_module_inputs_using(modules.len(), jobs, decode)?
-                .into_iter()
-                .map(|entry| {
-                    decode_memory_retries.push(entry.memory_retry);
-                    Some(entry.result)
-                })
-                .collect();
+        let mut dependencies: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); count];
+        let mut module_decoded_bytes = vec![0_u64; count];
+        let mut decoded: Vec<Option<FrontierDecodeSlot>> = Vec::with_capacity(count);
 
-        let mut dependencies: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); modules.len()];
-        for (index, entry) in decoded.iter_mut().enumerate() {
-            let Some(Ok(artifact)) = entry.as_ref() else {
-                continue;
-            };
-            let mut missing = BTreeSet::new();
-            for import in &artifact.module.imports {
-                match owners.get(&import.module).copied() {
-                    Some(owner) if owner != index => {
-                        dependencies[index].insert(owner);
+        if exec_options.decode_on_demand {
+            for index in 0..count {
+                decode_memory_retries.push(None);
+                module_decoded_bytes[index] = olean_module_input_bytes(&modules[index]);
+                match olean_module_input_imports(&modules[index], limits) {
+                    Ok(imports) => {
+                        let mut missing = BTreeSet::new();
+                        for import in imports {
+                            match owners.get(&import).copied() {
+                                Some(owner) if owner != index => {
+                                    dependencies[index].insert(owner);
+                                }
+                                Some(_) => {
+                                    dependencies[index].insert(index);
+                                }
+                                None => {
+                                    missing.insert(import);
+                                }
+                            }
+                        }
+                        if missing.is_empty() {
+                            decoded.push(Some(FrontierDecodeSlot::OnDemand));
+                        } else {
+                            dependencies[index].clear();
+                            decoded.push(Some(FrontierDecodeSlot::Error(
+                                OleanCheckError::MissingModuleImports {
+                                    module: modules[index].name.clone(),
+                                    imports: missing.into_iter().collect(),
+                                },
+                            )));
+                        }
                     }
-                    Some(_) => {
-                        dependencies[index].insert(index);
-                    }
-                    None => {
-                        missing.insert(import.module.clone());
+                    Err(error) => {
+                        decoded.push(Some(FrontierDecodeSlot::Error(error)));
                     }
                 }
             }
-            if !missing.is_empty() {
-                dependencies[index].clear();
-                *entry = Some(Err(OleanCheckError::MissingModuleImports {
-                    module: modules[index].name.clone(),
-                    imports: missing.into_iter().collect(),
-                }));
+        } else {
+            for (index, entry) in decode_olean_module_inputs_using(count, jobs, decode)?
+                .into_iter()
+                .enumerate()
+            {
+                decode_memory_retries.push(entry.memory_retry);
+                match entry.result {
+                    Ok(artifact) => {
+                        module_decoded_bytes[index] = decoded_olean_image_bytes(&artifact);
+                        let mut missing = BTreeSet::new();
+                        for import in &artifact.module.imports {
+                            match owners.get(&import.module).copied() {
+                                Some(owner) if owner != index => {
+                                    dependencies[index].insert(owner);
+                                }
+                                Some(_) => {
+                                    dependencies[index].insert(index);
+                                }
+                                None => {
+                                    missing.insert(import.module.clone());
+                                }
+                            }
+                        }
+                        if missing.is_empty() {
+                            decoded.push(Some(FrontierDecodeSlot::Upfront(Box::new(artifact))));
+                        } else {
+                            dependencies[index].clear();
+                            decoded.push(Some(FrontierDecodeSlot::Error(
+                                OleanCheckError::MissingModuleImports {
+                                    module: modules[index].name.clone(),
+                                    imports: missing.into_iter().collect(),
+                                },
+                            )));
+                        }
+                    }
+                    Err(error) => {
+                        decoded.push(Some(FrontierDecodeSlot::Error(error)));
+                    }
+                }
             }
         }
 
         let mut remaining: Vec<usize> = dependencies.iter().map(BTreeSet::len).collect();
-        let mut dependents = vec![Vec::new(); modules.len()];
+        let mut dependents = vec![Vec::new(); count];
         for (index, deps) in dependencies.iter().enumerate() {
             for dependency in deps {
                 dependents[*dependency].push(index);
@@ -3832,7 +4076,7 @@ impl Admitted {
             .filter(|(index, _)| remaining[*index] == 0)
             .map(|(_, module)| module.name.clone())
             .collect();
-        let mut order = Vec::with_capacity(modules.len());
+        let mut order = Vec::with_capacity(count);
         while let Some(name) = ready.pop_first() {
             let index = owners[&name];
             order.push(index);
@@ -3851,14 +4095,15 @@ impl Admitted {
             .collect();
         for (index, left) in remaining.iter().enumerate() {
             if *left != 0 {
-                decoded[index] = Some(Err(OleanCheckError::ModuleImportCycle {
-                    modules: cycle.clone(),
-                }));
+                decoded[index] = Some(FrontierDecodeSlot::Error(
+                    OleanCheckError::ModuleImportCycle {
+                        modules: cycle.clone(),
+                    },
+                ));
                 order.push(index);
             }
         }
 
-        let count = modules.len();
         let mut position = vec![0_usize; count];
         for (at, index) in order.iter().enumerate() {
             position[*index] = at;
@@ -3877,13 +4122,6 @@ impl Admitted {
             closure.insert(*index);
             closures[*index] = std::sync::Arc::new(closure);
         }
-        let module_decoded_bytes: Vec<u64> = decoded
-            .iter()
-            .map(|entry| match entry {
-                Some(Ok(artifact)) => decoded_olean_image_bytes(artifact),
-                _ => 0,
-            })
-            .collect();
         let estimated_bytes: Vec<u64> = (0..count)
             .map(|index| {
                 let closure_decoded = closures[index]
@@ -3894,15 +4132,64 @@ impl Admitted {
             })
             .collect();
 
+        let base_of: Vec<Option<usize>> = (0..count)
+            .map(|index| frontier_base_of(&dependencies, &closures, |i| position[i], index))
+            .collect();
+        // Track remaining consumers of each `accepted[member]` payload so streaming
+        // runs can evict accepted module payloads as soon as no later module can
+        // need them. In provisional mode we retain any member imported by a
+        // non-accepted Phase-1 module so Phase 2 can still build its environment.
+        let mut remaining_accepted_users = vec![0_usize; count];
+        if !exec_options.retain_union_engine {
+            for index in 0..count {
+                let base_dep = base_of[index];
+                for &member in closures[index].iter() {
+                    if member == index {
+                        continue;
+                    }
+                    if !exec_options.retain_accepted_for_phase2
+                        && base_dep.is_some_and(|base| closures[base].contains(&member))
+                    {
+                        continue;
+                    }
+                    remaining_accepted_users[member] += 1;
+                }
+            }
+        }
+        let release_accepted_consumers =
+            |settled_index: usize,
+             settled_accepted: bool,
+             base_dep: Option<usize>,
+             accepted: &mut [Option<std::sync::Arc<FrontierAccepted>>],
+             remaining_users: &mut [usize]| {
+                if exec_options.retain_union_engine {
+                    return;
+                }
+                if exec_options.retain_accepted_for_phase2 && !settled_accepted {
+                    return;
+                }
+                for &member in closures[settled_index].iter() {
+                    if member == settled_index {
+                        continue;
+                    }
+                    if !exec_options.retain_accepted_for_phase2
+                        && base_dep.is_some_and(|base| closures[base].contains(&member))
+                    {
+                        continue;
+                    }
+                    remaining_users[member] = remaining_users[member].saturating_sub(1);
+                    if remaining_users[member] == 0 {
+                        accepted[member] = None;
+                    }
+                }
+            };
+
         // A row waits here from its decision until every earlier row has left.
         let mut pending_rows: Vec<Option<OleanFrontierRow>> = (0..count).map(|_| None).collect();
         let mut decided = vec![false; count];
+        let mut is_accepted = vec![false; count];
         let mut accepted: Vec<Option<std::sync::Arc<FrontierAccepted>>> = vec![None; count];
-        let mut engines = FrontierEngines::new(
-            (0..count)
-                .map(|index| frontier_base_of(&dependencies, &closures, |i| position[i], index))
-                .collect(),
-        );
+        let mut engines = FrontierEngines::new(base_of);
         let mut rows = Vec::with_capacity(count);
         let threads = jobs.threads.get();
 
@@ -3917,11 +4204,7 @@ impl Admitted {
             frontier_guarded(index, false, started, || {
                 let artifact = match artifact {
                     Some(artifact) => Ok(artifact),
-                    None => decode_olean_module_input_with(
-                        &modules[index],
-                        limits,
-                        CheckerReading::Read,
-                    ),
+                    None => decode(index),
                 };
                 match artifact {
                     Ok(artifact) => {
@@ -4009,7 +4292,9 @@ impl Admitted {
             let record = |done: FrontierDone,
                           running: &mut Vec<bool>,
                           decided: &mut Vec<bool>,
+                          is_accepted: &mut Vec<bool>,
                           accepted: &mut Vec<Option<std::sync::Arc<FrontierAccepted>>>,
+                          remaining_accepted_users: &mut Vec<usize>,
                           engines: &mut FrontierEngines,
                           pending_rows: &mut Vec<Option<OleanFrontierRow>>,
                           memory_retry: Option<OleanFrontierMemoryRetry>,
@@ -4018,8 +4303,19 @@ impl Admitted {
                 let row_index = done.index;
                 running[row_index] = false;
                 decided[row_index] = true;
-                accepted[row_index] = done.accepted.map(std::sync::Arc::new);
+                let row_accepted = done.accepted.is_some();
+                is_accepted[row_index] = row_accepted;
+                if exec_options.retain_union_engine || remaining_accepted_users[row_index] > 0 {
+                    accepted[row_index] = done.accepted.map(std::sync::Arc::new);
+                }
                 engines.keep(row_index, done.engine);
+                release_accepted_consumers(
+                    row_index,
+                    row_accepted,
+                    engines.base_of(row_index),
+                    accepted,
+                    remaining_accepted_users,
+                );
                 pending_rows[row_index] = Some(OleanFrontierRow {
                     name: modules[row_index].name.clone(),
                     verdict: done.verdict,
@@ -4049,7 +4345,7 @@ impl Admitted {
                         continue;
                     }
                     let verdict = match &decoded[index] {
-                        Some(Ok(_)) => {
+                        Some(FrontierDecodeSlot::Upfront(_) | FrontierDecodeSlot::OnDemand) => {
                             if !dependencies[index]
                                 .iter()
                                 .all(|dependency| decided[*dependency])
@@ -4058,7 +4354,7 @@ impl Admitted {
                             }
                             match dependencies[index]
                                 .iter()
-                                .find(|dependency| accepted[**dependency].is_none())
+                                .find(|dependency| !is_accepted[**dependency])
                             {
                                 Some(blocker) => OleanModuleVerdict::Blocked {
                                     by: modules[*blocker].name.clone(),
@@ -4069,8 +4365,8 @@ impl Admitted {
                                 }
                             }
                         }
-                        Some(Err(_)) => match decoded[index].take() {
-                            Some(Err(error)) => frontier_error_verdict(error),
+                        Some(FrontierDecodeSlot::Error(_)) => match decoded[index].take() {
+                            Some(FrontierDecodeSlot::Error(error)) => frontier_error_verdict(error),
                             _ => continue,
                         },
                         None => frontier_error_verdict(OleanCheckError::InternalInvariant {
@@ -4082,6 +4378,13 @@ impl Admitted {
                     decoded[index] = None;
                     decided[index] = true;
                     engines.release(index, &closures, false)?;
+                    release_accepted_consumers(
+                        index,
+                        false,
+                        engines.base_of(index),
+                        &mut accepted,
+                        &mut remaining_accepted_users,
+                    );
                     let row = pending_rows[index].insert(OleanFrontierRow {
                         name: modules[index].name.clone(),
                         verdict,
@@ -4126,7 +4429,7 @@ impl Admitted {
                     && in_flight == 0
                     && let Some((_, index)) = retry_pending.pop_first()
                 {
-                    let imports =
+                    let mut imports =
                         retry_imports[index]
                             .take()
                             .ok_or(OleanCheckError::InternalInvariant {
@@ -4137,6 +4440,24 @@ impl Admitted {
                             detail: "an isolated retry has no first memory refusal",
                         },
                     )?;
+                    // Reclaim idle checker projections before running a memory-refused
+                    // module alone; if RSS is already near the ceiling, also trim the
+                    // retrying module's own retained checker projection so it projects
+                    // only what its declarations reference.
+                    engines.shed_idle_checker_environments(engines.base_of(index));
+                    let retry_sample = memory.sample();
+                    if retry_sample.limit_bytes.is_some_and(|limit| {
+                        retry_sample.rss_bytes >= (limit / 10).saturating_mul(7)
+                    }) {
+                        engines.shed_idle_checker_environments(None);
+                        if let Some(base) = &mut imports.base
+                            && base.engine.checker_environment.is_some()
+                        {
+                            let mut trimmed = (*base.engine).clone();
+                            trimmed.checker_environment = None;
+                            base.engine = std::sync::Arc::new(trimmed);
+                        }
+                    }
                     on_event(OleanFrontierEvent::Retrying {
                         position: position[index] + 1,
                         total: count,
@@ -4159,6 +4480,23 @@ impl Admitted {
                             detail: "every frontier worker thread has stopped",
                         })?;
                 }
+                // Release-aware dispatch: when multiple modules are ready in parallel,
+                // prefer modules whose dispatch drains a cached base engine to 0 users
+                // (freeing its PMap and checker projection immediately), then smallest
+                // remaining base user count, then deepest closure, with frontier
+                // position as deterministic tie-break. Logical verdicts and row order
+                // depend only on each module's own import closure (FL-INV-01).
+                if threads > 1 && ready.len() > 1 {
+                    ready.sort_by_key(|&index| {
+                        let base_users = engines.base_users(index).unwrap_or(usize::MAX);
+                        (
+                            base_users != 1,
+                            base_users,
+                            std::cmp::Reverse(closures[index].len()),
+                            position[index],
+                        )
+                    });
+                }
                 // A queued refusal drains the current workers before retrying.
                 // Once that retry starts, no new job may overlap it, including
                 // when it was the last entry in the pending retry queue.
@@ -4170,6 +4508,11 @@ impl Admitted {
                         break;
                     }
                     let sample = memory.sample();
+                    if let Some(limit_bytes) = sample.limit_bytes
+                        && sample.rss_bytes >= limit_bytes / 2
+                    {
+                        engines.shed_idle_checker_environments(engines.base_of(index));
+                    }
                     if in_flight == 0 {
                         idle_rss_bytes = sample.rss_bytes;
                     } else if let Some(limit_bytes) = sample.limit_bytes {
@@ -4182,15 +4525,24 @@ impl Admitted {
                             continue;
                         }
                     }
-                    let Some(Ok(artifact)) = decoded[index].take() else {
-                        return Err(OleanCheckError::InternalInvariant {
-                            detail: "a ready frontier module has no decoded artifact",
-                        });
+                    let artifact = match decoded[index].take() {
+                        Some(FrontierDecodeSlot::Upfront(artifact)) => Some(*artifact),
+                        Some(FrontierDecodeSlot::OnDemand) => None,
+                        _ => {
+                            return Err(OleanCheckError::InternalInvariant {
+                                detail: "a ready frontier module has no decoded artifact",
+                            });
+                        }
                     };
                     let base = engines.release(index, &closures, true)?;
                     let mut closure: Vec<_> = closures[index]
                         .iter()
-                        .filter(|member| **member != index)
+                        .filter(|member| {
+                            **member != index
+                                && !base
+                                    .as_ref()
+                                    .is_some_and(|base| base.closure.contains(member))
+                        })
                         .filter_map(|member| accepted[*member].clone())
                         .collect();
                     closure.sort_by_key(|module| module.position);
@@ -4212,19 +4564,15 @@ impl Admitted {
                     in_flight_estimated_bytes =
                         in_flight_estimated_bytes.saturating_add(estimated_bytes[index]);
                     dispatched += 1;
-                    let job = FrontierJob {
-                        index,
-                        position: position[index],
-                        name: modules[index].name.clone(),
-                        artifact,
-                        base,
-                        closure,
-                        retain: false,
-                    };
                     if threads == 1 {
                         // Serial: finish this module before deciding anything else,
                         // so the events keep the one-at-a-time order.
-                        let done = check(job);
+                        let done = run(FrontierWork {
+                            index,
+                            position: position[index],
+                            artifact,
+                            imports: FrontierRetryImports { base, closure },
+                        });
                         in_flight -= 1;
                         in_flight_estimated_bytes =
                             in_flight_estimated_bytes.saturating_sub(estimated_bytes[done.index]);
@@ -4233,7 +4581,9 @@ impl Admitted {
                             done,
                             &mut running,
                             &mut decided,
+                            &mut is_accepted,
                             &mut accepted,
+                            &mut remaining_accepted_users,
                             &mut engines,
                             &mut pending_rows,
                             None,
@@ -4244,18 +4594,15 @@ impl Admitted {
                         break;
                     }
                     retry_imports[index] = Some(FrontierRetryImports {
-                        base: job.base.clone(),
-                        closure: job.closure.clone(),
+                        base: base.clone(),
+                        closure: closure.clone(),
                     });
                     if job_sender
                         .send(FrontierWork {
                             index,
                             position: position[index],
-                            artifact: Some(job.artifact),
-                            imports: FrontierRetryImports {
-                                base: job.base,
-                                closure: job.closure,
-                            },
+                            artifact,
+                            imports: FrontierRetryImports { base, closure },
                         })
                         .is_err()
                     {
@@ -4312,7 +4659,9 @@ impl Admitted {
                     done,
                     &mut running,
                     &mut decided,
+                    &mut is_accepted,
                     &mut accepted,
+                    &mut remaining_accepted_users,
                     &mut engines,
                     &mut pending_rows,
                     memory_retries[index].take(),
@@ -4328,8 +4677,12 @@ impl Admitted {
         // A merge conflict between modules that never meet is not an error of the
         // run: every row above is already decided (fln-elp6's stdlib run lost its
         // whole --json to two executables' `main`).
-        let engine = self
-            .frontier_union_engine(order.iter().filter_map(|index| accepted[*index].as_deref()));
+        let engine = if exec_options.retain_union_engine {
+            self.frontier_union_engine(order.iter().filter_map(|index| accepted[*index].as_deref()))
+                .map(Some)
+        } else {
+            Ok(None)
+        };
         let policy_summary = CheckerPolicySummary::merge(
             limits.admission.policy,
             rows.iter().map(|row| &row.policy_summary),
@@ -8047,5 +8400,257 @@ mod tests {
             matches!(malformed, super::OleanModuleVerdict::Failed(_)),
             "malformed input stays failed, got {malformed:?}"
         );
+    }
+
+    fn empty_admitted() -> super::Admitted {
+        super::Admitted {
+            environment: fln_env::environment::Environment::new(),
+            checker_environment: None,
+            imported_modules: std::sync::Arc::default(),
+            imported_environment: None,
+            imported_module_dependencies: std::sync::Arc::default(),
+            executable_opaques: std::sync::Arc::default(),
+            runtime_initializers: std::sync::Arc::default(),
+            options: fln_core::options::KVMap::new(),
+        }
+    }
+
+    #[test]
+    fn frontier_engines_shed_idle_checker_environments_preserves_env_and_kept_base() {
+        let mut engines = super::FrontierEngines::new(vec![None, Some(0), Some(1), Some(0)]);
+        assert_eq!(engines.base_of(1), Some(0));
+        assert_eq!(engines.base_users(1), Some(2));
+        assert_eq!(engines.base_users(2), Some(1));
+
+        let mut base0 = empty_admitted();
+        base0.checker_environment = Some(super::CheckerConstantEnvironment::empty());
+        let mut base1 = empty_admitted();
+        base1.checker_environment = Some(super::CheckerConstantEnvironment::empty());
+        engines.keep(0, Some(base0));
+        engines.keep(1, Some(base1));
+
+        // Shedding with keep_base=Some(1) clears base 0's checker projection while
+        // preserving base 1's projection and both K1 environments.
+        let shed = engines.shed_idle_checker_environments(Some(1));
+        assert_eq!(shed, 1);
+        assert!(
+            engines.engines[0]
+                .as_ref()
+                .expect("base 0 kept")
+                .checker_environment
+                .is_none()
+        );
+        assert!(
+            engines.engines[1]
+                .as_ref()
+                .expect("base 1 kept")
+                .checker_environment
+                .is_some()
+        );
+        // Shedding with None clears the remaining idle projection too; a second
+        // sweep is a no-op.
+        assert_eq!(engines.shed_idle_checker_environments(None), 1);
+        assert_eq!(engines.shed_idle_checker_environments(None), 0);
+        assert!(
+            engines.engines[1]
+                .as_ref()
+                .expect("base 1 still kept")
+                .checker_environment
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn streaming_frontier_rows_match_upfront_frontier_and_evict_accepted_payloads() {
+        use fln_core::expr::Expr;
+        use fln_core::level::Level;
+        use fln_core::options::KVMap;
+        use fln_env::constants::{AxiomVal, ConstantInfo, ConstantVal, TheoremVal};
+        use fln_kernel::verdict::Budget;
+        use fln_olean::region::ModuleImport;
+        use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_module};
+        use std::num::NonZeroUsize;
+
+        let n = |text: &str| Name::from_components(text.split('.'));
+        let header = OleanWriteHeader {
+            version: 2,
+            flags: 1,
+            lean_version: "4.32.0",
+            githash: fln_olean::format::PIN_COMMIT,
+            base_addr: 0x20_000,
+        };
+        let make_mod = |name: &str, constants: Vec<ConstantInfo>, imports: &[&str]| {
+            let imports: Vec<ModuleImport> = imports
+                .iter()
+                .map(|imp| ModuleImport {
+                    module: n(imp),
+                    import_all: false,
+                    is_exported: true,
+                    is_meta: false,
+                })
+                .collect();
+            let input = ModuleWriteInput {
+                is_module: false,
+                imports: &imports,
+                constants: &constants,
+                extra_const_names: &[],
+            };
+            (
+                n(name),
+                encode_module(input, header, WriteBudget::default())
+                    .expect("encode olean")
+                    .bytes,
+            )
+        };
+        let prop = Expr::sort(Level::zero());
+        let p_const = Expr::const_(n("Stream.P"), Vec::new());
+        let p_proof = Expr::const_(n("Stream.hp"), Vec::new());
+
+        // Diamond A -> {B, C} -> D so D exercises both base engine reuse (B) and
+        // delta closure merge (C), plus leaf eviction on A, B, C, D.
+        let set = [
+            make_mod(
+                "Stream.A",
+                vec![
+                    ConstantInfo::Axiom(AxiomVal {
+                        base: ConstantVal {
+                            name: n("Stream.P"),
+                            level_params: Vec::new(),
+                            type_: prop,
+                        },
+                        is_unsafe: false,
+                    }),
+                    ConstantInfo::Axiom(AxiomVal {
+                        base: ConstantVal {
+                            name: n("Stream.hp"),
+                            level_params: Vec::new(),
+                            type_: p_const.clone(),
+                        },
+                        is_unsafe: false,
+                    }),
+                ],
+                &[],
+            ),
+            make_mod(
+                "Stream.B",
+                vec![ConstantInfo::Thm(TheoremVal {
+                    base: ConstantVal {
+                        name: n("Stream.tb"),
+                        level_params: Vec::new(),
+                        type_: p_const.clone(),
+                    },
+                    value: p_proof.clone(),
+                    all: vec![n("Stream.tb")],
+                })],
+                &["Stream.A"],
+            ),
+            make_mod(
+                "Stream.C",
+                vec![ConstantInfo::Thm(TheoremVal {
+                    base: ConstantVal {
+                        name: n("Stream.tc"),
+                        level_params: Vec::new(),
+                        type_: p_const.clone(),
+                    },
+                    value: p_proof,
+                    all: vec![n("Stream.tc")],
+                })],
+                &["Stream.A"],
+            ),
+            make_mod(
+                "Stream.D",
+                vec![ConstantInfo::Thm(TheoremVal {
+                    base: ConstantVal {
+                        name: n("Stream.td"),
+                        level_params: Vec::new(),
+                        type_: p_const,
+                    },
+                    value: Expr::const_(n("Stream.tc"), Vec::new()),
+                    all: vec![n("Stream.td")],
+                })],
+                &["Stream.B", "Stream.C"],
+            ),
+        ];
+        let inputs: Vec<super::OleanModuleInput<'_>> = set
+            .iter()
+            .map(|(name, bytes)| super::OleanModuleInput {
+                name,
+                artifact: bytes,
+                server_artifact: None,
+                private_artifact: None,
+            })
+            .collect();
+        let total_bytes: usize = set.iter().map(|(_, b)| b.len()).sum();
+        let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
+        let limits = super::OleanCheckLimits::new(total_bytes, budget);
+        let admitted = empty_admitted();
+        let options = KVMap::new();
+
+        let upfront = admitted
+            .check_olean_frontier_scheduled(
+                &inputs,
+                &options,
+                limits,
+                super::OleanFrontierJobs::SERIAL,
+                &mut |_| {},
+            )
+            .expect("upfront frontier");
+
+        for threads in [1_usize, 3] {
+            let jobs = super::OleanFrontierJobs {
+                threads: NonZeroUsize::new(threads).unwrap(),
+                worker_stack_bytes: 8 * 1024 * 1024,
+            };
+            let hooks = super::FrontierRunHooks {
+                check: &|job| admitted.frontier_check_module(job, &options, limits),
+                decode: &|index| {
+                    super::decode_olean_module_input_with(
+                        &inputs[index],
+                        limits,
+                        super::CheckerReading::Read,
+                    )
+                },
+                memory: &super::HostProcessMemorySource,
+            };
+            let phase1 = admitted
+                .check_olean_frontier_phase1_core_with_options(
+                    &inputs,
+                    limits,
+                    jobs,
+                    &mut |_| {},
+                    hooks,
+                    super::FrontierExecutionOptions::STREAMING_ROWS,
+                )
+                .expect("streaming phase1");
+            // Every accepted payload must be evicted once all consumers settle.
+            assert!(
+                phase1.accepted.iter().all(Option::is_none),
+                "streaming rows must evict all accepted payloads after completion (threads={threads})"
+            );
+            assert!(
+                phase1
+                    .frontier
+                    .engine
+                    .as_ref()
+                    .expect("no union error")
+                    .is_none(),
+                "streaming rows must not build a union engine"
+            );
+            assert_eq!(phase1.frontier.rows.len(), upfront.rows.len());
+            assert_eq!(phase1.frontier.policy_summary, upfront.policy_summary);
+            for (stream_row, up_row) in phase1.frontier.rows.iter().zip(&upfront.rows) {
+                assert_eq!(stream_row.name, up_row.name);
+                match (&stream_row.verdict, &up_row.verdict) {
+                    (
+                        super::OleanModuleVerdict::Accepted { declarations: a },
+                        super::OleanModuleVerdict::Accepted { declarations: b },
+                    ) => assert_eq!(a, b),
+                    other => panic!(
+                        "unexpected verdict pair for {}: {other:?}",
+                        stream_row.name.to_display_string()
+                    ),
+                }
+            }
+        }
     }
 }
