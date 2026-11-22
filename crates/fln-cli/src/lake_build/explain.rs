@@ -98,6 +98,7 @@ fn target_name<'a>(
     let bare = text
         .strip_suffix(":olean")
         .or_else(|| text.strip_suffix(":ir"))
+        .or_else(|| text.strip_suffix(":ilean"))
         .unwrap_or(text);
     if bare.contains('/') || bare.starts_with('@') {
         module_target(sources, bare).map(|(module, owner)| (module, Some(owner)))

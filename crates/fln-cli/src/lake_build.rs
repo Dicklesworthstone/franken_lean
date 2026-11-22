@@ -1,5 +1,6 @@
 //! Checked TOML and native Lean package module builds. The `+Module:ir` facet
-//! also compiles the supported source ABI; library defaults require further artifacts.
+//! also compiles the supported source ABI; the `+Module:ilean` facet emits checked
+//! editor metadata. Library defaults require further artifacts.
 use super::*;
 use fln::source_check::modules::persisted::{ModuleProvenance, PersistedModules};
 use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
@@ -282,6 +283,7 @@ struct BuildPlan<'a> {
     entries: Vec<Name>,
     owners: ModuleOwners<'a>,
     ir: BTreeSet<Name>,
+    ilean: BTreeSet<Name>,
     /// Query results preserve request order and duplicates independently of
     /// the deduplicated compilation graph and its combined facet demands.
     requests: Vec<(Name, ModuleFacet)>,
@@ -291,6 +293,7 @@ struct BuildPlan<'a> {
 enum ModuleFacet {
     Olean,
     Ir,
+    Ilean,
 }
 
 impl ModuleFacet {
@@ -298,6 +301,7 @@ impl ModuleFacet {
         match self {
             Self::Olean => "olean",
             Self::Ir => "ir",
+            Self::Ilean => "ilean",
         }
     }
 }
@@ -402,6 +406,7 @@ fn plan_modules<'a>(
         entries: Vec::new(),
         owners: BTreeMap::new(),
         ir: BTreeSet::new(),
+        ilean: BTreeSet::new(),
         requests: Vec::new(),
     };
     for target in targets {
@@ -413,9 +418,10 @@ fn plan_modules<'a>(
         let facet = match facet {
             "olean" => ModuleFacet::Olean,
             "ir" => ModuleFacet::Ir,
+            "ilean" => ModuleFacet::Ilean,
             _ => {
                 return Err(Failure::unsupported(format!(
-                    "facet `{facet}` is unavailable; supported module facets: +Module:olean, +Module:ir"
+                    "facet `{facet}` is unavailable; supported module facets: +Module:olean, +Module:ir, +Module:ilean"
                 )));
             }
         };
@@ -432,8 +438,14 @@ fn plan_modules<'a>(
             plan.owners.insert(module.clone(), owner);
         }
         plan.requests.push((module.clone(), facet));
-        if matches!(facet, ModuleFacet::Ir) {
-            plan.ir.insert(module);
+        match facet {
+            ModuleFacet::Ir => {
+                plan.ir.insert(module);
+            }
+            ModuleFacet::Ilean => {
+                plan.ilean.insert(module);
+            }
+            ModuleFacet::Olean => {}
         }
     }
     Ok(plan)
@@ -542,6 +554,7 @@ struct ModuleArtifacts {
     exported: Vec<u8>,
     companions: Option<CompanionArtifacts>,
     ir: Option<Vec<u8>>,
+    ilean: Option<Vec<u8>>,
 }
 
 impl ModuleArtifacts {
@@ -556,6 +569,7 @@ impl ModuleArtifacts {
                 ]
             })
             .chain(self.ir.iter().map(|bytes| ("ir", bytes.as_slice())))
+            .chain(self.ilean.iter().map(|bytes| ("ilean", bytes.as_slice())))
             .chain(std::iter::once(("olean", self.exported.as_slice())))
     }
 }
@@ -576,12 +590,13 @@ struct Compilation {
 struct CompileFacets<'a> {
     entries: &'a [Name],
     executable: &'a BTreeSet<Name>,
+    metadata: &'a BTreeSet<Name>,
     cancellation: Option<&'a dyn fln::CancellationProbe>,
 }
 
-/// Every local dependency of an executable target also needs its own companion.
+/// Every local dependency of an executable or editor target needs its companion.
 /// Other requested admission-only targets keep their independent facet contract.
-fn executable_modules(
+fn companion_modules(
     entries: &BTreeSet<Name>,
     modules: &BTreeMap<Name, Module>,
 ) -> BTreeSet<Name> {
@@ -758,6 +773,60 @@ fn compile(
             } else {
                 None
             };
+            let ilean = if facets.metadata.contains(&artifact.name) {
+                // Each metadata entry accepts only its own dependency closure.
+                // Reuse captured inputs; descendants must not become ambient.
+                let metadata_closure =
+                    companion_modules(&BTreeSet::from([artifact.name.clone()]), modules);
+                let metadata_inputs: Vec<_> = inputs
+                    .iter()
+                    .filter(|input| metadata_closure.contains(input.name))
+                    .map(|input| fln::SourceModuleInput {
+                        name: input.name,
+                        source: input.source,
+                    })
+                    .collect();
+                let outcome = active
+                    .as_mut()
+                    .expect("the current external context is installed")
+                    .1
+                    .ilean(
+                        &metadata_inputs,
+                        &artifact.name,
+                        MAX_ARTIFACT_BYTES,
+                        cancellation,
+                    )
+                    .map_err(|(class, detail, authority)| Failure {
+                        class,
+                        detail,
+                        authority,
+                    })?;
+                match outcome {
+                    Outcome::Complete(bytes) => Some(bytes),
+                    Outcome::Inconclusive(reason) => {
+                        let class = if matches!(
+                            reason.cause,
+                            fln_core::outcome::InconclusiveCause::Cancelled { .. }
+                        ) {
+                            "cancelled"
+                        } else {
+                            "inconclusive"
+                        };
+                        return Err(Failure::new(
+                            class,
+                            format!("module .ilean generation did not complete: {reason:?}"),
+                        ));
+                    }
+                    Outcome::InternalFault(fault) => {
+                        return Err(Failure::new(
+                            "internal-fault",
+                            format!("module .ilean generation faulted: {fault:?}"),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
             let family = ModuleArtifacts {
                 exported: artifact.bytes,
                 companions: artifact.companions.map(|parts| CompanionArtifacts {
@@ -765,6 +834,7 @@ fn compile(
                     private: parts.private,
                 }),
                 ir,
+                ilean,
             };
             if let Some(previous) = artifacts.get(&artifact.name) {
                 if previous != &family {
@@ -887,10 +957,8 @@ fn publish_locations_with(
         let path = directory.join(relative);
         // Never leave an old executable or implementation companion next to a
         // new public root. Every existing family member must be regenerated.
-        for suffix in ["ir", "olean.server", "olean.private"] {
-            if (suffix == "ir" && family.ir.is_some())
-                || (suffix != "ir" && family.companions.is_some())
-            {
+        for suffix in ["ir", "ilean", "olean.server", "olean.private"] {
+            if family.parts().any(|(part, _)| part == suffix) {
                 continue;
             }
             let existing = path.with_extension(suffix);
@@ -1104,7 +1172,8 @@ fn build(
         sources.resolve_build(module, &plan.owners)
     })?;
     sources.validate_entry_imports(&plan.owners, &modules)?;
-    let executable = executable_modules(&plan.ir, &modules);
+    let executable = companion_modules(&plan.ir, &modules);
+    let metadata = companion_modules(&plan.ilean, &modules);
     let records = macro_config
         .is_none()
         .then(|| source_check::module_records(posture));
@@ -1121,6 +1190,7 @@ fn build(
         CompileFacets {
             entries: &plan.entries,
             executable: &executable,
+            metadata: &metadata,
             cancellation,
         },
         &modules,
@@ -1180,7 +1250,17 @@ fn build(
         .values()
         .filter(|family| family.ir.is_some())
         .count();
-    let facet = if executable_count == 0 { "olean" } else { "ir" };
+    let metadata_count = artifacts
+        .values()
+        .filter(|family| family.ilean.is_some())
+        .count();
+    let facet = if executable_count != 0 {
+        "ir"
+    } else if metadata_count != 0 {
+        "ilean"
+    } else {
+        "olean"
+    };
     let output = if json {
         let paths = paths
             .iter()
@@ -1254,7 +1334,7 @@ fn build(
             ),
         };
         format!(
-            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":{},\"modules_built\":{},\"modules_cached\":{cached_modules},\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"executable_modules\":{executable_count},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\",\"import_posture\":{},\"imports\":[{imports}]{configuration_imports},\"module_records\":{}{unavailable},\"modules\":[{rows}]{macro_json},{snapshot}}}\n",
+            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":{},\"modules_built\":{},\"modules_cached\":{cached_modules},\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"executable_modules\":{executable_count},\"metadata_modules\":{metadata_count},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\",\"import_posture\":{},\"imports\":[{imports}]{configuration_imports},\"module_records\":{}{unavailable},\"modules\":[{rows}]{macro_json},{snapshot}}}\n",
             json_string(&config.name),
             json_string(facet),
             artifacts.len(),
@@ -1288,8 +1368,13 @@ fn build(
         } else {
             format!(" and {executable_count} native .ir companions")
         };
+        let metadata = if metadata_count == 0 {
+            String::new()
+        } else {
+            format!(" and {metadata_count} checked .ilean companions")
+        };
         format!(
-            "Built {} checked .olean modules{executable} for {} ({elaborated_modules} elaborated, {cached_modules} re-admitted from verified records; {reused_modules} module checks reused).{imports}{configuration_imports}{macros}{snapshot}\n",
+            "Built {} checked .olean modules{executable}{metadata} for {} ({elaborated_modules} elaborated, {cached_modules} re-admitted from verified records; {reused_modules} module checks reused).{imports}{configuration_imports}{macros}{snapshot}\n",
             artifacts.len(),
             config.name
         )
@@ -1353,6 +1438,7 @@ fn record_snapshot(
             artifact: relative(&output_dir.join(artifact)),
             artifact_digest: snapshot::digest(&family.exported),
             ir_digest: family.ir.as_ref().map(|bytes| snapshot::digest(bytes)),
+            ilean_digest: family.ilean.as_ref().map(|bytes| snapshot::digest(bytes)),
             companions: family
                 .companions
                 .as_ref()
@@ -1732,6 +1818,7 @@ mod publication_tests {
                 private: format!("{prefix} private").into_bytes(),
             }),
             ir: None,
+            ilean: None,
         }
     }
 
@@ -2001,6 +2088,60 @@ mod publication_tests {
             );
         }
         assert!(!directory.0.join(".fln-olean-build.lock").exists());
+    }
+
+    #[test]
+    fn editor_metadata_rolls_back_with_the_checked_module_family() {
+        let directory = Directory::new();
+        let mut old = family("old");
+        old.ilean = Some(b"old editor metadata".to_vec());
+        let mut next = family("new");
+        next.ilean = Some(b"new editor metadata".to_vec());
+        for (part, bytes) in old.parts() {
+            std::fs::write(directory.0.join("A.olean").with_extension(part), bytes).unwrap();
+        }
+        let artifacts = BTreeMap::from([(Name::from_components(["A"]), next)]);
+        let mut failed = false;
+        let result = publish_with(&directory.0, &directory.0, &artifacts, |bytes, path| {
+            fln::publish_file_atomic(bytes, path)?;
+            if path == directory.0.join("A.olean") && !failed {
+                failed = true;
+                assert_eq!(
+                    std::fs::read(directory.0.join("A.ilean"))?,
+                    b"new editor metadata",
+                );
+                return Err(std::io::Error::other("failure after public root publication"));
+            }
+            Ok(())
+        });
+        assert!(failed);
+        assert!(result.is_err());
+        for (part, bytes) in old.parts() {
+            assert_eq!(
+                std::fs::read(directory.0.join("A.olean").with_extension(part)).unwrap(),
+                bytes,
+            );
+        }
+        assert!(!directory.0.join(".fln-olean-build.lock").exists());
+
+        // Publishing a new root must never leave a previous reference index
+        // beside it. A request omitting that facet fails before the first write.
+        let incomplete = BTreeMap::from([(Name::from_components(["A"]), family("later"))]);
+        let mut writes = 0;
+        let error = publish_with(&directory.0, &directory.0, &incomplete, |bytes, path| {
+            writes += 1;
+            fln::publish_file_atomic(bytes, path)
+        })
+        .unwrap_err();
+        assert_eq!(error.class, "unsupported");
+        assert!(error.detail.contains("A.ilean"));
+        assert_eq!(writes, 0);
+        for (part, bytes) in old.parts() {
+            assert_eq!(
+                std::fs::read(directory.0.join("A.olean").with_extension(part)).unwrap(),
+                bytes,
+            );
+        }
     }
 
     #[test]

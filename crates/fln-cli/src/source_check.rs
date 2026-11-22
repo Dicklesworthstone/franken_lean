@@ -91,7 +91,7 @@ impl ModuleBuildContext {
         use fln::source_check::modules::{SourceModuleCacheLimits, SourceModuleSession};
         let (session, report) = match base {
             Some((receipt, report)) => (
-                SourceModuleSession::from_imports(
+                SourceModuleSession::from_lean_imports(
                     receipt,
                     fln::KVMap::new(),
                     limits,
@@ -100,8 +100,8 @@ impl ModuleBuildContext {
                 Some(report),
             ),
             None => (
-                SourceModuleSession::new(
-                    fln::Engine::from_environment(fln::Environment::new()),
+                SourceModuleSession::from_lean_imports(
+                    SourceOleanImport::empty(&fln::KVMap::new()),
                     fln::KVMap::new(),
                     limits,
                     SourceModuleCacheLimits::default(),
@@ -115,6 +115,66 @@ impl ModuleBuildContext {
             },
             report,
         ))
+    }
+
+    /// Derive editor metadata from the same admitted imports and captured source
+    /// bytes as the artifact build. Unsupported syntax must not become an empty
+    /// successful reference index.
+    pub(super) fn ilean(
+        &mut self,
+        modules: &[fln::SourceModuleInput<'_>],
+        entry: &fln::Name,
+        max_bytes: usize,
+        cancellation: Option<&dyn fln::CancellationProbe>,
+    ) -> Result<fln::Outcome<Vec<u8>>, BuildBaseFailure> {
+        let cancelled = || {
+            fln::Outcome::Inconclusive(fln::Inconclusive::cancelled("lake-build/ilean"))
+        };
+        if cancellation.is_some_and(fln::CancellationProbe::is_cancelled) {
+            return Ok(cancelled());
+        }
+        let ModuleBuildKind::Ordinary(session) = &mut self.kind else {
+            return Err((
+                "unsupported",
+                ".ilean references for imported macro execution are unavailable".to_owned(),
+                false,
+            ));
+        };
+        let metadata = session
+            .ilean(
+                modules,
+                entry,
+                fln::source_check::inspect::SourceIleanLimits::default(),
+            )
+            .map_err(|error| {
+                let (class, authority, _) = error.disposition();
+                (class, error.to_string(), authority)
+            })?;
+        if cancellation.is_some_and(fln::CancellationProbe::is_cancelled) {
+            return Ok(cancelled());
+        }
+        match metadata {
+            fln::Outcome::Complete(metadata) => {
+                let bytes = fln::encode_ilean(
+                    &metadata,
+                    fln::IleanBudget {
+                        max_bytes,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|error| {
+                    let class = if matches!(error, fln::IleanError::Budget { .. }) {
+                        "resource"
+                    } else {
+                        "internal-fault"
+                    };
+                    (class, error.to_string(), false)
+                })?;
+                Ok(fln::Outcome::Complete(bytes))
+            }
+            fln::Outcome::Inconclusive(reason) => Ok(fln::Outcome::Inconclusive(reason)),
+            fln::Outcome::InternalFault(fault) => Ok(fln::Outcome::InternalFault(fault)),
+        }
     }
 
     pub(super) fn compile_with_cancel(

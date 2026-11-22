@@ -57,6 +57,141 @@ const MODULE_TOP: &str = "module\nprelude\npublic import Lib.Base\npublic theore
 const FAMILY_PARTS: [&str; 3] = ["olean", "olean.server", "olean.private"];
 
 #[test]
+fn ilean_facets_publish_resolved_references_and_repair_changed_metadata() {
+    let package = library();
+    let targets = [
+        "+Lib.Top:olean",
+        "+Lib.Top:ilean",
+        "+Lib.Base:ilean",
+        "+Lib.Top:ilean",
+    ];
+    let report = success(&package.build(&targets));
+    assert!(report.contains("\"metadata_modules\":2"), "{report}");
+    assert!(report.contains("\"snapshot\":\"written\""), "{report}");
+    let base_path = package.artifact("Lib.Base");
+    let top_path = package.artifact("Lib.Top");
+    let metadata_path = top_path.with_extension("ilean");
+    let original = std::fs::read(&metadata_path).unwrap();
+    let metadata = fln::decode_ilean(&original, fln::IleanBudget::default()).unwrap();
+    assert_eq!(metadata.module, "Lib.Top");
+    assert!(metadata.decls.contains_key("Lib.again"));
+    assert!(
+        metadata.references[&fln::IleanRefIdent::Const {
+            module: "Lib.Top".to_owned(),
+            name: "Lib.proof".to_owned(),
+        }]
+        .definition
+        .is_some(),
+    );
+    assert_eq!(metadata.direct_imports.len(), 1);
+    assert_eq!(metadata.direct_imports[0].module, "Lib.Base");
+    let identity = &metadata.references[&fln::IleanRefIdent::Const {
+        module: "Lib.Base".to_owned(),
+        name: "Lib.identity".to_owned(),
+    }];
+    assert_eq!(identity.usages.len(), 1);
+    assert_eq!(identity.usages[0].parent_decl.as_deref(), Some("Lib.again"));
+    assert!(base_path.is_file() && top_path.is_file());
+    assert!(base_path.with_extension("ilean").is_file());
+    let previous_olean = std::fs::read(&top_path).unwrap();
+
+    let explain = || {
+        success(
+            &Command::new(env!("CARGO_BIN_EXE_fln"))
+                .args(["build", "explain", "--json", "--dir"])
+                .arg(&package.0)
+                .arg("+Lib.Top:ilean")
+                .env("LEAN_PATH", package.0.join("no-imports"))
+                .output()
+                .unwrap(),
+        )
+    };
+    let fresh = explain();
+    assert!(
+        fresh.contains("\"reference_decision\":\"up-to-date\""),
+        "{fresh}",
+    );
+    std::fs::write(&metadata_path, b"forged editor references").unwrap();
+    let changed = explain();
+    assert!(changed.contains("\"kind\":\"output\""), "{changed}");
+    assert!(changed.contains("Top.ilean"), "{changed}");
+    std::fs::rename(&metadata_path, metadata_path.with_extension("ilean.retained")).unwrap();
+    let missing = explain();
+    assert!(
+        missing.contains("\"reference_decision\":\"rebuild\""),
+        "{missing}",
+    );
+    success(&package.build(&targets));
+    assert_eq!(std::fs::read(&metadata_path).unwrap(), original);
+    assert_eq!(std::fs::read(&top_path).unwrap(), previous_olean);
+
+    // Query emits each requested result in its original order, including a
+    // repeated facet; the output is obtained from this build's artifacts.
+    let queried = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .arg("--dir")
+        .arg(&package.0)
+        .arg("query")
+        .args(targets)
+        .env("LEAN_PATH", package.0.join("no-imports"))
+        .env("FLN_IMPORT_REUSE_DIR", package.0.join(".records"))
+        .output()
+        .unwrap();
+    let canonical = |path: &Path| path.canonicalize().unwrap().display().to_string();
+    assert_eq!(
+        success(&queried),
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            canonical(&top_path),
+            canonical(&metadata_path),
+            canonical(&base_path.with_extension("ilean")),
+            canonical(&metadata_path),
+        ),
+    );
+}
+
+#[test]
+fn unsupported_ilean_keeps_previous_artifacts_and_does_not_leave_stale_references() {
+    let package = library();
+    let targets = ["+Lib.Top:ilean", "+Lib.Base:ilean"];
+    success(&package.build(&targets));
+    let paths = [
+        package.artifact("Lib.Base"),
+        package.artifact("Lib.Base").with_extension("ilean"),
+        package.artifact("Lib.Top"),
+        package.artifact("Lib.Top").with_extension("ilean"),
+        package.0.join(".lake/build/fln-build.snapshot"),
+    ];
+    let before: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let with_tactic = TOP.replace(": P := h", ": P := by exact h");
+    package.write("Lib/Top.lean", &with_tactic);
+    let error = failure(&package.build(&targets));
+    assert!(error.contains("\"class\":\"capability\""), "{error}");
+    assert!(error.contains(".ilean"), "{error}");
+    for (path, previous) in paths.iter().zip(&before) {
+        assert_eq!(std::fs::read(path).unwrap(), *previous);
+    }
+    // Admission still supports the program. It is metadata extraction, not
+    // theorem checking, that refuses this explicitly requested facet.
+    let admission_only = library();
+    admission_only.write("Lib/Top.lean", &with_tactic);
+    success(&admission_only.build(&["+Lib.Top:olean"]));
+    let error = failure(&package.build(&["+Lib.Top:olean"]));
+    assert!(error.contains("coordinated replacement"), "{error}");
+    assert!(error.contains(".ilean"), "{error}");
+    for (path, previous) in paths.iter().zip(&before) {
+        assert_eq!(std::fs::read(path).unwrap(), *previous);
+    }
+    package.write("Lib/Top.lean", TOP);
+    success(&package.build(&targets));
+    for (path, previous) in paths[..4].iter().zip(&before) {
+        assert_eq!(std::fs::read(path).unwrap(), *previous);
+    }
+}
+
+#[test]
 fn native_ir_facets_export_checked_recursive_primitive_definitions() {
     let Some(reference) = pinned_family_reference() else {
         return;
@@ -1625,7 +1760,7 @@ fn module_family_preflight_checks_every_companion_before_replacing_any_module() 
 #[cfg(unix)]
 #[test]
 fn dangling_ir_and_companion_symlinks_cannot_bypass_family_preflight() {
-    for part in ["ir", "olean.server", "olean.private"] {
+    for part in ["ir", "ilean", "olean.server", "olean.private"] {
         let package = module_library();
         package.write(
             ".lake/build/lib/lean/Lib/Base.olean",

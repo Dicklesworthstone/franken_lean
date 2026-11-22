@@ -257,6 +257,8 @@ fn query_module_facets_match_pinned_text_and_json_output() {
             "@program/+App.Top:ir",
             "right/Feature.Right:olean",
             "@/+App.Top:olean",
+            "@right/+Feature.Right:ilean",
+            "@/+App.Top:ilean",
         ];
         arguments.extend(&flags);
         let expected = Command::new(&lake)
@@ -275,10 +277,27 @@ fn query_module_facets_match_pinned_text_and_json_output() {
             normalize_query_output(build_success(native.run(&arguments, None)), &native, json);
         assert_eq!(actual, expected, "flags: {flags:?}");
         let lines: Vec<_> = actual.lines().collect();
-        assert_eq!(lines.len(), 4, "{actual}");
+        assert_eq!(lines.len(), 6, "{actual}");
         assert_eq!(lines[0], lines[2], "{actual}");
         assert!(lines[1].contains("Top.ir"), "{actual}");
         assert!(lines[3].contains("Top.olean"), "{actual}");
+        assert!(lines[4].contains("Right.ilean"), "{actual}");
+        assert!(lines[5].contains("Top.ilean"), "{actual}");
+        for relative in [
+            PathBuf::from("root/output/lib/lean/App/Top.ilean"),
+            PathBuf::from("right")
+                .join(proof_build_directory())
+                .join("lib/lean/Feature/Right.ilean"),
+        ] {
+            let decode = |workspace: &Workspace| {
+                fln::decode_ilean(
+                    &std::fs::read(workspace.0.join(&relative)).unwrap(),
+                    fln::IleanBudget::default(),
+                )
+                .unwrap()
+            };
+            assert_eq!(decode(&native), decode(&oracle), "{}", relative.display());
+        }
     }
     let mut paths = artifact_paths(&native);
     paths[2] = native
