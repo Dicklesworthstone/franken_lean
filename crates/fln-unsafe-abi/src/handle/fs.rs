@@ -5,6 +5,7 @@ use super::{Obj, canonical_stdio_string, native_stdio_ctor_shape, stdio_result_t
 
 mod bytes;
 mod directory;
+mod metadata;
 mod read;
 
 /// A bounded file-read failure. Consumed counts refer to original file bytes.
@@ -55,6 +56,7 @@ pub enum FileIoError {
     UnrepresentableFlush { errno: i32 },
     MalformedFlushResult,
     MalformedDirectoryResult,
+    MalformedMetadataResult,
     MalformedPathResult,
     MalformedEnvironmentResult,
     MalformedPathMutationResult,
@@ -174,6 +176,19 @@ impl Obj {
         unsafe {
             crate::stdio::is_native_file_handle(self.0)
         }
+    }
+
+    /// Observe whether this exact native Handle refers to a terminal. The
+    /// borrowed Handle and world scalar zero are checked before calling the
+    /// existing epoch primitive; no stream callback or foreign object runs.
+    pub fn try_file_is_tty(&self, world: &Obj) -> Result<bool, FileIoError> {
+        if !world.is_scalar() || world.unbox() != 0 {
+            return Err(FileIoError::InvalidWorld);
+        }
+        if !self.is_file_handle() {
+            return Err(FileIoError::InvalidHandle);
+        }
+        Ok(crate::export::export_lean_io_prim_handle_is_tty(self.0) != 0)
     }
 
     /// Open the canonical String filename with exact Mode ordinal 0..=4 and

@@ -627,7 +627,7 @@ fn workspace_source_edits_rebuild_only_the_selected_import_cone() {
     let (root, leaf) = local_workspace();
     root.built("+Lib.Top:olean", None);
     let snapshot = std::fs::read_to_string(root.0.join("products/fln-build.snapshot")).unwrap();
-    assert!(snapshot.starts_with("fln.lake-build-snapshot/4\n"));
+    assert!(snapshot.starts_with("fln.lake-build-snapshot/5\n"));
     assert_eq!(
         snapshot
             .lines()
@@ -820,7 +820,7 @@ fn legacy_workspace_snapshots_without_configuration_identity_remain_unknown() {
     root.built("+Lib.Top:olean", None);
     let snapshot = std::fs::read_to_string(root.0.join("products/fln-build.snapshot")).unwrap();
     let legacy = snapshot
-        .replacen("fln.lake-build-snapshot/4", "fln.lake-build-snapshot/3", 1)
+        .replacen("fln.lake-build-snapshot/5", "fln.lake-build-snapshot/3", 1)
         .lines()
         .filter(|line| !line.starts_with("configuration\t"))
         .collect::<Vec<_>>()

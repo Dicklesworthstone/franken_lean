@@ -9,7 +9,8 @@ use std::path::Path;
 
 /// Beside the outputs, under the package's build directory.
 pub(crate) const FILE: &str = "fln-build.snapshot";
-const SCHEMA: &str = "fln.lake-build-snapshot/4";
+const SCHEMA: &str = "fln.lake-build-snapshot/5";
+const CONFIGURATION_SCHEMA: &str = "fln.lake-build-snapshot/4";
 const IR_SCHEMA: &str = "fln.lake-build-snapshot/3";
 const COMPANION_SCHEMA: &str = "fln.lake-build-snapshot/2";
 const LEGACY_SCHEMA: &str = "fln.lake-build-snapshot/1";
@@ -52,6 +53,7 @@ pub(crate) struct ModuleRow {
     pub(crate) artifact: String,
     pub(crate) artifact_digest: String,
     pub(crate) ir_digest: Option<String>,
+    pub(crate) ilean_digest: Option<String>,
     pub(crate) companions: Option<CompanionDigests>,
     pub(crate) key: Option<String>,
     pub(crate) decision: String,
@@ -85,6 +87,12 @@ impl ModuleRow {
         }
         if let Some(digest) = &self.ir_digest {
             files.push((artifact.with_extension("ir").display().to_string(), digest));
+        }
+        if let Some(digest) = &self.ilean_digest {
+            files.push((
+                artifact.with_extension("ilean").display().to_string(),
+                digest,
+            ));
         }
         files
     }
@@ -183,6 +191,9 @@ impl Snapshot {
             if let Some(digest) = &module.ir_digest {
                 text.push_str(&line(&["ir", digest]));
             }
+            if let Some(digest) = &module.ilean_digest {
+                text.push_str(&line(&["ilean", digest]));
+            }
             for import in &module.imports {
                 text.push_str(&line(&["import", import]));
             }
@@ -205,7 +216,7 @@ impl Snapshot {
         let schema = lines.next();
         if !matches!(
             schema,
-            Some(SCHEMA | IR_SCHEMA | COMPANION_SCHEMA | LEGACY_SCHEMA)
+            Some(SCHEMA | CONFIGURATION_SCHEMA | IR_SCHEMA | COMPANION_SCHEMA | LEGACY_SCHEMA)
         ) {
             return Err(format!("not a {SCHEMA} snapshot"));
         }
@@ -249,7 +260,11 @@ impl Snapshot {
                     stage = 1;
                     snapshot.targets.push(fields[1].clone());
                 }
-                ("configuration", 3) if schema == Some(SCHEMA) && stage <= 2 && index >= 2 => {
+                ("configuration", 3)
+                    if matches!(schema, Some(SCHEMA | CONFIGURATION_SCHEMA))
+                        && stage <= 2
+                        && index >= 2 =>
+                {
                     if fields[1].is_empty()
                         || fields[2].is_empty()
                         || snapshot.configurations.len() >= MAX_CONFIGURATIONS
@@ -276,6 +291,7 @@ impl Snapshot {
                         artifact: fields[4].clone(),
                         artifact_digest: fields[5].clone(),
                         ir_digest: None,
+                        ilean_digest: None,
                         companions: None,
                         key: (fields[6] != "-").then(|| fields[6].clone()),
                         decision: fields[7].clone(),
@@ -283,8 +299,10 @@ impl Snapshot {
                     });
                 }
                 ("companions", 3)
-                    if matches!(schema, Some(SCHEMA | IR_SCHEMA | COMPANION_SCHEMA))
-                        && stage == 3
+                    if matches!(
+                        schema,
+                        Some(SCHEMA | CONFIGURATION_SCHEMA | IR_SCHEMA | COMPANION_SCHEMA)
+                    ) && stage == 3
                         && owner == Some(true) =>
                 {
                     let module = snapshot.modules.last_mut().ok_or_else(bad)?;
@@ -310,7 +328,7 @@ impl Snapshot {
                     });
                 }
                 ("ir", 2)
-                    if matches!(schema, Some(SCHEMA | IR_SCHEMA))
+                    if matches!(schema, Some(SCHEMA | CONFIGURATION_SCHEMA | IR_SCHEMA))
                         && stage == 3
                         && owner == Some(true) =>
                 {
@@ -322,6 +340,16 @@ impl Snapshot {
                         return Err(bad());
                     }
                     module.ir_digest = Some(fields[1].clone());
+                }
+                ("ilean", 2) if schema == Some(SCHEMA) && stage == 3 && owner == Some(true) => {
+                    let module = snapshot.modules.last_mut().ok_or_else(bad)?;
+                    if module.ilean_digest.is_some()
+                        || !module.imports.is_empty()
+                        || fields[1].is_empty()
+                    {
+                        return Err(bad());
+                    }
+                    module.ilean_digest = Some(fields[1].clone());
                 }
                 ("import", 2) => match owner {
                     Some(true) => snapshot
@@ -373,6 +401,7 @@ mod tests {
                 artifact: ".lake/build/lib/lean/Lib/Top.olean".to_owned(),
                 artifact_digest: digest(b"artifact"),
                 ir_digest: None,
+                ilean_digest: None,
                 companions: None,
                 key: None,
                 decision: "elaborated".to_owned(),
@@ -444,7 +473,12 @@ mod tests {
     fn whole_families_round_trip_and_legacy_snapshots_remain_readable() {
         let mut snapshot = sample();
         snapshot.configurations.clear();
-        for schema in [LEGACY_SCHEMA, COMPANION_SCHEMA, IR_SCHEMA] {
+        for schema in [
+            LEGACY_SCHEMA,
+            COMPANION_SCHEMA,
+            IR_SCHEMA,
+            CONFIGURATION_SCHEMA,
+        ] {
             assert_eq!(
                 Snapshot::parse(&snapshot.to_text().replace(SCHEMA, schema)).unwrap(),
                 snapshot
@@ -510,6 +544,38 @@ mod tests {
     }
 
     #[test]
+    fn editor_metadata_is_bound_to_the_snapshot_and_validated_output_location() {
+        let mut snapshot = sample();
+        snapshot.targets = vec!["+Lib.Top:ilean".to_owned()];
+        let digest = digest(b"checked source editor metadata");
+        snapshot.modules[0].ilean_digest = Some(digest.clone());
+        let text = snapshot.to_text();
+        assert_eq!(Snapshot::parse(&text).unwrap(), snapshot);
+        let artifact = Path::new("current/Lib/Top.olean");
+        assert!(
+            snapshot.modules[0]
+                .output_files(artifact)
+                .contains(&("current/Lib/Top.ilean".to_owned(), digest.as_str(),))
+        );
+        let row = format!("ilean\t{digest}");
+        for broken in [
+            text.replace(SCHEMA, CONFIGURATION_SCHEMA),
+            text.replace(&row, "ilean\t"),
+            text.replace(&row, &format!("{row}\n{row}")),
+            text.replace(&row, &format!("import\tLate\n{row}")),
+            text.replace("end\n", &format!("{row}\nend\n")),
+        ] {
+            assert!(Snapshot::parse(&broken).is_err(), "{broken}");
+        }
+        // Existing configuration-bearing snapshots remain readable.
+        snapshot.modules[0].ilean_digest = None;
+        assert_eq!(
+            Snapshot::parse(&snapshot.to_text().replace(SCHEMA, CONFIGURATION_SCHEMA)).unwrap(),
+            snapshot
+        );
+    }
+
+    #[test]
     fn output_paths_come_only_from_the_current_validated_destination() {
         let mut module = sample().modules.remove(0);
         module.artifact = "../../untrusted/Elsewhere.olean".to_owned();
@@ -518,6 +584,7 @@ mod tests {
             private: digest(b"private"),
         });
         module.ir_digest = Some(digest(b"ir"));
+        module.ilean_digest = Some(digest(b"ilean"));
         let artifact = Path::new("dependency/build/lib/lean/Lib/Top.olean");
         let paths = module
             .output_files(artifact)
@@ -537,6 +604,7 @@ mod tests {
                     .display()
                     .to_string(),
                 artifact.with_extension("ir").display().to_string(),
+                artifact.with_extension("ilean").display().to_string(),
             ],
         );
         assert!(paths.iter().all(|path| !path.contains("untrusted")));

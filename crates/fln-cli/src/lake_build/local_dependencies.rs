@@ -1219,6 +1219,7 @@ mod tests {
                         exported: Vec::new(),
                         companions: None,
                         ir: None,
+                        ilean: None,
                     },
                 )
             })

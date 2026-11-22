@@ -373,8 +373,8 @@ Results follow the requested target order, including duplicate requests.
 plain paths; the last format option takes effect. Package-qualified selections
 retain the selected package's source and output directories. Dependencies are
 built as needed but do not add result lines unless explicitly requested.
-Supported queries include `:olean` and the executable `:ir` facet described
-below. Each query uses the checked module records and writes build provenance
+Supported queries include `:olean`, checked editor metadata through `:ilean`,
+and the executable `:ir` facet described below. Each query uses the checked module records and writes build provenance
 for `fln build explain`. A failed target or compilation emits no result paths
 and does not replace the previous module products or successful snapshot.
 
@@ -382,6 +382,37 @@ With no explicit targets and no configured defaults, query succeeds with no
 results. Default library or executable facets, additional artifact facets, and
 `--no-build` remain unsupported; query does not invent paths for unavailable
 products.
+
+### Checked editor metadata
+
+`lake build +Module:ilean` emits the pinned-format editor metadata for the
+requested module and its local source dependencies. Each `.ilean` is generated
+from checked source and actual identifier resolution, with original source
+positions, declaration owners, and import visibility. It is published together
+with the matching `.olean` and, for module-system sources, its server and private
+companions.
+
+```sh
+lake build +Proofs:ilean
+lake query --json +Proofs:ilean +Proofs:olean
+fln ilean inspect --json .lake/build/lib/lean/Proofs.ilean
+fln build explain --json +Proofs:ilean
+```
+
+Metadata generation uses its own bounded source observations; an existing
+`.ilean` file or a cached module artifact cannot supply missing reference data.
+Supported forms include the native declaration, binder, application, lambda,
+and let paths. Tactic-selected references, imported macro execution, patterns,
+and other unsupported reference forms refuse the requested facet before any
+output is replaced. The native metadata path's existing restrictions still
+apply; this is not complete InfoTree or source-language coverage.
+
+Mixed `:olean`, `:ilean`, and `:ir` requests share the same checked build and
+publication rollback unit. A later build that would replace a module's logical
+artifacts without regenerating an existing `.ilean` is refused, so old editor
+positions cannot silently accompany new declarations. Request the `:ilean`
+facet again to replace that family coherently. Metadata paths and their exact
+hashes participate in build snapshots and output-change explanations.
 
 ### Executable module companions
 
@@ -436,10 +467,12 @@ carriers, and cyclic control flow are also refused. Native object-code
 generation, linking, and executable build facets remain unavailable.
 
 The JSON report uses `fln.lake-build/2`, identifies `ir` when executable
-companions are produced and otherwise `olean`, and lists every emitted path.
+companions are produced, `ilean` when only editor companions are produced, and
+otherwise `olean`. It lists every emitted path.
 It also reports:
 
 - `executable_modules`: modules with an emitted `.ir` companion;
+- `metadata_modules`: modules with an emitted `.ilean` companion;
 - `modules_cached`: modules re-admitted from records;
 - `module_elaborations`;
 - `module_checks_reused`: modules reused from an earlier target of the same
@@ -467,7 +500,8 @@ work also use the ordinary bounded source-check budgets. Resource exhaustion
 is reported as non-authoritative failure, never as successful compilation.
 
 Bare `lake build` of a library still refuses: its default `leanArts` facet also
-requires products such as `.ilean` and additional compiler outputs. Executable
+requires the complete artifact set, including compiler outputs beyond the
+explicit facets above. Executable
 build facets and native linking, dependency fetching, custom globs, custom compiler
 options, Lake configuration outside the slice above, and native
 extension metadata without a pinned export encoding remain unsupported.
@@ -477,7 +511,7 @@ with the Reference, or a claim that the Lake convergence bead is complete.
 
 Every successful build writes a snapshot, `buildDir/fln-build.snapshot`, in the
 invoking package (bead `franken_lean-z8j.1.2`). Schema
-`fln.lake-build-snapshot/4` records the path and exact content hash of every
+`fln.lake-build-snapshot/5` records the path and exact content hash of every
 selected TOML configuration. For every module it records the source path and
 content hash, the ordered imports, the output family paths and content hashes,
 the record key and the decision. It also records the content hash of every
@@ -494,8 +528,8 @@ closure) would rebuild. It elaborates and admits nothing, so this command still
 requires a TOML configuration and explicitly refuses `lakefile.lean`. It resolves
 the current selected packages and their source and output owners again; recorded
 paths never authorize reading arbitrary artifacts. It writes no artifacts,
-manifests, or snapshots. Both `+Module:olean` and `+Module:ir` can select the
-recorded module's closure.
+manifests, or snapshots. `+Module:olean`, `+Module:ilean`, and `+Module:ir` can
+select the recorded module's closure.
 
 - The Reference decision follows Lake's file-cone model. A module rebuilds when
   its source bytes, its ordered imports, or the bytes of an external `.olean` in
