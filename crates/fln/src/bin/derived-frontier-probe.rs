@@ -760,8 +760,10 @@ fn main() -> ExitCode {
     // Derived suffix histogram over immediate children of inductive names.
     let mut known_suffixes: BTreeMap<String, usize> = BTreeMap::new();
     let mut other_suffixes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut ctor_names: BTreeSet<Name> = BTreeSet::new();
     for (name, info) in &constants {
         if matches!(info, ConstantInfo::Ctor(_)) {
+            ctor_names.insert(name.clone());
             continue;
         }
         let parent = name.parent();
@@ -772,6 +774,62 @@ fn main() -> ExitCode {
                 *known_suffixes.entry(leaf.to_owned()).or_default() += 1;
             } else {
                 *other_suffixes.entry(leaf.to_owned()).or_default() += 1;
+            }
+        }
+    }
+
+    // Inventory remaining derived families (inductive-child and constructor-child)
+    // not yet covered by corpus-wide generators, plus unclassified constructor-child suffixes.
+    #[derive(Default)]
+    struct NotImplStats {
+        count: usize,
+        first: Option<(String, u64)>,
+    }
+    let mut not_impl: BTreeMap<&'static str, NotImplStats> = BTreeMap::new();
+    let mut ctor_unclassified: BTreeMap<String, usize> = BTreeMap::new();
+    let fnv1a_type = |info: &ConstantInfo| -> u64 {
+        let repr = format!("{:?}", info.constant_val().type_);
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in repr.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    };
+    let mut record_not_impl = |family: &'static str, name: &Name, info: &ConstantInfo| {
+        let entry = not_impl.entry(family).or_default();
+        entry.count += 1;
+        if entry.first.is_none() {
+            entry.first = Some((name.to_display_string(), fnv1a_type(info)));
+        }
+    };
+    for (name, info) in &constants {
+        if matches!(info, ConstantInfo::Ctor(_)) {
+            continue;
+        }
+        let parent = name.parent();
+        let LeafView::Str(leaf) = name.leaf_view() else {
+            continue;
+        };
+        if ind_names.contains(&parent) {
+            if leaf == "_sizeOf_inst" {
+                record_not_impl("_sizeOf_inst", name, info);
+            } else if leaf.starts_with("_sizeOf_") {
+                record_not_impl("_sizeOf_*", name, info);
+            } else if leaf == "inj" {
+                record_not_impl("ind.inj", name, info);
+            } else if leaf == "injEq" {
+                record_not_impl("ind.injEq", name, info);
+            }
+        } else if ctor_names.contains(&parent) {
+            match leaf {
+                "elim" => {}
+                "noConfusion" => record_not_impl("ctor.noConfusion", name, info),
+                "inj" => record_not_impl("ctor.inj", name, info),
+                "injEq" => record_not_impl("ctor.injEq", name, info),
+                "_flat_ctor" => record_not_impl("ctor._flat_ctor", name, info),
+                "sizeOf_spec" => record_not_impl("ctor.sizeOf_spec", name, info),
+                other => *ctor_unclassified.entry(other.to_owned()).or_default() += 1,
             }
         }
     }
@@ -789,11 +847,40 @@ fn main() -> ExitCode {
     let mut constructor_elim_tally = FamilyTally::default();
     let mut no_confusion_type_tally = FamilyTally::default();
     let mut no_confusion_tally = FamilyTally::default();
+    // Per-shape (single / mutual / nested) parity totals across all 12 implemented generators.
+    let mut shape_totals: [(usize, usize, usize); 3] = [(0, 0, 0); 3];
 
     for ind_name in &ind_names {
         let Some(ConstantInfo::Induct(inductive)) = constants.get(ind_name) else {
             continue;
         };
+        let shape_idx = if inductive.num_nested > 0 {
+            2
+        } else if inductive.all.len() > 1 {
+            1
+        } else {
+            0
+        };
+        let snap_totals = |tallies: [&FamilyTally; 12]| -> (usize, usize, usize) {
+            let pop = tallies.iter().map(|t| t.population).sum();
+            let id = tallies.iter().map(|t| t.identical).sum();
+            let mm = tallies.iter().map(|t| t.mismatches).sum();
+            (pop, id, mm)
+        };
+        let before = snap_totals([
+            &rec_on_tally,
+            &cases_on_tally,
+            &below_tally,
+            &brec_go_tally,
+            &brec_on_tally,
+            &ctor_idx_tally,
+            &to_ctor_idx_tally,
+            &ctor_elim_type_tally,
+            &ctor_elim_tally,
+            &constructor_elim_tally,
+            &no_confusion_type_tally,
+            &no_confusion_tally,
+        ]);
         let block: Vec<InductiveVal> = inductive
             .all
             .iter()
@@ -1064,6 +1151,23 @@ fn main() -> ExitCode {
                 }
             }
         }
+        let after = snap_totals([
+            &rec_on_tally,
+            &cases_on_tally,
+            &below_tally,
+            &brec_go_tally,
+            &brec_on_tally,
+            &ctor_idx_tally,
+            &to_ctor_idx_tally,
+            &ctor_elim_type_tally,
+            &ctor_elim_tally,
+            &constructor_elim_tally,
+            &no_confusion_type_tally,
+            &no_confusion_tally,
+        ]);
+        shape_totals[shape_idx].0 += after.0 - before.0;
+        shape_totals[shape_idx].1 += after.1 - before.1;
+        shape_totals[shape_idx].2 += after.2 - before.2;
     }
 
     let total_elapsed = start.elapsed();
@@ -1092,6 +1196,27 @@ fn main() -> ExitCode {
     no_confusion_type_tally.print("noConfusionType");
     no_confusion_tally.print("noConfusion");
 
+    println!("=== PARITY BY INDUCTIVE SHAPE (12 IMPLEMENTED GENERATORS) ===");
+    for (label, (pop, id, mm)) in [
+        ("single", shape_totals[0]),
+        ("mutual", shape_totals[1]),
+        ("nested", shape_totals[2]),
+    ] {
+        println!("  {label:<16} identical={id:>5}/{pop:<5}  mismatches={mm:>4}");
+    }
+
+    println!("=== REMAINING DERIVED FAMILIES (MEASURED NOT-IMPLEMENTED IN PROBE) ===");
+    for (family, stats) in &not_impl {
+        let first_str = match &stats.first {
+            Some((name, digest)) => format!("first={name} (type_fnv1a={digest:016x})"),
+            None => "first=none".to_owned(),
+        };
+        println!(
+            "  {family:<16} identical=    0/{:<5}  status=not-implemented  {first_str}",
+            stats.count
+        );
+    }
+
     println!("=== KNOWN DERIVED SUFFIX HISTOGRAM ===");
     let mut known_sorted: Vec<_> = known_suffixes.into_iter().collect();
     known_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -1099,12 +1224,47 @@ fn main() -> ExitCode {
         println!("  {count:>5}  .{suffix}");
     }
     println!(
-        "=== TOP 25 OTHER IMMEDIATE-CHILD SUFFIXES (projections / user defs / unclassified) ==="
+        "=== UNCLASSIFIED IMMEDIATE-CHILD SUFFIXES (distinct={}, showing top 25) ===",
+        other_suffixes.len()
     );
     let mut other_sorted: Vec<_> = other_suffixes.into_iter().collect();
     other_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     for (suffix, count) in other_sorted.into_iter().take(25) {
         println!("  {count:>5}  .{suffix}");
+    }
+    println!(
+        "=== UNCLASSIFIED CONSTRUCTOR-CHILD SUFFIXES (distinct={}, showing top 25) ===",
+        ctor_unclassified.len()
+    );
+    let mut ctor_other_sorted: Vec<_> = ctor_unclassified.into_iter().collect();
+    ctor_other_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    for (suffix, count) in ctor_other_sorted.into_iter().take(25) {
+        println!("  {count:>5}  .<ctor>.{suffix}");
+    }
+
+    let floor_checks = [
+        ("inductives", ind_names.len(), 2500usize),
+        ("recOn", rec_on_tally.population, 2500),
+        ("casesOn", cases_on_tally.population, 2500),
+        ("below", below_tally.population, 200),
+        ("brecOn.go", brec_go_tally.population, 200),
+        ("brecOn", brec_on_tally.population, 200),
+        ("ctorIdx", ctor_idx_tally.population, 2500),
+        ("toCtorIdx", to_ctor_idx_tally.population, 150),
+        ("ctorElimType", ctor_elim_type_tally.population, 450),
+        ("ctorElim", ctor_elim_tally.population, 450),
+        ("ctor.elim", constructor_elim_tally.population, 2000),
+        ("noConfusionType", no_confusion_type_tally.population, 2500),
+        ("noConfusion", no_confusion_tally.population, 2500),
+    ];
+    let mut floor_failures = Vec::new();
+    for (label, observed, floor) in floor_checks {
+        if observed < floor {
+            floor_failures.push(format!("{label}: observed {observed} < floor {floor}"));
+        }
+    }
+    if !floor_failures.is_empty() {
+        eprintln!("ANTI-VACUITY FLOOR FAILURE: {}", floor_failures.join(", "));
     }
 
     let total_mismatches = rec_on_tally.mismatches
@@ -1119,7 +1279,7 @@ fn main() -> ExitCode {
         + constructor_elim_tally.mismatches
         + no_confusion_type_tally.mismatches
         + no_confusion_tally.mismatches;
-    if total_mismatches == 0 || report_only {
+    if (total_mismatches == 0 && floor_failures.is_empty()) || report_only {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)

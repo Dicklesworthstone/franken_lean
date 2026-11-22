@@ -953,6 +953,17 @@ jobs:
             upstream_notation_printing_regressions_match_the_pin \
             -- --ignored --exact --nocapture
 
+      - name: run the whole-stdlib derived-declaration frontier (fln-derived-declaration-frontier-cj7s)
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        env:
+          PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
+        run: |
+          set -euo pipefail
+          export FLN_REFERENCE_LIB="$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG/lib/lean"
+          test -f "$FLN_REFERENCE_LIB/Init/Prelude.olean"
+          cargo run --locked --release -p fln --bin derived-frontier-probe -- "$FLN_REFERENCE_LIB"
+
       - name: run the reduced reject-side mutant lane (fln-kernel-reject-side-at-scale-bemc)
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash

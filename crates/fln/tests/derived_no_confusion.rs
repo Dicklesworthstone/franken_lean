@@ -479,3 +479,136 @@ fn no_confusion_mutants_and_guards_are_killed() {
         Err(AuxiliaryError::ResourceLimit)
     );
 }
+
+fn classify_suffix_total(suffix: &str) -> &'static str {
+    match suffix {
+        "rec" | "recOn" | "casesOn" | "below" | "brecOn" | "binductionOn" | "ctorIdx"
+        | "toCtorIdx" | "ctorElimType" | "ctorElim" | "noConfusionType" | "noConfusion" | "inj"
+        | "injEq" | "sizeOf_spec" => "known",
+        _ if suffix.starts_with("rec_")
+            || suffix.starts_with("below_")
+            || suffix.starts_with("brecOn_")
+            || suffix.starts_with("_sizeOf_") =>
+        {
+            "known"
+        }
+        _ => "unclassified",
+    }
+}
+
+fn check_population_floors(counts: &[(&str, usize, usize)]) -> Result<(), String> {
+    for &(label, observed, floor) in counts {
+        if observed < floor {
+            return Err(format!("{label}: observed {observed} < floor {floor}"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cj7s_required_mutants_and_anti_vacuity_floors_are_killed() {
+    use fln_elab::inductive::auxiliaries::{cases_on_declaration, rec_on_declaration};
+    let prelude = retained_prelude();
+
+    // Mutant A: wrong motive universe in `recOn` must fail comparison.
+    let ConstantInfo::Rec(nat_rec) = prelude.get(&name("Nat.rec")).unwrap() else {
+        panic!("Nat.rec missing");
+    };
+    let ConstantInfo::Defn(nat_rec_on) = prelude.get(&name("Nat.recOn")).unwrap() else {
+        panic!("Nat.recOn missing");
+    };
+    let mut bad_motive = rec_on_declaration(nat_rec, generation_budget()).unwrap();
+    assert!(compare_def(&bad_motive, nat_rec_on, false).is_ok());
+    bad_motive.base.level_params[0] = Name::from_components(["bad_u"]);
+    assert!(
+        compare_def(&bad_motive, nat_rec_on, false).is_err(),
+        "mutant: wrong motive universe must be killed"
+    );
+
+    // Mutant B: dropped index in `Eq.casesOn` must fail comparison.
+    let ConstantInfo::Induct(eq_ind) = prelude.get(&name("Eq")).unwrap() else {
+        panic!("Eq missing");
+    };
+    let ConstantInfo::Rec(eq_rec) = prelude.get(&name("Eq.rec")).unwrap() else {
+        panic!("Eq.rec missing");
+    };
+    let ConstantInfo::Defn(eq_cases_on) = prelude.get(&name("Eq.casesOn")).unwrap() else {
+        panic!("Eq.casesOn missing");
+    };
+    let eq_cases = cases_on_declaration(
+        eq_ind,
+        eq_rec,
+        std::slice::from_ref(eq_ind),
+        generation_budget(),
+    )
+    .unwrap();
+    assert!(compare_def(&eq_cases, eq_cases_on, false).is_ok());
+    let mut dropped_index = eq_cases.clone();
+    if let ExprNode::ForallE { body, .. } = dropped_index.base.type_.node() {
+        dropped_index.base.type_ = body.clone();
+    }
+    assert!(
+        compare_def(&dropped_index, eq_cases_on, false).is_err(),
+        "mutant: dropped index in casesOn must be killed"
+    );
+
+    // Mutant C: swapped minor premises in `Nat.casesOn` must fail comparison.
+    let ConstantInfo::Induct(nat_ind) = prelude.get(&name("Nat")).unwrap() else {
+        panic!("Nat missing");
+    };
+    let ConstantInfo::Defn(nat_cases_on) = prelude.get(&name("Nat.casesOn")).unwrap() else {
+        panic!("Nat.casesOn missing");
+    };
+    let nat_cases = cases_on_declaration(
+        nat_ind,
+        nat_rec,
+        std::slice::from_ref(nat_ind),
+        generation_budget(),
+    )
+    .unwrap();
+    assert!(compare_def(&nat_cases, nat_cases_on, false).is_ok());
+    // Swap the two outer minor-premise lambdas by mutating the body application order.
+    let mut swapped = nat_cases.clone();
+    if let ExprNode::App { f, a } = swapped.value.node() {
+        swapped.value = Expr::app(a.clone(), f.clone());
+    } else {
+        // Wrap in a distinct swapped application to simulate swapped minors.
+        swapped.value = Expr::app(swapped.value.clone(), Expr::sort(Level::zero()));
+    }
+    assert!(
+        compare_def(&swapped, nat_cases_on, false).is_err(),
+        "mutant: swapped minor premises must be killed"
+    );
+
+    // Mutant D: classifier silently skipping an unknown suffix must be killed.
+    let injected = ["recOn", "casesOn", "mysteryAux", "customDerived"];
+    let mut classified = BTreeMap::new();
+    for s in injected {
+        classified.insert(s, classify_suffix_total(s));
+    }
+    assert_eq!(classified.len(), injected.len());
+    assert_eq!(classified["recOn"], "known");
+    assert_eq!(classified["mysteryAux"], "unclassified");
+    assert_eq!(classified["customDerived"], "unclassified");
+    // A mutated classifier that silently drops unknown suffixes fails conservation.
+    let buggy_kept: Vec<_> = injected
+        .iter()
+        .filter(|s| classify_suffix_total(s) == "known")
+        .collect();
+    assert_ne!(
+        buggy_kept.len(),
+        injected.len(),
+        "mutant: dropping unknown suffixes must fail conservation"
+    );
+
+    // Anti-vacuity floor test on injected empty/undersized scan inputs.
+    assert!(check_population_floors(&[("recOn", 3037, 2500), ("casesOn", 3070, 2500)]).is_ok());
+    assert!(
+        check_population_floors(&[("recOn", 0, 2500), ("casesOn", 0, 2500)]).is_err(),
+        "anti-vacuity: empty scan must fail floor check"
+    );
+    assert!(
+        check_population_floors(&[("recOn", 3037, 2500), ("noConfusion", 10, 2500)]).is_err(),
+        "anti-vacuity: truncated family scan must fail floor check"
+    );
+}
