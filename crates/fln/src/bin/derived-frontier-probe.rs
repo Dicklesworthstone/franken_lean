@@ -9,13 +9,14 @@
 #![forbid(unsafe_code)]
 
 use fln_core::expr::{Expr, ExprNode};
+use fln_core::level::{Level, LevelView};
 use fln_core::name::{LeafView, Name};
 use fln_elab::inductive::auxiliaries::{
-    CtorIdxConstMeta, cases_on_declaration, ctor_elim_declarations, ctor_idx_declarations,
-    rec_on_declaration,
+    CtorIdxConstMeta, below_declaration, brec_on_declarations, cases_on_declaration,
+    ctor_elim_declarations, ctor_idx_declarations, no_confusion_declarations, rec_on_declaration,
 };
 use fln_elab::records::RecordBudget;
-use fln_env::constants::{ConstantInfo, ConstructorVal, DefinitionVal, InductiveVal};
+use fln_env::constants::{ConstantInfo, ConstructorVal, DefinitionVal, InductiveVal, RecursorVal};
 use fln_olean::decl::{ChainLimits, DeclDecoder, decode_chain_constants_from_parts};
 use fln_olean::region::{OleanView, WalkBudget};
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,11 +31,32 @@ fn generation_budget() -> RecordBudget {
     }
 }
 
-fn expr_eq_mod_binder_names(left: &Expr, right: &Expr) -> bool {
+fn level_eq_mod_param_map(a: &Level, b: &Level, map: &BTreeMap<Name, Name>) -> bool {
+    if map.is_empty() && a == b {
+        return true;
+    }
+    match (a.view(), b.view()) {
+        (LevelView::Zero, LevelView::Zero) => true,
+        (LevelView::Succ(x), LevelView::Succ(y)) => level_eq_mod_param_map(x, y, map),
+        (LevelView::Max(x1, x2), LevelView::Max(y1, y2))
+        | (LevelView::IMax(x1, x2), LevelView::IMax(y1, y2)) => {
+            level_eq_mod_param_map(x1, y1, map) && level_eq_mod_param_map(x2, y2, map)
+        }
+        (LevelView::Param(na), LevelView::Param(nb)) => map.get(na).unwrap_or(na) == nb,
+        (LevelView::MVar(ma), LevelView::MVar(mb)) => ma == mb,
+        _ => false,
+    }
+}
+
+fn expr_eq_mod_binder_and_level_names(
+    left: &Expr,
+    right: &Expr,
+    level_map: &BTreeMap<Name, Name>,
+) -> bool {
     let mut stack = vec![(left, right)];
     let mut seen = BTreeSet::new();
     while let Some((a, b)) = stack.pop() {
-        if a == b {
+        if level_map.is_empty() && a == b {
             continue;
         }
         let pair = (a.allocation_identity(), b.allocation_identity());
@@ -42,6 +64,51 @@ fn expr_eq_mod_binder_names(left: &Expr, right: &Expr) -> bool {
             continue;
         }
         match (a.node(), b.node()) {
+            (ExprNode::Sort { level: la }, ExprNode::Sort { level: lb }) => {
+                if !level_eq_mod_param_map(la, lb, level_map) {
+                    return false;
+                }
+            }
+            (
+                ExprNode::Const {
+                    name: na,
+                    levels: la,
+                },
+                ExprNode::Const {
+                    name: nb,
+                    levels: lb,
+                },
+            ) => {
+                if na != nb
+                    || la.len() != lb.len()
+                    || !la
+                        .iter()
+                        .zip(lb)
+                        .all(|(x, y)| level_eq_mod_param_map(x, y, level_map))
+                {
+                    return false;
+                }
+            }
+            (ExprNode::BVar { idx: x }, ExprNode::BVar { idx: y }) => {
+                if x != y {
+                    return false;
+                }
+            }
+            (ExprNode::FVar { id: x }, ExprNode::FVar { id: y }) => {
+                if x != y {
+                    return false;
+                }
+            }
+            (ExprNode::MVar { id: x }, ExprNode::MVar { id: y }) => {
+                if x != y {
+                    return false;
+                }
+            }
+            (ExprNode::Lit { literal: x }, ExprNode::Lit { literal: y }) => {
+                if x != y {
+                    return false;
+                }
+            }
             (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
                 stack.push((aa, ba));
                 stack.push((af, bf));
@@ -132,6 +199,168 @@ fn expr_eq_mod_binder_names(left: &Expr, right: &Expr) -> bool {
     true
 }
 
+fn first_expr_diff(left: &Expr, right: &Expr, level_map: &BTreeMap<Name, Name>) -> Option<String> {
+    let mut stack = vec![("root".to_owned(), left, right)];
+    let mut seen = BTreeSet::new();
+    while let Some((path, a, b)) = stack.pop() {
+        if level_map.is_empty() && a == b {
+            continue;
+        }
+        if !seen.insert((a.allocation_identity(), b.allocation_identity())) {
+            continue;
+        }
+        match (a.node(), b.node()) {
+            (ExprNode::Sort { level: la }, ExprNode::Sort { level: lb }) => {
+                if !level_eq_mod_param_map(la, lb, level_map) {
+                    return Some(format!("{path}: Sort({la:?}) != Sort({lb:?})"));
+                }
+            }
+            (
+                ExprNode::Const {
+                    name: na,
+                    levels: la,
+                },
+                ExprNode::Const {
+                    name: nb,
+                    levels: lb,
+                },
+            ) => {
+                if na != nb
+                    || la.len() != lb.len()
+                    || !la
+                        .iter()
+                        .zip(lb)
+                        .all(|(x, y)| level_eq_mod_param_map(x, y, level_map))
+                {
+                    return Some(format!(
+                        "{path}: Const({} {la:?}) != Const({} {lb:?})",
+                        na.to_display_string(),
+                        nb.to_display_string()
+                    ));
+                }
+            }
+            (ExprNode::BVar { idx: x }, ExprNode::BVar { idx: y }) => {
+                if x != y {
+                    return Some(format!("{path}: BVar({x}) != BVar({y})"));
+                }
+            }
+            (ExprNode::FVar { id: x }, ExprNode::FVar { id: y }) => {
+                if x != y {
+                    return Some(format!("{path}: FVar({x:?}) != FVar({y:?})"));
+                }
+            }
+            (ExprNode::MVar { id: x }, ExprNode::MVar { id: y }) => {
+                if x != y {
+                    return Some(format!("{path}: MVar({x:?}) != MVar({y:?})"));
+                }
+            }
+            (ExprNode::Lit { literal: x }, ExprNode::Lit { literal: y }) => {
+                if x != y {
+                    return Some(format!("{path}: Lit({x:?}) != Lit({y:?})"));
+                }
+            }
+            (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
+                stack.push((format!("{path}.a"), aa, ba));
+                stack.push((format!("{path}.f"), af, bf));
+            }
+            (
+                ExprNode::Lam {
+                    binder_type: at,
+                    body: ab,
+                    binder_info: ai,
+                    ..
+                },
+                ExprNode::Lam {
+                    binder_type: bt,
+                    body: bb,
+                    binder_info: bi,
+                    ..
+                },
+            ) => {
+                if ai != bi {
+                    return Some(format!("{path}: Lam binder_info {ai:?} != {bi:?}"));
+                }
+                stack.push((format!("{path}.lam_body"), ab, bb));
+                stack.push((format!("{path}.lam_ty"), at, bt));
+            }
+            (
+                ExprNode::ForallE {
+                    binder_type: at,
+                    body: ab,
+                    binder_info: ai,
+                    ..
+                },
+                ExprNode::ForallE {
+                    binder_type: bt,
+                    body: bb,
+                    binder_info: bi,
+                    ..
+                },
+            ) => {
+                if ai != bi {
+                    return Some(format!("{path}: ForallE binder_info {ai:?} != {bi:?}"));
+                }
+                stack.push((format!("{path}.pi_body"), ab, bb));
+                stack.push((format!("{path}.pi_ty"), at, bt));
+            }
+            (
+                ExprNode::LetE {
+                    type_: at,
+                    value: av,
+                    body: ab,
+                    non_dep: an,
+                    ..
+                },
+                ExprNode::LetE {
+                    type_: bt,
+                    value: bv,
+                    body: bb,
+                    non_dep: bn,
+                    ..
+                },
+            ) => {
+                if an != bn {
+                    return Some(format!("{path}: LetE non_dep {an} != {bn}"));
+                }
+                stack.push((format!("{path}.let_body"), ab, bb));
+                stack.push((format!("{path}.let_val"), av, bv));
+                stack.push((format!("{path}.let_ty"), at, bt));
+            }
+            (
+                ExprNode::Proj {
+                    struct_name: at,
+                    idx: ai,
+                    expr: ae,
+                },
+                ExprNode::Proj {
+                    struct_name: bt,
+                    idx: bi,
+                    expr: be,
+                },
+            ) => {
+                if at != bt || ai != bi {
+                    return Some(format!("{path}: Proj({at:?},{ai}) != Proj({bt:?},{bi})"));
+                }
+                stack.push((format!("{path}.proj"), ae, be));
+            }
+            (ExprNode::MData { data: ad, expr: ae }, ExprNode::MData { data: bd, expr: be }) => {
+                if ad != bd {
+                    return Some(format!("{path}: MData mismatch"));
+                }
+                stack.push((format!("{path}.mdata"), ae, be));
+            }
+            _ => {
+                return Some(format!(
+                    "{path}: node shape {:?} != {:?}",
+                    std::mem::discriminant(a.node()),
+                    std::mem::discriminant(b.node())
+                ));
+            }
+        }
+    }
+    None
+}
+
 #[derive(Default)]
 struct FamilyTally {
     population: usize,
@@ -139,15 +368,40 @@ struct FamilyTally {
     statement_identical: usize,
     mismatches: usize,
     first_mismatch: Option<String>,
+    samples: Vec<String>,
 }
 
 impl FamilyTally {
-    fn record_def(&mut self, actual: &DefinitionVal, expected: &DefinitionVal) {
+    fn record_def_with_alpha_levels(
+        &mut self,
+        actual: &DefinitionVal,
+        expected: &DefinitionVal,
+        alpha_first_level: bool,
+    ) {
         self.population += 1;
         let name_ok = actual.base.name == expected.base.name;
-        let levels_ok = actual.base.level_params == expected.base.level_params;
-        let type_ok = expr_eq_mod_binder_names(&actual.base.type_, &expected.base.type_);
-        let value_ok = expr_eq_mod_binder_names(&actual.value, &expected.value);
+        let mut level_map = BTreeMap::new();
+        let levels_ok = if alpha_first_level
+            && actual.base.level_params.len() == expected.base.level_params.len()
+            && !actual.base.level_params.is_empty()
+        {
+            if actual.base.level_params[0] != expected.base.level_params[0] {
+                level_map.insert(
+                    actual.base.level_params[0].clone(),
+                    expected.base.level_params[0].clone(),
+                );
+            }
+            actual.base.level_params[1..] == expected.base.level_params[1..]
+        } else {
+            actual.base.level_params == expected.base.level_params
+        };
+        let type_ok = expr_eq_mod_binder_and_level_names(
+            &actual.base.type_,
+            &expected.base.type_,
+            &level_map,
+        );
+        let value_ok =
+            expr_eq_mod_binder_and_level_names(&actual.value, &expected.value, &level_map);
         let hints_ok = actual.hints == expected.hints;
         let safety_ok = actual.safety == expected.safety;
         let all_ok = actual.all == expected.all;
@@ -156,36 +410,66 @@ impl FamilyTally {
         } else if name_ok && levels_ok && type_ok {
             self.statement_identical += 1;
             self.mismatches += 1;
+            let diff = first_expr_diff(&actual.value, &expected.value, &level_map)
+                .unwrap_or_else(|| "meta-only".to_owned());
+            let msg = format!(
+                "{}: statement-identical (value_ok={value_ok} hints={:?} vs {:?} safety={:?} vs {:?} all_ok={all_ok} diff={diff})",
+                expected.base.name.to_display_string(),
+                actual.hints,
+                expected.hints,
+                actual.safety,
+                expected.safety,
+            );
             if self.first_mismatch.is_none() {
-                self.first_mismatch = Some(format!(
-                    "{}: statement-identical (value_ok={value_ok} hints={:?} vs {:?} safety={:?} vs {:?} all_ok={all_ok})",
-                    expected.base.name.to_display_string(),
-                    actual.hints,
-                    expected.hints,
-                    actual.safety,
-                    expected.safety,
-                ));
+                self.first_mismatch = Some(msg.clone());
+            }
+            if self.samples.len() < 10 {
+                self.samples.push(msg);
             }
         } else {
             self.mismatches += 1;
+            let diff = if !type_ok {
+                format!(
+                    "type_diff={}",
+                    first_expr_diff(&actual.base.type_, &expected.base.type_, &level_map)
+                        .unwrap_or_default()
+                )
+            } else {
+                format!(
+                    "val_diff={}",
+                    first_expr_diff(&actual.value, &expected.value, &level_map).unwrap_or_default()
+                )
+            };
+            let msg = format!(
+                "{}: mismatch (name_ok={name_ok} levels_ok={levels_ok} type_ok={type_ok} value_ok={value_ok} hints={:?} vs {:?} safety={:?} vs {:?} {diff})",
+                expected.base.name.to_display_string(),
+                actual.hints,
+                expected.hints,
+                actual.safety,
+                expected.safety,
+            );
             if self.first_mismatch.is_none() {
-                self.first_mismatch = Some(format!(
-                    "{}: mismatch (name_ok={name_ok} levels_ok={levels_ok} type_ok={type_ok} value_ok={value_ok} hints={:?} vs {:?} safety={:?} vs {:?})",
-                    expected.base.name.to_display_string(),
-                    actual.hints,
-                    expected.hints,
-                    actual.safety,
-                    expected.safety,
-                ));
+                self.first_mismatch = Some(msg.clone());
+            }
+            if self.samples.len() < 10 {
+                self.samples.push(msg);
             }
         }
+    }
+
+    fn record_def(&mut self, actual: &DefinitionVal, expected: &DefinitionVal) {
+        self.record_def_with_alpha_levels(actual, expected, false);
     }
 
     fn record_error(&mut self, label: &Name, detail: String) {
         self.population += 1;
         self.mismatches += 1;
+        let msg = format!("{}: {detail}", label.to_display_string());
         if self.first_mismatch.is_none() {
-            self.first_mismatch = Some(format!("{}: {detail}", label.to_display_string()));
+            self.first_mismatch = Some(msg.clone());
+        }
+        if self.samples.len() < 10 {
+            self.samples.push(msg);
         }
     }
 
@@ -201,6 +485,9 @@ impl FamilyTally {
                 None => String::new(),
             }
         );
+        for extra in self.samples.iter().skip(1) {
+            println!("    sample: {extra}");
+        }
     }
 }
 
@@ -235,22 +522,92 @@ fn collect_olean_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn load_module_constants(
-    olean_path: &Path,
-    exported_out: &mut BTreeMap<Name, ConstantInfo>,
-    full_out: &mut BTreeMap<Name, ConstantInfo>,
-) {
+fn module_name_from_path(lib_root: &Path, olean_path: &Path) -> Option<Name> {
+    let rel = olean_path.strip_prefix(lib_root).ok()?;
+    let no_ext = rel.with_extension("");
+    let mut name = Name::anonymous();
+    for comp in no_ext.components() {
+        let s = comp.as_os_str().to_str()?;
+        name = Name::str(name, s);
+    }
+    (!name.is_anonymous()).then_some(name)
+}
+
+#[derive(Default)]
+struct LoadedCorpus {
+    exported_constants: BTreeMap<Name, ConstantInfo>,
+    constants: BTreeMap<Name, ConstantInfo>,
+    module_imports: BTreeMap<Name, Vec<Name>>,
+    inductive_module: BTreeMap<Name, Name>,
+    nce_module: Option<Name>,
+    before_nce_in_own_module: BTreeSet<Name>,
+}
+
+impl LoadedCorpus {
+    fn compute_modules_importing(&self, target: &Name) -> BTreeSet<Name> {
+        let mut reverse: BTreeMap<Name, Vec<Name>> = BTreeMap::new();
+        for (module, imports) in &self.module_imports {
+            for imp in imports {
+                reverse.entry(imp.clone()).or_default().push(module.clone());
+            }
+        }
+        let mut reachable = BTreeSet::new();
+        let mut work = vec![target.clone()];
+        while let Some(cur) = work.pop() {
+            if let Some(dependents) = reverse.get(&cur) {
+                for dep in dependents {
+                    if reachable.insert(dep.clone()) {
+                        work.push(dep.clone());
+                    }
+                }
+            }
+        }
+        reachable
+    }
+}
+
+fn load_module_constants(lib_root: &Path, olean_path: &Path, corpus: &mut LoadedCorpus) {
+    let mod_name = module_name_from_path(lib_root, olean_path);
     let server = olean_path.with_extension("olean.server");
     let private = olean_path.with_extension("olean.private");
     let Ok(base_bytes) = std::fs::read(olean_path) else {
         return;
     };
-    if let Ok(view) = OleanView::parse(&base_bytes)
-        && let Ok(constants) =
+    let nce = Name::from_components(["noConfusionEnum"]);
+    if let Ok(view) = OleanView::parse(&base_bytes) {
+        if let Some(m) = &mod_name
+            && let Ok(mdata) = view.module_data(WalkBudget::default())
+        {
+            corpus.module_imports.insert(
+                m.clone(),
+                mdata.imports.into_iter().map(|i| i.module).collect(),
+            );
+        }
+        if let Ok(constants) =
             DeclDecoder::new(&view, WalkBudget::default()).decode_module_constants()
-    {
-        for info in constants {
-            exported_out.insert(info.name().clone(), info);
+        {
+            let has_nce = constants.iter().any(|info| info.name() == &nce);
+            if has_nce {
+                corpus.nce_module = mod_name.clone();
+                let mut seen_nce = false;
+                for info in &constants {
+                    if info.name() == &nce {
+                        seen_nce = true;
+                    } else if !seen_nce && matches!(info, ConstantInfo::Induct(_)) {
+                        corpus.before_nce_in_own_module.insert(info.name().clone());
+                    }
+                }
+            }
+            for info in constants {
+                if let Some(m) = &mod_name
+                    && matches!(info, ConstantInfo::Induct(_))
+                {
+                    corpus
+                        .inductive_module
+                        .insert(info.name().clone(), m.clone());
+                }
+                corpus.exported_constants.insert(info.name().clone(), info);
+            }
         }
     }
     if server.is_file()
@@ -264,7 +621,15 @@ fn load_module_constants(
         )
     {
         for info in decoded.constants {
-            full_out.insert(info.name().clone(), info);
+            if let Some(m) = &mod_name
+                && matches!(info, ConstantInfo::Induct(_))
+            {
+                corpus
+                    .inductive_module
+                    .entry(info.name().clone())
+                    .or_insert_with(|| m.clone());
+            }
+            corpus.constants.insert(info.name().clone(), info);
         }
         return;
     }
@@ -273,9 +638,56 @@ fn load_module_constants(
             DeclDecoder::new(&view, WalkBudget::default()).decode_module_constants()
     {
         for info in constants {
-            full_out.insert(info.name().clone(), info);
+            if let Some(m) = &mod_name
+                && matches!(info, ConstantInfo::Induct(_))
+            {
+                corpus
+                    .inductive_module
+                    .entry(info.name().clone())
+                    .or_insert_with(|| m.clone());
+            }
+            corpus.constants.insert(info.name().clone(), info);
         }
     }
+}
+
+fn course_families(
+    constants: &BTreeMap<Name, ConstantInfo>,
+    block: &[InductiveVal],
+    recursor: &RecursorVal,
+) -> Vec<InductiveVal> {
+    let mut families = block.to_vec();
+    let mut names: BTreeSet<Name> = block.iter().map(|f| f.base.name.clone()).collect();
+    let mut seen = BTreeSet::new();
+    let mut work = vec![&recursor.base.type_];
+    while let Some(term) = work.pop() {
+        if !seen.insert(term.allocation_identity()) {
+            continue;
+        }
+        match term.node() {
+            ExprNode::Const { name, .. } => {
+                if !names.contains(name)
+                    && let Some(ConstantInfo::Induct(family)) = constants.get(name)
+                {
+                    names.insert(name.clone());
+                    families.push(family.clone());
+                }
+            }
+            ExprNode::App { f, a } => work.extend([f, a]),
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => work.extend([binder_type, body]),
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => work.extend([type_, value, body]),
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => work.push(expr),
+            _ => {}
+        }
+    }
+    families
 }
 
 fn is_private_name(name: &Name) -> bool {
@@ -309,11 +721,23 @@ fn main() -> ExitCode {
     let start = Instant::now();
     let mut olean_files = Vec::new();
     collect_olean_files(&lib_path, &mut olean_files);
-    let mut exported_constants = BTreeMap::new();
-    let mut constants = BTreeMap::new();
+    let mut corpus = LoadedCorpus::default();
     for path in &olean_files {
-        load_module_constants(path, &mut exported_constants, &mut constants);
+        load_module_constants(&lib_path, path, &mut corpus);
     }
+    let modules_with_nce = corpus
+        .nce_module
+        .as_ref()
+        .map(|m| corpus.compute_modules_importing(m))
+        .unwrap_or_default();
+    let LoadedCorpus {
+        exported_constants,
+        constants,
+        inductive_module,
+        nce_module,
+        before_nce_in_own_module,
+        ..
+    } = corpus;
     let decode_elapsed = start.elapsed();
 
     let mut ind_names = BTreeSet::new();
@@ -355,11 +779,16 @@ fn main() -> ExitCode {
     let budget = generation_budget();
     let mut rec_on_tally = FamilyTally::default();
     let mut cases_on_tally = FamilyTally::default();
+    let mut below_tally = FamilyTally::default();
+    let mut brec_go_tally = FamilyTally::default();
+    let mut brec_on_tally = FamilyTally::default();
     let mut ctor_idx_tally = FamilyTally::default();
     let mut to_ctor_idx_tally = FamilyTally::default();
     let mut ctor_elim_type_tally = FamilyTally::default();
     let mut ctor_elim_tally = FamilyTally::default();
     let mut constructor_elim_tally = FamilyTally::default();
+    let mut no_confusion_type_tally = FamilyTally::default();
+    let mut no_confusion_tally = FamilyTally::default();
 
     for ind_name in &ind_names {
         let Some(ConstantInfo::Induct(inductive)) = constants.get(ind_name) else {
@@ -397,6 +826,75 @@ fn main() -> ExitCode {
                 match cases_on_declaration(inductive, recursor, &block, budget) {
                     Ok(act) => cases_on_tally.record_def(&act, exp),
                     Err(e) => cases_on_tally.record_error(&cases_on_name, e.to_string()),
+                }
+            }
+        }
+
+        // below / brecOn.go / brecOn (primary and nested `_1.._k`).
+        // The pin only generates course-of-values auxiliaries for recursive
+        // inductives (`inductive.is_rec`); e.g. `Lean.Elab.Structural.IndGroupInst.brecOn`
+        // is an ordinary user function on a non-recursive structure.
+        let nested_max = if inductive.all.first() == Some(ind_name) {
+            inductive.num_nested
+        } else {
+            0
+        };
+        for nest_idx in 0..=nested_max {
+            if !inductive.is_rec {
+                break;
+            }
+            let suffix = if nest_idx == 0 {
+                String::new()
+            } else {
+                format!("_{nest_idx}")
+            };
+            let below_name = Name::str(ind_name.clone(), format!("below{suffix}"));
+            let brec_name = Name::str(ind_name.clone(), format!("brecOn{suffix}"));
+            let go_name = Name::str(brec_name.clone(), "go");
+            let exp_below = match constants.get(&below_name) {
+                Some(ConstantInfo::Defn(def)) => Some(def),
+                _ => None,
+            };
+            let exp_brec = match constants.get(&brec_name) {
+                Some(ConstantInfo::Defn(def)) => Some(def),
+                _ => None,
+            };
+            let exp_go = match constants.get(&go_name) {
+                Some(ConstantInfo::Defn(def)) => Some(def),
+                _ => None,
+            };
+            if exp_below.is_none() && exp_brec.is_none() && exp_go.is_none() {
+                continue;
+            }
+            let r_name = Name::str(ind_name.clone(), format!("rec{suffix}"));
+            let Some(ConstantInfo::Rec(rec)) = constants.get(&r_name) else {
+                if exp_below.is_some() {
+                    below_tally.record_error(&below_name, "missing matching recursor".to_owned());
+                }
+                continue;
+            };
+            let fams = course_families(&constants, &block, rec);
+            if let Some(exp) = exp_below {
+                match below_declaration(rec, &fams, budget) {
+                    Ok(act) => below_tally.record_def(&act, exp),
+                    Err(e) => below_tally.record_error(&below_name, e.to_string()),
+                }
+            }
+            if exp_go.is_some() || exp_brec.is_some() {
+                match brec_on_declarations(rec, &fams, budget) {
+                    Ok([act_go, act_brec]) => {
+                        if let Some(exp) = exp_go {
+                            brec_go_tally.record_def(&act_go, exp);
+                        }
+                        if let Some(exp) = exp_brec {
+                            brec_on_tally.record_def(&act_brec, exp);
+                        }
+                    }
+                    Err(e) => {
+                        if exp_brec.is_some() {
+                            brec_on_tally.record_error(&brec_name, e.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -505,6 +1003,67 @@ fn main() -> ExitCode {
                 }
             }
         }
+
+        // noConfusionType / noConfusion
+        let nct_name = Name::str(ind_name.clone(), "noConfusionType");
+        let nc_name = Name::str(ind_name.clone(), "noConfusion");
+        let exp_nct = match constants.get(&nct_name) {
+            Some(ConstantInfo::Defn(def)) => Some(def),
+            _ => None,
+        };
+        let exp_nc = match constants.get(&nc_name) {
+            Some(ConstantInfo::Defn(def)) => Some(def),
+            _ => None,
+        };
+        if (exp_nct.is_some() || exp_nc.is_some())
+            && let Some(cases_on) = cases_on_opt
+        {
+            let use_enum_helper = match inductive_module.get(ind_name) {
+                Some(m) if Some(m) == nce_module.as_ref() => {
+                    !before_nce_in_own_module.contains(ind_name)
+                }
+                Some(m) => modules_with_nce.contains(m),
+                None => false,
+            };
+            match no_confusion_declarations(
+                inductive,
+                &ctors,
+                cases_on,
+                use_enum_helper,
+                budget,
+                |n| constants.get(n),
+            ) {
+                Ok(Some(cands)) => {
+                    if let Some(exp) = exp_nct {
+                        no_confusion_type_tally.record_def_with_alpha_levels(
+                            &cands.no_confusion_type,
+                            exp,
+                            cands.is_enum_construction,
+                        );
+                    }
+                    if let Some(exp) = exp_nc {
+                        no_confusion_tally.record_def_with_alpha_levels(
+                            &cands.no_confusion,
+                            exp,
+                            cands.is_enum_construction,
+                        );
+                    }
+                }
+                Ok(None) => {
+                    if exp_nct.is_some() {
+                        no_confusion_type_tally.record_error(
+                            &nct_name,
+                            "generator returned None for pin noConfusionType".to_owned(),
+                        );
+                    }
+                }
+                Err(e) => {
+                    if exp_nct.is_some() {
+                        no_confusion_type_tally.record_error(&nct_name, e.to_string());
+                    }
+                }
+            }
+        }
     }
 
     let total_elapsed = start.elapsed();
@@ -522,11 +1081,16 @@ fn main() -> ExitCode {
     println!("=== GENERATOR PARITY ===");
     rec_on_tally.print("recOn");
     cases_on_tally.print("casesOn");
+    below_tally.print("below");
+    brec_go_tally.print("brecOn.go");
+    brec_on_tally.print("brecOn");
     ctor_idx_tally.print("ctorIdx");
     to_ctor_idx_tally.print("toCtorIdx");
     ctor_elim_type_tally.print("ctorElimType");
     ctor_elim_tally.print("ctorElim");
     constructor_elim_tally.print("ctor.elim");
+    no_confusion_type_tally.print("noConfusionType");
+    no_confusion_tally.print("noConfusion");
 
     println!("=== KNOWN DERIVED SUFFIX HISTOGRAM ===");
     let mut known_sorted: Vec<_> = known_suffixes.into_iter().collect();
@@ -545,11 +1109,16 @@ fn main() -> ExitCode {
 
     let total_mismatches = rec_on_tally.mismatches
         + cases_on_tally.mismatches
+        + below_tally.mismatches
+        + brec_go_tally.mismatches
+        + brec_on_tally.mismatches
         + ctor_idx_tally.mismatches
         + to_ctor_idx_tally.mismatches
         + ctor_elim_type_tally.mismatches
         + ctor_elim_tally.mismatches
-        + constructor_elim_tally.mismatches;
+        + constructor_elim_tally.mismatches
+        + no_confusion_type_tally.mismatches
+        + no_confusion_tally.mismatches;
     if total_mismatches == 0 || report_only {
         ExitCode::SUCCESS
     } else {

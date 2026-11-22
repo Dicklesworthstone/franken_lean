@@ -24,9 +24,11 @@ use std::collections::HashSet;
 mod course_of_values;
 mod ctor_elim;
 mod ctor_idx;
+mod no_confusion;
 pub use course_of_values::{below_declaration, brec_on_declarations};
 pub use ctor_elim::{CtorElimCandidates, ctor_elim_declarations};
 pub use ctor_idx::{CtorIdxCandidates, CtorIdxConstMeta, ctor_idx_declarations};
+pub use no_confusion::{NoConfusionCandidates, no_confusion_declarations};
 
 /// A candidate could not be constructed; this is not a kernel verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -193,7 +193,7 @@ fn split_private_name(name: &Name) -> (Option<Vec<NameAtom>>, Vec<NameAtom>) {
 }
 
 /// `CtorElim.lean::asPrivateAs`: apply `owner`'s private prefix (if any) to `target`.
-fn as_private_as(target: &Name, owner: &Name) -> Name {
+pub(super) fn as_private_as(target: &Name, owner: &Name) -> Name {
     let (_, target_user) = split_private_name(target);
     let (owner_prefix, _) = split_private_name(owner);
     match owner_prefix {
@@ -263,7 +263,7 @@ fn subst_level_params(
 }
 
 /// Iterative, DAG-memoized level-parameter substitution inside an `Expr`.
-fn subst_expr_level_params(
+pub(super) fn subst_expr_level_params(
     work: &mut Builder,
     expr: &Expr,
     params: &[Name],
@@ -384,7 +384,7 @@ fn subst_expr_level_params(
 /// Bounded lightweight WHNF (beta, zeta, delta on definitions, mdata unwrap,
 /// struct projection on constructor apps) sufficient to infer universe sort levels
 /// of inductive minor-premise types directly from a constant lookup closure.
-fn whnf_for_sort<'a, F>(
+pub(super) fn whnf_for_sort<'a, F>(
     work: &mut Builder,
     mut expr: Expr,
     lookup_const: &F,
@@ -481,7 +481,7 @@ where
 
 /// Infer the type of `expr` under `locals` using `lookup_const`, sufficient for
 /// computing `getLevel` on every `casesOn` minor premise type.
-fn infer_type_bounded<'a, F>(
+pub(super) fn infer_type_bounded<'a, F>(
     build: &mut Build,
     locals: &[LocalDecl],
     expr: &Expr,
@@ -648,7 +648,7 @@ where
     }
 }
 
-fn infer_sort_level<'a, F>(
+pub(super) fn infer_sort_level<'a, F>(
     build: &mut Build,
     locals: &[LocalDecl],
     type_: &Expr,

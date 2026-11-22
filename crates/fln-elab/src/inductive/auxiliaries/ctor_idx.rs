@@ -202,7 +202,7 @@ where
 }
 
 /// `Lean.isEnumType` (`Lean/MonadEnv.lean:198-208`).
-fn is_enum_type(
+pub(super) fn is_enum_type(
     inductive: &InductiveVal,
     constructors: &[ConstructorVal],
     prop_former: bool,
