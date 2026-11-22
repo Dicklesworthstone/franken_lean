@@ -904,6 +904,11 @@ enum IntrinsicImplementation {
     FileHandleRead,
     FileHandleWrite,
     FileHandleFlush,
+    FileHandleRewind,
+    FileHandleTruncate,
+    FileHandleLock,
+    FileHandleTryLock,
+    FileHandleUnlock,
     FileHandleIsTty,
     FilePathReadDir,
     FilePathMetadata,
@@ -1309,6 +1314,11 @@ impl IntrinsicImplementation {
             "extern:IO.FS.Handle.read" => Self::FileHandleRead,
             "extern:IO.FS.Handle.write" => Self::FileHandleWrite,
             "extern:IO.FS.Handle.flush" => Self::FileHandleFlush,
+            "extern:IO.FS.Handle.rewind" => Self::FileHandleRewind,
+            "extern:IO.FS.Handle.truncate" => Self::FileHandleTruncate,
+            "extern:IO.FS.Handle.lock" => Self::FileHandleLock,
+            "extern:IO.FS.Handle.tryLock" => Self::FileHandleTryLock,
+            "extern:IO.FS.Handle.unlock" => Self::FileHandleUnlock,
             "extern:IO.FS.Handle.isTty" => Self::FileHandleIsTty,
             "extern:System.FilePath.readDir" => Self::FilePathReadDir,
             "extern:System.FilePath.metadata" => Self::FilePathMetadata,
@@ -7679,6 +7689,38 @@ fn dispatch_intrinsic(
                 .map(IntrinsicResult::owned)
                 .map_err(|error| VmRefusal::NativeFileIo { error }.into())
         }
+        IntrinsicImplementation::FileHandleRewind
+        | IntrinsicImplementation::FileHandleTruncate
+        | IntrinsicImplementation::FileHandleUnlock => {
+            expect_arity(row, args, 1)?;
+            let world = Obj::mk_nat(0);
+            let result = match implementation {
+                IntrinsicImplementation::FileHandleRewind => args[0].try_file_rewind(&world),
+                IntrinsicImplementation::FileHandleTruncate => args[0].try_file_truncate(&world),
+                _ => args[0].try_file_unlock(&world),
+            };
+            result
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
+        IntrinsicImplementation::FileHandleLock | IntrinsicImplementation::FileHandleTryLock => {
+            expect_arity(row, args, 2)?;
+            let operation = if implementation == IntrinsicImplementation::FileHandleLock {
+                "IO.FS.Handle.lock"
+            } else {
+                "IO.FS.Handle.tryLock"
+            };
+            let exclusive = bool_value(&args[1], operation, 1)?;
+            let world = Obj::mk_nat(0);
+            let result = if implementation == IntrinsicImplementation::FileHandleLock {
+                args[0].try_file_lock(exclusive, &world)
+            } else {
+                args[0].try_file_try_lock(exclusive, &world)
+            };
+            result
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
         IntrinsicImplementation::FileHandleGetLine => {
             expect_arity(row, args, 1)?;
             args[0]
@@ -8421,6 +8463,11 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::FileHandleRead
         | IntrinsicImplementation::FileHandleWrite
         | IntrinsicImplementation::FileHandleFlush
+        | IntrinsicImplementation::FileHandleRewind
+        | IntrinsicImplementation::FileHandleTruncate
+        | IntrinsicImplementation::FileHandleLock
+        | IntrinsicImplementation::FileHandleTryLock
+        | IntrinsicImplementation::FileHandleUnlock
         | IntrinsicImplementation::FileHandleIsTty
         | IntrinsicImplementation::FilePathMetadata
         | IntrinsicImplementation::FilePathSymlinkMetadata

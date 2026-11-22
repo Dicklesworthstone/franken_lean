@@ -4,6 +4,7 @@
 use super::{Obj, canonical_stdio_string, native_stdio_ctor_shape, stdio_result_transport};
 
 mod bytes;
+mod control;
 mod directory;
 mod metadata;
 mod read;
@@ -55,6 +56,8 @@ pub enum FileIoError {
     MalformedWriteResult { bytes_written: usize },
     UnrepresentableFlush { errno: i32 },
     MalformedFlushResult,
+    UnrepresentableControl { errno: i32 },
+    MalformedControlResult,
     MalformedDirectoryResult,
     MalformedMetadataResult,
     MalformedPathResult,

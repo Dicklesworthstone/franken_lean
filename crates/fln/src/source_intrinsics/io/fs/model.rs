@@ -281,7 +281,23 @@ pub(super) fn primitive(operation: Operation) -> ConstantInfo {
             c("IO.FS.Handle"),
         ),
         Operation::PutStr => (vec![c("IO.FS.Handle"), c("String")], c("Unit")),
-        Operation::Flush => (vec![c("IO.FS.Handle")], c("Unit")),
+        Operation::Flush | Operation::Rewind | Operation::Truncate | Operation::Unlock => {
+            (vec![c("IO.FS.Handle")], c("Unit"))
+        }
+        Operation::Lock | Operation::TryLock => (
+            vec![
+                c("IO.FS.Handle"),
+                apply(
+                    Expr::const_(name("optParam"), vec![Level::one()]),
+                    [c("Bool"), c("Bool.true")],
+                ),
+            ],
+            c(if operation == Operation::TryLock {
+                "Bool"
+            } else {
+                "Unit"
+            }),
+        ),
         Operation::IsTty => (vec![c("IO.FS.Handle")], c("Bool")),
         Operation::Metadata | Operation::SymlinkMetadata => {
             (vec![c("System.FilePath")], c("IO.FS.Metadata"))
@@ -363,6 +379,13 @@ pub(super) fn primitive(operation: Operation) -> ConstantInfo {
             Expr::const_(name("Inhabited.default"), vec![Level::one()]),
             [action, instance],
         );
+        // optParam annotates the declared telescope; the opaque body's
+        // lambda binds the underlying Bool, as in the pinned Task models.
+        let domains = if matches!(operation, Operation::Lock | Operation::TryLock) {
+            vec![c("IO.FS.Handle"), c("Bool")]
+        } else {
+            domains
+        };
         domains
             .into_iter()
             .rev()

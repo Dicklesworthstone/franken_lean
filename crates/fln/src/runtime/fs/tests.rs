@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 mod bytes;
 #[cfg(test)]
+mod control;
+#[cfg(test)]
 mod flush;
 #[cfg(test)]
 mod metadata_observations;

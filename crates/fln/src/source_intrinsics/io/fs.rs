@@ -36,6 +36,11 @@ pub(crate) enum Operation {
     Metadata,
     SymlinkMetadata,
     IsTty,
+    Rewind,
+    Truncate,
+    Lock,
+    TryLock,
+    Unlock,
 }
 
 impl Operation {
@@ -58,6 +63,11 @@ impl Operation {
             Self::Metadata,
             Self::SymlinkMetadata,
             Self::IsTty,
+            Self::Rewind,
+            Self::Truncate,
+            Self::Lock,
+            Self::TryLock,
+            Self::Unlock,
         ]
         .into_iter()
         .find(|operation| requested == &operation.source_name())
@@ -82,6 +92,11 @@ impl Operation {
             Self::Metadata => "System.FilePath.metadata",
             Self::SymlinkMetadata => "System.FilePath.symlinkMetadata",
             Self::IsTty => "IO.FS.Handle.isTty",
+            Self::Rewind => "IO.FS.Handle.rewind",
+            Self::Truncate => "IO.FS.Handle.truncate",
+            Self::Lock => "IO.FS.Handle.lock",
+            Self::TryLock => "IO.FS.Handle.tryLock",
+            Self::Unlock => "IO.FS.Handle.unlock",
         };
         Name::from_components(label.split('.'))
     }
@@ -98,7 +113,10 @@ impl Operation {
             | Self::RemoveFile
             | Self::Metadata
             | Self::SymlinkMetadata
-            | Self::IsTty => 1,
+            | Self::IsTty
+            | Self::Rewind
+            | Self::Truncate
+            | Self::Unlock => 1,
             _ => 2,
         }
     }
@@ -242,6 +260,11 @@ pub(crate) fn assert_pin_models(environment: &Environment) {
             model::primitive(Operation::Metadata),
             model::primitive(Operation::SymlinkMetadata),
             model::primitive(Operation::IsTty),
+            model::primitive(Operation::Rewind),
+            model::primitive(Operation::Truncate),
+            model::primitive(Operation::Lock),
+            model::primitive(Operation::TryLock),
+            model::primitive(Operation::Unlock),
         ])
     {
         assert!(

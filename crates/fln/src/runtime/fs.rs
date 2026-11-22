@@ -287,9 +287,16 @@ impl Preparation<'_> {
                 vec![ValueType::Abi, ValueType::String],
                 vec![layout.receiver.clone(), c("String")],
             ),
-            Operation::GetLine | Operation::Flush | Operation::IsTty => {
-                (vec![ValueType::Abi], vec![layout.receiver.clone()])
-            }
+            Operation::GetLine
+            | Operation::Flush
+            | Operation::IsTty
+            | Operation::Rewind
+            | Operation::Truncate
+            | Operation::Unlock => (vec![ValueType::Abi], vec![layout.receiver.clone()]),
+            Operation::Lock | Operation::TryLock => (
+                vec![ValueType::Abi, ValueType::Bool],
+                vec![layout.receiver.clone(), c("Bool")],
+            ),
             Operation::Read => {
                 let bytes = self.fs_bytes_layout()?;
                 (
@@ -385,6 +392,10 @@ impl Preparation<'_> {
             Operation::PutStr
             | Operation::Write
             | Operation::Flush
+            | Operation::Rewind
+            | Operation::Truncate
+            | Operation::Lock
+            | Operation::Unlock
             | Operation::CreateDir
             | Operation::RemoveDir
             | Operation::RemoveFile
@@ -392,11 +403,11 @@ impl Preparation<'_> {
             | Operation::HardLink => {
                 Expr::const_(layout.error.unit_constructor.clone(), Vec::new())
             }
-            // The native producer validates canonical String success. The
-            // typed EST.Out constructor inserts an explicit ABI-to-String
-            // refinement here, inside the lazy success arm only. Error
-            // packets carry scalar zero and never reach that projection.
-            Operation::GetLine => field(layout, 0)?,
+            // The native producer validates canonical String or Bool success.
+            // The typed EST.Out constructor inserts an explicit ABI refinement
+            // inside the lazy success arm only. Error packets carry scalar zero
+            // and never reach that projection.
+            Operation::GetLine | Operation::TryLock => field(layout, 0)?,
             Operation::Read => self.fs_materialize_bytes(field(layout, 0)?)?,
             Operation::ReadDir => self.fs_materialize_directory(field(layout, 0)?)?,
             Operation::Metadata | Operation::SymlinkMetadata => {
@@ -486,12 +497,17 @@ impl Preparation<'_> {
             Operation::PutStr
             | Operation::Write
             | Operation::Flush
+            | Operation::Rewind
+            | Operation::Truncate
+            | Operation::Lock
+            | Operation::Unlock
             | Operation::CreateDir
             | Operation::RemoveDir
             | Operation::RemoveFile
             | Operation::Rename
             | Operation::HardLink => c("Unit"),
             Operation::GetLine => c("String"),
+            Operation::TryLock => c("Bool"),
             Operation::IsTty => c("Bool"),
             Operation::Metadata | Operation::SymlinkMetadata => c("IO.FS.Metadata"),
             Operation::Read => c("ByteArray"),
@@ -543,8 +559,14 @@ impl Preparation<'_> {
                 vec![layout.receiver.clone(), c("String")],
                 vec![b(2)?, b(1)?],
             ),
-            Operation::GetLine | Operation::Flush | Operation::IsTty => {
-                (vec![layout.receiver.clone()], vec![b(1)?])
+            Operation::GetLine
+            | Operation::Flush
+            | Operation::IsTty
+            | Operation::Rewind
+            | Operation::Truncate
+            | Operation::Unlock => (vec![layout.receiver.clone()], vec![b(1)?]),
+            Operation::Lock | Operation::TryLock => {
+                (vec![layout.receiver.clone(), c("Bool")], vec![b(2)?, b(1)?])
             }
             Operation::Read => {
                 let bytes = self.fs_bytes_layout()?;

@@ -1635,6 +1635,60 @@ pub(crate) fn checked_flush_result(status: Result<(), c_int>) -> Result<*mut Lea
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum HandleControl {
+    Rewind,
+    Truncate,
+    Lock(bool),
+    TryLock(bool),
+    Unlock,
+}
+
+/// Run one cursor, truncation, or advisory-lock effect with the epoch's exact
+/// native calls. Contention is a successful false result only for tryLock.
+///
+/// # Safety
+/// `handle` is a scalar or live membrane object, borrowed throughout. A
+/// successful Some transfers one owned native IO.Result reference.
+// UNSAFE-LEDGER: FLN-UL-0672
+#[allow(unsafe_code)]
+pub(crate) unsafe fn checked_handle_control(
+    handle: *mut LeanObject,
+    operation: HandleControl,
+) -> Result<Option<*mut LeanObject>, c_int> {
+    // SAFETY: the external class and nonnull FILE are checked before any
+    // descriptor access; the caller retains its owner throughout the call.
+    unsafe {
+        if !is_native_file_handle(handle) {
+            return Ok(None);
+        }
+        let file = io_get_handle(handle);
+        let status = match operation {
+            HandleControl::Rewind => fseek(file, 0, SEEK_SET),
+            HandleControl::Truncate => ftruncate(fileno(file), ftello(file)),
+            HandleControl::Lock(exclusive) => {
+                flock(fileno(file), if exclusive { LOCK_EX } else { LOCK_SH })
+            }
+            HandleControl::TryLock(exclusive) => flock(
+                fileno(file),
+                (if exclusive { LOCK_EX } else { LOCK_SH }) | LOCK_NB,
+            ),
+            HandleControl::Unlock => flock(fileno(file), LOCK_UN),
+        };
+        if status == 0 {
+            let payload = usize::from(matches!(operation, HandleControl::TryLock(_)));
+            return Ok(Some(io_result_mk_ok(tagged::boxi(payload))));
+        }
+        let code = errno();
+        if matches!(operation, HandleControl::TryLock(_)) && code == EWOULDBLOCK {
+            return Ok(Some(io_result_mk_ok(tagged::boxi(0))));
+        }
+        // The descriptor operations have no filename. Reuse the checked
+        // decoder which refuses EINTR/ENOENT before their filename arms.
+        checked_flush_result(Err(code)).map(Some)
+    }
+}
+
 /// `lean_io_prim_handle_flush` (`io.cpp:550-556`).
 ///
 /// # Safety
