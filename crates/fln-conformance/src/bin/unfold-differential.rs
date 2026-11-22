@@ -44,7 +44,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut max_steps: Option<u64> = None;
     let mut top: usize = 15;
     let mut module: Option<String> = None;
-    let mut decl: Option<String> = None;
+    let mut decls: Vec<String> = Vec::new();
     let mut pin_lean: Option<PathBuf> = None;
     let mut workspace = PathBuf::from(".");
     let mut force_left_delta = false;
@@ -74,7 +74,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             "--decl" => {
                 i += 1;
-                decl = Some(args.get(i).ok_or("--decl requires a value")?.clone());
+                decls.push(args.get(i).ok_or("--decl requires a value")?.clone());
             }
             "--pin-lean" => {
                 i += 1;
@@ -128,7 +128,7 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "diff" => {
-            let decl = decl.ok_or("--decl is required for `diff`")?;
+            let decl = decls.first().ok_or("--decl is required for `diff`")?;
             let pin_lean = pin_lean.ok_or("--pin-lean is required for `diff`")?;
             let lean_path = roots
                 .iter()
@@ -136,8 +136,8 @@ fn run(args: &[String]) -> Result<(), String> {
                 .collect::<Vec<_>>()
                 .join(":");
             let pin_table =
-                run_pin_unfold_counts(&workspace, &pin_lean, &lean_path, &module, &decl)?;
-            let k1_run = loaded.observe_declaration(&decl, budget, force_left_delta)?;
+                run_pin_unfold_counts(&workspace, &pin_lean, &lean_path, &module, decl)?;
+            let k1_run = loaded.observe_declaration(decl, budget, force_left_delta)?;
             let k1_counts = k1_run.display_counts();
             let report = join_and_rank(&k1_counts, &pin_table.counts);
             println!(
@@ -156,8 +156,21 @@ fn run(args: &[String]) -> Result<(), String> {
             print!("{}", report.render_top(top));
             Ok(())
         }
+        "council" => {
+            if decls.is_empty() {
+                return Err("--decl is required for `council`".to_owned());
+            }
+            for decl in &decls {
+                let (summary, wall) = loaded.probe_council(decl, budget)?;
+                println!(
+                    "COUNCIL module={module} decl={decl} ms={:.2} {summary}",
+                    wall.as_secs_f64() * 1e3
+                );
+            }
+            Ok(())
+        }
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `scan` or `diff`)"
+            "unknown subcommand `{other}` (expected `scan`, `diff`, or `council`)"
         )),
     }
 }

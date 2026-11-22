@@ -1323,6 +1323,13 @@ impl Probe<'_> {
                         .iter()
                         .rposition(|task| matches!(task, Work::Attempt { .. }))
                     else {
+                        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+                            eprintln!(
+                                "PROOF_CONV_ROOT_FAIL remaining_work={} taken_len={}",
+                                work.len(),
+                                taken.len(),
+                            );
+                        }
                         return Ok(false);
                     };
                     work.truncate(marker + 1);
@@ -1516,7 +1523,16 @@ impl Probe<'_> {
             if !skip {
                 match self.equal(&left, &right, &context)? {
                     Some(true) => continue,
-                    Some(false) => fail!(),
+                    Some(false) => {
+                        if std::env::var_os("FLN_CHECKER_TRACE").is_some() && attempts == 0 {
+                            eprintln!(
+                                "PROOF_CONV_EQUAL_FALSE attempts=0 l_root={:?} r_root={:?}",
+                                left.node(left.root()),
+                                right.node(right.root()),
+                            );
+                        }
+                        fail!()
+                    }
                     None => {}
                 }
             }
@@ -1525,9 +1541,21 @@ impl Probe<'_> {
                 continue;
             }
             let Some(l) = self.whnf_comparand(&left, &context)? else {
+                if std::env::var_os("FLN_CHECKER_TRACE").is_some() && attempts == 0 {
+                    eprintln!(
+                        "PROOF_CONV_WHNF_L_NONE attempts=0 l_root={:?}",
+                        left.node(left.root())
+                    );
+                }
                 fail!()
             };
             let Some(r) = self.whnf_comparand(&right, &context)? else {
+                if std::env::var_os("FLN_CHECKER_TRACE").is_some() && attempts == 0 {
+                    eprintln!(
+                        "PROOF_CONV_WHNF_R_NONE attempts=0 r_root={:?}",
+                        right.node(right.root())
+                    );
+                }
                 fail!()
             };
             // A changed head may expose ordinary conversion or proof evidence.
@@ -1694,7 +1722,18 @@ impl Probe<'_> {
                     });
                     work.push(Work::Pair(other_domain, domain, context));
                 }
-                _ => fail!(),
+                _ => {
+                    if std::env::var_os("FLN_CHECKER_TRACE").is_some() && attempts == 0 {
+                        eprintln!(
+                            "PROOF_CONV_FALLTHROUGH attempts=0 l_root={:?} r_root={:?} l_nodes={:?} r_nodes_len={}",
+                            l.node(l.root()),
+                            r.node(r.root()),
+                            &l.nodes()[..l.nodes().len().min(12)],
+                            r.nodes().len(),
+                        );
+                    }
+                    fail!()
+                }
             }
         }
         Ok(true)

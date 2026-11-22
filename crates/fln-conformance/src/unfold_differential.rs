@@ -586,11 +586,10 @@ impl LoadedOleanModule {
         budget: Budget,
         force_left_delta: bool,
     ) -> Result<K1UnfoldRun, String> {
-        let target_decl_name = Name::from_components(declaration.split('.'));
         let target_pos = self
             .constants
             .iter()
-            .position(|c| c.name() == &target_decl_name)
+            .position(|c| c.name().to_display_string() == declaration)
             .ok_or_else(|| {
                 format!(
                     "declaration {declaration} not found in module {}",
@@ -598,6 +597,7 @@ impl LoadedOleanModule {
                 )
             })?;
         let target_info = self.constants[target_pos].clone();
+        let target_decl_name = target_info.name().clone();
         let decl = constant_to_declaration(&target_info)?;
 
         let mut prereqs = Vec::new();
@@ -633,6 +633,60 @@ impl LoadedOleanModule {
             observation,
             wall,
         })
+    }
+
+    /// Run both K1 and the independent checker (`fln-checker`, Release policy)
+    /// on one named declaration in this module against its diagnostic import
+    /// environment. Non-authoritative Tribunal probe only.
+    pub fn probe_council(
+        &self,
+        declaration: &str,
+        budget: Budget,
+    ) -> Result<(String, Duration), String> {
+        let target_pos = self
+            .constants
+            .iter()
+            .position(|c| c.name().to_display_string() == declaration)
+            .ok_or_else(|| {
+                format!(
+                    "declaration {declaration} not found in module {}",
+                    self.module
+                )
+            })?;
+        let target_info = self.constants[target_pos].clone();
+        let target_decl_name = target_info.name().clone();
+        let decl = constant_to_declaration(&target_info)?;
+
+        let mut prereqs = Vec::new();
+        let mut seen_prereq = BTreeSet::new();
+        for info in &self.constants {
+            if info.name() == &target_decl_name {
+                continue;
+            }
+            if !self.imports_env.contains(info.name()) && seen_prereq.insert(info.name().clone()) {
+                prereqs.push(info.clone());
+            }
+        }
+        let env = if prereqs.is_empty() {
+            self.imports_env.clone()
+        } else {
+            self.imports_env
+                .assume_constants(&prereqs)
+                .map_err(|e| format!("failed to populate module prerequisites: {e:?}"))?
+        };
+
+        let engine = fln::Engine::from_environment(env.as_check_environment().clone());
+        let limits = fln::EngineAdmissionLimits::new(budget);
+        let started = Instant::now();
+        let summary = match engine.admit_declaration(decl, &fln::KVMap::new(), limits) {
+            Ok(Outcome::Complete(admitted)) => {
+                format!("ACCEPTED checker={:?}", admitted.checker)
+            }
+            Ok(Outcome::Inconclusive(reason)) => format!("INCONCLUSIVE {reason:?}"),
+            Ok(Outcome::InternalFault(fault)) => format!("INTERNAL_FAULT {fault:?}"),
+            Err(error) => format!("ERROR {error:?}"),
+        };
+        Ok((summary, started.elapsed()))
     }
 
     /// Check every individually checkable declaration (`Axiom`, `Defn`, `Thm`,
