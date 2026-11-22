@@ -27,6 +27,7 @@ pub mod builtin_table;
 pub mod category;
 pub mod command_scope;
 pub mod extensions;
+pub mod g3_ladder;
 pub mod macro_expand;
 pub mod macro_txn;
 pub mod pratt;

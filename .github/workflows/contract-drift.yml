@@ -626,6 +626,7 @@ jobs:
           FLN_GRAMMAR_CENSUS_JOBS: 4
         run: |
           ./scripts/extract/gen_grammar_census.sh --check
+          python3 scripts/extract/gen_g3_file_ladder.py --check
 
       - name: pin-dependent conformance suites (fln-rgha)
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}

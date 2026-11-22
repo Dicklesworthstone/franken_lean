@@ -617,3 +617,214 @@ fn the_builtin_registration_census_names_kinds_categories_and_precedences() {
         count(GRAMMAR_CENSUS, "init-std-syntax-decls")
     );
 }
+
+/// The derived G3 file ladder for `franken_lean-z8j.1.12` (bead `fln-vokf`):
+/// `contracts/REFERENCE_G3_LADDER.txt` matches live Rust re-derivation from the two
+/// pinned censuses row-for-row and kind-reach-for-kind-reach, starts at `Init.Prelude`,
+/// respects the full Init/Std import DAG, and covers every module and used kind.
+#[test]
+fn the_g3_ladder_matches_the_checked_in_contract_and_is_topologically_valid() {
+    use fln_parse::g3_ladder::{G3Ladder, REFERENCE_G3_LADDER, reference_g3_ladder};
+
+    let parsed = G3Ladder::parse(REFERENCE_G3_LADDER)
+        .expect("checked-in contracts/REFERENCE_G3_LADDER.txt parses cleanly");
+    let derived = reference_g3_ladder();
+
+    assert_eq!(
+        parsed.entries(),
+        derived.entries(),
+        "contracts/REFERENCE_G3_LADDER.txt drifted from live derivation (run scripts/extract/gen_g3_file_ladder.py generate)"
+    );
+    assert_eq!(
+        parsed.kind_reach(),
+        derived.kind_reach(),
+        "kind-reach rows drifted from live derivation"
+    );
+    assert_eq!(parsed.max_depth(), derived.max_depth());
+
+    assert_eq!(derived.entries().len(), count(KIND_USE, "files"));
+    assert_eq!(
+        derived.kind_reach().len(),
+        count(KIND_USE, "distinct-kinds")
+    );
+    assert_eq!(
+        derived.entries()[0].module,
+        "Init.Prelude",
+        "Init.Prelude is the unique zero-import root of the Init/Std DAG"
+    );
+    assert_eq!(derived.entries()[0].depth, 0);
+    assert!(derived.entries()[0].imports.is_empty());
+
+    let rank_by_mod: BTreeMap<&str, usize> = derived
+        .entries()
+        .iter()
+        .map(|entry| (entry.module.as_str(), entry.rank))
+        .collect();
+    for entry in derived.entries() {
+        for import in &entry.imports {
+            let imp_rank = rank_by_mod[import.as_str()];
+            assert!(
+                imp_rank < entry.rank,
+                "{} (rank {}) precedes import {} (rank {})",
+                entry.module,
+                entry.rank,
+                import,
+                imp_rank
+            );
+        }
+    }
+}
+
+/// Eligibility rule and planted mutation check for the G3 ladder (`fln-vokf`):
+/// a module is eligible iff all of its syntax kinds AND all of its transitive imports'
+/// syntax kinds exist; removing one kind disqualifies exactly its direct + transitive cone.
+#[test]
+fn g3_ladder_eligibility_and_planted_kind_removal() {
+    use fln_parse::g3_ladder::reference_g3_ladder;
+
+    let ladder = reference_g3_ladder();
+    let empty = BTreeSet::new();
+    assert!(
+        ladder.eligible_modules(&empty).is_empty(),
+        "no module is eligible with an empty syntax-kind set"
+    );
+
+    let all_kinds: BTreeSet<String> = ladder.kind_reach().keys().cloned().collect();
+    assert_eq!(
+        ladder.eligible_modules(&all_kinds).len(),
+        ladder.entries().len(),
+        "every Init/Std module is eligible once all 934 used kinds exist"
+    );
+
+    // With only Init.Prelude's own kinds, Init.Prelude itself is eligible, and the next
+    // unlockable frontier only contains modules whose imports are already eligible.
+    let prelude_kinds = ladder
+        .module_uses("Init.Prelude")
+        .expect("Init.Prelude uses")
+        .clone();
+    let eligible_with_prelude = ladder.eligible_modules(&prelude_kinds);
+    assert!(
+        eligible_with_prelude
+            .iter()
+            .any(|entry| entry.module == "Init.Prelude"),
+        "Init.Prelude becomes eligible once all of its own kinds exist"
+    );
+    let frontier = ladder.next_unlockable(&prelude_kinds, 5);
+    assert!(
+        !frontier.is_empty(),
+        "at least one direct Init.Prelude consumer appears in the next-unlockable frontier"
+    );
+    for (entry, missing) in &frontier {
+        assert!(
+            !missing.is_empty(),
+            "next_unlockable entry {} must have at least one missing kind",
+            entry.module
+        );
+    }
+
+    // Planted kind removal: removing one single kind disqualifies exactly its
+    // `kind-reach.transitive` count of modules, and missing_kinds_for names only that kind.
+    for target_kind in ["Lean.Parser.Term.byTactic", "«term_≥_»"] {
+        let reach = ladder
+            .kind_reach()
+            .get(target_kind)
+            .unwrap_or_else(|| panic!("expected kind {target_kind} in ladder"));
+        let mut reduced = all_kinds.clone();
+        assert!(reduced.remove(target_kind));
+
+        let eligible_after = ladder.eligible_modules(&reduced);
+        let ineligible_count = ladder.entries().len() - eligible_after.len();
+        assert_eq!(
+            ineligible_count, reach.transitive,
+            "removing {target_kind} must disqualify exactly its {} transitive dependents",
+            reach.transitive
+        );
+        let eligible_names: BTreeSet<&str> = eligible_after
+            .iter()
+            .map(|entry| entry.module.as_str())
+            .collect();
+        for entry in ladder.entries() {
+            let missing = ladder
+                .missing_kinds_for(&entry.module, &reduced)
+                .expect("module in ladder");
+            if eligible_names.contains(entry.module.as_str()) {
+                assert!(
+                    missing.is_empty(),
+                    "{} is eligible yet had missing {missing:?}",
+                    entry.module
+                );
+            } else {
+                assert_eq!(
+                    missing,
+                    BTreeSet::from([target_kind.to_owned()]),
+                    "{} became ineligible for a reason other than {target_kind}",
+                    entry.module
+                );
+            }
+        }
+    }
+}
+
+/// Malformed or cyclic G3 ladder inputs are refused with typed errors, never skipped.
+#[test]
+fn malformed_g3_ladder_inputs_are_refused() {
+    use fln_parse::g3_ladder::{G3Ladder, LadderError, REFERENCE_G3_LADDER};
+
+    assert!(matches!(
+        G3Ladder::parse("schema\twrong/1\n"),
+        Err(LadderError::Schema { .. })
+    ));
+
+    let bad_count = REFERENCE_G3_LADDER.replacen("count\tmodules\t1077", "count\tmodules\t1076", 1);
+    assert!(matches!(
+        G3Ladder::parse(&bad_count),
+        Err(LadderError::CountMismatch {
+            what: "modules",
+            declared: 1076,
+            found: 1077
+        })
+    ));
+
+    // Planted import cycle in synthetic censuses.
+    let cyclic_grammar = "\
+schema\tfln-reference-grammar-census/1
+count\tinit-std-modules\t2
+module\tA\timports=B
+module\tB\timports=A
+";
+    let cyclic_uses = "\
+schema\tfln-reference-syntax-kind-use/1
+count\tfiles\t2
+count\tdistinct-kinds\t1
+count\terrors\t0
+count\tfaults\t0
+file\tA\tA.lean\tcommands=1\terrors=0\tkinds=1
+uses\tA\tk1
+file\tB\tB.lean\tcommands=1\terrors=0\tkinds=1
+uses\tB\tk1
+";
+    assert!(matches!(
+        G3Ladder::derive(cyclic_grammar, cyclic_uses),
+        Err(LadderError::ImportCycle { .. })
+    ));
+
+    // Planted open-closure import.
+    let open_grammar = "\
+schema\tfln-reference-grammar-census/1
+count\tinit-std-modules\t1
+module\tA\timports=Missing
+";
+    let open_uses = "\
+schema\tfln-reference-syntax-kind-use/1
+count\tfiles\t1
+count\tdistinct-kinds\t1
+count\terrors\t0
+count\tfaults\t0
+file\tA\tA.lean\tcommands=1\terrors=0\tkinds=1
+uses\tA\tk1
+";
+    assert!(matches!(
+        G3Ladder::derive(open_grammar, open_uses),
+        Err(LadderError::OpenClosure { .. })
+    ));
+}
