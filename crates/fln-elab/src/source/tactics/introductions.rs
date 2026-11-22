@@ -53,8 +53,13 @@ impl Context {
             }
             Err(problem) => {
                 let spent = self.txn.budget.heartbeats_consumed;
+                // Failed typed introductions retain their observed annotation,
+                // as the pin's tactic rollback retains InfoState. This local
+                // rollback must not erase it before an enclosing first/try runs.
+                let references = self.references.take();
                 *self = snapshot;
                 self.txn.budget.heartbeats_consumed = spent;
+                self.references = references;
                 Err(problem)
             }
         }

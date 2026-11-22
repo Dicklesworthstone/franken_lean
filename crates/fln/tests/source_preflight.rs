@@ -184,3 +184,93 @@ fn a_module_preflight_reports_the_module_checker_error_and_whole_module_offsets(
     preflight_source_module(&name, header_free_body).expect("a parseable module passes");
     preflight_source_module(&name, b"prelude\n").expect("an empty body passes");
 }
+
+#[test]
+fn generated_parser_limits_remain_nonanswers_through_source_and_module_doors() {
+    let grammar = concat!(
+        "syntax \"boundedLambda \" bracketedBinder \" => \" term : term\n",
+        "macro_rules | `(boundedLambda ($n:ident : $ty:term) => $body) => `(fun ($n : $ty) => $body)\n",
+        "def beforeLimit : Nat := 7\n",
+    );
+    let source = format!(
+        "{grammar}def bounded : Nat := (boundedLambda (x : {}Nat{}) => x) 42\n",
+        "(".repeat(300),
+        ")".repeat(300),
+    );
+    let early = preflight_source_files(&[source.as_bytes()])
+        .expect_err("the generated operand exceeds its native parser depth");
+    let parser_error = match &early {
+        SourceCheckError::Command { error, .. } => match error.as_ref() {
+            EngineExecutionError::Frontend(DefinitionFrontendError::Parse(
+                error @ fln_parse::DefinitionParseError::GeneratedParser {
+                    error:
+                        fln_parse::builtin_interpreter::ParserFailure::Resource(
+                            fln_parse::builtin_interpreter::ParserResourceLimit::Depth,
+                        ),
+                    ..
+                },
+            )) => error.clone(),
+            other => panic!("expected the actual generated parser depth stop: {other:?}"),
+        },
+        other => panic!("expected a generated operand refusal: {other:?}"),
+    };
+    assert_eq!(early.disposition(), ("resource", false, 3));
+    let engine = engine();
+    let root = engine.logical_root(&KVMap::new());
+    let late = checked(&engine, source.as_bytes()).expect_err("checked source also stops");
+    assert_eq!(late.disposition(), early.disposition());
+    assert_eq!(late.to_string(), early.to_string());
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+    assert!(
+        !engine
+            .environment()
+            .contains(&Name::from_components(["beforeLimit"]))
+    );
+
+    let name = Name::from_components(["BoundedGrammar"]);
+    let module = format!("prelude\n{source}");
+    let module_error =
+        preflight_source_module(&name, module.as_bytes()).expect_err("module preflight also stops");
+    assert_eq!(module_error.disposition(), ("resource", false, 3));
+    // Inspection APIs retain command parser errors in this module wrapper.
+    // The actual depth failure must keep its meaning there as well.
+    let inspection_error = fln::source_check::modules::SourceModuleCheckError::Header {
+        module: name,
+        error: parser_error,
+    };
+    assert_eq!(inspection_error.disposition(), ("resource", false, 3));
+
+    let shallow = format!("{grammar}def bounded : Nat := (boundedLambda (x : Nat) => x) 42\n");
+    preflight_source_files(&[shallow.as_bytes()])
+        .expect("a completed operand is not poisoned by an earlier resource stop");
+    let recovery_engine = engine.clone();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let checked = recovery_engine
+                .check_source_files(
+                    &[shallow.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(admission()),
+                )
+                .expect("the generated binder macro checks after recovery")
+                .into_complete()
+                .expect("recovery produces a complete checked source result");
+            assert!(
+                checked
+                    .engine
+                    .environment()
+                    .contains(&Name::from_components(["bounded"]))
+            );
+        })
+        .expect("spawn recovery checker")
+        .join()
+        .expect("recovery checker thread");
+    let malformed = format!("{grammar}def bounded : Nat := (boundedLambda (x : Nat => x) 42\n");
+    assert_eq!(
+        preflight_source_files(&[malformed.as_bytes()])
+            .expect_err("a malformed operand is still an input error")
+            .disposition(),
+        ("input", false, 1),
+    );
+}

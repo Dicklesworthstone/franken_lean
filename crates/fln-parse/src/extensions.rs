@@ -80,6 +80,8 @@ mod categories;
 pub(crate) use categories::{category_for_quotation, parse_category_quotation};
 pub(crate) use commands::command_quotation;
 mod commands;
+mod generated;
+pub(crate) use generated::{quoted_builtin_operand, with_parse_errors};
 mod local_rules;
 mod macro_body;
 mod macro_rules;
@@ -517,6 +519,8 @@ struct AliasInfo {
 pub struct ExtensionCensus {
     decls: Vec<Arc<SyntaxDecl>>,
     aliases: BTreeMap<String, AliasInfo>,
+    /// Actual declaration backing each registered alias; not source visibility.
+    alias_declarations: BTreeMap<String, Name>,
     /// Builtin categories, and categories declared by a module (`None` for builtin).
     categories: BTreeMap<Name, (IdentBehavior, Option<Name>)>,
 }
@@ -544,6 +548,7 @@ impl ExtensionCensus {
         let mut declared: BTreeMap<Name, DeclaredRow> = BTreeMap::new();
         let mut descrs: BTreeMap<Name, (usize, Descr)> = BTreeMap::new();
         let mut aliases = BTreeMap::new();
+        let mut alias_declarations = BTreeMap::new();
         let mut categories = BTreeMap::new();
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for (index, row) in text.lines().enumerate() {
@@ -614,7 +619,11 @@ impl ExtensionCensus {
                         return Err(fail("a syntax description appears twice"));
                     }
                 }
-                ["parser-alias", name, arity, _, stack, group, _] => {
+                ["parser-alias", name, arity, declaration, stack, group, _] => {
+                    let declaration = declaration
+                        .strip_prefix("decl=")
+                        .and_then(rendered_name)
+                        .ok_or_else(|| fail("an alias declaration name"))?;
                     let arity = match *arity {
                         "const" => 0,
                         "unary" => 1,
@@ -639,6 +648,7 @@ impl ExtensionCensus {
                     if aliases.insert((*name).to_string(), info).is_some() {
                         return Err(fail("a parser alias appears twice"));
                     }
+                    alias_declarations.insert((*name).to_string(), declaration);
                 }
                 ["category", name, _, ident_behavior, _] => {
                     let name = rendered_name(name).ok_or_else(|| fail("category name"))?;
@@ -710,6 +720,7 @@ impl ExtensionCensus {
         Ok(ExtensionCensus {
             decls,
             aliases,
+            alias_declarations,
             categories,
         })
     }
@@ -757,6 +768,16 @@ impl ExtensionInfix {
 /// The grammar one command is parsed under: its token table and the active declarations.
 #[derive(Debug)]
 pub struct ActiveGrammar {
+    /// Lazily compiled exact builtin combinators plus this scope's descriptors.
+    generated: RefCell<
+        Option<
+            Result<
+                Rc<crate::builtin_interpreter::BuiltinInterpreter>,
+                crate::builtin_interpreter::CompileError,
+            >,
+        >,
+    >,
+    category_behaviors: BTreeMap<Name, IdentBehavior>,
     table: TokenTable,
     /// Scoped artifact command heads are recognized only while slicing a file,
     /// before scope directives run. This never installs a parser or token into
@@ -1043,6 +1064,12 @@ impl ActiveGrammar {
             }
         }
         ActiveGrammar {
+            generated: RefCell::new(None),
+            category_behaviors: extension_census()
+                .categories
+                .iter()
+                .map(|(name, (behavior, _))| (name.clone(), *behavior))
+                .collect(),
             category_decls,
             table: TokenTable::from_tokens(tokens),
             partition_table: None,
@@ -1712,6 +1739,18 @@ impl FileGrammar {
         grammar
             .source_quotation_categories
             .extend(artifact_quotations);
+        grammar.category_behaviors = self
+            .categories
+            .iter()
+            .filter(|(name, _)| {
+                self.imports_entered
+                    || grammar.source_categories.contains(*name)
+                    || crate::builtin_table::reference_builtin_parser_table()
+                        .categories
+                        .contains_key(*name)
+            })
+            .map(|(name, behavior)| (name.clone(), *behavior))
+            .collect();
         grammar.imports_entered = self.imports_entered;
         grammar.closure_kinds = Some(Arc::clone(&self.closure_kinds));
         grammar.expander = Some(self.expander_for(&key.0));
@@ -3582,6 +3621,11 @@ fn active() -> Option<Rc<ActiveGrammar>> {
     ACTIVE.with(|active| active.borrow().last().cloned())
 }
 
+/// Whether source parsing has selected an explicit file/scope grammar.
+pub(crate) fn has_active_grammar() -> bool {
+    ACTIVE.with(|active| !active.borrow().is_empty())
+}
+
 /// Whether the file's import closure declares `kind`, an `Init` syntax that the term parser
 /// reads by hand (`[a, b]` is `Init.Data.List.Notation`'s, `xs[i]` `Init.GetElem`'s). A `prelude`
 /// file importing less than its declaring module does not have it, as at the pin. With no file
@@ -3938,6 +3982,12 @@ pub(crate) fn tactic(
         view,
         tokens,
     };
+    if let Some(result) = generated::candidates(&run, candidates, range.start, range.end, 0) {
+        let (mut items, next) = result?;
+        return (next == range.end && items.len() == 1)
+            .then(|| items.pop())
+            .flatten();
+    }
     let mut parsed = UniquePriorityParse::default();
     for &index in candidates {
         let descr = &grammar.decls[index].descr;
@@ -3970,6 +4020,12 @@ pub(crate) fn leading_term(
         view,
         tokens,
     };
+    if let Some(result) = generated::candidates(&run, candidates, index, end, minimum) {
+        let (mut items, next) = result?;
+        return (items.len() == 1)
+            .then(|| items.pop().map(|syntax| (syntax, next)))
+            .flatten();
+    }
     let mut parsed = Vec::new();
     let mut score = None;
     for &candidate in candidates.iter().rev() {
@@ -4093,8 +4149,15 @@ pub(crate) fn command(
             view,
             tokens,
         };
+        let candidates = grammar.commands.get(head.as_str())?;
+        if let Some(result) = generated::candidates(&run, candidates, range.start, range.end, 0) {
+            let (mut items, next) = result?;
+            return (next == range.end && items.len() == 1)
+                .then(|| items.pop())
+                .flatten();
+        }
         let mut parsed = UniquePriorityParse::default();
-        for &index in grammar.commands.get(head.as_str())? {
+        for &index in candidates {
             if !categories::tick() {
                 return None;
             }
@@ -4124,13 +4187,20 @@ pub(crate) fn attribute(
 ) -> Option<Syntax> {
     let grammar = active()?;
     let head = token_text(tokens.get(range.start)?)?;
+    let candidates = grammar.attrs.get(head.as_str())?;
     let run = Run {
         leaves,
         view,
         tokens,
     };
+    if let Some(result) = generated::candidates(&run, candidates, range.start, range.end, 0) {
+        let (mut items, next) = result?;
+        return (next == range.end && items.len() == 1)
+            .then(|| items.pop())
+            .flatten();
+    }
     let mut parsed = UniquePriorityParse::default();
-    for &index in grammar.attrs.get(head.as_str())? {
+    for &index in candidates {
         if let Some((items, end)) = run.parse(
             &grammar.decls[index].descr,
             range.start,
@@ -4447,6 +4517,9 @@ impl Run<'_> {
         if !categories::tick() {
             return None;
         }
+        if generated::needs(descr) {
+            return generated::description(self, descr, at, end);
+        }
         match descr {
             Descr::Node { kind, body, .. } => {
                 let (items, next) = self.parse(body, at, end, follow, depth + 1)?;
@@ -4631,6 +4704,12 @@ impl Run<'_> {
         depth: usize,
     ) -> Parsed {
         match simple(name).as_deref() {
+            Some("withPosition" | "withoutPosition") => {
+                let position = (simple(name).as_deref() == Some("withPosition"))
+                    .then(|| self.tokens.get(at).map(|token| token.extent.start().0))
+                    .flatten();
+                generated::with_position(position, || self.parse(body, at, end, follow, depth + 1))
+            }
             Some("optional") => Some(
                 match self.repeated_item(body, at, end, follow, depth + 1, ("optional", "?")) {
                     Some((items, next)) => (vec![null_node(items)], next),

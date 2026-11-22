@@ -139,6 +139,26 @@ impl SourceCheckError {
         }
     }
 }
+
+/// Parser execution limits and unsupported descriptions are nonanswers, not
+/// judgments that the source is malformed. Keep this shared by source checking
+/// and inspection paths that retain parser errors in a module header wrapper.
+pub(crate) fn classify_parse_error(
+    error: &fln_parse::NatDefinitionParseError,
+) -> (&'static str, bool, u8) {
+    use fln_parse::builtin_interpreter::{CompileError, ParserFailure};
+    match error {
+        fln_parse::NatDefinitionParseError::GeneratedParser { error, .. } => match error {
+            ParserFailure::Resource(_)
+            | ParserFailure::Description(CompileError::DepthExceeded(_)) => ("resource", false, 3),
+            ParserFailure::Description(_) => ("capability", false, 5),
+            ParserFailure::Boundary => ("internal-fault", false, 4),
+            ParserFailure::Syntax { .. } | ParserFailure::Recovered { .. } => ("input", false, 1),
+        },
+        _ => ("input", false, 1),
+    }
+}
+
 pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
     use fln_elab::constraint::unify::UnificationError;
     use fln_elab::universe::UniverseInstantiationError;
@@ -153,6 +173,9 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
         | EngineExecutionError::UnexpectedPublication { .. } => ("internal-fault", false, 4),
         EngineExecutionError::AllocationFailure { .. }
         | EngineExecutionError::SourceScopeLimit { .. } => ("resource", false, 3),
+        EngineExecutionError::Frontend(NatDefinitionFrontendError::Parse(error)) => {
+            classify_parse_error(error)
+        }
         EngineExecutionError::Ingress(error) if error.is_resource_exhaustion() => {
             ("resource", false, 3)
         }

@@ -148,6 +148,7 @@ fn refusal_class(error: &NatDefinitionParseError) -> String {
         NatDefinitionParseError::Lexical { .. } => "lexer".to_owned(),
         NatDefinitionParseError::OutsideSeedGrammar { expected, .. } => format!("{expected:?}"),
         NatDefinitionParseError::ModuleHeader { reason, .. } => format!("header:{reason:?}"),
+        NatDefinitionParseError::GeneratedParser { error, .. } => format!("generated:{error:?}"),
         NatDefinitionParseError::Source(_) => "source".to_owned(),
         NatDefinitionParseError::Build(_) => "build".to_owned(),
     }

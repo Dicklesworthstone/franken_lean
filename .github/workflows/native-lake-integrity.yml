@@ -23,6 +23,8 @@ on:
       - 'crates/fln/tests/source_notation.rs'
       - 'crates/fln/tests/source_import_aliases.rs'
       - 'crates/fln/tests/source_ilean.rs'
+      - 'crates/fln/tests/source_generated_parser_aliases.rs'
+      - 'crates/fln/tests/source_preflight.rs'
       - 'crates/fln/tests/runtime_ir.rs'
   workflow_dispatch:
 permissions:
@@ -161,6 +163,9 @@ jobs:
       - name: Compare checked source editor metadata with the pinned Reference
         if: ${{ !cancelled() }}
         run: cargo test --locked -p fln --test source_ilean --no-fail-fast -- --nocapture --test-threads=1
+      - name: Execute generated parser aliases and preserve parser resource outcomes
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p fln --test source_generated_parser_aliases --test source_preflight --no-fail-fast -- --nocapture --test-threads=1
       - name: Check fieldless enum ABI and live IR interchange
         if: ${{ !cancelled() }}
         run: cargo test --locked -p fln --test runtime_ir fieldless_enum --no-fail-fast -- --nocapture --test-threads=1

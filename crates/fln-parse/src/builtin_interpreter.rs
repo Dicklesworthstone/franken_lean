@@ -25,6 +25,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
+mod descr;
+pub(crate) use descr::ParserInput;
+pub use descr::{ParserFailure, ParserResourceLimit};
+
 const MAX_PREC: u32 = 1024;
 const ARG_PREC: u32 = 1023;
 const LEAD_PREC: u32 = 1022;
@@ -292,6 +296,7 @@ struct CategoryDispatch {
 }
 
 /// Compiled builtin parser interpreter ready to parse headers, commands, or categories.
+#[derive(Debug, Clone)]
 pub struct BuiltinInterpreter {
     defs: Vec<CompiledParser>,
     def_index: BTreeMap<Name, usize>,
@@ -370,6 +375,7 @@ pub struct ParsedModule {
     pub commands: Vec<Syntax>,
     pub errors: Vec<InterpError>,
     pub steps_used: usize,
+    /// A sticky step or recursion-depth stop. Recovery cannot clear it.
     pub budget_exhausted: bool,
 }
 
@@ -590,6 +596,12 @@ impl BuiltinInterpreter {
             prec: 0,
         };
         self.exec_op(&op, &mut st);
+        if let Some(error) = st.resource_error() {
+            return Err(error);
+        }
+        if let Some(error) = st.recovered_errors.first() {
+            return Err(error.clone());
+        }
         if let Some(err) = st.error {
             return Err(err);
         }
@@ -618,14 +630,17 @@ impl BuiltinInterpreter {
             self.exec_op(&op, &mut hst);
         }
         total_steps = total_steps.saturating_add(hst.steps);
-        if hst.budget_exhausted {
+        if let Some(error) = hst.resource_error() {
             budget_exhausted = true;
+            errors.push(error);
         }
         let mut header = hst.back_cloned().unwrap_or(Syntax::Missing);
         for err in hst.recovered_errors.drain(..) {
             errors.push(err);
         }
-        if let Some(err) = hst.error.take() {
+        if let Some(err) = hst.error.take()
+            && !budget_exhausted
+        {
             errors.push(err);
         }
         let is_leading_set = set_start_of_file_leading(&mut header);
@@ -679,8 +694,9 @@ impl BuiltinInterpreter {
                     self.exec_op(&top_cmd_op, &mut st);
                 }
                 total_steps = total_steps.saturating_add(st.steps);
-                if st.budget_exhausted {
+                if let Some(error) = st.resource_error() {
                     budget_exhausted = true;
+                    errors.push(error);
                     break;
                 }
                 for err in st.recovered_errors.drain(..) {
@@ -779,6 +795,7 @@ impl BuiltinInterpreter {
             return;
         }
         if st.depth >= st.max_depth {
+            st.depth_exhausted = true;
             st.mk_unexpected_error(
                 format!("parser recursion depth limit exceeded at byte {}", st.pos),
                 Vec::new(),
@@ -2402,6 +2419,7 @@ struct RuntimeState<'a> {
     steps: usize,
     max_steps: usize,
     budget_exhausted: bool,
+    depth_exhausted: bool,
 }
 
 impl<'a> RuntimeState<'a> {
@@ -2430,11 +2448,33 @@ impl<'a> RuntimeState<'a> {
             steps: 0,
             max_steps,
             budget_exhausted: false,
+            depth_exhausted: false,
         }
+    }
+
+    fn resource_error(&self) -> Option<InterpError> {
+        let message = if self.depth_exhausted {
+            "parser recursion depth limit exceeded"
+        } else if self.budget_exhausted {
+            "parser step budget exhausted"
+        } else {
+            return None;
+        };
+        Some(InterpError::new(self.pos, message, Vec::new()))
     }
 
     #[inline]
     fn tick(&mut self) -> bool {
+        if self.depth_exhausted {
+            if self.error.is_none() {
+                self.error = Some(InterpError::new(
+                    self.pos,
+                    "parser recursion depth limit exceeded",
+                    Vec::new(),
+                ));
+            }
+            return false;
+        }
         if self.steps >= self.max_steps {
             self.budget_exhausted = true;
             if self.error.is_none() {

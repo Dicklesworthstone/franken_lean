@@ -522,6 +522,7 @@ fn supported_syntax(
             let kind = kind.to_display_string();
             let allowed = kind == "null"
                 || kind == "group"
+                || kind == "hygieneInfo"
                 || kind.is_empty()
                 || matches!(kind.as_str(), "num" | "str" | "char" | "scientific")
                 || kind
@@ -553,6 +554,7 @@ fn supported_syntax(
                         kind,
                         "app"
                             | "paren"
+                            | "hygienicLParen"
                             | "explicit"
                             | "explicitUniv"
                             | "type"

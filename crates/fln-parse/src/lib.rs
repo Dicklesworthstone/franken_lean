@@ -132,6 +132,12 @@ pub enum NatDefinitionParseError {
         at: BytePos,
         reason: command_scope::imports::ModuleHeaderError,
     },
+    /// A registered builtin parser alias rejected its operand or exhausted its
+    /// bounded native execution. This cannot be retried as a cheaper grammar.
+    GeneratedParser {
+        at: BytePos,
+        error: builtin_interpreter::ParserFailure,
+    },
     Build(BuildError),
 }
 
@@ -157,6 +163,7 @@ impl std::fmt::Display for NatDefinitionParseError {
                 "source is outside the bounded source grammar at {at}; expected {expected:?}"
             ),
             Self::ModuleHeader { at, reason } => write!(formatter, "{reason} at {at}"),
+            Self::GeneratedParser { at, error } => write!(formatter, "{error} at {at}"),
             Self::Build(error) => write!(formatter, "syntax construction failed: {error:?}"),
         }
     }
@@ -195,6 +202,10 @@ impl NatDefinitionParseError {
                 at: shifted(at),
                 reason,
             },
+            Self::GeneratedParser { at, error } => Self::GeneratedParser {
+                at: shifted(at),
+                error,
+            },
             Self::Build(error) => Self::Build(error),
         }
     }
@@ -229,6 +240,10 @@ impl NatDefinitionParseError {
                 at: mapped(at),
                 reason,
             },
+            Self::GeneratedParser { at, error } => Self::GeneratedParser {
+                at: mapped(at),
+                error,
+            },
             Self::Build(error) => Self::Build(error),
         }
     }
@@ -246,7 +261,9 @@ impl NatDefinitionParseError {
         match self {
             Self::Source(SourceError::NotUtf8 { at }) => Some(*at),
             Self::Lexical { diagnostics } => diagnostics.first().map(|diagnostic| diagnostic.at),
-            Self::OutsideSeedGrammar { at, .. } | Self::ModuleHeader { at, .. } => Some(*at),
+            Self::OutsideSeedGrammar { at, .. }
+            | Self::ModuleHeader { at, .. }
+            | Self::GeneratedParser { at, .. } => Some(*at),
             Self::Build(_) => None,
         }
     }
@@ -4299,6 +4316,35 @@ fn bounded_term_token(
     index: usize,
     mut cursor: usize,
 ) -> Result<usize, NatDefinitionParseError> {
+    // `doSeq` owns its whole-sequence antiquotation. Reading `$seq` as an
+    // ordinary term would instead build `doExpr($seq)`, which nests a sequence
+    // in a term slot after macro expansion. Its generated alias also decides
+    // explicit `$value:term` captures and repetition alternatives correctly.
+    if grammar == DefinitionGrammar::Scalar
+        && quotations::inside()
+        && extensions::has_active_grammar()
+        && term_locals::word(tokens, index, "do")
+        && term_locals::word(tokens, cursor, "$")
+    {
+        let (sequence, next) =
+            extensions::quoted_builtin_operand(leaves, view, tokens, "doSeq", cursor, range.end)
+                .ok_or_else(|| NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, cursor),
+                    expected: NatDefinitionExpectation::ScalarValue,
+                })?;
+        frames
+            .last_mut()
+            .expect("the root term frame remains live")
+            .application
+            .push((
+                Syntax::node(
+                    parser_kind(&["Term", "do"]),
+                    vec![leaves.leaf(index)?, sequence],
+                ),
+                index,
+            ));
+        return Ok(next);
+    }
     if grammar == DefinitionGrammar::Scalar
         && let Some(prefix) =
             bounded_term_prefix(leaves, view, tokens, frames, index, &mut cursor, range.end)?
@@ -4972,7 +5018,9 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
 /// This does not claim general Lean elaboration. Unsupported syntax remains a
 /// typed [`NatDefinitionParseError::OutsideSeedGrammar`] refusal.
 pub fn parse_definition(source: &[u8]) -> Result<ParsedDefinition, DefinitionParseError> {
-    parse_definition_with_grammar(source, DefinitionGrammar::Scalar)
+    extensions::with_parse_errors(|| {
+        parse_definition_with_grammar(source, DefinitionGrammar::Scalar)
+    })
 }
 
 /// A builtin command's tree and its epilogue.
@@ -5542,6 +5590,10 @@ fn grind_constraints(
 }
 
 pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionParseError> {
+    extensions::with_parse_errors(|| parse_source_command_inner(source))
+}
+
+fn parse_source_command_inner(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
     let run = lex_source(&view)?;
@@ -6503,7 +6555,38 @@ fn parse_definition_with_grammar(
             (None, cursor)
         };
     cursor = after_levels;
-    let (parameter_groups, next) = signature_binders(&view, &tokens, cursor, grammar)?;
+    let signature_kind = if is_theorem || is_instance || is_opaque {
+        "declSig"
+    } else {
+        "optDeclSig"
+    };
+    let quoted_signature = if grammar == DefinitionGrammar::Scalar
+        && quotations::inside()
+        && extensions::has_active_grammar()
+        && term_locals::word(&tokens, cursor, "$")
+    {
+        let leaves = Leaves::build(view.normalized(), &tokens)?;
+        Some(
+            extensions::quoted_builtin_operand(
+                &leaves,
+                &view,
+                &tokens,
+                signature_kind,
+                cursor,
+                tokens.len(),
+            )
+            .ok_or_else(|| NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(&view, &tokens, cursor),
+                expected: NatDefinitionExpectation::TheoremType,
+            })?,
+        )
+    } else {
+        None
+    };
+    let (parameter_groups, next) = match &quoted_signature {
+        Some((_, next)) => (Vec::new(), *next),
+        None => signature_binders(&view, &tokens, cursor, grammar)?,
+    };
     cursor = next;
     let explicit_result_type = if matches!(
         tokens.get(cursor).map(|token| &token.kind),
@@ -6530,7 +6613,10 @@ fn parse_definition_with_grammar(
     } else {
         None
     };
-    if (is_theorem || is_instance || is_opaque) && explicit_result_type.is_none() {
+    if (is_theorem || is_instance || is_opaque)
+        && explicit_result_type.is_none()
+        && quoted_signature.is_none()
+    {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, cursor),
             expected: NatDefinitionExpectation::TheoremType,
@@ -6639,7 +6725,7 @@ fn parse_definition_with_grammar(
     } else {
         null_node(Vec::new())
     };
-    let result_type = if is_theorem || is_instance || is_opaque {
+    let result_type = if (is_theorem || is_instance || is_opaque) && quoted_signature.is_none() {
         let Syntax::Node { args, .. } = &result_type else {
             unreachable!("optional type container");
         };
@@ -6647,17 +6733,13 @@ fn parse_definition_with_grammar(
     } else {
         result_type
     };
-    let optional_signature = Syntax::node(
-        parser_kind(&[
-            "Command",
-            if is_theorem || is_instance || is_opaque {
-                "declSig"
-            } else {
-                "optDeclSig"
-            },
-        ]),
-        vec![null_node(parameters), result_type],
-    );
+    let optional_signature = match quoted_signature {
+        Some((signature, _)) => signature,
+        None => Syntax::node(
+            parser_kind(&["Command", signature_kind]),
+            vec![null_node(parameters), result_type],
+        ),
+    };
     let value = if structure_where || bare_opaque {
         null_node(Vec::new())
     } else if equations {

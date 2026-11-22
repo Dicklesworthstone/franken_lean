@@ -217,6 +217,7 @@ impl SourceModuleCheckError {
         match self {
             Self::Source { error, .. } => error.disposition(),
             Self::Replay { error, .. } => super::classify(error),
+            Self::Header { error, .. } => super::classify_parse_error(error),
             Self::Limit { .. } => ("resource", false, 3),
             Self::Extension { .. } | Self::ImportContext { .. } => ("inconclusive", false, 3),
             _ => ("input", false, 1),

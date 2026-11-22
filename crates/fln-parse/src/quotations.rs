@@ -54,6 +54,10 @@ pub(crate) fn inside() -> bool {
     DEPTH.with(|depth| depth.get() > 0)
 }
 
+pub(crate) fn depth() -> u32 {
+    DEPTH.with(|depth| depth.get().min(u32::MAX as usize) as u32)
+}
+
 fn text(tokens: &[LexedToken], at: usize) -> Option<&str> {
     match &tokens.get(at)?.kind {
         TokenKind::Symbol(symbol) => Some(symbol.as_str()),
