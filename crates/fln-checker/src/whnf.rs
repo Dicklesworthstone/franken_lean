@@ -503,6 +503,57 @@ pub enum WhnfOutcome {
     InternalFault(WhnfFault),
 }
 
+/// Numeric arithmetic work performed inside eager WHNF (`NatFrame`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WhnfNatProgress {
+    pub steps: u64,
+    pub materialized_limbs: u64,
+    pub reductions: u64,
+}
+
+/// Outcome of an internal `whnf_core` step that avoids cloning or charging
+/// materialization when no reduction occurred and no input copy was made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WhnfCoreOutcome {
+    Unchanged {
+        steps: u64,
+        reductions: u64,
+        delta_reductions: u64,
+        has_auxiliary_work: bool,
+        string_progress: StringExpansionProgress,
+    },
+    Complete {
+        result: WhnfResult,
+        copied: bool,
+    },
+    Refused(WhnfRefusal),
+    Inconclusive(WhnfStop),
+    InternalFault(WhnfFault),
+}
+
+/// Result of eager Nat-operand WHNF (`DeltaMode::EagerNat`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WhnfEagerNatResult {
+    pub result: WhnfResult,
+    pub nat_progress: WhnfNatProgress,
+}
+
+/// Outcome of eager Nat-operand WHNF (`whnf_eager_nat_at_with`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WhnfEagerNatOutcome {
+    Complete(WhnfEagerNatResult),
+    PowCap {
+        cap: u64,
+        steps: u64,
+        reductions: u64,
+        delta_reductions: u64,
+        nat_progress: WhnfNatProgress,
+    },
+    Refused(WhnfRefusal),
+    Inconclusive(WhnfStop),
+    InternalFault(WhnfFault),
+}
+
 enum Halt {
     Refusal(WhnfRefusal),
     // Keep progress-rich stop payloads off the successful reduction stack:
@@ -1042,8 +1093,30 @@ struct ProjectionFrame {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum DeltaMode {
     Eager,
+    /// Eager reduction for `nat_reduce` operand evaluation: uses `keyed_thunks`
+    /// and in-loop `NatFrame` evaluation under the caller's `NatReductionScope`,
+    /// but stops immediately on `PowExponentAbovePinCap` instead of unfolding
+    /// `Nat.pow` over the exponent.
+    EagerNat(NatReductionScope),
     Disabled,
     Once,
+}
+
+impl DeltaMode {
+    const fn is_eager(self) -> bool {
+        matches!(self, DeltaMode::Eager | DeltaMode::EagerNat(_))
+    }
+
+    const fn is_eager_nat(self) -> bool {
+        matches!(self, DeltaMode::EagerNat(_))
+    }
+
+    const fn eager_child(self) -> DeltaMode {
+        match self {
+            DeltaMode::EagerNat(scope) => DeltaMode::EagerNat(scope),
+            DeltaMode::Eager | DeltaMode::Disabled | DeltaMode::Once => DeltaMode::Eager,
+        }
+    }
 }
 
 enum HeadAction {
@@ -1066,6 +1139,10 @@ struct Reducer<'a, 'c> {
     delta_mode: DeltaMode,
     /// Which open operands a Nat operation at the head may normalize.
     head_nat: NatReductionScope,
+    /// Optional explicit numeric budget when running under `DeltaMode::EagerNat`.
+    numeric_budget: Option<NatBudget>,
+    nat_progress: WhnfNatProgress,
+    nat_pow_cap: Option<u64>,
     delta_reductions: u64,
     /// Reductions spent normalizing the major of a recursor that then stayed
     /// stuck. Its application is returned with the major it had, so this work
@@ -3141,7 +3218,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             unfolded_bindings: self.unfolded_bindings.clone(),
             force_string_delta: self.force_string_delta,
         })));
-        self.delta_mode = DeltaMode::Eager;
+        self.delta_mode = self.delta_mode.eager_child();
         self.force_string_delta = false;
         Ok(Some(first))
     }
@@ -3277,6 +3354,15 @@ impl<'a, 'c> Reducer<'a, 'c> {
             .max_reductions
             .saturating_sub(self.control.reductions);
         let materialization = self.control.budget.materialization;
+        let numeric = match self.numeric_budget {
+            Some(limit) => NatBudget::new(
+                limit.max_steps.saturating_sub(self.nat_progress.steps),
+                limit
+                    .max_materialized_limbs
+                    .saturating_sub(self.nat_progress.materialized_limbs),
+            ),
+            None => NatBudget::new(steps, materialization.max_output_units),
+        };
         let budget = NatReductionBudget::new(
             steps,
             steps,
@@ -3286,7 +3372,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             materialization.max_output_units,
             WhnfBudget::new(steps, reductions, materialization)
                 .with_string(self.remaining_string_budget()),
-            NatBudget::new(steps, materialization.max_output_units),
+            numeric,
         );
         let result = crate::nat_reduce::execute_operation(
             frame.operation,
@@ -3296,13 +3382,42 @@ impl<'a, 'c> Reducer<'a, 'c> {
         );
         match result {
             NatReductionOutcome::Reduced(result) => {
+                self.nat_progress.steps = self
+                    .nat_progress
+                    .steps
+                    .saturating_add(result.progress.numeric_steps);
+                self.nat_progress.materialized_limbs = self
+                    .nat_progress
+                    .materialized_limbs
+                    .saturating_add(result.progress.numeric_materialized_limbs);
+                self.nat_progress.reductions = self
+                    .nat_progress
+                    .reductions
+                    .saturating_add(result.progress.numeric_reductions);
                 self.absorb_demanded_nat(result.progress, at)?;
                 self.control.reduction(at, self.cancelled)?;
                 let root = result.term.root();
                 Ok(Some(Cursor::closed(Arc::new(result.term), root)))
             }
-            NatReductionOutcome::NotReduced { progress, .. } => {
+            NatReductionOutcome::NotReduced { reason, progress } => {
+                self.nat_progress.steps = self
+                    .nat_progress
+                    .steps
+                    .saturating_add(progress.numeric_steps);
+                self.nat_progress.materialized_limbs = self
+                    .nat_progress
+                    .materialized_limbs
+                    .saturating_add(progress.numeric_materialized_limbs);
+                self.nat_progress.reductions = self
+                    .nat_progress
+                    .reductions
+                    .saturating_add(progress.numeric_reductions);
                 self.absorb_demanded_nat(progress, at)?;
+                if self.delta_mode.is_eager_nat()
+                    && let crate::nat_reduce::NatNotReduced::PowExponentAbovePinCap { cap } = reason
+                {
+                    self.nat_pow_cap = Some(cap);
+                }
                 Ok(None)
             }
             NatReductionOutcome::Refused {
@@ -3402,23 +3517,171 @@ impl<'a, 'c> Reducer<'a, 'c> {
             return Ok(remembered);
         }
         let input = Arc::clone(&current.arena);
-        let (result, copied) = self.normalize(current)?;
+        let (result, nat_progress, copied) = self.normalize(current)?;
         memo.remember(
             input,
             delta_mode,
             budget.materialization,
             bindings,
-            &result,
-            copied,
+            memo::RememberedWhnf {
+                result: &result,
+                nat_progress,
+                copied,
+            },
         );
         Ok((result, copied))
+    }
+
+    /// Core normalization that avoids cloning or charging materialization when
+    /// no input copy was made and the spine stayed unchanged.
+    fn run_core_step(
+        mut self,
+        input: WhnfInput<'_>,
+        root: ExprId,
+    ) -> Result<WhnfCoreOutcome, Halt> {
+        let (current, skipped_initial_copy) = match input {
+            WhnfInput::Copied(arena)
+                if root == arena.root()
+                    && copy_cannot_stop(arena, self.control.budget.materialization) =>
+            {
+                self.control.step(root.index(), self.cancelled)?;
+                (Cursor::closed(Arc::clone(arena), root), true)
+            }
+            WhnfInput::Copied(arena) => (
+                self.materialize_term(arena, root, WhnfPhase::Initial)?,
+                false,
+            ),
+            WhnfInput::Borrowed(term) => (
+                self.materialize_term(term, root, WhnfPhase::Initial)?,
+                false,
+            ),
+        };
+        self.entry = Some(Arc::clone(&current.arena));
+        let (memo, bindings) = self.context.source.whnf_memo();
+        let (delta_mode, budget) = (self.delta_mode, self.control.budget);
+        if let Some((result, copied)) = memo.recall(&current.arena, delta_mode, &budget, bindings) {
+            return Ok(WhnfCoreOutcome::Complete { result, copied });
+        }
+        let input = Arc::clone(&current.arena);
+        let stuck = self.normalize_to_stuck(current)?;
+        if skipped_initial_copy && let Some(unchanged) = self.unchanged_input(&stuck)? {
+            if !stuck.args.is_empty() {
+                self.control.step(stuck.head.root.index(), self.cancelled)?;
+            }
+            self.control
+                .step(unchanged.root().index(), self.cancelled)?;
+            return Ok(WhnfCoreOutcome::Unchanged {
+                steps: self.control.steps,
+                reductions: self
+                    .control
+                    .reductions
+                    .saturating_sub(self.discarded_reductions),
+                delta_reductions: self
+                    .delta_reductions
+                    .saturating_sub(self.discarded_delta_reductions),
+                has_auxiliary_work: self.has_auxiliary_work,
+                string_progress: self.string_progress,
+            });
+        }
+        let result = self.finish(stuck)?;
+        let nat_progress = self.nat_progress;
+        let copied = self.copied_result;
+        memo.remember(
+            input,
+            delta_mode,
+            budget.materialization,
+            bindings,
+            memo::RememberedWhnf {
+                result: &result,
+                nat_progress,
+                copied,
+            },
+        );
+        Ok(WhnfCoreOutcome::Complete { result, copied })
+    }
+
+    /// Eager Nat-operand normalization (`DeltaMode::EagerNat`): evaluates
+    /// operands in-loop with shared thunks and `NatFrame` arithmetic while
+    /// stopping cleanly on `PowExponentAbovePinCap`.
+    fn run_eager_nat(
+        mut self,
+        input: WhnfInput<'_>,
+        root: ExprId,
+        numeric_budget: NatBudget,
+    ) -> Result<WhnfEagerNatOutcome, Halt> {
+        let current = match input {
+            WhnfInput::Copied(arena)
+                if root == arena.root()
+                    && copy_cannot_stop(arena, self.control.budget.materialization) =>
+            {
+                self.control.step(root.index(), self.cancelled)?;
+                Cursor::closed(Arc::clone(arena), root)
+            }
+            WhnfInput::Copied(arena) => self.materialize_term(arena, root, WhnfPhase::Initial)?,
+            WhnfInput::Borrowed(term) => self.materialize_term(term, root, WhnfPhase::Initial)?,
+        };
+        self.entry = Some(Arc::clone(&current.arena));
+        let (memo, bindings) = self.context.source.whnf_memo();
+        let (delta_mode, budget) = (self.delta_mode, self.control.budget);
+        if let Some((result, nat_progress, _)) = memo.recall_eager_nat(
+            &current.arena,
+            delta_mode,
+            &budget,
+            numeric_budget,
+            bindings,
+        ) {
+            return Ok(WhnfEagerNatOutcome::Complete(WhnfEagerNatResult {
+                result,
+                nat_progress,
+            }));
+        }
+        let input = Arc::clone(&current.arena);
+        let stuck = self.normalize_to_stuck(current)?;
+        if let Some(cap) = self.nat_pow_cap {
+            return Ok(WhnfEagerNatOutcome::PowCap {
+                cap,
+                steps: self.control.steps,
+                reductions: self
+                    .control
+                    .reductions
+                    .saturating_sub(self.discarded_reductions),
+                delta_reductions: self
+                    .delta_reductions
+                    .saturating_sub(self.discarded_delta_reductions),
+                nat_progress: self.nat_progress,
+            });
+        }
+        let result = self.finish(stuck)?;
+        let nat_progress = self.nat_progress;
+        let copied = self.copied_result;
+        memo.remember(
+            input,
+            delta_mode,
+            budget.materialization,
+            bindings,
+            memo::RememberedWhnf {
+                result: &result,
+                nat_progress,
+                copied,
+            },
+        );
+        Ok(WhnfEagerNatOutcome::Complete(WhnfEagerNatResult {
+            result,
+            nat_progress,
+        }))
+    }
+
+    fn normalize(mut self, current: Cursor) -> Result<(WhnfResult, WhnfNatProgress, bool), Halt> {
+        let stuck = self.normalize_to_stuck(current)?;
+        let result = self.finish(stuck)?;
+        Ok((result, self.nat_progress, self.copied_result))
     }
 
     /// The reduction loop. Out of line so the initial materialization in `run`
     /// executes on a small frame: unoptimized, this loop's frame is about 11 KiB,
     /// and the 64 KiB stack tests reach materialization from inside inference.
     #[inline(never)]
-    fn normalize(mut self, mut current: Cursor) -> Result<(WhnfResult, bool), Halt> {
+    fn normalize_to_stuck(&mut self, mut current: Cursor) -> Result<Spine, Halt> {
         let mut pending_arguments = VecDeque::<Cursor>::new();
         let mut frames = Vec::new();
 
@@ -3436,7 +3699,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             // `Nat.mod a b` then never reaches the arithmetic its application
             // is offered.
             if let Some(thunk) = current.thunk.take()
-                && matches!(self.delta_mode, DeltaMode::Eager)
+                && self.delta_mode.is_eager()
                 && pending_arguments.is_empty()
             {
                 // Another term of the same key may already have been evaluated.
@@ -3512,11 +3775,11 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     let forced = self.force_string_delta;
                     let may_unfold = forced
                         || match self.delta_mode {
-                            DeltaMode::Eager => true,
+                            DeltaMode::Eager | DeltaMode::EagerNat(_) => true,
                             DeltaMode::Disabled => false,
                             DeltaMode::Once => self.delta_reductions == 0,
                         };
-                    if matches!(self.delta_mode, DeltaMode::Eager)
+                    if self.delta_mode.is_eager()
                         && !std::mem::take(&mut self.skip_nat)
                         && let Some(first) =
                             self.begin_nat(&current, &mut pending_arguments, &mut frames)?
@@ -3546,7 +3809,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                             unfolded_bindings: self.unfolded_bindings.clone(),
                             force_string_delta: self.force_string_delta,
                         }));
-                        self.delta_mode = DeltaMode::Eager;
+                        self.delta_mode = self.delta_mode.eager_child();
                         self.force_string_delta = false;
                         current = next;
                         continue;
@@ -3563,7 +3826,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                             }
                             RecursorStep::NormalizeMajor { frame, major } => {
                                 frames.push(ReductionFrame::Recursor(frame));
-                                self.delta_mode = DeltaMode::Eager;
+                                self.delta_mode = self.delta_mode.eager_child();
                                 self.force_string_delta = false;
                                 current = major;
                                 continue;
@@ -3644,8 +3907,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     pending_arguments = next.args;
                 }
                 Resumed::Stuck(stuck) => {
-                    let result = self.finish(stuck)?;
-                    return Ok((result, self.copied_result));
+                    return Ok(stuck);
                 }
             }
         }
@@ -3687,7 +3949,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                         let arity = usize::from(frame.operation.arity());
                         if frame.values.len() < arity {
                             let next = frame.arguments[frame.values.len()].clone();
-                            self.delta_mode = DeltaMode::Eager;
+                            self.delta_mode = self.delta_mode.eager_child();
                             self.force_string_delta = false;
                             frames.push(ReductionFrame::Nat(frame));
                             return Ok(Resumed::Continue(Spine {
@@ -3700,6 +3962,13 @@ impl<'a, 'c> Reducer<'a, 'c> {
                             self.delta_reductions = self.delta_reductions.saturating_add(1);
                             let args = frame.arguments.split_off(arity);
                             return Ok(Resumed::Continue(Spine { head: result, args }));
+                        }
+                        if self.nat_pow_cap.is_some() {
+                            frames.clear();
+                            return Ok(Resumed::Stuck(Spine {
+                                head: frame.head,
+                                args: frame.arguments,
+                            }));
                         }
                     }
                     // Declined, as when the pin's `reduce_nat` returns none:
@@ -3771,7 +4040,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                         let major = self.expand_string(value, stuck.head.root.index())?;
                         frame.expanded_string_major = true;
                         frames.push(ReductionFrame::Recursor(frame));
-                        self.delta_mode = DeltaMode::Eager;
+                        self.delta_mode = self.delta_mode.eager_child();
                         self.force_string_delta = false;
                         return Ok(Resumed::Continue(Spine {
                             head: major,
@@ -5035,24 +5304,6 @@ pub(crate) fn whnf_core_at_with(
     )
 }
 
-pub(crate) fn whnf_delta_step_at_with(
-    term: &WireExpr,
-    root: ExprId,
-    context: &WhnfContext,
-    budget: WhnfBudget,
-    cancelled: &mut dyn FnMut() -> bool,
-) -> WhnfOutcome {
-    whnf_at_mode_with(
-        term,
-        root,
-        context,
-        budget,
-        DeltaMode::Once,
-        NatReductionScope::WhnfHead,
-        cancelled,
-    )
-}
-
 /// Whether the loose index `target` occurs in `term`, counting it at every
 /// binder depth.
 fn loose_bound_occurs(term: &WireExpr, target: u32) -> bool {
@@ -5174,6 +5425,7 @@ fn copy_cannot_stop(arena: &WireExpr, budget: TermBudget) -> bool {
 
 /// The weak head normal form without delta (`whnf_core_at_with`), and whether
 /// its term is this module's own copy of a term.
+#[cfg(test)]
 pub(crate) fn whnf_core_of_with(
     input: WhnfInput<'_>,
     root: ExprId,
@@ -5192,8 +5444,7 @@ pub(crate) fn whnf_core_of_with(
     )
 }
 
-/// One delta step (`whnf_delta_step_at_with`), and whether its term is this
-/// module's own copy of a term.
+/// One delta step, and whether its term is this module's own copy of a term.
 pub(crate) fn whnf_delta_step_of_with(
     input: WhnfInput<'_>,
     root: ExprId,
@@ -5210,6 +5461,211 @@ pub(crate) fn whnf_delta_step_of_with(
         NatReductionScope::WhnfHead,
         cancelled,
     )
+}
+
+/// Check in place whether `(arena, root)` is already in `whnf_core` (i.e.
+/// `DeltaMode::Disabled` cannot perform any reduction at the spine head).
+/// Validates backward references along the application spine and meters every
+/// visited node against `control`.
+fn is_already_whnf_core(
+    arena: &WireExpr,
+    root: ExprId,
+    prepared: &PreparedContext<'_>,
+    control: &mut Control,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<bool, Halt> {
+    let mut head = root;
+    let mut arg_count = 0_usize;
+    loop {
+        control.step(head.index(), cancelled)?;
+        let node = arena
+            .node(head)
+            .ok_or(Halt::Fault(WhnfFault::MissingExpression {
+                input: 0,
+                index: head.index(),
+            }))?;
+        match node {
+            ExprNode::Apply { function, .. } => {
+                if function.index() >= head.index() {
+                    return Err(Halt::Fault(WhnfFault::NonBackwardExpressionReference {
+                        input: 0,
+                        parent: head.index(),
+                        child: function.index(),
+                    }));
+                }
+                arg_count = arg_count.saturating_add(1);
+                head = *function;
+            }
+            ExprNode::Bound { .. }
+            | ExprNode::Meta { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Forall { .. }
+            | ExprNode::NatLiteral { .. }
+            | ExprNode::StringLiteral(_) => return Ok(true),
+            ExprNode::Lambda { .. } => return Ok(arg_count == 0),
+            ExprNode::Free { name } => return Ok(!prepared.free_bindings.contains_key(name)),
+            ExprNode::Constant { name, .. } => {
+                if arg_count == 0 {
+                    return Ok(true);
+                }
+                let Some(entry) = prepared.source.constants().find(name) else {
+                    return Ok(true);
+                };
+                if let Some(kind) = entry.quotient_kind() {
+                    let major = match kind {
+                        crate::environment::QuotientKind::Lift => Some(5_usize),
+                        crate::environment::QuotientKind::Induction => Some(4_usize),
+                        _ => None,
+                    };
+                    if major.is_some_and(|m| arg_count > m) {
+                        return Ok(false);
+                    }
+                }
+                if let Some(metadata) = entry.recursor_metadata() {
+                    let major_index = usize::try_from(metadata.num_parameters())
+                        .unwrap_or(usize::MAX)
+                        .saturating_add(
+                            usize::try_from(metadata.num_motives()).unwrap_or(usize::MAX),
+                        )
+                        .saturating_add(
+                            usize::try_from(metadata.num_minors()).unwrap_or(usize::MAX),
+                        )
+                        .saturating_add(
+                            usize::try_from(metadata.num_indices()).unwrap_or(usize::MAX),
+                        );
+                    if arg_count > major_index {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+            ExprNode::Metadata { .. } | ExprNode::Let { .. } | ExprNode::Projection { .. } => {
+                return Ok(false);
+            }
+        }
+    }
+}
+
+/// Core normalization (`DeltaMode::Disabled`) that skips copying and
+/// materialization when the term is already in `whnf_core` or when a copied
+/// input remained unchanged.
+pub(crate) fn whnf_core_step_of_with(
+    input: WhnfInput<'_>,
+    root: ExprId,
+    context: &WhnfContext,
+    budget: WhnfBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> WhnfCoreOutcome {
+    let mut control = Control::new(budget);
+    let prepared = match PreparedContext::prepare(context, &mut control, cancelled) {
+        Ok(prepared) => prepared,
+        Err(Halt::Refusal(refusal)) => return WhnfCoreOutcome::Refused(refusal),
+        Err(Halt::Stop(stop)) => return WhnfCoreOutcome::Inconclusive(*stop),
+        Err(Halt::Fault(fault)) => return WhnfCoreOutcome::InternalFault(fault),
+    };
+    let arena: &WireExpr = match input {
+        WhnfInput::Borrowed(term) => term,
+        WhnfInput::Copied(term) => term,
+    };
+    match is_already_whnf_core(arena, root, &prepared, &mut control, cancelled) {
+        Ok(true) => {
+            return WhnfCoreOutcome::Unchanged {
+                steps: control.steps,
+                reductions: 0,
+                delta_reductions: 0,
+                has_auxiliary_work: false,
+                string_progress: StringExpansionProgress::default(),
+            };
+        }
+        Ok(false) => {}
+        Err(Halt::Refusal(refusal)) => return WhnfCoreOutcome::Refused(refusal),
+        Err(Halt::Stop(stop)) => return WhnfCoreOutcome::Inconclusive(*stop),
+        Err(Halt::Fault(fault)) => return WhnfCoreOutcome::InternalFault(fault),
+    }
+    let reducer = Reducer {
+        context: prepared,
+        control,
+        cancelled,
+        unfolded_bindings: BTreeSet::new(),
+        acyclic_bindings: BTreeSet::new(),
+        delta_mode: DeltaMode::Disabled,
+        head_nat: NatReductionScope::WhnfHead,
+        numeric_budget: None,
+        nat_progress: WhnfNatProgress::default(),
+        nat_pow_cap: None,
+        delta_reductions: 0,
+        discarded_reductions: 0,
+        discarded_delta_reductions: 0,
+        has_auxiliary_work: false,
+        string_progress: StringExpansionProgress::default(),
+        force_string_delta: false,
+        skip_nat: false,
+        facts: FastHashMap::default(),
+        string_expansions: FastHashMap::default(),
+        bodies: FastHashMap::default(),
+        keyed_thunks: FastHashMap::default(),
+        entry: None,
+        copied_result: false,
+    };
+    match reducer.run_core_step(input, root) {
+        Ok(outcome) => outcome,
+        Err(Halt::Refusal(refusal)) => WhnfCoreOutcome::Refused(refusal),
+        Err(Halt::Stop(stop)) => WhnfCoreOutcome::Inconclusive(*stop),
+        Err(Halt::Fault(fault)) => WhnfCoreOutcome::InternalFault(fault),
+    }
+}
+
+/// Eager Nat-operand normalization for `nat_reduce::EvalState::ForceDelta`:
+/// evaluates definitions, recursors, projections, shared thunks, and nested
+/// `NatFrame` arithmetic in one WHNF run without materializing an arena per
+/// delta step, while stopping immediately on `PowExponentAbovePinCap`.
+pub(crate) fn whnf_eager_nat_at_with(
+    term: &WireExpr,
+    root: ExprId,
+    context: &WhnfContext,
+    scope: NatReductionScope,
+    budget: WhnfBudget,
+    numeric_budget: NatBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> WhnfEagerNatOutcome {
+    let mut control = Control::new(budget);
+    let prepared = match PreparedContext::prepare(context, &mut control, cancelled) {
+        Ok(prepared) => prepared,
+        Err(Halt::Refusal(refusal)) => return WhnfEagerNatOutcome::Refused(refusal),
+        Err(Halt::Stop(stop)) => return WhnfEagerNatOutcome::Inconclusive(*stop),
+        Err(Halt::Fault(fault)) => return WhnfEagerNatOutcome::InternalFault(fault),
+    };
+    let reducer = Reducer {
+        context: prepared,
+        control,
+        cancelled,
+        unfolded_bindings: BTreeSet::new(),
+        acyclic_bindings: BTreeSet::new(),
+        delta_mode: DeltaMode::EagerNat(scope),
+        head_nat: scope,
+        numeric_budget: Some(numeric_budget),
+        nat_progress: WhnfNatProgress::default(),
+        nat_pow_cap: None,
+        delta_reductions: 0,
+        discarded_reductions: 0,
+        discarded_delta_reductions: 0,
+        has_auxiliary_work: false,
+        string_progress: StringExpansionProgress::default(),
+        force_string_delta: false,
+        skip_nat: false,
+        facts: FastHashMap::default(),
+        string_expansions: FastHashMap::default(),
+        bodies: FastHashMap::default(),
+        keyed_thunks: FastHashMap::default(),
+        entry: None,
+        copied_result: false,
+    };
+    match reducer.run_eager_nat(WhnfInput::Borrowed(term), root, numeric_budget) {
+        Ok(outcome) => outcome,
+        Err(Halt::Refusal(refusal)) => WhnfEagerNatOutcome::Refused(refusal),
+        Err(Halt::Stop(stop)) => WhnfEagerNatOutcome::Inconclusive(*stop),
+        Err(Halt::Fault(fault)) => WhnfEagerNatOutcome::InternalFault(fault),
+    }
 }
 
 fn whnf_input_at_mode_with(
@@ -5236,6 +5692,9 @@ fn whnf_input_at_mode_with(
         acyclic_bindings: BTreeSet::new(),
         delta_mode,
         head_nat,
+        numeric_budget: None,
+        nat_progress: WhnfNatProgress::default(),
+        nat_pow_cap: None,
         delta_reductions: 0,
         discarded_reductions: 0,
         discarded_delta_reductions: 0,

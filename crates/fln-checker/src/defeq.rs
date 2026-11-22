@@ -39,8 +39,8 @@ use crate::string_reduce::{
 };
 use crate::universe::{UniverseError, level_roots_equal};
 use crate::whnf::{
-    WhnfBudget, WhnfContext, WhnfFault, WhnfInput, WhnfOutcome, WhnfRefusal, WhnfStop,
-    whnf_at_with, whnf_core_of_with, whnf_delta_step_of_with,
+    WhnfBudget, WhnfContext, WhnfCoreOutcome, WhnfFault, WhnfInput, WhnfOutcome, WhnfRefusal,
+    WhnfStop, whnf_at_with, whnf_core_step_of_with, whnf_delta_step_of_with,
 };
 use crate::wire::{
     ExprId, ExprNode, MAX_BVAR_INDEX, NamePart, WireExpr, WireName, expression_owned_units,
@@ -1051,6 +1051,21 @@ impl SlowControl {
             .saturating_add(result.delta_reductions);
         self.poll(cancelled)?;
         self.charge_materialized(&result.term)
+    }
+
+    fn absorb_whnf_unchanged(
+        &mut self,
+        steps: u64,
+        reductions: u64,
+        delta_reductions: u64,
+        string_progress: StringExpansionProgress,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<(), SlowHalt> {
+        self.absorb_string(string_progress);
+        self.progress.whnf_steps = self.progress.whnf_steps.saturating_add(steps);
+        self.progress.whnf_reductions = self.progress.whnf_reductions.saturating_add(reductions);
+        self.progress.delta_unfolds = self.progress.delta_unfolds.saturating_add(delta_reductions);
+        self.poll(cancelled)
     }
 
     /// Charge a term this conversion materialized, in arena nodes and in owned
@@ -2152,8 +2167,7 @@ fn lazy_delta_heights(
     // budget. Metadata is transparent here as it is to conversion, and no index
     // is shifted, so this is reflexivity and nothing more: the pair is done,
     // and `None` with nothing pushed drops it.
-    if left_delta
-        && right_delta
+    if left_height.is_some()
         && left_height == right_height
         && eta_structurally_equal(
             left_reference,
@@ -2225,8 +2239,62 @@ fn lazy_delta_heights(
 
 #[derive(Clone, Copy)]
 enum NormalizationMode {
-    Core,
     DeltaStep,
+}
+
+enum NormalizedCore {
+    Unchanged,
+    Complete {
+        result: crate::whnf::WhnfResult,
+        copied: bool,
+    },
+}
+
+fn normalize_core(
+    reference: DefEqTerm,
+    sources: TermSources<'_>,
+    context: &WhnfContext,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<NormalizedCore, SlowHalt> {
+    let budget = control.begin_normalization(cancelled)?;
+    let input = sources.whnf_input(reference)?;
+    match whnf_core_step_of_with(input, reference.root, context, budget, cancelled) {
+        WhnfCoreOutcome::Unchanged {
+            steps,
+            reductions,
+            delta_reductions,
+            string_progress,
+            ..
+        } => {
+            control.absorb_whnf_unchanged(
+                steps,
+                reductions,
+                delta_reductions,
+                string_progress,
+                cancelled,
+            )?;
+            Ok(NormalizedCore::Unchanged)
+        }
+        WhnfCoreOutcome::Complete { result, copied } => {
+            control.absorb_whnf(&result, cancelled)?;
+            Ok(NormalizedCore::Complete { result, copied })
+        }
+        WhnfCoreOutcome::Refused(refusal) => Err(SlowHalt::Refusal {
+            side: reference.side(),
+            refusal: Box::new(refusal),
+            progress: Box::new(control.progress),
+        }),
+        WhnfCoreOutcome::Inconclusive(stop) => Err(SlowHalt::Stop(Box::new(DefEqStop::Whnf {
+            side: reference.side(),
+            stop,
+            progress: control.progress,
+        }))),
+        WhnfCoreOutcome::InternalFault(fault) => Err(SlowHalt::Fault(DefEqFault::Whnf {
+            side: reference.side(),
+            fault,
+        })),
+    }
 }
 
 fn normalize(
@@ -2240,9 +2308,6 @@ fn normalize(
     let budget = control.begin_normalization(cancelled)?;
     let input = sources.whnf_input(reference)?;
     let (outcome, copied) = match mode {
-        NormalizationMode::Core => {
-            whnf_core_of_with(input, reference.root, context, budget, cancelled)
-        }
         NormalizationMode::DeltaStep => {
             whnf_delta_step_of_with(input, reference.root, context, budget, cancelled)
         }
@@ -3860,19 +3925,17 @@ fn run_slow(
                     }
                 }
 
-                let (left_result, left_copied) = normalize(
+                let left_core = normalize_core(
                     left_reference,
                     TermSources::new(left, right, &generated),
                     context,
-                    NormalizationMode::Core,
                     &mut control,
                     cancelled,
                 )?;
-                let (right_result, right_copied) = normalize(
+                let right_core = normalize_core(
                     right_reference,
                     TermSources::new(left, right, &generated),
                     context,
-                    NormalizationMode::Core,
                     &mut control,
                     cancelled,
                 )?;
@@ -3880,7 +3943,17 @@ fn run_slow(
                 // (e.g. beta-redexes in generated noConfusion principles reducing
                 // to identical noConfusionType applications), reflexivity decides
                 // the pair immediately without redundant delta unfolding.
-                if left_result.reductions != 0
+                if let (
+                    NormalizedCore::Complete {
+                        result: left_result,
+                        ..
+                    },
+                    NormalizedCore::Complete {
+                        result: right_result,
+                        ..
+                    },
+                ) = (&left_core, &right_core)
+                    && left_result.reductions != 0
                     && right_result.reductions != 0
                     && left_result.term == right_result.term
                 {
@@ -3892,11 +3965,13 @@ fn run_slow(
                 // The zero-shift structural comparison is metered by this query.
                 let mut next_left = left_reference;
                 let mut next_right = right_reference;
-                for (reference, result, copied, next) in [
-                    (left_reference, left_result, left_copied, &mut next_left),
-                    (right_reference, right_result, right_copied, &mut next_right),
+                for (reference, core, next) in [
+                    (left_reference, left_core, &mut next_left),
+                    (right_reference, right_core, &mut next_right),
                 ] {
-                    if result.reductions != 0 {
+                    if let NormalizedCore::Complete { result, copied } = core
+                        && result.reductions != 0
+                    {
                         let candidate = retain_normalized(
                             &mut generated,
                             reference.side(),

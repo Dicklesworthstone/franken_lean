@@ -356,8 +356,9 @@ fn pure_conversion_preserves_pending_siblings_across_beta_reduction() {
     assert_eq!(progress.whnf_reductions, 2);
     // Since be66b472 a lambda-headed spine normalizes BEFORE congruence, so
     // the partially reduced spine `function (identity argument)` materializes
-    // whole (13 nodes) instead of only the two one-node redex reductions.
-    assert_eq!(progress.materialized_arena_nodes, 13);
+    // whole (8 nodes) plus the 1-node beta reduction of `identity argument` (9
+    // nodes total); the already-core right side skips copying entirely.
+    assert_eq!(progress.materialized_arena_nodes, 9);
 }
 
 #[test]
@@ -1972,8 +1973,10 @@ fn deep_slow_child() -> Result<(), String> {
                     == DEPTH.saturating_mul(4).saturating_add(6) as u64
                 && progress.normalizations == 2
                 && progress.whnf_reductions == 1
+                // Only the beta-reducing left side materializes (DEPTH*2+1 nodes);
+                // the already-core right spine skips copying entirely.
                 && progress.materialized_arena_nodes
-                    == DEPTH.saturating_mul(4).saturating_add(2) as u64 =>
+                    == DEPTH.saturating_mul(2).saturating_add(1) as u64 =>
         {
             Ok(())
         }
@@ -2051,7 +2054,9 @@ fn deep_lazy_delta_child() -> Result<(), String> {
                 && progress.normalizations == DEPTH.saturating_mul(3) as u64
                 && progress.whnf_reductions == DEPTH as u64
                 && progress.delta_unfolds == DEPTH as u64
-                && progress.materialized_arena_nodes == DEPTH.saturating_mul(3) as u64 =>
+                // Only the DEPTH actual delta-step unfolds materialize; the
+                // 2*DEPTH already-core no-op checks skip copying entirely.
+                && progress.materialized_arena_nodes == DEPTH as u64 =>
         {
             Ok(())
         }

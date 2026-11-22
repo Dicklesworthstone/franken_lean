@@ -74,6 +74,7 @@ struct Entry {
     /// The let-bound locals in scope when `result` was computed.
     bindings: Vec<FreeBinding>,
     result: WhnfResult,
+    nat_progress: WhnfNatProgress,
     /// Whether `result`'s term is the module's own copy of a term (`WhnfInput`).
     copied: bool,
 }
@@ -246,6 +247,12 @@ fn covers(budget: &WhnfBudget, result: &WhnfResult) -> bool {
         && string.owned_units <= budget.string.max_owned_units
 }
 
+pub(super) struct RememberedWhnf<'a> {
+    pub(super) result: &'a WhnfResult,
+    pub(super) nat_progress: WhnfNatProgress,
+    pub(super) copied: bool,
+}
+
 impl WhnfMemo {
     pub(super) fn recall(
         &self,
@@ -269,6 +276,34 @@ impl WhnfMemo {
             .map(|entry| (entry.result.clone(), entry.copied))
     }
 
+    pub(super) fn recall_eager_nat(
+        &self,
+        input: &WireExpr,
+        delta_mode: DeltaMode,
+        budget: &WhnfBudget,
+        numeric_budget: NatBudget,
+        bindings: &[FreeBinding],
+    ) -> Option<(WhnfResult, WhnfNatProgress, bool)> {
+        let table = self.0.lock().ok()?;
+        table
+            .buckets
+            .get(&fingerprint(
+                input,
+                delta_mode,
+                budget.materialization,
+                bindings,
+            ))?
+            .iter()
+            .find(|entry| entry.matches(input, delta_mode, budget.materialization, bindings))
+            .filter(|entry| {
+                covers(budget, &entry.result)
+                    && entry.nat_progress.steps <= numeric_budget.max_steps
+                    && entry.nat_progress.materialized_limbs
+                        <= numeric_budget.max_materialized_limbs
+            })
+            .map(|entry| (entry.result.clone(), entry.nat_progress, entry.copied))
+    }
+
     /// Record a complete result. Results that reduced nothing are not worth a
     /// slot: recomputing them costs no more than the lookup.
     pub(super) fn remember(
@@ -277,10 +312,9 @@ impl WhnfMemo {
         delta_mode: DeltaMode,
         materialization: TermBudget,
         bindings: &[FreeBinding],
-        result: &WhnfResult,
-        copied: bool,
+        value: RememberedWhnf<'_>,
     ) {
-        if result.reductions == 0 && result.delta_reductions == 0 {
+        if value.result.reductions == 0 && value.result.delta_reductions == 0 {
             return;
         }
         let Ok(mut table) = self.0.lock() else {
@@ -289,7 +323,7 @@ impl WhnfMemo {
         let nodes = input
             .nodes()
             .len()
-            .saturating_add(result.term.nodes().len());
+            .saturating_add(value.result.term.nodes().len());
         if table.entries >= MAX_ENTRIES
             || table.stored_nodes.saturating_add(nodes) > MAX_STORED_NODES
         {
@@ -307,8 +341,9 @@ impl WhnfMemo {
             delta_mode,
             materialization,
             bindings: bindings.to_vec(),
-            result: result.clone(),
-            copied,
+            result: value.result.clone(),
+            nat_progress: value.nat_progress,
+            copied: value.copied,
         });
         table.entries += 1;
         table.stored_nodes = table.stored_nodes.saturating_add(nodes);
@@ -504,6 +539,7 @@ mod tests {
                 has_auxiliary_work: false,
                 string_progress: StringExpansionProgress::default(),
             },
+            nat_progress: WhnfNatProgress::default(),
             copied: false,
         };
         let admits_fresh = |bucket: &[Entry]| {

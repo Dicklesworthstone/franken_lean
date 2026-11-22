@@ -21,8 +21,9 @@ use crate::numeric::{
     NatStop, NatValue,
 };
 use crate::whnf::{
-    WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_core_at_with,
-    whnf_delta_step_at_with,
+    WhnfBudget, WhnfContext, WhnfCoreOutcome, WhnfEagerNatOutcome, WhnfFault, WhnfInput,
+    WhnfNatProgress, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_core_at_with, whnf_core_step_of_with,
+    whnf_eager_nat_at_with,
 };
 use crate::wire::{
     ExprId, ExprNode, NamePart, WireExpr, WireName, expression_owned_units, level_owned_units,
@@ -597,6 +598,24 @@ impl<'a> Control<'a> {
             .saturating_add(result.delta_reductions);
     }
 
+    fn absorb_whnf_counters(&mut self, steps: u64, reductions: u64, delta_reductions: u64) {
+        self.progress.whnf_steps = self.progress.whnf_steps.saturating_add(steps);
+        self.progress.whnf_reductions = self.progress.whnf_reductions.saturating_add(reductions);
+        self.progress.delta_unfolds = self.progress.delta_unfolds.saturating_add(delta_reductions);
+    }
+
+    fn absorb_whnf_nat(&mut self, progress: WhnfNatProgress) {
+        self.progress.numeric_steps = self.progress.numeric_steps.saturating_add(progress.steps);
+        self.progress.numeric_materialized_limbs = self
+            .progress
+            .numeric_materialized_limbs
+            .saturating_add(progress.materialized_limbs);
+        self.progress.numeric_reductions = self
+            .progress
+            .numeric_reductions
+            .saturating_add(progress.reductions);
+    }
+
     fn remaining_numeric(&self) -> NatBudget {
         NatBudget::new(
             self.budget
@@ -1156,46 +1175,187 @@ fn direct_natural(
     }
 }
 
-fn normalize_cursor(
+fn normalize_core_cursor(
     cursor: Cursor,
-    phase: NatReductionPhase,
     candidate: &WireExpr,
     generated: &mut Vec<WireExpr>,
     context: &WhnfContext,
+    retain_unchanged: bool,
     control: &mut Control<'_>,
 ) -> Result<(Cursor, bool), Halt> {
+    let phase = NatReductionPhase::OperandCore;
+    if retain_unchanged {
+        let outcome = {
+            let term = source_term(cursor.source, candidate, generated)?;
+            let budget = control.remaining_whnf();
+            whnf_core_at_with(term, cursor.root, context, budget, control.cancelled)
+        };
+        return match outcome {
+            WhnfOutcome::Complete(result) => {
+                let changed = result.reductions != 0;
+                control.absorb_whnf(&result);
+                let next = control.retain_generated(generated, result.term, cursor.root.index())?;
+                Ok((next, changed))
+            }
+            WhnfOutcome::Refused(refusal) => Err(Halt::Refusal {
+                refusal: Box::new(NatReductionRefusal::Whnf { phase, refusal }),
+                progress: control.progress,
+            }),
+            WhnfOutcome::Inconclusive(stop) => Err(Halt::stop(NatReductionStop::Whnf {
+                phase,
+                stop,
+                progress: control.progress,
+            })),
+            WhnfOutcome::InternalFault(fault) => {
+                Err(Halt::Fault(NatReductionFault::Whnf { phase, fault }))
+            }
+        };
+    }
     let outcome = {
         let term = source_term(cursor.source, candidate, generated)?;
         let budget = control.remaining_whnf();
-        match phase {
-            NatReductionPhase::OperandCore => {
-                whnf_core_at_with(term, cursor.root, context, budget, control.cancelled)
-            }
-            NatReductionPhase::OperandDelta => {
-                whnf_delta_step_at_with(term, cursor.root, context, budget, control.cancelled)
-            }
-        }
+        whnf_core_step_of_with(
+            WhnfInput::Borrowed(term),
+            cursor.root,
+            context,
+            budget,
+            control.cancelled,
+        )
     };
     match outcome {
-        WhnfOutcome::Complete(result) => {
-            let changed = match phase {
-                NatReductionPhase::OperandCore => result.reductions != 0,
-                NatReductionPhase::OperandDelta => result.delta_reductions != 0,
-            };
-            control.absorb_whnf(&result);
-            let next = control.retain_generated(generated, result.term, cursor.root.index())?;
-            Ok((next, changed))
+        WhnfCoreOutcome::Unchanged {
+            steps,
+            reductions,
+            delta_reductions,
+            ..
+        } => {
+            control.absorb_whnf_counters(steps, reductions, delta_reductions);
+            Ok((cursor, false))
         }
-        WhnfOutcome::Refused(refusal) => Err(Halt::Refusal {
+        WhnfCoreOutcome::Complete { result, .. } => {
+            let changed = result.reductions != 0;
+            control.absorb_whnf(&result);
+            if changed {
+                let next = control.retain_generated(generated, result.term, cursor.root.index())?;
+                Ok((next, true))
+            } else {
+                Ok((cursor, false))
+            }
+        }
+        WhnfCoreOutcome::Refused(refusal) => Err(Halt::Refusal {
             refusal: Box::new(NatReductionRefusal::Whnf { phase, refusal }),
             progress: control.progress,
         }),
-        WhnfOutcome::Inconclusive(stop) => Err(Halt::stop(NatReductionStop::Whnf {
+        WhnfCoreOutcome::Inconclusive(stop) => Err(Halt::stop(NatReductionStop::Whnf {
             phase,
             stop,
             progress: control.progress,
         })),
-        WhnfOutcome::InternalFault(fault) => {
+        WhnfCoreOutcome::InternalFault(fault) => {
+            Err(Halt::Fault(NatReductionFault::Whnf { phase, fault }))
+        }
+    }
+}
+
+enum EagerDeltaStep {
+    Changed(Cursor),
+    Unchanged,
+    PowCap(u64),
+}
+
+fn normalize_eager_delta_cursor(
+    cursor: Cursor,
+    candidate: &WireExpr,
+    generated: &mut Vec<WireExpr>,
+    context: &WhnfContext,
+    scope: NatReductionScope,
+    control: &mut Control<'_>,
+) -> Result<EagerDeltaStep, Halt> {
+    let outcome = {
+        let term = source_term(cursor.source, candidate, generated)?;
+        let budget = control.remaining_whnf();
+        let numeric = control.remaining_numeric();
+        whnf_eager_nat_at_with(
+            term,
+            cursor.root,
+            context,
+            scope,
+            budget,
+            numeric,
+            control.cancelled,
+        )
+    };
+    let phase = NatReductionPhase::OperandDelta;
+    match outcome {
+        WhnfEagerNatOutcome::Complete(eager) => {
+            let changed = eager.result.delta_reductions != 0 || eager.result.reductions != 0;
+            control.absorb_whnf(&eager.result);
+            control.absorb_whnf_nat(eager.nat_progress);
+            if changed {
+                let next =
+                    control.retain_generated(generated, eager.result.term, cursor.root.index())?;
+                Ok(EagerDeltaStep::Changed(next))
+            } else {
+                Ok(EagerDeltaStep::Unchanged)
+            }
+        }
+        WhnfEagerNatOutcome::PowCap {
+            cap,
+            steps,
+            reductions,
+            delta_reductions,
+            nat_progress,
+        } => {
+            control.absorb_whnf_counters(steps, reductions, delta_reductions);
+            control.absorb_whnf_nat(nat_progress);
+            Ok(EagerDeltaStep::PowCap(cap))
+        }
+        WhnfEagerNatOutcome::Refused(refusal) => Err(Halt::Refusal {
+            refusal: Box::new(NatReductionRefusal::Whnf { phase, refusal }),
+            progress: control.progress,
+        }),
+        WhnfEagerNatOutcome::Inconclusive(WhnfStop::NatReduction {
+            at,
+            stop,
+            completed_steps,
+            completed_reductions,
+        }) => match *stop {
+            NatReductionStop::Numeric {
+                operation,
+                stop: nat_stop,
+                progress,
+            } => {
+                control.progress.numeric_steps = control
+                    .progress
+                    .numeric_steps
+                    .saturating_add(progress.numeric_steps);
+                control.progress.numeric_materialized_limbs = control
+                    .progress
+                    .numeric_materialized_limbs
+                    .saturating_add(progress.numeric_materialized_limbs);
+                Err(Halt::stop(NatReductionStop::Numeric {
+                    operation,
+                    stop: nat_stop,
+                    progress: control.progress,
+                }))
+            }
+            other => Err(Halt::stop(NatReductionStop::Whnf {
+                phase,
+                stop: WhnfStop::NatReduction {
+                    at,
+                    stop: Box::new(other),
+                    completed_steps,
+                    completed_reductions,
+                },
+                progress: control.progress,
+            })),
+        },
+        WhnfEagerNatOutcome::Inconclusive(stop) => Err(Halt::stop(NatReductionStop::Whnf {
+            phase,
+            stop,
+            progress: control.progress,
+        })),
+        WhnfEagerNatOutcome::InternalFault(fault) => {
             Err(Halt::Fault(NatReductionFault::Whnf { phase, fault }))
         }
     }
@@ -1603,12 +1763,12 @@ fn reduce_inner(
                             core_normalized: false,
                         }
                     } else if !core_normalized {
-                        let (next, _) = normalize_cursor(
+                        let (next, _) = normalize_core_cursor(
                             cursor,
-                            NatReductionPhase::OperandCore,
                             candidate,
                             &mut generated,
                             context,
+                            !context_validated,
                             &mut control,
                         )?;
                         context_validated = true;
@@ -1626,22 +1786,27 @@ fn reduce_inner(
                 }
             }
             EvalState::ForceDelta(cursor) => {
-                let (next, changed) = normalize_cursor(
+                let step = normalize_eager_delta_cursor(
                     cursor,
-                    NatReductionPhase::OperandDelta,
                     candidate,
                     &mut generated,
                     context,
+                    scope,
                     &mut control,
                 )?;
                 context_validated = true;
-                if changed {
-                    EvalState::Seek {
+                match step {
+                    EagerDeltaStep::Changed(next) => EvalState::Seek {
                         cursor: next,
                         core_normalized: false,
+                    },
+                    EagerDeltaStep::Unchanged => EvalState::NonNatural,
+                    EagerDeltaStep::PowCap(cap) => {
+                        return Ok(NatReductionOutcome::NotReduced {
+                            reason: NatNotReduced::PowExponentAbovePinCap { cap },
+                            progress: control.progress,
+                        });
                     }
-                } else {
-                    EvalState::NonNatural
                 }
             }
             EvalState::Natural(value) => {
