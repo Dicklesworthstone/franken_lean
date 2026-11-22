@@ -198,6 +198,13 @@ enum ParserOp {
     FieldIdx,
     HygieneInfo,
     CommentBody,
+    VersoCommentBody,
+    IfVerso {
+        module_docs: bool,
+        verso: Arc<ParserOp>,
+        plain: Arc<ParserOp>,
+    },
+    WithoutVersoSyntax(Arc<ParserOp>),
     InterpolatedStr(Arc<ParserOp>),
     Seq(Vec<Arc<ParserOp>>),
     OrElse(Vec<Arc<ParserOp>>),
@@ -540,8 +547,8 @@ impl BuiltinInterpreter {
             hexnum_kind: Name::from_components(["hexnum"]),
             field_idx_kind: Name::from_components(["fieldIdx"]),
             hygiene_info_kind: Name::from_components(["hygieneInfo"]),
-            interpolated_str_kind: Name::from_components(["interpolatedStr"]),
-            interpolated_str_lit_kind: Name::from_components(["interpolatedStrLit"]),
+            interpolated_str_kind: Name::from_components(["interpolatedStrKind"]),
+            interpolated_str_lit_kind: Name::from_components(["interpolatedStrLitKind"]),
             token_antiquot_kind: Name::from_components(["token_antiquot"]),
             dot_ident_kind: Name::from_components(["Lean", "Parser", "Term", "dotIdent"]),
             proj_kind: Name::from_components(["Lean", "Parser", "Term", "proj"]),
@@ -585,7 +592,7 @@ impl BuiltinInterpreter {
         source: &SourceText,
         max_steps: usize,
     ) -> Result<Syntax, InterpError> {
-        let mut st = RuntimeState::new(source, &self.builtin_tokens, max_steps);
+        let mut st = RuntimeState::new(source, false, max_steps);
         st.skip_whitespace();
         if let Some(err) = st.error.take() {
             return Err(err);
@@ -623,7 +630,7 @@ impl BuiltinInterpreter {
         let mut budget_exhausted = false;
 
         // 1. Parse module header with header token table (`Module.lean:75-112`).
-        let mut hst = RuntimeState::new(source, &self.header_tokens, max_steps);
+        let mut hst = RuntimeState::new(source, true, max_steps);
         hst.skip_whitespace();
         if !hst.has_error() {
             let op = ParserOp::Ref(self.module_header_id);
@@ -687,7 +694,7 @@ impl BuiltinInterpreter {
                     break;
                 }
                 let start_pos = pos;
-                let mut st = RuntimeState::new(source, &self.builtin_tokens, rem);
+                let mut st = RuntimeState::new(source, false, rem);
                 st.pos = pos;
                 st.skip_whitespace();
                 if !st.has_error() {
@@ -756,6 +763,206 @@ impl BuiltinInterpreter {
         }
     }
 
+    /// Parse a complete Lean module (`header` + top-level commands until EOI) through
+    /// the unified registry engine: pin-extracted builtin combinators composed with
+    /// [`crate::extensions::FileGrammar`] (`Init`/`Std` imported `ParserDescr` rows,
+    /// `namespace`/`section`/`end`/`open`/`open scoped`/`open ... in` scope activations,
+    /// `doc.verso` / `doc.verso.module`, and the file's own `syntax`/`notation`/`macro`
+    /// declarations). No hand-written seed grammar or `command_scope::partition` is used.
+    pub fn parse_module_with_file_grammar(
+        &self,
+        source: &SourceText,
+        module: Option<Name>,
+        max_steps: usize,
+    ) -> ParsedModule {
+        let mut errors = Vec::new();
+        let mut total_steps = 0usize;
+        let mut budget_exhausted = false;
+
+        // 1. Parse module header with header token table (`Module.lean:75-112`).
+        let mut hst = RuntimeState::new(source, true, max_steps);
+        hst.skip_whitespace();
+        if !hst.has_error() {
+            let op = ParserOp::Ref(self.module_header_id);
+            self.exec_op(&op, &mut hst);
+        }
+        total_steps = total_steps.saturating_add(hst.steps);
+        if let Some(error) = hst.resource_error() {
+            budget_exhausted = true;
+            errors.push(error);
+        }
+        let mut header = hst.back_cloned().unwrap_or(Syntax::Missing);
+        for err in hst.recovered_errors.drain(..) {
+            errors.push(err);
+        }
+        if let Some(err) = hst.error.take()
+            && !budget_exhausted
+        {
+            errors.push(err);
+        }
+        let is_leading_set = set_start_of_file_leading(&mut header);
+        let mut pos = hst.pos;
+        let mut recovering = !errors.is_empty();
+        let mut has_leading = !is_leading_set;
+
+        // 2. Construct the file's dynamic grammar from header prelude + imports.
+        let (prelude, imports) = extract_header_prelude_and_imports(&header);
+        let mut file_grammar = match crate::extensions::FileGrammar::new(prelude, &imports, module)
+        {
+            Ok(fg) => Some(fg),
+            Err(err) => {
+                errors.push(InterpError::new(
+                    0,
+                    format!(
+                        "file grammar initialization failed: unknown module {}",
+                        err.0.to_display_string()
+                    ),
+                    Vec::new(),
+                ));
+                None
+            }
+        };
+
+        // 3. Parse commands one by one using the currently active grammar's compiled interpreter.
+        let mut commands = Vec::new();
+        let top_cmd_op = ParserOp::WithPosition(Arc::new(ParserOp::CategoryParser {
+            cat: Name::from_components(["command"]),
+            prec: 0,
+        }));
+
+        loop {
+            if budget_exhausted {
+                break;
+            }
+            let remaining = max_steps.saturating_sub(total_steps);
+            if remaining == 0 {
+                budget_exhausted = true;
+                break;
+            }
+            if pos >= source.len_bytes() {
+                let mut eoi_stx = self.mk_eoi_syntax(pos);
+                if has_leading {
+                    set_start_of_file_leading(&mut eoi_stx);
+                }
+                commands.push(eoi_stx);
+                break;
+            }
+
+            let active_grammar = file_grammar.as_ref().map(|fg| fg.grammar());
+            let active_interp_rc = match active_grammar.as_ref() {
+                Some(grammar) => match grammar.generated_interpreter(self) {
+                    Ok(interp) => Some(interp),
+                    Err(err) => {
+                        errors.push(InterpError::new(
+                            pos,
+                            format!("active ParserDescr compilation failed: {err}"),
+                            Vec::new(),
+                        ));
+                        None
+                    }
+                },
+                None => None,
+            };
+            let active_interp: &BuiltinInterpreter = active_interp_rc.as_deref().unwrap_or(self);
+            let docs = active_grammar
+                .as_ref()
+                .map(|g| g.doc_options())
+                .unwrap_or_default();
+
+            let mut cmd_stx = Syntax::Missing;
+            let mut produced = false;
+            let mut had_cmd_error = false;
+            loop {
+                if pos >= source.len_bytes() {
+                    cmd_stx = active_interp.mk_eoi_syntax(pos);
+                    produced = true;
+                    break;
+                }
+                let rem = max_steps.saturating_sub(total_steps);
+                if rem == 0 {
+                    budget_exhausted = true;
+                    break;
+                }
+                let start_pos = pos;
+                let mut st = RuntimeState::new(source, false, rem);
+                st.pos = pos;
+                st.ctx.verso_docs = docs.verso(false);
+                st.ctx.verso_module_docs = docs.verso(true);
+                if let Some(fg) = file_grammar.as_ref() {
+                    st.open_context = Some((self, fg, fg.scope_snapshot()));
+                }
+                st.skip_whitespace();
+                if !st.has_error() {
+                    active_interp.exec_op(&top_cmd_op, &mut st);
+                }
+                total_steps = total_steps.saturating_add(st.steps);
+                if let Some(error) = st.resource_error() {
+                    budget_exhausted = true;
+                    errors.push(error);
+                    break;
+                }
+                for err in st.recovered_errors.drain(..) {
+                    errors.push(err);
+                }
+                pos = st.pos;
+                if recovering && st.back().is_some_and(is_antiquot) {
+                    continue;
+                }
+                match st.error.take() {
+                    None => {
+                        cmd_stx = st.back_cloned().unwrap_or(Syntax::Missing);
+                        recovering = false;
+                        produced = true;
+                        break;
+                    }
+                    Some(err) => {
+                        had_cmd_error = true;
+                        if pos == start_pos {
+                            pos = active_interp.consume_one_token(source, pos);
+                        }
+                        let ignore = st.stack_size() == 0
+                            || st.back().is_none_or(|s| first_pos_of(s).is_none());
+                        if !(recovering && ignore) {
+                            errors.push(err);
+                        }
+                        recovering = true;
+                        if ignore {
+                            continue;
+                        }
+                        cmd_stx = st.back_cloned().unwrap_or(Syntax::Missing);
+                        produced = true;
+                        break;
+                    }
+                }
+            }
+
+            if !produced {
+                break;
+            }
+            if has_leading {
+                set_start_of_file_leading(&mut cmd_stx);
+                has_leading = false;
+            }
+            if !had_cmd_error && let Some(fg) = file_grammar.as_mut() {
+                fg.apply_command_syntax(&cmd_stx);
+                declare_command_or_in(fg, &cmd_stx);
+            }
+            let terminal = active_interp.is_terminal_command(&cmd_stx);
+            commands.push(cmd_stx);
+            if terminal {
+                break;
+            }
+        }
+
+        ParsedModule {
+            header,
+            commands,
+            errors,
+            steps_used: total_steps,
+            budget_exhausted,
+        }
+    }
+
     fn mk_eoi_syntax(&self, pos: usize) -> Syntax {
         let bp = BytePos(pos);
         let empty = ByteSpan::empty_at(bp);
@@ -780,7 +987,7 @@ impl BuiltinInterpreter {
     }
 
     fn consume_one_token(&self, source: &SourceText, pos: usize) -> usize {
-        let mut st = RuntimeState::new(source, &self.builtin_tokens, 1024);
+        let mut st = RuntimeState::new(source, false, 1024);
         st.pos = pos;
         self.token_fn(&[], &mut st);
         if st.has_error() || st.pos <= pos {
@@ -790,11 +997,56 @@ impl BuiltinInterpreter {
         }
     }
 
-    fn exec_op(&self, op: &ParserOp, st: &mut RuntimeState<'_>) {
-        if !st.tick() {
-            return;
+    fn exec_op<'a>(&'a self, mut op: &'a ParserOp, st: &mut RuntimeState<'_>) {
+        // Dereference transparent wrapper chains iteratively so `Ref`,
+        // `WithoutInfo`, `IfVerso`, single-step `Seq`, and non-`$`
+        // `WithAntiquot` consume zero native stack frames.
+        let mut hops = 0usize;
+        loop {
+            if !st.tick() {
+                return;
+            }
+            match op {
+                ParserOp::Ref(id) => {
+                    hops += 1;
+                    if hops >= st.max_op_depth {
+                        st.depth_exhausted = true;
+                        st.mk_unexpected_error(
+                            format!("parser recursion depth limit exceeded at byte {}", st.pos),
+                            Vec::new(),
+                            true,
+                        );
+                        return;
+                    }
+                    op = &self.defs[*id].op;
+                }
+                ParserOp::WithoutInfo(inner) => op = inner,
+                ParserOp::Seq(steps) if steps.len() == 1 => op = &steps[0],
+                ParserOp::IfVerso {
+                    module_docs,
+                    verso,
+                    plain,
+                } => {
+                    let enabled = if *module_docs {
+                        st.ctx.verso_module_docs
+                    } else {
+                        st.ctx.verso_docs
+                    };
+                    op = if enabled { verso } else { plain };
+                }
+                ParserOp::WithAntiquot { body, .. }
+                    if st.source.as_bytes().get(st.pos) != Some(&b'$') =>
+                {
+                    op = body;
+                }
+                _ => break,
+            }
         }
-        if st.depth >= st.max_depth {
+        let counts_recursive_depth = matches!(
+            op,
+            ParserOp::CategoryParser { .. } | ParserOp::ParserOfStack { .. }
+        );
+        if (counts_recursive_depth && st.depth >= st.max_depth) || st.op_depth >= st.max_op_depth {
             st.depth_exhausted = true;
             st.mk_unexpected_error(
                 format!("parser recursion depth limit exceeded at byte {}", st.pos),
@@ -803,9 +1055,15 @@ impl BuiltinInterpreter {
             );
             return;
         }
-        st.depth += 1;
+        st.op_depth += 1;
+        if counts_recursive_depth {
+            st.depth += 1;
+        }
         self.exec_op_inner(op, st);
-        st.depth -= 1;
+        if counts_recursive_depth {
+            st.depth -= 1;
+        }
+        st.op_depth -= 1;
     }
 
     fn exec_op_inner(&self, op: &ParserOp, st: &mut RuntimeState<'_>) {
@@ -839,6 +1097,27 @@ impl BuiltinInterpreter {
             ParserOp::FieldIdx => self.field_idx_fn(st),
             ParserOp::HygieneInfo => self.hygiene_info_fn(st),
             ParserOp::CommentBody => self.comment_body_fn(st),
+            ParserOp::VersoCommentBody => self.verso_comment_body_fn(st),
+            ParserOp::IfVerso {
+                module_docs,
+                verso,
+                plain,
+            } => {
+                let enabled = if *module_docs {
+                    st.ctx.verso_module_docs
+                } else {
+                    st.ctx.verso_docs
+                };
+                self.exec_op(if enabled { verso } else { plain }, st);
+            }
+            ParserOp::WithoutVersoSyntax(inner) => {
+                let (saved_docs, saved_module) = (st.ctx.verso_docs, st.ctx.verso_module_docs);
+                st.ctx.verso_docs = false;
+                st.ctx.verso_module_docs = false;
+                self.exec_op(inner, st);
+                st.ctx.verso_docs = saved_docs;
+                st.ctx.verso_module_docs = saved_module;
+            }
             ParserOp::InterpolatedStr(inner) => self.interpolated_str_fn(inner, st),
             ParserOp::Seq(steps) => {
                 for step in steps {
@@ -1048,9 +1327,8 @@ impl BuiltinInterpreter {
             ParserOp::AdaptContext(transform, inner) => {
                 self.exec_adapt_context(transform, inner, st);
             }
-            ParserOp::WithOpen(inner) | ParserOp::WithOpenDecl(inner) => {
-                self.exec_with_reset_cache(inner, st);
-            }
+            ParserOp::WithOpen(inner) => self.exec_with_open(true, inner, st),
+            ParserOp::WithOpenDecl(inner) => self.exec_with_open(false, inner, st),
             ParserOp::CategoryParser { cat, prec } => self.exec_category_parser(cat, *prec, st),
             ParserOp::ParserOfStack { offset, prec } => {
                 self.exec_parser_of_stack(*offset, *prec, st);
@@ -1208,6 +1486,75 @@ impl BuiltinInterpreter {
     }
 
     #[inline(never)]
+    fn exec_with_open(&self, expect_open_cmd: bool, inner: &ParserOp, st: &mut RuntimeState<'_>) {
+        let open_decl = st.stack.last().and_then(|top| {
+            if expect_open_cmd {
+                if let Syntax::Node { kind, args, .. } = top
+                    && *kind == Name::from_components(["Lean", "Parser", "Command", "open"])
+                {
+                    args.get(1)
+                } else {
+                    None
+                }
+            } else {
+                Some(top)
+            }
+        });
+        let activation = open_decl.and_then(|decl| {
+            let Syntax::Node { kind, args, .. } = decl else {
+                return None;
+            };
+            if *kind == Name::from_components(["Lean", "Parser", "Command", "openSimple"]) {
+                let Syntax::Node { args: items, .. } = args.first()? else {
+                    return None;
+                };
+                let names: Vec<Name> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Syntax::Ident { val, .. } => Some(val.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                (!names.is_empty()).then_some((names, true))
+            } else if *kind == Name::from_components(["Lean", "Parser", "Command", "openScoped"]) {
+                let Syntax::Node { args: items, .. } = args.get(1)? else {
+                    return None;
+                };
+                let names: Vec<Name> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Syntax::Ident { val, .. } => Some(val.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                (!names.is_empty()).then_some((names, false))
+            } else {
+                None
+            }
+        });
+        if let Some((names, simple)) = activation
+            && let Some((base, fg, snap)) = st.open_context.clone()
+        {
+            let next_snap = fg.activate_snapshot(&snap, &names, simple);
+            let next_grammar = fg.grammar_for_snapshot(&next_snap);
+            if let Ok(next_interp) = next_grammar.generated_interpreter(base) {
+                let old_drop = st.stack_drop;
+                let saved_cache = std::mem::take(&mut st.parser_cache);
+                let saved_ctx = st.open_context.replace((base, fg, next_snap));
+                st.token_cache = None;
+                st.stack_drop = 0;
+                next_interp.exec_op(inner, st);
+                st.open_context = saved_ctx;
+                st.stack_drop = old_drop;
+                st.parser_cache = saved_cache;
+                st.token_cache = None;
+                return;
+            }
+        }
+        self.exec_with_reset_cache(inner, st);
+    }
+
+    #[inline(never)]
     fn exec_with_antiquot_suffix_splice(
         &self,
         kind: &Name,
@@ -1352,8 +1699,49 @@ impl BuiltinInterpreter {
             );
             return;
         };
-        let cat = val.clone();
-        self.exec_category_parser(&cat, prec, st);
+        let name = val.clone();
+        let canonical_cat = if name.to_display_string() == "syntax" {
+            Name::from_components(["stx"])
+        } else {
+            name.clone()
+        };
+        // Mirror `Lean/Parser/Extension.lean::parserOfStackFn` + `resolveParserNameCore`:
+        // 1. Category name (`term`, `tactic`, `conv`, `grind`, ...)
+        if self.categories.contains_key(&canonical_cat) {
+            self.exec_category_parser(&canonical_cat, prec, st);
+            return;
+        }
+        // 2. Active `FileGrammar` syntax abbreviation (`syntax rwRuleSeq := ...`, etc.)
+        let census = crate::extensions::extension_census();
+        if let Some((_, fg, snap)) = st.open_context.as_ref() {
+            if let Some(descr) = fg.resolve_abbreviation_in(snap, &name)
+                && let Ok(op) = self.compile_descr_op(descr, &census.alias_declarations)
+            {
+                self.exec_op(&op, st);
+                return;
+            }
+            if let Some(resolved) =
+                fg.resolve_name_in(snap, &name, |n| self.def_index.contains_key(n))
+                && let Some(&id) = self.def_index.get(&resolved)
+            {
+                self.exec_op(&self.defs[id].op, st);
+                return;
+            }
+        }
+        // 3. Direct compiled declaration name in `def_index`
+        if let Some(&id) = self.def_index.get(&name) {
+            self.exec_op(&self.defs[id].op, st);
+            return;
+        }
+        // 4. Registered zero-arg parser alias (`attrKind`, `optConfig`, `docComment`, ...)
+        let alias_key = name.to_display_string();
+        if census.alias_declarations.contains_key(&alias_key)
+            && let Ok(op) = self.compile_alias_op(&name, &census.alias_declarations)
+        {
+            self.exec_op(&op, st);
+            return;
+        }
+        self.exec_category_parser(&name, prec, st);
     }
 
     #[inline(never)]
@@ -1913,7 +2301,12 @@ impl BuiltinInterpreter {
             return;
         }
 
-        match lex_token(st.source, st.tokens, BytePos(start_pos)) {
+        let tokens = if st.use_header_tokens {
+            &self.header_tokens
+        } else {
+            &self.builtin_tokens
+        };
+        match lex_token(st.source, tokens, BytePos(start_pos)) {
             Ok(lexed) => {
                 if let TokenKind::Symbol(ref sym) = lexed.kind
                     && st.ctx.forbidden_tk.as_deref() == Some(sym.as_str())
@@ -2180,6 +2573,78 @@ impl BuiltinInterpreter {
         self.push_raw_atom(start_pos, true, st);
     }
 
+    fn verso_comment_body_fn(&self, st: &mut RuntimeState<'_>) {
+        let start_pos = st.pos;
+        let bytes = st.source.as_bytes();
+        let mut at = start_pos;
+        let mut depth = 1usize;
+        while depth > 0 {
+            match (bytes.get(at), bytes.get(at + 1)) {
+                (Some(b'-'), Some(b'/')) => {
+                    depth -= 1;
+                    at += 2;
+                }
+                (Some(b'/'), Some(b'-')) => {
+                    depth += 1;
+                    at += 2;
+                }
+                (Some(_), _) => at += 1,
+                (None, _) => {
+                    st.pos = at;
+                    st.mk_unexpected_error("unterminated comment", Vec::new(), true);
+                    return;
+                }
+            }
+        }
+        let close = at.saturating_sub(2);
+        let text = st.source.as_str();
+        let Some(verso) = crate::verso::body(text, start_pos, close) else {
+            st.pos = at;
+            self.push_raw_atom(start_pos, true, st);
+            return;
+        };
+        let ws_stop = match scan_trivia(st.source, BytePos(at)) {
+            Ok(ws) => {
+                st.pos = ws.0;
+                ws
+            }
+            Err(err) => {
+                st.pos = err.at().0;
+                st.mk_unexpected_error(err.message(), Vec::new(), false);
+                return;
+            }
+        };
+        let document = match verso {
+            crate::verso::Body::Blocks(blocks) => blocks,
+            crate::verso::Body::Failure => Syntax::node(
+                Name::from_components(["Lean", "Doc", "Syntax", "parseFailure"]),
+                vec![Syntax::Atom {
+                    info: SourceInfo::Original {
+                        leading: ByteSpan::empty_at(BytePos(start_pos)),
+                        pos: BytePos(start_pos),
+                        trailing: ByteSpan::empty_at(BytePos(close)),
+                        end_pos: BytePos(close),
+                    },
+                    val: text[start_pos..close].into(),
+                }],
+            ),
+        };
+        let closer = Syntax::Atom {
+            info: SourceInfo::Original {
+                leading: ByteSpan::empty_at(BytePos(close)),
+                pos: BytePos(close),
+                trailing: ByteSpan::new(BytePos(at), ws_stop)
+                    .expect("scan_trivia never moves backwards"),
+                end_pos: BytePos(at),
+            },
+            val: "-/".into(),
+        };
+        st.push(Syntax::node(
+            Name::from_components(["Lean", "Parser", "Command", "versoCommentBody"]),
+            vec![document, closer],
+        ));
+    }
+
     fn interpolated_str_fn(&self, inner: &ParserOp, st: &mut RuntimeState<'_>) {
         let stack_sz = st.stack_size();
         let start_pos = st.pos;
@@ -2384,6 +2849,8 @@ struct CacheableCtx {
     suppress_inside_quot: bool,
     saved_pos: Option<usize>,
     forbidden_tk: Option<String>,
+    verso_docs: bool,
+    verso_module_docs: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2403,7 +2870,12 @@ struct ParserCacheEntry {
 
 struct RuntimeState<'a> {
     source: &'a SourceText,
-    tokens: &'a TokenTable,
+    use_header_tokens: bool,
+    open_context: Option<(
+        &'a BuiltinInterpreter,
+        &'a crate::extensions::FileGrammar,
+        crate::extensions::FileScope,
+    )>,
     ctx: CacheableCtx,
     stack: Vec<Syntax>,
     stack_drop: usize,
@@ -2416,6 +2888,8 @@ struct RuntimeState<'a> {
     active_cache_keys: HashSet<ParserCacheKey>,
     depth: usize,
     max_depth: usize,
+    op_depth: usize,
+    max_op_depth: usize,
     steps: usize,
     max_steps: usize,
     budget_exhausted: bool,
@@ -2423,16 +2897,19 @@ struct RuntimeState<'a> {
 }
 
 impl<'a> RuntimeState<'a> {
-    fn new(source: &'a SourceText, tokens: &'a TokenTable, max_steps: usize) -> Self {
+    fn new(source: &'a SourceText, use_header_tokens: bool, max_steps: usize) -> Self {
         Self {
             source,
-            tokens,
+            use_header_tokens,
+            open_context: None,
             ctx: CacheableCtx {
                 prec: 0,
                 quot_depth: 0,
                 suppress_inside_quot: false,
                 saved_pos: None,
                 forbidden_tk: None,
+                verso_docs: false,
+                verso_module_docs: false,
             },
             stack: Vec::new(),
             stack_drop: 0,
@@ -2444,7 +2921,9 @@ impl<'a> RuntimeState<'a> {
             parser_cache: HashMap::new(),
             active_cache_keys: HashSet::new(),
             depth: 0,
-            max_depth: 256,
+            max_depth: 128,
+            op_depth: 0,
+            max_op_depth: 384,
             steps: 0,
             max_steps,
             budget_exhausted: false,
@@ -2960,8 +3439,9 @@ fn eval_const(
         "Lean.Parser.checkNoImmediateColon" => {
             Ok(EvalVal::Parser(Arc::new(ParserOp::CheckNoImmediateColon)))
         }
-        "Lean.Parser.Command.commentBody" | "Lean.Parser.Command.versoCommentBody" => {
-            Ok(EvalVal::Parser(Arc::new(ParserOp::CommentBody)))
+        "Lean.Parser.Command.commentBody" => Ok(EvalVal::Parser(Arc::new(ParserOp::CommentBody))),
+        "Lean.Parser.Command.versoCommentBody" => {
+            Ok(EvalVal::Parser(Arc::new(ParserOp::VersoCommentBody)))
         }
         "Lean.Parser.instInhabitedParser.default" => {
             Ok(EvalVal::Parser(Arc::new(ParserOp::InhabitedDefault)))
@@ -2981,7 +3461,9 @@ fn eval_const(
         "Lean.hexnumKind" => Ok(EvalVal::Name(Name::from_components(["hexnum"]))),
         "Lean.hygieneInfoKind" => Ok(EvalVal::Name(Name::from_components(["hygieneInfo"]))),
         "Lean.groupKind" => Ok(EvalVal::Name(Name::from_components(["group"]))),
-        "Lean.interpolatedStrKind" => Ok(EvalVal::Name(Name::from_components(["interpolatedStr"]))),
+        "Lean.interpolatedStrKind" => Ok(EvalVal::Name(Name::from_components([
+            "interpolatedStrKind",
+        ]))),
         // Syntax predicates & recovery helpers
         "Lean.Parser.Term.isIdent" => Ok(EvalVal::SyntaxPred(SyntaxPred::IsIdent)),
         "Lean.Parser.Term.isIdentOrDotIdentOrProj" => {
@@ -3127,12 +3609,45 @@ fn eval_call(
             let pred = extract_skip_until_pred(&args[0]);
             return Ok(EvalVal::Parser(Arc::new(ParserOp::SkipUntil(pred))));
         }
-        // Verso doc switches (default false on Prelude and standard Lean unless `doc.verso` is set)
-        "Lean.Doc.Parser.ifVerso" | "Lean.Doc.Parser.ifVersoModuleDocs" if args.len() == 2 => {
-            return eval_ast(table, def_index, owner, &args[1], env, depth);
+        // Verso doc switches (`doc.verso`, `doc.verso.module`, `withoutVersoSyntax`).
+        "Lean.Doc.Parser.ifVerso" if args.len() == 2 => {
+            let verso = expect_parser(
+                owner,
+                eval_ast(table, def_index, owner, &args[0], env, depth)?,
+            )?;
+            let plain = expect_parser(
+                owner,
+                eval_ast(table, def_index, owner, &args[1], env, depth)?,
+            )?;
+            return Ok(EvalVal::Parser(Arc::new(ParserOp::IfVerso {
+                module_docs: false,
+                verso,
+                plain,
+            })));
+        }
+        "Lean.Doc.Parser.ifVersoModuleDocs" if args.len() == 2 => {
+            let verso = expect_parser(
+                owner,
+                eval_ast(table, def_index, owner, &args[0], env, depth)?,
+            )?;
+            let plain = expect_parser(
+                owner,
+                eval_ast(table, def_index, owner, &args[1], env, depth)?,
+            )?;
+            return Ok(EvalVal::Parser(Arc::new(ParserOp::IfVerso {
+                module_docs: true,
+                verso,
+                plain,
+            })));
         }
         "Lean.Doc.Parser.withoutVersoSyntax" if args.len() == 1 => {
-            return eval_ast(table, def_index, owner, &args[0], env, depth);
+            let inner = expect_parser(
+                owner,
+                eval_ast(table, def_index, owner, &args[0], env, depth)?,
+            )?;
+            return Ok(EvalVal::Parser(Arc::new(ParserOp::WithoutVersoSyntax(
+                inner,
+            ))));
         }
         _ => {}
     }
@@ -3578,6 +4093,7 @@ fn compute_op_first_tokens(
         | ParserOp::WithResetCache(p)
         | ParserOp::WithOpen(p)
         | ParserOp::WithOpenDecl(p)
+        | ParserOp::WithoutVersoSyntax(p)
         | ParserOp::SetExpected { body: p, .. }
         | ParserOp::TokenWithAntiquot(p)
         | ParserOp::Recover { parser: p, .. } => {
@@ -3619,12 +4135,18 @@ fn compute_op_first_tokens(
             let fb = compute_op_first_tokens(b, raw_ops, cache, visiting);
             fa.merge(&fb)
         }
+        ParserOp::IfVerso { verso, plain, .. } => {
+            let fv = compute_op_first_tokens(verso, raw_ops, cache, visiting);
+            let fp = compute_op_first_tokens(plain, raw_ops, cache, visiting);
+            fv.merge(&fp)
+        }
         // `FirstTokens.unknown` primitives (exact match to `Basic.lean`)
         ParserOp::PushNone
         | ParserOp::Eoi
         | ParserOp::RawCh { .. }
         | ParserOp::RawIdent
         | ParserOp::CommentBody
+        | ParserOp::VersoCommentBody
         | ParserOp::Many(_)
         | ParserOp::Many1Unbox(_)
         | ParserOp::SepBy { .. }
@@ -3639,6 +4161,40 @@ fn compute_op_first_tokens(
         | ParserOp::SkipUntil(_)
         | ParserOp::ErrorAtSavedPos { .. }
         | ParserOp::InhabitedDefault => FirstTokens::Unknown,
+    }
+}
+
+fn extract_header_prelude_and_imports(header: &Syntax) -> (bool, Vec<Name>) {
+    let Syntax::Node { args, .. } = header else {
+        return (false, Vec::new());
+    };
+    let prelude = matches!(
+        args.get(1),
+        Some(Syntax::Node { args: items, .. }) if !items.is_empty()
+    );
+    let mut imports = Vec::new();
+    if let Some(Syntax::Node {
+        args: import_nodes, ..
+    }) = args.get(2)
+    {
+        for import in import_nodes {
+            if let Syntax::Node { args: parts, .. } = import
+                && let Some(Syntax::Ident { val, .. }) = parts.get(4)
+            {
+                imports.push(val.clone());
+            }
+        }
+    }
+    (prelude, imports)
+}
+
+fn declare_command_or_in(fg: &mut crate::extensions::FileGrammar, cmd: &Syntax) {
+    let _ = fg.declare(cmd);
+    if let Syntax::Node { kind, args, .. } = cmd
+        && *kind == Name::from_components(["Lean", "Parser", "Command", "in"])
+        && let Some(rhs) = args.get(2)
+    {
+        declare_command_or_in(fg, rhs);
     }
 }
 

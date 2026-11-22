@@ -520,7 +520,7 @@ pub struct ExtensionCensus {
     decls: Vec<Arc<SyntaxDecl>>,
     aliases: BTreeMap<String, AliasInfo>,
     /// Actual declaration backing each registered alias; not source visibility.
-    alias_declarations: BTreeMap<String, Name>,
+    pub(crate) alias_declarations: BTreeMap<String, Name>,
     /// Builtin categories, and categories declared by a module (`None` for builtin).
     categories: BTreeMap<Name, (IdentBehavior, Option<Name>)>,
 }
@@ -832,6 +832,46 @@ pub struct ActiveGrammar {
     expander: Option<Expander>,
     /// The doc-comment options in effect.
     docs: DocOptions,
+}
+
+impl ActiveGrammar {
+    pub(crate) fn doc_options(&self) -> DocOptions {
+        self.docs
+    }
+
+    pub(crate) fn generated_interpreter(
+        &self,
+        base: &crate::builtin_interpreter::BuiltinInterpreter,
+    ) -> Result<
+        Rc<crate::builtin_interpreter::BuiltinInterpreter>,
+        crate::builtin_interpreter::CompileError,
+    > {
+        let census = extension_census();
+        if std::ptr::eq(
+            base,
+            crate::builtin_interpreter::reference_builtin_interpreter(),
+        ) {
+            let mut cache = self.generated.borrow_mut();
+            return cache
+                .get_or_insert_with(|| {
+                    base.with_active_descriptions(
+                        &self.table,
+                        &self.decls,
+                        &self.category_behaviors,
+                        &census.alias_declarations,
+                    )
+                    .map(Rc::new)
+                })
+                .clone();
+        }
+        base.with_active_descriptions(
+            &self.table,
+            &self.decls,
+            &self.category_behaviors,
+            &census.alias_declarations,
+        )
+        .map(Rc::new)
+    }
 }
 
 /// The options that change how a doc comment parses (`Lean.Doc.Parser.ifVerso`,
@@ -1245,7 +1285,7 @@ enum Trail {
 }
 
 #[derive(Debug, Clone)]
-struct FileScope {
+pub(crate) struct FileScope {
     namespace: Name,
     trail: Vec<Trail>,
     opens: Vec<Name>,
@@ -1633,6 +1673,157 @@ impl FileGrammar {
         let mut scope = self.top().clone();
         self.activate_names_in(&mut scope, names, true);
         self.grammar_for(scope.trail, scope.docs)
+    }
+
+    pub(crate) fn scope_snapshot(&self) -> FileScope {
+        self.top().clone()
+    }
+
+    pub(crate) fn activate_snapshot(
+        &self,
+        snapshot: &FileScope,
+        names: &[Name],
+        simple: bool,
+    ) -> FileScope {
+        let mut next = snapshot.clone();
+        self.activate_names_in(&mut next, names, simple);
+        next
+    }
+
+    pub(crate) fn grammar_for_snapshot(&self, snapshot: &FileScope) -> Rc<ActiveGrammar> {
+        self.grammar_for(snapshot.trail.clone(), snapshot.docs)
+    }
+
+    pub(crate) fn resolve_abbreviation_in(
+        &self,
+        snapshot: &FileScope,
+        name: &Name,
+    ) -> Option<&Descr> {
+        let mut prefix = snapshot.namespace.clone();
+        loop {
+            if let Some(descr) = self.abbreviations.get(&prefix.append_core(name)) {
+                return Some(descr);
+            }
+            if prefix.is_anonymous() {
+                break;
+            }
+            prefix = prefix.parent();
+        }
+        snapshot
+            .opens
+            .iter()
+            .rev()
+            .find_map(|open| self.abbreviations.get(&open.append_core(name)))
+    }
+
+    pub(crate) fn resolve_name_in(
+        &self,
+        snapshot: &FileScope,
+        name: &Name,
+        exists: impl Fn(&Name) -> bool,
+    ) -> Option<Name> {
+        let mut prefix = snapshot.namespace.clone();
+        loop {
+            let candidate = prefix.append_core(name);
+            if exists(&candidate) {
+                return Some(candidate);
+            }
+            if prefix.is_anonymous() {
+                break;
+            }
+            prefix = prefix.parent();
+        }
+        snapshot.opens.iter().rev().find_map(|open| {
+            let candidate = open.append_core(name);
+            exists(&candidate).then_some(candidate)
+        })
+    }
+
+    /// Advance scope and doc-option state directly from a parsed command `Syntax` tree
+    /// (`Lean.Parser.Command.{namespace, section, end, open, set_option}`), mirroring
+    /// `Lean/Elab/BuiltinCommand.lean` and `Lean/Elab/Open.lean`.
+    pub fn apply_command_syntax(&mut self, command: &Syntax) {
+        let Syntax::Node { kind, args, .. } = command else {
+            return;
+        };
+        let command_kind = components(kind);
+        let parts: Vec<&str> = command_kind.iter().map(String::as_str).collect();
+        match parts.as_slice() {
+            ["Lean", "Parser", "Command", "namespace"] => {
+                if let Some(name) = args.get(1).and_then(ident_name) {
+                    self.apply(&ScopeCommand::Namespace(name));
+                }
+            }
+            ["Lean", "Parser", "Command", "section"] => {
+                let name = args
+                    .get(2)
+                    .and_then(null_args)
+                    .and_then(|items| items.first())
+                    .and_then(ident_name);
+                self.apply(&ScopeCommand::Section(name));
+            }
+            ["Lean", "Parser", "Command", "end"] => {
+                let name = args
+                    .get(1)
+                    .and_then(null_args)
+                    .and_then(|items| items.first())
+                    .and_then(ident_name);
+                self.apply(&ScopeCommand::End(name));
+            }
+            ["Lean", "Parser", "Command", "open"] => {
+                let Some(Syntax::Node {
+                    kind: decl_kind,
+                    args: decl_args,
+                    ..
+                }) = args.get(1)
+                else {
+                    return;
+                };
+                let dk = components(decl_kind);
+                let dparts: Vec<&str> = dk.iter().map(String::as_str).collect();
+                match dparts.as_slice() {
+                    ["Lean", "Parser", "Command", "openSimple"] => {
+                        if let Some(items) = decl_args.first().and_then(null_args) {
+                            let names: Vec<Name> = items.iter().filter_map(ident_name).collect();
+                            if !names.is_empty() {
+                                self.apply(&ScopeCommand::Open(names));
+                            }
+                        }
+                    }
+                    ["Lean", "Parser", "Command", "openScoped"] => {
+                        if let Some(items) = decl_args.get(1).and_then(null_args) {
+                            let names: Vec<Name> = items.iter().filter_map(ident_name).collect();
+                            if !names.is_empty() {
+                                self.apply(&ScopeCommand::OpenScoped(names));
+                            }
+                        }
+                    }
+                    ["Lean", "Parser", "Command", "openHiding"] => {
+                        if let Some(name) = decl_args.first().and_then(ident_name) {
+                            self.apply(&ScopeCommand::Open(vec![name]));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ["Lean", "Parser", "Command", "set_option"] => {
+                let Some(opt_name) = args.get(1).and_then(ident_name) else {
+                    return;
+                };
+                let bool_val = match args.get(3) {
+                    Some(Syntax::Atom { val, .. }) if val == "true" => Some(true),
+                    Some(Syntax::Atom { val, .. }) if val == "false" => Some(false),
+                    _ => None,
+                };
+                if let Some(value) = bool_val {
+                    self.apply(&ScopeCommand::SetOption {
+                        name: opt_name,
+                        value: DataValue::OfBool(value),
+                    });
+                }
+            }
+            _ => {}
+        }
     }
 
     fn grammar_for(&self, trail: Vec<Trail>, docs: DocOptions) -> Rc<ActiveGrammar> {
@@ -2243,6 +2434,7 @@ impl FileGrammar {
         }
         let descr =
             Descr::NodeWithAntiquot(name.to_display_string(), decl_name.clone(), Box::new(descr));
+        descr.collect_tokens(&mut self.declared_tokens);
         self.abbreviations.insert(decl_name.clone(), descr.clone());
         self.constants.insert(decl_name.clone());
         let decl = Arc::new(SyntaxDecl {

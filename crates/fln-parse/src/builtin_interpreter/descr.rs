@@ -88,7 +88,15 @@ fn alias_ast(
         .ok_or_else(|| CompileError::UnresolvedDecl(name.clone()))?;
     match (name.as_str(), args.as_slice()) {
         ("bracketedBinder", []) => args.push(CombinatorAst::LitBool(false)),
-        ("patternIgnore", [body]) => return Ok(body.clone()),
+        ("patternIgnore", [body]) => {
+            return Ok(call(
+                "Lean.Parser.node",
+                vec![
+                    CombinatorAst::LitName(Name::from_components(["patternIgnore"])),
+                    body.clone(),
+                ],
+            ));
+        }
         ("andthen", [left, right]) => {
             return Ok(CombinatorAst::Seq(
                 Box::new(left.clone()),
@@ -210,7 +218,64 @@ fn descr_ast(
     })
 }
 
+/// Set of `'static` census `SyntaxDecl` pointers so only invariant census
+/// descriptors are cached across files and scopes.
+fn census_decl_ptrs() -> &'static HashSet<usize> {
+    static PTRS: OnceLock<HashSet<usize>> = OnceLock::new();
+    PTRS.get_or_init(|| {
+        crate::extensions::extension_census()
+            .decls()
+            .iter()
+            .map(|decl| Arc::as_ptr(decl) as usize)
+            .collect()
+    })
+}
+
+/// Lazy per-declaration cache of compiled `(ParserOp, FirstTokens)` for
+/// `'static` census `SyntaxDecl`s, keyed by `Arc::as_ptr`. Compiling lazily on
+/// demand avoids touching unused census entries on small `own_syntax_only()`
+/// grammars while still eliminating redundant recompilation across files/scopes.
+fn census_compiled_cache() -> &'static std::sync::Mutex<HashMap<usize, CompiledParser>> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<usize, CompiledParser>>> = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 impl BuiltinInterpreter {
+    pub(super) fn compile_descr_op(
+        &self,
+        description: &Descr,
+        aliases: &BTreeMap<String, Name>,
+    ) -> Result<Arc<ParserOp>, CompileError> {
+        let owner = Name::from_components(["active", "descriptor"]);
+        let ast = descr_ast(description, aliases, 0)?;
+        let value = eval_ast(
+            reference_builtin_parser_table(),
+            &self.def_index,
+            &owner,
+            &ast,
+            &mut Vec::new(),
+            0,
+        )?;
+        expect_parser(&owner, value)
+    }
+
+    pub(super) fn compile_alias_op(
+        &self,
+        alias: &Name,
+        aliases: &BTreeMap<String, Name>,
+    ) -> Result<Arc<ParserOp>, CompileError> {
+        let ast = alias_ast(alias, Vec::new(), aliases)?;
+        let value = eval_ast(
+            reference_builtin_parser_table(),
+            &self.def_index,
+            alias,
+            &ast,
+            &mut Vec::new(),
+            0,
+        )?;
+        expect_parser(alias, value)
+    }
+
     pub(crate) fn with_active_descriptions(
         &self,
         tokens: &TokenTable,
@@ -220,24 +285,31 @@ impl BuiltinInterpreter {
     ) -> Result<Self, CompileError> {
         let mut out = self.clone();
         out.builtin_tokens = tokens.clone();
+        let mut added_categories = Vec::new();
         for (name, behavior) in behaviors {
-            out.categories
-                .entry(name.clone())
-                .or_insert_with(|| CategoryDispatch {
-                    name: name.clone(),
-                    behavior: match behavior {
-                        IdentBehavior::Default => LeadingIdentBehavior::Default,
-                        IdentBehavior::Symbol => LeadingIdentBehavior::Symbol,
-                        IdentBehavior::Both => LeadingIdentBehavior::Both,
+            if !out.categories.contains_key(name) {
+                added_categories.push(name.clone());
+                out.categories.insert(
+                    name.clone(),
+                    CategoryDispatch {
+                        name: name.clone(),
+                        behavior: match behavior {
+                            IdentBehavior::Default => LeadingIdentBehavior::Default,
+                            IdentBehavior::Symbol => LeadingIdentBehavior::Symbol,
+                            IdentBehavior::Both => LeadingIdentBehavior::Both,
+                        },
+                        leading_table: BTreeMap::new(),
+                        leading_unindexed: Vec::new(),
+                        trailing_table: BTreeMap::new(),
+                        trailing_unindexed: Vec::new(),
+                        antiquot_parser: build_category_antiquot_parser(name),
                     },
-                    leading_table: BTreeMap::new(),
-                    leading_unindexed: Vec::new(),
-                    trailing_table: BTreeMap::new(),
-                    trailing_unindexed: Vec::new(),
-                    antiquot_parser: build_category_antiquot_parser(name),
-                });
+                );
+            }
         }
         let first_new = out.defs.len();
+        out.defs
+            .reserve(declarations.len() + added_categories.len());
         for (offset, declaration) in declarations.iter().enumerate() {
             if self.def_index.contains_key(&declaration.decl) {
                 return Err(CompileError::TypeMismatch {
@@ -249,37 +321,77 @@ impl BuiltinInterpreter {
             out.def_index
                 .insert(declaration.decl.clone(), first_new + offset);
         }
-        for declaration in declarations {
-            let ast = descr_ast(&declaration.descr, aliases, 0)?;
-            let value = eval_ast(
-                reference_builtin_parser_table(),
-                &out.def_index,
-                &declaration.decl,
-                &ast,
-                &mut Vec::new(),
-                0,
-            )?;
-            out.defs.push(CompiledParser {
-                op: expect_parser(&declaration.decl, value)?,
-                first_tokens: FirstTokens::Unknown,
+        let use_census_cache = std::ptr::eq(self, reference_builtin_interpreter());
+        let census_ptrs = use_census_cache.then(census_decl_ptrs);
+        let mut needs_first_tokens = Vec::new();
+        let mut newly_compiled_census: Vec<(usize, usize)> = Vec::new();
+        {
+            let guard = use_census_cache.then(|| {
+                census_compiled_cache()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
             });
+            for (offset, declaration) in declarations.iter().enumerate() {
+                let ptr = Arc::as_ptr(declaration) as usize;
+                let is_census = census_ptrs.is_some_and(|set| set.contains(&ptr));
+                if is_census && let Some(cached) = guard.as_ref().and_then(|map| map.get(&ptr)) {
+                    out.defs.push(cached.clone());
+                    continue;
+                }
+                let ast = descr_ast(&declaration.descr, aliases, 0)?;
+                let value = eval_ast(
+                    reference_builtin_parser_table(),
+                    &out.def_index,
+                    &declaration.decl,
+                    &ast,
+                    &mut Vec::new(),
+                    0,
+                )?;
+                let id = first_new + offset;
+                out.defs.push(CompiledParser {
+                    op: expect_parser(&declaration.decl, value)?,
+                    first_tokens: FirstTokens::Unknown,
+                });
+                needs_first_tokens.push(id);
+                if is_census {
+                    newly_compiled_census.push((ptr, id));
+                }
+            }
         }
-        let raw_ops: Vec<_> = out
-            .defs
-            .iter()
-            .map(|d| (Name::anonymous(), Arc::clone(&d.op)))
-            .collect();
-        let mut cache: Vec<_> = self
-            .defs
-            .iter()
-            .map(|d| Some(d.first_tokens.clone()))
-            .collect();
-        cache.resize(out.defs.len(), None);
-        let mut visiting = vec![false; out.defs.len()];
+        if !needs_first_tokens.is_empty() {
+            let raw_ops: Vec<_> = out
+                .defs
+                .iter()
+                .map(|d| (Name::anonymous(), Arc::clone(&d.op)))
+                .collect();
+            let mut cache: Vec<_> = out
+                .defs
+                .iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    if needs_first_tokens.contains(&i) {
+                        None
+                    } else {
+                        Some(d.first_tokens.clone())
+                    }
+                })
+                .collect();
+            let mut visiting = vec![false; out.defs.len()];
+            for id in needs_first_tokens {
+                let first = compute_def_first_tokens(id, &raw_ops, &mut cache, &mut visiting);
+                out.defs[id].first_tokens = first;
+            }
+            if !newly_compiled_census.is_empty() {
+                let mut guard = census_compiled_cache()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for (ptr, id) in newly_compiled_census {
+                    guard.entry(ptr).or_insert_with(|| out.defs[id].clone());
+                }
+            }
+        }
         for (offset, declaration) in declarations.iter().enumerate() {
             let id = first_new + offset;
-            let first = compute_def_first_tokens(id, &raw_ops, &mut cache, &mut visiting);
-            out.defs[id].first_tokens = first.clone();
             let Some(category) = &declaration.category else {
                 continue;
             };
@@ -293,7 +405,7 @@ impl BuiltinInterpreter {
             };
             // addParser conses each new entry. FileGrammar passes the actual
             // declaration/activation chronology, including local and scoped syntax.
-            match first.indexed_tokens() {
+            match out.defs[id].first_tokens.indexed_tokens() {
                 Some(tokens) => {
                     for token in tokens {
                         table
@@ -303,6 +415,55 @@ impl BuiltinInterpreter {
                     }
                 }
                 None => unindexed.insert(0, (id, declaration.priority)),
+            }
+        }
+        // Mirror `Lean/Elab/Syntax.lean::declareSyntaxCatQuotParser`: any newly declared
+        // syntax category whose quotation opener `` `(<suffix>| `` is not yet registered in
+        // `term` receives its standard `Lean.Parser.Term.quot` -> `<cat>.quot` parser.
+        let term_name = Name::from_components(["term"]);
+        for cat_name in added_categories {
+            let LeafView::Str(suffix) = cat_name.leaf_view() else {
+                continue;
+            };
+            let quot_sym = format!("`({suffix}|");
+            let quot_key = Name::str(Name::anonymous(), &quot_sym);
+            let already_registered = out
+                .categories
+                .get(&term_name)
+                .is_some_and(|term_cat| term_cat.leading_table.contains_key(&quot_key));
+            if already_registered {
+                continue;
+            }
+            let quot_kind = Name::str(cat_name.clone(), "quot");
+            let descr = Descr::Node {
+                kind: Name::from_components(["Lean", "Parser", "Term", "quot"]),
+                prec: MAX_PREC,
+                body: Box::new(Descr::Node {
+                    kind: quot_kind.clone(),
+                    prec: MAX_PREC,
+                    body: Box::new(Descr::Binary(
+                        Name::from_components(["andthen"]),
+                        Box::new(Descr::Symbol(format!("`({suffix}| "))),
+                        Box::new(Descr::Binary(
+                            Name::from_components(["andthen"]),
+                            Box::new(Descr::Cat(cat_name.clone(), 0)),
+                            Box::new(Descr::Symbol(")".to_owned())),
+                        )),
+                    )),
+                }),
+            };
+            if let Ok(op) = out.compile_descr_op(&descr, aliases) {
+                let id = out.defs.len();
+                let first_tokens = FirstTokens::Tokens(vec![quot_sym]);
+                out.defs.push(CompiledParser { op, first_tokens });
+                out.def_index.entry(quot_kind).or_insert(id);
+                if let Some(term_cat) = out.categories.get_mut(&term_name) {
+                    term_cat
+                        .leading_table
+                        .entry(quot_key)
+                        .or_default()
+                        .insert(0, (id, 1000));
+                }
             }
         }
         Ok(out)
@@ -366,7 +527,7 @@ impl BuiltinInterpreter {
     }
 
     fn run(&self, input: ParserInput<'_>, parse: impl FnOnce(&mut RuntimeState<'_>)) -> ParserRun {
-        let mut state = RuntimeState::new(input.source, &self.builtin_tokens, input.max_steps);
+        let mut state = RuntimeState::new(input.source, false, input.max_steps);
         state.pos = input.start;
         state.ctx.saved_pos = input.saved_pos;
         state.ctx.quot_depth = input.quot_depth;

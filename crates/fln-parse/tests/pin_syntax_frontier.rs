@@ -533,3 +533,305 @@ fn pin_syntax_frontier_a_measures_the_production_parser() {
         check.unnamed.len()
     );
 }
+
+#[test]
+fn generated_registry_parses_scopes_open_in_verso_and_local_syntax() {
+    use fln_parse::builtin_interpreter::{DEFAULT_STEP_BUDGET, reference_builtin_interpreter};
+    use fln_syntax::source::SourceText;
+
+    let interp = reference_builtin_interpreter();
+    let src = SourceText::from_utf8(
+        br#"prelude
+namespace MyScope
+scoped syntax "magicTok" : term
+def insideScope := magicTok
+end MyScope
+
+open scoped MyScope in
+def viaOpenCmd := magicTok
+
+def viaOpenTerm := open scoped MyScope in magicTok
+
+set_option doc.verso true
+/--
+A verso paragraph with {name}`Nat`.
+-/
+def documented := 1
+
+syntax (name := myTriple) "triple(" patternIgnore("!") term ")" : term
+def usesLocal := triple(! documented)
+
+declare_syntax_cat mycat
+syntax "myleaf" : mycat
+def usesDeclaredCatQuot := `(mycat| myleaf)
+
+syntax myAbbrev := "abv" ident
+def usesAbbrevQuot := `(myAbbrev| abv foo)
+def usesAliasQuot := `(attrKind| local)
+
+syntax "s!" interpolatedStr(term) : term
+def usesInterp := s!"hello {documented}"
+"#,
+    )
+    .unwrap();
+    let parsed = interp.parse_module_with_file_grammar(
+        &src,
+        Some(Name::from_components(["Stage5Smoke"])),
+        DEFAULT_STEP_BUDGET,
+    );
+    assert!(
+        parsed.errors.is_empty(),
+        "unexpected parse errors: {:?}",
+        parsed.errors
+    );
+    assert!(!parsed.budget_exhausted);
+
+    fn has_kind(stx: &Syntax, needle: &str) -> bool {
+        let mut stack = vec![stx];
+        while let Some(node) = stack.pop() {
+            if let Syntax::Node { kind, args, .. } = node {
+                if kind.to_display_string() == needle {
+                    return true;
+                }
+                stack.extend(args.iter());
+            }
+        }
+        false
+    }
+
+    assert!(
+        parsed
+            .commands
+            .iter()
+            .any(|c| has_kind(c, "Lean.Parser.Command.versoCommentBody")),
+        "set_option doc.verso true must emit Lean.Parser.Command.versoCommentBody even at top of command"
+    );
+    assert!(
+        parsed.commands.iter().any(|c| has_kind(c, "myTriple")),
+        "local syntax declaration must register myTriple for subsequent commands"
+    );
+    assert!(
+        parsed.commands.iter().any(|c| has_kind(c, "patternIgnore")),
+        "patternIgnore alias must preserve the patternIgnore wrapper node"
+    );
+    assert!(
+        parsed.commands.iter().any(|c| has_kind(c, "mycat.quot")),
+        "declare_syntax_cat must register its mycat.quot quotation parser in term"
+    );
+    assert!(
+        parsed.commands.iter().any(|c| has_kind(c, "myAbbrev")),
+        "parserOfStack must resolve active syntaxAbbrev in dynamic quotation"
+    );
+    assert!(
+        parsed
+            .commands
+            .iter()
+            .any(|c| has_kind(c, "Lean.Parser.Term.attrKind")),
+        "parserOfStack must resolve registered parser aliases in dynamic quotation"
+    );
+    assert!(
+        parsed
+            .commands
+            .iter()
+            .any(|c| has_kind(c, "interpolatedStrKind")),
+        "interpolatedStr must emit interpolatedStrKind"
+    );
+
+    // Outside MyScope without `open scoped`, `magicTok` must not parse as MyScope's syntax.
+    let outside = SourceText::from_utf8(
+        br#"prelude
+namespace MyScope
+scoped syntax (name := scopedMagic) "magicTok" : term
+end MyScope
+def leaked := magicTok
+"#,
+    )
+    .unwrap();
+    let parsed_out = interp.parse_module_with_file_grammar(
+        &outside,
+        Some(Name::from_components(["Stage5Leak"])),
+        DEFAULT_STEP_BUDGET,
+    );
+    assert!(
+        !parsed_out
+            .commands
+            .iter()
+            .any(|c| has_kind(c, "MyScope.scopedMagic")),
+        "scoped syntax must deactivate after end MyScope"
+    );
+}
+
+#[ignore = "cost: Stage 5 pure generated registry parser (BuiltinInterpreter + FileGrammar ParserDescr) over all 71,015 Init+Std commands from ~/.cache/fln/pin-syntax (bead franken_lean-z8j.1.10)"]
+#[test]
+fn pin_syntax_frontier_stage5_generated_registry() {
+    use fln_parse::builtin_interpreter::{DEFAULT_STEP_BUDGET, reference_builtin_interpreter};
+    use fln_syntax::source::SourceText;
+    use std::time::Instant;
+
+    let root = workspace_root();
+    let producer = format!(
+        "{:016x}",
+        fnv1a(&std::fs::read(root.join(PRODUCER)).expect("read the producer"))
+    );
+    let Some(cache) = cache_root().map(|cache| cache.join(pin_commit(&root)).join(&producer))
+    else {
+        eprintln!("SKIP pin_syntax_frontier_stage5: no cache directory");
+        return;
+    };
+    let manifest = std::fs::read_to_string(root.join(MANIFEST)).expect("read the manifest");
+    let files: Vec<&str> = manifest
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split('\t').next())
+        .collect();
+    assert!(files.len() > 1000, "manifest too small: {}", files.len());
+
+    let interp = reference_builtin_interpreter();
+    let t0 = Instant::now();
+    let mut histogram: BTreeMap<String, usize> = BTreeMap::new();
+    let mut examples: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut worst_files: Vec<(usize, usize, String)> = Vec::new();
+    let mut identical_headers = 0usize;
+    let mut identical_files = 0usize;
+    let mut files_with_errors = 0usize;
+    let mut total_errors = 0usize;
+    let mut budget_exhausted_files = 0usize;
+    let mut total_cmds = 0usize;
+
+    for file in &files {
+        let source_bytes = std::fs::read(root.join(SOURCES).join(file)).expect("read a source");
+        let Ok(dump) =
+            std::fs::read_to_string(cache.join(format!("{:016x}.dump", fnv1a(&source_bytes))))
+        else {
+            eprintln!("SKIP pin_syntax_frontier_stage5: {file} has no cached dump");
+            return;
+        };
+        let trees = pin_syntax::read(&dump, &source_bytes).expect("cached dump reads");
+        let source = SourceText::from_utf8(&source_bytes).expect("utf-8 source");
+        let module = file
+            .strip_suffix(".lean")
+            .map(|path| Name::from_components(path.split('/')));
+        let parsed = interp.parse_module_with_file_grammar(&source, module, DEFAULT_STEP_BUDGET);
+
+        if compare(&trees.header, &parsed.header, 0) == Ok(None) {
+            identical_headers += 1;
+        }
+        if !parsed.errors.is_empty() {
+            files_with_errors += 1;
+            total_errors += parsed.errors.len();
+        }
+        if parsed.budget_exhausted {
+            budget_exhausted_files += 1;
+        }
+
+        let pin_cmds: Vec<&Syntax> = trees
+            .commands
+            .iter()
+            .filter(|tree| {
+                !matches!(
+                    tree,
+                    Syntax::Node { kind, .. } if kind.to_display_string() == "Lean.Parser.Command.eoi"
+                )
+            })
+            .collect();
+        let mut ours_by_start: BTreeMap<usize, &Syntax> = BTreeMap::new();
+        for cmd in &parsed.commands {
+            if matches!(
+                cmd,
+                Syntax::Node { kind, .. } if kind.to_display_string() == "Lean.Parser.Command.eoi"
+            ) {
+                continue;
+            }
+            if let Some(pos) = first_position(cmd) {
+                ours_by_start.entry(pos).or_insert(cmd);
+            }
+        }
+
+        let mut file_bad = 0usize;
+        for pin in &pin_cmds {
+            total_cmds += 1;
+            let Some(start) = first_position(pin) else {
+                file_bad += 1;
+                *histogram
+                    .entry("boundary:pin-no-pos".to_owned())
+                    .or_default() += 1;
+                continue;
+            };
+            let Some(ours) = ours_by_start.get(&start) else {
+                file_bad += 1;
+                let class = if parsed.budget_exhausted {
+                    "boundary:budget".to_owned()
+                } else if !parsed.errors.is_empty() {
+                    "boundary:after-error".to_owned()
+                } else {
+                    "boundary:missing".to_owned()
+                };
+                let shown = examples.entry(class.clone()).or_default();
+                if shown.len() < 3 {
+                    let first_err = parsed
+                        .errors
+                        .first()
+                        .map(|e| format!("err@{} {}", e.pos, e.unexpected))
+                        .unwrap_or_default();
+                    shown.push(format!("{file}@{start} {first_err}"));
+                }
+                *histogram.entry(class).or_default() += 1;
+                continue;
+            };
+            match compare(pin, ours, 0) {
+                Ok(None) => {
+                    *histogram.entry("identical".to_owned()).or_default() += 1;
+                }
+                Ok(Some(leaf)) => {
+                    file_bad += 1;
+                    let class = "positions".to_owned();
+                    let shown = examples.entry(class.clone()).or_default();
+                    if shown.len() < 3 {
+                        shown.push(format!("{file}@{start} {leaf}"));
+                    }
+                    *histogram.entry(class).or_default() += 1;
+                }
+                Err(kind) => {
+                    file_bad += 1;
+                    let class = format!("tree:{kind}");
+                    let shown = examples.entry(class.clone()).or_default();
+                    if shown.len() < 3 {
+                        shown.push(format!("{file}@{start} ours={}", kind_of(ours)));
+                    }
+                    *histogram.entry(class).or_default() += 1;
+                }
+            }
+        }
+        if !pin_cmds.is_empty() && file_bad == 0 {
+            identical_files += 1;
+        }
+        if file_bad > 0 {
+            worst_files.push((file_bad, pin_cmds.len(), (*file).to_owned()));
+        }
+    }
+
+    let identical = histogram.get("identical").copied().unwrap_or(0);
+    let mut rows: Vec<_> = histogram.iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    eprintln!(
+        "STAGE 5 GENERATED REGISTRY FRONTIER ({:.2}s): {identical}/{total_cmds} ({:.2}%) commands identical; \
+         {identical_files}/{} files wholly identical; headers {identical_headers}/{}; \
+         files_with_errors={files_with_errors} total_errors={total_errors} budget_exhausted={budget_exhausted_files}",
+        t0.elapsed().as_secs_f64(),
+        (identical as f64) * 100.0 / (total_cmds.max(1) as f64),
+        files.len(),
+        files.len(),
+    );
+    for (class, count) in rows.iter().take(40) {
+        let ex = examples
+            .get(*class)
+            .map(|v| v.join(" | "))
+            .unwrap_or_default();
+        eprintln!("  {count:>6}  {class}  [{ex}]");
+    }
+    worst_files.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)));
+    eprintln!("TOP 20 FILES BY NON-IDENTICAL COMMANDS:");
+    for (bad, total, file) in worst_files.iter().take(20) {
+        eprintln!("  {bad:>4}/{total:<4}  {file}");
+    }
+}
