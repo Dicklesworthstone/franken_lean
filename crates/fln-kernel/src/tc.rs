@@ -8778,7 +8778,7 @@ mod tests {
         for i in (1..40).rev() {
             let val = Expr::app(Expr::app(f.clone(), bvar0.clone()), bvar0.clone());
             term = Expr::let_e(
-                Name::str(Name::anonymous(), &format!("x{i}")),
+                Name::str(Name::anonymous(), format!("x{i}")),
                 nat.clone(),
                 val,
                 term,
