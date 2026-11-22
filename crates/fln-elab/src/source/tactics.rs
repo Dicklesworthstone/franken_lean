@@ -2023,9 +2023,11 @@ impl Context {
                 return Err(error(TacticError::MalformedScript));
             };
             expect_atom(keyword, word, "well-founded recursion tactic")?;
-            let body = self.proof_instructions(expansion)?;
-            proof.work.push(Work::Goal(goal));
-            self.start_macro_scope(proof, body)?;
+            if word != "decreasing_tactic" || !self.try_direct_decreasing_proof(&goal)? {
+                let body = self.proof_instructions(expansion)?;
+                proof.work.push(Work::Goal(goal));
+                self.start_macro_scope(proof, body)?;
+            }
         } else if kind == &parser_kind(&["Tactic", "clear"]) {
             self.clear_proof_locals(proof, goal, args)?;
         } else if kind == &parser_kind(&["Tactic", "tacticNext_=>_"]) {

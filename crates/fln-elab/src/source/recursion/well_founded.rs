@@ -1427,7 +1427,7 @@ impl Context {
     /// `Init.Omega`) or the goal needs `simp` (e.g. `SizeOf` lemmas), roll back
     /// cleanly while retaining spent work and immutable environment caches so
     /// the caller falls through to the full `automatic_decreasing_proof`.
-    fn try_direct_decreasing_proof(
+    pub(in crate::source) fn try_direct_decreasing_proof(
         &mut self,
         goal: &tactics::ProofGoal,
     ) -> Result<bool, NatDefinitionElabError> {
