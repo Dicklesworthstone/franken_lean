@@ -22,7 +22,9 @@ use fln_env::constants::{
 use std::collections::HashSet;
 
 mod course_of_values;
+mod ctor_idx;
 pub use course_of_values::{below_declaration, brec_on_declarations};
+pub use ctor_idx::{CtorIdxCandidates, CtorIdxConstMeta, ctor_idx_declarations};
 
 /// A candidate could not be constructed; this is not a kernel verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
