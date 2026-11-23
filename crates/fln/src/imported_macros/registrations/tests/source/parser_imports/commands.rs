@@ -137,6 +137,38 @@ fn command_fixture(payload: Payload, selected: Option<u64>) -> (SourceOleanImpor
     (imported, code)
 }
 
+fn check_with_command_hygiene(
+    imported: &SourceOleanImport,
+    code: &[IrModule],
+    source: &str,
+) -> crate::source_check::modules::SourceMacroModuleCheck {
+    use crate::source_check::modules::{SourceModuleCheckLimits, SourceModuleMacroInputs};
+
+    let module = name("Main");
+    imported.check_source_modules_with_imported_macros(
+        &[crate::SourceModuleInput {
+            name: &module,
+            source: source.as_bytes(),
+        }],
+        &module,
+        &KVMap::new(),
+        SourceModuleCheckLimits::new(crate::source_check::SourceCheckLimits::new(admission())),
+        SourceModuleMacroInputs {
+            code,
+            partition: &VerifiedPartition::user_fixture(),
+            user_declarations: &users(code),
+            registry_limits: MacroRegistryLimits::default(),
+            context: MacroContext {
+                current_macro_scope: 0,
+                ..context()
+            },
+            state: MacroState::default(),
+            limits: MacroTreeLimits::default(),
+        },
+        None,
+    )
+}
+
 fn command_artifact_fixture(
     payload: Payload,
     selected: Option<u64>,
@@ -486,9 +518,170 @@ fn custom_command_scopes_restore_and_do_not_escape_source_modules() {
 }
 
 #[test]
-fn custom_command_result_must_be_one_named_declaration() {
+fn imported_custom_commands_check_examples_without_publishing_declarations() {
+    let (imported, code) = command_fixture(Payload::Example, Some(2));
+    let before = imported.engine.logical_root(&KVMap::new());
+    let prefix = "prelude\nimport SourceLibrary\nmacro \"nativeValue\" : term => `(0 + 11)\n";
+    let source = format!(
+        "{prefix}\
+         declare! (example : Nat := nativeValue)\n\
+         declare! (example : 1 = 1 := by rfl)\n\
+         namespace Scoped\nvariable (P : Prop) (h : P)\n\
+         declare! (example : P := h)\nend Scoped"
+    );
+    for command_hygiene in [false, true] {
+        let run = |source: &str| {
+            if command_hygiene {
+                check_with_command_hygiene(&imported, &code, source)
+            } else {
+                check(
+                    &imported,
+                    &code,
+                    &[("Main", source)],
+                    MacroTreeLimits::default(),
+                    None,
+                )
+            }
+        };
+        let baseline = run(prefix);
+        let baseline = &succeeded(&baseline).checked;
+        let report = run(&source);
+        let checked = &succeeded(&report).checked;
+        assert_eq!(checked.theorems, 0);
+        assert_eq!(checked.result_logical_root, baseline.result_logical_root);
+        assert_eq!(
+            checked.engine.environment().len(),
+            baseline.engine.environment().len()
+        );
+        assert!(!checked.engine.environment().contains(&name("_example")));
+        assert_eq!(
+            report
+                .attempts
+                .iter()
+                .filter(|attempt| attempt.declaration == name("SourceLibrary.commandMacro"))
+                .count(),
+            3
+        );
+        assert!(report.attempts.iter().any(|attempt| {
+            attempt
+                .native_functions
+                .iter()
+                .any(|name| name == "source-template:quoted")
+        }));
+        assert!(report.completed_vm_usage.steps > 0);
+    }
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn imported_custom_command_examples_reach_program_execution() {
+    let (imported, code) = command_fixture(Payload::BuiltinCommand, Some(2));
+    let declarations = users(&code);
+    let compilation =
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let report = execute_graph(
+        &imported,
+        compilation,
+        &[(
+            "Main",
+            "prelude\nimport SourceLibrary\n\
+             declare! (declare! (example : Nat := 42))\n#eval (43 : Nat)",
+        )],
+        crate::source_check::modules::execution::SourceProgramLimits::new(execution_limits()),
+        MacroRegistryLimits::default(),
+        None,
+    );
+    let Outcome::Complete(Ok(program)) = &report.outcome else {
+        panic!("{report:?}")
+    };
+    let batch = &program.modules[0].commands.batch;
+    assert_eq!(batch.base_logical_root, batch.result_logical_root);
+    assert!(batch.source_admissions.is_empty());
+    assert_eq!(batch.source_evaluation_indices.len(), 1);
+    let index = batch.source_evaluation_indices[0];
+    assert_eq!(
+        crate::closed_vm_value(&batch.executions[index].exit)
+            .unwrap()
+            .unwrap(),
+        crate::ClosedVmValue::Scalar(43)
+    );
+    assert_eq!(report.attempts.len(), 2);
+    assert!(report.completed_vm_usage.steps > 0);
+    assert!(report.states.is_some());
+}
+
+#[test]
+fn imported_custom_command_false_examples_reach_checking_and_roll_back() {
+    let (imported, code) = command_fixture(Payload::Example, Some(2));
+    let before = imported.engine.logical_root(&KVMap::new());
+    let source = "prelude\nimport SourceLibrary\ndef priorValue : Nat := 7\n\
+                  declare! (example : 0 = 1 := by rfl)";
+    for report in [
+        check(
+            &imported,
+            &code,
+            &[("Main", source)],
+            MacroTreeLimits::default(),
+            None,
+        ),
+        check_with_command_hygiene(&imported, &code, source),
+    ] {
+        let Outcome::Complete(Err(SourceModuleCheckError::Source { error, .. })) = &report.outcome
+        else {
+            panic!("{report:?}")
+        };
+        assert!(
+            matches!(error, SourceCheckError::Command { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            report
+                .attempts
+                .iter()
+                .filter(|attempt| attempt.declaration == name("SourceLibrary.commandMacro"))
+                .count(),
+            1
+        );
+        assert!(report.states.is_none());
+    }
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    assert!(!imported.engine.environment().contains(&name("priorValue")));
+    assert!(!imported.engine.environment().contains(&name("_example")));
+}
+
+#[test]
+fn imported_custom_command_examples_preserve_typed_limits_and_cancellation() {
+    struct Cancel;
+    impl fln_vm::interpreter::CancellationProbe for Cancel {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    let (imported, code) = command_fixture(Payload::Example, Some(2));
+    let before = imported.engine.logical_root(&KVMap::new());
+    let source = "prelude\nimport SourceLibrary\n\
+                  declare! (example : Nat := 1)\ndeclare! (example : Nat := 2)";
+    for cancelled in [false, true] {
+        let mut limits = MacroTreeLimits::default();
+        limits.dispatch.max_attempts = 1;
+        let probe = Cancel;
+        let cancellation =
+            cancelled.then_some(&probe as &dyn fln_vm::interpreter::CancellationProbe);
+        let report = check(&imported, &code, &[("Main", source)], limits, cancellation);
+        assert!(
+            matches!(report.outcome, Outcome::Inconclusive(_)),
+            "{report:?}"
+        );
+        assert_eq!(report.attempts.len(), usize::from(!cancelled));
+        assert!(report.states.is_none());
+        assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    }
+}
+
+#[test]
+fn custom_command_result_must_be_one_declaration_or_example() {
     for (payload, inner) in [
-        (Payload::Example, "example : Nat := 0"),
         (Payload::Check, "#check Nat"),
         (Payload::Namespace, "namespace Hidden"),
         (Payload::Container, "def nested : Nat := 0"),

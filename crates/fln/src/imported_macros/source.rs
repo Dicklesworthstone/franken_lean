@@ -90,6 +90,7 @@ pub enum SourceMacroError {
     },
     EvaluationRequired,
     DeclarationRequired,
+    CommandDeclarationRequired,
     ExampleRequired,
     ScopeControl {
         kind: Name,
@@ -139,6 +140,12 @@ impl std::fmt::Display for SourceMacroError {
             }
             Self::DeclarationRequired => {
                 write!(f, "source macro admission requires one named declaration")
+            }
+            Self::CommandDeclarationRequired => {
+                write!(
+                    f,
+                    "source command macro requires one declaration or anonymous example"
+                )
             }
             Self::ExampleRequired => {
                 write!(f, "source macro checking requires an anonymous example")
@@ -316,14 +323,8 @@ pub(crate) fn scoped_command(
     if fln_elab::source::deriving::is_command(parsed.syntax()) {
         return Ok(ScopedCommandSyntax::Deriving(parsed.syntax().clone()));
     }
-    match parsed.kind() {
-        SourceCommandKind::Example => Ok(ScopedCommandSyntax::Example(parsed)),
-        SourceCommandKind::Definition => parsed
-            .into_definition()
-            .map(ScopedCommandSyntax::Definition)
-            .ok_or_else(|| SourceMacroError::DeclarationRequired.into_execution_error()),
-        _ => Err(SourceMacroError::DeclarationRequired.into_execution_error()),
-    }
+    ScopedCommandSyntax::from_declaration(parsed)
+        .ok_or_else(|| SourceMacroError::DeclarationRequired.into_execution_error())
 }
 
 impl<'a> FileSession<'a> {
@@ -843,10 +844,8 @@ impl<'a> FileSession<'a> {
                     .expand_imported_command(engine, registry, parsed, scope)
                     .map_complete(|result| {
                         result.and_then(|parsed| {
-                            parsed
-                                .into_definition()
-                                .map(ScopedCommandSyntax::Definition)
-                                .ok_or(SourceMacroError::DeclarationRequired)
+                            ScopedCommandSyntax::from_declaration(parsed)
+                                .ok_or(SourceMacroError::CommandDeclarationRequired)
                         })
                     });
             }
@@ -1025,8 +1024,9 @@ impl<'a> FileSession<'a> {
     }
 
     /// The caller has checked both registrations and the source preflight.
-    /// Expand the complete original tree once, then require one ordinary named
-    /// declaration. The usual elaborator and council still own its admission.
+    /// Expand the complete original tree once, then require one ordinary
+    /// declaration or anonymous example. The usual elaborator and council still
+    /// check it; the example's checked successor is discarded by its caller.
     fn expand_imported_command(
         &mut self,
         engine: &Engine,
@@ -1047,7 +1047,7 @@ impl<'a> FileSession<'a> {
                     result.and_then(|syntax| {
                         parsed
                             .with_expanded_command_declaration(syntax)
-                            .ok_or(SourceMacroError::DeclarationRequired)
+                            .ok_or(SourceMacroError::CommandDeclarationRequired)
                     })
                 });
         }
@@ -1066,7 +1066,7 @@ impl<'a> FileSession<'a> {
             Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
         };
         let Some(parsed) = parsed.with_expanded_command_declaration(root) else {
-            return Outcome::Complete(Err(SourceMacroError::DeclarationRequired));
+            return Outcome::Complete(Err(SourceMacroError::CommandDeclarationRequired));
         };
         match self.enter_declaration_hygiene(parsed.syntax()) {
             Outcome::Complete(()) => {}
@@ -1082,9 +1082,12 @@ impl<'a> FileSession<'a> {
         )
         .map_complete(|result| {
             result.and_then(|syntax| {
-                parsed
-                    .with_expanded_declaration(syntax)
-                    .ok_or(SourceMacroError::DeclarationRequired)
+                match parsed.kind() {
+                    SourceCommandKind::Example => parsed.with_expanded_example(syntax),
+                    SourceCommandKind::Definition => parsed.with_expanded_declaration(syntax),
+                    _ => None,
+                }
+                .ok_or(SourceMacroError::CommandDeclarationRequired)
             })
         })
     }

@@ -884,6 +884,14 @@ fn is_named_declaration_syntax(syntax: &Syntax) -> bool {
                 *body != parser_kind(&["Command", "example"])))
 }
 
+fn is_example_declaration_syntax(syntax: &Syntax) -> bool {
+    matches!(syntax, Syntax::Node { kind, args, .. }
+        if *kind == parser_kind(&["Command", "declaration"])
+            && args.len() == 2
+            && matches!(&args[1], Syntax::Node { kind, args, .. }
+                if *kind == parser_kind(&["Command", "example"]) && args.len() == 3))
+}
+
 impl ParsedSourceCommand {
     pub(crate) fn from_command_syntax(
         source_view: SourceView,
@@ -1023,32 +1031,35 @@ impl ParsedSourceCommand {
         None
     }
 
-    /// Transfer an externally expanded command to the named-declaration path.
+    /// Transfer an externally expanded command to ordinary declaration checking.
     /// The caller must establish the original command's parser and macro
     /// registrations before expanding it. Unlike [`Self::with_expanded_declaration`],
     /// its original root may be a custom command kind, but its result must be
-    /// one canonical named declaration. Queries and anonymous examples cannot
-    /// cross this boundary. The original source view and epilogue survive;
-    /// elaboration and admission still validate the complete replacement tree.
+    /// one canonical named declaration or anonymous example. An example changes
+    /// the command kind so that its checked successor is discarded. Queries,
+    /// scope controls and command sequences cannot cross this boundary. The
+    /// original source view and epilogue survive; the ordinary checker still
+    /// validates the complete replacement tree.
     pub fn with_expanded_command_declaration(mut self, syntax: Syntax) -> Option<Self> {
-        if self.kind == SourceCommandKind::Definition && is_named_declaration_syntax(&syntax) {
-            self.syntax = syntax;
-            return Some(self);
+        if self.kind != SourceCommandKind::Definition {
+            return None;
         }
-        None
+        self.kind = if is_named_declaration_syntax(&syntax) {
+            SourceCommandKind::Definition
+        } else if is_example_declaration_syntax(&syntax) {
+            SourceCommandKind::Example
+        } else {
+            return None;
+        };
+        self.syntax = syntax;
+        Some(self)
     }
 
     /// Replace an anonymous example's complete syntax while retaining its
     /// source view. An expander cannot turn a scratch-only example into a
     /// named declaration or another command through this boundary.
     pub fn with_expanded_example(mut self, syntax: Syntax) -> Option<Self> {
-        if self.kind == SourceCommandKind::Example
-            && matches!(&syntax, Syntax::Node { kind, args, .. }
-                if *kind == parser_kind(&["Command", "declaration"])
-                    && args.len() == 2
-                    && matches!(&args[1], Syntax::Node { kind, args, .. }
-                        if *kind == parser_kind(&["Command", "example"]) && args.len() == 3))
-        {
+        if self.kind == SourceCommandKind::Example && is_example_declaration_syntax(&syntax) {
             self.syntax = syntax;
             return Some(self);
         }
@@ -1068,10 +1079,19 @@ impl ParsedSourceCommand {
 
     /// This command with the entered grammar's notations expanded, as
     /// [`ParsedDefinition::expanded`]; its query term's text stays the source's.
+    /// An active native command macro transfers only a single canonical
+    /// declaration or example to the appropriate checked command kind.
     pub fn expanded(mut self) -> Result<ParsedSourceCommand, NatDefinitionParseError> {
+        let command_macro = self.kind == SourceCommandKind::Definition
+            && extensions::is_active_command_macro(&self.syntax);
         if let Some(syntax) =
             extensions::expand_active(&self.syntax).map_err(|_| expansion_refusal())?
         {
+            if command_macro {
+                return self
+                    .with_expanded_command_declaration(syntax)
+                    .ok_or_else(expansion_refusal);
+            }
             self.syntax = syntax;
         }
         Ok(self)
@@ -6569,7 +6589,7 @@ mod nat_definition_tests {
     }
 
     #[test]
-    fn externally_expanded_commands_retain_source_and_require_named_declarations() {
+    fn externally_expanded_commands_retain_source_and_route_declarations_and_examples() {
         use extensions::{
             Descr, FileGrammar, ImportedSyntaxEntry, ImportedSyntaxModule, SyntaxDecl,
         };
@@ -6633,11 +6653,37 @@ mod nat_definition_tests {
             source
         );
 
-        for source in [
-            b"#check Nat".as_slice(),
-            b"#eval 42",
-            b"example : Nat := 42",
-        ] {
+        let example = parse_source_command(b"example : Nat := 42").unwrap();
+        let expanded = parsed
+            .clone()
+            .with_expanded_command_declaration(example.syntax().clone())
+            .unwrap();
+        assert_eq!(expanded.kind(), SourceCommandKind::Example);
+        assert_eq!(expanded.syntax(), example.syntax());
+        assert_eq!(expanded.source_view(), parsed.source_view());
+        assert_eq!(expanded.epilogue(), parsed.epilogue());
+        assert_eq!(expanded.reconstruct_original(), source);
+        assert!(expanded.clone().into_definition().is_none());
+        assert!(
+            expanded
+                .clone()
+                .with_expanded_declaration(declaration.clone())
+                .is_none()
+        );
+        assert!(
+            expanded
+                .with_expanded_command_declaration(declaration.clone())
+                .is_none(),
+            "a checked example cannot regain named-declaration authority"
+        );
+        assert!(
+            example
+                .clone()
+                .with_expanded_example(declaration.clone())
+                .is_none()
+        );
+
+        for source in [b"#check Nat".as_slice(), b"#eval 42"] {
             let other = parse_source_command(source).unwrap();
             assert!(
                 other
@@ -6655,6 +6701,14 @@ mod nat_definition_tests {
         for syntax in [
             Syntax::node(parser_kind(&["Command", "namespace"]), vec![]),
             null_node(vec![declaration.clone(), declaration]),
+            null_node(vec![example.syntax().clone()]),
+            Syntax::node(
+                parser_kind(&["Command", "declaration"]),
+                vec![
+                    null_node(vec![]),
+                    Syntax::node(parser_kind(&["Command", "example"]), vec![]),
+                ],
+            ),
         ] {
             assert!(
                 parsed

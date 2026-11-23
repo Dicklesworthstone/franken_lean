@@ -1658,6 +1658,19 @@ pub(crate) enum ScopedCommandSyntax {
 }
 
 impl ScopedCommandSyntax {
+    /// Route a classified declaration to its ordinary checked command path.
+    /// Examples retain their scratch-only parser view and never become named
+    /// declarations, including when a command macro produced the syntax.
+    pub(crate) fn from_declaration(parsed: fln_parse::ParsedSourceCommand) -> Option<Self> {
+        match parsed.kind() {
+            fln_parse::SourceCommandKind::Example => Some(Self::Example(parsed)),
+            fln_parse::SourceCommandKind::Definition => {
+                parsed.into_definition().map(Self::Definition)
+            }
+            _ => None,
+        }
+    }
+
     /// The complete declaration trees, retaining mutual source order.
     pub(crate) fn syntaxes(&self) -> Vec<&fln_syntax::tree::Syntax> {
         match self {
@@ -1725,12 +1738,12 @@ pub(crate) fn parse_native_command_macro(
         .expanded()
         .map_err(DefinitionFrontendError::Parse)
         .map_err(EngineExecutionError::Frontend)?;
-    let declaration = parsed
-        .into_definition()
-        .ok_or(EngineExecutionError::NotImplemented {
-            feature: "a command macro that does not expand to one named declaration",
-        })?;
-    Ok(Some(ScopedCommandSyntax::Definition(declaration)))
+    let declaration = ScopedCommandSyntax::from_declaration(parsed).ok_or(
+        EngineExecutionError::NotImplemented {
+            feature: "a command macro that does not expand to one declaration or anonymous example",
+        },
+    )?;
+    Ok(Some(declaration))
 }
 
 fn parse_scoped_command_with_expansion(
@@ -1758,13 +1771,15 @@ fn parse_scoped_command_with_expansion(
         }
         Err(original) if expand_templates => {
             // A source-defined command macro has no declaration keyword until
-            // expansion. Keep its original source view, but admit only the same
-            // canonical named declaration accepted at the imported MacroM door.
+            // expansion. Keep its original source view and route the same
+            // declaration/example forms accepted at the imported MacroM door.
             // Syntax declarations, queries and command sequences cannot enter
             // the kernel through this fallback.
-            fln_parse::parse_source_command(source)
+            return fln_parse::parse_source_command(source)
                 .and_then(fln_parse::ParsedSourceCommand::expanded)
-                .and_then(|parsed| parsed.into_definition().ok_or(original))
+                .and_then(|parsed| ScopedCommandSyntax::from_declaration(parsed).ok_or(original))
+                .map_err(DefinitionFrontendError::Parse)
+                .map_err(EngineExecutionError::Frontend);
         }
         Err(error) => Err(error),
     }

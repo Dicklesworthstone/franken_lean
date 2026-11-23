@@ -1,9 +1,13 @@
 //! Native command-producing macros still enter ordinary elaboration and kernel admission.
 #![forbid(unsafe_code)]
 
-use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
+use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, SourceCheckLimits};
 
 fn check(source: &str) -> Result<usize, String> {
+    check_file(source).map(|result| result.theorems)
+}
+
+fn check_file(source: &str) -> Result<fln::source_check::SourceFileCheck, String> {
     let admission = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     Engine::with_source_seed(admission)
         .unwrap()
@@ -15,7 +19,7 @@ fn check(source: &str) -> Result<usize, String> {
             SourceCheckLimits::new(admission),
         )
         .map_err(|error| format!("{error:?}"))
-        .map(|result| result.into_complete().unwrap().theorems)
+        .map(|result| result.into_complete().unwrap())
 }
 
 #[test]
@@ -106,6 +110,131 @@ theorem another_ok : another = 45 := rfl
 "#;
     assert_eq!(check(source).unwrap(), 2);
     assert!(check(&source.replace("Values.original = 44", "Values.original = 45")).is_err());
+}
+
+#[test]
+fn command_macros_check_anonymous_examples_without_publishing_declarations() {
+    let macros = r#"
+macro "checked " ty:term " := " proof:term : command =>
+  `(example : $ty := $proof)
+syntax "checked_proof " term " := " term : command
+macro_rules
+  | `(checked_proof $ty := $proof) => `(example : $ty := $proof)
+macro "pass_command " c:command : command => `($c:command)
+macro "nested_command " c:command : command => `(pass_command $c:command)
+macro "checked_shadow " ty:term " := " proof:term : command =>
+  `(example (h : Nat) : $ty := $proof)
+"#;
+    let baseline = check_file(macros).unwrap();
+    let source = format!(
+        r#"{macros}
+checked (∀ (P : Prop), P → P) := fun _ h => h
+checked_proof (0 = 0) := rfl
+pass_command example : Nat := 42
+nested_command example (n : Nat) : n = n := by rfl
+namespace Scoped
+variable (P : Prop) (h : P)
+checked_shadow P := h
+end Scoped
+"#
+    );
+    let checked = check_file(&source).unwrap();
+    assert_eq!(checked.theorems, 0);
+    assert_eq!(checked.result_logical_root, baseline.result_logical_root);
+    assert_eq!(
+        checked.engine.environment().len(),
+        baseline.engine.environment().len(),
+        "neither the example nor its local proof may be published"
+    );
+    assert!(check(&format!("{source}\ndef leaked : Nat := _example")).is_err());
+}
+
+#[test]
+fn command_macro_examples_are_checked_and_discarded_in_program_execution() {
+    let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(EngineAdmissionLimits::new(limits.kernel))
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    let macros = r#"
+macro "checked " ty:term " := " proof:term : command =>
+  `(example : $ty := $proof)
+macro "pass_command " c:command : command => `($c:command)
+"#;
+    let baseline = engine
+        .execute_source_commands_with_checks(
+            format!("{macros}\n#eval (43 : Nat)").as_bytes(),
+            &options,
+            limits,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let source = format!(
+        "{macros}\nchecked Nat := 42\n\
+         pass_command example (n : Nat) : n = n := by rfl\n#eval (43 : Nat)"
+    );
+    let completed = engine
+        .execute_source_commands_with_checks(source.as_bytes(), &options, limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(completed.checks.len(), 2);
+    assert_eq!(completed.batch.executions.len(), 1);
+    assert_eq!(completed.batch.source_evaluation_indices, [0]);
+    assert!(completed.batch.source_admissions.is_empty());
+    assert_eq!(
+        completed.batch.result_logical_root,
+        baseline.batch.result_logical_root
+    );
+    for check in &completed.checks {
+        let fln::Declaration::Defn(candidate) = &check.declaration else {
+            panic!("an example must produce only a scratch checking candidate")
+        };
+        assert!(
+            !completed
+                .batch
+                .engine
+                .environment()
+                .contains(&candidate.base.name)
+        );
+    }
+    let fln::VmExit::Returned(returned) = &completed.batch.executions[0].exit else {
+        panic!("the ordinary evaluation following the examples must return")
+    };
+    assert_eq!(fln::nat_decimal(&returned.value).as_deref(), Some("43"));
+    assert!(
+        engine
+            .execute_source_commands_with_checks(
+                format!("{macros}\nchecked False := True.intro\n#eval (43 : Nat)").as_bytes(),
+                &options,
+                limits,
+            )
+            .is_err()
+    );
+    assert_eq!(engine.logical_root(&options), root);
+}
+
+#[test]
+fn command_macro_examples_reject_invalid_proofs_after_expansion() {
+    let macros = r#"
+macro "checked " ty:term " := " proof:term : command =>
+  `(example : $ty := $proof)
+macro "pass_command " c:command : command => `($c:command)
+"#;
+    for command in [
+        "checked False := True.intro",
+        "checked Nat := True",
+        "pass_command example : 0 = 1 := by rfl",
+    ] {
+        let error = check(&format!("{macros}\n{command}")).unwrap_err();
+        assert!(
+            error.contains("Elaborate"),
+            "{command}: the expanded example must reach ordinary checking: {error}"
+        );
+    }
 }
 
 #[test]
