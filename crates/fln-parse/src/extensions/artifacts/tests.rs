@@ -3,6 +3,7 @@
 use super::*;
 
 mod abbreviations;
+mod nullable_heads;
 mod precedence;
 mod shared_heads;
 mod tactics;

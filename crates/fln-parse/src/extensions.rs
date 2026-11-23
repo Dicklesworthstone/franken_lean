@@ -1275,29 +1275,97 @@ impl ActiveGrammar {
     }
 }
 
-/// The atoms a description can start with, through the wrappers that add no input.
-fn heads(descr: &Descr, depth: usize) -> Vec<String> {
+/// Known first atoms, whether input may be omitted, and whether the atoms cover
+/// every possible start. Native dispatch retains useful known alternatives;
+/// artifact admission additionally requires complete, supported dispatch.
+#[derive(Default)]
+struct DescriptionHeads {
+    atoms: Vec<String>,
+    nullable: bool,
+    complete: bool,
+}
+
+fn description_heads(descr: &Descr, depth: usize, allow_non_reserved: bool) -> DescriptionHeads {
     if depth > MAX_DESCR_DEPTH {
-        return Vec::new();
+        return DescriptionHeads::default();
     }
+    let atom = |atoms, complete| DescriptionHeads {
+        atoms,
+        nullable: false,
+        complete,
+    };
+    let empty = || DescriptionHeads {
+        atoms: Vec::new(),
+        nullable: true,
+        complete: true,
+    };
+    let child = |body| description_heads(body, depth + 1, allow_non_reserved);
     match descr {
-        Descr::Symbol(text) | Descr::NonReservedSymbol(text, _) => vec![text.trim().to_string()],
-        Descr::UnicodeSymbol(text, ascii, _) => {
-            vec![text.trim().to_string(), ascii.trim().to_string()]
-        }
-        Descr::Node { body, .. } | Descr::NodeWithAntiquot(_, _, body) => heads(body, depth + 1),
-        Descr::Unary(name, body) if input_wrapper(name) => heads(body, depth + 1),
-        Descr::Binary(name, left, right) => match simple(name).as_deref() {
-            Some("andthen") => heads(left, depth + 1),
-            Some("orelse") => {
-                let mut out = heads(left, depth + 1);
-                out.extend(heads(right, depth + 1));
-                out
-            }
-            _ => Vec::new(),
+        Descr::Symbol(text) => atom(vec![text.trim().to_string()], true),
+        Descr::NonReservedSymbol(text, include_ident) => atom(
+            vec![text.trim().to_string()],
+            allow_non_reserved && !*include_ident,
+        ),
+        Descr::UnicodeSymbol(text, ascii, _) => atom(
+            vec![text.trim().to_string(), ascii.trim().to_string()],
+            true,
+        ),
+        Descr::Const(name) => match simple(name).as_deref() {
+            Some(alias) if no_input(alias) || alias == "noWs" => empty(),
+            _ => DescriptionHeads::default(),
         },
-        _ => Vec::new(),
+        Descr::Node { body, .. } | Descr::NodeWithAntiquot(_, _, body) => child(body),
+        Descr::Unary(name, body) if input_wrapper(name) => child(body),
+        Descr::Unary(name, body) => match simple(name).as_deref() {
+            Some("optional" | "many") => {
+                let mut first = child(body);
+                first.nullable = true;
+                first
+            }
+            Some("many1") => child(body),
+            // A lookahead never consumes its operand's first atom. Full
+            // descriptor validation still checks the operand at admission.
+            Some("notFollowedBy") => empty(),
+            _ => DescriptionHeads::default(),
+        },
+        Descr::Binary(name, left, right) => match simple(name).as_deref() {
+            Some("andthen") => {
+                let mut first = child(left);
+                if first.nullable {
+                    let next = child(right);
+                    first.atoms.extend(next.atoms);
+                    first.nullable = next.nullable;
+                    first.complete &= next.complete;
+                }
+                first
+            }
+            Some("orelse") => {
+                let mut first = child(left);
+                let next = child(right);
+                first.atoms.extend(next.atoms);
+                first.nullable |= next.nullable;
+                first.complete &= next.complete;
+                first
+            }
+            _ => DescriptionHeads::default(),
+        },
+        Descr::SepBy {
+            item, at_least_one, ..
+        } => {
+            let mut first = child(item);
+            // A nullable element can expose separator input too; it is not a
+            // complete dispatch description, and admission rejects it later.
+            first.complete &= !first.nullable;
+            first.nullable |= !*at_least_one;
+            first
+        }
+        _ => DescriptionHeads::default(),
     }
+}
+
+/// The atoms a description can start with, including nullable prefixes.
+fn heads(descr: &Descr, depth: usize) -> Vec<String> {
+    description_heads(descr, depth, true).atoms
 }
 
 /// The builtin token table (`builtinTokenTable`): every token some builtin parser reads.
@@ -3876,6 +3944,120 @@ fn named<T>(syntax: &Syntax, value: fn(&Syntax) -> Option<T>) -> Result<Option<T
         },
         _ => Err("a named argument"),
     }
+}
+
+pub(crate) type PartitionSyntaxHeads = (BTreeSet<String>, bool);
+
+/// Conservative FIRST atoms for a source header's generated `stx` tree.
+/// This discovers file boundaries only; declaration admission and parser
+/// registration still validate the complete source command.
+pub(crate) fn partition_syntax_heads(
+    syntax: &Syntax,
+) -> Result<Option<PartitionSyntaxHeads>, crate::builtin_interpreter::ParserResourceLimit> {
+    // `stx_item` and its consumers recurse. Bound the generated tree before
+    // converting it, even though the parser VM itself uses heap frames.
+    let mut pending = vec![(syntax, 0_usize)];
+    while let Some((node, depth)) = pending.pop() {
+        if depth > MAX_DESCR_DEPTH {
+            return Err(crate::builtin_interpreter::ParserResourceLimit::Depth);
+        }
+        if let Syntax::Node { args, .. } = node {
+            pending.extend(args.iter().map(|arg| (arg, depth + 1)));
+        }
+    }
+    let Ok(item) = stx_item(syntax) else {
+        return Ok(None);
+    };
+    Ok(partition_item_heads(&item))
+}
+
+fn partition_sequence_heads(items: &[StxItem]) -> Option<PartitionSyntaxHeads> {
+    let mut heads = BTreeSet::new();
+    let mut nullable = true;
+    for item in items {
+        let (next, empty) = partition_item_heads(item)?;
+        if nullable {
+            heads.extend(next);
+            nullable = empty;
+        }
+    }
+    Some((heads, nullable))
+}
+
+fn partition_item_heads(item: &StxItem) -> Option<PartitionSyntaxHeads> {
+    let atom = |text: &str| {
+        valid_atom(text).ok()?;
+        Some(text.trim_matches(|c: char| c.is_ascii_whitespace()).to_owned())
+    };
+    let empty = || (BTreeSet::new(), true);
+    let unknown = || (BTreeSet::new(), false);
+    Some(match item {
+        StxItem::Atom(text) | StxItem::NonReserved(text) => {
+            ([atom(text)?].into_iter().collect(), false)
+        }
+        StxItem::Unicode(text, ascii, _) => {
+            ([atom(text)?, atom(ascii)?].into_iter().collect(), false)
+        }
+        StxItem::Cat(name, None)
+            if simple(name).is_some_and(|alias| no_input(&alias) || alias == "noWs") =>
+        {
+            empty()
+        }
+        StxItem::Cat(..) => unknown(),
+        StxItem::Paren(items) => partition_sequence_heads(items)?,
+        StxItem::Unary(name, items) => match simple(name).as_deref() {
+            Some("optional" | "many") => {
+                let (heads, _) = partition_sequence_heads(items)?;
+                (heads, true)
+            }
+            Some("notFollowedBy") => empty(),
+            Some("many1") => partition_sequence_heads(items)?,
+            _ if input_wrapper(name) => partition_sequence_heads(items)?,
+            _ => unknown(),
+        },
+        StxItem::Binary(name, left, right) => match simple(name).as_deref() {
+            Some("andthen") => {
+                let (mut heads, nullable) = partition_sequence_heads(left)?;
+                let (next, empty) = partition_sequence_heads(right)?;
+                if nullable {
+                    heads.extend(next);
+                }
+                (heads, nullable && empty)
+            }
+            Some("orelse") => {
+                let (mut heads, left_empty) = partition_sequence_heads(left)?;
+                let (next, right_empty) = partition_sequence_heads(right)?;
+                heads.extend(next);
+                (heads, left_empty || right_empty)
+            }
+            _ => unknown(),
+        },
+        StxItem::SepBy {
+            items,
+            separator,
+            at_least_one,
+            ..
+        } => {
+            valid_atom(separator).ok()?;
+            let (heads, nullable) = partition_sequence_heads(items)?;
+            (heads, nullable || !at_least_one)
+        }
+        StxItem::Postfix(postfix, operand) => {
+            let (heads, nullable) = partition_item_heads(operand)?;
+            match postfix.as_str() {
+                "?" | "*" | ",*" | ",*,?" => (heads, true),
+                "+" | ",+" | ",+,?" => (heads, nullable),
+                _ => return None,
+            }
+        }
+        StxItem::OrElse(left, right) => {
+            let (mut heads, left_empty) = partition_item_heads(left)?;
+            let (next, right_empty) = partition_item_heads(right)?;
+            heads.extend(next);
+            (heads, left_empty || right_empty)
+        }
+        StxItem::Not(_) => empty(),
+    })
 }
 
 /// One `stx` tree, as `syntax_decls` builds it.

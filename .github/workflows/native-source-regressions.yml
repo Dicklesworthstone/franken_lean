@@ -37,16 +37,18 @@ concurrency:
 jobs:
   regressions:
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: '0'
-      CARGO_BUILD_JOBS: '2'
+      CARGO_BUILD_JOBS: '1'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Provision the locked suite dependency
+        run: bash scripts/ci/checkout_asupersync.sh
       - name: Install repository-pinned Rust
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
@@ -64,5 +66,15 @@ jobs:
         run: cargo test --locked -p fln --test source_command_macros --test source_command_macro_hygiene --no-fail-fast -- --test-threads=1
       - name: Check quotation expansion through the native elaborator and kernel
         run: cargo test --locked -p fln --test source_quoted_capture_kinds --test source_quotation_repetitions --no-fail-fast
+      - name: Check command syntax formatting
+        if: ${{ !cancelled() }}
+        run: |
+          rustfmt --check --edition 2024 --config skip_children=true \
+            crates/fln-parse/src/command_scope.rs \
+            crates/fln-parse/src/extensions.rs \
+            crates/fln-parse/src/extensions/artifacts.rs \
+            crates/fln-parse/src/extensions/artifacts/tests.rs \
+            crates/fln-parse/src/extensions/artifacts/tests/nullable_heads.rs
       - name: Lint the native parser
+        if: ${{ !cancelled() }}
         run: cargo clippy --locked -p fln-parse --all-targets -- -D warnings

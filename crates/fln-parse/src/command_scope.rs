@@ -269,6 +269,7 @@ fn partition_tokens_with_heads(
 /// it never installs a parser or authorizes a macro. The actual command parser
 /// still checks the complete declaration and every later invocation.
 type PartitionCommandHeads = std::collections::BTreeMap<String, BytePos>;
+type DeclaredCommandHeads = (std::collections::BTreeSet<String>, BytePos);
 
 fn partition_column(view: &SourceView, token: &LexedToken) -> usize {
     let source = view.normalized();
@@ -280,15 +281,14 @@ fn partition_column(view: &SourceView, token: &LexedToken) -> usize {
             .0
 }
 
-/// Read the bounded header of an ordinary leading-atom syntax or macro declaration.
-/// Parentheses in named options and parser arguments are balanced, so strings in
-/// those positions cannot become the command's leading atom.
-fn partition_declared_command_head(
+/// Locate a bounded syntax header without inspecting its macro implementation.
+/// Only the header's generated `stx` trees can contribute command boundary hints.
+fn partition_command_header(
     view: &SourceView,
     tokens: &[LexedToken],
     keyword: usize,
     base_column: usize,
-) -> Option<(String, BytePos)> {
+) -> Option<(std::ops::Range<usize>, BytePos)> {
     const HEADER_TOKENS: usize = 4096;
     let source = view.normalized();
     let end = tokens.len().min(keyword.saturating_add(HEADER_TOKENS));
@@ -340,25 +340,8 @@ fn partition_declared_command_head(
             first = group_end(first)?;
         }
     }
-    // A macro may name even its first atom with the adjacent "name:" binder.
-    if is_macro
-        && first + 1 < end
-        && matches!(&tokens[first].kind, TokenKind::Ident(_))
-        && symbol(first + 1, ":")
-        && tokens[first].extent.end() == tokens[first + 1].extent.start()
-    {
-        first += 2;
-    }
-    if first >= end || !matches!(&tokens[first].kind, TokenKind::Literal(LiteralKind::Str)) {
-        return None;
-    }
-    let atom = fln_syntax::literal::decode_string(source.span_str(tokens[first].extent)?)?;
-    let atom = atom.trim_matches([' ', '\t', '\r', '\n']);
-    if atom.is_empty() || atom.chars().any(|c| matches!(c, ' ' | '\t' | '\r' | '\n')) {
-        return None;
-    }
     let mut depth = 0_usize;
-    for at in first + 1..end {
+    for at in first..end {
         let token = &tokens[at];
         if depth == 0
             && source.line_of(token.extent.start()) > source.line_of(tokens[at - 1].extent.end())
@@ -375,8 +358,8 @@ fn partition_declared_command_head(
                         > source.line_of(tokens[at + 1].extent.end())
                 })
             };
-            if tail {
-                return Some((atom.to_owned(), tokens[at + 1].extent.end()));
+            if tail && first < at {
+                return Some((first..at, tokens[at + 1].extent.end()));
             }
         }
         if let TokenKind::Symbol(text) = &token.kind {
@@ -391,6 +374,94 @@ fn partition_declared_command_head(
         }
     }
     None
+}
+
+/// Use the generated syntax-expression parser, including its grouping and
+/// alternative precedence. A later item contributes only after a proven
+/// nullable prefix; unknown parser names never expose their following atoms.
+fn partition_declared_command_heads(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    keyword: usize,
+    base_column: usize,
+) -> Result<Option<DeclaredCommandHeads>, DefinitionParseError> {
+    use crate::builtin_interpreter::{DEFAULT_STEP_BUDGET, ParserFailure, ParserInput};
+    let Some((header, after)) = partition_command_header(view, tokens, keyword, base_column) else {
+        return Ok(None);
+    };
+    let offset = tokens[header.start].extent.start().0;
+    let end = tokens[header.end].extent.start().0;
+    // The parser cannot read the category delimiter, a later command or a macro
+    // RHS. Its local positions are mapped back through the original source view.
+    let source = SourceText::from_utf8(&view.normalized().as_bytes()[offset..end])
+        .map_err(NatDefinitionParseError::Source)?;
+    let is_macro = matches!(&tokens[keyword].kind, TokenKind::Symbol(text) if text == "macro");
+    let description = crate::extensions::Descr::Cat(Name::from_components(["stx"]), 1023);
+    let aliases = std::collections::BTreeMap::new();
+    let mut remaining_steps = DEFAULT_STEP_BUDGET;
+    let mut heads = std::collections::BTreeSet::new();
+    let mut cursor = header.start;
+    while cursor < header.end {
+        // Each macro argument may have the adjacent `name:` binder, including
+        // an optional prefix or an alternative that owns the leading atom.
+        if is_macro
+            && cursor + 1 < header.end
+            && matches!(&tokens[cursor].kind, TokenKind::Ident(_))
+            && matches!(&tokens[cursor + 1].kind, TokenKind::Symbol(text) if text == ":")
+            && tokens[cursor].extent.end() == tokens[cursor + 1].extent.start()
+        {
+            cursor += 2;
+        }
+        if cursor == header.end {
+            return Ok(None);
+        }
+        let start = tokens[cursor].extent.start().0 - offset;
+        let run = crate::extensions::default_init_interpreter().run_description(
+            &description,
+            &aliases,
+            ParserInput {
+                source: &source,
+                start,
+                saved_pos: None,
+                quot_depth: 0,
+                precedence: 1023,
+                max_steps: remaining_steps,
+                verso_docs: false,
+                verso_module_docs: false,
+            },
+        );
+        remaining_steps = remaining_steps.saturating_sub(run.steps);
+        let syntax = match run.result {
+            Ok(syntax) if run.next > start => syntax,
+            Err((at, error @ ParserFailure::Resource(_))) => {
+                return Err(NatDefinitionParseError::GeneratedParser {
+                    at: view.to_original(BytePos(offset + at)),
+                    error,
+                });
+            }
+            _ => return Ok(None),
+        };
+        let [item] = syntax.as_slice() else {
+            return Ok(None);
+        };
+        let first = crate::extensions::partition_syntax_heads(item).map_err(|limit| {
+            NatDefinitionParseError::GeneratedParser {
+                at: view.to_original(BytePos(offset + start)),
+                error: ParserFailure::Resource(limit),
+            }
+        })?;
+        let Some((first, nullable)) = first else {
+            return Ok(None);
+        };
+        heads.extend(first);
+        if !nullable {
+            return Ok(Some((heads, after)));
+        }
+        cursor += tokens[cursor..header.end]
+            .partition_point(|token| token.extent.start().0 < offset + run.next);
+    }
+    // A production that can consume no tokens cannot start a command slice.
+    Ok(None)
 }
 
 /// Find only top-level declaration headers. Quotations and bracketed operands
@@ -427,10 +498,12 @@ fn partition_source_command_heads(
             } else if command_line || prefix_column.is_some() {
                 let base = prefix_column.take().unwrap_or(column);
                 if matches!(symbol, Some("syntax" | "macro"))
-                    && let Some((head, after)) =
-                        partition_declared_command_head(view, tokens, index, base)
+                    && let Some((declared, after)) =
+                        partition_declared_command_heads(view, tokens, index, base)?
                 {
-                    heads.entry(head).or_insert(after);
+                    for head in declared {
+                        heads.entry(head).or_insert(after);
+                    }
                 }
                 if symbol == Some("#exit") {
                     break;
@@ -1444,6 +1517,181 @@ theorem checked : forwarded = 5 := rfl
                 .collect::<Vec<_>>(),
             source.as_bytes()
         );
+    }
+
+    #[test]
+    fn source_command_groups_partition_every_leading_alternative() {
+        let source = r###"def before : Nat := 0
+syntax ("left_cmd " <|> "right_cmd ") ident " := " term : command
+macro_rules
+  | `(left_cmd $n:ident := $value:term) => `(def $n : Nat := $value)
+  | `(right_cmd $n:ident := $value:term) => `(def $n : Nat := $value)
+left_cmd leftValue := 11
+right_cmd rightValue := 31
+syntax ("later_cmd ") ident : command
+later_cmd result
+theorem checked : leftValue + rightValue = 42 := rfl
+"###;
+        let commands = partition(source.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 8);
+        assert_eq!(commands[3].1, b"left_cmd leftValue := 11\n");
+        assert_eq!(commands[4].1, b"right_cmd rightValue := 31\n");
+        assert_eq!(commands[6].1, b"later_cmd result\n");
+
+        // Feed the slices through the production generated parser and evolve
+        // the grammar in source order, as the file driver does.
+        let mut grammar = crate::extensions::FileGrammar::new(false, &[], None).unwrap();
+        for (_, command) in &commands {
+            let parsed = crate::extensions::with_grammar(&grammar.grammar(), || {
+                crate::parse_source_command(command)
+            })
+            .unwrap();
+            grammar.declare(&parsed.syntax).unwrap();
+        }
+        assert_eq!(
+            commands
+                .iter()
+                .flat_map(|(_, bytes)| *bytes)
+                .copied()
+                .collect::<Vec<_>>(),
+            source.as_bytes()
+        );
+    }
+
+    #[test]
+    fn source_command_groups_keep_macro_operands_and_optional_prefixes() {
+        let source = r###"macro ("pass_left " <|> "pass_right ") cmd:command : command => return cmd
+pass_left def leftValue : Nat := 11
+pass_right
+  theorem checked : leftValue = 11 := rfl
+syntax ("optional ")? "generated " ident : command
+optional generated firstValue
+generated secondValue
+def after : Nat := 0
+"###;
+        let commands = partition(source.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 7);
+        assert_eq!(commands[1].1, b"pass_left def leftValue : Nat := 11\n");
+        assert_eq!(
+            commands[2].1,
+            b"pass_right\n  theorem checked : leftValue = 11 := rfl\n"
+        );
+        assert_eq!(commands[4].1, b"optional generated firstValue\n");
+        assert_eq!(commands[5].1, b"generated secondValue\n");
+        assert_eq!(commands[6].1, b"def after : Nat := 0\n");
+    }
+
+    #[test]
+    fn source_command_groups_respect_precedence_and_proven_nullability() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                r#"syntax (("first " "tail ") <|> "second ") ident : command"#,
+                &["first", "second"],
+            ),
+            (
+                r#"syntax ("first " "middle " <|> "alternate ") ident : command"#,
+                &["first"],
+            ),
+            (
+                r#"syntax ("prefix " "body ")? "fallback " ident : command"#,
+                &["fallback", "prefix"],
+            ),
+            (
+                r#"syntax (("prefix ")? "body ") "tail " ident : command"#,
+                &["body", "prefix"],
+            ),
+            (
+                r#"syntax !("forbidden ") "actual " : command"#,
+                &["actual"],
+            ),
+            (
+                r#"syntax sepBy("item", ",") "done" : command"#,
+                &["done", "item"],
+            ),
+            (r#"syntax ident "not_a_head " : command"#, &[]),
+            (
+                r#"syntax unknownAlias("hidden ") "not_a_head " : command"#,
+                &[],
+            ),
+            (
+                r#"syntax (ident <|> "known ") "not_a_head " : command"#,
+                &["known"],
+            ),
+            (
+                r#"macro p:("maybe ")? h:("one " <|> "two ") : command => return h"#,
+                &["maybe", "one", "two"],
+            ),
+            (
+                r#"syntax ppSpace ("layout_head ") : command"#,
+                &["layout_head"],
+            ),
+            (r#"syntax ("nullable ")? : command"#, &[]),
+            (
+                "syntax (\"invalid\u{a0}head\" <|> \"valid \") : command",
+                &[],
+            ),
+            (r#"syntax ("123bad " <|> "valid ") : command"#, &[]),
+            (
+                r#"macro ("term_only " <|> "another_term ") : term => `(0)"#,
+                &[],
+            ),
+            (
+                r#"macro ("real ") : command => do let _ := "rhs_fake "; return `(def value := 0)"#,
+                &["real"],
+            ),
+        ];
+        for (source, expected) in cases {
+            let original = SourceText::from_utf8(source.as_bytes()).unwrap();
+            let view = SourceView::of(&original);
+            let (tokens, _) = partition_tokens(&view).unwrap();
+            let heads = partition_source_command_heads(&view, &tokens).unwrap();
+            assert_eq!(
+                heads.keys().map(String::as_str).collect::<Vec<_>>(),
+                *expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_command_groups_preserve_layout_activation_and_original_offsets() {
+        let source = "-- 😀\r\ndef before : Nat := 0\r\nfirst_cmd earlier\r\nsyntax (\"first_cmd \" <|> \"second_cmd \") ident : command\r\ndef body : Nat := by\r\n  first_cmd nested\r\n  second_cmd nested\r\n  exact 0\r\n-- second_cmd comment\r\ndef quoted := `(command| second_cmd hidden)\r\ndef escaped : Nat := 1\r\n«first_cmd» value\r\nfirst_cmd_suffix value\r\nfirst_cmd later\r\nsecond_cmd final\r\n";
+        let commands = partition(source.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 7);
+        assert!(commands[0].1.ends_with(b"first_cmd earlier\r\n"));
+        assert!(
+            std::str::from_utf8(commands[2].1)
+                .unwrap()
+                .contains("  first_cmd nested\r\n  second_cmd nested\r\n")
+        );
+        assert!(commands[3].1.starts_with(b"def quoted"));
+        assert!(commands[4].1.ends_with(b"first_cmd_suffix value\r\n"));
+        assert_eq!(commands[5].1, b"first_cmd later\r\n");
+        assert_eq!(commands[6].1, b"second_cmd final\r\n");
+        let mut joined = Vec::new();
+        for (offset, bytes) in commands {
+            assert_eq!(offset, BytePos(joined.len()));
+            joined.extend_from_slice(bytes);
+        }
+        assert_eq!(joined, source.as_bytes());
+    }
+
+    #[test]
+    fn source_command_groups_bound_recursive_header_translation() {
+        let source = format!(
+            "syntax {}\"deep \"{} : command\ndeep\n",
+            "(".repeat(96),
+            ")".repeat(96)
+        );
+        assert!(matches!(
+            partition(source.as_bytes()),
+            Err(NatDefinitionParseError::GeneratedParser {
+                error: crate::builtin_interpreter::ParserFailure::Resource(
+                    crate::builtin_interpreter::ParserResourceLimit::Depth
+                ),
+                ..
+            })
+        ));
     }
 
     #[test]
