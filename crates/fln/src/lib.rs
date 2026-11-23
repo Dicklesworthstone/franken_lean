@@ -3147,6 +3147,7 @@ impl Engine {
         // is neither `@[reducible]` nor `@[implicit_reducible]` (`Lean/Meta/Instances.lean:288`).
         let mut instance_attribute_warnings: Vec<SourceWarning> = Vec::new();
         let mut macro_pattern_warnings: Vec<SourceWarning> = Vec::new();
+        let mut syntax_documentation_warnings: Vec<SourceWarning> = Vec::new();
         // The pin's deprecation warnings, logged while each command elaborates
         // (`Linter.checkDeprecated`). This thread's elaborations publish their uses here; the
         // uses of a command are read at the next step, before anything else runs, with the
@@ -3791,6 +3792,34 @@ impl Engine {
                                 follows_output: true,
                             }),
                     );
+                    // Grammar declarations take this early route instead of ordinary declaration
+                    // admission. They still run the documentation linter under their own options.
+                    if linters::missing_docs_enabled(&scopes.current.options)
+                        && let Some(parsed) = grammar.declared_command()
+                    {
+                        let lints = linters::MissingDocs::new(engine.environment())
+                            .lint(parsed.syntax(), &scopes.current.options, &scopes.current)
+                            .map_err(|feature| EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(EngineExecutionError::NotImplemented { feature }),
+                                at: Some(original_offset),
+                            })?;
+                        syntax_documentation_warnings.extend(lints.into_iter().map(|lint| {
+                            SourceWarning {
+                                command_index,
+                                at: fln_parse::BytePos(
+                                    original_offset.0
+                                        + parsed
+                                            .source_view()
+                                            .to_original(fln_parse::BytePos(lint.at))
+                                            .0,
+                                ),
+                                message: lint.message,
+                                severity: SourceSeverity::Warning,
+                                follows_output: true,
+                            }
+                        }));
+                    }
                     grammar.extend_scopes(&mut scopes);
                     continue;
                 }
@@ -3976,7 +4005,8 @@ impl Engine {
                                 parsed.syntax().kind()
                                     == Some(&unused_variables::parser_kind(&["Command", kind]))
                             })
-                            || unused_variables::is_reduce(parsed.syntax()) =>
+                            || unused_variables::is_reduce(parsed.syntax())
+                            || linters::has_missing_docs_handler(parsed.syntax()) =>
                     {
                         (vec![(fln_parse::BytePos(0), parsed.syntax().clone())], None)
                     }
@@ -4000,7 +4030,9 @@ impl Engine {
                             syntax,
                             scope.options.clone(),
                             block,
-                            scope.clone(),
+                            // Documentation visibility is the lexical default, before this
+                            // declaration's explicit `public`/`private` modifier is applied.
+                            scopes.current.clone(),
                         ),
                     );
                 }
@@ -5449,6 +5481,7 @@ impl Engine {
                 deprecations.retain(|warning| warning.command_index < end);
                 instance_attribute_warnings.retain(|warning| warning.command_index < end);
                 macro_pattern_warnings.retain(|warning| warning.command_index < end);
+                syntax_documentation_warnings.retain(|warning| warning.command_index < end);
                 warning_sites.retain(|command, _| *command < end);
                 lint_sites.retain(|(command, _), _| *command < end);
                 exit_warning = exit_warning.filter(|warning| warning.command_index < end);
@@ -5536,12 +5569,26 @@ impl Engine {
             let mut warnings: Vec<SourceWarning> = deprecations;
             if pin_world {
                 warnings.extend(instance_attribute_warnings);
-                warnings.extend(macro_pattern_warnings);
                 warnings.extend(declaration_reducibility_warnings(
                     &lint_sites,
                     &linted,
                     engine.environment(),
                 ));
+                // The deprecated assignment note is an elaboration warning, before both
+                // `sorry` and the command's documentation/unused-variable linters.
+                for (&(command, _), (offset, syntax, options, _, _)) in &lint_sites {
+                    warnings.extend(
+                        linters::deprecated_assignment_syntax(syntax, options)
+                            .into_iter()
+                            .map(|lint| SourceWarning {
+                                command_index: command,
+                                at: fln_parse::BytePos(offset.0 + lint.at),
+                                message: lint.message,
+                                severity: SourceSeverity::Warning,
+                                follows_output: false,
+                            }),
+                    );
+                }
             }
             warnings.extend(sorry_commands.iter().copied().filter_map(|command| {
                 let &(offset, source, warn) = warning_sites.get(&command)?;
@@ -5557,9 +5604,52 @@ impl Engine {
                     follows_output: false,
                 })
             }));
+            // MissingDocs precedes the default-on linters, including across every member of
+            // a mutual block. It also runs in the source seed and on declarations using sorry.
+            warnings.extend(syntax_documentation_warnings);
+            let mut documentation = linters::MissingDocs::new(engine.environment());
+            for (&(command, _), (offset, syntax, options, _, scope)) in &lint_sites {
+                if guarded_errors
+                    .iter()
+                    .any(|error| error.command_index == command)
+                {
+                    continue;
+                }
+                let lints = documentation
+                    .lint(syntax, options, scope)
+                    .map_err(|feature| EngineExecutionError::BatchCommand {
+                        index: command,
+                        error: Box::new(EngineExecutionError::NotImplemented { feature }),
+                        at: Some(*offset),
+                    })?;
+                for lint in lints {
+                    let at = scope
+                        .source_site
+                        .as_ref()
+                        .and_then(|site| {
+                            site.view
+                                .from_original(*offset)
+                                .or_else(|| {
+                                    site.view.from_original(fln_parse::BytePos(offset.0 + 1))
+                                })
+                                .map(|start| {
+                                    site.view.to_original(fln_parse::BytePos(start.0 + lint.at))
+                                })
+                        })
+                        .unwrap_or(fln_parse::BytePos(offset.0 + lint.at));
+                    warnings.push(SourceWarning {
+                        command_index: command,
+                        at,
+                        message: lint.message,
+                        severity: SourceSeverity::Warning,
+                        follows_output: true,
+                    });
+                }
+            }
             // The pin's `linter.unusedVariables` runs after each command that logged no error and
             // contains no `sorry`.
             if pin_world {
+                warnings.extend(macro_pattern_warnings);
                 // Every constructor spelling, for telling a pattern variable from a constructor, and
                 // the indexed families' constructors with the fields a pattern leaves unread.
                 let spelling = |name: &Name| match name.leaf_view() {
@@ -5651,16 +5741,9 @@ impl Engine {
                             .collect(),
                         None => spellings.clone(),
                     };
-                    // In the pin's order: the `:=` note while the command elaborates (`sorry` does
-                    // not suppress it), then the unused-variables linter (skipped with `sorry`),
-                    // then `linter.defProp`.
+                    // The documentation linter ran above, before these default-on linters.
                     let declared = linted_declaration(syntax, &linted, command);
-                    let mut lints: Vec<linters::Lint> =
-                        linters::deprecated_assignment_syntax(syntax, options)
-                            .into_iter()
-                            .collect();
-                    // The `:=` note is logged while the command elaborates; the linters after it.
-                    let elaboration_notes = lints.len();
+                    let mut lints: Vec<linters::Lint> = Vec::new();
                     // The pin runs no linter after a command that logged an error.
                     let errored = guarded_errors
                         .iter()
@@ -5763,13 +5846,13 @@ impl Engine {
                             options,
                         ));
                     }
-                    for (index, lint) in lints.into_iter().enumerate() {
+                    for lint in lints {
                         warnings.push(SourceWarning {
                             command_index: command,
                             at: fln_parse::BytePos(offset.0 + lint.at),
                             message: lint.message,
                             severity: SourceSeverity::Warning,
-                            follows_output: index >= elaboration_notes,
+                            follows_output: true,
                         });
                     }
                 }
@@ -9006,6 +9089,8 @@ fn reproduced_warning(line: &str, environment: &Environment) -> bool {
             })
     };
     line == "warning: declaration uses `sorry`"
+        || line.starts_with("warning: missing doc string for ")
+        || line.starts_with("warning: empty doc string for ")
         || EXACT.contains(&line)
         || deprecated_constant()
         || line

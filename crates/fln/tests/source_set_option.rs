@@ -352,7 +352,7 @@ fn unknown_mistyped_and_unimplemented_options_are_refused_by_name() {
         ("set_option autoLift 1", "`autoLift`"),
         ("set_option pp.analyze true", "`pp.analyze`"),
         ("set_option maxHeartbeats 1000", "`maxHeartbeats`"),
-        ("set_option linter.missingDocs true", "`linter.missingDocs`"),
+        ("set_option linter.missingDocs 1", "`linter.missingDocs`"),
         (
             "set_option trace.Meta.synthInstance true",
             "`trace.Meta.synthInstance`",
@@ -366,6 +366,84 @@ fn unknown_mistyped_and_unimplemented_options_are_refused_by_name() {
         assert!(error.contains(named), "{source}: {error}");
         assert_eq!(base.logical_root(&KVMap::new()), root);
     }
+}
+
+#[test]
+fn missing_docs_warns_in_the_seed_world_and_respects_scoped_options() {
+    let source = "def defaultOff : Nat := 0\n\
+        set_option linter.missingDocs true\n\
+        def missing : Nat := 1\n\
+        /-- -/ def empty : Nat := 2\n\
+        /-- documented -/ def documented : Nat := 3\n\
+        section\nset_option linter.missingDocs false\n\
+        def quiet : Nat := 4\nend\n\
+        set_option linter.missingDocs false in\n\
+        def scopedQuiet : Nat := 5\n\
+        open Nat in\n\
+        def afterScope : Nat := 6\n\
+        theorem noDocsNeeded : 1 = 1 := rfl\n";
+    let executed = seed()
+        .execute_source_commands_with_checks(
+            source.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().admission.kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let warnings = executed
+        .warnings
+        .iter()
+        .map(|warning| {
+            (
+                warning.at.0,
+                warning.message.lines().next().unwrap().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected = [
+        ("missing :", "missing doc string for public def missing"),
+        ("empty :", "empty doc string for public def empty"),
+        (
+            "afterScope :",
+            "missing doc string for public def afterScope",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, message)| (source.find(name).unwrap(), message.to_owned()))
+    .collect::<Vec<_>>();
+    assert_eq!(warnings, expected);
+    assert!(
+        executed
+            .warnings
+            .iter()
+            .all(|warning| warning.follows_output)
+    );
+    // Checking and executing both accept the honored option; warnings do not change admission.
+    assert_eq!(run(&seed(), source).unwrap().theorems, 1);
+}
+
+#[test]
+fn missing_docs_skips_inherited_field_redeclarations_and_preserves_crlf_offsets() {
+    let source = "set_option linter.missingDocs true\r\n\
+        /-- Base. -/ structure Base where\r\n  /-- Field. -/ value : Nat\r\n\
+        /-- Child. -/ structure Child extends Base where\r\n  value := 2\r\n  /-- -/ fresh : Nat\r\n";
+    let executed = seed()
+        .execute_source_commands_with_checks(
+            source.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().admission.kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(executed.warnings.len(), 1, "{:?}", executed.warnings);
+    assert_eq!(executed.warnings[0].at.0, source.find("fresh").unwrap());
+    assert!(
+        executed.warnings[0]
+            .message
+            .starts_with("empty doc string for public field Child.fresh\n")
+    );
 }
 
 #[test]

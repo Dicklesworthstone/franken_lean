@@ -45,6 +45,8 @@ jobs:
       CARGO_BUILD_JOBS: '1'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_CODEGEN_UNITS: '256'
+      CARGO_PROFILE_TEST_CODEGEN_UNITS: '256'
       FLN_REQUIRE_REFERENCE: '1'
       FLN_REFERENCE_PARTITION: ${{ github.workspace }}/contracts/builtin_partition.tsv
       FLN_IR_REFERENCE_ARTIFACTS: ${{ github.workspace }}/target/imported-ir-reference/live
@@ -97,7 +99,9 @@ jobs:
           set -euo pipefail
           cargo test --locked -p fln --lib thunk_ -- --nocapture --test-threads=1 \
             2>&1 | tee target/imported-ir-reference/thunks.log
-          grep -Fq 'test imported_ir::native_signature::tests::live_pinned_thunk_ir_preserves_native_prototypes_laziness_and_boxed_calls ... ok' \
+          grep -Fq 'test imported_ir::native_signature::tests::live_pinned_thunk_ir_preserves_native_prototypes_laziness_and_boxed_calls' \
+            target/imported-ir-reference/thunks.log
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' \
             target/imported-ir-reference/thunks.log
       - name: Check cancellable import reconstruction
         shell: bash
