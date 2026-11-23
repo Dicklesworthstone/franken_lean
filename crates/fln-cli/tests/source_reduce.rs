@@ -21,6 +21,9 @@ import Init.Core
 #reduce (2, 3).1
 #reduce (types := true) 2 = 1 + 1
 #reduce 2 = 1 + 1
+def hidden : Nat := 4
+attribute [irreducible] hidden
+#reduce hidden
 ";
 
 const EXPECTED: &str = "5
@@ -31,6 +34,7 @@ fun x => x.succ
 2
 2 = 2
 2 = 1 + 1
+4
 ";
 
 fn pinned_lib() -> Option<PathBuf> {

@@ -1,9 +1,10 @@
-//! `#reduce`'s normal form: the pin's `Meta.reduce` (vendored `src/Lean/Meta/Reduce.lean`) as
-//! `elabReduce` runs it (`src/Lean/Elab/BuiltinCommand.lean:459`), at transparency `all` with
-//! smart unfolding off.
+//! The pin's `Meta.reduce` (vendored `src/Lean/Meta/Reduce.lean`), shared by `#reduce`
+//! and conversion mode. `elabReduce` (`src/Lean/Elab/BuiltinCommand.lean:459`) uses
+//! transparency `all` with smart unfolding off; conv `reduce` preserves the ambient
+//! transparency and smart unfolding of `whnf`.
 //!
-//! Each subterm that is neither a type nor a proof is put in weak-head normal form by the
-//! unifier's reducer at [`UnificationTransparency::SafeDefinitions`], whose `reduceNat?` rung
+//! For the command, each subterm that is neither a type nor a proof is put in weak-head normal
+//! form at [`UnificationTransparency::SafeDefinitions`], whose `reduceNat?` rung
 //! folds literal arithmetic before delta, as the pin's `whnfImp` does. Then its head and its
 //! explicit arguments are reduced in turn, under binders through telescopes. Where this reduction
 //! stops but the pin's would go on, nothing is printed: the pin unfolds theorems at `all`, and so
@@ -24,6 +25,12 @@ pub(in crate::source) struct ReduceConfig {
     pub implicits: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ReduceMode {
+    Command,
+    Ambient,
+}
+
 impl Context {
     /// The normal form `#reduce` prints for `term`.
     pub(in crate::source) fn meta_reduce(
@@ -32,13 +39,26 @@ impl Context {
         config: ReduceConfig,
     ) -> Result<Expr, NatDefinitionElabError> {
         let mut cache = HashMap::new();
-        self.meta_reduce_visit(term, config, &mut cache, 0)
+        self.meta_reduce_visit(term, config, ReduceMode::Command, &mut cache, 0)
+    }
+
+    /// `Meta.reduce` in the current tactic context (`Conv.evalReduce`, vendored
+    /// `Lean/Elab/Tactic/Conv/Basic.lean:95-97`). In particular, this does not
+    /// inherit `#reduce`'s permission to unfold irreducible definitions.
+    pub(in crate::source) fn meta_reduce_ambient(
+        &mut self,
+        term: &Expr,
+        config: ReduceConfig,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let mut cache = HashMap::new();
+        self.meta_reduce_visit(term, config, ReduceMode::Ambient, &mut cache, 0)
     }
 
     fn meta_reduce_visit(
         &mut self,
         term: &Expr,
         config: ReduceConfig,
+        mode: ReduceMode,
         cache: &mut HashMap<usize, (Expr, Expr)>,
         depth: usize,
     ) -> Result<Expr, NatDefinitionElabError> {
@@ -51,7 +71,7 @@ impl Context {
         if let Some((_, reduced)) = cache.get(&key) {
             return Ok(reduced.clone());
         }
-        let reduced = self.meta_reduce_node(&term, config, cache, depth)?;
+        let reduced = self.meta_reduce_node(&term, config, mode, cache, depth)?;
         // The key's allocation is held with its answer, so no other term can reuse its address.
         cache.insert(key, (term, reduced.clone()));
         Ok(reduced)
@@ -61,6 +81,7 @@ impl Context {
         &mut self,
         term: &Expr,
         config: ReduceConfig,
+        mode: ReduceMode,
         cache: &mut HashMap<usize, (Expr, Expr)>,
         depth: usize,
     ) -> Result<Expr, NatDefinitionElabError> {
@@ -70,19 +91,25 @@ impl Context {
         if !config.proofs && self.reduce_is_proof(term)? {
             return Ok(term.clone());
         }
-        let term = self.meta_whnf(term)?;
-        self.refuse_reduction_stuck_short(&term)?;
+        let term = match mode {
+            ReduceMode::Command => {
+                let term = self.meta_whnf(term)?;
+                self.refuse_reduction_stuck_short(&term)?;
+                term
+            }
+            ReduceMode::Ambient => self.whnf(term)?,
+        };
         match term.node() {
             ExprNode::App { .. } => {
                 let (head, arguments) = operators::spine(&term);
-                let head = self.meta_reduce_visit(&head, config, cache, depth + 1)?;
+                let head = self.meta_reduce_visit(&head, config, mode, cache, depth + 1)?;
                 let explicit = self.reduce_explicit_arguments(&head, &arguments)?;
                 let mut reduced = Vec::with_capacity(arguments.len());
                 for (index, argument) in arguments.iter().enumerate() {
                     self.tick()?;
                     reduced.push(
                         if config.implicits || explicit.get(index).copied().unwrap_or(true) {
-                            self.meta_reduce_visit(argument, config, cache, depth + 1)?
+                            self.meta_reduce_visit(argument, config, mode, cache, depth + 1)?
                         } else {
                             argument.clone()
                         },
@@ -105,14 +132,14 @@ impl Context {
                 Ok(reduced.into_iter().fold(head, Expr::app))
             }
             ExprNode::Lam { .. } | ExprNode::ForallE { .. } => {
-                self.meta_reduce_binders(&term, config, cache, depth)
+                self.meta_reduce_binders(&term, config, mode, cache, depth)
             }
             ExprNode::Proj {
                 struct_name,
                 idx,
                 expr,
             } => {
-                let inner = self.meta_reduce_visit(expr, config, cache, depth + 1)?;
+                let inner = self.meta_reduce_visit(expr, config, mode, cache, depth + 1)?;
                 Ok(Expr::proj(struct_name.clone(), *idx, inner))
             }
             _ => Ok(term),
@@ -125,41 +152,47 @@ impl Context {
         &mut self,
         term: &Expr,
         config: ReduceConfig,
+        mode: ReduceMode,
         cache: &mut HashMap<usize, (Expr, Expr)>,
         depth: usize,
     ) -> Result<Expr, NatDefinitionElabError> {
         let lambda = matches!(term.node(), ExprNode::Lam { .. });
         let saved = self.txn.lctx.clone();
-        let mut binders = Vec::new();
-        let mut body = term.clone();
-        loop {
-            self.tick()?;
-            let (name, domain, inner, style) = match body.node() {
-                ExprNode::Lam {
-                    binder_name,
-                    binder_type,
-                    body,
-                    binder_info,
-                } if lambda => (binder_name, binder_type, body, binder_info),
-                ExprNode::ForallE {
-                    binder_name,
-                    binder_type,
-                    body,
-                    binder_info,
-                } if !lambda => (binder_name, binder_type, body, binder_info),
-                _ => break,
-            };
-            let id = FVarId(self.fresh_name()?);
-            self.txn
-                .lctx
-                .add_param(id.clone(), name.clone(), domain.clone(), *style);
-            let opened = self.substitute(inner, &Expr::fvar(id.clone()))?;
-            binders.push((id, name.clone(), domain.clone(), *style));
-            body = opened;
-        }
-        let result = self.meta_reduce_visit(&body, config, cache, depth + 1);
+        // Opening a telescope can exhaust the budget too. Restore the caller's
+        // context on those exits as well as on a failure while reducing its body.
+        let result = (|| -> Result<_, NatDefinitionElabError> {
+            let mut binders = Vec::new();
+            let mut body = term.clone();
+            loop {
+                self.tick()?;
+                let (name, domain, inner, style) = match body.node() {
+                    ExprNode::Lam {
+                        binder_name,
+                        binder_type,
+                        body,
+                        binder_info,
+                    } if lambda => (binder_name, binder_type, body, binder_info),
+                    ExprNode::ForallE {
+                        binder_name,
+                        binder_type,
+                        body,
+                        binder_info,
+                    } if !lambda => (binder_name, binder_type, body, binder_info),
+                    _ => break,
+                };
+                let id = FVarId(self.fresh_name()?);
+                self.txn
+                    .lctx
+                    .add_param(id.clone(), name.clone(), domain.clone(), *style);
+                let opened = self.substitute(inner, &Expr::fvar(id.clone()))?;
+                binders.push((id, name.clone(), domain.clone(), *style));
+                body = opened;
+            }
+            let body = self.meta_reduce_visit(&body, config, mode, cache, depth + 1)?;
+            Ok((binders, body))
+        })();
         self.txn.lctx = saved;
-        let mut body = result?;
+        let (binders, mut body) = result?;
         for (id, name, domain, style) in binders.into_iter().rev() {
             self.tick()?;
             body = body
@@ -289,6 +322,83 @@ impl Context {
                 Ok(())
             }
             _ => Err(stuck()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduction_locals_are_restored_at_every_heartbeat_stop() {
+        let env = crate::seed::bootstrap_nat_environment(Budget::DEFAULT).unwrap();
+        let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+        let x = Name::from_components(["x"]);
+        let y = Name::from_components(["y"]);
+        let term = Expr::lam(
+            x.clone(),
+            nat.clone(),
+            Expr::lam(
+                y.clone(),
+                nat.clone(),
+                Expr::let_e(
+                    Name::from_components(["z"]),
+                    nat.clone(),
+                    Expr::app(
+                        Expr::lam(
+                            x.clone(),
+                            nat.clone(),
+                            Expr::bvar(0).unwrap(),
+                            BinderInfo::Default,
+                        ),
+                        Expr::bvar(1).unwrap(),
+                    ),
+                    Expr::bvar(0).unwrap(),
+                    false,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let expected = Expr::lam(
+            x.clone(),
+            nat.clone(),
+            Expr::lam(y, nat.clone(), Expr::bvar(1).unwrap(), BinderInfo::Default),
+            BinderInfo::Default,
+        );
+        let context = || {
+            let mut context = Context::new(&env, Budget::DEFAULT);
+            context.txn.lctx.add_param(
+                FVarId(Name::from_components(["existing"])),
+                x.clone(),
+                nat.clone(),
+                BinderInfo::Default,
+            );
+            context
+        };
+        // Both entry points share telescope traversal, but retain their distinct
+        // weak-head reduction policies. Every failing allowance must leave the
+        // original local context intact, even if opening stopped mid-telescope.
+        for mode in [ReduceMode::Command, ReduceMode::Ambient] {
+            let run = |context: &mut Context| {
+                let mut cache = HashMap::new();
+                context.meta_reduce_visit(&term, ReduceConfig::default(), mode, &mut cache, 0)
+            };
+            let mut complete = context();
+            let saved = complete.txn.lctx.clone();
+            assert_eq!(run(&mut complete).unwrap(), expected);
+            assert_eq!(complete.txn.lctx, saved);
+            let steps = complete.txn.budget.heartbeats_consumed;
+            assert!(steps > 1, "reduction must actually visit the telescope");
+            for allowed in 1..steps {
+                let mut limited = context();
+                limited.txn.budget.max_heartbeats = allowed;
+                assert!(run(&mut limited).is_err(), "bound {allowed}");
+                assert_eq!(limited.txn.lctx, saved, "locals escaped at bound {allowed}");
+                assert_eq!(limited.txn.env, env);
+                assert!(limited.txn.budget.heartbeats_consumed >= allowed);
+            }
         }
     }
 }

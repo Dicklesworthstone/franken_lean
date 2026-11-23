@@ -282,6 +282,114 @@ fn conv_delta_succeeds_unchanged_without_exposing_opaque_bodies() {
 }
 
 #[test]
+fn conv_reduce_normalizes_nested_arguments_binders_and_dependent_focus() {
+    let base = conv_environment();
+    // Closing with reducible transparency after normalization makes these
+    // checks sensitive to the actual intermediate term: an ignored `reduce`
+    // cannot discharge the remaining applications of semireducible `wrap`.
+    check(
+        &base,
+        r#"structure Cell where
+  value : Nat
+def select : Nat -> Nat
+  | .zero => 2
+  | .succ _ => 5
+theorem applications (f : Nat -> Nat -> Nat) :
+    f ((fun n : Nat => n) (wrap (Nat.add 2 3))) (let n := wrap 7; n) = f 5 7 := by
+  conv =>
+    lhs
+    reduce
+    tactic => with_reducible exact Eq.refl (f 5 7)
+theorem iota (f : Nat -> Nat) : f (select 3) = f 5 := by
+  conv =>
+    lhs
+    reduce
+    tactic => with_reducible exact Eq.refl (f 5)
+theorem projection (f : Nat -> Nat) : f ((Cell.mk (wrap 9)).value) = f 9 := by
+  conv =>
+    lhs
+    reduce
+    tactic => with_reducible exact Eq.refl (f 9)
+theorem underLambda : (fun n : Nat => wrap (Nat.add n 0)) = (fun n : Nat => n) := by
+  conv =>
+    lhs
+    reduce
+    tactic => with_reducible exact Eq.refl (fun n : Nat => n)
+theorem dependent {A : Nat -> Type} (n : Nat) (x : A n) (f : (i : Nat) -> A i -> Nat) :
+    f (wrap n) (id x) = f n x := by
+  conv =>
+    lhs
+    reduce
+    tactic => with_reducible exact Eq.refl (f n x)
+theorem hypothesis (f : Nat -> Nat) (n m : Nat) (h : f (wrap n) = m) : f n = m := by
+  conv at h => lhs; reduce
+  exact h
+"#,
+    );
+}
+
+#[test]
+fn conv_reduce_preserves_transparency_and_implicit_arguments() {
+    let base = check(
+        &conv_environment(),
+        "def hidden : Nat := 4\nattribute [irreducible] hidden\nopaque sealed : Nat := 7\naxiom indexed {n : Nat} (x : Nat) : Nat\n",
+    )
+    .engine;
+    for source in [
+        "theorem stable : hidden = hidden := by conv => lhs; reduce",
+        "theorem forced : hidden = 4 := by with_unfolding_all conv => lhs; reduce",
+        "theorem opaqueStable : sealed = sealed := by conv => lhs; reduce",
+        "theorem implicitUnchanged : @indexed (wrap 1) (wrap 2) = @indexed (wrap 1) 2 := by\n  conv =>\n    lhs\n    reduce\n    tactic => with_reducible exact Eq.refl (@indexed (wrap 1) 2)",
+    ] {
+        check(&base, source);
+    }
+    for source in [
+        "theorem bad : hidden = 4 := by conv => lhs; reduce",
+        "theorem bad : sealed = 7 := by with_unfolding_all conv => lhs; reduce",
+        "theorem bad (n : Nat) : wrap n = n := by with_reducible conv => lhs; reduce",
+        "theorem bad (f : Nat -> Nat) : f (wrap 5) = f 6 := by conv => lhs; reduce",
+    ] {
+        refuses_source_conversion(&base, source, "bad");
+    }
+    // A failed conversion cannot poison a later query using the same input.
+    check(
+        &base,
+        "theorem recovered (n : Nat) : wrap n = n := by conv => lhs; reduce",
+    );
+}
+
+#[test]
+fn conv_reduce_resource_stops_are_nonanswers_and_preserve_the_input() {
+    let base = conv_environment();
+    let root = base.logical_root(&KVMap::new());
+    let mut low = SourceCheckLimits::new(limits());
+    low.admission.kernel = low.admission.kernel.narrowed(0, 32);
+    let result = base.check_source_files(
+        &[b"theorem stopped (n : Nat) : wrap n = n := by conv => lhs; reduce"],
+        &KVMap::new(),
+        low,
+    );
+    match result {
+        Ok(Outcome::Inconclusive(_)) => {}
+        Err(error) => assert!(
+            matches!(error.disposition(), ("resource" | "inconclusive", false, 3)),
+            "{error:?}"
+        ),
+        other => panic!("reduction exhaustion changed into a verdict: {other:?}"),
+    }
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(
+        !base
+            .environment()
+            .contains(&Name::from_components(["stopped"]))
+    );
+    check(
+        &base,
+        "theorem recovered (n : Nat) : wrap n = n := by conv => lhs; reduce",
+    );
+}
+
+#[test]
 fn ordinary_rfl_infers_shared_arguments_through_safe_delta_conversion() {
     let base = check(&engine(), WRAP).engine;
     for source in [

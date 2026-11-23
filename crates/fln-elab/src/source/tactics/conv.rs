@@ -670,9 +670,13 @@ impl Context {
                 proof.work.push(Work::Goal(goal));
                 Ok(())
             }
-            "whnf" => {
+            "whnf" | "reduce" => {
                 let (_, _, lhs, _) = self.conv_sides(&goal)?;
-                let reduced = self.whnf(&lhs)?;
+                let reduced = if short == "reduce" {
+                    self.meta_reduce_ambient(&lhs, reduce::ReduceConfig::default())?
+                } else {
+                    self.whnf(&lhs)?
+                };
                 let next = self.conv_change_lhs(goal, reduced)?;
                 proof.work.push(Work::Goal(next));
                 Ok(())

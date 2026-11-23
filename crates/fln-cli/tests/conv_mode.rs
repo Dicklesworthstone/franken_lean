@@ -11,11 +11,10 @@
 //! indices, names and patterns, `congr` (with its case tags, over-applied functions and
 //! implications), `ext`/`intro` into `∀`, `fun` and `let`, `pattern` (one occurrence, a list,
 //! `*`) and `conv in`, `conv at h`, `rw`/`rewrite`, `change`, `zeta`, `unfold`, `simp only`,
-//! `dsimp only`, `simp`, `delta`, `clear`, `apply`, `tactic =>`, `rfl`, `skip`, `done`, `·`, `{ }`,
+//! `dsimp only`, `simp`, `delta`, `reduce`, `clear`, `apply`, `tactic =>`, `rfl`, `skip`, `done`, `·`, `{ }`,
 //! `( )`, `first`, `try`, `repeat`, `fail_if_success`, nested `conv =>` blocks, `calc` (with a
 //! first step that has no proof), `rw` abstracting as the pin's `kabstract`, and goal display
-//! through `trace_state`; then failures the pin reports, and a conv tactic this engine refuses,
-//! typed.
+//! through `trace_state`; then failures the pin reports and transparency boundaries.
 //!
 //! The original fixture set was run through pinned `lean` v4.32.0 with the same header
 //! (2026-10-24). Every test compares its programs with the pinned binary when it is present.
@@ -144,26 +143,50 @@ fn conv_failures_are_refused_as_the_pin_reports_them() {
     }
 }
 
-/// `reduce` is a conv tactic the pin runs and this engine does not: it is refused, typed, rather
-/// than approximated by another unfolding.
+/// `Conv.evalReduce` is `Meta.reduce` at the current transparency, with its
+/// default omission of type, proof and implicit arguments. Traces distinguish
+/// full recursive reduction from `whnf`, a no-op, or `#reduce`'s stronger mode.
 #[test]
-fn an_unimplemented_conv_tactic_is_refused_typed() {
+fn conv_reduce_normalizes_with_the_reference_transparency_and_traversal() {
     let Some(lib) = pinned_lib() else {
         return;
     };
-    let root = workspace("unsupported");
-    let name = "Reduce.lean";
-    std::fs::write(root.join(name), REDUCE).unwrap();
-    if let Some((code, stdout)) = pinned(&lib, &root, name) {
-        assert_eq!((code, stdout.as_str()), (0, ""), "the pin moved");
+    let root = workspace("reduce");
+    for (name, program, expected) in REDUCE_ACCEPTED {
+        std::fs::write(root.join(name), program).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!(
+                (code, stdout.as_str()),
+                (0, *expected),
+                "{name}: the pin moved"
+            );
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 0, "{name}: {stdout}{stderr}");
+        assert_eq!(stdout, *expected, "{name}: {stderr}");
+        assert!(stderr.is_empty(), "{name}: {stderr}");
     }
-    let (code, stdout, stderr) = ours(&lib, &root, name);
-    assert_eq!(code, 1, "{stdout}{stderr}");
-    assert!(
-        stdout.contains(": error: unsupported tactic `Lean.Parser.Tactic.Conv.reduce`"),
-        "{stdout}{stderr}"
-    );
-    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn conv_reduce_cannot_expose_opaque_bodies_or_turn_false_goals_into_proofs() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace("reduce-refused");
+    for (name, program) in REDUCE_REFUSED {
+        std::fs::write(root.join(name), program).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!(code, 1, "{name}: the pin moved: {stdout}");
+            assert!(stdout.contains("unsolved goals"), "{name}: {stdout}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+        assert!(
+            stderr.contains("proof script left 1 unsolved goals"),
+            "{name}: {stdout}{stderr}"
+        );
+    }
 }
 
 /// `Conv.evalDelta` uses `deltaExpand`, then `changeLhs`: selected definitions
@@ -298,6 +321,107 @@ example : (fun n : Nat => n) 7 = 7 := by
     lhs
     reduce
 "#;
+
+const REDUCE_ACCEPTED: &[(&str, &str, &str)] = &[
+    ("Reduce.lean", REDUCE, ""),
+    (
+        "ReduceArguments.lean",
+        r#"prelude
+import Init.Conv
+import Init.Data.Nat.Basic
+def wrap (n : Nat) : Nat := n
+structure Cell where
+  value : Nat
+def select : Nat -> Nat
+  | .zero => 2
+  | .succ _ => 5
+example (f : Nat -> Nat) : f (wrap ((fun n : Nat => n) (Nat.add 2 3))) = f 5 := by
+  conv => lhs; reduce; trace_state
+example (f : Nat -> Nat) : f (let n := wrap 7; n) = f 7 := by
+  conv => lhs; reduce; trace_state
+example (f : Nat -> Nat) : f ((Cell.mk (wrap 9)).value) = f 9 := by
+  conv => lhs; reduce; trace_state
+example (f : Nat -> Nat) : f (select 3) = f 5 := by
+  conv => lhs; reduce; trace_state
+"#,
+        "f : Nat → Nat\n| f 5\nf : Nat → Nat\n| f 7\nf : Nat → Nat\n| f 9\nf : Nat → Nat\n| f 5\n",
+    ),
+    (
+        "ReduceBinders.lean",
+        r#"prelude
+import Init.Conv
+import Init.Data.Nat.Basic
+def wrap.{u} {A : Sort u} (a : A) : A := a
+example : (fun n : Nat => wrap (Nat.add n 0)) = (fun n : Nat => n) := by
+  conv => lhs; reduce; trace_state
+example {A : Nat -> Type} (n : Nat) (x : A n) (f : (i : Nat) -> A i -> Nat) :
+    f (wrap n) (id x) = f n x := by
+  conv =>
+    lhs
+    reduce
+    tactic => with_reducible exact Eq.refl (f n x)
+example (f : Nat -> Nat) (n m : Nat) (h : f (wrap n) = m) : f n = m := by
+  conv at h => lhs; reduce
+  exact h
+axiom indexed {n : Nat} (x : Nat) : Nat
+example : @indexed (wrap 1) (wrap 2) = @indexed (wrap 1) 2 := by
+  conv =>
+    lhs
+    reduce
+    tactic => with_reducible exact Eq.refl (@indexed (wrap 1) 2)
+"#,
+        "| fun n => n\n",
+    ),
+    (
+        "ReduceTransparency.lean",
+        r#"prelude
+import Init.Conv
+def hidden : Nat := 4
+attribute [irreducible] hidden
+opaque sealed : Nat := 7
+def wrap.{u} {A : Sort u} (a : A) : A := a
+example : hidden = hidden := by
+  conv => lhs; reduce; trace_state
+example : hidden = 4 := by
+  with_unfolding_all conv => lhs; reduce; trace_state
+example : sealed = sealed := by
+  conv => lhs; reduce; trace_state
+example (A : Type) : wrap A = A := by
+  conv => lhs; reduce; trace_state
+example (P : Prop) (h : P) : wrap h = h := by
+  conv => lhs; reduce; trace_state
+"#,
+        "| hidden\n| 4\n| sealed\nA : Type\n| wrap A\nP : Prop\nh : P\n| wrap h\n",
+    ),
+];
+
+const REDUCE_REFUSED: &[(&str, &str)] = &[
+    (
+        "ReduceIrreducible.lean",
+        r#"prelude
+import Init.Conv
+def hidden : Nat := 4
+attribute [irreducible] hidden
+example : hidden = 4 := by conv => lhs; reduce
+"#,
+    ),
+    (
+        "ReduceOpaque.lean",
+        r#"prelude
+import Init.Conv
+opaque sealed : Nat := 7
+example : sealed = 7 := by with_unfolding_all conv => lhs; reduce
+"#,
+    ),
+    (
+        "ReduceFalse.lean",
+        r#"prelude
+import Init.Conv
+def wrap (n : Nat) : Nat := n
+example (f : Nat -> Nat) : f (wrap 5) = f 6 := by conv => lhs; reduce
+"#,
+    ),
+];
 
 const DELTA_ACCEPTED: &[(&str, &str, &str)] = &[
     (
