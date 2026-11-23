@@ -387,23 +387,30 @@ fn quotations_and_macros_produce_the_pins_trees() {
     }
 }
 
-/// Outside a quotation `$` starts no antiquotation, and unsupported splice shapes are refused
-/// rather than read as operators. `match $c with` is refused too: the pin reads a bare capture
-/// as its `(generalizing := …)` parameter, then misses the discriminant. Escaped antiquotations
-/// are valid syntax; the source checker separately rejects their use as unbound captures.
+/// Malformed quotation/splice shapes refused by the pinned Lean 4 v4.32.0 frontend stay refused,
+/// while valid splice syntax (`$xs*`, `[$xs,*]`) and escaped antiquotations parse to the pin's
+/// trees.
 #[test]
 fn antiquotations_outside_quotations_and_unread_splices_are_refused() {
     let mut grammar = FileGrammar::new(false, &[], None).expect("Init");
     for source in [
-        "def f (x : Nat) : Nat := $x",
         "def f (c : Lean.Term) : Lean.MacroM Lean.Term := `(match $c with | _ => 1)",
-        "macro_rules | `(h $xs*) => `(g $xs*)",
         "macro_rules | `(h $x) => `(g $[$x]?)",
     ] {
         assert!(parse(&mut grammar, source).is_err(), "{source}");
     }
-    // Whole sepBy suffix captures now have a native reader. Keep the other
-    // unsupported splices above refused, rather than dropping this boundary.
+    // Verified against Lean 4 v4.32.0 (`exit=0`): `$xs*` parses as a suffix-splice antiquotation.
+    let splice = parse(&mut grammar, "macro_rules | `(h $xs*) => `(g $xs*)")
+        .expect("Lean 4 v4.32.0 accepts suffix splice antiquotation `$xs*`");
+    assert!(
+        splice.contains("many.antiquot_suffix_splice"),
+        "expected many.antiquot_suffix_splice node, got: {splice}"
+    );
+    // Verified against Lean 4 v4.32.0: `withAntiquotFn` parses `$x` as `term.pseudo.antiquot`
+    // even outside quotations; elaboration rejects stray antiquotation nodes.
+    let outside = parse(&mut grammar, "def f (x : Nat) : Nat := $x").unwrap();
+    assert!(outside.contains(r#"(term.pseudo.antiquot "$" [] `x [])"#));
+    // Whole sepBy suffix captures also parse to the pinned suffix-splice shape.
     parse(&mut grammar, "macro_rules | `(h [$xs,*]) => `([$xs,*])")
         .expect("a list repetition capture has the pinned suffix-splice shape");
     parse(&mut grammar, r#"syntax "h " term:max : term"#).expect("a native macro syntax");
@@ -436,10 +443,12 @@ fn typed_captures_do_not_end_their_enclosing_match_or_conditional() {
         "macro \"bad \" a:term:max : term => `(match $a:unknown with | _ => 0)",
         "macro \"bad \" a:term:max : term => `(match $a: with | _ => 0)",
         "macro \"bad \" a:term:max : term => `(match $a with | _ => 0)",
-        "def bad : Nat := match $a:term with | _ => 0",
     ] {
         assert!(parse(&mut grammar, source).is_err(), "{source}");
     }
+    // Verified against Lean 4 v4.32.0: `$a:term` parses as `term.pseudo.antiquot` at any depth.
+    let outside = parse(&mut grammar, "def bad : Nat := match $a:term with | _ => 0").unwrap();
+    assert!(outside.contains(r#"(term.pseudo.antiquot "$" [] `a (antiquotName ":" "term"))"#));
 }
 
 #[test]

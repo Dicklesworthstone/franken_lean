@@ -8431,13 +8431,26 @@ fn reduce_config(syntax: &Syntax) -> Result<reduce::ReduceConfig, NatDefinitionE
     )?;
     let mut config = reduce::ReduceConfig::default();
     for item in expect_null_args(&parts[0], "reduce options")? {
+        let item_args = match item {
+            Syntax::Node { kind, args, .. }
+                if *kind == Name::from_components(["group"])
+                    || *kind == fln_parse::state::null_kind() =>
+            {
+                args.as_slice()
+            }
+            _ => {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "reduce option",
+                });
+            }
+        };
         let [
             open,
             Syntax::Ident { val: name, .. },
             assign,
             Syntax::Ident { val: value, .. },
             close,
-        ] = expect_null_args(item, "reduce option")?
+        ] = item_args
         else {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "a #reduce option written `(name := true)` or `(name := false)`",
@@ -8920,4 +8933,24 @@ fn where_struct_instance(syntax: &Syntax) -> Result<Syntax, NatDefinitionElabErr
             atom("}"),
         ],
     ))
+}
+
+#[cfg(test)]
+mod reduce_config_tests {
+    use super::*;
+
+    #[test]
+    fn reduce_config_reads_pinned_group_nodes_from_unified_parser() {
+        let parsed = fln_parse::parse_source_command(
+            b"#reduce (types := true) (proofs := false) (implicits := true) 1",
+        )
+        .expect("unified parser accepts #reduce with boolean options");
+        let Syntax::Node { args, .. } = parsed.syntax() else {
+            panic!("expected Lean.reduceCmd node");
+        };
+        let config = reduce_config(&args[1]).expect("reduce_config accepts pin group nodes");
+        assert!(config.types);
+        assert!(!config.proofs);
+        assert!(config.implicits);
+    }
 }

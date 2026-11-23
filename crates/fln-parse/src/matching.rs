@@ -2676,11 +2676,11 @@ mod tests {
                     source.replace("\r\n", "\n").as_bytes()
                 );
             } else {
-                assert!(matches!(parsed,
-                    Err(NatDefinitionParseError::OutsideSeedGrammar {
-                        at,
-                        expected: NatDefinitionExpectation::MatchAlternative,
-                    }) if at.0 == source.rfind('1').unwrap()));
+                assert!(matches!(
+                    parsed,
+                    Err(NatDefinitionParseError::GeneratedParser { at, .. })
+                        if at.0 == source.rfind('1').unwrap()
+                ));
             }
         }
     }
@@ -2724,13 +2724,17 @@ mod tests {
             "def f := match b with | => 1",
             "def f := match b with | true =>",
             "def f := match b with | true 1",
-            "def f := match b, c with | true => 1",
             "def f := match b with | true => 1\n  | false => 0",
         ] {
             assert!(parse_definition(text.as_bytes()).is_err(), "{text}");
         }
-        // An ascribed pattern is the pin's `Term.typeAscription`.
-        assert!(parse_definition(b"def f := match b with | .some (x : Nat) => x").is_ok());
+        // Ascribed patterns and arity mismatches parse in Lean 4 v4.32.0 (elaborator checks arity).
+        for text in [
+            "def f := match b with | .some (x : Nat) => x",
+            "def f := match b, c with | true => 1",
+        ] {
+            assert!(parse_definition(text.as_bytes()).is_ok(), "{text}");
+        }
     }
     #[test]
     fn deeply_nested_matches_parse_without_host_recursion() {
@@ -2774,20 +2778,19 @@ mod matrix_tests {
     }
     #[test]
     fn malformed_matrices_never_drop_a_column_or_group() {
-        for pattern in [
-            "",
-            ", true",
-            "true,",
-            "true,,false",
-            "(.some x",
-            ".some ()",
-            ".some (x : Nat)",
-            ".some (x, y)",
-        ] {
+        for pattern in ["", ", true", "true,", "true,,false", "(.some x"] {
             let text = format!("def bad (a b : Bool) := match a, b with | {pattern} => 0");
             assert!(parse_definition(text.as_bytes()).is_err(), "{text}");
         }
-        assert!(parse_definition(b"def bad := match a, b with | true, false, true => 0").is_err());
+        // Lean 4 v4.32.0's parser accepts arbitrary term patterns and checks arity in elaboration.
+        for text in [
+            "def bad (a b : Bool) := match a, b with | .some () => 0",
+            "def bad (a b : Bool) := match a, b with | .some (x : Nat) => 0",
+            "def bad (a b : Bool) := match a, b with | .some (x, y) => 0",
+            "def bad := match a, b with | true, false, true => 0",
+        ] {
+            assert!(parse_definition(text.as_bytes()).is_ok(), "{text}");
+        }
     }
     #[test]
     fn deeply_nested_pattern_groups_fit_a_small_stack() {
@@ -2836,12 +2839,13 @@ mod equation_tests {
             "def f : Bool -> Nat | true 1",
             "def f : Bool -> Nat | true =>",
             "def f : Bool -> Nat | true => 1 | false =>",
-            "def f : Bool -> Nat | true => 1 | false, true => 2",
             "def f : Bool -> Nat | true => 1 := 2",
             "def f : Bool -> Nat | true => 1\n   | false => 2",
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }
+        // Row-arity mismatches are elaborator errors in Lean 4 v4.32.0, not parser errors.
+        assert!(parse_definition(b"def f : Bool -> Nat | true => 1 | false, true => 2").is_ok());
         assert!(parse_nat_definition(b"def f : Nat -> Nat | n => n").is_err());
     }
 }
@@ -2912,11 +2916,11 @@ mod pattern_function_tests {
             "def f := fun | true =>",
             "def f := fun | true 7",
             "def f := fun | => 1",
-            "def f := fun | true => 1 | false, true => 2",
             "def f := (fun | true => 1 | false => 2",
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }
+        assert!(parse_definition(b"def f := fun | true => 1 | false, true => 2").is_ok());
     }
     #[test]
     fn nested_pattern_functions_use_a_heap_plan() {
@@ -2963,13 +2967,18 @@ mod literal_pattern_tests {
     #[test]
     fn literals_cannot_be_applied_as_pattern_constructors() {
         for source in [
-            "def f : Nat -> Nat | 0 x => 1 | _ => 2",
             "def f : Nat -> Nat | .0 => 1 | _ => 2",
-            "def f : String -> Nat | \"a\" x => 1 | _ => 2",
-            "def f : Char -> Nat | 'a' x => 1 | _ => 2",
             "def f : Char -> Nat | .'a' => 1 | _ => 2",
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+        // In Lean 4 v4.32.0 patterns are parsed as `term` (`0 x` is `Term.app`); elaboration rejects them.
+        for source in [
+            "def f : Nat -> Nat | 0 x => 1 | _ => 2",
+            "def f : String -> Nat | \"a\" x => 1 | _ => 2",
+            "def f : Char -> Nat | 'a' x => 1 | _ => 2",
+        ] {
+            assert!(parse_definition(source.as_bytes()).is_ok(), "{source}");
         }
     }
     #[test]

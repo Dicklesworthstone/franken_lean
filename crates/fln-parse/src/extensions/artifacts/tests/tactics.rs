@@ -264,12 +264,23 @@ fn tactic_arguments_use_the_compound_planner_but_require_one_tactic() {
         let source = format!("theorem rejected : True := by imported_wrap [{body}]");
         assert!(parse(&file, &source).is_err(), "accepted sequence {body}");
     }
+    let depth = crate::builtin_interpreter::DEFAULT_MAX_DEPTH + 2;
     let deeply_nested = format!(
         "theorem rejected : True := by {}rfl{}",
-        "imported_wrap [".repeat(32),
-        "]".repeat(32)
+        "imported_wrap [".repeat(depth),
+        "]".repeat(depth)
     );
-    assert!(parse(&file, &deeply_nested).is_err());
+    assert!(matches!(
+        with_grammar(&file.grammar(), || crate::parse_source_command(
+            deeply_nested.as_bytes()
+        )),
+        Err(crate::NatDefinitionParseError::GeneratedParser {
+            error: crate::builtin_interpreter::ParserFailure::Resource(
+                crate::builtin_interpreter::ParserResourceLimit::Depth
+            ),
+            ..
+        })
+    ));
 }
 
 #[test]

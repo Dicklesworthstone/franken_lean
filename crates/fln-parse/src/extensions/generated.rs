@@ -5,10 +5,11 @@
 use super::*;
 use crate::DefinitionParseError;
 use crate::builtin_interpreter::{
-    ParserFailure, ParserInput, ParserResourceLimit, reference_builtin_interpreter,
+    DEFAULT_STEP_BUDGET, ParserFailure, ParserInput, ParserResourceLimit,
+    reference_builtin_interpreter,
 };
 
-const MAX_ALIAS_STEPS: usize = 250_000;
+const MAX_ALIAS_STEPS: usize = DEFAULT_STEP_BUDGET;
 
 struct Work {
     nesting: usize,
@@ -78,6 +79,49 @@ impl Drop for Position {
 pub(super) fn with_position<T>(position: Option<usize>, parse: impl FnOnce() -> T) -> T {
     WORK.with(|work| work.borrow_mut().positions.push(position));
     let _position = Position;
+    parse()
+}
+
+pub(super) fn remaining_steps() -> usize {
+    WORK.with(|work| {
+        let work = work.borrow();
+        if work.nesting > 0 {
+            work.remaining
+        } else {
+            DEFAULT_STEP_BUDGET
+        }
+    })
+}
+
+pub(super) fn charge_steps(steps: usize) {
+    WORK.with(|work| {
+        let mut work = work.borrow_mut();
+        if work.nesting > 0 {
+            work.remaining = work.remaining.saturating_sub(steps);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn with_step_budget<T>(budget: usize, parse: impl FnOnce() -> T) -> T {
+    let saved = WORK.with(|work| {
+        let mut work = work.borrow_mut();
+        let prev = (work.nesting, work.remaining);
+        work.nesting += 1;
+        work.remaining = budget;
+        prev
+    });
+    struct Restore(usize, usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WORK.with(|work| {
+                let mut work = work.borrow_mut();
+                work.nesting = self.0;
+                work.remaining = self.1;
+            });
+        }
+    }
+    let _restore = Restore(saved.0, saved.1);
     parse()
 }
 
@@ -216,31 +260,7 @@ fn read(run: &Run<'_>, request: Request<'_>, at: usize, end: usize, minimum: u32
     if WORK.with(|work| work.borrow().error.is_some()) {
         return None;
     }
-    if grammar.docs.verso(false) || grammar.docs.verso(true) {
-        return refuse(
-            run,
-            start,
-            ParserFailure::Description(crate::builtin_interpreter::CompileError::TypeMismatch {
-                owner: "active descriptor".to_owned(),
-                detail: "generated parser aliases do not support Verso doc mode".to_owned(),
-            }),
-        );
-    }
-    let interpreter = {
-        let mut cache = grammar.generated.borrow_mut();
-        cache
-            .get_or_insert_with(|| {
-                reference_builtin_interpreter()
-                    .with_active_descriptions(
-                        &grammar.table,
-                        &grammar.decls,
-                        &grammar.category_behaviors,
-                        &census.alias_declarations,
-                    )
-                    .map(Rc::new)
-            })
-            .clone()
-    };
+    let interpreter = grammar.generated_interpreter(reference_builtin_interpreter());
     let interpreter = match interpreter {
         Ok(interpreter) => interpreter,
         Err(error) => return refuse(run, start, ParserFailure::Description(error)),
@@ -278,6 +298,8 @@ fn read(run: &Run<'_>, request: Request<'_>, at: usize, end: usize, minimum: u32
         quot_depth: crate::quotations::depth(),
         precedence: minimum,
         max_steps: remaining,
+        verso_docs: grammar.docs.verso(false),
+        verso_module_docs: grammar.docs.verso(true),
     };
     let parsed = match request {
         Request::Description(descr) => {
@@ -371,7 +393,8 @@ mod tests {
     #[test]
     fn public_generated_entry_points_keep_depth_and_step_stops_sticky() {
         let interpreter = reference_builtin_interpreter();
-        let nested = format!("{}Nat{}", "(".repeat(300), ")".repeat(300));
+        let depth = crate::builtin_interpreter::DEFAULT_MAX_DEPTH + 2;
+        let nested = format!("{}Nat{}", "(".repeat(depth), ")".repeat(depth));
         let term = SourceText::from_utf8(nested.as_bytes()).unwrap();
         let error = interpreter
             .parse_category("term", &term, MAX_ALIAS_STEPS)

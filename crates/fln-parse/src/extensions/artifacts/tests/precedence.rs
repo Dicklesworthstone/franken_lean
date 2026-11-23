@@ -187,7 +187,10 @@ fn imported_infix_rhs_minimum_is_independent_of_its_node_precedence() {
 
 #[test]
 fn imported_operand_minimum_does_not_leak_into_prefix_or_binder_bodies() {
-    let negative = operand(&at_precedence(81), "- a ^ b");
+    // Lean 4's unary minus `«term-_»` has leading precedence 75 (`Init/Notation.lean:293`),
+    // so `term:81` refuses `- a ^ b` while `term:75` accepts it without leaking into `a ^ b`.
+    assert!(parse(&at_precedence(81), "def result := bounded! [- a ^ b]").is_err());
+    let negative = operand(&at_precedence(75), "- a ^ b");
     kind(&negative, "term-_");
     assert!(contains(&negative, "term_^_"));
     let lambda = operand(&at_precedence(1022), "fun x => x + 1");

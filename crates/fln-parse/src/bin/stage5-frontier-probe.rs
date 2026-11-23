@@ -7,11 +7,15 @@
 //! header + every command losslessly against `~/.cache/fln/pin-syntax`.
 //!
 //! Usage:
-//!   stage5-frontier-probe <workspace-root> [--filter <substr>] [--dump-diff <max>]
+//!   stage5-frontier-probe <workspace-root> [--filter <substr>] [--dump-diff <max>] [--frontier-a]
 #![forbid(unsafe_code)]
 
 use fln_core::name::Name;
 use fln_parse::builtin_interpreter::{DEFAULT_STEP_BUDGET, reference_builtin_interpreter};
+use fln_parse::command_scope::imports::parse_source_header;
+use fln_parse::command_scope::{self, ScopeCommand};
+use fln_parse::extensions::{FileGrammar, with_grammar};
+use fln_parse::{NatDefinitionParseError, parse_source_command};
 use fln_syntax::pin_syntax::{self, cache_root, fnv1a};
 use fln_syntax::source::{SourceInfo, SourceText};
 use fln_syntax::tree::Syntax;
@@ -63,21 +67,21 @@ fn kind_of(syntax: &Syntax) -> String {
     }
 }
 
-fn leaf_span(info: &SourceInfo) -> Option<(usize, usize)> {
+fn leaf_span(info: &SourceInfo, offset: usize) -> Option<(usize, usize)> {
     match info {
-        SourceInfo::Original { pos, end_pos, .. } => Some((pos.0, end_pos.0)),
+        SourceInfo::Original { pos, end_pos, .. } => Some((pos.0 + offset, end_pos.0 + offset)),
         _ => None,
     }
 }
 
 /// Exact comparison matching `crates/fln-parse/tests/pin_syntax_frontier.rs::compare`:
 /// `Ok(None)` identical, `Ok(Some(detail))` same shape with misplaced leaf,
-/// `Err((pin_kind, ours_kind, path))` structural mismatch at first differing node.
-fn compare(pin: &Syntax, ours: &Syntax) -> Result<Option<String>, (String, String)> {
+/// `Err((pin_kind, ours_kind))` structural mismatch at first differing node.
+fn compare(pin: &Syntax, ours: &Syntax, offset: usize) -> Result<Option<String>, (String, String)> {
     let mut misplaced = None;
     let mut stack = vec![(pin, ours)];
     let mut place = |pin_leaf: &Syntax, a: &SourceInfo, b: &SourceInfo| {
-        let (theirs, mine) = (leaf_span(a), leaf_span(b));
+        let (theirs, mine) = (leaf_span(a, 0), leaf_span(b, offset));
         if misplaced.is_none() && theirs != mine {
             misplaced = Some(format!(
                 "{} pin {theirs:?} ours {mine:?}",
@@ -117,6 +121,169 @@ fn compare(pin: &Syntax, ours: &Syntax) -> Result<Option<String>, (String, Strin
     Ok(misplaced)
 }
 
+fn refusal_class(error: &NatDefinitionParseError) -> String {
+    match error {
+        NatDefinitionParseError::Lexical { .. } => "lexer".to_owned(),
+        NatDefinitionParseError::OutsideSeedGrammar { expected, .. } => format!("{expected:?}"),
+        NatDefinitionParseError::ModuleHeader { reason, .. } => format!("header:{reason:?}"),
+        NatDefinitionParseError::GeneratedParser { error, .. } => format!("generated:{error:?}"),
+        NatDefinitionParseError::Source(_) => "source".to_owned(),
+        NatDefinitionParseError::Build(_) => "build".to_owned(),
+    }
+}
+
+fn run_frontier_a(root: &Path, cache: &Path, files: &[&str]) {
+    let t0 = Instant::now();
+    let mut histogram: BTreeMap<String, usize> = BTreeMap::new();
+    let mut examples: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut identical_files = 0usize;
+    let mut total = 0usize;
+
+    for file in files {
+        let source = std::fs::read(root.join(SOURCES).join(file)).expect("read source");
+        let dump_path = cache.join(format!("{:016x}.dump", fnv1a(&source)));
+        let dump = std::fs::read_to_string(&dump_path)
+            .unwrap_or_else(|e| panic!("missing cached dump for {file} at {dump_path:?}: {e}"));
+        let trees = pin_syntax::read(&dump, &source).expect("cached dump reads");
+        let module = file
+            .strip_suffix(".lean")
+            .map(|path| Name::from_components(path.split('/')));
+        let commands: Vec<&Syntax> = trees
+            .commands
+            .iter()
+            .filter(|tree| {
+                !matches!(
+                    tree,
+                    Syntax::Node { kind, .. } if kind.to_display_string() == "Lean.Parser.Command.eoi"
+                )
+            })
+            .collect();
+        let header = match parse_source_header(&source) {
+            Ok(h) => h,
+            Err(err) => {
+                let class = format!("file:header:{}", refusal_class(&err));
+                for _ in &commands {
+                    total += 1;
+                    *histogram.entry(class.clone()).or_default() += 1;
+                }
+                continue;
+            }
+        };
+        let body_start = header.body_start.0;
+        let Ok(mut grammar) = FileGrammar::new(header.prelude, &header.imports, module) else {
+            for _ in &commands {
+                total += 1;
+                *histogram.entry("file:grammar".to_owned()).or_default() += 1;
+            }
+            continue;
+        };
+        let partitioned = with_grammar(&grammar.grammar(), || {
+            command_scope::partition(&source[body_start..])
+        });
+        let ours: BTreeMap<usize, &[u8]> = match partitioned {
+            Ok(parts) => parts
+                .into_iter()
+                .map(|(offset, bytes)| (offset.0 + body_start, bytes))
+                .collect(),
+            Err(err) => {
+                let class = format!("file:partition:{}", refusal_class(&err));
+                let ex = examples.entry(class.clone()).or_default();
+                if ex.len() < 3 {
+                    ex.push((*file).to_owned());
+                }
+                for _ in &commands {
+                    total += 1;
+                    *histogram.entry(class.clone()).or_default() += 1;
+                }
+                continue;
+            }
+        };
+        let mut file_identical = !commands.is_empty();
+        for pin in &commands {
+            total += 1;
+            let Some(start) = first_position(pin) else {
+                file_identical = false;
+                *histogram.entry("boundary".to_owned()).or_default() += 1;
+                continue;
+            };
+            let Some(bytes) = ours.get(&start) else {
+                file_identical = false;
+                let ex = examples.entry("boundary".to_owned()).or_default();
+                if ex.len() < 3 {
+                    ex.push(format!("{file}@{start}"));
+                }
+                *histogram.entry("boundary".to_owned()).or_default() += 1;
+                continue;
+            };
+            let current = grammar.grammar();
+            let syntax_res: Result<Syntax, String> =
+                match with_grammar(&current, || command_scope::parse(bytes)) {
+                    Ok(Some(scope)) => {
+                        let inner = match &scope {
+                            ScopeCommand::OpenIn { names, .. } => grammar.grammar_opening(names),
+                            _ => current,
+                        };
+                        let tree = with_grammar(&inner, || command_scope::trees::tree(bytes));
+                        grammar.apply(&scope);
+                        match tree {
+                            Ok(Some(stx)) => Ok(stx),
+                            Ok(None) => Err("no-tree".to_owned()),
+                            Err(e) => Err(format!("refused:{}", refusal_class(&e))),
+                        }
+                    }
+                    Ok(None) => match with_grammar(&current, || parse_source_command(bytes)) {
+                        Ok(parsed) => {
+                            let _ = grammar.declare(parsed.syntax());
+                            Ok(parsed.syntax().clone())
+                        }
+                        Err(e) => Err(format!("refused:{}", refusal_class(&e))),
+                    },
+                    Err(e) => match with_grammar(&current, || command_scope::trees::tree(bytes)) {
+                        Ok(Some(stx)) => Ok(stx),
+                        _ => Err(format!("refused:{}", refusal_class(&e))),
+                    },
+                };
+            let class = match syntax_res {
+                Ok(stx) => match compare(pin, &stx, start) {
+                    Ok(None) => "identical".to_owned(),
+                    Ok(Some(_)) => "positions".to_owned(),
+                    Err((pk, _)) => format!("tree:{pk}"),
+                },
+                Err(c) => c,
+            };
+            if class != "identical" {
+                file_identical = false;
+                let ex = examples.entry(class.clone()).or_default();
+                if ex.len() < 3 {
+                    ex.push(format!("{file}@{start}"));
+                }
+            }
+            *histogram.entry(class).or_default() += 1;
+        }
+        if file_identical {
+            identical_files += 1;
+        }
+    }
+
+    let identical = histogram.get("identical").copied().unwrap_or(0);
+    let mut rows: Vec<_> = histogram.iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    println!(
+        "FRONTIER A PRODUCTION PARSER ({:.2}s): {identical}/{total} ({:.2}%) commands identical; \
+         {identical_files}/{} files wholly identical",
+        t0.elapsed().as_secs_f64(),
+        (identical as f64) * 100.0 / (total.max(1) as f64),
+        files.len(),
+    );
+    for (class, count) in rows.iter().take(25) {
+        let ex = examples
+            .get(*class)
+            .map(|v| v.join(" | "))
+            .unwrap_or_default();
+        println!("  {count:>6}  {class}  [{ex}]");
+    }
+}
+
 fn fmt_tree(stx: &Syntax, depth: usize, max_depth: usize, out: &mut String) {
     let indent = "  ".repeat(depth);
     if depth > max_depth {
@@ -126,13 +293,13 @@ fn fmt_tree(stx: &Syntax, depth: usize, max_depth: usize, out: &mut String) {
     match stx {
         Syntax::Missing => out.push_str(&format!("{indent}M\n")),
         Syntax::Atom { info, val } => {
-            out.push_str(&format!("{indent}A {val:?} {:?}\n", leaf_span(info)));
+            out.push_str(&format!("{indent}A {val:?} {:?}\n", leaf_span(info, 0)));
         }
         Syntax::Ident { info, val, .. } => {
             out.push_str(&format!(
                 "{indent}I `{}` {:?}\n",
                 val.to_display_string(),
-                leaf_span(info)
+                leaf_span(info, 0)
             ));
         }
         Syntax::Node { kind, args, .. } => {
@@ -156,12 +323,14 @@ fn main() {
         .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
     let mut filter: Option<String> = None;
     let mut dump_diff_limit: usize = 0;
+    let mut frontier_a = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--filter" => filter = args.next(),
             "--dump-diff" => {
                 dump_diff_limit = args.next().and_then(|s| s.parse().ok()).unwrap_or(5);
             }
+            "--frontier-a" => frontier_a = true,
             other => {
                 eprintln!("unknown argument: {other}");
                 std::process::exit(2);
@@ -184,6 +353,11 @@ fn main() {
         .filter_map(|line| line.split('\t').next())
         .filter(|file| filter.as_ref().is_none_or(|f| file.contains(f.as_str())))
         .collect();
+
+    if frontier_a {
+        run_frontier_a(&root, &cache, &files);
+        return;
+    }
 
     let interp = reference_builtin_interpreter();
     let t0 = Instant::now();
@@ -212,7 +386,7 @@ fn main() {
             .map(|path| Name::from_components(path.split('/')));
         let parsed = interp.parse_module_with_file_grammar(&source, module, DEFAULT_STEP_BUDGET);
 
-        let header_ok = compare(&trees.header, &parsed.header) == Ok(None);
+        let header_ok = compare(&trees.header, &parsed.header, 0) == Ok(None);
         if header_ok {
             identical_headers += 1;
         }
@@ -285,7 +459,7 @@ fn main() {
                 *histogram.entry(class).or_default() += 1;
                 continue;
             };
-            match compare(pin, ours) {
+            match compare(pin, ours, 0) {
                 Ok(None) => {
                     *histogram.entry("identical".to_owned()).or_default() += 1;
                 }

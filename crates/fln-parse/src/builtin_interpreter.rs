@@ -21,11 +21,15 @@ use fln_syntax::source::{BytePos, ByteSpan, SourceInfo, SourceText};
 use fln_syntax::token::{TokenKind, TokenTable, lex_token};
 use fln_syntax::tree::Syntax;
 use fln_syntax::trivia::scan_trivia;
+use fln_syntax::view::SourceView;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::ops::Deref;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 mod descr;
+mod vm;
 pub(crate) use descr::ParserInput;
 pub use descr::{ParserFailure, ParserResourceLimit};
 
@@ -36,6 +40,22 @@ const MIN_PREC: u32 = 10;
 
 /// Default step budget per top-level parse invocation (FL-INV-07).
 pub const DEFAULT_STEP_BUDGET: usize = 50_000_000;
+
+/// Default non-tail category recursion depth bound per parse invocation (FL-INV-07).
+///
+/// The execution VM (`vm.rs`) runs entirely on heap-allocated frames with O(1)
+/// native stack usage, so deep legitimate syntax (thousands of nested terms)
+/// completes on small threads while adversarial nesting still terminates with
+/// a typed [`ParserResourceLimit::Depth`] stop.
+pub const DEFAULT_MAX_DEPTH: usize = 16_384;
+
+/// Default maximum materialized syntax tree node count per parse invocation (FL-INV-07).
+///
+/// Tracks the unfolded tree size of `VmNode` DAGs in O(1) per node construction so
+/// exponentially ambiguous `choice` chains (`2^N` shared subtrees) hit a deterministic
+/// `ParserResourceLimit::Steps` refusal in microseconds instead of expanding into
+/// gigabytes during owned `Syntax` materialization.
+pub const DEFAULT_MAX_TREE_NODES: usize = 1_000_000;
 
 /// Error compiling a `BuiltinParserTable` into an executable interpreter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,8 +357,19 @@ pub struct BuiltinInterpreter {
 pub fn reference_builtin_interpreter() -> &'static BuiltinInterpreter {
     static INTERP: OnceLock<BuiltinInterpreter> = OnceLock::new();
     INTERP.get_or_init(|| {
-        BuiltinInterpreter::from_table(reference_builtin_parser_table())
-            .expect("checked-in builtin parser table must compile into an interpreter")
+        // Initialize on an explicit 8 MiB stack so tiny caller threads (e.g.,
+        // 96 KiB heap-frame regression threads) never overflow during one-time
+        // builtin-table compilation.
+        std::thread::Builder::new()
+            .name("fln-builtin-interp-init".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                BuiltinInterpreter::from_table(reference_builtin_parser_table())
+                    .expect("checked-in builtin parser table must compile into an interpreter")
+            })
+            .expect("failed to spawn builtin interpreter init thread")
+            .join()
+            .expect("builtin interpreter init thread panicked")
     })
 }
 
@@ -348,6 +379,7 @@ pub struct InterpError {
     pub pos: usize,
     pub unexpected: String,
     pub expected: Vec<String>,
+    pub(crate) lexical_message: Option<&'static str>,
 }
 
 impl InterpError {
@@ -356,6 +388,16 @@ impl InterpError {
             pos,
             unexpected: unexpected.into(),
             expected,
+            lexical_message: None,
+        }
+    }
+
+    fn lexical(pos: usize, message: &'static str, expected: Vec<String>) -> Self {
+        Self {
+            pos,
+            unexpected: message.to_owned(),
+            expected,
+            lexical_message: Some(message),
         }
     }
 
@@ -371,6 +413,7 @@ impl InterpError {
             pos: newer.pos,
             unexpected,
             expected,
+            lexical_message: newer.lexical_message.or(self.lexical_message),
         }
     }
 }
@@ -402,7 +445,7 @@ enum EvalVal {
     Unit,
     SyntaxPred(SyntaxPred),
     Closure {
-        body: CombinatorAst,
+        body: Box<CombinatorAst>,
         env: Vec<EvalVal>,
     },
 }
@@ -619,7 +662,122 @@ impl BuiltinInterpreter {
                 vec!["end of input".to_owned()],
             ));
         }
-        Ok(st.pop_or_missing())
+        Ok(st.pop_or_missing().to_syntax())
+    }
+
+    /// Parse one complete top-level command through the unified registry engine,
+    /// enforcing full-buffer consumption, lossless trivia tiling, CRLF-mapped
+    /// error positions, and sticky `FL-INV-07` resource/recovery diagnostics.
+    pub fn parse_single_command(
+        &self,
+        view: &SourceView,
+        docs: crate::extensions::DocOptions,
+        max_steps: usize,
+    ) -> Result<(Syntax, ByteSpan, usize), crate::NatDefinitionParseError> {
+        let source = view.normalized();
+        if max_steps == 0 {
+            return Err(crate::NatDefinitionParseError::GeneratedParser {
+                at: view.to_original(BytePos(0)),
+                error: ParserFailure::Resource(ParserResourceLimit::Steps),
+            });
+        }
+        let mut st = RuntimeState::new(source, false, max_steps);
+        st.ctx.verso_docs = docs.verso(false);
+        st.ctx.verso_module_docs = docs.verso(true);
+        st.skip_whitespace();
+        if let Some(error) = st.error.take() {
+            if let Some(message) = error.lexical_message {
+                return Err(crate::NatDefinitionParseError::Lexical {
+                    diagnostics: vec![crate::ParseDiagnostic {
+                        message,
+                        at: view.to_original(BytePos(error.pos)),
+                    }],
+                });
+            }
+            return Err(crate::NatDefinitionParseError::GeneratedParser {
+                at: view.to_original(BytePos(error.pos)),
+                error: ParserFailure::Syntax {
+                    unexpected: error.unexpected,
+                    expected: error.expected,
+                },
+            });
+        }
+        if st.pos >= source.len_bytes() {
+            return Err(crate::NatDefinitionParseError::GeneratedParser {
+                at: view.to_original(BytePos(st.pos)),
+                error: ParserFailure::Syntax {
+                    unexpected: "end of input".to_owned(),
+                    expected: vec!["command".to_owned()],
+                },
+            });
+        }
+        let top_cmd_op = ParserOp::WithPosition(Arc::new(ParserOp::CategoryParser {
+            cat: Name::from_components(["command"]),
+            prec: 0,
+        }));
+        self.exec_op(&top_cmd_op, &mut st);
+        if st.depth_exhausted || st.budget_exhausted {
+            return Err(crate::NatDefinitionParseError::GeneratedParser {
+                at: view.to_original(BytePos(st.pos)),
+                error: ParserFailure::Resource(if st.depth_exhausted {
+                    ParserResourceLimit::Depth
+                } else {
+                    ParserResourceLimit::Steps
+                }),
+            });
+        }
+        if let Some(error) = st.recovered_errors.first() {
+            if let Some(message) = error.lexical_message {
+                return Err(crate::NatDefinitionParseError::Lexical {
+                    diagnostics: vec![crate::ParseDiagnostic {
+                        message,
+                        at: view.to_original(BytePos(error.pos)),
+                    }],
+                });
+            }
+            return Err(crate::NatDefinitionParseError::GeneratedParser {
+                at: view.to_original(BytePos(error.pos)),
+                error: ParserFailure::Recovered {
+                    unexpected: error.unexpected.clone(),
+                    expected: error.expected.clone(),
+                },
+            });
+        }
+        if let Some(error) = st.error.take() {
+            if let Some(message) = error.lexical_message {
+                return Err(crate::NatDefinitionParseError::Lexical {
+                    diagnostics: vec![crate::ParseDiagnostic {
+                        message,
+                        at: view.to_original(BytePos(error.pos)),
+                    }],
+                });
+            }
+            return Err(crate::NatDefinitionParseError::GeneratedParser {
+                at: view.to_original(BytePos(error.pos)),
+                error: ParserFailure::Syntax {
+                    unexpected: error.unexpected,
+                    expected: error.expected,
+                },
+            });
+        }
+        if st.pos < source.len_bytes() {
+            return Err(crate::NatDefinitionParseError::GeneratedParser {
+                at: view.to_original(BytePos(st.pos)),
+                error: ParserFailure::Syntax {
+                    unexpected: "unexpected trailing input".to_owned(),
+                    expected: vec!["end of input".to_owned()],
+                },
+            });
+        }
+        let mut cmd_stx = st.pop_or_missing().to_syntax();
+        set_start_of_file_leading(&mut cmd_stx);
+        let tail_end = match get_tail_info(&cmd_stx) {
+            SourceInfo::Original { trailing, .. } => trailing.end(),
+            _ => BytePos(source.len_bytes()),
+        };
+        let epilogue = ByteSpan::new(tail_end, BytePos(source.len_bytes()))
+            .unwrap_or_else(|| ByteSpan::empty_at(BytePos(source.len_bytes())));
+        Ok((cmd_stx, epilogue, st.steps))
     }
 
     /// Parse a complete Lean module (`header` + top-level commands until EOI),
@@ -641,7 +799,7 @@ impl BuiltinInterpreter {
             budget_exhausted = true;
             errors.push(error);
         }
-        let mut header = hst.back_cloned().unwrap_or(Syntax::Missing);
+        let mut header = hst.back().map(VmNode::to_syntax).unwrap_or(Syntax::Missing);
         for err in hst.recovered_errors.drain(..) {
             errors.push(err);
         }
@@ -710,12 +868,12 @@ impl BuiltinInterpreter {
                     errors.push(err);
                 }
                 pos = st.pos;
-                if recovering && st.back().is_some_and(is_antiquot) {
+                if recovering && st.back().is_some_and(is_antiquot_vm) {
                     continue;
                 }
                 match st.error.take() {
                     None => {
-                        cmd_stx = st.back_cloned().unwrap_or(Syntax::Missing);
+                        cmd_stx = st.back().map(VmNode::to_syntax).unwrap_or(Syntax::Missing);
                         recovering = false;
                         produced = true;
                         break;
@@ -725,7 +883,7 @@ impl BuiltinInterpreter {
                             pos = self.consume_one_token(source, pos);
                         }
                         let ignore = st.stack_size() == 0
-                            || st.back().is_none_or(|s| first_pos_of(s).is_none());
+                            || st.back().is_none_or(|s| first_pos_of_vm(s).is_none());
                         if !(recovering && ignore) {
                             errors.push(err);
                         }
@@ -733,7 +891,7 @@ impl BuiltinInterpreter {
                         if ignore {
                             continue;
                         }
-                        cmd_stx = st.back_cloned().unwrap_or(Syntax::Missing);
+                        cmd_stx = st.back().map(VmNode::to_syntax).unwrap_or(Syntax::Missing);
                         produced = true;
                         break;
                     }
@@ -791,7 +949,7 @@ impl BuiltinInterpreter {
             budget_exhausted = true;
             errors.push(error);
         }
-        let mut header = hst.back_cloned().unwrap_or(Syntax::Missing);
+        let mut header = hst.back().map(VmNode::to_syntax).unwrap_or(Syntax::Missing);
         for err in hst.recovered_errors.drain(..) {
             errors.push(err);
         }
@@ -905,12 +1063,12 @@ impl BuiltinInterpreter {
                     errors.push(err);
                 }
                 pos = st.pos;
-                if recovering && st.back().is_some_and(is_antiquot) {
+                if recovering && st.back().is_some_and(is_antiquot_vm) {
                     continue;
                 }
                 match st.error.take() {
                     None => {
-                        cmd_stx = st.back_cloned().unwrap_or(Syntax::Missing);
+                        cmd_stx = st.back().map(VmNode::to_syntax).unwrap_or(Syntax::Missing);
                         recovering = false;
                         produced = true;
                         break;
@@ -921,7 +1079,7 @@ impl BuiltinInterpreter {
                             pos = active_interp.consume_one_token(source, pos);
                         }
                         let ignore = st.stack_size() == 0
-                            || st.back().is_none_or(|s| first_pos_of(s).is_none());
+                            || st.back().is_none_or(|s| first_pos_of_vm(s).is_none());
                         if !(recovering && ignore) {
                             errors.push(err);
                         }
@@ -929,7 +1087,7 @@ impl BuiltinInterpreter {
                         if ignore {
                             continue;
                         }
-                        cmd_stx = st.back_cloned().unwrap_or(Syntax::Missing);
+                        cmd_stx = st.back().map(VmNode::to_syntax).unwrap_or(Syntax::Missing);
                         produced = true;
                         break;
                     }
@@ -997,236 +1155,31 @@ impl BuiltinInterpreter {
         }
     }
 
-    fn exec_op<'a>(&'a self, mut op: &'a ParserOp, st: &mut RuntimeState<'_>) {
-        // Dereference transparent wrapper chains iteratively so `Ref`,
-        // `WithoutInfo`, `IfVerso`, single-step `Seq`, and non-`$`
-        // `WithAntiquot` consume zero native stack frames.
-        let mut hops = 0usize;
-        loop {
-            if !st.tick() {
-                return;
-            }
-            match op {
-                ParserOp::Ref(id) => {
-                    hops += 1;
-                    if hops >= st.max_op_depth {
-                        st.depth_exhausted = true;
-                        st.mk_unexpected_error(
-                            format!("parser recursion depth limit exceeded at byte {}", st.pos),
-                            Vec::new(),
-                            true,
-                        );
-                        return;
-                    }
-                    op = &self.defs[*id].op;
-                }
-                ParserOp::WithoutInfo(inner) => op = inner,
-                ParserOp::Seq(steps) if steps.len() == 1 => op = &steps[0],
-                ParserOp::IfVerso {
-                    module_docs,
-                    verso,
-                    plain,
-                } => {
-                    let enabled = if *module_docs {
-                        st.ctx.verso_module_docs
-                    } else {
-                        st.ctx.verso_docs
-                    };
-                    op = if enabled { verso } else { plain };
-                }
-                ParserOp::WithAntiquot { body, .. }
-                    if st.source.as_bytes().get(st.pos) != Some(&b'$') =>
-                {
-                    op = body;
-                }
-                _ => break,
-            }
-        }
-        let counts_recursive_depth = matches!(
-            op,
-            ParserOp::CategoryParser { .. } | ParserOp::ParserOfStack { .. }
+    #[inline(never)]
+    fn exec_depth_exceeded(&self, st: &mut RuntimeState<'_>) {
+        st.depth_exhausted = true;
+        st.mk_unexpected_error(
+            format!("parser recursion depth limit exceeded at byte {}", st.pos),
+            Vec::new(),
+            true,
         );
-        if (counts_recursive_depth && st.depth >= st.max_depth) || st.op_depth >= st.max_op_depth {
-            st.depth_exhausted = true;
-            st.mk_unexpected_error(
-                format!("parser recursion depth limit exceeded at byte {}", st.pos),
-                Vec::new(),
-                true,
-            );
-            return;
-        }
-        st.op_depth += 1;
-        if counts_recursive_depth {
-            st.depth += 1;
-        }
-        self.exec_op_inner(op, st);
-        if counts_recursive_depth {
-            st.depth -= 1;
-        }
-        st.op_depth -= 1;
     }
 
-    fn exec_op_inner(&self, op: &ParserOp, st: &mut RuntimeState<'_>) {
+    #[inline(never)]
+    fn exec_push_none(&self, st: &mut RuntimeState<'_>) {
+        st.push(VmNode::node(self.null_kind.clone(), Vec::new()));
+    }
+
+    #[inline(never)]
+    fn exec_eoi(&self, st: &mut RuntimeState<'_>) {
+        if st.pos < st.source.len_bytes() {
+            st.mk_error("expected end of file");
+        }
+    }
+
+    #[inline(never)]
+    fn exec_check_leaf(&self, op: &ParserOp, st: &mut RuntimeState<'_>) {
         match op {
-            ParserOp::Ref(id) => self.exec_op(&self.defs[*id].op, st),
-            ParserOp::Skip | ParserOp::InhabitedDefault => {}
-            ParserOp::PushNone => st.push(Syntax::node(self.null_kind.clone(), Vec::new())),
-            ParserOp::Eoi => {
-                if st.pos < st.source.len_bytes() {
-                    st.mk_error("expected end of file");
-                }
-            }
-            ParserOp::Symbol(sym) => self.exec_symbol(sym, st),
-            ParserOp::NonReservedSymbol { sym, .. } => self.exec_non_reserved_symbol(sym, st),
-            ParserOp::UnicodeSymbol { sym, ascii_sym } => {
-                self.exec_unicode_symbol(sym, ascii_sym, st);
-            }
-            ParserOp::RawCh { ch, trailing_ws } => self.exec_raw_ch(*ch, *trailing_ws, st),
-            ParserOp::Ident => self.expect_token_kind(&self.ident_kind, "identifier", st),
-            ParserOp::RawIdent => self.raw_ident_fn(st),
-            ParserOp::NumLit => self.expect_token_kind(&self.num_lit_kind, "numeral", st),
-            ParserOp::HexNum => self.hexnum_fn(st),
-            ParserOp::ScientificLit => {
-                self.expect_token_kind(&self.scientific_lit_kind, "scientific number", st)
-            }
-            ParserOp::StrLit => self.expect_token_kind(&self.str_lit_kind, "string literal", st),
-            ParserOp::CharLit => {
-                self.expect_token_kind(&self.char_lit_kind, "character literal", st)
-            }
-            ParserOp::NameLit => self.expect_token_kind(&self.name_lit_kind, "Name literal", st),
-            ParserOp::FieldIdx => self.field_idx_fn(st),
-            ParserOp::HygieneInfo => self.hygiene_info_fn(st),
-            ParserOp::CommentBody => self.comment_body_fn(st),
-            ParserOp::VersoCommentBody => self.verso_comment_body_fn(st),
-            ParserOp::IfVerso {
-                module_docs,
-                verso,
-                plain,
-            } => {
-                let enabled = if *module_docs {
-                    st.ctx.verso_module_docs
-                } else {
-                    st.ctx.verso_docs
-                };
-                self.exec_op(if enabled { verso } else { plain }, st);
-            }
-            ParserOp::WithoutVersoSyntax(inner) => {
-                let (saved_docs, saved_module) = (st.ctx.verso_docs, st.ctx.verso_module_docs);
-                st.ctx.verso_docs = false;
-                st.ctx.verso_module_docs = false;
-                self.exec_op(inner, st);
-                st.ctx.verso_docs = saved_docs;
-                st.ctx.verso_module_docs = saved_module;
-            }
-            ParserOp::InterpolatedStr(inner) => self.interpolated_str_fn(inner, st),
-            ParserOp::Seq(steps) => {
-                for step in steps {
-                    self.exec_op(step, st);
-                    if st.has_error() {
-                        break;
-                    }
-                }
-            }
-            ParserOp::OrElse(alts) => self.orelse_chain(alts, st),
-            ParserOp::Node(kind, inner) => {
-                let ini_sz = st.stack_size();
-                self.exec_op(inner, st);
-                st.mk_node(kind.clone(), ini_sz);
-            }
-            ParserOp::TrailingNodeAux(kind, inner) => {
-                let ini_sz = st.stack_size();
-                self.exec_op(inner, st);
-                st.mk_trailing_node(kind.clone(), ini_sz);
-            }
-            ParserOp::Atomic(inner) => {
-                let ini_pos = st.pos;
-                self.exec_op(inner, st);
-                if st.has_error() {
-                    st.pos = ini_pos;
-                }
-            }
-            ParserOp::Optional(inner) => {
-                let ini_sz = st.stack_size();
-                let ini_pos = st.pos;
-                self.exec_op(inner, st);
-                if st.has_error() && st.pos == ini_pos {
-                    st.restore(ini_sz, ini_pos);
-                }
-                st.mk_node(self.null_kind.clone(), ini_sz);
-            }
-            ParserOp::Many(inner) => {
-                let ini_sz = st.stack_size();
-                self.many_aux(inner, st);
-                st.mk_node(self.null_kind.clone(), ini_sz);
-            }
-            ParserOp::Many1(inner) => {
-                let ini_sz = st.stack_size();
-                self.exec_op(inner, st);
-                if !st.has_error() {
-                    self.many_aux(inner, st);
-                }
-                st.mk_node(self.null_kind.clone(), ini_sz);
-            }
-            ParserOp::Many1Unbox(inner) => self.exec_many1_unbox(inner, st),
-            ParserOp::SepBy {
-                elem,
-                sep,
-                allow_trailing,
-            } => {
-                let ini_sz = st.stack_size();
-                self.sep_by_aux(elem, sep, *allow_trailing, ini_sz, true, st);
-            }
-            ParserOp::SepBy1 {
-                elem,
-                sep,
-                allow_trailing,
-            } => {
-                let ini_sz = st.stack_size();
-                self.sep_by_aux(elem, sep, *allow_trailing, ini_sz, false, st);
-            }
-            ParserOp::Lookahead(inner) => {
-                let ini_sz = st.stack_size();
-                let ini_pos = st.pos;
-                self.exec_op(inner, st);
-                if !st.has_error() {
-                    st.restore(ini_sz, ini_pos);
-                }
-            }
-            ParserOp::NotFollowedBy(inner, msg) => self.exec_not_followed_by(inner, msg, st),
-            ParserOp::WithCache(name, inner) => self.exec_with_cache(name, inner, st),
-            ParserOp::WithResetCache(inner) => self.exec_with_reset_cache(inner, st),
-            ParserOp::WithAntiquot {
-                antiquot,
-                body,
-                is_cat,
-            } => {
-                if st.source.as_bytes().get(st.pos) == Some(&b'$') {
-                    let behavior = if *is_cat {
-                        OrElseAntiquotBehavior::AcceptLhs
-                    } else {
-                        OrElseAntiquotBehavior::TakeLongest
-                    };
-                    self.orelse_core(antiquot, body, behavior, st);
-                } else {
-                    self.exec_op(body, st);
-                }
-            }
-            ParserOp::TokenWithAntiquot(inner) => {
-                self.exec_op(inner, st);
-                if !st.has_error() && st.source.as_bytes().get(st.pos) == Some(&b'%') {
-                    self.token_antiquot_fn(st);
-                }
-            }
-            ParserOp::WithAntiquotSuffixSplice { kind, body, suffix } => {
-                self.exec_with_antiquot_suffix_splice(kind, body, suffix, st);
-            }
-            ParserOp::WithoutInfo(inner) => self.exec_op(inner, st),
-            ParserOp::SetExpected { expected, body } => {
-                self.exec_op(body, st);
-                if let Some(err) = &mut st.error {
-                    err.expected = expected.clone();
-                }
-            }
             ParserOp::CheckPrec(prec) => {
                 if st.ctx.prec > *prec {
                     st.mk_unexpected_error(
@@ -1299,45 +1252,13 @@ impl BuiltinInterpreter {
                     st.mk_error(msg);
                 }
             }
-            ParserOp::CheckNoImmediateColon => {
+            ParserOp::CheckNoImmediateColon
                 if st.back().is_some_and(check_tail_no_ws)
-                    && st.source.as_bytes().get(st.pos) == Some(&b':')
-                {
-                    st.mk_unexpected_error("unexpected ':'", Vec::new(), true);
-                }
+                    && st.source.as_bytes().get(st.pos) == Some(&b':') =>
+            {
+                st.mk_unexpected_error("unexpected ':'", Vec::new(), true);
             }
-            ParserOp::CheckStackTop { pred, msg } => self.exec_check_stack_top(*pred, msg, st),
-            ParserOp::WithPosition(inner) => {
-                let saved = st.ctx.saved_pos;
-                st.ctx.saved_pos = Some(st.pos);
-                self.exec_op(inner, st);
-                st.ctx.saved_pos = saved;
-            }
-            ParserOp::WithPositionAfterLinebreak(inner) => {
-                let saved = st.ctx.saved_pos;
-                if st
-                    .back()
-                    .is_some_and(|prev| check_tail_linebreak(st.source, prev))
-                {
-                    st.ctx.saved_pos = Some(st.pos);
-                }
-                self.exec_op(inner, st);
-                st.ctx.saved_pos = saved;
-            }
-            ParserOp::AdaptContext(transform, inner) => {
-                self.exec_adapt_context(transform, inner, st);
-            }
-            ParserOp::WithOpen(inner) => self.exec_with_open(true, inner, st),
-            ParserOp::WithOpenDecl(inner) => self.exec_with_open(false, inner, st),
-            ParserOp::CategoryParser { cat, prec } => self.exec_category_parser(cat, *prec, st),
-            ParserOp::ParserOfStack { offset, prec } => {
-                self.exec_parser_of_stack(*offset, *prec, st);
-            }
-            ParserOp::Recover { parser, handler } => self.exec_recover(parser, handler, st),
-            ParserOp::SkipUntil(pred) => self.exec_skip_until(pred, st),
-            ParserOp::ErrorAtSavedPos { msg, delta } => {
-                self.exec_error_at_saved_pos(msg, *delta, st);
-            }
+            _ => {}
         }
     }
 
@@ -1355,12 +1276,12 @@ impl BuiltinInterpreter {
         if st.has_error() {
             return;
         }
-        match st.back() {
-            Some(Syntax::Atom { val, .. }) if val == sym => {}
-            Some(Syntax::Ident { info, raw_val, .. }) if raw_val.text(st.source) == Some(sym) => {
+        match st.back().map(Deref::deref) {
+            Some(VmSyntax::Atom { val, .. }) if val == sym => {}
+            Some(VmSyntax::Ident { info, raw_val, .. }) if raw_val.text(st.source) == Some(sym) => {
                 let info = *info;
                 st.pop();
-                st.push(Syntax::atom(info, sym.to_owned()));
+                st.push(VmNode::atom(info, sym.to_owned()));
             }
             _ => {
                 st.mk_unexpected_token_errors(std::slice::from_ref(&expected), Some(ini_pos));
@@ -1393,373 +1314,17 @@ impl BuiltinInterpreter {
     }
 
     #[inline(never)]
-    fn exec_many1_unbox(&self, inner: &ParserOp, st: &mut RuntimeState<'_>) {
-        let ini_sz = st.stack_size();
-        self.exec_op(inner, st);
-        if !st.has_error() {
-            self.many_aux(inner, st);
-        }
-        st.mk_node(self.null_kind.clone(), ini_sz);
-        if !st.has_error()
-            && let Some(mut popped) = st.pop()
-        {
-            if let Syntax::Node { args, .. } = &mut popped
-                && args.len() == 1
-            {
-                st.push(args.pop().unwrap_or(Syntax::Missing));
-            } else {
-                st.push(popped);
-            }
-        }
-    }
-
-    #[inline(never)]
-    fn exec_not_followed_by(&self, inner: &ParserOp, msg: &str, st: &mut RuntimeState<'_>) {
-        let ini_sz = st.stack_size();
-        let ini_pos = st.pos;
-        self.exec_op(inner, st);
-        if st.has_error() {
-            st.restore(ini_sz, ini_pos);
-        } else {
-            st.restore(ini_sz, ini_pos);
-            st.mk_unexpected_error(format!("unexpected {msg}"), Vec::new(), true);
-        }
-    }
-
-    #[inline(never)]
-    fn exec_with_cache(&self, name: &Name, inner: &ParserOp, st: &mut RuntimeState<'_>) {
-        let key = ParserCacheKey {
-            ctx: st.ctx.clone(),
-            parser_name: name.clone(),
-            pos: st.pos,
-        };
-        if let Some(entry) = st.parser_cache.get(&key).cloned() {
-            st.push(entry.stx);
-            st.lhs_prec = entry.lhs_prec;
-            st.pos = entry.new_pos;
-            st.error = entry.error;
-            return;
-        }
-        if !st.active_cache_keys.insert(key.clone()) {
-            st.mk_unexpected_error(
-                format!(
-                    "left-recursive cycle in parser {} at byte {}",
-                    name.to_display_string(),
-                    st.pos
-                ),
-                Vec::new(),
-                true,
-            );
-            return;
-        }
-        let init_raw_sz = st.raw_stack_len();
-        let old_drop = st.stack_drop;
-        st.stack_drop = init_raw_sz;
-        st.lhs_prec = 0;
-        st.error = None;
-        self.exec_op(inner, st);
-        st.stack_drop = old_drop;
-        st.active_cache_keys.remove(&key);
-        if st.raw_stack_len() == init_raw_sz + 1
-            && let Some(top) = st.back_cloned()
-        {
-            st.parser_cache.insert(
-                key,
-                ParserCacheEntry {
-                    stx: top,
-                    lhs_prec: st.lhs_prec,
-                    new_pos: st.pos,
-                    error: st.error.clone(),
-                },
-            );
-        }
-    }
-
-    #[inline(never)]
-    fn exec_with_reset_cache(&self, inner: &ParserOp, st: &mut RuntimeState<'_>) {
-        let old_drop = st.stack_drop;
-        let saved_cache = std::mem::take(&mut st.parser_cache);
-        st.stack_drop = 0;
-        self.exec_op(inner, st);
-        st.stack_drop = old_drop;
-        st.parser_cache = saved_cache;
-    }
-
-    #[inline(never)]
-    fn exec_with_open(&self, expect_open_cmd: bool, inner: &ParserOp, st: &mut RuntimeState<'_>) {
-        let open_decl = st.stack.last().and_then(|top| {
-            if expect_open_cmd {
-                if let Syntax::Node { kind, args, .. } = top
-                    && *kind == Name::from_components(["Lean", "Parser", "Command", "open"])
-                {
-                    args.get(1)
-                } else {
-                    None
-                }
-            } else {
-                Some(top)
-            }
-        });
-        let activation = open_decl.and_then(|decl| {
-            let Syntax::Node { kind, args, .. } = decl else {
-                return None;
-            };
-            if *kind == Name::from_components(["Lean", "Parser", "Command", "openSimple"]) {
-                let Syntax::Node { args: items, .. } = args.first()? else {
-                    return None;
-                };
-                let names: Vec<Name> = items
-                    .iter()
-                    .filter_map(|item| match item {
-                        Syntax::Ident { val, .. } => Some(val.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                (!names.is_empty()).then_some((names, true))
-            } else if *kind == Name::from_components(["Lean", "Parser", "Command", "openScoped"]) {
-                let Syntax::Node { args: items, .. } = args.get(1)? else {
-                    return None;
-                };
-                let names: Vec<Name> = items
-                    .iter()
-                    .filter_map(|item| match item {
-                        Syntax::Ident { val, .. } => Some(val.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                (!names.is_empty()).then_some((names, false))
-            } else {
-                None
-            }
-        });
-        if let Some((names, simple)) = activation
-            && let Some((base, fg, snap)) = st.open_context.clone()
-        {
-            let next_snap = fg.activate_snapshot(&snap, &names, simple);
-            let next_grammar = fg.grammar_for_snapshot(&next_snap);
-            if let Ok(next_interp) = next_grammar.generated_interpreter(base) {
-                let old_drop = st.stack_drop;
-                let saved_cache = std::mem::take(&mut st.parser_cache);
-                let saved_ctx = st.open_context.replace((base, fg, next_snap));
-                st.token_cache = None;
-                st.stack_drop = 0;
-                next_interp.exec_op(inner, st);
-                st.open_context = saved_ctx;
-                st.stack_drop = old_drop;
-                st.parser_cache = saved_cache;
-                st.token_cache = None;
-                return;
-            }
-        }
-        self.exec_with_reset_cache(inner, st);
-    }
-
-    #[inline(never)]
-    fn exec_with_antiquot_suffix_splice(
-        &self,
-        kind: &Name,
-        body: &ParserOp,
-        suffix: &ParserOp,
-        st: &mut RuntimeState<'_>,
-    ) {
-        self.exec_op(body, st);
-        if !st.has_error()
-            && st
-                .back()
-                .is_some_and(|s| is_antiquots(s, &self.choice_kind))
-        {
-            let ini_sz = st.stack_size();
-            let ini_pos = st.pos;
-            self.exec_op(suffix, st);
-            if st.has_error() {
-                st.restore(ini_sz, ini_pos);
-            } else {
-                let splice_kind = Name::str(kind.clone(), "antiquot_suffix_splice");
-                let target_sz = st.stack_size().saturating_sub(2);
-                st.mk_node(splice_kind, target_sz);
-            }
-        }
-    }
-
-    #[inline(never)]
     fn exec_check_stack_top(&self, pred: SyntaxPred, msg: &str, st: &mut RuntimeState<'_>) {
         let ok = st.back().is_some_and(|top| match pred {
-            SyntaxPred::IsIdent => is_ident_stx(top),
+            SyntaxPred::IsIdent => is_ident_stx_vm(top),
             SyntaxPred::IsIdentOrDotIdentOrProj => {
-                is_ident_stx(top)
+                is_ident_stx_vm(top)
                     || top.kind() == Some(&self.dot_ident_kind)
                     || top.kind() == Some(&self.proj_kind)
             }
         });
         if !ok {
             st.mk_unexpected_error(msg.to_owned(), Vec::new(), true);
-        }
-    }
-
-    #[inline(never)]
-    fn exec_adapt_context(
-        &self,
-        transform: &ContextTransform,
-        inner: &ParserOp,
-        st: &mut RuntimeState<'_>,
-    ) {
-        let saved = st.ctx.clone();
-        match transform {
-            ContextTransform::WithoutPosition => st.ctx.saved_pos = None,
-            ContextTransform::WithForbidden(tk) => st.ctx.forbidden_tk = Some(tk.clone()),
-            ContextTransform::WithoutForbidden => st.ctx.forbidden_tk = None,
-            ContextTransform::SuppressInsideQuot => {
-                if st.ctx.quot_depth == 0 {
-                    st.ctx.suppress_inside_quot = true;
-                }
-            }
-            ContextTransform::AddQuotDepth(delta) => {
-                st.ctx.quot_depth = (st.ctx.quot_depth as i64 + i64::from(*delta)).max(0) as u32;
-            }
-        }
-        self.exec_op(inner, st);
-        st.ctx = saved;
-    }
-
-    #[inline(never)]
-    fn exec_category_parser(&self, cat: &Name, prec: u32, st: &mut RuntimeState<'_>) {
-        let saved_prec = st.ctx.prec;
-        st.ctx.prec = prec;
-        let canonical_cat = if cat.to_display_string() == "syntax" {
-            Name::from_components(["stx"])
-        } else {
-            cat.clone()
-        };
-        let key = ParserCacheKey {
-            ctx: st.ctx.clone(),
-            parser_name: canonical_cat.clone(),
-            pos: st.pos,
-        };
-        if let Some(entry) = st.parser_cache.get(&key).cloned() {
-            st.push(entry.stx);
-            st.lhs_prec = entry.lhs_prec;
-            st.pos = entry.new_pos;
-            st.error = entry.error;
-            st.ctx.prec = saved_prec;
-            return;
-        }
-        if !st.active_cache_keys.insert(key.clone()) {
-            st.mk_unexpected_error(
-                format!(
-                    "left-recursive cycle in category {} at byte {}",
-                    canonical_cat.to_display_string(),
-                    st.pos
-                ),
-                Vec::new(),
-                true,
-            );
-            st.ctx.prec = saved_prec;
-            return;
-        }
-        let init_raw_sz = st.raw_stack_len();
-        let old_drop = st.stack_drop;
-        st.stack_drop = init_raw_sz;
-        st.lhs_prec = 0;
-        st.error = None;
-        self.pratt_category(&canonical_cat, st);
-        st.stack_drop = old_drop;
-        st.active_cache_keys.remove(&key);
-        if st.raw_stack_len() == init_raw_sz + 1
-            && let Some(top) = st.back_cloned()
-        {
-            st.parser_cache.insert(
-                key,
-                ParserCacheEntry {
-                    stx: top,
-                    lhs_prec: st.lhs_prec,
-                    new_pos: st.pos,
-                    error: st.error.clone(),
-                },
-            );
-        }
-        st.ctx.prec = saved_prec;
-    }
-
-    #[inline(never)]
-    fn exec_parser_of_stack(&self, offset: usize, prec: u32, st: &mut RuntimeState<'_>) {
-        let sz = st.stack_size();
-        if sz < offset + 1 {
-            st.mk_unexpected_error(
-                "failed to determine parser using syntax stack, stack is too small",
-                Vec::new(),
-                true,
-            );
-            return;
-        }
-        let Some(Syntax::Ident { val, .. }) = st.get_visible(sz - offset - 1) else {
-            st.mk_unexpected_error(
-                "failed to determine parser using syntax stack, the specified element on the stack is not an identifier",
-                Vec::new(),
-                true,
-            );
-            return;
-        };
-        let name = val.clone();
-        let canonical_cat = if name.to_display_string() == "syntax" {
-            Name::from_components(["stx"])
-        } else {
-            name.clone()
-        };
-        // Mirror `Lean/Parser/Extension.lean::parserOfStackFn` + `resolveParserNameCore`:
-        // 1. Category name (`term`, `tactic`, `conv`, `grind`, ...)
-        if self.categories.contains_key(&canonical_cat) {
-            self.exec_category_parser(&canonical_cat, prec, st);
-            return;
-        }
-        // 2. Active `FileGrammar` syntax abbreviation (`syntax rwRuleSeq := ...`, etc.)
-        let census = crate::extensions::extension_census();
-        if let Some((_, fg, snap)) = st.open_context.as_ref() {
-            if let Some(descr) = fg.resolve_abbreviation_in(snap, &name)
-                && let Ok(op) = self.compile_descr_op(descr, &census.alias_declarations)
-            {
-                self.exec_op(&op, st);
-                return;
-            }
-            if let Some(resolved) =
-                fg.resolve_name_in(snap, &name, |n| self.def_index.contains_key(n))
-                && let Some(&id) = self.def_index.get(&resolved)
-            {
-                self.exec_op(&self.defs[id].op, st);
-                return;
-            }
-        }
-        // 3. Direct compiled declaration name in `def_index`
-        if let Some(&id) = self.def_index.get(&name) {
-            self.exec_op(&self.defs[id].op, st);
-            return;
-        }
-        // 4. Registered zero-arg parser alias (`attrKind`, `optConfig`, `docComment`, ...)
-        let alias_key = name.to_display_string();
-        if census.alias_declarations.contains_key(&alias_key)
-            && let Ok(op) = self.compile_alias_op(&name, &census.alias_declarations)
-        {
-            self.exec_op(&op, st);
-            return;
-        }
-        self.exec_category_parser(&name, prec, st);
-    }
-
-    #[inline(never)]
-    fn exec_recover(&self, parser: &ParserOp, handler: &ParserOp, st: &mut RuntimeState<'_>) {
-        self.exec_op(parser, st);
-        if let Some(msg) = st.error.take() {
-            let saved_pos = st.pos;
-            let saved_stack_len = st.raw_stack_len();
-            let saved_lhs = st.lhs_prec;
-            self.exec_op(handler, st);
-            if st.has_error() {
-                st.pos = saved_pos;
-                st.truncate_raw(saved_stack_len);
-                st.lhs_prec = saved_lhs;
-                st.error = Some(msg);
-            } else {
-                st.recovered_errors.push(msg);
-            }
         }
     }
 
@@ -1797,101 +1362,6 @@ impl BuiltinInterpreter {
         }
     }
 
-    fn pratt_category(&self, cat_name: &Name, st: &mut RuntimeState<'_>) {
-        let Some(cat) = self.categories.get(cat_name) else {
-            st.mk_unexpected_error(
-                format!("unknown parser category '{}'", cat_name.to_display_string()),
-                Vec::new(),
-                true,
-            );
-            return;
-        };
-
-        // 1. Leading parser with category antiquot (`Basic.lean:1923-1924`).
-        if st.source.as_bytes().get(st.pos) == Some(&b'$') {
-            let ini_sz = st.stack_size();
-            let ini_pos = st.pos;
-            self.exec_op(&cat.antiquot_parser, st);
-            if let Some(err1) = st.error.take() {
-                if st.pos == ini_pos {
-                    st.restore(ini_sz, ini_pos);
-                    self.leading_parser_aux(cat, st);
-                    if st.pos == ini_pos
-                        && let Some(err2) = st.error.take()
-                    {
-                        st.error = Some(err1.merge(&err2));
-                    }
-                } else {
-                    st.error = Some(err1);
-                }
-            }
-        } else {
-            self.leading_parser_aux(cat, st);
-        }
-
-        if st.has_error() {
-            return;
-        }
-
-        // 2. Trailing loop (`Basic.lean:1929-1947`).
-        loop {
-            if !st.tick() {
-                return;
-            }
-            let ini_sz = st.stack_size();
-            let ini_pos = st.pos;
-            let indexed =
-                self.indexed_lookup(&cat.trailing_table, LeadingIdentBehavior::Default, st);
-            if st.has_error() {
-                st.restore(ini_sz, ini_pos);
-                return;
-            }
-            if indexed.is_empty() && cat.trailing_unindexed.is_empty() {
-                return;
-            }
-            let Some(left) = st.pop() else {
-                return;
-            };
-            let mut candidates = indexed;
-            candidates.extend_from_slice(&cat.trailing_unindexed);
-            self.longest_match(Some(&left), &candidates, st);
-            if st.has_error() {
-                if st.pos == ini_pos {
-                    st.restore(ini_sz.saturating_sub(1), ini_pos);
-                    st.push(left);
-                }
-                return;
-            }
-            if st.pos == ini_pos {
-                return;
-            }
-        }
-    }
-
-    fn leading_parser_aux(&self, cat: &CategoryDispatch, st: &mut RuntimeState<'_>) {
-        let ini_sz = st.stack_size();
-        let indexed = self.indexed_lookup(&cat.leading_table, cat.behavior, st);
-        if st.has_error() {
-            return;
-        }
-        let mut candidates = cat.leading_unindexed.clone();
-        candidates.extend(indexed);
-        if candidates.is_empty() {
-            let expected = vec![cat.name.to_display_string()];
-            let ini_pos = st.pos;
-            self.token_fn(&expected, st);
-            if st.has_error() {
-                return;
-            }
-            st.mk_unexpected_token_errors(&expected, Some(ini_pos));
-            return;
-        }
-        self.longest_match(None, &candidates, st);
-        if st.stack_size() != ini_sz + 1 {
-            st.mk_node(self.null_kind.clone(), ini_sz);
-        }
-    }
-
     fn indexed_lookup(
         &self,
         table: &BTreeMap<Name, Vec<(usize, u32)>>,
@@ -1902,9 +1372,9 @@ impl BuiltinInterpreter {
             return Vec::new();
         };
         let lookup = |k: &Name| table.get(k).cloned().unwrap_or_default();
-        match &tok {
-            Syntax::Atom { val, .. } => lookup(&Name::str(Name::anonymous(), val.as_str())),
-            Syntax::Ident { val, .. } => match behavior {
+        match &*tok {
+            VmSyntax::Atom { val, .. } => lookup(&Name::str(Name::anonymous(), val.as_str())),
+            VmSyntax::Ident { val, .. } => match behavior {
                 LeadingIdentBehavior::Default => lookup(&self.ident_kind),
                 LeadingIdentBehavior::Symbol => match table.get(val) {
                     Some(ps) => ps.clone(),
@@ -1925,229 +1395,13 @@ impl BuiltinInterpreter {
                     None => lookup(&self.ident_kind),
                 },
             },
-            Syntax::Node { kind, .. } => lookup(kind),
-            Syntax::Missing => Vec::new(),
+            VmSyntax::Node { kind, .. } => lookup(kind),
+            VmSyntax::Missing => Vec::new(),
         }
     }
 
-    fn run_longest_match_parser(
-        &self,
-        left: Option<&Syntax>,
-        start_lhs_prec: u32,
-        def_id: usize,
-        st: &mut RuntimeState<'_>,
-    ) {
-        st.lhs_prec = if left.is_some() {
-            start_lhs_prec
-        } else {
-            MAX_PREC
-        };
-        let start_sz = st.stack_size();
-        if let Some(l) = left {
-            st.push(l.clone());
-        }
-        let op = Arc::clone(&self.defs[def_id].op);
-        self.exec_op(&op, st);
-        if st.stack_size() == start_sz + 1 {
-            return;
-        }
-        if st.has_error() {
-            st.shrink(start_sz);
-            st.push(Syntax::Missing);
-        } else {
-            st.mk_error("longestMatch parsers must generate exactly one Syntax node");
-        }
-    }
-
-    fn longest_match(
-        &self,
-        left: Option<&Syntax>,
-        candidates: &[(usize, u32)],
-        st: &mut RuntimeState<'_>,
-    ) {
-        let Some(&(first_id, first_prio)) = candidates.first() else {
-            st.mk_error("longestMatch: empty list");
-            return;
-        };
-        if candidates.len() == 1 {
-            let start_lhs = st.lhs_prec;
-            self.run_longest_match_parser(left, start_lhs, first_id, st);
-            return;
-        }
-        let start_sz = st.stack_size();
-        let start_lhs = st.lhs_prec;
-        let start_pos = st.pos;
-        self.run_longest_match_parser(left, start_lhs, first_id, st);
-        let mut prev_prio = first_prio;
-
-        for &(def_id, prio) in &candidates[1..] {
-            let prev_score = (st.pos, u8::from(!st.has_error()), prev_prio);
-            let prev_err = st.error.clone();
-            let prev_pos = st.pos;
-            let prev_sz = st.stack_size();
-            let prev_lhs = st.lhs_prec;
-
-            st.restore(prev_sz, start_pos);
-            self.run_longest_match_parser(left, start_lhs, def_id, st);
-            let cur_score = (st.pos, u8::from(!st.has_error()), prio);
-
-            match prev_score.cmp(&cur_score) {
-                std::cmp::Ordering::Less => {
-                    st.keep_top(start_sz);
-                    prev_prio = prio;
-                }
-                std::cmp::Ordering::Greater => {
-                    st.shrink(prev_sz);
-                    st.lhs_prec = prev_lhs;
-                    st.pos = prev_pos;
-                    st.error = prev_err;
-                }
-                std::cmp::Ordering::Equal => match prev_err {
-                    None => {
-                        st.lhs_prec = st.lhs_prec.min(prev_lhs);
-                        prev_prio = prio;
-                    }
-                    Some(old_err) => {
-                        st.shrink(prev_sz);
-                        if let Some(cur_err) = &st.error
-                            && *cur_err != old_err
-                        {
-                            st.error = Some(old_err.merge(cur_err));
-                        }
-                        prev_prio = prio;
-                    }
-                },
-            }
-        }
-
-        if st.stack_size() > start_sz + 1 {
-            st.mk_node(self.choice_kind.clone(), start_sz);
-        }
-    }
-
-    fn orelse_chain(&self, alts: &[Arc<ParserOp>], st: &mut RuntimeState<'_>) {
-        let Some((first, rest)) = alts.split_first() else {
-            return;
-        };
-        if rest.is_empty() {
-            self.exec_op(first, st);
-            return;
-        }
-        let ini_sz = st.stack_size();
-        let ini_pos = st.pos;
-        self.exec_op(first, st);
-        for alt in rest {
-            if let Some(err1) = st.error.take() {
-                if st.pos == ini_pos {
-                    st.restore(ini_sz, ini_pos);
-                    self.exec_op(alt, st);
-                    if st.pos == ini_pos
-                        && let Some(err2) = st.error.take()
-                    {
-                        st.error = Some(err1.merge(&err2));
-                    }
-                    continue;
-                }
-                st.error = Some(err1);
-                return;
-            }
-            let Some(p_back) = st.back_cloned() else {
-                return;
-            };
-            if st.stack_size() != ini_sz + 1 || !is_antiquots(&p_back, &self.choice_kind) {
-                return;
-            }
-            let p_pos = st.pos;
-            st.restore(ini_sz, ini_pos);
-            self.exec_op(alt, st);
-            if st.has_error() {
-                st.restore(ini_sz, p_pos);
-                st.push(p_back);
-                continue;
-            }
-            if st.pos > p_pos {
-                continue;
-            }
-            if st.pos < p_pos
-                || st.stack_size() != ini_sz + 1
-                || !st
-                    .back()
-                    .is_some_and(|b| is_antiquots(b, &self.choice_kind))
-            {
-                st.restore(ini_sz, p_pos);
-                st.push(p_back);
-                continue;
-            }
-            let q_back = st.pop_or_missing();
-            self.push_flattened_antiquots(p_back, st);
-            self.push_flattened_antiquots(q_back, st);
-            st.mk_node(self.choice_kind.clone(), ini_sz);
-        }
-    }
-
-    fn orelse_core(
-        &self,
-        lhs: &ParserOp,
-        rhs: &ParserOp,
-        antiquot_behavior: OrElseAntiquotBehavior,
-        st: &mut RuntimeState<'_>,
-    ) {
-        let ini_sz = st.stack_size();
-        let ini_pos = st.pos;
-        self.exec_op(lhs, st);
-        if let Some(err1) = st.error.take() {
-            if st.pos == ini_pos {
-                st.restore(ini_sz, ini_pos);
-                self.exec_op(rhs, st);
-                if st.pos == ini_pos
-                    && let Some(err2) = st.error.take()
-                {
-                    st.error = Some(err1.merge(&err2));
-                }
-            } else {
-                st.error = Some(err1);
-            }
-            return;
-        }
-        let Some(p_back) = st.back_cloned() else {
-            return;
-        };
-        if antiquot_behavior == OrElseAntiquotBehavior::AcceptLhs
-            || st.stack_size() != ini_sz + 1
-            || !is_antiquots(&p_back, &self.choice_kind)
-        {
-            return;
-        }
-        let p_pos = st.pos;
-        st.restore(ini_sz, ini_pos);
-        self.exec_op(rhs, st);
-        if st.has_error() {
-            st.restore(ini_sz, p_pos);
-            st.push(p_back);
-            return;
-        }
-        if st.pos > p_pos {
-            return;
-        }
-        if st.pos < p_pos
-            || antiquot_behavior != OrElseAntiquotBehavior::Merge
-            || st.stack_size() != ini_sz + 1
-            || !st
-                .back()
-                .is_some_and(|b| is_antiquots(b, &self.choice_kind))
-        {
-            st.restore(ini_sz, p_pos);
-            st.push(p_back);
-            return;
-        }
-        let q_back = st.pop_or_missing();
-        self.push_flattened_antiquots(p_back, st);
-        self.push_flattened_antiquots(q_back, st);
-        st.mk_node(self.choice_kind.clone(), ini_sz);
-    }
-
-    fn push_flattened_antiquots(&self, stx: Syntax, st: &mut RuntimeState<'_>) {
-        if let Syntax::Node { kind, args, .. } = &stx
+    fn push_flattened_antiquots(&self, stx: VmNode, st: &mut RuntimeState<'_>) {
+        if let VmSyntax::Node { kind, args, .. } = &*stx
             && *kind == self.choice_kind
         {
             for arg in args {
@@ -2158,117 +1412,7 @@ impl BuiltinInterpreter {
         st.push(stx);
     }
 
-    fn many_aux(&self, inner: &ParserOp, st: &mut RuntimeState<'_>) {
-        loop {
-            if !st.tick() {
-                return;
-            }
-            let ini_sz = st.stack_size();
-            let ini_pos = st.pos;
-            self.exec_op(inner, st);
-            if st.has_error() {
-                if st.pos == ini_pos {
-                    st.restore(ini_sz, ini_pos);
-                }
-                return;
-            }
-            if st.pos == ini_pos {
-                st.mk_unexpected_error(
-                    "invalid 'many' parser combinator application, parser did not consume anything",
-                    Vec::new(),
-                    true,
-                );
-                return;
-            }
-            if st.stack_size() > ini_sz + 1 {
-                st.mk_node(self.null_kind.clone(), ini_sz);
-            }
-        }
-    }
-
-    fn sep_by_aux(
-        &self,
-        elem: &ParserOp,
-        sep: &ParserOp,
-        allow_trailing: bool,
-        ini_sz: usize,
-        mut p_opt: bool,
-        st: &mut RuntimeState<'_>,
-    ) {
-        loop {
-            if !st.tick() {
-                return;
-            }
-            let sz = st.stack_size();
-            let pos = st.pos;
-            self.exec_op(elem, st);
-            if st.has_error() {
-                if st.pos > pos {
-                    st.mk_node(self.null_kind.clone(), ini_sz);
-                    return;
-                } else if p_opt {
-                    st.restore(sz, pos);
-                    st.mk_node(self.null_kind.clone(), ini_sz);
-                    return;
-                } else {
-                    st.push(Syntax::Missing);
-                    st.mk_node(self.null_kind.clone(), ini_sz);
-                    return;
-                }
-            }
-            if st.stack_size() > sz + 1 {
-                st.mk_node(self.null_kind.clone(), sz);
-            }
-            let sz = st.stack_size();
-            let pos = st.pos;
-            self.exec_op(sep, st);
-            if st.has_error() {
-                st.restore(sz, pos);
-                st.mk_node(self.null_kind.clone(), ini_sz);
-                return;
-            }
-            if st.stack_size() > sz + 1 {
-                st.mk_node(self.null_kind.clone(), sz);
-            }
-            p_opt = allow_trailing;
-        }
-    }
-
-    fn token_antiquot_fn(&self, st: &mut RuntimeState<'_>) {
-        let ini_sz = st.stack_size();
-        let ini_pos = st.pos;
-        if !st
-            .pick_non_none(&self.null_kind)
-            .is_some_and(check_tail_no_ws)
-        {
-            return;
-        }
-        self.satisfy_symbol(|s| s == "%", &["'%'".to_owned()], st);
-        if st.has_error() {
-            st.restore(ini_sz, ini_pos);
-            return;
-        }
-        self.satisfy_symbol(|s| s == "$", &["'$'".to_owned()], st);
-        if st.has_error() {
-            st.restore(ini_sz, ini_pos);
-            return;
-        }
-        if !st
-            .pick_non_none(&self.null_kind)
-            .is_some_and(check_tail_no_ws)
-        {
-            st.restore(ini_sz, ini_pos);
-            return;
-        }
-        self.exec_op(&self.antiquot_expr_op, st);
-        if st.has_error() {
-            st.restore(ini_sz, ini_pos);
-            return;
-        }
-        st.mk_node(self.token_antiquot_kind.clone(), ini_sz.saturating_sub(1));
-    }
-
-    fn peek_token(&self, st: &mut RuntimeState<'_>) -> Option<Syntax> {
+    fn peek_token(&self, st: &mut RuntimeState<'_>) -> Option<VmNode> {
         if let Some((start, _, ref forb, ref tok)) = st.token_cache
             && start == st.pos
             && *forb == st.ctx.forbidden_tk
@@ -2320,7 +1464,7 @@ impl BuiltinInterpreter {
                     Ok(ws) => ws,
                     Err(err) => {
                         st.pos = err.at().0;
-                        st.mk_unexpected_error(err.message(), Vec::new(), false);
+                        st.mk_lexical_error(err.message(), Vec::new(), false);
                         return;
                     }
                 };
@@ -2332,13 +1476,8 @@ impl BuiltinInterpreter {
                     end_pos: stop_pos,
                 };
                 let tok = match lexed.kind {
-                    TokenKind::Symbol(sym) => Syntax::atom(info, sym),
-                    TokenKind::Ident(val) => Syntax::Ident {
-                        info,
-                        raw_val: lexed.extent.into(),
-                        val,
-                        preresolved: Vec::new(),
-                    },
+                    TokenKind::Symbol(sym) => VmNode::atom(info, sym),
+                    TokenKind::Ident(val) => VmNode::ident(info, lexed.extent.into(), val),
                     TokenKind::Literal(lit_kind) => {
                         let kind = match lit_kind {
                             LiteralKind::Nat => self.num_lit_kind.clone(),
@@ -2352,7 +1491,7 @@ impl BuiltinInterpreter {
                             .span_str(lexed.extent)
                             .unwrap_or_default()
                             .to_owned();
-                        Syntax::node(kind, vec![Syntax::atom(info, raw)])
+                        VmNode::node(kind, vec![VmNode::atom(info, raw)])
                     }
                 };
                 st.pos = ws_stop.0;
@@ -2366,7 +1505,7 @@ impl BuiltinInterpreter {
             }
             Err(err) => {
                 st.pos = err.at().0;
-                st.mk_unexpected_error(err.message(), expected.to_vec(), true);
+                st.mk_lexical_error(err.message(), expected.to_vec(), true);
             }
         }
     }
@@ -2382,7 +1521,7 @@ impl BuiltinInterpreter {
         if st.has_error() {
             return;
         }
-        if let Some(Syntax::Atom { val, .. }) = st.back()
+        if let Some(VmSyntax::Atom { val, .. }) = st.back().map(Deref::deref)
             && pred(val)
         {
             return;
@@ -2397,9 +1536,9 @@ impl BuiltinInterpreter {
         if st.has_error() {
             return;
         }
-        let matches = match st.back() {
-            Some(Syntax::Ident { .. }) => *kind == self.ident_kind,
-            Some(Syntax::Node { kind: k, .. }) => k == kind,
+        let matches = match st.back().map(Deref::deref) {
+            Some(VmSyntax::Ident { .. }) => *kind == self.ident_kind,
+            Some(VmSyntax::Node { kind: k, .. }) => k == kind,
             _ => false,
         };
         if !matches {
@@ -2425,7 +1564,7 @@ impl BuiltinInterpreter {
                     Ok(ws) => ws,
                     Err(err) => {
                         st.pos = err.at().0;
-                        st.mk_unexpected_error(err.message(), Vec::new(), false);
+                        st.mk_lexical_error(err.message(), Vec::new(), false);
                         return;
                     }
                 };
@@ -2437,12 +1576,7 @@ impl BuiltinInterpreter {
                     end_pos: stop_pos,
                 };
                 st.pos = ws_stop.0;
-                st.push(Syntax::Ident {
-                    info,
-                    raw_val: lexed.extent.into(),
-                    val,
-                    preresolved: Vec::new(),
-                });
+                st.push(VmNode::ident(info, lexed.extent.into(), val));
             }
             _ => {
                 st.pos = start_pos;
@@ -2510,13 +1644,8 @@ impl BuiltinInterpreter {
                 trailing,
                 end_pos: pos,
             };
-            let ident = Syntax::Ident {
-                info,
-                raw_val: empty.into(),
-                val: Name::anonymous(),
-                preresolved: Vec::new(),
-            };
-            st.push(Syntax::node(self.hygiene_info_kind.clone(), vec![ident]));
+            let ident = VmNode::ident(info, empty.into(), Name::anonymous());
+            st.push(VmNode::node(self.hygiene_info_kind.clone(), vec![ident]));
         };
         if let Some(mut prev) = st.pop() {
             if let SourceInfo::Original {
@@ -2524,10 +1653,10 @@ impl BuiltinInterpreter {
                 pos,
                 trailing,
                 end_pos,
-            } = get_tail_info(&prev)
+            } = get_tail_info_vm(&prev)
             {
                 let empty = ByteSpan::empty_at(end_pos);
-                set_tail_info(
+                set_tail_info_vm(
                     &mut prev,
                     SourceInfo::Original {
                         leading,
@@ -2615,103 +1744,34 @@ impl BuiltinInterpreter {
             }
         };
         let document = match verso {
-            crate::verso::Body::Blocks(blocks) => blocks,
-            crate::verso::Body::Failure => Syntax::node(
+            crate::verso::Body::Blocks(blocks) => VmNode::from_syntax(&blocks),
+            crate::verso::Body::Failure => VmNode::node(
                 Name::from_components(["Lean", "Doc", "Syntax", "parseFailure"]),
-                vec![Syntax::Atom {
-                    info: SourceInfo::Original {
+                vec![VmNode::atom(
+                    SourceInfo::Original {
                         leading: ByteSpan::empty_at(BytePos(start_pos)),
                         pos: BytePos(start_pos),
                         trailing: ByteSpan::empty_at(BytePos(close)),
                         end_pos: BytePos(close),
                     },
-                    val: text[start_pos..close].into(),
-                }],
+                    text[start_pos..close].to_owned(),
+                )],
             ),
         };
-        let closer = Syntax::Atom {
-            info: SourceInfo::Original {
+        let closer = VmNode::atom(
+            SourceInfo::Original {
                 leading: ByteSpan::empty_at(BytePos(close)),
                 pos: BytePos(close),
                 trailing: ByteSpan::new(BytePos(at), ws_stop)
                     .expect("scan_trivia never moves backwards"),
                 end_pos: BytePos(at),
             },
-            val: "-/".into(),
-        };
-        st.push(Syntax::node(
+            "-/",
+        );
+        st.push(VmNode::node(
             Name::from_components(["Lean", "Parser", "Command", "versoCommentBody"]),
             vec![document, closer],
         ));
-    }
-
-    fn interpolated_str_fn(&self, inner: &ParserOp, st: &mut RuntimeState<'_>) {
-        let stack_sz = st.stack_size();
-        let start_pos = st.pos;
-        if start_pos >= st.source.len_bytes() {
-            st.mk_eoi_error(&[]);
-            return;
-        }
-        if st.source.as_bytes().get(start_pos) != Some(&b'"') {
-            st.mk_error("interpolated string");
-            return;
-        }
-        st.pos = start_pos + 1;
-        let mut chunk_start = start_pos;
-        let saved_pos_ctx = st.ctx.saved_pos;
-        loop {
-            if !st.tick() {
-                return;
-            }
-            let i = st.pos;
-            if i >= st.source.len_bytes() {
-                st.mk_error("unterminated string literal");
-                st.mk_node(self.interpolated_str_kind.clone(), stack_sz);
-                return;
-            }
-            let ch = st.source.as_str()[i..].chars().next().unwrap_or('\0');
-            st.pos = i + ch.len_utf8();
-            if ch == '"' {
-                self.push_node_token(
-                    self.interpolated_str_lit_kind.clone(),
-                    chunk_start,
-                    true,
-                    st,
-                );
-                st.mk_node(self.interpolated_str_kind.clone(), stack_sz);
-                return;
-            } else if ch == '\\' {
-                if !skip_quoted_char_for_interp(st) {
-                    st.mk_node(self.interpolated_str_kind.clone(), stack_sz);
-                    return;
-                }
-            } else if ch == '{' {
-                self.push_node_token(
-                    self.interpolated_str_lit_kind.clone(),
-                    chunk_start,
-                    true,
-                    st,
-                );
-                if st.has_error() {
-                    return;
-                }
-                st.ctx.saved_pos = None;
-                self.exec_op(inner, st);
-                st.ctx.saved_pos = saved_pos_ctx;
-                if st.has_error() {
-                    return;
-                }
-                let brace_pos = st.pos;
-                if st.source.as_bytes().get(brace_pos) == Some(&b'}') {
-                    st.pos = brace_pos + 1;
-                    chunk_start = brace_pos;
-                } else {
-                    st.mk_error("'}'");
-                    st.mk_node(self.interpolated_str_kind.clone(), stack_sz);
-                    return;
-                }
-            }
-        }
     }
 
     fn push_raw_atom(&self, start_pos: usize, trailing_ws: bool, st: &mut RuntimeState<'_>) {
@@ -2725,7 +1785,7 @@ impl BuiltinInterpreter {
                 }
                 Err(err) => {
                     st.pos = err.at().0;
-                    st.mk_unexpected_error(err.message(), Vec::new(), false);
+                    st.mk_lexical_error(err.message(), Vec::new(), false);
                     return;
                 }
             }
@@ -2739,7 +1799,7 @@ impl BuiltinInterpreter {
                 .expect("scan_trivia never moves backwards"),
             end_pos: BytePos(stop_pos),
         };
-        st.push(Syntax::atom(info, val));
+        st.push(VmNode::atom(info, val));
     }
 
     fn push_node_token(
@@ -2762,7 +1822,7 @@ impl BuiltinInterpreter {
                 }
                 Err(err) => {
                     st.pos = err.at().0;
-                    st.mk_unexpected_error(err.message(), Vec::new(), false);
+                    st.mk_lexical_error(err.message(), Vec::new(), false);
                     return;
                 }
             }
@@ -2776,7 +1836,7 @@ impl BuiltinInterpreter {
                 .expect("scan_trivia never moves backwards"),
             end_pos: BytePos(stop_pos),
         };
-        st.push(Syntax::node(kind, vec![Syntax::atom(info, val)]));
+        st.push(VmNode::node(kind, vec![VmNode::atom(info, val)]));
     }
 }
 
@@ -2860,9 +1920,247 @@ struct ParserCacheKey {
     pos: usize,
 }
 
+/// Reference-counted syntax tree node used internally by the parser VM so
+/// packrat memoization (`parser_cache`) and Pratt/OrElse backtracking clone
+/// subtrees in O(1) while iterative [`Drop`] keeps destruction O(1) on the
+/// native stack even for 6,000+ deep trees on 96 KiB threads.
+#[derive(Debug, Clone)]
+pub(super) struct VmNode(Option<Rc<VmSyntax>>);
+
+#[derive(Debug, Clone)]
+pub(super) enum VmSyntax {
+    Missing,
+    Atom {
+        info: SourceInfo,
+        val: String,
+    },
+    Ident {
+        info: SourceInfo,
+        raw_val: fln_syntax::tree::RawIdentifier,
+        val: Name,
+        preresolved: Vec<fln_syntax::tree::Preresolved>,
+    },
+    Node {
+        info: SourceInfo,
+        kind: Name,
+        args: Vec<VmNode>,
+        tree_nodes: usize,
+    },
+}
+
+impl Deref for VmNode {
+    type Target = VmSyntax;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        const MISSING: &VmSyntax = &VmSyntax::Missing;
+        self.0.as_deref().unwrap_or(MISSING)
+    }
+}
+
+impl Drop for VmNode {
+    fn drop(&mut self) {
+        let Some(root) = self.0.take() else {
+            return;
+        };
+        if Rc::strong_count(&root) > 1 {
+            return;
+        }
+        let mut work = vec![root];
+        while let Some(node) = work.pop() {
+            if let Ok(mut inner) = Rc::try_unwrap(node)
+                && let VmSyntax::Node { args, .. } = &mut inner
+            {
+                for mut child in std::mem::take(args) {
+                    if let Some(c) = child.0.take() {
+                        work.push(c);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl VmNode {
+    #[inline]
+    fn missing() -> Self {
+        Self(Some(Rc::new(VmSyntax::Missing)))
+    }
+
+    #[inline]
+    fn atom(info: SourceInfo, val: impl Into<String>) -> Self {
+        Self(Some(Rc::new(VmSyntax::Atom {
+            info,
+            val: val.into(),
+        })))
+    }
+
+    #[inline]
+    fn ident(info: SourceInfo, raw_val: fln_syntax::tree::RawIdentifier, val: Name) -> Self {
+        Self(Some(Rc::new(VmSyntax::Ident {
+            info,
+            raw_val,
+            val,
+            preresolved: Vec::new(),
+        })))
+    }
+
+    #[inline]
+    fn tree_nodes(&self) -> usize {
+        match &**self {
+            VmSyntax::Node { tree_nodes, .. } => *tree_nodes,
+            VmSyntax::Missing | VmSyntax::Atom { .. } | VmSyntax::Ident { .. } => 1,
+        }
+    }
+
+    #[inline]
+    fn node(kind: Name, args: Vec<VmNode>) -> Self {
+        let mut tree_nodes = 1usize;
+        for arg in &args {
+            tree_nodes = tree_nodes.saturating_add(arg.tree_nodes());
+        }
+        Self(Some(Rc::new(VmSyntax::Node {
+            info: SourceInfo::None,
+            kind,
+            args,
+            tree_nodes,
+        })))
+    }
+
+    #[inline]
+    fn kind(&self) -> Option<&Name> {
+        match &**self {
+            VmSyntax::Node { kind, .. } => Some(kind),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn make_mut(&mut self) -> &mut VmSyntax {
+        let rc = self.0.get_or_insert_with(|| Rc::new(VmSyntax::Missing));
+        Rc::make_mut(rc)
+    }
+
+    /// Iterative conversion from `&Syntax` into `VmNode`.
+    fn from_syntax(root: &Syntax) -> Self {
+        enum Step<'a> {
+            Visit(&'a Syntax),
+            FinishNode {
+                info: SourceInfo,
+                kind: Name,
+                arity: usize,
+            },
+        }
+        let mut work = vec![Step::Visit(root)];
+        let mut out: Vec<VmNode> = Vec::new();
+        while let Some(step) = work.pop() {
+            match step {
+                Step::Visit(Syntax::Missing) => out.push(VmNode::missing()),
+                Step::Visit(Syntax::Atom { info, val }) => {
+                    out.push(VmNode::atom(*info, val.clone()));
+                }
+                Step::Visit(Syntax::Ident {
+                    info,
+                    raw_val,
+                    val,
+                    preresolved,
+                }) => out.push(Self(Some(Rc::new(VmSyntax::Ident {
+                    info: *info,
+                    raw_val: raw_val.clone(),
+                    val: val.clone(),
+                    preresolved: preresolved.clone(),
+                })))),
+                Step::Visit(Syntax::Node { info, kind, args }) => {
+                    let arity = args.len();
+                    work.push(Step::FinishNode {
+                        info: *info,
+                        kind: kind.clone(),
+                        arity,
+                    });
+                    for arg in args.iter().rev() {
+                        work.push(Step::Visit(arg));
+                    }
+                }
+                Step::FinishNode { info, kind, arity } => {
+                    let split = out.len().saturating_sub(arity);
+                    let args = out.split_off(split);
+                    let mut tree_nodes = 1usize;
+                    for arg in &args {
+                        tree_nodes = tree_nodes.saturating_add(arg.tree_nodes());
+                    }
+                    out.push(Self(Some(Rc::new(VmSyntax::Node {
+                        info,
+                        kind,
+                        args,
+                        tree_nodes,
+                    }))));
+                }
+            }
+        }
+        out.pop().unwrap_or_else(VmNode::missing)
+    }
+
+    /// Iterative O(N) conversion from `VmNode` back to owned `Syntax`.
+    pub(super) fn to_syntax(&self) -> Syntax {
+        enum Step<'a> {
+            Visit(&'a VmNode),
+            FinishNode {
+                info: SourceInfo,
+                kind: Name,
+                arity: usize,
+            },
+        }
+        let mut work = vec![Step::Visit(self)];
+        let mut out: Vec<Syntax> = Vec::new();
+        while let Some(step) = work.pop() {
+            match step {
+                Step::Visit(node) => match &**node {
+                    VmSyntax::Missing => out.push(Syntax::Missing),
+                    VmSyntax::Atom { info, val } => out.push(Syntax::Atom {
+                        info: *info,
+                        val: val.clone(),
+                    }),
+                    VmSyntax::Ident {
+                        info,
+                        raw_val,
+                        val,
+                        preresolved,
+                    } => out.push(Syntax::Ident {
+                        info: *info,
+                        raw_val: raw_val.clone(),
+                        val: val.clone(),
+                        preresolved: preresolved.clone(),
+                    }),
+                    VmSyntax::Node {
+                        info,
+                        kind,
+                        args,
+                        tree_nodes: _,
+                    } => {
+                        let arity = args.len();
+                        work.push(Step::FinishNode {
+                            info: *info,
+                            kind: kind.clone(),
+                            arity,
+                        });
+                        for arg in args.iter().rev() {
+                            work.push(Step::Visit(arg));
+                        }
+                    }
+                },
+                Step::FinishNode { info, kind, arity } => {
+                    let split = out.len().saturating_sub(arity);
+                    let args = out.split_off(split);
+                    out.push(Syntax::Node { info, kind, args });
+                }
+            }
+        }
+        out.pop().unwrap_or(Syntax::Missing)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ParserCacheEntry {
-    stx: Syntax,
+    stx: VmNode,
     lhs_prec: u32,
     new_pos: usize,
     error: Option<InterpError>,
@@ -2877,19 +2175,19 @@ struct RuntimeState<'a> {
         crate::extensions::FileScope,
     )>,
     ctx: CacheableCtx,
-    stack: Vec<Syntax>,
+    stack: Vec<VmNode>,
     stack_drop: usize,
     lhs_prec: u32,
     pos: usize,
     error: Option<InterpError>,
     recovered_errors: Vec<InterpError>,
-    token_cache: Option<(usize, usize, Option<String>, Syntax)>,
+    token_cache: Option<(usize, usize, Option<String>, VmNode)>,
     parser_cache: HashMap<ParserCacheKey, ParserCacheEntry>,
     active_cache_keys: HashSet<ParserCacheKey>,
     depth: usize,
     max_depth: usize,
-    op_depth: usize,
     max_op_depth: usize,
+    max_tree_nodes: usize,
     steps: usize,
     max_steps: usize,
     budget_exhausted: bool,
@@ -2921,14 +2219,19 @@ impl<'a> RuntimeState<'a> {
             parser_cache: HashMap::new(),
             active_cache_keys: HashSet::new(),
             depth: 0,
-            max_depth: 128,
-            op_depth: 0,
-            max_op_depth: 384,
+            max_depth: DEFAULT_MAX_DEPTH,
+            max_op_depth: 65_536,
+            max_tree_nodes: DEFAULT_MAX_TREE_NODES,
             steps: 0,
             max_steps,
             budget_exhausted: false,
             depth_exhausted: false,
         }
+    }
+
+    #[inline]
+    fn is_exhausted(&self) -> bool {
+        self.depth_exhausted || self.budget_exhausted
     }
 
     fn resource_error(&self) -> Option<InterpError> {
@@ -2954,7 +2257,7 @@ impl<'a> RuntimeState<'a> {
             }
             return false;
         }
-        if self.steps >= self.max_steps {
+        if self.budget_exhausted || self.steps >= self.max_steps {
             self.budget_exhausted = true;
             if self.error.is_none() {
                 self.error = Some(InterpError::new(
@@ -2974,7 +2277,7 @@ impl<'a> RuntimeState<'a> {
             Ok(ws) => self.pos = ws.0,
             Err(err) => {
                 self.pos = err.at().0;
-                self.mk_unexpected_error(err.message(), Vec::new(), false);
+                self.mk_lexical_error(err.message(), Vec::new(), false);
             }
         }
     }
@@ -3000,12 +2303,12 @@ impl<'a> RuntimeState<'a> {
     }
 
     #[inline]
-    fn push(&mut self, stx: Syntax) {
+    fn push(&mut self, stx: VmNode) {
         self.stack.push(stx);
     }
 
     #[inline]
-    fn pop(&mut self) -> Option<Syntax> {
+    fn pop(&mut self) -> Option<VmNode> {
         if self.stack_size() > 0 {
             self.stack.pop()
         } else {
@@ -3014,12 +2317,12 @@ impl<'a> RuntimeState<'a> {
     }
 
     #[inline]
-    fn pop_or_missing(&mut self) -> Syntax {
-        self.pop().unwrap_or(Syntax::Missing)
+    fn pop_or_missing(&mut self) -> VmNode {
+        self.pop().unwrap_or_else(VmNode::missing)
     }
 
     #[inline]
-    fn back(&self) -> Option<&Syntax> {
+    fn back(&self) -> Option<&VmNode> {
         if self.stack_size() > 0 {
             self.stack.last()
         } else {
@@ -3028,12 +2331,12 @@ impl<'a> RuntimeState<'a> {
     }
 
     #[inline]
-    fn back_cloned(&self) -> Option<Syntax> {
+    fn back_cloned(&self) -> Option<VmNode> {
         self.back().cloned()
     }
 
     #[inline]
-    fn get_visible(&self, idx: usize) -> Option<&Syntax> {
+    fn get_visible(&self, idx: usize) -> Option<&VmNode> {
         if idx < self.stack_size() {
             self.stack.get(self.stack_drop + idx)
         } else {
@@ -3059,27 +2362,47 @@ impl<'a> RuntimeState<'a> {
         self.push(top);
     }
 
-    fn pick_non_none(&self, null_kind: &Name) -> Option<&Syntax> {
+    fn pick_non_none(&self, null_kind: &Name) -> Option<&VmNode> {
         self.stack[self.stack_drop..]
             .iter()
             .rev()
-            .find(|s| !is_none_stx(s, null_kind))
+            .find(|s| !is_none_stx_vm(s, null_kind))
     }
 
     fn mk_node(&mut self, kind: Name, ini_sz: usize) {
         if self.has_error() && self.stack_size() == ini_sz {
-            self.push(Syntax::Missing);
+            self.push(VmNode::missing());
             return;
         }
         let split_at = (self.stack_drop + ini_sz).min(self.stack.len());
         let args = self.stack.split_off(split_at);
-        self.push(Syntax::node(kind, args));
+        let node = VmNode::node(kind, args);
+        if node.tree_nodes() > self.max_tree_nodes {
+            self.budget_exhausted = true;
+            self.mk_unexpected_error(
+                "syntax tree node budget exhausted".to_owned(),
+                Vec::new(),
+                true,
+            );
+            return;
+        }
+        self.push(node);
     }
 
     fn mk_trailing_node(&mut self, kind: Name, ini_sz: usize) {
         let split_at = (self.stack_drop + ini_sz.saturating_sub(1)).min(self.stack.len());
         let args = self.stack.split_off(split_at);
-        self.push(Syntax::node(kind, args));
+        let node = VmNode::node(kind, args);
+        if node.tree_nodes() > self.max_tree_nodes {
+            self.budget_exhausted = true;
+            self.mk_unexpected_error(
+                "syntax tree node budget exhausted".to_owned(),
+                Vec::new(),
+                true,
+            );
+            return;
+        }
+        self.push(node);
     }
 
     fn mk_error(&mut self, expected: &str) {
@@ -3088,7 +2411,7 @@ impl<'a> RuntimeState<'a> {
             String::new(),
             vec![expected.to_owned()],
         ));
-        self.push(Syntax::Missing);
+        self.push(VmNode::missing());
     }
 
     fn mk_unexpected_error(
@@ -3099,7 +2422,19 @@ impl<'a> RuntimeState<'a> {
     ) {
         self.error = Some(InterpError::new(self.pos, unexpected, expected));
         if push_missing {
-            self.push(Syntax::Missing);
+            self.push(VmNode::missing());
+        }
+    }
+
+    fn mk_lexical_error(
+        &mut self,
+        message: &'static str,
+        expected: Vec<String>,
+        push_missing: bool,
+    ) {
+        self.error = Some(InterpError::lexical(self.pos, message, expected));
+        if push_missing {
+            self.push(VmNode::missing());
         }
     }
 
@@ -3109,15 +2444,15 @@ impl<'a> RuntimeState<'a> {
 
     fn mk_unexpected_token_errors(&mut self, expected: &[String], ini_pos: Option<usize>) {
         let tk = self.pop_or_missing();
-        let pos = ini_pos.or_else(|| first_pos_of(&tk)).unwrap_or(self.pos);
+        let pos = ini_pos.or_else(|| first_pos_of_vm(&tk)).unwrap_or(self.pos);
         self.pos = pos;
-        let unexpected = match &tk {
-            Syntax::Ident { .. } => "unexpected identifier".to_owned(),
-            Syntax::Atom { val, .. } => format!("unexpected token '{val}'"),
+        let unexpected = match &*tk {
+            VmSyntax::Ident { .. } => "unexpected identifier".to_owned(),
+            VmSyntax::Atom { val, .. } => format!("unexpected token '{val}'"),
             _ => "unexpected token".to_owned(),
         };
         self.error = Some(InterpError::new(pos, unexpected, expected.to_vec()));
-        self.push(Syntax::Missing);
+        self.push(VmNode::missing());
     }
 }
 
@@ -3133,32 +2468,6 @@ fn builtin_category_behavior(cat: &Name) -> LeadingIdentBehavior {
 /// (`Extension.lean:417-418`, `Basic.lean:1822-1833`).
 fn build_category_antiquot_parser(cat: &Name) -> Arc<ParserOp> {
     build_mk_antiquot(&cat.to_display_string(), cat, true, true)
-}
-
-fn flatten_seq(lhs: Arc<ParserOp>, rhs: Arc<ParserOp>) -> Arc<ParserOp> {
-    let mut items = Vec::new();
-    match lhs.as_ref() {
-        ParserOp::Seq(xs) => items.extend(xs.iter().cloned()),
-        _ => items.push(lhs),
-    }
-    match rhs.as_ref() {
-        ParserOp::Seq(xs) => items.extend(xs.iter().cloned()),
-        _ => items.push(rhs),
-    }
-    Arc::new(ParserOp::Seq(items))
-}
-
-fn flatten_orelse(lhs: Arc<ParserOp>, rhs: Arc<ParserOp>) -> Arc<ParserOp> {
-    let mut items = Vec::new();
-    match lhs.as_ref() {
-        ParserOp::OrElse(xs) => items.extend(xs.iter().cloned()),
-        _ => items.push(lhs),
-    }
-    match rhs.as_ref() {
-        ParserOp::OrElse(xs) => items.extend(xs.iter().cloned()),
-        _ => items.push(rhs),
-    }
-    Arc::new(ParserOp::OrElse(items))
 }
 
 fn build_mk_antiquot(
@@ -3289,7 +2598,7 @@ fn eval_ast(
             Ok(env[env.len() - 1 - *idx].clone())
         }
         CombinatorAst::Lam { body, .. } => Ok(EvalVal::Closure {
-            body: (**body).clone(),
+            body: Box::new((**body).clone()),
             env: env.clone(),
         }),
         CombinatorAst::Let { val, body, .. } => {
@@ -3299,20 +2608,8 @@ fn eval_ast(
             env.pop();
             res
         }
-        CombinatorAst::Seq(lhs, rhs) => {
-            let lv = eval_ast(table, def_index, owner, lhs, env, depth + 1)?;
-            let lp = expect_parser(owner, lv)?;
-            let rv = eval_thunk_or_ast(table, def_index, owner, rhs, env, depth + 1)?;
-            let rp = expect_parser(owner, rv)?;
-            Ok(EvalVal::Parser(flatten_seq(lp, rp)))
-        }
-        CombinatorAst::OrElse(lhs, rhs) => {
-            let lv = eval_ast(table, def_index, owner, lhs, env, depth + 1)?;
-            let lp = expect_parser(owner, lv)?;
-            let rv = eval_thunk_or_ast(table, def_index, owner, rhs, env, depth + 1)?;
-            let rp = expect_parser(owner, rv)?;
-            Ok(EvalVal::Parser(flatten_orelse(lp, rp)))
-        }
+        CombinatorAst::Seq(_, _) => eval_seq_spine(table, def_index, owner, ast, env, depth),
+        CombinatorAst::OrElse(_, _) => eval_orelse_spine(table, def_index, owner, ast, env, depth),
         CombinatorAst::Append(lhs, rhs) => {
             let lv = eval_ast(table, def_index, owner, lhs, env, depth + 1)?;
             let rv = eval_ast(table, def_index, owner, rhs, env, depth + 1)?;
@@ -3372,6 +2669,76 @@ fn eval_ast(
     }
 }
 
+#[inline(never)]
+fn eval_seq_spine(
+    table: &BuiltinParserTable,
+    def_index: &BTreeMap<Name, usize>,
+    owner: &Name,
+    ast: &CombinatorAst,
+    env: &mut Vec<EvalVal>,
+    depth: usize,
+) -> Result<EvalVal, CompileError> {
+    let mut parts: Vec<(&CombinatorAst, bool)> = Vec::new();
+    let mut stack: Vec<(&CombinatorAst, bool)> = vec![(ast, false)];
+    while let Some((node, is_rhs)) = stack.pop() {
+        if let CombinatorAst::Seq(l, r) = node {
+            stack.push((r, true));
+            stack.push((l, false));
+        } else {
+            parts.push((node, is_rhs));
+        }
+    }
+    let mut items = Vec::with_capacity(parts.len());
+    for (node, is_rhs) in parts {
+        let v = if is_rhs {
+            eval_thunk_or_ast(table, def_index, owner, node, env, depth + 1)?
+        } else {
+            eval_ast(table, def_index, owner, node, env, depth + 1)?
+        };
+        let p = expect_parser(owner, v)?;
+        match p.as_ref() {
+            ParserOp::Seq(xs) => items.extend(xs.iter().cloned()),
+            _ => items.push(p),
+        }
+    }
+    Ok(EvalVal::Parser(Arc::new(ParserOp::Seq(items))))
+}
+
+#[inline(never)]
+fn eval_orelse_spine(
+    table: &BuiltinParserTable,
+    def_index: &BTreeMap<Name, usize>,
+    owner: &Name,
+    ast: &CombinatorAst,
+    env: &mut Vec<EvalVal>,
+    depth: usize,
+) -> Result<EvalVal, CompileError> {
+    let mut parts: Vec<(&CombinatorAst, bool)> = Vec::new();
+    let mut stack: Vec<(&CombinatorAst, bool)> = vec![(ast, false)];
+    while let Some((node, is_rhs)) = stack.pop() {
+        if let CombinatorAst::OrElse(l, r) = node {
+            stack.push((r, true));
+            stack.push((l, false));
+        } else {
+            parts.push((node, is_rhs));
+        }
+    }
+    let mut items = Vec::with_capacity(parts.len());
+    for (node, is_rhs) in parts {
+        let v = if is_rhs {
+            eval_thunk_or_ast(table, def_index, owner, node, env, depth + 1)?
+        } else {
+            eval_ast(table, def_index, owner, node, env, depth + 1)?
+        };
+        let p = expect_parser(owner, v)?;
+        match p.as_ref() {
+            ParserOp::OrElse(xs) => items.extend(xs.iter().cloned()),
+            _ => items.push(p),
+        }
+    }
+    Ok(EvalVal::Parser(Arc::new(ParserOp::OrElse(items))))
+}
+
 fn eval_thunk_or_ast(
     table: &BuiltinParserTable,
     def_index: &BTreeMap<Name, usize>,
@@ -3410,6 +2777,7 @@ fn apply_closure(
     }
 }
 
+#[inline(never)]
 fn eval_const(
     def_index: &BTreeMap<Name, usize>,
     owner: &Name,
@@ -3480,6 +2848,7 @@ fn eval_const(
     }
 }
 
+#[inline(never)]
 fn eval_call(
     table: &BuiltinParserTable,
     def_index: &BTreeMap<Name, usize>,
@@ -3491,165 +2860,31 @@ fn eval_call(
 ) -> Result<EvalVal, CompileError> {
     let fname = func.to_display_string();
 
-    // Direct specialized intercepts for context-adapting & syntax-transform helpers
-    // whose bodies construct Lean lambdas over `CacheableParserContext` or `Syntax`.
-    match fname.as_str() {
-        "Lean.Parser.withForbidden" if args.len() == 2 => {
-            let tk = expect_str(
-                owner,
-                eval_ast(table, def_index, owner, &args[0], env, depth)?,
-            )?;
-            let p = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[1], env, depth)?,
-            )?;
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
-                ContextTransform::WithForbidden(tk),
-                p,
-            ))));
+    // Non-strict special forms whose AST arguments cannot be evaluated eagerly.
+    if fname == "Lean.Parser.recover'" && args.len() == 2 {
+        let p = expect_parser(
+            owner,
+            eval_ast(table, def_index, owner, &args[0], env, depth)?,
+        )?;
+        let h = eval_thunk_or_ast(table, def_index, owner, &args[1], env, depth)?;
+        let hp = expect_parser(owner, h)?;
+        return Ok(EvalVal::Parser(Arc::new(ParserOp::Recover {
+            parser: p,
+            handler: hp,
+        })));
+    }
+    if fname == "_private.Lean.Parser.Command.0.Lean.Parser.Command.skipUntil" && args.len() == 1 {
+        let pred = extract_skip_until_pred(&args[0]);
+        return Ok(EvalVal::Parser(Arc::new(ParserOp::SkipUntil(pred))));
+    }
+
+    // Strict intercepts take precedence over `table.generatables` entries.
+    if is_strict_intercept_call(&fname, args.len()) {
+        let mut vals = Vec::with_capacity(args.len());
+        for arg in args {
+            vals.push(eval_ast(table, def_index, owner, arg, env, depth)?);
         }
-        "Lean.Parser.withoutForbidden" if args.len() == 1 => {
-            let p = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[0], env, depth)?,
-            )?;
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
-                ContextTransform::WithoutForbidden,
-                p,
-            ))));
-        }
-        "Lean.Parser.withoutPosition" if args.len() == 1 => {
-            let p = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[0], env, depth)?,
-            )?;
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
-                ContextTransform::WithoutPosition,
-                p,
-            ))));
-        }
-        "Lean.Parser.suppressInsideQuot" if args.len() == 1 => {
-            let p = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[0], env, depth)?,
-            )?;
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
-                ContextTransform::SuppressInsideQuot,
-                p,
-            ))));
-        }
-        "Lean.Parser.incQuotDepth" if args.len() == 1 => {
-            let p = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[0], env, depth)?,
-            )?;
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
-                ContextTransform::AddQuotDepth(1),
-                p,
-            ))));
-        }
-        "Lean.Parser.decQuotDepth" if args.len() == 1 => {
-            let p = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[0], env, depth)?,
-            )?;
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
-                ContextTransform::AddQuotDepth(-1),
-                p,
-            ))));
-        }
-        "_private.Lean.Parser.Basic.0.Lean.Parser.addQuotDepth" if args.len() == 2 => {
-            let delta = expect_int(
-                owner,
-                eval_ast(table, def_index, owner, &args[0], env, depth)?,
-            )?;
-            let p = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[1], env, depth)?,
-            )?;
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
-                ContextTransform::AddQuotDepth(delta as i32),
-                p,
-            ))));
-        }
-        "Lean.Parser.many1Unbox" if args.len() == 1 => {
-            let p = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[0], env, depth)?,
-            )?;
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::Many1Unbox(p))));
-        }
-        "Lean.Parser.recover" if args.len() == 2 => {
-            let p = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[0], env, depth)?,
-            )?;
-            let h = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[1], env, depth)?,
-            )?;
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::Recover {
-                parser: p,
-                handler: h,
-            })));
-        }
-        "Lean.Parser.recover'" if args.len() == 2 => {
-            let p = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[0], env, depth)?,
-            )?;
-            let h = eval_thunk_or_ast(table, def_index, owner, &args[1], env, depth)?;
-            let hp = expect_parser(owner, h)?;
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::Recover {
-                parser: p,
-                handler: hp,
-            })));
-        }
-        "_private.Lean.Parser.Command.0.Lean.Parser.Command.skipUntil" if args.len() == 1 => {
-            let pred = extract_skip_until_pred(&args[0]);
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::SkipUntil(pred))));
-        }
-        // Verso doc switches (`doc.verso`, `doc.verso.module`, `withoutVersoSyntax`).
-        "Lean.Doc.Parser.ifVerso" if args.len() == 2 => {
-            let verso = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[0], env, depth)?,
-            )?;
-            let plain = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[1], env, depth)?,
-            )?;
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::IfVerso {
-                module_docs: false,
-                verso,
-                plain,
-            })));
-        }
-        "Lean.Doc.Parser.ifVersoModuleDocs" if args.len() == 2 => {
-            let verso = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[0], env, depth)?,
-            )?;
-            let plain = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[1], env, depth)?,
-            )?;
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::IfVerso {
-                module_docs: true,
-                verso,
-                plain,
-            })));
-        }
-        "Lean.Doc.Parser.withoutVersoSyntax" if args.len() == 1 => {
-            let inner = expect_parser(
-                owner,
-                eval_ast(table, def_index, owner, &args[0], env, depth)?,
-            )?;
-            return Ok(EvalVal::Parser(Arc::new(ParserOp::WithoutVersoSyntax(
-                inner,
-            ))));
-        }
-        _ => {}
+        return eval_primitive_call(owner, &fname, vals);
     }
 
     // Parameterized (and eta-reduced) generatable helpers in the table.
@@ -3689,8 +2924,121 @@ fn eval_call(
     for arg in args {
         vals.push(eval_ast(table, def_index, owner, arg, env, depth)?);
     }
+    eval_primitive_call(owner, &fname, vals)
+}
 
-    match fname.as_str() {
+fn is_strict_intercept_call(fname: &str, arity: usize) -> bool {
+    matches!(
+        (fname, arity),
+        ("Lean.Parser.withForbidden", 2)
+            | ("Lean.Parser.withoutForbidden", 1)
+            | ("Lean.Parser.withoutPosition", 1)
+            | ("Lean.Parser.suppressInsideQuot", 1)
+            | ("Lean.Parser.incQuotDepth", 1)
+            | ("Lean.Parser.decQuotDepth", 1)
+            | ("_private.Lean.Parser.Basic.0.Lean.Parser.addQuotDepth", 2)
+            | ("Lean.Parser.many1Unbox", 1)
+            | ("Lean.Parser.recover", 2)
+            | ("Lean.Doc.Parser.ifVerso", 2)
+            | ("Lean.Doc.Parser.ifVersoModuleDocs", 2)
+            | ("Lean.Doc.Parser.withoutVersoSyntax", 1)
+    )
+}
+
+#[inline(never)]
+fn eval_primitive_call(
+    owner: &Name,
+    fname: &str,
+    mut vals: Vec<EvalVal>,
+) -> Result<EvalVal, CompileError> {
+    match fname {
+        "Lean.Parser.withForbidden" if vals.len() == 2 => {
+            let tk = expect_str(owner, vals.remove(0))?;
+            let p = expect_parser(owner, vals.remove(0))?;
+            Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
+                ContextTransform::WithForbidden(tk),
+                p,
+            ))))
+        }
+        "Lean.Parser.withoutForbidden" if vals.len() == 1 => {
+            let p = expect_parser(owner, vals.remove(0))?;
+            Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
+                ContextTransform::WithoutForbidden,
+                p,
+            ))))
+        }
+        "Lean.Parser.withoutPosition" if vals.len() == 1 => {
+            let p = expect_parser(owner, vals.remove(0))?;
+            Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
+                ContextTransform::WithoutPosition,
+                p,
+            ))))
+        }
+        "Lean.Parser.suppressInsideQuot" if vals.len() == 1 => {
+            let p = expect_parser(owner, vals.remove(0))?;
+            Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
+                ContextTransform::SuppressInsideQuot,
+                p,
+            ))))
+        }
+        "Lean.Parser.incQuotDepth" if vals.len() == 1 => {
+            let p = expect_parser(owner, vals.remove(0))?;
+            Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
+                ContextTransform::AddQuotDepth(1),
+                p,
+            ))))
+        }
+        "Lean.Parser.decQuotDepth" if vals.len() == 1 => {
+            let p = expect_parser(owner, vals.remove(0))?;
+            Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
+                ContextTransform::AddQuotDepth(-1),
+                p,
+            ))))
+        }
+        "_private.Lean.Parser.Basic.0.Lean.Parser.addQuotDepth" if vals.len() == 2 => {
+            let delta = expect_int(owner, vals.remove(0))?;
+            let p = expect_parser(owner, vals.remove(0))?;
+            Ok(EvalVal::Parser(Arc::new(ParserOp::AdaptContext(
+                ContextTransform::AddQuotDepth(delta as i32),
+                p,
+            ))))
+        }
+        "Lean.Parser.many1Unbox" if vals.len() == 1 => {
+            let p = expect_parser(owner, vals.remove(0))?;
+            Ok(EvalVal::Parser(Arc::new(ParserOp::Many1Unbox(p))))
+        }
+        "Lean.Parser.recover" if vals.len() == 2 => {
+            let p = expect_parser(owner, vals.remove(0))?;
+            let h = expect_parser(owner, vals.remove(0))?;
+            Ok(EvalVal::Parser(Arc::new(ParserOp::Recover {
+                parser: p,
+                handler: h,
+            })))
+        }
+        "Lean.Doc.Parser.ifVerso" if vals.len() == 2 => {
+            let verso = expect_parser(owner, vals.remove(0))?;
+            let plain = expect_parser(owner, vals.remove(0))?;
+            Ok(EvalVal::Parser(Arc::new(ParserOp::IfVerso {
+                module_docs: false,
+                verso,
+                plain,
+            })))
+        }
+        "Lean.Doc.Parser.ifVersoModuleDocs" if vals.len() == 2 => {
+            let verso = expect_parser(owner, vals.remove(0))?;
+            let plain = expect_parser(owner, vals.remove(0))?;
+            Ok(EvalVal::Parser(Arc::new(ParserOp::IfVerso {
+                module_docs: true,
+                verso,
+                plain,
+            })))
+        }
+        "Lean.Doc.Parser.withoutVersoSyntax" if vals.len() == 1 => {
+            let inner = expect_parser(owner, vals.remove(0))?;
+            Ok(EvalVal::Parser(Arc::new(ParserOp::WithoutVersoSyntax(
+                inner,
+            ))))
+        }
         // Core primitive combinators
         "Lean.Parser.withAntiquot" if vals.len() == 2 => {
             let antiq = expect_parser(owner, vals.remove(0))?;
@@ -3943,10 +3291,10 @@ fn eval_call(
             }),
         },
         "id" if vals.is_empty() => Ok(EvalVal::Closure {
-            body: CombinatorAst::Var {
+            body: Box::new(CombinatorAst::Var {
                 name: "x".to_owned(),
                 idx: 0,
-            },
+            }),
             env: Vec::new(),
         }),
         "id" if vals.len() == 1 => Ok(vals.remove(0)),
@@ -4344,118 +3692,237 @@ fn scalar_col_of(source: &SourceText, pos: usize) -> usize {
         .map_or(0, |p| p.scalar_column)
 }
 
-fn is_none_stx(stx: &Syntax, null_kind: &Name) -> bool {
-    matches!(stx, Syntax::Node { kind, args, .. } if kind == null_kind && args.is_empty())
+fn is_none_stx_vm(stx: &VmNode, null_kind: &Name) -> bool {
+    matches!(&**stx, VmSyntax::Node { kind, args, .. } if kind == null_kind && args.is_empty())
 }
 
-fn is_antiquot(stx: &Syntax) -> bool {
-    matches!(stx, Syntax::Node { kind, .. } if matches!(kind.leaf_view(), LeafView::Str("antiquot")))
+fn is_antiquot_vm(stx: &VmNode) -> bool {
+    matches!(&**stx, VmSyntax::Node { kind, .. } if matches!(kind.leaf_view(), LeafView::Str("antiquot")))
 }
 
-fn is_antiquots(stx: &Syntax, choice_kind: &Name) -> bool {
-    if is_antiquot(stx) {
-        return true;
+fn is_antiquots(stx: &VmNode, choice_kind: &Name) -> bool {
+    let mut stack = vec![stx];
+    while let Some(node) = stack.pop() {
+        if is_antiquot_vm(node) {
+            continue;
+        }
+        if let VmSyntax::Node { kind, args, .. } = &**node
+            && kind == choice_kind
+            && !args.is_empty()
+        {
+            stack.extend(args);
+            continue;
+        }
+        return false;
     }
-    if let Syntax::Node { kind, args, .. } = stx
-        && kind == choice_kind
-        && !args.is_empty()
-    {
-        return args.iter().all(|a| is_antiquots(a, choice_kind));
-    }
-    false
+    true
 }
 
-fn is_ident_stx(stx: &Syntax) -> bool {
-    matches!(stx, Syntax::Ident { .. }) || is_antiquot(stx)
+fn is_ident_stx_vm(stx: &VmNode) -> bool {
+    matches!(&**stx, VmSyntax::Ident { .. }) || is_antiquot_vm(stx)
+}
+
+fn get_tail_info_vm(stx: &VmNode) -> SourceInfo {
+    let mut stack: Vec<(&VmNode, Option<SourceInfo>)> = vec![(stx, None)];
+    while let Some((node, fallback)) = stack.pop() {
+        if let Some(info) = fallback {
+            if !matches!(info, SourceInfo::None) {
+                return info;
+            }
+            continue;
+        }
+        match &**node {
+            VmSyntax::Missing => {}
+            VmSyntax::Atom { info, .. } | VmSyntax::Ident { info, .. } => {
+                if !matches!(info, SourceInfo::None) {
+                    return *info;
+                }
+            }
+            VmSyntax::Node { info, args, .. } => {
+                if !matches!(info, SourceInfo::None) {
+                    stack.push((node, Some(*info)));
+                }
+                for arg in args {
+                    stack.push((arg, None));
+                }
+            }
+        }
+    }
+    SourceInfo::None
+}
+
+fn set_tail_info_vm(stx: &mut VmNode, new_info: SourceInfo) -> bool {
+    // 1. Find the rightmost child-index path to the non-`None` `SourceInfo` iteratively.
+    let mut path: Vec<usize> = Vec::new();
+    let mut found = false;
+    enum Step<'a> {
+        Enter(&'a VmNode, usize),
+        CheckSelf(&'a VmNode),
+        Pop,
+    }
+    let mut work: Vec<Step<'_>> = vec![Step::Enter(stx, usize::MAX)];
+    while let Some(step) = work.pop() {
+        match step {
+            Step::Pop => {
+                path.pop();
+            }
+            Step::CheckSelf(node) => {
+                if let VmSyntax::Node { info, .. } = &**node
+                    && !matches!(info, SourceInfo::None)
+                {
+                    found = true;
+                    break;
+                }
+            }
+            Step::Enter(node, idx) => {
+                if idx != usize::MAX {
+                    path.push(idx);
+                    work.push(Step::Pop);
+                }
+                match &**node {
+                    VmSyntax::Missing => {}
+                    VmSyntax::Atom { info, .. } | VmSyntax::Ident { info, .. } => {
+                        if !matches!(info, SourceInfo::None) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    VmSyntax::Node { info, args, .. } => {
+                        if !matches!(info, SourceInfo::None) {
+                            work.push(Step::CheckSelf(node));
+                        }
+                        for (i, arg) in args.iter().enumerate() {
+                            work.push(Step::Enter(arg, i));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !found {
+        return false;
+    }
+    // 2. Mutate only along the discovered path (copy-on-write via `Rc::make_mut`).
+    let mut cur = stx;
+    for idx in path {
+        match cur.make_mut() {
+            VmSyntax::Node { args, .. } => cur = &mut args[idx],
+            _ => return false,
+        }
+    }
+    match cur.make_mut() {
+        VmSyntax::Atom { info, .. }
+        | VmSyntax::Ident { info, .. }
+        | VmSyntax::Node { info, .. } => {
+            *info = new_info;
+            true
+        }
+        VmSyntax::Missing => false,
+    }
+}
+
+fn get_head_info_vm(stx: &VmNode) -> Option<SourceInfo> {
+    let mut stack = vec![stx];
+    while let Some(node) = stack.pop() {
+        match &**node {
+            VmSyntax::Missing => {}
+            VmSyntax::Atom { info, .. } | VmSyntax::Ident { info, .. } => {
+                if !matches!(info, SourceInfo::None) {
+                    return Some(*info);
+                }
+            }
+            VmSyntax::Node { info, args, .. } => {
+                if !matches!(info, SourceInfo::None) {
+                    return Some(*info);
+                }
+                for arg in args.iter().rev() {
+                    stack.push(arg);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn first_pos_of_vm(stx: &VmNode) -> Option<usize> {
+    get_head_info_vm(stx).and_then(|info| info.pos(false).map(|p| p.0))
 }
 
 fn get_tail_info(stx: &Syntax) -> SourceInfo {
-    match stx {
-        Syntax::Missing => SourceInfo::None,
-        Syntax::Atom { info, .. } | Syntax::Ident { info, .. } => *info,
-        Syntax::Node { info, args, .. } => {
-            for arg in args.iter().rev() {
-                let tail = get_tail_info(arg);
-                if !matches!(tail, SourceInfo::None) {
-                    return tail;
+    let mut stack: Vec<(&Syntax, Option<SourceInfo>)> = vec![(stx, None)];
+    while let Some((node, fallback)) = stack.pop() {
+        if let Some(info) = fallback {
+            if !matches!(info, SourceInfo::None) {
+                return info;
+            }
+            continue;
+        }
+        match node {
+            Syntax::Missing => {}
+            Syntax::Atom { info, .. } | Syntax::Ident { info, .. } => {
+                if !matches!(info, SourceInfo::None) {
+                    return *info;
                 }
             }
-            *info
-        }
-    }
-}
-
-fn set_tail_info(stx: &mut Syntax, new_info: SourceInfo) -> bool {
-    match stx {
-        Syntax::Missing => false,
-        Syntax::Atom { info, .. } | Syntax::Ident { info, .. } => {
-            if matches!(info, SourceInfo::None) {
-                false
-            } else {
-                *info = new_info;
-                true
-            }
-        }
-        Syntax::Node { info, args, .. } => {
-            for arg in args.iter_mut().rev() {
-                if set_tail_info(arg, new_info) {
-                    return true;
+            Syntax::Node { info, args, .. } => {
+                if !matches!(info, SourceInfo::None) {
+                    stack.push((node, Some(*info)));
                 }
-            }
-            if matches!(info, SourceInfo::None) {
-                false
-            } else {
-                *info = new_info;
-                true
+                for arg in args {
+                    stack.push((arg, None));
+                }
             }
         }
     }
+    SourceInfo::None
 }
 
 fn get_head_info(stx: &Syntax) -> Option<SourceInfo> {
-    match stx {
-        Syntax::Missing => None,
-        Syntax::Atom { info, .. } | Syntax::Ident { info, .. } => {
-            (!matches!(info, SourceInfo::None)).then_some(*info)
-        }
-        Syntax::Node { info, args, .. } => {
-            if !matches!(info, SourceInfo::None) {
-                return Some(*info);
-            }
-            for arg in args {
-                if let Some(found) = get_head_info(arg) {
-                    return Some(found);
+    let mut stack = vec![stx];
+    while let Some(node) = stack.pop() {
+        match node {
+            Syntax::Missing => {}
+            Syntax::Atom { info, .. } | Syntax::Ident { info, .. } => {
+                if !matches!(info, SourceInfo::None) {
+                    return Some(*info);
                 }
             }
-            None
+            Syntax::Node { info, args, .. } => {
+                if !matches!(info, SourceInfo::None) {
+                    return Some(*info);
+                }
+                for arg in args.iter().rev() {
+                    stack.push(arg);
+                }
+            }
         }
     }
+    None
 }
 
 fn set_head_info(stx: &mut Syntax, new_info: SourceInfo) -> bool {
-    match stx {
-        Syntax::Missing => false,
-        Syntax::Atom { info, .. } | Syntax::Ident { info, .. } => {
-            if matches!(info, SourceInfo::None) {
-                false
-            } else {
-                *info = new_info;
-                true
-            }
-        }
-        Syntax::Node { info, args, .. } => {
-            if !matches!(info, SourceInfo::None) {
-                *info = new_info;
-                return true;
-            }
-            for arg in args {
-                if set_head_info(arg, new_info) {
+    let mut stack = vec![stx];
+    while let Some(node) = stack.pop() {
+        match node {
+            Syntax::Missing => {}
+            Syntax::Atom { info, .. } | Syntax::Ident { info, .. } => {
+                if !matches!(info, SourceInfo::None) {
+                    *info = new_info;
                     return true;
                 }
             }
-            false
+            Syntax::Node { info, args, .. } => {
+                if !matches!(info, SourceInfo::None) {
+                    *info = new_info;
+                    return true;
+                }
+                for arg in args.iter_mut().rev() {
+                    stack.push(arg);
+                }
+            }
         }
     }
+    false
 }
 
 fn set_start_of_file_leading(stx: &mut Syntax) -> bool {
@@ -4480,27 +3947,32 @@ fn set_start_of_file_leading(stx: &mut Syntax) -> bool {
     )
 }
 
-fn first_pos_of(stx: &Syntax) -> Option<usize> {
-    get_head_info(stx).and_then(|info| info.pos(false).map(|p| p.0))
+pub(crate) fn syntax_token_span(stx: &Syntax) -> Option<ByteSpan> {
+    let start = get_head_info(stx).and_then(|info| info.pos(false))?;
+    let end = match get_tail_info(stx) {
+        SourceInfo::Original { end_pos, .. } => end_pos,
+        _ => return None,
+    };
+    ByteSpan::new(start, end)
 }
 
-fn check_tail_ws(prev: &Syntax) -> bool {
+fn check_tail_ws(prev: &VmNode) -> bool {
     matches!(
-        get_tail_info(prev),
+        get_tail_info_vm(prev),
         SourceInfo::Original { trailing, .. } if trailing.end().0 > trailing.start().0
     )
 }
 
-fn check_tail_no_ws(prev: &Syntax) -> bool {
+fn check_tail_no_ws(prev: &VmNode) -> bool {
     matches!(
-        get_tail_info(prev),
+        get_tail_info_vm(prev),
         SourceInfo::Original { trailing, .. } if trailing.end().0 == trailing.start().0
     )
 }
 
-fn check_tail_linebreak(source: &SourceText, prev: &Syntax) -> bool {
+fn check_tail_linebreak(source: &SourceText, prev: &VmNode) -> bool {
     matches!(
-        get_tail_info(prev),
+        get_tail_info_vm(prev),
         SourceInfo::Original { trailing, .. }
             if source.span_str(trailing).is_some_and(|s| s.contains('\n'))
     )

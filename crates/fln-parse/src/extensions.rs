@@ -777,6 +777,16 @@ pub struct ActiveGrammar {
             >,
         >,
     >,
+    /// Full command declarations for the unified registry engine when
+    /// `own_syntax_only()` omits Init notations from `decls`.
+    command_decls: Option<Vec<Arc<SyntaxDecl>>>,
+    /// Category behaviors for `generated_interpreter` (includes Init categories
+    /// under `own_syntax_only()`).
+    command_category_behaviors: BTreeMap<Name, IdentBehavior>,
+    /// Categories eligible for synthesized `<cat>.quot` parsers when
+    /// `own_syntax_only()` is active (excludes artifact-only categories without
+    /// an explicit quotation parser row).
+    command_quot_categories: Option<BTreeSet<Name>>,
     category_behaviors: BTreeMap<Name, IdentBehavior>,
     table: TokenTable,
     /// Scoped artifact command heads are recognized only while slicing a file,
@@ -847,6 +857,9 @@ impl ActiveGrammar {
         crate::builtin_interpreter::CompileError,
     > {
         let census = extension_census();
+        let decls = self.command_decls.as_deref().unwrap_or(&self.decls);
+        let behaviors = &self.command_category_behaviors;
+        let quot_cats = self.command_quot_categories.as_ref();
         if std::ptr::eq(
             base,
             crate::builtin_interpreter::reference_builtin_interpreter(),
@@ -854,24 +867,136 @@ impl ActiveGrammar {
             let mut cache = self.generated.borrow_mut();
             return cache
                 .get_or_insert_with(|| {
-                    base.with_active_descriptions(
-                        &self.table,
-                        &self.decls,
-                        &self.category_behaviors,
-                        &census.alias_declarations,
-                    )
-                    .map(Rc::new)
+                    let (prefix_ptrs, prefix_interp) = default_own_syntax_init_base();
+                    if decls.len() >= prefix_ptrs.len()
+                        && decls[..prefix_ptrs.len()]
+                            .iter()
+                            .zip(prefix_ptrs.iter())
+                            .all(|(d, &ptr)| Arc::as_ptr(d) as usize == ptr)
+                    {
+                        prefix_interp
+                            .with_active_descriptions(
+                                &self.table,
+                                &decls[prefix_ptrs.len()..],
+                                behaviors,
+                                &census.alias_declarations,
+                                quot_cats,
+                            )
+                            .map(Rc::new)
+                    } else {
+                        base.with_active_descriptions(
+                            &self.table,
+                            decls,
+                            behaviors,
+                            &census.alias_declarations,
+                            quot_cats,
+                        )
+                        .map(Rc::new)
+                    }
                 })
                 .clone();
         }
         base.with_active_descriptions(
             &self.table,
-            &self.decls,
-            &self.category_behaviors,
+            decls,
+            behaviors,
             &census.alias_declarations,
+            quot_cats,
         )
         .map(Rc::new)
     }
+}
+
+/// Cached `Init` (`own_syntax_only`) base interpreter + exact `Arc<SyntaxDecl>`
+/// pointer prefix so per-file grammars (`FileGrammar::declare`, `import_artifact`,
+/// etc.) only compile and index their delta declarations instead of rebuilding
+/// all ~600 `Init` census declarations on every mutation.
+fn default_own_syntax_init_base() -> (
+    &'static [usize],
+    &'static crate::builtin_interpreter::BuiltinInterpreter,
+) {
+    static BASE: OnceLock<(Vec<usize>, crate::builtin_interpreter::BuiltinInterpreter)> =
+        OnceLock::new();
+    let (ptrs, interp) = BASE.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("fln-default-own-init-base".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let fg = FileGrammar::new(false, &[], None)
+                    .expect("invariant: the grammar census describes Init")
+                    .own_syntax_only();
+                let grammar = fg.grammar();
+                let decls = grammar.command_decls.as_deref().unwrap_or(&grammar.decls);
+                let ptrs: Vec<usize> = decls.iter().map(|d| Arc::as_ptr(d) as usize).collect();
+                let census = extension_census();
+                let interp = crate::builtin_interpreter::reference_builtin_interpreter()
+                    .with_active_descriptions(
+                        &grammar.table,
+                        decls,
+                        &grammar.command_category_behaviors,
+                        &census.alias_declarations,
+                        grammar.command_quot_categories.as_ref(),
+                    )
+                    .expect("invariant: default own-syntax Init base compiles");
+                (ptrs, interp)
+            })
+            .expect("spawn default own-syntax Init base thread")
+            .join()
+            .expect("default own-syntax Init base thread panicked")
+    });
+    (ptrs.as_slice(), interp)
+}
+
+/// Cached implicit-`Init` unified registry interpreter for standalone command
+/// parses when no [`with_grammar`] scope is active.
+pub(crate) fn default_init_interpreter() -> &'static crate::builtin_interpreter::BuiltinInterpreter
+{
+    static DEFAULT: OnceLock<crate::builtin_interpreter::BuiltinInterpreter> = OnceLock::new();
+    DEFAULT.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("fln-default-init-grammar".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let fg = FileGrammar::new(false, &[], None)
+                    .expect("invariant: the grammar census describes Init");
+                let grammar = fg.grammar();
+                let census = extension_census();
+                crate::builtin_interpreter::reference_builtin_interpreter()
+                    .with_active_descriptions(
+                        &grammar.table,
+                        grammar.command_decls.as_deref().unwrap_or(&grammar.decls),
+                        &grammar.command_category_behaviors,
+                        &census.alias_declarations,
+                        grammar.command_quot_categories.as_ref(),
+                    )
+                    .expect("invariant: default Init registry interpreter compiles")
+            })
+            .expect("spawn default Init interpreter init thread")
+            .join()
+            .expect("default Init interpreter init thread panicked")
+    })
+}
+
+/// Parse one complete top-level command through the active unified registry
+/// interpreter (`with_grammar` if active, otherwise implicit `Init`).
+pub(crate) fn parse_active_command(
+    view: &SourceView,
+) -> Result<(Syntax, ByteSpan), crate::NatDefinitionParseError> {
+    let max_steps = generated::remaining_steps();
+    let result = if let Some(grammar) = active() {
+        let interp = grammar
+            .generated_interpreter(crate::builtin_interpreter::reference_builtin_interpreter())
+            .map_err(|error| crate::NatDefinitionParseError::GeneratedParser {
+                at: view.to_original(BytePos(0)),
+                error: crate::builtin_interpreter::ParserFailure::Description(error),
+            })?;
+        interp.parse_single_command(view, grammar.docs, max_steps)
+    } else {
+        default_init_interpreter().parse_single_command(view, DocOptions::default(), max_steps)
+    };
+    let (syntax, epilogue, steps) = result?;
+    generated::charge_steps(steps);
+    Ok((syntax, epilogue))
 }
 
 /// The options that change how a doc comment parses (`Lean.Doc.Parser.ifVerso`,
@@ -1103,13 +1228,17 @@ impl ActiveGrammar {
                     .push(index);
             }
         }
+        let behaviors: BTreeMap<Name, IdentBehavior> = extension_census()
+            .categories
+            .iter()
+            .map(|(name, (behavior, _))| (name.clone(), *behavior))
+            .collect();
         ActiveGrammar {
             generated: RefCell::new(None),
-            category_behaviors: extension_census()
-                .categories
-                .iter()
-                .map(|(name, (behavior, _))| (name.clone(), *behavior))
-                .collect(),
+            command_decls: None,
+            command_category_behaviors: behaviors.clone(),
+            command_quot_categories: None,
+            category_behaviors: behaviors,
             category_decls,
             table: TokenTable::from_tokens(tokens),
             partition_table: None,
@@ -1844,6 +1973,7 @@ impl FileGrammar {
                 .cloned()
                 .collect()
         };
+        let non_imported_start = decls.len();
         decls.extend(self.native_imported.iter().cloned());
         decls.extend(self.artifact.imported.iter().cloned());
         let own =
@@ -1942,6 +2072,56 @@ impl FileGrammar {
             })
             .map(|(name, behavior)| (name.clone(), *behavior))
             .collect();
+        if !self.imports_entered {
+            let mut suffix_counts: BTreeMap<String, usize> = BTreeMap::new();
+            for cat_name in self.categories.keys() {
+                if let LeafView::Str(suffix) = cat_name.leaf_view() {
+                    *suffix_counts.entry(suffix.to_owned()).or_default() += 1;
+                }
+            }
+            let is_ambiguous_suffix = |cat_name: &Name| -> bool {
+                matches!(cat_name.leaf_view(), LeafView::Str(suffix) if suffix_counts.get(suffix).copied().unwrap_or(0) > 1)
+            };
+            let empty_braces = Name::str(Name::anonymous(), "term{}");
+            let set_braces = Name::str(Name::anonymous(), "term{_}");
+            let interp_s = Name::from_components(["termS!_"]);
+            let mut cmd_decls: Vec<Arc<SyntaxDecl>> = self
+                .imported
+                .iter()
+                .filter(|decl| {
+                    decl.decl != empty_braces
+                        && decl.decl != set_braces
+                        && (decl.decl != interp_s || self.interpolation_kinds.contains(&decl.decl))
+                })
+                .cloned()
+                .collect();
+            cmd_decls.extend(
+                grammar.decls[non_imported_start..]
+                    .iter()
+                    .filter(|decl| {
+                        self.artifact
+                            .quotations
+                            .get(&decl.decl)
+                            .is_none_or(|cat| !is_ambiguous_suffix(cat))
+                    })
+                    .cloned(),
+            );
+            grammar.command_decls = Some(cmd_decls);
+            grammar.command_category_behaviors = self.categories.clone();
+            let quot_cats: BTreeSet<Name> = self
+                .categories
+                .keys()
+                .filter(|name| {
+                    !is_ambiguous_suffix(name)
+                        && (!self.artifact.categories.contains(*name)
+                            || grammar.source_quotation_categories.contains(*name))
+                })
+                .cloned()
+                .collect();
+            grammar.command_quot_categories = Some(quot_cats);
+        } else {
+            grammar.command_category_behaviors = grammar.category_behaviors.clone();
+        }
         grammar.imports_entered = self.imports_entered;
         grammar.closure_kinds = Some(Arc::clone(&self.closure_kinds));
         grammar.expander = Some(self.expander_for(&key.0));
@@ -4322,50 +4502,6 @@ pub(crate) fn attribute_syntax(head: &str) -> Option<bool> {
 pub(crate) fn is_partition_command_keyword(symbol: &str) -> bool {
     active().is_some_and(|grammar| {
         grammar.commands.contains_key(symbol) || grammar.partition_commands.contains(symbol)
-    })
-}
-
-/// The command in the complete range read by the unique highest-priority active
-/// command declaration its first token names.
-pub(crate) fn command(
-    leaves: &Leaves,
-    view: &SourceView,
-    tokens: &[LexedToken],
-    range: Range<usize>,
-) -> Option<Syntax> {
-    categories::bounded(|| {
-        let grammar = active()?;
-        let head = token_text(tokens.get(range.start)?)?;
-        let run = Run {
-            leaves,
-            view,
-            tokens,
-        };
-        let candidates = grammar.commands.get(head.as_str())?;
-        if let Some(result) = generated::candidates(&run, candidates, range.start, range.end, 0) {
-            let (mut items, next) = result?;
-            return (next == range.end && items.len() == 1)
-                .then(|| items.pop())
-                .flatten();
-        }
-        let mut parsed = UniquePriorityParse::default();
-        for &index in candidates {
-            if !categories::tick() {
-                return None;
-            }
-            if let Some((items, end)) = run.parse(
-                &grammar.decls[index].descr,
-                range.start,
-                range.end,
-                &Follow::End,
-                0,
-            ) && end == range.end
-                && let [syntax] = items.as_slice()
-            {
-                parsed.consider(syntax, grammar.decls[index].priority);
-            }
-        }
-        parsed.finish()
     })
 }
 

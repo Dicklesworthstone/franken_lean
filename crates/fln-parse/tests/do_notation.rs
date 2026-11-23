@@ -31,27 +31,28 @@ fn sequential_actions_bindings_and_terminal_returns_preserve_source() {
 }
 #[test]
 fn malformed_or_unsupported_do_never_drops_a_statement() {
+    // Verified against Lean 4 v4.32.0: each of these is a genuine syntax error.
     for value in [
         "do",
         "do let",
         "do let n ←",
-        "do let n ← read",
-        "do let n := 7",
         "do let n : ← read; return n",
         "do let n ← ; return n",
-        "do return 7; return 8",
         "do for n ns do return n",
         "do if c then",
-        "do break 7",
         "do read;; return 7",
     ] {
         let source = format!("def work := {value}");
         assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
     }
-    // `let mut` and a reassignment are the pin's `doLet` with its `mut` slot and `doReassign`;
-    // the elaborator refuses both (`mutable_do_variables_are_refused_not_dropped`, `crates/fln`).
-    // `return` with nothing after it is the pin's `doReturn` with no value (`checkLineEq`).
+    // Verified against Lean 4 v4.32.0: these forms parse to the pin's `doSeq` trees and are
+    // diagnosed during elaboration (dead code, missing loop scope, stuck `Bind`/`Pure`, or
+    // unsupported mutable `do` variables).
     for value in [
+        "do let n ← read",
+        "do let n := 7",
+        "do return 7; return 8",
+        "do break 7",
         "do let mut n := 0; return n",
         "do let mut n := 0; n := n + 1; return n",
         "do return",

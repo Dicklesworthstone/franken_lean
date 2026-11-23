@@ -553,13 +553,15 @@ fn imported_category_quotations_preserve_the_generated_envelope_and_capture_kind
         "def q := `(artifactItem| 42 43)",
         "def q := `(artifactItem| $x:str)",
         "def q := `(artifactItem| $x:missing)",
-        "def q := `(artifactItem| $(f $outside))",
         "def q := `(artifactItem| $(f `(artifactItem| 42))",
         "def q := `(unregisteredCategory| 42)",
-        "def q := $x:artifactItem",
     ] {
         assert!(parse(&file, source).is_err(), "accepted {source}");
     }
+    // Lean 4's parser accepts antiquotations at any quotDepth (elaboration rejects stray ones).
+    let outer_antiquot = parse(&file, "def q := `(artifactItem| $(f $outside))").unwrap();
+    assert!(contains(&outer_antiquot, "term.pseudo.antiquot"));
+    assert!(parse(&file, "def q := $x:artifactItem").is_err());
     assert!(parse(&file, "def recovered := `(artifactItem| 7)").is_ok());
     assert!(file.export_native().unwrap().is_empty());
 }

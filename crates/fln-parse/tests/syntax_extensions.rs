@@ -163,12 +163,22 @@ fn complete_extension_readings_refuse_tied_highest_priorities() {
         ] {
             let ordered = order.map(|index| declarations[index].as_str());
             let grammar = grammar_after(&[], &ordered);
+            let parsed = with_grammar(&grammar.grammar(), || {
+                parse_source_command(source.as_bytes())
+            })
+            .unwrap_or_else(|e| panic!("{category}: {order:?}: {e:?}"));
+            let found = kinds(parsed.syntax());
             assert!(
-                with_grammar(&grammar.grammar(), || parse_source_command(
-                    source.as_bytes()
-                ))
-                .is_err(),
-                "{category}: {order:?}: tied winners require a choice node"
+                found.contains(&name("choice")),
+                "{category}: {order:?}: tied winners must produce a choice node: {found:?}"
+            );
+            assert!(
+                found.contains(&name("firstHigh")) && found.contains(&name("secondHigh")),
+                "{category}: {order:?}: choice must preserve both tied winners: {found:?}"
+            );
+            assert!(
+                !found.contains(&name("fallback")),
+                "{category}: {order:?}: lower-priority fallback must not enter choice: {found:?}"
             );
         }
     }
@@ -654,8 +664,17 @@ fn interpolated_strings_are_chunks_around_terms() {
             .count(),
         1
     );
-    // Without a grammar the string is one literal and `s!` is not read.
-    assert!(parse_source_command("def g : String := s!\"a{1}\"".as_bytes()).is_err());
+    // Under default implicit-Init, `s!` parses cleanly; under `prelude` (without Init) it refuses.
+    let implicit = parse_source_command("def g : String := s!\"a{1}\"".as_bytes())
+        .expect("implicit Init parses s!");
+    assert!(kinds(implicit.syntax()).contains(&name("termS!_")));
+    let prelude = FileGrammar::new(true, &[], None).expect("prelude");
+    assert!(
+        with_grammar(&prelude.grammar(), || parse_source_command(
+            "def g : String := s!\"a{1}\"".as_bytes()
+        ))
+        .is_err()
+    );
 }
 
 #[test]
@@ -943,9 +962,16 @@ fn empty_and_abbreviated_braces_are_the_pins_choice_with_init_notation() {
             "{source}"
         );
     }
-    // Without the notation (no grammar entered) there is no second reading.
-    let plain = parse_source_command("def e : Nat := f {}".as_bytes()).expect("parses");
-    assert!(!kinds(plain.syntax()).contains(&name("choice")));
+    // Under implicit Init, `{}` builds the same `choice` node; under `prelude` or
+    // `own_syntax_only` there is no second reading.
+    let implicit = parse_source_command("def e : Nat := f {}".as_bytes()).expect("parses");
+    assert!(kinds(implicit.syntax()).contains(&name("choice")));
+    let prelude = FileGrammar::new(true, &[], None).expect("prelude");
+    let no_init = with_grammar(&prelude.grammar(), || {
+        parse_source_command("def e : Nat := f {}".as_bytes())
+    })
+    .expect("parses");
+    assert!(!kinds(no_init.syntax()).contains(&name("choice")));
 }
 
 /// An attribute the census declares by `syntax … : attr` is read by that declaration where the
@@ -980,7 +1006,7 @@ fn a_census_attribute_is_read_by_its_declaration_only_where_imported() {
     let own = FileGrammar::new(true, &[], Some(name("Test.Extensions")))
         .expect("prelude")
         .own_syntax_only();
-    assert!(kinds(parse(&own, simp).syntax()).contains(&name("Lean.Parser.Attr.simp")));
+    assert!(kinds(parse(&own, simp).syntax()).contains(&name("Lean.Parser.Attr.simple")));
     let plain = parse_source_command(simp.as_bytes()).expect("parses");
     assert!(kinds(plain.syntax()).contains(&name("Lean.Parser.Attr.simp")));
 }

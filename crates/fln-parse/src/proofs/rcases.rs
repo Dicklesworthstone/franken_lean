@@ -533,10 +533,22 @@ mod tests {
 
     #[test]
     fn explicit_prefix_nesting_is_bounded() {
-        let prefixes = "@".repeat(PATTERN_NESTING + 1);
+        // Heap-stack VM parses moderate `@` prefix chains cleanly while stopping past `DEFAULT_MAX_DEPTH`.
+        let moderate = "@".repeat(PATTERN_NESTING + 1);
         for tactic in ["rcases h with", "rintro", "obtain"] {
-            let source = format!("theorem f : True := by {tactic} {prefixes}⟨n, h⟩");
-            assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
+            let source = format!("theorem f : True := by {tactic} {moderate}⟨n, h⟩");
+            assert!(parse_source_command(source.as_bytes()).is_ok(), "{source}");
         }
+        let deep = "@".repeat(crate::builtin_interpreter::DEFAULT_MAX_DEPTH + 2);
+        let source = format!("theorem f : True := by rcases h with {deep}⟨n, h⟩");
+        assert!(matches!(
+            parse_source_command(source.as_bytes()),
+            Err(crate::NatDefinitionParseError::GeneratedParser {
+                error: crate::builtin_interpreter::ParserFailure::Resource(
+                    crate::builtin_interpreter::ParserResourceLimit::Depth
+                ),
+                ..
+            })
+        ));
     }
 }

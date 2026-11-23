@@ -141,19 +141,28 @@ fn command_operands_require_one_complete_command_at_zero_precedence() {
 #[test]
 fn command_reentry_exhaustion_refuses_the_whole_choice_and_resets_between_commands() {
     let file = grammar();
+    let depth = crate::builtin_interpreter::DEFAULT_MAX_DEPTH + 2;
     let nested = format!(
         "{}def deepest : Nat := 1{}",
-        "declare% [".repeat(MAX_DESCR_DEPTH + 1),
-        "]".repeat(MAX_DESCR_DEPTH + 1),
+        "declare% [".repeat(depth),
+        "]".repeat(depth),
     );
-    assert!(parse(&file, &nested).is_err());
+    assert!(matches!(
+        parse(&file, &nested),
+        Err(crate::NatDefinitionParseError::GeneratedParser {
+            error: crate::builtin_interpreter::ParserFailure::Resource(
+                crate::builtin_interpreter::ParserResourceLimit::Depth
+            ),
+            ..
+        })
+    ));
     assert!(parse(&file, "declare% [def next : Nat := 2]").is_ok());
 
     // Native source grammars can have several candidates for one head. The
     // second candidate would succeed if the first exhausted its allowance in
     // isolation. Keep the refusal shared across the complete candidate loop.
-    let mut padding = Descr::Const(name("ppSpace"));
-    for _ in 0..12 {
+    let mut padding = Descr::parse(r#"(unary "optional" (symbol "pad"))"#).unwrap();
+    for _ in 0..5 {
         padding = sequence(padding.clone(), padding);
     }
     let mut file = FileGrammar::new(false, &[], None)
@@ -171,7 +180,16 @@ fn command_reentry_exhaustion_refuses_the_whole_choice_and_resets_between_comman
         ..NativeSyntaxModule::default()
     })
     .unwrap();
-    assert!(parse(&file, "budget%").is_err());
+    let exhausted = crate::extensions::generated::with_step_budget(100, || parse(&file, "budget%"));
+    assert!(matches!(
+        exhausted,
+        Err(crate::NatDefinitionParseError::GeneratedParser {
+            error: crate::builtin_interpreter::ParserFailure::Resource(
+                crate::builtin_interpreter::ParserResourceLimit::Steps
+            ),
+            ..
+        })
+    ));
     assert!(parse(&file, "fresh%").is_ok());
 
     let mut fallback = FileGrammar::new(false, &[], None)

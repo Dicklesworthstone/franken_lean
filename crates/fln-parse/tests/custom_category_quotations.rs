@@ -153,11 +153,17 @@ fn category_quotations_preserve_term_argument_bounds_and_nested_capture_depth() 
     }
     for source in [
         "def q := consumeQuote `(item| 42 endQuote)",
-        "def q := `(item| $(f $outside))",
         "def q := `(item| 42 43)",
         "def q := `(item| $(f `(item| 42))",
     ] {
         assert!(parse(&grammar, source).is_err(), "accepted {source}");
     }
+    // Verified against Lean 4 v4.32.0 (`dump_command_syntax.lean`): `withAntiquotFn` parses
+    // `$outside` inside `$(...)` as `term.pseudo.antiquot`; elaboration rejects stray antiquots.
+    let nested_stray = parse(&grammar, "def q := `(item| $(f $outside))").unwrap();
+    assert_eq!(
+        node(&nested_stray, &["term", "pseudo", "antiquot"]).len(),
+        4
+    );
     assert!(parse(&grammar, "def recovered := `(item| 7)").is_ok());
 }

@@ -63,24 +63,31 @@ fn malformed_membership_headers_never_fall_back_to_ordinary_for() {
     for header in [
         "h : : x in xs",
         "_ : x in xs",
-        "A.h : x in xs",
-        "h : A.x in xs",
         "h : in xs",
-        "h : (x, y) in xs",
         "h : x xs",
         "h : x in",
     ] {
         let source = format!("def run : Nat := do {{ for {header} do {{ visit }}; return 7 }}");
         assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
     }
+    // Verified against Lean 4 v4.32.0: `doForDecl` parses `ident : term in term`.
+    for header in ["A.h : x in xs", "h : A.x in xs", "h : (x, y) in xs"] {
+        let source = format!("def run : Nat := do {{ for {header} do {{ visit }}; return 7 }}");
+        assert!(parse_definition(source.as_bytes()).is_ok(), "{source}");
+    }
 }
 
 #[test]
 fn missing_dependent_loop_body_reports_original_crlf_position() {
-    let source = "def run : Nat := do\r\n  for h : x in xs do\r\n  return 7";
-    let error = parse_definition(source.as_bytes()).unwrap_err();
+    // Verified against Lean 4 v4.32.0: `doSeqIndent` anchors at its first token, so
+    // `for h : x in xs do\n  return 7` parses as the loop body, while an empty body before `}`
+    // refuses at the exact original CRLF byte offset.
+    let same_col = "def run : Nat := do\r\n  for h : x in xs do\r\n  return 7";
+    assert!(parse_definition(same_col.as_bytes()).is_ok());
+    let missing = "def run : Nat := do\r\n  for h : x in xs do\r\n  }";
+    let error = parse_definition(missing.as_bytes()).unwrap_err();
     assert_eq!(
         error.primary_offset(),
-        Some(BytePos(source.find("return").unwrap()))
+        Some(BytePos(missing.find('}').unwrap()))
     );
 }

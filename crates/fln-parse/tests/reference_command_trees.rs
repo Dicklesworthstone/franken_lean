@@ -6112,7 +6112,7 @@ fn refusals_agree(rows: &[Refused]) {
             row.source
         );
         match parse_definition(row.source.as_bytes()) {
-            Err(NatDefinitionParseError::OutsideSeedGrammar { at, .. }) => {
+            Err(NatDefinitionParseError::GeneratedParser { at, .. }) => {
                 assert_eq!(at, BytePos(row.at), "{}", row.source);
             }
             other => panic!(

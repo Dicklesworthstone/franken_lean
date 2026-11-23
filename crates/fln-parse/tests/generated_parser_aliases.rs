@@ -180,8 +180,13 @@ fn builtin_aliases_can_enter_user_categories_and_keep_recovered_errors() {
 
 #[test]
 fn deep_generated_operand_reports_a_typed_resource_stop() {
+    let depth = fln_parse::builtin_interpreter::DEFAULT_MAX_DEPTH + 2;
     let file = grammar(&["syntax (name := signature) \"signature \" declSig \" done\" : command"]);
-    let source = format!("signature : {}Nat{} done", "(".repeat(300), ")".repeat(300));
+    let source = format!(
+        "signature : {}Nat{} done",
+        "(".repeat(depth),
+        ")".repeat(depth)
+    );
     assert!(matches!(
         parse(&file, &source),
         Err(DefinitionParseError::GeneratedParser {
@@ -202,8 +207,8 @@ fn deep_generated_operand_reports_a_typed_resource_stop() {
     ]);
     let source = format!(
         "def bounded : Nat := (boundedLambda (x : {}Nat{}) => x) 42",
-        "(".repeat(300),
-        ")".repeat(300)
+        "(".repeat(depth),
+        ")".repeat(depth)
     );
     assert!(matches!(
         parse(&file, &source),
@@ -224,15 +229,15 @@ fn deep_generated_operand_reports_a_typed_resource_stop() {
 }
 
 #[test]
-fn quotations_without_an_active_file_grammar_keep_the_existing_parser_path() {
+fn quotations_without_an_active_file_grammar_produce_the_pinned_tree() {
+    // Verified against Lean 4 v4.32.0: `` `(do $body) `` produces `Term.doSeq.pseudo.antiquot`.
     let source = b"def quoted := `(do $body)";
     let parsed = parse_definition(source).unwrap();
     assert_eq!(parsed.reconstruct_original(), source);
     assert_eq!(
-        nodes(parsed.syntax(), "Lean.Parser.Term.doSeqIndent").len(),
+        nodes(parsed.syntax(), "Lean.Parser.Term.doSeq.pseudo.antiquot").len(),
         1
     );
-    assert_eq!(nodes(parsed.syntax(), "term.pseudo.antiquot").len(), 1);
 }
 
 #[test]

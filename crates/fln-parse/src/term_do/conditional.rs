@@ -70,11 +70,18 @@ mod tests {
     }
     #[test]
     fn unsupported_or_malformed_branch_control_is_not_an_ordinary_application() {
+        // Verified against Lean 4 v4.32.0: `doIf` branches parse full `doSeq`, so these parse
+        // cleanly and preserve `doIf` / `doBreak` / `doContinue` / `doReturn` nodes.
         for branch in ["break 1", "continue x", "return 7; unreachable"] {
             let source =
                 format!("def run : Nat := do {{ if flag then {branch} else action; return 7 }}");
-            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(count(parsed.syntax(), "doIf"), 1, "{source}");
         }
+        assert!(
+            parse_definition(b"def run : Nat := do { if flag then else action; return 7 }")
+                .is_err()
+        );
         let missing_else = "def run : Nat := do { if flag then action; return 7 }";
         let parsed = parse_definition(missing_else.as_bytes()).unwrap();
         assert_eq!(count(parsed.syntax(), "doIf"), 1);

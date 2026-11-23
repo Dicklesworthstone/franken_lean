@@ -2312,11 +2312,10 @@ def after : Nat := 3
         ] {
             assert!(partition(bad.as_bytes()).is_err(), "{bad}");
         }
-        // A command the pin lets a doc lead and this grammar does not parse (`elab`: the pin
-        // parses it, 2026-10-09) keeps its doc: the file partitions, and that one command is
-        // refused where it is parsed.
-        let unparsed = "/-- d -/\nelab \"x\" : term => return default\ndef y : Nat := 1\n";
-        let commands = partition(unparsed.as_bytes()).unwrap();
+        // A command the pin lets a doc lead (`elab`, verified against v4.32.0) keeps its doc
+        // through partitioning and parses into `Lean.Parser.Command.elab`.
+        let elab_cmd = "/-- d -/\nelab \"x\" : term => return default\ndef y : Nat := 1\n";
+        let commands = partition(elab_cmd.as_bytes()).unwrap();
         assert_eq!(commands.len(), 2, "{commands:?}");
         assert!(
             std::str::from_utf8(commands[0].1)
@@ -2327,7 +2326,9 @@ def after : Nat := 3
             parse(commands[0].1),
             Ok(Some(ScopeCommand::Trivia))
         ));
-        assert!(crate::parse_source_command(commands[0].1).is_err());
+        let parsed_elab = crate::parse_source_command(commands[0].1)
+            .expect("the unified registry parser reads `elab` with its doc comment");
+        assert_eq!(parsed_elab.reconstruct_original(), commands[0].1);
         // A syntax declaration is parsed with its doc (`Command.syntax`), and so is a macro
         // (`Command.macro`).
         assert!(crate::parse_source_command(b"/-- d -/\nscoped syntax \"x\" : term").is_ok());
@@ -2365,20 +2366,30 @@ def after : Nat := 3
 
     #[test]
     fn a_token_the_table_lacks_refuses_its_own_command_and_no_other() {
-        // `#'` is BitVec's scoped notation and `✓` no table's: each command holding one is kept
-        // whole and refused where it is parsed; the commands around it partition as before.
-        for bad in ["theorem t : x#'lt = 1 := rfl", "def ok : Nat := ✓"] {
+        // `#'` is BitVec's scoped notation (so `#` lexes under Init and refuses syntactically,
+        // matching v4.32.0 `unexpected token '#'`) while `✓` is in no table (lexical refusal).
+        // Each command holding one is kept whole and refused where it is parsed; surrounding
+        // commands partition and parse cleanly.
+        for (bad, expect_lexical) in [
+            ("theorem t : x#'lt = 1 := rfl", false),
+            ("def ok : Nat := ✓", true),
+        ] {
             let source = format!("def a : Nat := 1\n{bad}\ndef b : Nat := 2\n");
             let commands = partition(source.as_bytes()).unwrap();
             assert_eq!(commands.len(), 3, "{source}");
             assert_eq!(commands[1].1, format!("{bad}\n").as_bytes(), "{source}");
-            assert!(
-                matches!(
-                    crate::parse_source_command(commands[1].1),
-                    Err(NatDefinitionParseError::Lexical { .. })
-                ),
-                "{source}"
-            );
+            let err = crate::parse_source_command(commands[1].1).expect_err(&source);
+            if expect_lexical {
+                assert!(
+                    matches!(err, NatDefinitionParseError::Lexical { .. }),
+                    "{source}: {err:?}"
+                );
+            } else {
+                assert!(
+                    matches!(err, NatDefinitionParseError::GeneratedParser { .. }),
+                    "{source}: {err:?}"
+                );
+            }
             assert!(
                 crate::parse_source_command(commands[2].1).is_ok(),
                 "{source}"

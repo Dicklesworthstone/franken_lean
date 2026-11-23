@@ -152,12 +152,16 @@ fn imported_abbreviation_quotations_capture_the_node_or_the_longer_body() {
         "def q := `(boxed! $x:missing)",
         "def q := `(boxed! $x:)",
         "def q := `(boxed! $ x)",
-        "def q := `(boxed! $(f $outside):number)",
         "def q := `(boxed! $x:number*)",
-        "def q := boxed! $x:number",
     ] {
         assert!(parse(&file, input).is_err(), "accepted {input}");
     }
+    // Lean 4's parser (`withAntiquotFn`) does not gate `$x` on `quotDepth > 0`; elaboration
+    // rejects stray antiquotation nodes.
+    let spliced = parse(&file, "def q := `(boxed! $(f $outside):number)").unwrap();
+    assert!(contains(&spliced, "term.pseudo.antiquot"));
+    let outside = parse(&file, "def q := boxed! $x:number").unwrap();
+    assert!(contains(&outside, "Library.number.antiquot"));
     assert!(parse(&file, "def recovered := boxed! 7").is_ok());
 }
 

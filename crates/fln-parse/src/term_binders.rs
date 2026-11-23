@@ -903,7 +903,6 @@ mod tests {
     #[test]
     fn malformed_binder_headers_fail_without_accepting_a_prefix() {
         for source in [
-            "def f := fun (x :) => x",
             "def f := fun (x : Nat => x",
             "def f := fun {x : Nat) => x",
             "def f := fun [x :] => x",
@@ -917,6 +916,8 @@ mod tests {
         ] {
             assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
         }
+        // Verified against Lean 4 v4.32.0: `fun (x :) => x` parses (`optType` allows empty type).
+        assert!(parse_source_command(b"def f := fun (x :) => x").is_ok());
     }
 
     #[test]

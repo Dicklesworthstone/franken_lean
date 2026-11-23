@@ -256,18 +256,13 @@ fn the_header_and_the_body_use_the_pins_two_tables() {
 
 #[test]
 fn production_lexes_the_tokens_the_hand_table_refused() {
-    // Before: `lexical analysis reported N diagnostic(s)` at the token. Now the bytes lex, and
-    // what remains is the grammar's own typed refusal at that same token, which says nothing
-    // about validity. Each such parser is added only with the pin's own tree for it
-    // (`tests/reference_command_trees.rs`, franken_lean-z8j.1.10); `s!` comes next.
-    let (source, token) = ("def p : String := s!\"x\"", "s!");
-    let at = BytePos(source.find(token).expect("the token is in the source"));
-    assert!(
-        matches!(
-            parse_source_command(source.as_bytes()),
-            Err(NatDefinitionParseError::OutsideSeedGrammar { at: refused, .. }) if refused == at
-        ),
-        "{source}: the grammar, not the lexer, refuses at {token}"
+    // Every token the retired hand table refused now both lexes and parses through the
+    // unified builtin+Init registry engine, including interpolated strings `s!"..."`.
+    let parsed_interp = parse_source_command("def p : String := s!\"x\"".as_bytes())
+        .expect("`s!` parses under the unified implicit-Init registry");
+    assert_eq!(
+        parsed_interp.reconstruct_original(),
+        "def p : String := s!\"x\"".as_bytes()
     );
     // `≤` was the second: the relation parsers (`«term_≤_»`) now take it, with the pin's tree
     // in `RELATIONS_AND_EXISTENTIALS` (`omega` parses too, and the elaborator refuses it).
@@ -384,7 +379,7 @@ fn keyword_refusals_agree_with_the_pinned_reference() {
                 .find(token)
                 .expect("token after the column");
         match parse_definition(source.as_bytes()) {
-            Err(NatDefinitionParseError::OutsideSeedGrammar { at: refused, .. }) => {
+            Err(NatDefinitionParseError::GeneratedParser { at: refused, .. }) => {
                 assert_eq!(
                     refused,
                     BytePos(at),
@@ -394,7 +389,29 @@ fn keyword_refusals_agree_with_the_pinned_reference() {
             other => panic!("{source}: the Reference refuses ({reference}), got {other:?}"),
         }
         // Escaped, the same word is an identifier and the Reference accepts the program.
-        let escaped = source.replace(token, &format!("«{token}»"));
+        // Replace whole-word occurrences only (e.g., do not corrupt `Nat` into `N«at»`, which
+        // the Reference itself refuses with `unexpected identifier` due to missing whitespace).
+        let mut escaped = String::with_capacity(source.len() + 8);
+        let bytes = source.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let before_ok =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let end = i + token.len();
+            let after_ok = end == bytes.len()
+                || (end < bytes.len()
+                    && !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_'));
+            if before_ok && source[i..].starts_with(token) && after_ok {
+                escaped.push('«');
+                escaped.push_str(token);
+                escaped.push('»');
+                i = end;
+            } else {
+                let ch = source[i..].chars().next().unwrap();
+                escaped.push(ch);
+                i += ch.len_utf8();
+            }
+        }
         assert!(
             parse_definition(escaped.as_bytes()).is_ok(),
             "{escaped} must parse"

@@ -167,24 +167,31 @@ mod tests {
             "symm hx",
             "symm at * hx",
             "symm at hx, hy",
-            "rw [h] at 3",
             "rw [h] «at» hx",
-            "rw [h] at ⊢ 3",
             "rw [h] at | -",
             "rw [h] at hx, ⊢",
-            "rw [h] at (hx)",
             "rw [h] at hx, hy",
             "rw [h] at * hx",
             "rw [h] at hx *",
             "rw [h] at * ⊢",
             "rw [h] at * *",
             "simp only [h] at",
-            "simp only [h] at (hx)",
             "simp only [h] at hx, hy",
             "simp only [h] at * hx",
         ] {
             let source = format!("theorem t : True := by {tail}");
             assert!(parse_source_command(source.as_bytes()).is_err(), "{tail}");
+        }
+        // Verified against Lean 4 v4.32.0: `locationHyp` parses `colGt term`, so numeric/paren
+        // terms parse and are rejected by elaboration.
+        for tail in [
+            "rw [h] at 3",
+            "rw [h] at ⊢ 3",
+            "rw [h] at (hx)",
+            "simp only [h] at (hx)",
+        ] {
+            let source = format!("theorem t : True := by {tail}");
+            assert!(parse_source_command(source.as_bytes()).is_ok(), "{tail}");
         }
     }
 }

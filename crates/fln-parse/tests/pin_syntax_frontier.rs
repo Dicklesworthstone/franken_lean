@@ -661,6 +661,146 @@ def leaked := magicTok
     );
 }
 
+/// Mutation test (`franken_lean-z8j.1.10`): mutate a real builtin parser's precedence in the
+/// pin-extracted `BuiltinParserTable` (`Lean.Parser.Term.arrow`: RHS `termParser(25)` -> `26`,
+/// flipping `→` from right-associative to left-associative) and verify that the compiled
+/// `BuiltinInterpreter` produces a different tree that fails structural comparison against the
+/// Reference parse of `def f : A → B → C := sorry`.
+#[test]
+fn mutant_changing_builtin_arrow_precedence_fails_reference_tree_comparison() {
+    use fln_parse::builtin_interpreter::{
+        BuiltinInterpreter, DEFAULT_STEP_BUDGET, reference_builtin_interpreter,
+    };
+    use fln_parse::builtin_table::{CombinatorAst, reference_builtin_parser_table};
+    use fln_parse::extensions::DocOptions;
+    use fln_syntax::source::SourceText;
+    use fln_syntax::view::SourceView;
+
+    fn replace_term_parser_prec(ast: &mut CombinatorAst, from: u64, to: u64) -> usize {
+        match ast {
+            CombinatorAst::Call { func, args } => {
+                if func.to_display_string() == "Lean.Parser.termParser"
+                    && matches!(args.as_slice(), [CombinatorAst::LitNat(n)] if *n == from)
+                {
+                    args[0] = CombinatorAst::LitNat(to);
+                    return 1;
+                }
+                args.iter_mut()
+                    .map(|arg| replace_term_parser_prec(arg, from, to))
+                    .sum()
+            }
+            CombinatorAst::Seq(a, b)
+            | CombinatorAst::OrElse(a, b)
+            | CombinatorAst::Append(a, b)
+            | CombinatorAst::Beq(a, b)
+            | CombinatorAst::BoolOr(a, b) => {
+                replace_term_parser_prec(a, from, to) + replace_term_parser_prec(b, from, to)
+            }
+            CombinatorAst::App { func, args } => {
+                replace_term_parser_prec(func, from, to)
+                    + args
+                        .iter_mut()
+                        .map(|arg| replace_term_parser_prec(arg, from, to))
+                        .sum::<usize>()
+            }
+            CombinatorAst::Lam { body, .. } | CombinatorAst::SomeVal(body) => {
+                replace_term_parser_prec(body, from, to)
+            }
+            CombinatorAst::Let { val, body, .. } => {
+                replace_term_parser_prec(val, from, to) + replace_term_parser_prec(body, from, to)
+            }
+            CombinatorAst::Ite {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                replace_term_parser_prec(cond, from, to)
+                    + replace_term_parser_prec(then_branch, from, to)
+                    + replace_term_parser_prec(else_branch, from, to)
+            }
+            CombinatorAst::LitList(items) => items
+                .iter_mut()
+                .map(|item| replace_term_parser_prec(item, from, to))
+                .sum(),
+            CombinatorAst::NoneVal
+            | CombinatorAst::Const(_)
+            | CombinatorAst::Var { .. }
+            | CombinatorAst::LitNat(_)
+            | CombinatorAst::LitStr(_)
+            | CombinatorAst::LitName(_)
+            | CombinatorAst::LitBool(_)
+            | CombinatorAst::LitChar(_) => 0,
+        }
+    }
+
+    let source = SourceText::from_utf8(b"def f : A -> B -> C := sorry").unwrap();
+    let view = SourceView::of(&source);
+    let (real, _, _) = reference_builtin_interpreter()
+        .parse_single_command(&view, DocOptions::default(), DEFAULT_STEP_BUDGET)
+        .expect("real builtin parser parses right-associative arrows");
+
+    // Verify right-associativity of the real parse: `A -> (B -> C)`, i.e. the outer arrow's
+    // LHS is `A` (an Ident) and RHS is another `Lean.Parser.Term.arrow`.
+    let arrow_kind = Name::from_components(["Lean", "Parser", "Term", "arrow"]);
+    fn find_first_kind<'a>(stx: &'a Syntax, target: &Name) -> Option<&'a [Syntax]> {
+        let mut stack = vec![stx];
+        while let Some(node) = stack.pop() {
+            if let Syntax::Node { kind, args, .. } = node {
+                if kind == target {
+                    return Some(args.as_slice());
+                }
+                stack.extend(args.iter().rev());
+            }
+        }
+        None
+    }
+    let real_arrow_args = find_first_kind(&real, &arrow_kind).expect("real tree has Term.arrow");
+    assert!(
+        matches!(real_arrow_args.first(), Some(Syntax::Ident { val, .. }) if val.to_display_string() == "A"),
+        "unmutated Lean.Parser.Term.arrow must associate right (LHS = A)"
+    );
+    assert_eq!(
+        real_arrow_args.get(2).and_then(Syntax::kind),
+        Some(&arrow_kind),
+        "unmutated Lean.Parser.Term.arrow must associate right (RHS = B -> C)"
+    );
+
+    // Mutate `Lean.Parser.Term.arrow`: bump RHS `termParser(25)` -> `termParser(26)`.
+    let mut mutated_table = reference_builtin_parser_table().clone();
+    let entry = mutated_table
+        .generatables
+        .get_mut(&arrow_kind)
+        .expect("Lean.Parser.Term.arrow is in REFERENCE_BUILTIN_PARSER_TABLE");
+    let patched = replace_term_parser_prec(&mut entry.ast, 25, 26);
+    assert_eq!(
+        patched, 1,
+        "must mutate exactly Lean.Parser.Term.arrow's RHS termParser(25)"
+    );
+
+    let mutated_interp = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || BuiltinInterpreter::from_table(&mutated_table))
+        .expect("spawn compiler thread")
+        .join()
+        .expect("join compiler thread")
+        .expect("mutated table compiles");
+    let (mutated, _, _) = mutated_interp
+        .parse_single_command(&view, DocOptions::default(), DEFAULT_STEP_BUDGET)
+        .expect("mutated parser still parses left-associative arrows");
+
+    let mutated_arrow_args =
+        find_first_kind(&mutated, &arrow_kind).expect("mutated tree has Term.arrow");
+    assert_eq!(
+        mutated_arrow_args.first().and_then(Syntax::kind),
+        Some(&arrow_kind),
+        "mutated Lean.Parser.Term.arrow must associate left (LHS = A -> B)"
+    );
+    assert!(
+        compare(&real, &mutated, 0).is_err(),
+        "mutating Lean.Parser.Term.arrow precedence must fail Reference tree comparison"
+    );
+}
+
 #[ignore = "cost: Stage 5 pure generated registry parser (BuiltinInterpreter + FileGrammar ParserDescr) over all 71,015 Init+Std commands from ~/.cache/fln/pin-syntax (bead franken_lean-z8j.1.10)"]
 #[test]
 fn pin_syntax_frontier_stage5_generated_registry() {

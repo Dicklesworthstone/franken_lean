@@ -477,8 +477,16 @@ impl Syntax {
                     // when the tree was built from a well-formed attachment.
                     at: crate::source::BytePos(0),
                 }),
-                Syntax::Node { args, .. } => {
-                    pending.extend(args.iter().rev());
+                Syntax::Node { kind, args, .. } => {
+                    // A `choice` node holds tied longest-match alternatives over the
+                    // exact same byte span; walking every branch would duplicate leaves.
+                    if *kind == Name::str(Name::anonymous(), "choice") {
+                        if let Some(first) = args.first() {
+                            pending.push(first);
+                        }
+                    } else {
+                        pending.extend(args.iter().rev());
+                    }
                 }
                 Syntax::Atom { info, .. } | Syntax::Ident { info, .. } => {
                     out.push(Attached::Token(*info));
@@ -881,6 +889,36 @@ mod tests {
         assert!(
             stdout.contains(COMPLETION_MARKER),
             "isolated regression process omitted its completion marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn choice_node_reconstructs_losslessly_from_its_first_branch() {
+        let text = text_of(b"{}");
+        let open = SourceInfo::Original {
+            leading: ByteSpan::empty_at(BytePos(0)),
+            pos: BytePos(0),
+            trailing: ByteSpan::empty_at(BytePos(1)),
+            end_pos: BytePos(1),
+        };
+        let close = SourceInfo::Original {
+            leading: ByteSpan::empty_at(BytePos(1)),
+            pos: BytePos(1),
+            trailing: ByteSpan::empty_at(BytePos(2)),
+            end_pos: BytePos(2),
+        };
+        let branch_a = Syntax::node(
+            name(&["Lean", "Parser", "Term", "structInst"]),
+            vec![Syntax::atom(open, "{"), Syntax::atom(close, "}")],
+        );
+        let branch_b = Syntax::node(
+            name(&["term{}"]),
+            vec![Syntax::atom(open, "{"), Syntax::atom(close, "}")],
+        );
+        let choice = Syntax::node(name(&["choice"]), vec![branch_a, branch_b]);
+        assert_eq!(
+            choice.reconstruct(&text, ByteSpan::empty_at(BytePos(2))),
+            Some(b"{}".to_vec())
         );
     }
 }

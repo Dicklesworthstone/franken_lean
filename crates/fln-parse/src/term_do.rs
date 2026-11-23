@@ -1521,11 +1521,17 @@ mod for_tests {
             "def walk : Nat := do { for x in xs; return 7 }",
             "def walk : Nat := do { for x in xs do {}; return 7 }",
             "def walk : Nat := do { for h : : x in xs do { visit x }; return 7 }",
+        ] {
+            assert!(parse_definition(source.as_ref()).is_err(), "{source}");
+        }
+        // Verified against Lean 4 v4.32.0: multi-clause `for` and `break`/`continue` followed by
+        // same-line tokens parse in Lean 4's `do` grammar (elaboration rejects malformed jumps).
+        for source in [
             "def walk : Nat := do { for x in xs, y in ys do { visit x }; return 7 }",
             "def walk : Nat := do { for x in xs do { break 1 }; return 7 }",
             "def walk : Nat := do { for x in xs do { continue action }; return 7 }",
         ] {
-            assert!(parse_definition(source.as_ref()).is_err(), "{source}");
+            assert!(parse_definition(source.as_ref()).is_ok(), "{source}");
         }
         // A pattern binder is `doForDecl`'s term: the pin parses it (and fails in elaboration,
         // 2026-10-09).
@@ -1547,11 +1553,16 @@ mod for_tests {
 
     #[test]
     fn missing_indented_body_does_not_consume_the_enclosing_continuation() {
-        let source = "def walk : Nat := do\r\n  for x in xs do\r\n  return 7";
-        let error = parse_definition(source.as_ref()).expect_err("missing loop body");
+        // Verified against Lean 4 v4.32.0: `doSeqIndent` anchors at its first token, so
+        // `for x in xs do\n  return 7` parses as a loop with body `return 7`, while a missing
+        // loop body before a closing delimiter or next command refuses at the exact CRLF offset.
+        let same_col = "def walk : Nat := do\r\n  for x in xs do\r\n  return 7";
+        assert!(parse_definition(same_col.as_ref()).is_ok());
+        let missing = "def walk : Nat := do\r\n  for x in xs do\r\n  }";
+        let error = parse_definition(missing.as_ref()).expect_err("missing loop body");
         assert_eq!(
             error.primary_offset(),
-            Some(BytePos(source.find("return").unwrap()))
+            Some(BytePos(missing.find('}').unwrap()))
         );
     }
 }
@@ -1610,15 +1621,20 @@ mod control_tests {
 
     #[test]
     fn terminal_controls_cannot_hide_unreachable_or_malformed_source() {
+        assert!(
+            parse_definition(b"def run : Nat := do { for x in xs do { break : Nat }; return 7 }")
+                .is_err()
+        );
+        // Verified against Lean 4 v4.32.0: `break`/`continue` followed by `; ...` or same-line
+        // terms parse as `doSeq` items (elaboration checks reachability/types).
         for body in [
             "break; missing",
             "continue; missing",
             "break 1",
             "continue true",
-            "break : Nat",
         ] {
             let source = format!("def run : Nat := do {{ for x in xs do {{ {body} }}; return 7 }}");
-            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+            assert!(parse_definition(source.as_bytes()).is_ok(), "{source}");
         }
     }
 }

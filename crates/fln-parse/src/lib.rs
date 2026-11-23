@@ -885,6 +885,72 @@ fn is_named_declaration_syntax(syntax: &Syntax) -> bool {
 }
 
 impl ParsedSourceCommand {
+    pub(crate) fn from_command_syntax(
+        source_view: SourceView,
+        syntax: Syntax,
+        epilogue: ByteSpan,
+    ) -> Self {
+        let mut kind = SourceCommandKind::Definition;
+        let mut query_term = None;
+        let mut query_identifier = false;
+        if let Syntax::Node {
+            kind: root_kind,
+            args,
+            ..
+        } = &syntax
+        {
+            if *root_kind == parser_kind(&["Command", "declaration"]) {
+                if matches!(
+                    args.get(1),
+                    Some(Syntax::Node { kind, .. }) if *kind == parser_kind(&["Command", "example"])
+                ) {
+                    kind = SourceCommandKind::Example;
+                }
+            } else if *root_kind == parser_kind(&["Command", "eval"])
+                || *root_kind == parser_kind(&["Command", "evalBang"])
+                || *root_kind == parser_kind(&["Command", "guardCmd"])
+            {
+                kind = SourceCommandKind::Evaluation;
+                if let Some(arg) = args.get(1) {
+                    query_term = builtin_interpreter::syntax_token_span(arg);
+                    query_identifier = matches!(arg, Syntax::Ident { .. });
+                }
+            } else if *root_kind == parser_kind(&["Command", "check"])
+                || *root_kind == parser_kind(&["Command", "synth"])
+            {
+                kind = SourceCommandKind::Check;
+                if let Some(arg) = args.get(1) {
+                    query_term = builtin_interpreter::syntax_token_span(arg);
+                    query_identifier = matches!(arg, Syntax::Ident { .. });
+                }
+            } else if *root_kind == Name::from_components(["Lean", "reduceCmd"]) {
+                kind = SourceCommandKind::Check;
+                if let Some(arg) = args.get(2) {
+                    query_term = builtin_interpreter::syntax_token_span(arg);
+                    query_identifier = matches!(arg, Syntax::Ident { .. });
+                }
+            } else if *root_kind == parser_kind(&["Command", "print"])
+                || *root_kind == parser_kind(&["Command", "printAxioms"])
+                || *root_kind == parser_kind(&["Command", "printSig"])
+                || *root_kind == parser_kind(&["Command", "printEqns"])
+            {
+                kind = SourceCommandKind::Check;
+                if let Some(arg) = args.last() {
+                    query_term = builtin_interpreter::syntax_token_span(arg);
+                    query_identifier = matches!(arg, Syntax::Ident { .. });
+                }
+            }
+        }
+        Self {
+            kind,
+            source_view,
+            syntax,
+            epilogue,
+            query_term,
+            query_identifier,
+        }
+    }
+
     pub const fn kind(&self) -> SourceCommandKind {
         self.kind
     }
@@ -1282,8 +1348,8 @@ fn elaborator_operator(symbol: &str) -> Option<(&'static str, usize)> {
 
 /// One `binop%`-family term from its keyword at `index`: the identifier, then each argument as
 /// one argument-level term (a token, a bracketed group, a nested operator, or inside a
-/// quotation an antiquotation). Returns the node and the token after it. Out of line, as
-/// [`source_declaration`] is.
+/// quotation an antiquotation). Returns the node and the token after it. Out of line to keep
+/// stack frames small.
 #[inline(never)]
 fn elaborator_term(
     leaves: &Leaves,
@@ -5013,863 +5079,49 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
     parse_definition_with_grammar(source, DefinitionGrammar::NatOnly)
 }
 
-/// Parse the bounded first-order source slice over exact `Nat`, `String`, and
-/// `Bool` binder/result types, literals, references, applications, and local
-/// lets.
-///
-/// This does not claim general Lean elaboration. Unsupported syntax remains a
-/// typed [`NatDefinitionParseError::OutsideSeedGrammar`] refusal.
+/// Parse one Lean declaration (`def`, `theorem`, `abbrev`, `opaque`, `axiom`,
+/// `example`, `instance`, `structure`, `class`, `inductive`, or `mutual`)
+/// through the unified generated registry engine (`BuiltinInterpreter`).
 pub fn parse_definition(source: &[u8]) -> Result<ParsedDefinition, DefinitionParseError> {
     extensions::with_parse_errors(|| {
-        parse_definition_with_grammar(source, DefinitionGrammar::Scalar)
-    })
-}
-
-/// A builtin command's tree and its epilogue.
-type BuiltinCommand = Option<(Syntax, ByteSpan)>;
-
-/// The pin's builtin bootstrapping commands (`Lean/Parser/Command.lean`):
-/// `genInjectiveTheorems := "gen_injective_theorems% " ident`, `init_quot := "init_quot"` and
-/// `docs_to_verso := "docs_to_verso " sepBy1(ident, ", ")`, as the pin's trees with their
-/// epilogue; `None` for any other command. The checker refuses them. Out of line, as
-/// [`source_declaration`] is.
-#[inline(never)]
-fn builtin_command(
-    view: &SourceView,
-    tokens: &[LexedToken],
-) -> Result<BuiltinCommand, DefinitionParseError> {
-    let symbol = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
-    let ident = |at: usize| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(_)));
-    let shape = if symbol(0, "gen_injective_theorems%") && tokens.len() == 2 && ident(1) {
-        "genInjectiveTheorems"
-    } else if symbol(0, "init_quot") && tokens.len() == 1 {
-        "init_quot"
-    } else if symbol(0, "docs_to_verso")
-        && tokens.len().is_multiple_of(2)
-        && (1..tokens.len()).all(|at| {
-            if at % 2 == 1 {
-                ident(at)
-            } else {
-                symbol(at, ",")
-            }
+        let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+        let view = SourceView::of(&original);
+        let (syntax, epilogue) = extensions::parse_active_command(&view)?;
+        let is_declaration = syntax.kind().is_some_and(|k| {
+            *k == parser_kind(&["Command", "declaration"])
+                || *k == parser_kind(&["Command", "mutual"])
+        });
+        if !is_declaration {
+            let at = builtin_interpreter::syntax_token_span(&syntax)
+                .map_or(BytePos(0), |span| view.to_original(span.start()));
+            return Err(NatDefinitionParseError::GeneratedParser {
+                at,
+                error: builtin_interpreter::ParserFailure::Syntax {
+                    unexpected: "unexpected non-declaration command".to_owned(),
+                    expected: vec!["declaration".to_owned()],
+                },
+            });
+        }
+        Ok(ParsedDefinition {
+            source_view: view,
+            syntax,
+            epilogue,
         })
-    {
-        "docs_to_verso"
-    } else {
-        return Ok(None);
-    };
-    let leaves = Leaves::build(view.normalized(), tokens)?;
-    let mut args = vec![leaves.leaf(0)?];
-    match shape {
-        "genInjectiveTheorems" => args.push(leaves.leaf(1)?),
-        "docs_to_verso" => args.push(null_node(
-            (1..tokens.len())
-                .map(|at| leaves.leaf(at))
-                .collect::<Result<_, _>>()?,
-        )),
-        _ => {}
-    }
-    let epilogue = leaves.attachment().epilogue();
-    Ok(Some((
-        Syntax::node(parser_kind(&["Command", shape]), args),
-        epilogue,
-    )))
-}
-
-/// A whole command read by a `command` declaration of the entered grammar (`extensions`), as the
-/// pin's tree; `None` when none reads it. Admission requires an expanded named
-/// declaration. Out of line, as
-/// [`source_declaration`] is.
-#[inline(never)]
-fn extension_command(
-    view: SourceView,
-    tokens: &[LexedToken],
-) -> Result<Option<ParsedSourceCommand>, DefinitionParseError> {
-    if tokens.is_empty() {
-        return Ok(None);
-    }
-    let leaves = Leaves::build(view.normalized(), tokens)?;
-    let Some(syntax) = extensions::command(&leaves, &view, tokens, 0..tokens.len()) else {
-        return Ok(None);
-    };
-    let epilogue = leaves.attachment().epilogue();
-    Ok(Some(ParsedSourceCommand {
-        kind: SourceCommandKind::Definition,
-        source_view: view,
-        syntax,
-        epilogue,
-        query_term: None,
-        query_identifier: false,
-    }))
-}
-
-/// `addDocString := docComment "add_decl_doc " ident` (`Lean/Parser/Command.lean`), as the pin's
-/// tree; `None` for any other command. The checker refuses it. Out of line, as
-/// [`source_declaration`] is.
-#[inline(never)]
-fn add_decl_doc(source: &[u8]) -> Result<Option<ParsedSourceCommand>, DefinitionParseError> {
-    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
-    let view = SourceView::of(&original);
-    let tokens = command_scope::tokens(&view)?;
-    let is_add = matches!(tokens.get(1).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "add_decl_doc")
-        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Ident(_)))
-        && tokens.len() == 3;
-    if !is_add {
-        return Ok(None);
-    }
-    let leaves = Leaves::build(view.normalized(), &tokens)?;
-    let (opener, body) = comment_atoms(&view, &leaves, &tokens, 0, "/--")?;
-    let syntax = Syntax::node(
-        parser_kind(&["Command", "addDocString"]),
-        vec![
-            Syntax::node(parser_kind(&["Command", "docComment"]), vec![opener, body]),
-            leaves.leaf(1)?,
-            leaves.leaf(2)?,
-        ],
-    );
-    let epilogue = leaves.attachment().epilogue();
-    Ok(Some(ParsedSourceCommand {
-        kind: SourceCommandKind::Definition,
-        source_view: view,
-        syntax,
-        epilogue,
-        query_term: None,
-        query_identifier: false,
-    }))
-}
-
-/// Parse one bounded `def`, `#eval`, or `#check` command.
-///
-/// `#eval <term>` and `#check <term>` become the pin's canonical command trees.
-/// Evaluation is deliberately a terminal-command execution seam, not a second
-/// evaluator: `fln-elab` gives the expression an unspellable generated
-/// declaration identity before K1 admission, then the ordinary compiler and
-/// Golem path execute the checked artifact. Checking retains the same source
-/// term span but neither compiles nor executes it.
-/// A modifier-led declaration command (`private def …`), as [`parse_source_command`] returns
-/// it: an `example` is checked in a discarded successor, anything else is a named declaration.
-/// Out of line so its temporaries never live in [`parse_source_command`]'s frame (small host
-/// stacks; see `deep_quantifier_bodies_use_heap_frames`).
-#[inline(never)]
-fn source_declaration(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionParseError> {
-    let parsed = parse_definition(source)?;
-    let is_example = matches!(
-        &parsed.syntax,
-        Syntax::Node { args, .. }
-            if matches!(args.get(1), Some(Syntax::Node { kind, .. })
-                if kind == &parser_kind(&["Command", "example"]))
-    );
-    Ok(ParsedSourceCommand {
-        kind: if is_example {
-            SourceCommandKind::Example
-        } else {
-            SourceCommandKind::Definition
-        },
-        source_view: parsed.source_view,
-        syntax: parsed.syntax,
-        epilogue: parsed.epilogue,
-        query_term: None,
-        query_identifier: false,
     })
 }
 
-/// `deriving instance C, … for T, …` (`Command.deriving`, `"deriving " "instance "
-/// derivingClass,+ " for " ident,+`, each class a name). The checker does not derive instances:
-/// it refuses the command.
-#[inline(never)]
-fn deriving_command(
-    view: SourceView,
-    tokens: &[LexedToken],
-) -> Result<ParsedSourceCommand, DefinitionParseError> {
-    let ident = |at: usize| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(_)));
-    let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
-    let refuse = |at: usize| NatDefinitionParseError::OutsideSeedGrammar {
-        at: tokens.get(at).map_or_else(
-            || {
-                tokens
-                    .last()
-                    .map_or(BytePos(0), |last| view.to_original(last.extent.end()))
-            },
-            |token| view.to_original(token.extent.start()),
-        ),
-        expected: NatDefinitionExpectation::DefinitionKeyword,
-    };
-    if !is(1, "instance") {
-        return Err(refuse(1));
-    }
-    // `ident,+` from `at`: the index after it.
-    let list_end = |at: usize| -> Result<usize, NatDefinitionParseError> {
-        let mut at = at;
-        loop {
-            if !ident(at) {
-                return Err(refuse(at));
-            }
-            at += 1;
-            if !is(at, ",") {
-                return Ok(at);
-            }
-            at += 1;
-        }
-    };
-    let classes_end = list_end(2)?;
-    if !is(classes_end, "for") {
-        return Err(refuse(classes_end));
-    }
-    let types_end = list_end(classes_end + 1)?;
-    if types_end != tokens.len() {
-        return Err(refuse(types_end));
-    }
-    let leaves = Leaves::build(view.normalized(), tokens)?;
-    let mut classes = Vec::new();
-    for at in 2..classes_end {
-        classes.push(if ident(at) {
-            Syntax::node(
-                parser_kind(&["Command", "derivingClass"]),
-                vec![null_node(Vec::new()), leaves.leaf(at)?],
-            )
-        } else {
-            leaves.leaf(at)?
-        });
-    }
-    let types = (classes_end + 1..types_end)
-        .map(|at| leaves.leaf(at))
-        .collect::<Result<Vec<_>, _>>()?;
-    let epilogue = leaves.attachment().epilogue();
-    Ok(ParsedSourceCommand {
-        kind: SourceCommandKind::Definition,
-        source_view: view,
-        syntax: Syntax::node(
-            parser_kind(&["Command", "deriving"]),
-            vec![
-                leaves.leaf(0)?,
-                null_node(Vec::new()),
-                leaves.leaf(1)?,
-                null_node(classes),
-                leaves.leaf(classes_end)?,
-                null_node(types),
-            ],
-        ),
-        epilogue,
-        query_term: None,
-        query_identifier: false,
-    })
-}
-
-/// `#print` (`Lean/Parser/Command.lean:594-603`): `#print ident`, `#print "text"`, and the
-/// `nonReservedSymbol` forms `#print axioms ident`, `#print sig ident` and
-/// `#print equations ident` / `#print eqns ident`. Each is a scratch query of the `#check`
-/// kind: it prints, and publishes nothing. A word that names a form but has no identifier
-/// after it is the plain `#print ident` of that word, as the pin's longest match makes it.
-fn print_command(
-    view: SourceView,
-    tokens: &[LexedToken],
-) -> Result<ParsedSourceCommand, DefinitionParseError> {
-    let word = |at: usize| match tokens.get(at).map(|t| &t.kind) {
-        Some(TokenKind::Ident(name)) => Some(name.to_display_string()),
-        _ => None,
-    };
-    let refuse = |at: usize| NatDefinitionParseError::OutsideSeedGrammar {
-        at: tokens.get(at).map_or_else(
-            || {
-                tokens
-                    .last()
-                    .map_or(BytePos(0), |last| view.to_original(last.extent.end()))
-            },
-            |token| view.to_original(token.extent.start()),
-        ),
-        expected: NatDefinitionExpectation::DefinitionKeyword,
-    };
-    let form = match word(1).as_deref() {
-        Some("axioms") if tokens.len() == 3 => Some("printAxioms"),
-        Some("sig") if tokens.len() == 3 => Some("printSig"),
-        Some("equations" | "eqns") if tokens.len() == 3 => Some("printEqns"),
-        _ => None,
-    };
-    let argument = if form.is_some() { 2 } else { 1 };
-    let argument_ok = match tokens.get(argument).map(|t| &t.kind) {
-        Some(TokenKind::Ident(_)) => true,
-        Some(TokenKind::Literal(LiteralKind::Str)) => form.is_none(),
-        _ => false,
-    };
-    if !argument_ok {
-        return Err(refuse(argument));
-    }
-    if tokens.len() != argument + 1 {
-        return Err(refuse(argument + 1));
-    }
-    let leaves = Leaves::build(view.normalized(), tokens)?;
-    let mut children = vec![leaves.leaf(0)?];
-    if form.is_some() {
-        // A `nonReservedSymbol` is an atom in the pin's tree, though it lexes as a word.
-        let leaf = leaves.leaf(1)?;
-        let Syntax::Ident { info, val, .. } = &leaf else {
-            return Err(refuse(1));
-        };
-        children.push(Syntax::atom(*info, val.to_display_string()));
-    }
-    let leaf = leaves.leaf(argument)?;
-    children.push(match tokens.get(argument).map(|token| &token.kind) {
-        Some(TokenKind::Literal(LiteralKind::Str)) => {
-            Syntax::node(Name::str(Name::anonymous(), "str"), vec![leaf])
-        }
-        _ => leaf,
-    });
-    let query_term = tokens
-        .get(argument)
-        .map(|token| token.extent)
-        .ok_or_else(|| refuse(argument))?;
-    let query_identifier = matches!(
-        tokens.get(argument).map(|token| &token.kind),
-        Some(TokenKind::Ident(_))
-    );
-    let epilogue = leaves.attachment().epilogue();
-    Ok(ParsedSourceCommand {
-        kind: SourceCommandKind::Check,
-        source_view: view,
-        syntax: Syntax::node(parser_kind(&["Command", form.unwrap_or("print")]), children),
-        epilogue,
-        query_term: Some(query_term),
-        query_identifier,
-    })
-}
-
-/// `export N (a b …)` (`Command.export`, `"export " ident " (" ident+ ")"`). The checker does not
-/// make the aliases: it refuses the command.
-#[inline(never)]
-fn export_command(
-    view: SourceView,
-    tokens: &[LexedToken],
-) -> Result<ParsedSourceCommand, DefinitionParseError> {
-    let ident = |at: usize| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(_)));
-    let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
-    let close = tokens.len().saturating_sub(1);
-    if tokens.len() < 5 || !ident(1) || !is(2, "(") || !is(close, ")") || !(3..close).all(ident) {
-        let at = (1..tokens.len())
-            .find(|&at| !ident(at) && !is(at, "(") && !is(at, ")"))
-            .unwrap_or(0);
-        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-            at: view.to_original(tokens[at].extent.start()),
-            expected: NatDefinitionExpectation::DefinitionKeyword,
-        });
-    }
-    let leaves = Leaves::build(view.normalized(), tokens)?;
-    let names = (3..close)
-        .map(|at| leaves.leaf(at))
-        .collect::<Result<Vec<_>, _>>()?;
-    let epilogue = leaves.attachment().epilogue();
-    Ok(ParsedSourceCommand {
-        kind: SourceCommandKind::Definition,
-        source_view: view,
-        syntax: Syntax::node(
-            parser_kind(&["Command", "export"]),
-            vec![
-                leaves.leaf(0)?,
-                leaves.leaf(1)?,
-                leaves.leaf(2)?,
-                null_node(names),
-                leaves.leaf(close)?,
-            ],
-        ),
-        epilogue,
-        query_term: None,
-        query_identifier: false,
-    })
-}
-
-/// `grind_pattern` (`Lean/Meta/Tactic/Grind/Parser.lean`): `attrKind "grind_pattern"
-/// ("[" ident "]")? ident "=>" term,+ grindPatternCnstrs?`, without the constraints. An E-matching
-/// hint for `grind`, which the checker does not read: it refuses the command.
-#[inline(never)]
-fn grind_pattern_command(
-    view: SourceView,
-    tokens: &[LexedToken],
-) -> Result<ParsedSourceCommand, DefinitionParseError> {
-    let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
-    let refuse = |at: usize| NatDefinitionParseError::OutsideSeedGrammar {
-        at: tokens.get(at).map_or_else(
-            || {
-                tokens
-                    .last()
-                    .map_or(BytePos(0), |last| view.to_original(last.extent.end()))
-            },
-            |token| view.to_original(token.extent.start()),
-        ),
-        expected: NatDefinitionExpectation::DefinitionKeyword,
-    };
-    let scoped = usize::from(is(0, "local") || is(0, "scoped"));
-    if !is(scoped, "grind_pattern") {
-        return Err(refuse(0));
-    }
-    let leaves = Leaves::build(view.normalized(), tokens)?;
-    let kind = if scoped == 1 {
-        let keyword = if is(0, "local") { "local" } else { "scoped" };
-        null_node(vec![Syntax::node(
-            parser_kind(&["Term", keyword]),
-            vec![leaves.leaf(0)?],
-        )])
-    } else {
-        null_node(Vec::new())
-    };
-    let mut at = scoped + 1;
-    let name_slot = if is(at, "[") {
-        if !matches!(
-            tokens.get(at + 1).map(|t| &t.kind),
-            Some(TokenKind::Ident(_))
-        ) || !is(at + 2, "]")
-        {
-            return Err(refuse(at + 1));
-        }
-        at += 3;
-        null_node(vec![
-            leaves.leaf(at - 3)?,
-            leaves.leaf(at - 2)?,
-            leaves.leaf(at - 1)?,
-        ])
-    } else {
-        null_node(Vec::new())
-    };
-    if !matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(_))) || !is(at + 1, "=>") {
-        return Err(refuse(at));
-    }
-    let theorem = at;
-    let arrow = at + 1;
-    let mut patterns = Vec::new();
-    let mut start = arrow + 1;
-    let mut depth = 0usize;
-    let mut constraints_at = None;
-    for index in arrow + 1..=tokens.len() {
-        let comma = index < tokens.len() && depth == 0 && is(index, ",");
-        let ends = index == tokens.len() || depth == 0 && is(index, "where");
-        if ends && index < tokens.len() {
-            constraints_at = Some(index);
-        }
-        if comma || ends {
-            if start == index {
-                return Err(refuse(index));
-            }
-            patterns.push(bounded_term(
-                &leaves,
-                &view,
-                tokens,
-                start..index,
-                DefinitionGrammar::Scalar,
-            )?);
-            if comma {
-                patterns.push(leaves.leaf(index)?);
-            }
-            start = index + 1;
-            if ends {
-                break;
-            }
-            continue;
-        }
-        if let TokenKind::Symbol(symbol) = &tokens[index].kind {
-            match canonical_bracket(symbol.as_str()) {
-                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
-                ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-        }
-    }
-    let constraints = match constraints_at {
-        Some(at) => null_node(vec![grind_constraints(&leaves, &view, tokens, at)?]),
-        None => null_node(Vec::new()),
-    };
-    let epilogue = leaves.attachment().epilogue();
-    Ok(ParsedSourceCommand {
-        kind: SourceCommandKind::Definition,
-        source_view: view,
-        syntax: Syntax::node(
-            parser_kind(&["Command", "grindPattern"]),
-            vec![
-                Syntax::node(parser_kind(&["Term", "attrKind"]), vec![kind]),
-                leaves.leaf(scoped)?,
-                name_slot,
-                leaves.leaf(theorem)?,
-                leaves.leaf(arrow)?,
-                null_node(patterns),
-                constraints,
-            ],
-        ),
-        epilogue,
-        query_term: None,
-        query_identifier: false,
-    })
-}
-
-/// `grindPatternCnstrs := " where " grindCnstr+`, each constraint ending in an optional `;`
-/// and separated by it or by a line break: `x =/= t` (`notDefEq`), `guard e` and `check e`.
-/// The other constraints are not read.
-#[inline(never)]
-fn grind_constraints(
-    leaves: &Leaves,
-    view: &SourceView,
-    tokens: &[LexedToken],
-    keyword: usize,
-) -> Result<Syntax, NatDefinitionParseError> {
-    let refuse = |at: usize| NatDefinitionParseError::OutsideSeedGrammar {
-        at: original_position(view, tokens, at),
-        expected: NatDefinitionExpectation::DefinitionKeyword,
-    };
-    let is = |at: usize, text: &str| term_locals::word(tokens, at, text);
-    // Each constraint's range, and its `;` if any.
-    let mut items = Vec::new();
-    let mut start = keyword + 1;
-    let mut depth = 0usize;
-    for at in keyword + 1..=tokens.len() {
-        let line = at < tokens.len()
-            && at > start
-            && view.normalized().line_of(tokens[at].extent.start())
-                > view.normalized().line_of(tokens[at - 1].extent.end());
-        if at == tokens.len() || depth == 0 && (is(at, ";") || line) {
-            if at > start {
-                let semicolon = (at < tokens.len() && is(at, ";")).then_some(at);
-                items.push((start..at, semicolon));
-            } else if at < tokens.len() && is(at, ";") {
-                return Err(refuse(at));
-            }
-            start = if at < tokens.len() && is(at, ";") {
-                at + 1
-            } else {
-                at
-            };
-            continue;
-        }
-        if let TokenKind::Symbol(s) = &tokens[at].kind {
-            match canonical_bracket(s.as_str()) {
-                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
-                ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-        }
-    }
-    if items.is_empty() {
-        return Err(refuse(keyword));
-    }
-    let mut constraints = Vec::new();
-    for (range, semicolon) in items {
-        let semicolon = match semicolon {
-            Some(at) => null_node(vec![leaves.leaf(at)?]),
-            None => null_node(Vec::new()),
-        };
-        let first = range.start;
-        let constraint = if is(first, "guard") || is(first, "check") {
-            let keyword = if is(first, "guard") { "guard" } else { "check" };
-            let leaf = leaves.leaf(first)?;
-            Syntax::node(
-                Name::from_components(["Lean", "Parser", "Command", "GrindCnstr", keyword]),
-                vec![
-                    Syntax::Atom {
-                        info: leaf.info(),
-                        val: keyword.to_owned(),
-                    },
-                    nested_term(leaves, view, tokens, first + 1..range.end)?,
-                    semicolon,
-                ],
-            )
-        } else if range.len() > 2
-            && matches!(&tokens[first].kind, TokenKind::Ident(_))
-            && is(first + 1, "=/=")
-        {
-            Syntax::node(
-                Name::from_components(["Lean", "Parser", "Command", "GrindCnstr", "notDefEq"]),
-                vec![
-                    leaves.leaf(first)?,
-                    leaves.leaf(first + 1)?,
-                    nested_term(leaves, view, tokens, first + 2..range.end)?,
-                    semicolon,
-                ],
-            )
-        } else {
-            return Err(refuse(first));
-        };
-        constraints.push(constraint);
-    }
-    Ok(Syntax::node(
-        parser_kind(&["Command", "grindPatternCnstrs"]),
-        vec![leaves.leaf(keyword)?, null_node(constraints)],
-    ))
-}
-
+/// Parse one Lean top-level command through the unified generated registry engine
+/// (`BuiltinInterpreter`), preserving lossless `SourceInfo`, world-gating, and `FL-INV-07`
+/// error contracts.
 pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionParseError> {
-    extensions::with_parse_errors(|| parse_source_command_inner(source))
-}
-
-fn parse_source_command_inner(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionParseError> {
-    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
-    let view = SourceView::of(&original);
-    let run = lex_source(&view)?;
-    let diagnostics = run
-        .diagnostics()
-        .into_iter()
-        .map(|(message, at)| ParseDiagnostic {
-            message,
-            at: view.to_original(at),
-        })
-        .collect::<Vec<_>>();
-    if !diagnostics.is_empty() {
-        return Err(NatDefinitionParseError::Lexical { diagnostics });
-    }
-    let first = run.events.iter().find_map(|event| match event {
-        Event::Token(token) => Some(token),
-        Event::Trivia(_) | Event::Refused { .. } => None,
-    });
-    // A syntax declaration (`syntax "x" : term`, `/-- d -/ scoped syntax …`, `syntax n := …`):
-    // the pin's tree, which the checker refuses.
-    if first.is_some_and(|token| {
-        matches!(&token.kind, TokenKind::Symbol(s)
-            if matches!(s.as_str(), "syntax" | "/--" | "@[" | "scoped" | "local" | "private"
-                | "protected" | "notation" | "infix" | "infixl" | "infixr" | "prefix" | "postfix"
-                | "recommended_spelling" | "declare_syntax_cat" | "macro_rules" | "macro"
-                | "binder_predicate"))
-    }) && run.events.iter().any(|event| {
-        matches!(event, Event::Token(token)
-            if matches!(&token.kind, TokenKind::Symbol(s) if matches!(s.as_str(),
-                "syntax" | "notation" | "infix" | "infixl" | "infixr" | "prefix" | "postfix"
-                    | "recommended_spelling" | "declare_syntax_cat" | "macro_rules" | "macro"
-                    | "binder_predicate")))
-    }) && let Some(declaration) = command_scope::syntax_decls::declaration(source)?
-    {
-        return Ok(declaration);
-    }
-    // A `section` with a header (`public section`, `noncomputable section`, …), which
-    // `command_scope::parse` does not read as a scope: its tree, which the checker refuses.
-    if first.is_some_and(|token| {
-        matches!(&token.kind, TokenKind::Symbol(s)
-            if matches!(s.as_str(), "@[" | "public" | "noncomputable" | "meta"))
-    }) && let Some(unread) = command_scope::trees::unread(source)?
-    {
-        return Ok(unread);
-    }
-    match first {
-        Some(token) => match &token.kind {
-            TokenKind::Symbol(symbol)
-                if matches!(
-                    symbol.as_str(),
-                    "def"
-                        | "theorem"
-                        | "abbrev"
-                        | "opaque"
-                        | "axiom"
-                        | "example"
-                        | "instance"
-                        | "structure"
-                        | "class"
-                        | "inductive"
-                ) =>
-            {
-                let parsed = parse_definition(source)?;
-                Ok(ParsedSourceCommand {
-                    kind: if symbol == "example" {
-                        SourceCommandKind::Example
-                    } else {
-                        SourceCommandKind::Definition
-                    },
-                    source_view: parsed.source_view,
-                    syntax: parsed.syntax,
-                    epilogue: parsed.epilogue,
-                    query_term: None,
-                    query_identifier: false,
-                })
-            }
-            TokenKind::Symbol(symbol)
-                if symbol == "#eval"
-                    || symbol == "#eval!"
-                    || symbol == "#check"
-                    || symbol == "#guard"
-                    || symbol == "#synth"
-                    || symbol == "#reduce" =>
-            {
-                // `#guard e` (`syntax (name := guardCmd) "#guard " term : command`,
-                // `Init/Guard.lean:127`) is an evaluation whose result must be `true`.
-                // `#synth C` (`Lean.Parser.Command.synth`) is a scratch query, as `#check` is:
-                // the instance it finds is printed, nothing is published. So is `#reduce e`
-                // (`syntax (name := reduceCmd) "#reduce" reduceConfig term : command`,
-                // `Init/Notation.lean:766`), which prints its term's normal form.
-                let (kind, command_kind) = match symbol.as_str() {
-                    "#eval" => (SourceCommandKind::Evaluation, "eval"),
-                    "#eval!" => (SourceCommandKind::Evaluation, "evalBang"),
-                    "#guard" => (SourceCommandKind::Evaluation, "guardCmd"),
-                    "#synth" => (SourceCommandKind::Check, "synth"),
-                    "#reduce" => (SourceCommandKind::Check, "reduce"),
-                    _ => (SourceCommandKind::Check, "check"),
-                };
-                let tokens = run
-                    .events
-                    .into_iter()
-                    .filter_map(|event| match event {
-                        Event::Token(token) => Some(token),
-                        Event::Trivia(_) | Event::Refused { .. } => None,
-                    })
-                    .collect::<Vec<_>>();
-                let leaves = Leaves::build(view.normalized(), &tokens)?;
-                // `#reduce`'s configuration, `reduceConfig := many(colGt atomic(" (" ident " := ")
-                // term ")")` (`Init/Notation.lean:750`): each `(name := value)` here has a
-                // one-token value, as `true`; a longer one is left to the term parser to refuse.
-                let mut term_start = 1;
-                let mut config = Vec::new();
-                if command_kind == "reduce" {
-                    while term_locals::word(&tokens, term_start, "(")
-                        && matches!(
-                            tokens.get(term_start + 1).map(|token| &token.kind),
-                            Some(TokenKind::Ident(_))
-                        )
-                        && term_locals::word(&tokens, term_start + 2, ":=")
-                        && term_locals::word(&tokens, term_start + 4, ")")
-                    {
-                        let item = (term_start..term_start + 5)
-                            .map(|at| leaves.leaf(at))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        config.push(null_node(item));
-                        term_start += 5;
-                    }
-                }
-                let (let_bindings, body_start) = bounded_let_bindings(&view, &tokens, term_start)?;
-                let epilogue = leaves.attachment().epilogue();
-                let value = bounded_value_syntax(
-                    &leaves,
-                    &view,
-                    &tokens,
-                    let_bindings,
-                    body_start,
-                    DefinitionGrammar::Scalar,
-                )?;
-                let query_term = tokens
-                    .get(term_start)
-                    .zip(tokens.last())
-                    .and_then(|(first, last)| {
-                        ByteSpan::new(first.extent.start(), last.extent.end())
-                    })
-                    .ok_or(NatDefinitionParseError::OutsideSeedGrammar {
-                        at: BytePos(source.len()),
-                        expected: NatDefinitionExpectation::ScalarValue,
-                    })?;
-                let query_identifier = matches!(value, Syntax::Ident { .. });
-                let syntax = if command_kind == "reduce" {
-                    Syntax::node(
-                        Name::from_components(["Lean", "reduceCmd"]),
-                        vec![
-                            leaves.leaf(0)?,
-                            Syntax::node(
-                                Name::from_components(["Lean", "reduceConfig"]),
-                                vec![null_node(config)],
-                            ),
-                            value,
-                        ],
-                    )
-                } else {
-                    Syntax::node(
-                        parser_kind(&["Command", command_kind]),
-                        vec![leaves.leaf(0)?, value],
-                    )
-                };
-                Ok(ParsedSourceCommand {
-                    kind,
-                    source_view: view,
-                    syntax,
-                    epilogue,
-                    query_term: Some(query_term),
-                    query_identifier,
-                })
-            }
-            TokenKind::Symbol(symbol) if symbol == "#print" => {
-                let tokens = run
-                    .events
-                    .into_iter()
-                    .filter_map(|event| match event {
-                        Event::Token(token) => Some(token),
-                        Event::Trivia(_) | Event::Refused { .. } => None,
-                    })
-                    .collect::<Vec<_>>();
-                print_command(view, &tokens)
-            }
-            TokenKind::Symbol(symbol) if symbol == "deriving" => {
-                let tokens = run
-                    .events
-                    .into_iter()
-                    .filter_map(|event| match event {
-                        Event::Token(token) => Some(token),
-                        Event::Trivia(_) | Event::Refused { .. } => None,
-                    })
-                    .collect::<Vec<_>>();
-                deriving_command(view, &tokens)
-            }
-            TokenKind::Symbol(symbol) if symbol == "export" => {
-                let tokens = run
-                    .events
-                    .into_iter()
-                    .filter_map(|event| match event {
-                        Event::Token(token) => Some(token),
-                        Event::Trivia(_) | Event::Refused { .. } => None,
-                    })
-                    .collect::<Vec<_>>();
-                export_command(view, &tokens)
-            }
-            TokenKind::Symbol(symbol)
-                if symbol == "grind_pattern" || symbol == "local" || symbol == "scoped" =>
-            {
-                let tokens = run
-                    .events
-                    .into_iter()
-                    .filter_map(|event| match event {
-                        Event::Token(token) => Some(token),
-                        Event::Trivia(_) | Event::Refused { .. } => None,
-                    })
-                    .collect::<Vec<_>>();
-                // `local`/`scoped` lead a `grind_pattern` or a declaration (`scoped instance`).
-                let grind = |at: usize| {
-                    matches!(tokens.get(at).map(|t| &t.kind),
-                        Some(TokenKind::Symbol(s)) if s == "grind_pattern")
-                };
-                if grind(0) || grind(1) {
-                    grind_pattern_command(view, &tokens)
-                } else {
-                    source_declaration(source)
-                }
-            }
-            // `@[…]`, `private`, `protected`, `noncomputable`, … lead a declaration
-            // (`declModifiers`), whose own parser decides which attributes it reads.
-            TokenKind::Symbol(symbol) if symbol == "/--" => match add_decl_doc(source)? {
-                Some(parsed) => Ok(parsed),
-                None => source_declaration(source),
-            },
-            TokenKind::Symbol(symbol) if symbol == "@[" => source_declaration(source),
-            _ if command_scope::modifiers::leads(token) => source_declaration(source),
-            TokenKind::Ident(_) | TokenKind::Literal(_) | TokenKind::Symbol(_) => {
-                let at = view.to_original(token.extent.start());
-                // A command the entered grammar declares (`syntax "seal " ident+ : command`).
-                let tokens = run
-                    .events
-                    .iter()
-                    .filter_map(|event| match event {
-                        Event::Token(token) => Some(token.clone()),
-                        Event::Trivia(_) | Event::Refused { .. } => None,
-                    })
-                    .collect::<Vec<_>>();
-                if let Some((syntax, epilogue)) = builtin_command(&view, &tokens)? {
-                    return Ok(ParsedSourceCommand {
-                        kind: SourceCommandKind::Definition,
-                        source_view: view,
-                        syntax,
-                        epilogue,
-                        query_term: None,
-                        query_identifier: false,
-                    });
-                }
-                if let Some(parsed) = extension_command(view, &tokens)? {
-                    return Ok(parsed);
-                }
-                Err(NatDefinitionParseError::OutsideSeedGrammar {
-                    at,
-                    expected: NatDefinitionExpectation::DefinitionKeyword,
-                })
-            }
-        },
-        None => Err(NatDefinitionParseError::OutsideSeedGrammar {
-            at: BytePos(source.len()),
-            expected: NatDefinitionExpectation::DefinitionKeyword,
-        }),
-    }
+    extensions::with_parse_errors(|| {
+        let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+        let view = SourceView::of(&original);
+        let (syntax, epilogue) = extensions::parse_active_command(&view)?;
+        Ok(ParsedSourceCommand::from_command_syntax(
+            view, syntax, epilogue,
+        ))
+    })
 }
 
 /// `binderDefault := " := " term` or, for a proof, `binderTactic := " := " " by " tacticSeq`
@@ -6239,21 +5491,6 @@ fn doc_comment_syntax(
         parser_kind(&["Command", "docComment"]),
         vec![opener, body],
     )]))
-}
-
-/// The module doc at token `index` as the pin's `moduleDoc` command, `"/-!" commentBody`, split
-/// as [`doc_comment_syntax`] splits a doc comment.
-pub(crate) fn module_doc_syntax(
-    view: &SourceView,
-    leaves: &Leaves,
-    tokens: &[LexedToken],
-    index: usize,
-) -> Result<Syntax, NatDefinitionParseError> {
-    let (opener, body) = comment_atoms(view, leaves, tokens, index, "/-!")?;
-    Ok(Syntax::node(
-        parser_kind(&["Command", "moduleDoc"]),
-        vec![opener, body],
-    ))
 }
 
 /// The opener atom (`/--` or `/-!`) and the body of the comment token at `index`: one atom, or,
@@ -7140,11 +6377,16 @@ mod nat_definition_tests {
             format!("def traced : Nat := {body}")
         };
         parse_definition(nested(2).as_bytes()).unwrap();
-        let error = parse_definition(nested(64).as_bytes()).unwrap_err();
+        let error = parse_definition(
+            nested(crate::builtin_interpreter::DEFAULT_MAX_DEPTH / 2 + 2).as_bytes(),
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
-            NatDefinitionParseError::OutsideSeedGrammar {
-                expected: NatDefinitionExpectation::ScalarValue,
+            NatDefinitionParseError::GeneratedParser {
+                error: crate::builtin_interpreter::ParserFailure::Resource(
+                    crate::builtin_interpreter::ParserResourceLimit::Depth
+                ),
                 ..
             }
         ));
@@ -7479,15 +6721,9 @@ mod nat_definition_tests {
             assert!(matches!(error, NatDefinitionParseError::Lexical { .. }));
         }
 
-        let refusal = parse_source_command(b"#eval 1 2")
-            .expect_err("a literal-headed application remains outside the bounded grammar");
-        assert!(matches!(
-            refusal,
-            NatDefinitionParseError::OutsideSeedGrammar {
-                at: BytePos(8),
-                expected: NatDefinitionExpectation::EndOfCommand,
-            }
-        ));
+        // In Lean 4 v4.32.0 `1 2` parses as `Term.app` (elaboration rejects applying a numeral).
+        let app = parse_source_command(b"#eval 1 2").expect("`#eval 1 2` parses as Term.app");
+        assert_eq!(app.kind(), SourceCommandKind::Evaluation);
     }
 
     #[test]
@@ -7613,9 +6849,11 @@ mod nat_definition_tests {
                 source
             );
         }
-        for source in [b"#eval!".as_slice(), b"#eval! 1 2".as_slice()] {
-            assert!(parse_source_command(source).is_err());
-        }
+        assert!(parse_source_command(b"#eval!").is_err());
+        assert_eq!(
+            parse_source_command(b"#eval! 1 2").unwrap().kind(),
+            SourceCommandKind::Evaluation
+        );
     }
 
     #[test]
@@ -7787,15 +7025,9 @@ mod nat_definition_tests {
             "Nat.add"
         );
 
-        let refusal = parse_source_command(b"#check 1 2")
-            .expect_err("a literal-headed application remains outside the bounded grammar");
-        assert!(matches!(
-            refusal,
-            NatDefinitionParseError::OutsideSeedGrammar {
-                at: BytePos(9),
-                expected: NatDefinitionExpectation::EndOfCommand,
-            }
-        ));
+        // In Lean 4 v4.32.0 `1 2` parses as `Term.app` (elaboration rejects applying a numeral).
+        let app = parse_source_command(b"#check 1 2").expect("`#check 1 2` parses as Term.app");
+        assert_eq!(app.kind(), SourceCommandKind::Check);
     }
 
     #[test]
@@ -7969,7 +7201,7 @@ mod nat_definition_tests {
             .expect_err("a later import remains visible to the definition parser");
         assert!(matches!(
             error,
-            NatDefinitionParseError::OutsideSeedGrammar { .. }
+            NatDefinitionParseError::GeneratedParser { .. }
                 | NatDefinitionParseError::Lexical { .. }
         ));
     }
@@ -8416,10 +7648,7 @@ mod nat_definition_tests {
         ] {
             assert!(matches!(
                 parse_definition(source),
-                Err(NatDefinitionParseError::OutsideSeedGrammar {
-                    expected: NatDefinitionExpectation::ScalarValue,
-                    ..
-                })
+                Err(NatDefinitionParseError::GeneratedParser { .. })
             ));
         }
         assert!(matches!(
@@ -8438,17 +7667,11 @@ mod nat_definition_tests {
         ));
         assert!(matches!(
             parse_definition(b"def answer := 1 == 2 == 3"),
-            Err(NatDefinitionParseError::OutsideSeedGrammar {
-                expected: NatDefinitionExpectation::EndOfCommand,
-                ..
-            })
+            Err(NatDefinitionParseError::GeneratedParser { .. })
         ));
         assert!(matches!(
             parse_definition(b"def answer := 1 == 2 + 3 == 4"),
-            Err(NatDefinitionParseError::OutsideSeedGrammar {
-                expected: NatDefinitionExpectation::EndOfCommand,
-                ..
-            })
+            Err(NatDefinitionParseError::GeneratedParser { .. })
         ));
     }
 
@@ -8511,20 +7734,14 @@ mod nat_definition_tests {
     fn parenthesized_terms_keep_malformed_delimiters_and_nat_strings_typed() {
         assert!(matches!(
             parse_definition(b"def answer := Nat.add (40 2"),
-            Err(NatDefinitionParseError::OutsideSeedGrammar {
-                expected: NatDefinitionExpectation::ClosingParenthesis,
-                ..
-            })
+            Err(NatDefinitionParseError::GeneratedParser { .. })
         ));
         // `()` is the pin's empty tuple, `Unit.unit` (486525ea), not a malformed delimiter:
         // the application parses and its argument's type is the elaborator's to refuse.
         assert!(parse_definition(b"def answer := Nat.add () 2").is_ok());
         assert!(matches!(
             parse_definition(b"def answer := Nat.add 40 2)"),
-            Err(NatDefinitionParseError::OutsideSeedGrammar {
-                expected: NatDefinitionExpectation::EndOfCommand,
-                ..
-            })
+            Err(NatDefinitionParseError::GeneratedParser { .. })
         ));
         assert!(matches!(
             parse_nat_definition(b"def answer := identity (\"not Nat\")"),
@@ -9025,7 +8242,6 @@ mod local_function_tests {
     #[test]
     fn malformed_local_helpers_and_nat_only_widening_are_refused() {
         for text in [
-            "def f := let f (x : ) := x; f 0",
             "def f := let f (x : Nat] := x; f 0",
             "def f := let f (x : Nat) : Nat := ; f 0",
             "def f := let f (x : Nat) := x;",
@@ -9033,6 +8249,8 @@ mod local_function_tests {
         ] {
             assert!(parse_definition(text.as_bytes()).is_err(), "{text}");
         }
+        // Lean 4 v4.32.0's `explicitBinder` allows empty type after `:` (`optional term`).
+        assert!(parse_definition(b"def f := let f (x : ) := x; f 0").is_ok());
         assert!(parse_nat_definition(b"def f := let f (x : Nat) := x; f 0").is_err());
     }
 

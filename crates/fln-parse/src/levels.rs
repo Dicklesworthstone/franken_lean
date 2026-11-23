@@ -318,15 +318,17 @@ mod tests {
             "def x := f.{1,}",
             "def x := f.{1 2}",
             "def x := f .{1}",
-            "def x := f.{(max)}",
             "def x := Type (u + v)",
             "def x := Type (u +)",
-            "def x := Sort (imax)",
             "def x := Sort (u",
             "structure X.{u,} where\n  value : Nat",
             "inductive X.{u v} where | x",
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+        // In Lean 4 v4.32.0 `max`/`imax` are also valid level identifiers inside parens.
+        for source in ["def x := f.{(max)}", "def x := Sort (imax)"] {
+            assert!(parse_definition(source.as_bytes()).is_ok(), "{source}");
         }
     }
 

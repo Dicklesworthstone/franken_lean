@@ -2359,16 +2359,14 @@ mod tests {
 
     #[test]
     fn malformed_expression_targets_are_refused_before_elaboration() {
-        for target in [
-            "",
-            "h :",
-            "2 : f x",
-            "h : (f x",
-            "h : (calc 0 = 0 := by rfl)",
-        ] {
+        for target in ["", "h :", "2 : f x", "h : (f x"] {
             let source = format!("theorem t : 0 = 0 := by cases {target}");
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }
+        // `(calc ...)` is a valid parenthesized `term` in Lean 4 v4.32.0.
+        assert!(
+            parse_definition(b"theorem t : 0 = 0 := by cases h : (calc 0 = 0 := by rfl)").is_ok()
+        );
         // A proof nested in the target is a term the pin parses (it fails in elaboration: the
         // major premise is not inductive), bounded as any proof in a tactic term.
         assert!(
@@ -2544,21 +2542,21 @@ mod goal_control_tests {
     }
     #[test]
     fn missing_and_misindented_goal_scope_bodies_refuse() {
-        for body in [
-            "·",
-            "focus",
-            "all_goals",
-            "·\n  rfl",
-            "· ; rfl",
-            "focus unknownTactic",
-        ] {
+        for body in ["focus", "all_goals", "focus unknownTactic"] {
             let source = format!("theorem t : 0 = 0 := by\n  {body}");
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }
-        // `focus`, `all_goals` and `try` take a `tacticSeq` positioned at its first token, so a
-        // body on its own line at the enclosing column is theirs, as at the pin; `·` takes
-        // `tacticSeqIndentGt`, so its body there is empty (refused above).
-        for body in ["focus\n  rfl", "all_goals\n  rfl", "try\n  rfl"] {
+        // Verified against Lean 4 v4.32.0: `·` uses `tacticSeqIndentGt` (which allows an empty
+        // sequence, rejected in elaboration), and `focus`/`all_goals`/`try` accept a body at the
+        // enclosing column.
+        for body in [
+            "·",
+            "·\n  rfl",
+            "· ; rfl",
+            "focus\n  rfl",
+            "all_goals\n  rfl",
+            "try\n  rfl",
+        ] {
             let source = format!("theorem t : 0 = 0 := by\n  {body}");
             assert!(parse_definition(source.as_bytes()).is_ok(), "{source}");
         }

@@ -540,13 +540,15 @@ mod tests {
             "def x := { value := 1 : Box Nat : Box Nat }",
             "def x := (1 : Nat : Nat)",
             "def x : Box Nat := { value := 1,, }",
-            "def x : Box Nat := { value other }",
         ] {
             assert!(
                 parse_definition(text.as_bytes()).is_err(),
                 "accepted {text}"
             );
         }
+        // Under Lean 4 v4.32.0 with implicit `Init`, `{ value other }` parses via `«term{_}»`
+        // (set singleton notation of application `value other`); elaboration rejects it for `Box Nat`.
+        assert!(parse_definition(b"def x : Box Nat := { value other }").is_ok());
     }
     #[test]
     fn deeply_nested_literals_and_ascriptions_use_heap_frames() {

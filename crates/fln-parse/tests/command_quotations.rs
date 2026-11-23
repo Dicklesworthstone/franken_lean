@@ -149,18 +149,35 @@ fn declaration_name_coercions_refuse_non_identifier_captures() {
 fn command_quotation_slots_refuse_wrong_capture_kinds_and_trailing_commands() {
     let grammar = FileGrammar::new(false, &[], None).unwrap();
     let active = grammar.grammar();
+    // Verified against Lean 4 v4.32.0: mismatched antiquot kind in declId / command category is a
+    // parse error.
     for source in [
         r#"macro "bad " n:term : command => `(def $n:term : Nat := 1)"#,
-        r#"macro "bad " s:ident : command => `(macro $s:ident x:term : term => `($$x))"#,
         r#"macro "bad " c:term : command => `(command| $c:term)"#,
-        r#"macro "bad" : command => `(def a : Nat := 1 def b : Nat := 2)"#,
-        "def $outside : Nat := 1",
     ] {
         assert!(
             with_grammar(&active, || parse_source_command(source.as_bytes())).is_err(),
             "{source}"
         );
     }
-    // A refusal must restore the thread-local quotation depth.
-    assert!(parse_source_command(b"def escaped : Nat := $x").is_err());
+    // Verified against Lean 4 v4.32.0: nested macro with `$s:ident`, multi-command quotations
+    // (`Command.commands`), and stray `$ident` antiquotations parse to the pin's trees (stray
+    // antiquotations are rejected during elaboration).
+    for source in [
+        r#"macro "bad " s:ident : command => `(macro $s:ident x:term : term => `($$x))"#,
+        r#"macro "bad" : command => `(def a : Nat := 1 def b : Nat := 2)"#,
+        "def $outside : Nat := 1",
+    ] {
+        assert!(
+            with_grammar(&active, || parse_source_command(source.as_bytes())).is_ok(),
+            "{source}"
+        );
+    }
+    // Outside a quotation, `withAntiquotFn` parses `$x` as `term.pseudo.antiquot`; elaboration
+    // rejects it.
+    let parsed = parse_source_command(b"def escaped : Nat := $x").unwrap();
+    assert_eq!(
+        nodes(parsed.syntax(), &["term", "pseudo", "antiquot"]).len(),
+        1
+    );
 }

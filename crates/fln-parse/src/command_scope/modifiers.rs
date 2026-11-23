@@ -95,11 +95,6 @@ impl Modifiers {
     }
 }
 
-/// Whether `token` is a modifier keyword, so the command it starts is a declaration.
-pub(crate) fn leads(token: &LexedToken) -> bool {
-    keyword(token).is_some()
-}
-
 /// Scan the modifier keywords starting at token `start` (just after any attributes). Slots
 /// are taken in order and each at most once; scanning stops at the first token that does not
 /// fill the next possible slot.

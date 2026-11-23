@@ -60,6 +60,8 @@ pub(crate) struct ParserInput<'a> {
     pub quot_depth: u32,
     pub precedence: u32,
     pub max_steps: usize,
+    pub verso_docs: bool,
+    pub verso_module_docs: bool,
 }
 
 pub(crate) struct ParserRun {
@@ -77,6 +79,7 @@ fn call(name: &str, args: Vec<CombinatorAst>) -> CombinatorAst {
 
 /// Resolve only the registered alias names supplied by the checked-in census.
 /// A declaration's name in the builtin table is not source visibility evidence.
+#[inline(never)]
 fn alias_ast(
     alias: &Name,
     mut args: Vec<CombinatorAst>,
@@ -282,6 +285,7 @@ impl BuiltinInterpreter {
         declarations: &[Arc<SyntaxDecl>],
         behaviors: &BTreeMap<Name, IdentBehavior>,
         aliases: &BTreeMap<String, Name>,
+        quot_categories: Option<&std::collections::BTreeSet<Name>>,
     ) -> Result<Self, CompileError> {
         let mut out = self.clone();
         out.builtin_tokens = tokens.clone();
@@ -422,6 +426,9 @@ impl BuiltinInterpreter {
         // `term` receives its standard `Lean.Parser.Term.quot` -> `<cat>.quot` parser.
         let term_name = Name::from_components(["term"]);
         for cat_name in added_categories {
+            if quot_categories.is_some_and(|allowed| !allowed.contains(&cat_name)) {
+                continue;
+            }
             let LeafView::Str(suffix) = cat_name.leaf_view() else {
                 continue;
             };
@@ -523,7 +530,9 @@ impl BuiltinInterpreter {
             };
             candidates.push((id, declaration.priority));
         }
-        self.run(input, |state| self.longest_match(None, &candidates, state))
+        self.run(input, |state| {
+            self.exec_longest_match_vm(None, &candidates, state)
+        })
     }
 
     fn run(&self, input: ParserInput<'_>, parse: impl FnOnce(&mut RuntimeState<'_>)) -> ParserRun {
@@ -532,6 +541,8 @@ impl BuiltinInterpreter {
         state.ctx.saved_pos = input.saved_pos;
         state.ctx.quot_depth = input.quot_depth;
         state.ctx.prec = input.precedence;
+        state.ctx.verso_docs = input.verso_docs;
+        state.ctx.verso_module_docs = input.verso_module_docs;
         parse(&mut state);
         // Resource and recovered diagnostics are sticky even if a recovery,
         // optional parser or longest-match alternative cleared `error`.
@@ -561,7 +572,7 @@ impl BuiltinInterpreter {
                 },
             ))
         } else {
-            Ok(state.stack)
+            Ok(state.stack.iter().map(VmNode::to_syntax).collect())
         };
         ParserRun {
             result,

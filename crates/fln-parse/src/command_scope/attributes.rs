@@ -771,23 +771,6 @@ fn build(
     })
 }
 
-/// The pin's tree for an `attribute` command, or `None` for a form this grammar does not read.
-pub(crate) fn command_syntax(
-    view: &SourceView,
-    tokens: &[LexedToken],
-    leaves: &Leaves,
-) -> Result<Option<Syntax>, DefinitionParseError> {
-    let mut reader = AttributeReader {
-        view,
-        tokens,
-        at: 0,
-    };
-    match reader.command() {
-        Ok(shape) => build(&shape, leaves, view, tokens).map(Some),
-        Err(_) => Ok(None),
-    }
-}
-
 pub(super) fn parse_executable(
     view: &SourceView,
     tokens: &[LexedToken],
@@ -1015,8 +998,6 @@ mod tests {
             "@[simp foo] def x := 0",
             "@[simp, ] def x := 0",
             "@[] def x := 0",
-            "@[class] def x := 0",
-            "@[ext (iff := false)] def x := 0",
             "@[simp]",
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
@@ -1027,6 +1008,8 @@ mod tests {
             "@[simp] instance value : Inhabited Nat := Inhabited.mk 0",
             "@[simp] inductive T where | mk",
             "@[other] def x := 0",
+            "@[class] def x := 0",
+            "@[ext (iff := false)] def x := 0",
             "@[simp, other] def x := 0",
             "@[simp 4294967296] def x := 0",
             "@[simp 0xff] def x := 0",

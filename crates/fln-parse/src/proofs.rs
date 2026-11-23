@@ -2270,15 +2270,18 @@ mod simp_tests {
             "simp only [<-]",
             "simp only [h] garbage",
             "simp [-]",
-            "simp [-1]",
             "simp [-h x]",
-            "simp [-(h)]",
             "simp [-← h]",
-            "simp [-h.{u}]",
             "simp [-h,,k]",
         ] {
             let source = format!("theorem t (x : Nat) : x = x := by {tail}");
             assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
+        }
+        // In Lean 4 v4.32.0 `simpErase` takes a term/ident (`-1`, `-(h)`, `-h.{u}` parse;
+        // elaboration rejects them).
+        for tail in ["simp [-1]", "simp [-(h)]", "simp [-h.{u}]"] {
+            let source = format!("theorem t (x : Nat) : x = x := by {tail}");
+            assert!(parse_source_command(source.as_bytes()).is_ok(), "{source}");
         }
         assert!(parse_definition(b"def simp (only : Nat) := only").is_ok());
     }
@@ -2299,18 +2302,23 @@ mod equality_tests {
                 .is_ok()
             );
         }
-        for tail in [
-            "subst",
-            "subst 2",
-            "subst (h)",
-            "subst h at x",
-            "subst h, x",
-        ] {
+        for tail in ["subst", "subst h at x", "subst h, x"] {
             assert!(
                 parse_source_command(
                     format!("theorem t (x : Nat) : x = x := by {tail}").as_bytes()
                 )
                 .is_err(),
+                "{tail}"
+            );
+        }
+        // Lean 4 v4.32.0's `subst` parser takes `colGt term+` (`subst 2`, `subst (h)` parse;
+        // elaboration rejects non-hypothesis targets).
+        for tail in ["subst 2", "subst (h)"] {
+            assert!(
+                parse_source_command(
+                    format!("theorem t (x : Nat) : x = x := by {tail}").as_bytes()
+                )
+                .is_ok(),
                 "{tail}"
             );
         }
@@ -2390,13 +2398,20 @@ mod local_declaration_tests {
             "have h :",
             "have h :=",
             "have h : := rfl",
-            "have h : Nat := by",
-            "have 7 := 7",
             "let n = 7",
-            "have h : 0 = 0 := by\n  exact h",
         ] {
             let source = format!("theorem t : 0 = 0 := by\n  {tail}");
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+        // Empty `by`, non-ident LHS, and same-column continuation parse in Lean 4 v4.32.0
+        // and fail in elaboration.
+        for tail in [
+            "have h : Nat := by",
+            "have 7 := 7",
+            "have h : 0 = 0 := by\n  exact h",
+        ] {
+            let source = format!("theorem t : 0 = 0 := by\n  {tail}");
+            assert!(parse_definition(source.as_bytes()).is_ok(), "{source}");
         }
         // A local's binders (`letIdBinder`s) and an anonymous `let` (`letIdLhs`'s `hygieneInfo`)
         // are no malformation: the pin parses each as `letIdDecl` and fails only in elaboration
@@ -2483,10 +2498,13 @@ mod construction_refinement_tests {
     #[test]
     fn ac_normalization_refuses_arguments_and_malformed_locations() {
         for word in ["ac_nf0", "ac_nf"] {
-            for suffix in [" h", " [h]", " (config := {})", " at", " at * h", " at 1"] {
+            for suffix in [" h", " [h]", " (config := {})", " at", " at * h"] {
                 let source = format!("theorem t : True := by {word}{suffix}");
                 assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
             }
+            // In Lean 4 v4.32.0 `locationHyp` parses `colGt term`, so `at 1` parses (elaborator rejects).
+            let source = format!("theorem t : True := by {word} at 1");
+            assert!(parse_definition(source.as_bytes()).is_ok(), "{source}");
         }
     }
 
@@ -2566,15 +2584,14 @@ mod construction_refinement_tests {
             let parsed = parse_definition(source.as_bytes()).unwrap();
             assert_eq!(parsed.reconstruct_original(), source.as_bytes());
         }
-        for tail in [
-            "revert",
-            "revert _",
-            "revert 3",
-            "revert (h)",
-            "revert h, k",
-        ] {
+        for tail in ["revert", "revert h, k"] {
             let source = format!("theorem t : True := by {tail}");
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+        // In Lean 4 v4.32.0 `revert` parses `colGt term+` (`_`, `3`, `(h)` are elaborator errors).
+        for tail in ["revert _", "revert 3", "revert (h)"] {
+            let source = format!("theorem t : True := by {tail}");
+            assert!(parse_definition(source.as_bytes()).is_ok(), "{source}");
         }
     }
 
@@ -2673,26 +2690,28 @@ mod construction_refinement_tests {
         format!("theorem t (h : 1 = 1) : 1 = 1 := by {body}\n")
     }
 
-    // A debug build needs between 384 and 512 KiB here for the refused level.
     #[test]
     fn proofs_nested_in_tactic_terms_stop_at_the_limit_on_a_small_stack() {
         std::thread::Builder::new()
             .name("nested-proof-parser".to_string())
             .stack_size(1024 * 1024)
             .spawn(|| {
-                let deepest = nested_proofs(PROOF_NESTING);
+                // Heap-stack VM parses well past the old native-stack cap (`PROOF_NESTING = 8`)
+                // while still terminating with a typed `Resource(Depth)` stop past `DEFAULT_MAX_DEPTH`.
+                let deepest = nested_proofs(24);
                 let parsed = parse_definition(deepest.as_bytes()).unwrap();
                 assert_eq!(parsed.reconstruct_original(), deepest.as_bytes());
-                let refused = nested_proofs(PROOF_NESTING + 1);
-                let innermost = BytePos(refused.rfind("by").unwrap());
+                let refused = nested_proofs(crate::builtin_interpreter::DEFAULT_MAX_DEPTH / 2 + 4);
                 assert!(matches!(
                     parse_definition(refused.as_bytes()),
-                    Err(NatDefinitionParseError::OutsideSeedGrammar {
-                        at,
-                        expected: NatDefinitionExpectation::Tactic,
-                    }) if at == innermost
+                    Err(NatDefinitionParseError::GeneratedParser {
+                        error: crate::builtin_interpreter::ParserFailure::Resource(
+                            crate::builtin_interpreter::ParserResourceLimit::Depth
+                        ),
+                        ..
+                    })
                 ));
-                // The refusal closed every block it had opened.
+                // The refusal closed every frame cleanly.
                 assert!(parse_definition(deepest.as_bytes()).is_ok());
             })
             .unwrap()
@@ -2777,10 +2796,10 @@ mod search_tests {
             "theorem t : And P Q := by constructor <;> (solve_by_elim)",
             "theorem t : P := by solve_by_elim only",
             "theorem t : P := by solve_by_elim only []",
-            "theorem t : P := by solve_by_elim only [h,]",
             "theorem t : P := by solve_by_elim [f (g x), -(h), h]",
             "theorem t : P := by solve_by_elim only [*, -h, replacement]",
             "theorem t : P := by\r\n  solve_by_elim /- pick -/ only [h, f]\r\n",
+            "theorem t : True := by solve_by_elim [h] using localRules",
             // Option names and values are retained syntax. The elaborator
             // rejects unsupported configuration instead of the parser dropping it.
             "theorem t : P := by solve_by_elim (config := {})",
@@ -2798,12 +2817,13 @@ mod search_tests {
     fn solve_by_elim_does_not_silently_ignore_unsupported_options() {
         for tail in [
             "solve_by_elim h",
+            // `Init/Tactics.lean:1664`: `SolveByElim.arg,*` forbids trailing commas (`allowTrailingSep = false`).
+            "solve_by_elim only [h,]",
             "solve_by_elim [h,, h]",
             "solve_by_elim [,h]",
             "solve_by_elim [-]",
             "solve_by_elim [* h]",
             "solve_by_elim [-h x]",
-            "solve_by_elim [h] using localRules",
             "solve_by_elim at h",
         ] {
             let source = format!("theorem t : True := by {tail}");
@@ -2822,7 +2842,7 @@ mod simp_all_tests {
             "simp_all",
             "simp_all only",
             "simp_all only [h, <- k,]",
-            "simp_all [*, -N.rule]",
+            "simp_all [-N.rule]",
         ] {
             let source = format!("theorem t : True := by\r\n  /- 🦀 -/ {tactic}\r\n");
             let parsed = parse_source_command(source.as_bytes()).unwrap();
@@ -2845,6 +2865,8 @@ mod simp_all_tests {
             }
             assert_eq!(count, 1);
         }
+        // Verified against Lean 4 v4.32.0: `simp_all [*]` is a syntax error (`unexpected token '*'`).
+        assert!(parse_source_command(b"theorem t : True := by simp_all [*, -N.rule]").is_err());
         assert!(parse_definition(b"def simp_all (n : Nat) := n").is_ok());
     }
 

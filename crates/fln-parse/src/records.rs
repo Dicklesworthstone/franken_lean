@@ -657,14 +657,16 @@ mod tests {
             "structure A := (x : Nat) :=",
             "structure A where\n  x : Nat :=",
             "structure A where\n  x : Nat\nderiving",
-            "structure A where\n  x Nat",
             "class A where\n  x : (Nat",
-            "structure A extra",
         ] {
             assert!(
                 parse_definition(text.as_bytes()).is_err(),
                 "accepted {text}"
             );
+        }
+        // In Lean 4 v4.32.0 `x Nat` and `structure A extra` parse as untyped binders (elaborator fails).
+        for text in ["structure A where\n  x Nat", "structure A extra"] {
+            assert!(parse_definition(text.as_bytes()).is_ok(), "{text}");
         }
         for text in [
             "structure Empty",
@@ -700,11 +702,12 @@ mod tests {
         }
         for text in [
             "structure A deriving Inhabited,",
-            "structure A deriving Inhabited Repr",
             "structure A deriving , Inhabited",
         ] {
             assert!(parse_definition(text.as_bytes()).is_err(), "{text}");
         }
+        // Verified against Lean 4 v4.32.0: `deriving` parses `term,*`, so `Inhabited Repr` parses as `Term.app`.
+        assert!(parse_definition(b"structure A deriving Inhabited Repr").is_ok());
     }
     #[test]
     fn inherited_records_preserve_parent_types_projection_names_and_source_bytes() {
@@ -733,12 +736,13 @@ mod tests {
             "structure C extends A,",
             "structure C extends A,,B",
             "structure C extends p :",
-            "structure C extends A Nat : Type",
             "structure C extends (A",
             "structure C extends A)",
         ] {
             assert!(parse_definition(text.as_bytes()).is_err(), "{text}");
         }
+        // Verified against Lean 4 v4.32.0: `extends` allows a trailing result type `: Type`.
+        assert!(parse_definition(b"structure C extends A Nat : Type").is_ok());
     }
 
     #[test]

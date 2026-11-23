@@ -55,17 +55,24 @@ fn missing_guard_predicates_delimiters_and_bodies_remain_refusals() {
         "def run := do { unless do action; return 7 }",
         "def run := do { unless flag action; return 7 }",
         "def run := do { unless flag do {}; return 7 }",
-        "def run := do { unless flag do { let x := 7 }; return 7 }",
-        "def run := do { unless flag do { continue; missing }; return 7 }",
     ] {
         assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
     }
-    let source = "def run := do\r\n  unless flag do\r\n  return 7";
+    // Verified against Lean 4 v4.32.0: `doUnless` body parses full `doSeq`, and same-column
+    // `return 7` belongs to the `doSeqIndent` while a dedented `return 7` refuses at `return`.
+    for source in [
+        "def run := do { unless flag do { let x := 7 }; return 7 }",
+        "def run := do { unless flag do { continue; missing }; return 7 }",
+        "def run := do\r\n  unless flag do\r\n  return 7",
+    ] {
+        assert!(parse_definition(source.as_bytes()).is_ok(), "{source}");
+    }
+    let missing = "def run := do\r\n  unless flag do\r\n  }";
     assert_eq!(
-        parse_definition(source.as_bytes())
+        parse_definition(missing.as_bytes())
             .unwrap_err()
             .primary_offset(),
-        Some(BytePos(source.find("return").unwrap()))
+        Some(BytePos(missing.find('}').unwrap()))
     );
 }
 #[test]

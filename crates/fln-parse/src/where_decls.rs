@@ -582,11 +582,13 @@ mod tests {
                 "accepted {source}"
             );
         }
+        // Verified against Lean 4 v4.32.0 (`<stdin>:3:8: error: unexpected token ':='`):
+        // `other` parses as the RHS of `make`, and the refusal lands at the trailing `:=`.
         let source = "instance f : Factory where\r\n  make _ : Nat :=\r\n  other := 1";
         let error = parse_definition(source.as_bytes()).unwrap_err();
         assert!(
-            matches!(error, NatDefinitionParseError::OutsideSeedGrammar { at, .. }
-            if at == BytePos(source.find("other").unwrap()))
+            matches!(error, NatDefinitionParseError::GeneratedParser { at, .. }
+            if at == BytePos(source.rfind(":=").unwrap()))
         );
     }
 }
