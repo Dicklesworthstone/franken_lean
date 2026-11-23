@@ -21,6 +21,8 @@ mod match_patterns;
 mod simp;
 #[path = "structures.rs"]
 mod structures;
+#[path = "symm.rs"]
+mod symm;
 
 const CLASS: &str = "prelude\nclass Mapper (A : Type) where\n  apply : A -> A";
 

@@ -240,6 +240,7 @@ pub enum SourceInferenceError {
     InvalidMacroInlineProvenance,
     InvalidInstanceBinder,
     InstanceRegistry(crate::instances::InstanceRegistryError),
+    Symm(crate::symm::SymmRegistryError),
     Option(scope::options::OptionRefusal),
     SimpSet(scope::simp::SimpSetError),
     /// The protected-declaration journal refused a tag.
@@ -565,6 +566,7 @@ impl std::fmt::Display for SourceInferenceError {
                 "instance binder must end in a registered class with inferable parameters"
             ),
             Self::InstanceRegistry(error) => write!(f, "{error}"),
+            Self::Symm(error) => write!(f, "{error}"),
             Self::SimpSet(error) => write!(f, "{error}"),
             Self::ProtectedJournal(error) => write!(f, "{error}"),
             Self::DeprecationJournal(error) => write!(f, "{error}"),

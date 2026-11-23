@@ -14,6 +14,7 @@ struct Frame {
     label: Option<String>,
     saved: SourceScope,
     public_instances: ActiveScopes,
+    public_symm: fln_elab::symm::ActiveScopes,
     imported_macros: Option<RegisteredMacros>,
 }
 #[derive(Default)]
@@ -22,6 +23,7 @@ pub(crate) struct Scopes {
     // Public and private journals have different rows and insertion positions.
     // Each namespace activation must retain the boundary in its own world.
     public_instances: ActiveScopes,
+    public_symm: fln_elab::symm::ActiveScopes,
     // Imported macro activations have the same lexical lifetime as opened
     // namespaces. The registry retains its checked owners independently of the
     // ordinary source name-resolution state.
@@ -33,6 +35,7 @@ pub(crate) struct Scopes {
 pub(crate) enum TransitionError {
     Scope(String),
     Registry(fln_elab::instances::InstanceRegistryError),
+    Symm(fln_elab::symm::SymmRegistryError),
     Macro(MacroRegistrationError),
 }
 
@@ -42,6 +45,7 @@ impl TransitionError {
         match self {
             Self::Scope(message) => message,
             Self::Registry(error) => format!("{error:?}"),
+            Self::Symm(error) => error.to_string(),
             Self::Macro(error) => error.to_string(),
         }
     }
@@ -61,6 +65,22 @@ impl TransitionError {
                     DefinitionFrontendError::Elaborate(
                         fln_elab::NatDefinitionElabError::Inference(
                             fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                        ),
+                    ),
+                )),
+            },
+            Self::Symm(fln_elab::symm::SymmRegistryError::Limit) => SourceCheckError::Limit {
+                resource: "symmetry scope entries",
+                limit: fln_elab::symm::MAX_ROWS,
+            },
+            Self::Symm(error) => SourceCheckError::Command {
+                file,
+                command,
+                offset,
+                error: Box::new(EngineExecutionError::Frontend(
+                    DefinitionFrontendError::Elaborate(
+                        fln_elab::NatDefinitionElabError::Inference(
+                            fln_elab::source::SourceInferenceError::Symm(error),
                         ),
                     ),
                 )),
@@ -110,10 +130,17 @@ impl Scopes {
                         .instance_scopes
                         .activate(env, &self.current.namespace)
                         .map_err(TransitionError::Registry)?;
+                    self.current
+                        .symm_scopes
+                        .activate(env, &self.current.namespace)
+                        .map_err(TransitionError::Symm)?;
                     if let Some(public_env) = public_env {
                         self.public_instances
                             .activate(public_env, &self.current.namespace)
                             .map_err(TransitionError::Registry)?;
+                        self.public_symm
+                            .activate(public_env, &self.current.namespace)
+                            .map_err(TransitionError::Symm)?;
                     }
                     if let Some(registry) = &self.imported_macros {
                         self.imported_macros = Some(
@@ -159,12 +186,18 @@ impl Scopes {
         self.observe_namespaces(env)
             .map_err(TransitionError::Registry)?;
         let mut public_instances = self.public_instances.clone();
+        let mut public_symm = self.public_symm.clone();
         let mut imported_macros = self.imported_macros.clone();
         let registry =
             fln_elab::instances::InstanceRegistry::read(env).map_err(TransitionError::Registry)?;
         for namespace in registry.instance_namespaces() {
             self.namespaces.insert(namespace.clone());
             self.observe(namespace);
+        }
+        for entry in fln_elab::symm::read(env).map_err(TransitionError::Symm)? {
+            if let Some(namespace) = entry.namespace {
+                self.observe_namespace(&namespace);
+            }
         }
         // The pin elaborates an open declaration left-to-right in a private
         // name-resolution state: `open Lean Elab` first makes `Lean.Elab`
@@ -177,10 +210,16 @@ impl Scopes {
                 next.instance_scopes
                     .activate(env, &namespace)
                     .map_err(TransitionError::Registry)?;
+                next.symm_scopes
+                    .activate(env, &namespace)
+                    .map_err(TransitionError::Symm)?;
                 if let Some(public_env) = public_env {
                     public_instances
                         .activate(public_env, &namespace)
                         .map_err(TransitionError::Registry)?;
+                    public_symm
+                        .activate(public_env, &namespace)
+                        .map_err(TransitionError::Symm)?;
                 }
                 if let Some(registry) = &imported_macros {
                     imported_macros = Some(
@@ -196,6 +235,7 @@ impl Scopes {
         }
         self.current = next;
         self.public_instances = public_instances;
+        self.public_symm = public_symm;
         self.imported_macros = imported_macros;
         Ok(())
     }
@@ -228,6 +268,7 @@ impl Scopes {
     pub fn public_scope(&self) -> SourceScope {
         let mut scope = self.current.clone();
         scope.instance_scopes = self.public_instances.clone();
+        scope.symm_scopes = self.public_symm.clone();
         scope
     }
 
@@ -238,8 +279,20 @@ impl Scopes {
         let mut scope = self.current.for_command_source(source)?;
         if scope.exports_declaration() {
             scope.instance_scopes = self.public_instances.clone();
+            scope.symm_scopes = self.public_symm.clone();
         }
         Ok(scope)
+    }
+
+    /// Commit the two lexical successors only after their enclosing metadata
+    /// command and public projection have both succeeded.
+    pub(super) fn set_symm_scopes(
+        &mut self,
+        private: fln_elab::symm::ActiveScopes,
+        public: fln_elab::symm::ActiveScopes,
+    ) {
+        self.current.symm_scopes = private;
+        self.public_symm = public;
     }
 
     /// `open Ns (a b …)`: each name with the one declaration `ns ++ name` it denotes among the
@@ -420,6 +473,7 @@ impl Scopes {
     pub(super) fn from_checked_prefix(
         current: SourceScope,
         public_instances: ActiveScopes,
+        public_symm: fln_elab::symm::ActiveScopes,
         env: &Environment,
         max_names: usize,
         max_name_bytes: usize,
@@ -427,6 +481,7 @@ impl Scopes {
         let mut scopes = Self {
             current,
             public_instances,
+            public_symm,
             ..Self::default()
         };
         for (index, (name, _)) in env.constants().enumerate() {
@@ -489,9 +544,11 @@ impl Scopes {
         env: &Environment,
         public_env: Option<&Environment>,
     ) -> Result<(), TransitionError> {
+        let mut instances = self.current.instance_scopes.clone();
+        let mut public_instances = self.public_instances.clone();
+        let mut symm = self.current.symm_scopes.clone();
+        let mut public_symm = self.public_symm.clone();
         if let Some((name, priority)) = &batch.local_instance {
-            let mut instances = self.current.instance_scopes.clone();
-            let mut public_instances = self.public_instances.clone();
             instances
                 .register_local(env, name, *priority)
                 .map_err(TransitionError::Registry)?;
@@ -500,9 +557,21 @@ impl Scopes {
                     .register_local(public_env, name, *priority)
                     .map_err(TransitionError::Registry)?;
             }
-            self.current.instance_scopes = instances;
-            self.public_instances = public_instances;
         }
+        for lemma in &batch.local_symm {
+            symm.register_local(env, lemma.clone())
+                .map_err(TransitionError::Symm)?;
+            if let Some(public_env) = public_env
+                && public_env.contains(&lemma.declaration)
+            {
+                public_symm
+                    .register_local(public_env, lemma.clone())
+                    .map_err(TransitionError::Symm)?;
+            }
+        }
+        self.current.instance_scopes = instances;
+        self.public_instances = public_instances;
+        self.set_symm_scopes(symm, public_symm);
         for row in &batch.admissions {
             self.admitted(&row.declaration);
         }
@@ -615,6 +684,9 @@ impl Scopes {
             ScopeCommand::Executable(_) => {
                 return Err("executable attributes require an environment transition".into());
             }
+            ScopeCommand::Symm(_) => {
+                return Err("symmetry attributes require a checked environment transition".into());
+            }
             ScopeCommand::OpenScoped(_) => {
                 return Err("scoped opening requires an environment transition".into());
             }
@@ -649,6 +721,7 @@ impl Scopes {
                         label: Some(part.clone()),
                         saved: self.current.clone(),
                         public_instances: self.public_instances.clone(),
+                        public_symm: self.public_symm.clone(),
                         imported_macros: self.imported_macros.clone(),
                     });
                     if namespace {
@@ -662,6 +735,7 @@ impl Scopes {
                     label: None,
                     saved: self.current.clone(),
                     public_instances: self.public_instances.clone(),
+                    public_symm: self.public_symm.clone(),
                     imported_macros: self.imported_macros.clone(),
                 });
             }
@@ -688,6 +762,7 @@ impl Scopes {
                         label,
                         saved: self.current.clone(),
                         public_instances: self.public_instances.clone(),
+                        public_symm: self.public_symm.clone(),
                         imported_macros: self.imported_macros.clone(),
                     });
                     self.current.public_declarations |= public;
@@ -717,6 +792,7 @@ impl Scopes {
                     let frame = self.stack.pop().expect("validated end depth");
                     self.current = frame.saved;
                     self.public_instances = frame.public_instances;
+                    self.public_symm = frame.public_symm;
                     self.imported_macros = frame.imported_macros;
                 }
             }

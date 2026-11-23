@@ -19,6 +19,8 @@ mod reducibility;
 mod simp;
 #[path = "imported/structures.rs"]
 mod structures;
+#[path = "imported/symm.rs"]
+mod symm;
 
 #[derive(Default)]
 struct ReflexivityTags {
@@ -152,6 +154,8 @@ pub struct SourceMetadataReport {
     pub unbox: usize,
     /// Owned exposed definitions carrying the pin's `[match_pattern]` tag.
     pub match_patterns: usize,
+    /// Ordered symmetry registrations, including dormant scoped rows.
+    pub symms: usize,
     /// `@[defeq]` tags (the pin's `Lean.defeqAttr`), which select `dsimp`'s rfl lemmas.
     pub defeq: usize,
     /// Backward-definitional tags, retained independently so an imported
@@ -497,6 +501,12 @@ pub enum SourceOleanImportError {
         declaration: Name,
         reason: &'static str,
     },
+    /// Preserve unsupported symmetry-header reductions separately from invalid
+    /// registrations; neither is evidence that a checked theorem is false.
+    Symm {
+        module: Name,
+        error: fln_elab::symm::SymmRegistryError,
+    },
     Internal(&'static str),
 }
 impl std::fmt::Display for SourceOleanImportError {
@@ -539,6 +549,11 @@ impl std::fmt::Display for SourceOleanImportError {
                 module.to_display_string(),
                 declaration.to_display_string()
             ),
+            Self::Symm { module, error } => write!(
+                f,
+                "module {} symmetry metadata: {error}",
+                module.to_display_string(),
+            ),
             Self::Internal(reason) => write!(f, "source import invariant: {reason}"),
         }
     }
@@ -550,6 +565,10 @@ impl SourceOleanImportError {
     pub fn metadata_resource_exhausted(&self) -> bool {
         match self {
             Self::Limit(_)
+            | Self::Symm {
+                error: fln_elab::symm::SymmRegistryError::Limit,
+                ..
+            }
             | Self::Registry {
                 error: InstanceRegistryError::Limit,
                 ..
@@ -1058,6 +1077,7 @@ fn prepare_source_metadata_view(
             Name::from_components(metadata::REDUCIBILITY_EXTRA_EXTENSION.split('.')),
             Name::from_components(metadata::UNBOX_EXTENSION.split('.')),
             Name::from_components(metadata::MATCH_PATTERN_EXTENSION.split('.')),
+            Name::from_components(metadata::SYMM_EXTENSION.split('.')),
         ])
         .collect();
     let mut blocks: Vec<_> = selected
@@ -1127,6 +1147,7 @@ fn prepare_source_metadata_view(
             noncomputable: 0,
             unbox: 0,
             match_patterns: 0,
+            symms: 0,
             defeq: 0,
             backward_defeq: 0,
             structures: 0,
@@ -1225,6 +1246,7 @@ fn prepare_source_metadata_view(
                     22 => report.reducibility_extra = entries.len(),
                     23 => report.unbox = entries.len(),
                     24 => report.match_patterns = entries.len(),
+                    25 => report.symms = entries.len(),
                     _ => {
                         return Err(SourceOleanImportError::Internal(
                             "unknown selected metadata kind",
@@ -1396,6 +1418,9 @@ impl Engine {
         let mut noncomputable = decoded.noncomputable.into_iter();
         let mut unbox = decoded.unbox.into_iter();
         let mut match_patterns = decoded.match_patterns.into_iter();
+        let mut symm_scopes =
+            symm::Scopes::new(&checked, &decoded.symms, limits.metadata.max_objects)?;
+        let mut symms = decoded.symms.into_iter();
         let mut defeq = decoded.defeq.into_iter();
         let mut backward_defeq = decoded.backward_defeq.into_iter();
         let mut pp_anonymous_constructor = decoded.pp_anonymous_constructor.into_iter();
@@ -1901,6 +1926,29 @@ impl Engine {
                         reducibility::error(&report.module, &row.declaration, error)
                     })?;
             }
+            // Header validation observes the module's imported reducibility policies.
+            for _ in 0..report.symms {
+                cancelled!("source-olean/symm");
+                let row = symms.next().ok_or(SourceOleanImportError::Internal(
+                    "symmetry count changed during decode",
+                ))?;
+                symm_scopes.validate_row(
+                    &checked,
+                    &self.environment,
+                    activation.environment(),
+                    index,
+                    &row,
+                )?;
+                activation = activation
+                    .register_symm(fln_elab::symm::SymmEntry {
+                        lemma: fln_elab::symm::SymmLemma {
+                            declaration: row.declaration,
+                            keys: row.keys.into_iter().map(instance_key).collect(),
+                        },
+                        namespace: row.scope,
+                    })
+                    .map_err(|error| symm::error(&report.module, error))?;
+            }
             if report.externs != 0 {
                 cancelled!("source-olean/extern-owner-index");
                 let mut owners = AttributeOwners::new(
@@ -2059,6 +2107,8 @@ impl Engine {
         fln_elab::match_pattern::read(&engine.environment).map_err(|error| {
             match_pattern_error(&roots.first().cloned().unwrap_or_default(), error)
         })?;
+        fln_elab::symm::read(&engine.environment)
+            .map_err(|error| symm::error(&roots.first().cloned().unwrap_or_default(), error))?;
         fln_elab::macro_inline::read(&engine.environment).map_err(|_| {
             SourceOleanImportError::Metadata {
                 module: roots.first().cloned().unwrap_or_default(),
@@ -2100,6 +2150,7 @@ impl Engine {
             || noncomputable.next().is_some()
             || unbox.next().is_some()
             || match_patterns.next().is_some()
+            || symms.next().is_some()
             || defeq.next().is_some()
             || backward_defeq.next().is_some()
             || pp_anonymous_constructor.next().is_some()
@@ -2402,6 +2453,10 @@ trait Registrar: Sized {
         self,
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::match_pattern::MatchPatternError>;
+    fn register_symm(
+        self,
+        entry: fln_elab::symm::SymmEntry,
+    ) -> std::result::Result<Self, fln_elab::symm::SymmRegistryError>;
     fn register_defeq(
         self,
         declaration: &Name,
@@ -2518,6 +2573,12 @@ impl Registrar for instances::imported::ImportActivation {
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::match_pattern::MatchPatternError> {
         self.register_match_pattern(declaration)
+    }
+    fn register_symm(
+        self,
+        entry: fln_elab::symm::SymmEntry,
+    ) -> std::result::Result<Self, fln_elab::symm::SymmRegistryError> {
+        self.register_symm(entry)
     }
     fn register_defeq(
         self,
@@ -4370,6 +4431,12 @@ pub(super) mod tests {
             declaration: &Name,
         ) -> std::result::Result<Self, fln_elab::match_pattern::MatchPatternError> {
             fln_elab::match_pattern::register(&self.0, declaration).map(Sequential)
+        }
+        fn register_symm(
+            self,
+            entry: fln_elab::symm::SymmEntry,
+        ) -> std::result::Result<Self, fln_elab::symm::SymmRegistryError> {
+            fln_elab::symm::register(&self.0, entry).map(Sequential)
         }
         fn register_defeq(
             self,

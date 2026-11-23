@@ -636,6 +636,7 @@ impl<'a> PublicWorld<'a> {
         checked.engine = engine.clone();
         checked.result_logical_root = engine.logical_root(options);
         checked.local_instance = staged.public.local_instance;
+        checked.local_symm = staged.public.local_symm;
         if !equations.admissions.is_empty() {
             equations.admissions.append(&mut checked.admissions);
             checked.admissions = equations.admissions;
@@ -761,6 +762,90 @@ impl<'a> PublicWorld<'a> {
         let mut next = private.clone();
         next.environment = next_private;
         self.engine = next_public;
+        Ok(Outcome::Complete(next))
+    }
+
+    /// Preserve the private command's exact insertion order while exporting its
+    /// public subset. Replaying that subset into the private journal would add
+    /// synthetic duplicate rows and move local activation boundaries.
+    pub(crate) fn publish_symm_attributes(
+        &mut self,
+        private: &Engine,
+        next_private: Environment,
+        next_public: Environment,
+    ) -> Result<Outcome<Engine>, EngineExecutionError> {
+        let cancelled =
+            || Outcome::Inconclusive(Inconclusive::cancelled("source-module/symm-attributes"));
+        if self
+            .cancellation
+            .is_some_and(CancellationProbe::is_cancelled)
+        {
+            return Ok(cancelled());
+        }
+        let journal = fln_elab::symm::journal_name();
+        // Charge before decoding; all four snapshots are bounded journals, and
+        // each prefix validation must account for the rows and bytes it reads.
+        for environment in [
+            private.environment(),
+            &next_private,
+            self.engine.environment(),
+            &next_public,
+        ] {
+            if let Some(extension) = environment.extension(&journal) {
+                self.meter.work(extension.len()).map_err(execution_error)?;
+                for entry in extension.entries() {
+                    self.meter
+                        .bytes(entry.payload.len())
+                        .map_err(execution_error)?;
+                }
+            }
+        }
+        let registry_error = |error| {
+            execution_error(match error {
+                fln_elab::symm::SymmRegistryError::Limit => SourceModuleCheckError::Limit {
+                    resource: "module work",
+                    limit: self.meter.limits.max_work,
+                },
+                _ => SourceModuleCheckError::Extension {
+                    module: self.module.clone(),
+                    extension: journal.clone(),
+                    reason: "symmetry attributes require checked chronological journals",
+                },
+            })
+        };
+        let before = fln_elab::symm::read(private.environment()).map_err(registry_error)?;
+        let after = fln_elab::symm::read(&next_private).map_err(registry_error)?;
+        let public_before =
+            fln_elab::symm::read(self.engine.environment()).map_err(registry_error)?;
+        let public_after = fln_elab::symm::read(&next_public).map_err(registry_error)?;
+        if !after.starts_with(&before) || !public_after.starts_with(&public_before) {
+            return Err(registry_error(fln_elab::symm::SymmRegistryError::Malformed));
+        }
+        let exported: Vec<_> = after[before.len()..]
+            .iter()
+            .filter(|entry| self.engine.environment().contains(&entry.lemma.declaration))
+            .cloned()
+            .collect();
+        if public_after[public_before.len()..] != exported {
+            return Err(registry_error(fln_elab::symm::SymmRegistryError::Malformed));
+        }
+        replay::Export::capture(
+            &self.module,
+            self.engine.environment(),
+            &next_public,
+            Vec::new(),
+            self.meter,
+        )
+        .map_err(execution_error)?;
+        if self
+            .cancellation
+            .is_some_and(CancellationProbe::is_cancelled)
+        {
+            return Ok(cancelled());
+        }
+        let mut next = private.clone();
+        next.environment = next_private;
+        self.engine.environment = next_public;
         Ok(Outcome::Complete(next))
     }
 

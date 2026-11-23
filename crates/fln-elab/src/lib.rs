@@ -50,6 +50,7 @@ pub mod reducibility;
 pub mod scheduler;
 pub mod seed;
 pub mod source;
+pub mod symm;
 pub mod tactic_macros;
 pub mod txn;
 pub mod unbox;

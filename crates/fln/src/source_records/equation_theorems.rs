@@ -155,6 +155,7 @@ impl Engine {
             result_logical_root,
             admissions,
             local_instance: None,
+            local_symm: Vec::new(),
         })))
     }
 }
@@ -171,6 +172,7 @@ pub(crate) fn push_command_admission(
             last.admission.result_logical_root = row.admission.result_logical_root;
             last.admission.admissions.extend(row.admission.admissions);
             last.admission.local_instance = row.admission.local_instance;
+            last.admission.local_symm = row.admission.local_symm;
         }
         _ => rows.push(row),
     }

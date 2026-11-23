@@ -771,6 +771,28 @@ fn build(
     })
 }
 
+pub(super) fn parse_symm(
+    view: &SourceView,
+    tokens: &[LexedToken],
+) -> Result<Option<Syntax>, DefinitionParseError> {
+    let requested = tokens
+        .iter()
+        .skip(2)
+        .take_while(|token| !matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "]"))
+        .any(|token| view.normalized().span_str(token.extent) == Some("symm"));
+    if !requested {
+        return Ok(None);
+    }
+    let mut reader = AttributeReader {
+        view,
+        tokens,
+        at: 0,
+    };
+    let shape = reader.command()?;
+    let leaves = Leaves::build(view.normalized(), tokens)?;
+    build(&shape, &leaves, view, tokens).map(Some)
+}
+
 pub(super) fn parse_executable(
     view: &SourceView,
     tokens: &[LexedToken],

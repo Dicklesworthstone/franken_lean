@@ -6,6 +6,7 @@ pub(crate) mod instance_attributes;
 pub mod modules;
 mod reducibility;
 pub(crate) mod scopes;
+mod symm;
 
 pub(crate) fn source_site(
     source: &[u8],
@@ -351,6 +352,9 @@ pub(crate) fn apply_control_command(
                 offset,
             )?;
         }
+        ScopeCommand::Symm(syntax) => {
+            return symm::apply_private(engine, scope, &syntax, limits, position);
+        }
         ScopeCommand::Reducibility(attribute) => {
             engine.environment =
                 reducibility::apply(engine.environment(), file_base, scope, attribute, position)?;
@@ -526,6 +530,16 @@ pub(crate) fn apply_module_control_command(
         }
         engine.environment = environment;
         return Ok(Outcome::Complete(Vec::new()));
+    }
+    if let ScopeCommand::Symm(syntax) = &control {
+        return symm::apply_module(
+            engine,
+            scopes,
+            syntax,
+            limits,
+            position,
+            public.as_deref_mut(),
+        );
     }
     // `attribute [local simp] x`: a rule of `simp`'s default set until the enclosing scope ends,
     // validated as a registered rule is, and never globally registered. Lazy
@@ -711,6 +725,7 @@ pub(crate) fn apply_module_control_command(
             | ScopeCommand::Instance(_)
             | ScopeCommand::Reducibility(_)
             | ScopeCommand::Executable(_)
+            | ScopeCommand::Symm(_)
             | ScopeCommand::Simp(_)
     ) {
         scopes

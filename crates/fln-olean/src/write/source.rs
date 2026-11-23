@@ -8,7 +8,7 @@ use crate::source_extension_format as layout;
 use crate::source_extensions::{
     AliasEntry, ClassEntry, DefaultEntry, DiscrTreeKey, ExternAttribute, ExternEntry,
     ImplementedByEntry, InlineEntry, InstanceEntry, ReducibilityEntry, ReducibilityExtraEntry,
-    SimpEntry, SimpKind, SimpTheorem, StructureEntry, StructureField, StructureParent,
+    SimpEntry, SimpKind, SimpTheorem, StructureEntry, StructureField, StructureParent, SymmEntry,
 };
 use std::collections::HashSet;
 
@@ -22,6 +22,7 @@ mod namespaces;
 mod reducibility;
 mod simp;
 mod structures;
+mod symm;
 
 pub use compiler::{CompilerData, CompilerSignature};
 
@@ -55,6 +56,9 @@ pub struct SourceMetadata {
     /// Owned exposed definitions carrying `[match_pattern]`, sorted by `Name.quickLt`.
     /// These tags only select bodies for ordinary checked pattern elaboration.
     pub match_patterns: Vec<Name>,
+    /// Chronological global/scoped symmetry registrations with their original paths.
+    /// Targets may be dependency declarations and repeated entries remain ordered.
+    pub symms: Vec<SymmEntry>,
     /// Owned plain `pp_using_anonymous_constructor` tags, sorted by `Name.quickLt`.
     pub pp_anonymous_constructor: Vec<Name>,
     /// Owned definitional-equality tags. The pin's defeq attribute also records
@@ -161,6 +165,9 @@ impl Encoder {
         }
         if !metadata.simp.is_empty() {
             blocks.push(self.simp_block(&metadata.simp)?);
+        }
+        if !metadata.symms.is_empty() {
+            blocks.push(self.symm_block(&metadata.symms)?);
         }
         if !metadata.aliases.is_empty() {
             blocks.push(self.alias_block(&metadata.aliases)?);

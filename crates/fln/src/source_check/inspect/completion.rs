@@ -213,6 +213,12 @@ impl SourceModuleSession {
                                 .as_ref()
                                 .map(|scope| scope.instance_scopes.clone())
                                 .unwrap_or_default(),
+                            checked
+                                .checked
+                                .public_scope
+                                .as_ref()
+                                .map(|scope| scope.symm_scopes.clone())
+                                .unwrap_or_default(),
                             checked.checked.checked.engine.environment(),
                             limits.max_candidates,
                             limits.max_name_bytes,

@@ -729,6 +729,16 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain a global/scoped symmetry row after the importer has validated its
+    /// declaration and key names in the recording module's checked import closure.
+    pub fn register_symm(
+        mut self,
+        entry: crate::symm::SymmEntry,
+    ) -> Result<Self, crate::symm::SymmRegistryError> {
+        self.env = crate::symm::register(&self.env, entry)?;
+        Ok(self)
+    }
+
     /// Record an imported `@[defeq]` tag
     /// ([`crate::source::scope::simp::defeq::register_imported`]). The tag journal is
     /// not one this activation keeps or reads.

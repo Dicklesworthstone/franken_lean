@@ -22,7 +22,7 @@ pub use format::{
     IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION, INSTANCE_EXTENSION, MATCH_PATTERN_EXTENSION,
     NONCOMPUTABLE_EXTENSION, PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION,
     PROTECTED_EXTENSION, REDUCIBILITY_EXTENSION, REDUCIBILITY_EXTRA_EXTENSION, SIMP_EXTENSION,
-    STRUCTURE_EXTENSION, UNBOX_EXTENSION,
+    STRUCTURE_EXTENSION, SYMM_EXTENSION, UNBOX_EXTENSION,
 };
 mod deprecations;
 pub use deprecations::DeprecationEntry;
@@ -99,6 +99,16 @@ pub struct DefaultEntry {
     pub class: Name,
     pub declaration: Name,
     pub priority: u32,
+}
+
+/// A chronological `symmExt` registration. Stored paths are selection metadata,
+/// not proof authority; imported targets may belong to checked dependencies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymmEntry {
+    pub declaration: Name,
+    pub keys: Vec<DiscrTreeKey>,
+    /// Scoped registrations remain dormant until their namespace is activated.
+    pub scope: Option<Name>,
 }
 
 /// An `export` alias: `alias` names `declaration`. The pin's `export A (x)` in
@@ -198,6 +208,8 @@ pub struct SourceExtensions {
     /// Definitions marked for pattern expansion, still awaiting checked ownership
     /// and visible-body validation before a source consumer can unfold them.
     pub match_patterns: Vec<Name>,
+    /// Global/scoped symmetry registrations, including repeated rows, in source order.
+    pub symms: Vec<SymmEntry>,
     /// The pin's defeq attribute tags, not evidence that an equation is true.
     /// Source activation must bind names to their checked owning module; each
     /// use still requires conversion and ordinary proof checking.
@@ -474,6 +486,28 @@ impl Reader {
             keys: self.keys(&field(&entry, format::INSTANCE_KEYS)?)?,
         })
     }
+    fn symm(&mut self, obj: &Obj) -> Result<SymmEntry, DecodeError> {
+        if obj.is_scalar() {
+            return Err(shape("symmetry entry lacks its scope wrapper"));
+        }
+        let (scope, entry) = match obj.obj_tag() as u8 {
+            format::SCOPE_GLOBAL => {
+                constructor(obj, format::SCOPE_GLOBAL, 1)?;
+                (None, field(obj, 0)?)
+            }
+            format::SCOPE_SCOPED => {
+                constructor(obj, format::SCOPE_SCOPED, 2)?;
+                (Some(self.name(&field(obj, 0)?)?), field(obj, 1)?)
+            }
+            _ => return Err(shape("unknown symmetry scope tag")),
+        };
+        constructor(&entry, 0, format::PROD_POINTERS)?;
+        Ok(SymmEntry {
+            declaration: self.name(&field(&entry, format::PROD_FST)?)?,
+            keys: self.keys(&field(&entry, format::PROD_SND)?)?,
+            scope,
+        })
+    }
     /// `Name × InlineAttributeKind`, the same Prod as a reducibility entry.
     fn inline(&mut self, obj: &Obj) -> Result<InlineEntry, DecodeError> {
         constructor(obj, 0, format::PROD_POINTERS)?;
@@ -682,6 +716,7 @@ fn decode_batch(
         name(format::REDUCIBILITY_EXTRA_EXTENSION),
         name(format::UNBOX_EXTENSION),
         name(format::MATCH_PATTERN_EXTENSION),
+        name(format::SYMM_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -858,7 +893,8 @@ fn decode_batch(
                     }
                     out.match_patterns.push(declaration);
                 }
-                _ => unreachable!("twenty-five selected extension families"),
+                25 => out.symms.push(reader.symm(&obj)?),
+                _ => unreachable!("twenty-six selected extension families"),
             }
         }
     }

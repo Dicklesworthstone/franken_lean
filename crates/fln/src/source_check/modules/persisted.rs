@@ -474,6 +474,7 @@ impl SourceModuleRecord {
             fln_elab::noncomputable::journal_name(),
             fln_elab::unbox::journal_name(),
             fln_elab::match_pattern::journal_name(),
+            fln_elab::symm::journal_name(),
             fln_elab::delaborator_tags::source_journal_name(),
             fln_elab::source::scope::simp::export::journal_name(),
             fln_elab::source::scope::simp::defeq::journal_name(),

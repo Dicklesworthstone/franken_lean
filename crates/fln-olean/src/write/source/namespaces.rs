@@ -52,6 +52,7 @@ impl Encoder {
         namespaces: &[Name],
         instances: &[InstanceEntry],
         simp: &[SimpEntry],
+        symms: &[SymmEntry],
     ) -> WResult<Vec<Name>> {
         let mut names = HashSet::new();
         for mut namespace in constants
@@ -63,6 +64,7 @@ impl Encoder {
                     .filter_map(|instance| instance.scope.clone()),
             )
             .chain(simp.iter().filter_map(|entry| entry.scope.clone()))
+            .chain(symms.iter().filter_map(|entry| entry.scope.clone()))
         {
             while !namespace.is_anonymous() {
                 // Every previous walk finished its ancestor chain. A shared
@@ -109,6 +111,7 @@ pub(super) fn encode(
         &metadata.namespaces,
         &metadata.instances,
         &metadata.simp,
+        &metadata.symms,
     )?;
     if namespaces.is_empty() {
         return if metadata.classes.is_empty()
@@ -121,6 +124,7 @@ pub(super) fn encode(
             && metadata.noncomputable.is_empty()
             && metadata.unbox.is_empty()
             && metadata.match_patterns.is_empty()
+            && metadata.symms.is_empty()
             && metadata.pp_anonymous_constructor.is_empty()
             && metadata.defeq.is_empty()
             && metadata.backward_defeq.is_empty()
@@ -265,7 +269,7 @@ mod tests {
             row(None),
         ];
         let actual = encoder
-            .declaration_namespaces(&[], &[], &rows, &[])
+            .declaration_namespaces(&[], &[], &rows, &[], &[])
             .unwrap();
         let mut expected = vec![
             name("Feature"),
@@ -287,7 +291,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            limited.declaration_namespaces(&[], &[], &rows, &[]),
+            limited.declaration_namespaces(&[], &[], &rows, &[], &[]),
             Err(WriteError::Budget {
                 resource: WriteResource::Objects,
                 ..
@@ -306,7 +310,7 @@ mod tests {
         expected.sort_by(Name::quick_cmp);
         assert_eq!(
             encoder
-                .declaration_namespaces(&constants, &[], &[], &[])
+                .declaration_namespaces(&constants, &[], &[], &[], &[])
                 .unwrap(),
             expected
         );
@@ -314,7 +318,7 @@ mod tests {
         reversed.reverse();
         assert_eq!(
             encoder
-                .declaration_namespaces(&reversed, &[], &[], &[])
+                .declaration_namespaces(&reversed, &[], &[], &[], &[])
                 .unwrap(),
             expected
         );
@@ -326,7 +330,7 @@ mod tests {
         let constants = [constant(Name::str(parent.clone(), "value"))];
         let mut encoder = Encoder::new(WriteBudget::default(), 2).unwrap();
         let namespaces = encoder
-            .declaration_namespaces(&constants, &[], &[], &[])
+            .declaration_namespaces(&constants, &[], &[], &[], &[])
             .unwrap();
         assert!(namespaces.contains(&parent));
         assert!(namespaces.contains(&Name::str(Name::anonymous(), "A.B")));
@@ -488,13 +492,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             encoder
-                .declaration_namespaces(&[], &[Name::anonymous()], &[], &[])
+                .declaration_namespaces(&[], &[Name::anonymous()], &[], &[], &[])
                 .unwrap(),
             vec![Name::anonymous()]
         );
         assert!(
             encoder
-                .declaration_namespaces(&[], &[name("A")], &[], &[])
+                .declaration_namespaces(&[], &[name("A")], &[], &[], &[])
                 .is_err()
         );
     }
@@ -511,7 +515,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            limited.declaration_namespaces(&constants, &[], &[], &[]),
+            limited.declaration_namespaces(&constants, &[], &[], &[], &[]),
             Err(WriteError::Budget {
                 resource: WriteResource::Objects,
                 ..
@@ -520,7 +524,7 @@ mod tests {
         let fresh = Encoder::new(WriteBudget::default(), 2).unwrap();
         assert_eq!(
             fresh
-                .declaration_namespaces(&constants, &[], &[], &[])
+                .declaration_namespaces(&constants, &[], &[], &[], &[])
                 .unwrap()
                 .len(),
             4

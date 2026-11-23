@@ -225,6 +225,7 @@ impl PublicWorld<'_> {
             result_logical_root: staged.private.logical_root(options),
             admissions: staged.admissions,
             local_instance: None,
+            local_symm: Vec::new(),
         };
         self.engine = staged.public;
         self.declarations.extend(staged.declarations);

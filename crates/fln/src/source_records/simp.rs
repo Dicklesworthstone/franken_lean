@@ -65,6 +65,7 @@ impl Engine {
             result_logical_root: root,
             admissions: Vec::new(),
             local_instance: None,
+            local_symm: Vec::new(),
         };
         let mut equations = Vec::new();
         let mut pattern_equations = false;

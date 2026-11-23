@@ -23,6 +23,7 @@ impl SourceDeclarationAdmission {
             result_logical_root: self.result_logical_root,
             admissions: self.admissions,
             local_instance: None,
+            local_symm: Vec::new(),
         }
     }
 }
@@ -138,6 +139,7 @@ impl Engine {
             result_logical_root: primary.result_logical_root,
             admissions: vec![primary],
             local_instance: None,
+            local_symm: Vec::new(),
         };
         Ok(self
             .finish_local_function_batch(batch, helpers, options, limits)?

@@ -8,6 +8,7 @@ mod reserved;
 pub use reserved::is_reserved as is_reserved_name;
 pub(in crate::source) use reserved::structurally_recursive;
 pub mod simp;
+pub mod symm;
 pub mod variables;
 pub(super) mod visibility;
 use crate::aliases::AliasTable;
@@ -88,6 +89,9 @@ pub struct SourceScope {
     pub universes: Vec<Name>,
     pub variables: variables::SectionVariables,
     pub instance_scopes: crate::instances::scoped::ActiveScopes,
+    /// Symmetry lemmas activated by namespaces or selected by local attributes.
+    /// Their journal offsets belong to the current public or private world.
+    pub symm_scopes: crate::symm::ActiveScopes,
     /// `attribute [local simp] x`'s rules, in order: `simp`'s default set until this scope ends.
     /// They are never registered, as the pin keeps local attributes out of the `.olean`.
     pub local_simp: Vec<simp::SimpEntry>,
@@ -137,6 +141,7 @@ impl PartialEq for SourceScope {
             universes,
             variables,
             instance_scopes,
+            symm_scopes,
             local_simp,
             local_reducibility,
             frontier_recursors,
@@ -159,6 +164,7 @@ impl PartialEq for SourceScope {
             && universes == &other.universes
             && variables == &other.variables
             && instance_scopes == &other.instance_scopes
+            && symm_scopes == &other.symm_scopes
             && local_simp == &other.local_simp
             && local_reducibility == &other.local_reducibility
             && frontier_recursors == &other.frontier_recursors
@@ -1296,6 +1302,7 @@ mod tests {
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+            symm_scopes: crate::symm::ActiveScopes::default(),
             local_simp: Vec::new(),
             local_reducibility: crate::reducibility::LocalReducibility::default(),
             frontier_recursors: false,
@@ -1495,6 +1502,7 @@ mod tests {
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+            symm_scopes: crate::symm::ActiveScopes::default(),
             local_simp: Vec::new(),
             local_reducibility: crate::reducibility::LocalReducibility::default(),
             frontier_recursors: false,
@@ -1577,6 +1585,7 @@ mod tests {
             universes: vec![],
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
+            symm_scopes: crate::symm::ActiveScopes::default(),
             local_simp: Vec::new(),
             local_reducibility: crate::reducibility::LocalReducibility::default(),
             frontier_recursors: false,

@@ -395,6 +395,15 @@ impl Engine {
                 // `[macro_inline]` on a member of a recursive group (`isValidMacroInline`);
                 // refuse it on any member here rather than drop it.
                 for member in &members {
+                    if !fln_elab::source::scope::symm::registrations(member)
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?
+                        .is_empty()
+                    {
+                        return Err(EngineExecutionError::NotImplemented {
+                            feature: "symmetry registration on a member of a mutual declaration",
+                        });
+                    }
                     if fln_elab::source::scope::simp::macro_inline_requested(member)
                         .map_err(DefinitionFrontendError::Elaborate)
                         .map_err(EngineExecutionError::Frontend)?
@@ -459,6 +468,7 @@ impl Engine {
                                 result_logical_root: root,
                                 admissions: Vec::new(),
                                 local_instance: None,
+                                local_symm: Vec::new(),
                             })
                         }
                         Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
@@ -858,6 +868,9 @@ impl Engine {
         let executable = fln_elab::source::scope::executable::registrations(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let symm = fln_elab::source::scope::symm::registrations(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let noncomputable = fln_elab::source::noncomputable_registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -1004,6 +1017,27 @@ impl Engine {
                     };
                     batch.engine.environment =
                         tag_executable(&batch.engine, &admitted.declaration, scope, &executable)?;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
+                if !symm.is_empty() {
+                    let [admitted] = batch.admissions.as_slice() else {
+                        return Err(EngineExecutionError::UnexpectedPublication {
+                            detail: "symmetry metadata requires one checked declaration",
+                        });
+                    };
+                    let (environment, local) = match tag_symm(
+                        &batch.engine,
+                        &admitted.declaration,
+                        scope,
+                        &symm,
+                        limits.kernel,
+                    )? {
+                        Outcome::Complete(value) => value,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    batch.engine.environment = environment;
+                    batch.local_symm = local;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
                 if let Some(declared) = batch
@@ -1241,6 +1275,15 @@ impl Engine {
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         if fln_elab::source::partial::is_partial(parsed.syntax()) {
+            if !fln_elab::source::scope::symm::registrations(parsed.syntax())
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?
+                .is_empty()
+            {
+                return Err(EngineExecutionError::NotImplemented {
+                    feature: "symmetry registration on a partial declaration",
+                });
+            }
             let declarations = match elaboration_outcome(fln_elab::source::partial::elaborate(
                 parsed.syntax(),
                 self.environment(),
@@ -1295,6 +1338,10 @@ impl Engine {
                 || fln_elab::source::instance_registration_is_local(parsed.syntax())
                     .map_err(DefinitionFrontendError::Elaborate)
                     .map_err(EngineExecutionError::Frontend)?
+                || fln_elab::source::scope::symm::registrations(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?
+                    .contains(&fln_elab::source::scope::symm::Kind::Local)
             {
                 let elaborated = match elaboration_outcome(
                     fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
@@ -1552,6 +1599,7 @@ impl Engine {
                 result_logical_root: root,
                 admissions: Vec::new(),
                 local_instance: None,
+                local_symm: Vec::new(),
             },
             (&request.handlers, &request.targets),
             names,
@@ -1966,6 +2014,40 @@ pub(crate) fn tag_executable(
     fln_elab::source::scope::executable::apply(engine.environment(), scope, name, rows, false)
         .map_err(DefinitionFrontendError::Elaborate)
         .map_err(EngineExecutionError::Frontend)
+}
+
+/// Compile metadata from the exact admitted type. Keep local registrations in
+/// the source receipt so only the caller's successful lexical batch selects them.
+pub(crate) fn tag_symm(
+    engine: &Engine,
+    declaration: &Declaration,
+    scope: &fln_elab::source::scope::SourceScope,
+    kinds: &[fln_elab::source::scope::symm::Kind],
+    kernel: Budget,
+) -> Result<Outcome<(Environment, Vec<fln_elab::symm::SymmLemma>)>, EngineExecutionError> {
+    use fln_elab::source::scope::symm;
+    let name = declared_name(declaration).ok_or(EngineExecutionError::UnexpectedPublication {
+        detail: "symmetry metadata requires one checked constant",
+    })?;
+    let lemma = match elaboration_outcome(symm::compile(engine.environment(), scope, name, kernel))?
+    {
+        Outcome::Complete(lemma) => lemma,
+        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+    };
+    let mut scope = scope.clone();
+    let environment =
+        match elaboration_outcome(symm::apply(engine.environment(), &mut scope, &lemma, kinds))? {
+            Outcome::Complete(environment) => environment,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+    let local = kinds
+        .iter()
+        .filter(|kind| **kind == symm::Kind::Local)
+        .map(|_| lemma.clone())
+        .collect();
+    Ok(Outcome::Complete((environment, local)))
 }
 
 #[cfg(test)]

@@ -2441,6 +2441,7 @@ impl Engine {
             result_logical_root,
             admissions,
             local_instance: None,
+            local_symm: Vec::new(),
         }))
     }
 
@@ -2511,6 +2512,9 @@ impl Engine {
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
         let executable = fln_elab::source::scope::executable::registrations(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        let symm = fln_elab::source::scope::symm::registrations(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
         let noncomputable = fln_elab::source::noncomputable_registration(syntax)
@@ -2659,6 +2663,21 @@ impl Engine {
                         &scope,
                         &executable,
                     )?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
+                if !symm.is_empty() {
+                    let (environment, _) = match source_records::tag_symm(
+                        &admitted.engine,
+                        &admitted.declaration,
+                        &scope,
+                        &symm,
+                        limits.kernel,
+                    )? {
+                        Outcome::Complete(value) => value,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    admitted.engine.environment = environment;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
                 if let Some(declared) =
@@ -3683,6 +3702,7 @@ impl Engine {
                         | ScopeCommand::Include(_)
                         | ScopeCommand::Omit(_)
                         | ScopeCommand::Simp(_)
+                        | ScopeCommand::Symm(_)
                         | ScopeCommand::Executable(_)
                         | ScopeCommand::Instance(_)
                         | ScopeCommand::Export { .. }
@@ -3737,6 +3757,7 @@ impl Engine {
                                                         .logical_root(options),
                                                     admissions,
                                                     local_instance: None,
+                                                    local_symm: Vec::new(),
                                                 },
                                             },
                                         );
@@ -8500,6 +8521,9 @@ pub struct DeclarationBatchAdmission {
     /// scope. Its declaration and reducibility are in `engine`, but its local
     /// registration is never part of a persistent environment or module export.
     pub local_instance: Option<(Name, u32)>,
+    /// Symmetry lemmas whose local registrations begin only after this whole
+    /// checked source batch succeeds. Never serialized into module metadata.
+    pub local_symm: Vec<fln_elab::symm::SymmLemma>,
 }
 
 /// The authoritative outputs of one completed bounded engine run.

@@ -720,6 +720,56 @@ impl ArtifactData {
                 metadata.match_patterns.push(tagged);
             }
         }
+        let symms = |env: &Environment, meter: &mut Meter| {
+            if let Some(journal) = env.extension(&fln_elab::symm::journal_name()) {
+                for entry in journal.entries() {
+                    meter.work(1)?;
+                    meter.bytes(entry.payload.len())?;
+                }
+            }
+            fln_elab::symm::read(env).map_err(|error| match error {
+                fln_elab::symm::SymmRegistryError::Limit => SourceModuleCheckError::Limit {
+                    resource: "native symmetry registrations",
+                    limit: fln_elab::symm::MAX_ROWS,
+                },
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::symm::journal_name(),
+                    reason: "invalid symmetry journal",
+                },
+            })
+        };
+        let inherited = symms(base, meter)?;
+        let current = symms(checked, meter)?;
+        if !current.starts_with(&inherited) {
+            return Err(SourceModuleCheckError::Extension {
+                module: name.clone(),
+                extension: fln_elab::symm::journal_name(),
+                reason: "symmetry registrations do not extend the checked predecessor journal",
+            });
+        }
+        for entry in current.into_iter().skip(inherited.len()) {
+            meter.work(1)?;
+            if !checked.contains(&entry.lemma.declaration) {
+                return Err(SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::symm::journal_name(),
+                    reason: "a symmetry registration names a hidden declaration",
+                });
+            }
+            metadata
+                .symms
+                .push(fln_olean::source_extensions::SymmEntry {
+                    declaration: entry.lemma.declaration,
+                    keys: entry
+                        .lemma
+                        .keys
+                        .into_iter()
+                        .map(artifact_discrimination_key)
+                        .collect(),
+                    scope: entry.namespace,
+                });
+        }
         let anonymous_constructors = |env: &Environment, meter: &mut Meter| {
             use fln_elab::delaborator_tags;
             if let Some(journal) = env.extension(&delaborator_tags::source_journal_name()) {

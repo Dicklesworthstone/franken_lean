@@ -171,6 +171,7 @@ fn scope_name(command: &ScopeCommand) -> &'static str {
         ScopeCommand::GuardMsgs { .. } => "guard_msgs",
         ScopeCommand::In { .. } => "in",
         ScopeCommand::Simp(_)
+        | ScopeCommand::Symm(_)
         | ScopeCommand::Instance(_)
         | ScopeCommand::Reducibility(_)
         | ScopeCommand::Executable(_) => "attribute",

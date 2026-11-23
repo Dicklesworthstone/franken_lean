@@ -567,7 +567,10 @@ impl<'a> FileSession<'a> {
     ) -> Result<(), SourceMacroError> {
         use fln_parse::command_scope::ScopeCommand;
         let command = match control {
-            ScopeCommand::Variable(_) | ScopeCommand::Executable(_) | ScopeCommand::Trivia => {
+            ScopeCommand::Variable(_)
+            | ScopeCommand::Executable(_)
+            | ScopeCommand::Symm(_)
+            | ScopeCommand::Trivia => {
                 return Ok(());
             }
             ScopeCommand::Namespace(_) => "namespace",
@@ -1104,9 +1107,10 @@ impl<'a> FileSession<'a> {
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Outcome<Result<fln_parse::command_scope::ScopeCommand, SourceMacroError>> {
         use fln_parse::command_scope::ScopeCommand;
-        let (syntax, variable) = match control {
-            ScopeCommand::Variable(syntax) => (syntax, true),
-            ScopeCommand::Executable(syntax) => (syntax, false),
+        let (syntax, variable, symm) = match control {
+            ScopeCommand::Variable(syntax) => (syntax, true, false),
+            ScopeCommand::Executable(syntax) => (syntax, false, false),
+            ScopeCommand::Symm(syntax) => (syntax, false, true),
             other => return Outcome::Complete(Ok(other)),
         };
         match source_preflight(engine, registry, source, self.limits, self.cancellation) {
@@ -1165,6 +1169,8 @@ impl<'a> FileSession<'a> {
                     Err(SourceMacroError::ScopeControl {
                         kind: variable_kind,
                     })
+                } else if symm {
+                    Ok(ScopeCommand::Symm(syntax))
                 } else {
                     Ok(ScopeCommand::Executable(syntax))
                 }

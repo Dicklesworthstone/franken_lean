@@ -33,6 +33,9 @@ pub enum ScopeCommand {
     Include(Vec<Name>),
     Omit(Vec<Name>),
     Simp(attributes::SimpAttribute),
+    /// Preserve the attribute kinds and source order for checked symmetry
+    /// registration, including lexical `local` and namespace `scoped` entries.
+    Symm(Syntax),
     Instance(instances::InstanceAttribute),
     Reducibility(reducibility::ReducibilityAttribute),
     /// Executable metadata is checked against admitted declarations by the
@@ -873,6 +876,9 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         return variables::parse(&view, &tokens).map(|syntax| Some(ScopeCommand::Variable(syntax)));
     }
     if keyword == "attribute" {
+        if let Some(attribute) = attributes::parse_symm(&view, &tokens)? {
+            return Ok(Some(ScopeCommand::Symm(attribute)));
+        }
         if let Some(attribute) = attributes::parse_executable(&view, &tokens)? {
             return Ok(Some(ScopeCommand::Executable(attribute)));
         }

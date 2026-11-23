@@ -732,7 +732,8 @@ fn real_prelude_instance_keys_are_the_pins_paths() {
             _ => 0,
         })
         .sum();
-    let total: usize = kinds.iter().sum::<usize>() + simp_keys;
+    let symm_keys: usize = decoded.symms.iter().map(|entry| entry.keys.len()).sum();
+    let total: usize = kinds.iter().sum::<usize>() + simp_keys + symm_keys;
     let limits = |max_keys| DecodeLimits {
         max_keys,
         ..Default::default()
@@ -1008,4 +1009,103 @@ fn deprecation_entries_decode_their_options_and_forgeries_refuse() {
     {
         assert!(read(&one(extension, &forged)).is_err(), "forgery {index}");
     }
+}
+
+#[test]
+fn real_prelude_symmetry_paths_are_decoded_and_reemitted_without_recomputation() {
+    use fln_olean::source_extensions::SYMM_EXTENSION;
+    use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
+    use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget};
+    let decoded = read(blocks()).unwrap();
+    assert!(!decoded.uninterpreted.contains(&n(SYMM_EXTENSION)));
+    assert_eq!(decoded.symms.len(), 1);
+    assert_eq!(decoded.symms[0].declaration, n("Eq.symm"));
+    assert_eq!(
+        decoded.symms[0].keys,
+        [DiscrTreeKey::Const(n("Eq"), 1), DiscrTreeKey::Star]
+    );
+    assert_eq!(decoded.symms[0].scope, None);
+    for version in fln_olean::format::OLEAN_ACCEPTED_VERSIONS {
+        let encoded = encode_module_with_source_metadata(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[],
+                extra_const_names: &[],
+            },
+            &SourceMetadata {
+                symms: decoded.symms.clone(),
+                ..SourceMetadata::default()
+            },
+            OleanWriteHeader {
+                version: *version,
+                flags: 1,
+                lean_version: fln_olean::format::PIN_TAG.strip_prefix('v').unwrap(),
+                githash: fln_olean::format::PIN_COMMIT,
+                base_addr: 2 * fln_olean::format::REGION_ALIGN as u64,
+            },
+            WriteBudget::default(),
+        )
+        .unwrap();
+        let actual = OleanView::parse(&encoded.bytes)
+            .unwrap()
+            .extension_payloads(WalkBudget::default(), 4 << 20)
+            .unwrap();
+        assert_eq!(read(&actual).unwrap().symms, decoded.symms);
+    }
+}
+
+#[test]
+fn symmetry_decode_preserves_repeats_and_refuses_forged_scope_or_payload_shapes() {
+    use fln_olean::source_extensions::{Decoder, SYMM_EXTENSION};
+    let original = entry(SYMM_EXTENSION);
+    let valid = one(SYMM_EXTENSION, &original);
+    let mut repeated = valid.clone();
+    let duplicate = repeated[0].entries[0].clone();
+    repeated[0].entries.push(duplicate);
+    let rows = read(&repeated).unwrap().symms;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], rows[1]);
+    let core = original.ctor_child(0);
+    for malformed in [
+        Obj::mk_nat(0),
+        Obj::mk_ctor(2, vec![core.clone_ref()], &[]),
+        Obj::mk_ctor(1, vec![core.clone_ref()], &[]),
+        Obj::mk_ctor(
+            1,
+            vec![inject_name(&Name::anonymous()), core.clone_ref()],
+            &[],
+        ),
+        Obj::mk_ctor(
+            0,
+            vec![Obj::mk_ctor(
+                0,
+                vec![inject_name(&Name::anonymous()), core.ctor_child(1)],
+                &[],
+            )],
+            &[],
+        ),
+        Obj::mk_ctor(
+            0,
+            vec![Obj::mk_ctor(
+                0,
+                vec![core.ctor_child(0), Obj::mk_nat(7)],
+                &[],
+            )],
+            &[],
+        ),
+    ] {
+        assert!(
+            !read(&one(SYMM_EXTENSION, &malformed))
+                .unwrap_err()
+                .is_resource()
+        );
+    }
+    let mut decoder = Decoder::new(DecodeLimits {
+        max_keys: rows[0].keys.len(),
+        ..DecodeLimits::default()
+    });
+    assert_eq!(decoder.decode(&valid).unwrap().symms.len(), 1);
+    assert!(decoder.decode(&valid).unwrap_err().is_resource());
+    assert!(decoder.decode(&[]).unwrap_err().is_resource());
 }
