@@ -30,6 +30,7 @@
 //! src/Lean/Parser/Extension.lean: sha256 98e709d27527de027e6e7c6aff0b4fe2a624c6d9d8beb12df79a4b73d4115c99
 //! src/Lean/Parser/Basic.lean: sha256 52bc0d189a600e760fde91f55e1429d9a612b1a63452da063ee74de9ed3f3d8e
 //! src/Lean/Parser/Types.lean: sha256 450faec4439ebaf7c7656ffd881e8bfeb2e0104a3368b92956f8e1e2a6aed51d
+//! src/Lean/Compiler/IR/UnboxResult.lean: sha256 980931c69e6cb07aead773b5c5143960ad6cff6cc4765c050e12062954e01a0a
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -122,6 +123,7 @@ pub const AUX_RECURSOR_EXTENSION: &str = "Lean.auxRecExt";
 pub const NONCOMPUTABLE_EXTENSION: &str = "Lean.noncomputableExt";
 pub const DEFEQ_EXTENSION: &str = "Lean.defeqAttr";
 pub const BACKWARD_DEFEQ_EXTENSION: &str = "Lean.backwardDefeqAttr";
+pub const UNBOX_EXTENSION: &str = "Lean.IR.UnboxResult.unboxAttr";
 pub const PP_ANONYMOUS_CONSTRUCTOR_EXTENSION: &str = "Lean.ppUsingAnonymousConstructorAttr";
 pub const PP_NODOT_EXTENSION: &str = "Lean.ppNoDotAttr";
 pub const APP_UNEXPANDER_EXTENSION: &str = "Lean.PrettyPrinter.Delaborator.appUnexpanderAttribute";

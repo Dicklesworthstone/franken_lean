@@ -23,6 +23,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Provision the locked suite dependency
+        run: bash scripts/ci/checkout_asupersync.sh
       - name: Install configured compiler
         id: compiler
         shell: bash

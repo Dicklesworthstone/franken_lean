@@ -148,6 +148,8 @@ pub struct SourceMetadataReport {
     pub aux_recursors: usize,
     /// Compilation restrictions owned by this module, including partial companions.
     pub noncomputable: usize,
+    /// Persistent `[unbox]` tags on this module's nonrecursive inductive types.
+    pub unbox: usize,
     /// `@[defeq]` tags (the pin's `Lean.defeqAttr`), which select `dsimp`'s rfl lemmas.
     pub defeq: usize,
     /// Backward-definitional tags, retained independently so an imported
@@ -1052,6 +1054,7 @@ fn prepare_source_metadata_view(
             Name::from_components(metadata::DEPRECATED_EXTENSION.split('.')),
             Name::from_components(metadata::BACKWARD_DEFEQ_EXTENSION.split('.')),
             Name::from_components(metadata::REDUCIBILITY_EXTRA_EXTENSION.split('.')),
+            Name::from_components(metadata::UNBOX_EXTENSION.split('.')),
         ])
         .collect();
     let mut blocks: Vec<_> = selected
@@ -1119,6 +1122,7 @@ fn prepare_source_metadata_view(
             protected: 0,
             aux_recursors: 0,
             noncomputable: 0,
+            unbox: 0,
             defeq: 0,
             backward_defeq: 0,
             structures: 0,
@@ -1215,6 +1219,7 @@ fn prepare_source_metadata_view(
                     20 => report.deprecations = entries.len(),
                     21 => report.backward_defeq = entries.len(),
                     22 => report.reducibility_extra = entries.len(),
+                    23 => report.unbox = entries.len(),
                     _ => {
                         return Err(SourceOleanImportError::Internal(
                             "unknown selected metadata kind",
@@ -1384,6 +1389,7 @@ impl Engine {
         let mut protected = decoded.protected.into_iter();
         let mut aux_recursors = decoded.aux_recursors.into_iter();
         let mut noncomputable = decoded.noncomputable.into_iter();
+        let mut unbox = decoded.unbox.into_iter();
         let mut defeq = decoded.defeq.into_iter();
         let mut backward_defeq = decoded.backward_defeq.into_iter();
         let mut pp_anonymous_constructor = decoded.pp_anonymous_constructor.into_iter();
@@ -1756,6 +1762,24 @@ impl Engine {
                         .map_err(|error| noncomputable_error(&report.module, error))?;
                 }
             }
+            if report.unbox != 0 {
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.unbox,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..report.unbox {
+                    cancelled!("source-olean/unbox");
+                    let declaration = unbox.next().ok_or(SourceOleanImportError::Internal(
+                        "unbox count changed during decode",
+                    ))?;
+                    owners.validate(activation.environment(), &report.module, &declaration)?;
+                    activation = activation
+                        .register_unbox(&declaration)
+                        .map_err(|error| unbox_error(&report.module, error))?;
+                }
+            }
             if report.defeq != 0 {
                 let mut owners = AttributeOwners::new(
                     &checked.modules[index].decoded.constants,
@@ -2004,6 +2028,8 @@ impl Engine {
         fln_elab::noncomputable::read(&engine.environment).map_err(|error| {
             noncomputable_error(&roots.first().cloned().unwrap_or_default(), error)
         })?;
+        fln_elab::unbox::read(&engine.environment)
+            .map_err(|error| unbox_error(&roots.first().cloned().unwrap_or_default(), error))?;
         fln_elab::macro_inline::read(&engine.environment).map_err(|_| {
             SourceOleanImportError::Metadata {
                 module: roots.first().cloned().unwrap_or_default(),
@@ -2043,6 +2069,7 @@ impl Engine {
             || protected.next().is_some()
             || aux_recursors.next().is_some()
             || noncomputable.next().is_some()
+            || unbox.next().is_some()
             || defeq.next().is_some()
             || backward_defeq.next().is_some()
             || pp_anonymous_constructor.next().is_some()
@@ -2337,6 +2364,10 @@ trait Registrar: Sized {
         self,
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError>;
+    fn register_unbox(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::unbox::UnboxError>;
     fn register_defeq(
         self,
         declaration: &Name,
@@ -2441,6 +2472,12 @@ impl Registrar for instances::imported::ImportActivation {
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError> {
         self.register_noncomputable(declaration)
+    }
+    fn register_unbox(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::unbox::UnboxError> {
+        self.register_unbox(declaration)
     }
     fn register_defeq(
         self,
@@ -2744,6 +2781,26 @@ fn registry_error(
         module: module.clone(),
         declaration: declaration.clone(),
         error,
+    }
+}
+
+fn unbox_error(module: &Name, error: fln_elab::unbox::UnboxError) -> SourceOleanImportError {
+    use fln_elab::unbox::UnboxError;
+    let (declaration, reason) = match error {
+        UnboxError::Limit => return SourceOleanImportError::Limit("unbox journal"),
+        UnboxError::UnknownDeclaration(name) => {
+            (name, "an unbox tag names no admitted declaration")
+        }
+        UnboxError::NotInductive(name) => (name, "an unbox tag requires an inductive type"),
+        UnboxError::RecursiveInductive(name) => {
+            (name, "an unbox tag requires a nonrecursive inductive type")
+        }
+        UnboxError::Malformed => (module.clone(), "malformed unbox journal"),
+    };
+    SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration,
+        reason,
     }
 }
 
@@ -4237,6 +4294,12 @@ pub(super) mod tests {
             declaration: &Name,
         ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError> {
             fln_elab::noncomputable::register(&self.0, declaration).map(Sequential)
+        }
+        fn register_unbox(
+            self,
+            declaration: &Name,
+        ) -> std::result::Result<Self, fln_elab::unbox::UnboxError> {
+            fln_elab::unbox::register(&self.0, declaration).map(Sequential)
         }
         fn register_defeq(
             self,

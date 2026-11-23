@@ -652,6 +652,39 @@ impl ArtifactData {
                 metadata.noncomputable.push(tagged);
             }
         }
+        let unbox = |env: &Environment, meter: &mut Meter| {
+            if let Some(journal) = env.extension(&fln_elab::unbox::journal_name()) {
+                for entry in journal.entries() {
+                    meter.work(1)?;
+                    meter.bytes(entry.payload.len())?;
+                }
+            }
+            fln_elab::unbox::read(env).map_err(|error| match error {
+                fln_elab::unbox::UnboxError::Limit => SourceModuleCheckError::Limit {
+                    resource: "native unbox tags",
+                    limit: fln_elab::unbox::MAX_ROWS,
+                },
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::unbox::journal_name(),
+                    reason: "invalid unbox journal",
+                },
+            })
+        };
+        let inherited = unbox(base, meter)?;
+        for tagged in unbox(checked, meter)? {
+            meter.work(1)?;
+            if !inherited.contains(&tagged) {
+                if base.contains(&tagged) {
+                    return Err(SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::unbox::journal_name(),
+                        reason: "a module cannot tag an imported unbox declaration",
+                    });
+                }
+                metadata.unbox.push(tagged);
+            }
+        }
         // Reflexivity tags are selection metadata owned by the module that
         // declared the theorem. The codec already emits both pinned tag sets;
         // export the journal delta rather than silently losing it at this edge.

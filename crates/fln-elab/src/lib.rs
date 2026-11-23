@@ -51,6 +51,7 @@ pub mod seed;
 pub mod source;
 pub mod tactic_macros;
 pub mod txn;
+pub mod unbox;
 pub mod universe;
 
 pub use constraint::{Constraint, ConstraintId, ConstraintKind, ConstraintQueue};

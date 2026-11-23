@@ -799,7 +799,7 @@ pub(super) fn parse_executable(
         .any(|token| {
             matches!(
                 view.normalized().span_str(token.extent),
-                Some("implemented_by" | "extern")
+                Some("implemented_by" | "extern" | "unbox")
             )
         });
     if !has_executable {
@@ -957,6 +957,9 @@ mod tests {
             "attribute [implemented_by Backend.call] f g",
             "attribute [extern c inline \"#1\" cpp \"call_λ\"] f",
             "attribute [local implemented_by f, extern] g",
+            "attribute [unbox] Prod",
+            "attribute [unbox] Prod Option Except",
+            "attribute [local unbox] Prod",
         ] {
             let Some(ScopeCommand::Executable(syntax)) =
                 super::super::parse(source.as_bytes()).unwrap()

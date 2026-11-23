@@ -50,6 +50,8 @@ pub struct SourceMetadata {
     pub aux_recursors: Vec<Name>,
     /// Module-owned `Lean.noncomputableExt` tags, sorted by `Name.quickLt`.
     pub noncomputable: Vec<Name>,
+    /// Owned nonrecursive inductive `[unbox]` tags in the pin's `Name.quickLt` order.
+    pub unbox: Vec<Name>,
     /// Owned definitional-equality tags. The pin's defeq attribute also records
     /// backward_defeq; emit both sorted tag arrays, never just the subset.
     /// These flags are metadata, not a certificate of equality.
@@ -201,6 +203,13 @@ impl Encoder {
                 layout::NONCOMPUTABLE_EXTENSION,
                 &metadata.noncomputable,
                 "anonymous or duplicate noncomputable declaration",
+            )?);
+        }
+        if !metadata.unbox.is_empty() {
+            blocks.push(self.tagged_names_block(
+                layout::UNBOX_EXTENSION,
+                &metadata.unbox,
+                "anonymous or duplicate unbox declaration",
             )?);
         }
         if !metadata.defeq.is_empty() {
@@ -440,6 +449,60 @@ mod tests {
         let duplicate = repeated[0].entries[0].clone();
         repeated[0].entries.push(duplicate);
         assert!(source_extensions::decode(&repeated, DecodeLimits::default()).is_err());
+    }
+
+    #[test]
+    fn unbox_only_metadata_roundtrips_without_namespace_or_other_extensions() {
+        let names = vec![
+            Name::from_components(["Box"]),
+            Name::from_components(["A", "Tagged"]),
+        ];
+        let metadata = SourceMetadata {
+            unbox: names.clone(),
+            ..SourceMetadata::default()
+        };
+        let encoded = encode_module_with_source_metadata(
+            input(),
+            &metadata,
+            header(),
+            WriteBudget::default(),
+        )
+        .unwrap();
+        let blocks = crate::region::OleanView::parse(&encoded.bytes)
+            .unwrap()
+            .extension_payloads(crate::region::WalkBudget::default(), 1024 * 1024)
+            .unwrap();
+        assert_eq!(blocks.len(), 1, "unbox-only metadata must not be dropped");
+        assert_eq!(
+            blocks[0].name,
+            Name::from_components(layout::UNBOX_EXTENSION.split('.'))
+        );
+        let mut sorted = names;
+        sorted.sort_by(Name::quick_cmp);
+        let decoded = source_extensions::decode(&blocks, DecodeLimits::default()).unwrap();
+        assert_eq!(decoded.unbox, sorted);
+        assert!(decoded.uninterpreted.is_empty());
+        let mut repeated = blocks.clone();
+        let duplicate = repeated[0].entries[0].clone();
+        repeated[0].entries.push(duplicate);
+        assert!(source_extensions::decode(&repeated, DecodeLimits::default()).is_err());
+        for unbox in [
+            vec![Name::anonymous()],
+            vec![metadata.unbox[0].clone(), metadata.unbox[0].clone()],
+        ] {
+            assert!(matches!(
+                encode_module_with_source_metadata(
+                    input(),
+                    &SourceMetadata {
+                        unbox,
+                        ..SourceMetadata::default()
+                    },
+                    header(),
+                    WriteBudget::default(),
+                ),
+                Err(WriteError::Contract { .. })
+            ));
+        }
     }
 
     #[test]

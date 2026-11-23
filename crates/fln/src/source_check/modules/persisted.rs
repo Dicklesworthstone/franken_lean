@@ -472,6 +472,7 @@ impl SourceModuleRecord {
             fln_elab::aux_recursors::journal_name(),
             fln_elab::reducibility::export::journal_name(),
             fln_elab::noncomputable::journal_name(),
+            fln_elab::unbox::journal_name(),
             fln_elab::source::scope::simp::export::journal_name(),
             fln_elab::source::scope::simp::defeq::journal_name(),
             fln_elab::source::scope::simp::equations::journal_name(),

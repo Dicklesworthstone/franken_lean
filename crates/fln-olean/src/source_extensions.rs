@@ -22,6 +22,7 @@ pub use format::{
     IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION, INSTANCE_EXTENSION, NONCOMPUTABLE_EXTENSION,
     PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION, PROTECTED_EXTENSION,
     REDUCIBILITY_EXTENSION, REDUCIBILITY_EXTRA_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
+    UNBOX_EXTENSION,
 };
 mod deprecations;
 pub use deprecations::DeprecationEntry;
@@ -192,6 +193,8 @@ pub struct SourceExtensions {
     pub aux_recursors: Vec<Name>,
     /// Noncomputable tags, interpreted only after checking their owning module.
     pub noncomputable: Vec<Name>,
+    /// Nonrecursive inductive types carrying the pin's persistent `[unbox]` tag.
+    pub unbox: Vec<Name>,
     /// The pin's defeq attribute tags, not evidence that an equation is true.
     /// Source activation must bind names to their checked owning module; each
     /// use still requires conversion and ordinary proof checking.
@@ -674,6 +677,7 @@ fn decode_batch(
         namespace_extension_name(),
         name(format::DEPRECATED_EXTENSION),
         name(format::REDUCIBILITY_EXTRA_EXTENSION),
+        name(format::UNBOX_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -683,6 +687,7 @@ fn decode_batch(
     let mut protected = BTreeSet::new();
     let mut aux_recursors = BTreeSet::new();
     let mut noncomputable = BTreeSet::new();
+    let mut unbox = BTreeSet::new();
     let mut defeq = BTreeSet::new();
     let mut backward_defeq = BTreeSet::new();
     let mut pp_anonymous_constructor = BTreeSet::new();
@@ -834,7 +839,14 @@ fn decode_batch(
                 22 => out
                     .reducibility_extra
                     .push(reader.reducibility_extra(&obj)?),
-                _ => unreachable!("twenty-three selected extension families"),
+                23 => {
+                    let declaration = reader.name(&obj)?;
+                    if declaration.is_anonymous() || !unbox.insert(declaration.clone()) {
+                        return Err(shape("anonymous or repeated unbox declaration"));
+                    }
+                    out.unbox.push(declaration);
+                }
+                _ => unreachable!("twenty-four selected extension families"),
             }
         }
     }

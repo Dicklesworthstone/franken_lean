@@ -755,6 +755,78 @@ pub(crate) fn apply_module_control_command(
         }
         return Ok(Outcome::Complete(Vec::new()));
     }
+    // `[unbox]` is global metadata on its target, independent of the current
+    // section's visibility. Stage every target first, splitting public and
+    // private owners so a mixed command neither drops public tags nor exports
+    // private names. Public suffixes are replayed only after all names validate.
+    if let (ScopeCommand::Executable(syntax), Some(public)) = (&control, public.as_deref_mut()) {
+        use fln_elab::source::scope::executable::{self, Attribute};
+        let (file, command, offset) = position;
+        let frontend = |error| {
+            command_error(
+                file,
+                command,
+                fln_parse::BytePos(offset),
+                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(error)),
+            )
+        };
+        let (rows, names) = executable::command(syntax).map_err(frontend)?;
+        if rows.iter().all(|row| matches!(row, Attribute::Unbox)) {
+            let mut private_next = engine.clone();
+            let mut public_next = public.engine().clone();
+            for requested in names {
+                let name = executable::resolve(engine.environment(), &scopes.current, &requested)
+                    .map_err(frontend)?
+                    .ok_or_else(|| SourceCheckError::Scope {
+                        file,
+                        command,
+                        offset,
+                        message: format!(
+                            "unknown unbox declaration `{}`",
+                            requested.to_display_string()
+                        ),
+                    })?;
+                if file_base.contains(&name) {
+                    return Err(SourceCheckError::Scope {
+                        file,
+                        command,
+                        offset,
+                        message: "executable attributes cannot modify imported declarations".into(),
+                    });
+                }
+                let target = if public_next.environment().contains(&name) {
+                    &mut public_next
+                } else {
+                    &mut private_next
+                };
+                target.environment = executable::apply(
+                    target.environment(),
+                    &scopes.current,
+                    &name,
+                    &rows,
+                    true,
+                )
+                .map_err(frontend)?;
+            }
+            return match public
+                .publish(
+                    &private_next,
+                    public_next,
+                    Vec::new(),
+                    &scopes.public_scope(),
+                    options,
+                )
+                .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?
+            {
+                Outcome::Complete(next) => {
+                    *engine = next;
+                    Ok(Outcome::Complete(Vec::new()))
+                }
+                Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
+            };
+        }
+    }
     // Global default attributes export according to each candidate's visibility,
     // including commands written in a private section or mixing both worlds.
     if !scopes.current.exports_declaration()

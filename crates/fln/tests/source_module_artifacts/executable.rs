@@ -20,6 +20,171 @@ def left.{u} (A : Sort u) (x y : A) : A := x
 @[extern] axiom adhoc.{u} : (A : Sort u) -> A -> A
 "#;
 
+const UNBOX_BASE: &str = r#"prelude
+namespace Boxing
+structure Prod (A : Type) (B : Type) where
+  /-- The constructor spelling used by Init.Prelude. -/
+  mk ::
+  fst : A
+  snd : B
+attribute [unbox] Prod Prod
+@[unbox] structure Inline (A : Type) where
+  value : A
+@[unbox] inductive Choice (A : Type) where
+  | none
+  | some (value : A)
+structure Untagged (A : Type) where
+  value : A
+end Boxing
+"#;
+
+#[test]
+fn unbox_tags_survive_artifacts_and_diamond_imports_without_reexporting_inherited_tags() {
+    let built = compiled(&[
+        ("Main", "prelude\nimport Left\nimport Right"),
+        ("Left", "prelude\nimport Base"),
+        ("Right", "prelude\nimport Base"),
+        ("Base", UNBOX_BASE),
+    ]);
+    let expected = std::collections::BTreeSet::from([
+        name("Boxing.Prod"),
+        name("Boxing.Inline"),
+        name("Boxing.Choice"),
+    ]);
+    assert_eq!(
+        fln_elab::unbox::read(built.checked.checked.engine.environment()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        built
+            .artifacts
+            .iter()
+            .map(|artifact| metadata(&artifact.bytes).unbox.len())
+            .collect::<Vec<_>>(),
+        [3, 0, 0, 0]
+    );
+    let receipt = imported(&built);
+    assert_eq!(
+        fln_elab::unbox::read(receipt.engine.environment()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        receipt.modules.iter().map(|report| report.unbox).collect::<Vec<_>>(),
+        [3, 0, 0, 0]
+    );
+    let probe = "theorem first (A B : Type) (a : A) (b : B) (P : A -> Prop) (h : P a) :\n\
+        P ((Boxing.Prod.mk a b).fst) := h";
+    receipt
+        .engine
+        .check_source_files(&[probe.as_bytes()], &KVMap::new(), limits().source)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    // The pin reads the serialized tag extension itself, not our native journal.
+    aliases::reference_import_stdout(
+        &built,
+        r#"prelude
+import Lean
+import Main
+run_cmd do
+  let env ← Lean.getEnv
+  for decl in [`Boxing.Prod, `Boxing.Inline, `Boxing.Choice] do
+    unless Lean.IR.UnboxResult.hasUnboxAttr env decl do
+      throwError "missing unbox tag: {decl}"
+  for decl in [`Boxing.Untagged, `Boxing.Prod.mk, `Boxing.Prod.fst] do
+    if Lean.IR.UnboxResult.hasUnboxAttr env decl then
+      throwError "unexpected unbox tag: {decl}"
+example (A B : Type) (a : A) (b : B) : (Boxing.Prod.mk a b).fst = a := rfl
+"#,
+        true,
+        Some(""),
+    );
+}
+
+#[test]
+fn invalid_unbox_attributes_and_imported_target_updates_are_refused_atomically() {
+    let engine = Engine::builder().build_empty();
+    let root = engine.logical_root(&KVMap::new());
+    for source in [
+        "prelude\naxiom A : Type\nattribute [unbox] A",
+        "prelude\n@[unbox] axiom A : Type",
+        "prelude\ninductive Loop where | stop | step (tail : Loop)\nattribute [unbox] Loop",
+        "prelude\n@[unbox] inductive Loop where | stop | step (tail : Loop)",
+        "prelude\nstructure Box where\nattribute [unbox] Box.mk",
+        "prelude\n@[local unbox] structure Box where",
+        "prelude\n@[scoped unbox] inductive Box where | mk",
+        "prelude\nstructure Box where\nattribute [local unbox] Box",
+        "prelude\nstructure Box where\nattribute [scoped unbox] Box",
+        "prelude\n@[unbox argument] structure Box where",
+        "prelude\nstructure Box where\nattribute [unbox argument] Box",
+        "prelude\nstructure Box where\nattribute [-unbox] Box",
+        "prelude\nstructure Box where\nattribute [unbox] missing",
+        "prelude\nstructure Box where\nattribute [unbox, unknown] Box",
+    ] {
+        let error = build(&engine, &[("Main", source)], OleanWriteBudget::default()).unwrap_err();
+        assert_eq!(error.disposition().2, 1, "{source}: {error:?}");
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
+    for target in ["Boxing.Prod", "Boxing.Untagged"] {
+        let source = format!("prelude\nimport Base\nattribute [unbox] {target}");
+        let error = build(
+            &engine,
+            &[("Main", &source), ("Base", UNBOX_BASE)],
+            OleanWriteBudget::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.disposition().2, 1, "{source}: {error:?}");
+        assert!(
+            error.to_string().contains("cannot modify imported declarations"),
+            "{error:?}"
+        );
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
+fn unbox_export_follows_target_visibility_for_a_mixed_private_section_command() {
+    let built = compiled(&[(
+        "Main",
+        "module\nprelude\n\
+         public structure Visible (A : Type) where\n  value : A\n\
+         structure Hidden (A : Type) where\n  value : A\n\
+         attribute [unbox] Visible Hidden\n\
+         @[unbox] public structure InlineVisible (A : Type) where\n  value : A\n\
+         @[unbox] structure InlineHidden (A : Type) where\n  value : A\n",
+    )]);
+    let exported: std::collections::BTreeSet<_> = metadata(&built.artifacts[0].bytes)
+        .unbox
+        .into_iter()
+        .collect();
+    assert_eq!(
+        exported,
+        std::collections::BTreeSet::from([name("Visible"), name("InlineVisible")])
+    );
+    let tags = fln_elab::unbox::read(built.checked.checked.engine.environment()).unwrap();
+    assert_eq!(tags.len(), 4);
+    assert!(tags.contains(&name("Visible")));
+    assert!(tags.contains(&name("InlineVisible")));
+    assert_eq!(
+        fln_elab::unbox::read(imported(&built).engine.environment()).unwrap(),
+        tags
+    );
+    aliases::reference_import_stdout(
+        &built,
+        r#"prelude
+import Lean
+import Main
+run_cmd do
+  let env ← Lean.getEnv
+  unless Lean.IR.UnboxResult.hasUnboxAttr env `Visible &&
+      Lean.IR.UnboxResult.hasUnboxAttr env `InlineVisible do
+    throwError "public unbox metadata was lost in a private section"
+"#,
+        true,
+        Some(""),
+    );
+}
+
 #[test]
 fn executable_attributes_export_owned_final_maps_across_a_diamond() {
     let built = compiled(&[

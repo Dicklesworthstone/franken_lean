@@ -755,7 +755,38 @@ impl Engine {
         let result = self
             .admit_declarations(&[candidate], options, limits)
             .map_err(EngineExecutionError::from)?;
-        self.finish_source_inductive_auxiliaries(result, options, limits)
+        let result = self.finish_source_inductive_auxiliaries(result, options, limits)?;
+        self.finish_source_data_attributes(result, members, options, scope)
+    }
+
+    fn finish_source_data_attributes(
+        &self,
+        result: Outcome<DeclarationBatchAdmission>,
+        members: &[fln_syntax::tree::Syntax],
+        options: &KVMap,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let Outcome::Complete(mut batch) = result else {
+            return Ok(result);
+        };
+        for syntax in members {
+            let registration = fln_elab::source::scope::executable::data_registration(syntax, scope)
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?;
+            if let Some((name, rows)) = registration {
+                batch.engine.environment = fln_elab::source::scope::executable::apply(
+                    batch.engine.environment(),
+                    scope,
+                    &name,
+                    &rows,
+                    false,
+                )
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?;
+            }
+        }
+        batch.result_logical_root = batch.engine.logical_root(options);
+        Ok(Outcome::Complete(batch))
     }
 
     /// Admit a scoped candidate before applying its declaration attributes. This
@@ -1209,6 +1240,12 @@ impl Engine {
                 .admit_declarations(&[candidate], options, limits)
                 .map_err(EngineExecutionError::from)?;
             let result = self.finish_source_inductive_auxiliaries(result, options, limits)?;
+            let result = self.finish_source_data_attributes(
+                result,
+                std::slice::from_ref(syntax),
+                options,
+                scope,
+            )?;
             return self.finish_source_deriving(result, deriving.as_ref(), options, limits, scope);
         }
         if !fln_elab::source::is_record(syntax) {
@@ -1410,6 +1447,12 @@ impl Engine {
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
         };
+        let result = self.finish_source_data_attributes(
+            result,
+            std::slice::from_ref(syntax),
+            options,
+            scope,
+        )?;
         self.finish_source_deriving(result, deriving.as_ref(), options, limits, scope)
     }
 

@@ -713,6 +713,15 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain the owning module's checked nonrecursive inductive `[unbox]` tag.
+    pub fn register_unbox(
+        mut self,
+        declaration: &Name,
+    ) -> Result<Self, crate::unbox::UnboxError> {
+        self.env = crate::unbox::register(&self.env, declaration)?;
+        Ok(self)
+    }
+
     /// Record an imported `@[defeq]` tag
     /// ([`crate::source::scope::simp::defeq::register_imported`]). The tag journal is
     /// not one this activation keeps or reads.

@@ -11,6 +11,7 @@ const MAX_ATTRIBUTE_ITEMS: usize = 4096;
 pub enum Attribute {
     ImplementedBy(Name),
     Extern(Vec<ExternEntry>),
+    Unbox,
 }
 
 fn implemented_error(error: crate::implemented_by::ImplementedByError) -> NatDefinitionElabError {
@@ -48,17 +49,22 @@ pub(in crate::source) fn attribute(
             let [Syntax::Ident { val, .. }, argument] = args.as_slice() else {
                 return Ok(None);
             };
-            if val != &Name::from_components(["implemented_by"]) {
+            if val == &Name::from_components(["unbox"]) {
+                expect_empty_null(argument, "unbox without arguments")?;
+                Attribute::Unbox
+            } else if val == &Name::from_components(["implemented_by"]) {
+                let [Syntax::Ident { val, .. }] =
+                    expect_null_args(argument, "implemented_by target")?
+                else {
+                    return Err(refused("one implemented_by declaration name"));
+                };
+                if val.is_anonymous() {
+                    return Err(refused("a named implemented_by target"));
+                }
+                Attribute::ImplementedBy(val.clone())
+            } else {
                 return Ok(None);
             }
-            let [Syntax::Ident { val, .. }] = expect_null_args(argument, "implemented_by target")?
-            else {
-                return Err(refused("one implemented_by declaration name"));
-            };
-            if val.is_anonymous() {
-                return Err(refused("a named implemented_by target"));
-            }
-            Attribute::ImplementedBy(val.clone())
         }
         Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Attr", "extern"]) => {
             let [keyword, entries] = args.as_slice() else {
@@ -169,10 +175,58 @@ pub fn registrations(syntax: &Syntax) -> Result<Vec<Attribute>, NatDefinitionEla
         ]
         .iter()
         .any(|kind| declaration.kind() == Some(&parser_kind(&["Command", kind])))
+        && !(rows.iter().all(|row| matches!(row, Attribute::Unbox))
+            && ["structure", "inductive"]
+                .iter()
+                .any(|kind| declaration.kind() == Some(&parser_kind(&["Command", kind]))))
     {
         return Err(refused("executable attributes on one admitted constant"));
     }
     Ok(rows)
+}
+
+/// Resolve a data declaration's own inline compiler tags after its checked
+/// inductive bundle has been admitted. Generated constructors and projections
+/// do not acquire their type's tags.
+pub fn data_registration(
+    syntax: &Syntax,
+    scope: &SourceScope,
+) -> Result<Option<(Name, Vec<Attribute>)>, NatDefinitionElabError> {
+    let rows = registrations(syntax)?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let root = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "data declaration",
+    )?;
+    let (kind, arity) = if root[1].kind() == Some(&parser_kind(&["Command", "structure"])) {
+        ("structure", 6)
+    } else {
+        ("inductive", 7)
+    };
+    let parts = expect_node(
+        &root[1],
+        &parser_kind(&["Command", kind]),
+        arity,
+        "data declaration",
+    )?;
+    let id = expect_node(
+        &parts[1],
+        &parser_kind(&["Command", "declId"]),
+        2,
+        "data declaration name",
+    )?;
+    let Syntax::Ident { val, .. } = &id[0] else {
+        return Err(refused("a data declaration name"));
+    };
+    let name = scope
+        .for_declaration(syntax)?
+        .declaration_name(val)
+        .map_err(|error| failure(SourceInferenceError::NameScope(error)))?;
+    Ok(Some((name, rows)))
 }
 
 /// Parse standalone command attributes without weakening unknown-attribute refusal.
@@ -255,6 +309,7 @@ pub fn apply(
     standalone: bool,
 ) -> Result<Environment, NatDefinitionElabError> {
     if standalone
+        && rows.iter().any(|row| !matches!(row, Attribute::Unbox))
         && (!matches!(environment.find(declaration), Some(ConstantInfo::Axiom(_)))
             || ExternTable::read(environment)
                 .map_err(extern_error)?
@@ -290,6 +345,21 @@ pub fn apply(
                 crate::externs::register(&result, declaration, entries.clone())
                     .map_err(extern_error)?
             }
+            Attribute::Unbox => crate::unbox::register(&result, declaration).map_err(|error| {
+                match error {
+                    crate::unbox::UnboxError::Limit => failure(SourceInferenceError::ResourceLimit),
+                    crate::unbox::UnboxError::NotInductive(_) => {
+                        refused("unbox on an inductive type")
+                    }
+                    crate::unbox::UnboxError::RecursiveInductive(_) => {
+                        refused("unbox on a nonrecursive inductive type")
+                    }
+                    crate::unbox::UnboxError::UnknownDeclaration(_) => {
+                        refused("unbox on an admitted declaration")
+                    }
+                    crate::unbox::UnboxError::Malformed => refused("a valid unbox journal"),
+                }
+            })?,
         };
     }
     // Every registration validates its signature/payload, including overwritten

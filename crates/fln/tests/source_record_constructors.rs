@@ -60,11 +60,12 @@ structure Prod (A : Type u) (B : Type v) where
   mk ::
   fst : A
   snd : B
+attribute [unbox] Prod
 structure And (a b : Prop) : Prop where
   intro ::
   left : a
   right : b
-structure PLift (A : Sort u) : Type u where
+@[unbox] structure PLift (A : Sort u) : Type u where
   up ::
   down : A
 def swap {A : Type u} {B : Type v} (p : Prod A B) : Prod B A :=
@@ -75,6 +76,10 @@ def raised {A : Sort u} (a : A) : PLift A := PLift.up a
 "#,
     );
     let env = checked.engine.environment();
+    assert_eq!(
+        fln_elab::unbox::read(env).unwrap(),
+        std::collections::BTreeSet::from([name("Prod"), name("PLift")])
+    );
     for (record, ctor) in [("Prod", "mk"), ("And", "intro"), ("PLift", "up")] {
         let Some(ConstantInfo::Induct(family)) = env.find(&name(record)) else {
             panic!("missing source record {record}");
@@ -101,6 +106,7 @@ structure Pair (A : Type) where
   build ::
   left : A
   right : A
+attribute [unbox] Pair Pair
 def direct : Pair Nat := Pair.build 7 9
 def anonymous : Pair Nat := ⟨7, 9⟩
 def literal : Pair Nat := { left := 7, right := 9 }
@@ -113,7 +119,7 @@ def sum (p : Pair Nat) : Nat :=
 theorem sum_ok : Eq (sum direct) 16 := rfl
 theorem recursor_ok :
     Eq (Pair.rec (motive := fun _ => Nat) (fun x _ => x) anonymous) 7 := rfl
-structure Bits where
+@[unbox] structure Bits where
   ofFin ::
   toFin : Nat
 def bitValue : Bits := Bits.ofFin 11
@@ -130,6 +136,10 @@ fn named_constructors_compute_through_patterns_projections_and_the_vm() {
     assert!(env.contains(&name("Named.Pair.build._flat_ctor")));
     assert!(!env.contains(&name("Named.Pair.mk")));
     assert!(!env.contains(&name("Named.Bits.mk")));
+    assert_eq!(
+        fln_elab::unbox::read(env).unwrap(),
+        std::collections::BTreeSet::from([name("Named.Pair"), name("Named.Bits")])
+    );
     let result = base
         .execute_source_commands_with_checks(
             format!("{COMPUTING}\n#eval Named.sum Named.literal\n").as_bytes(),
