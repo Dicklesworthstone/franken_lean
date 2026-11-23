@@ -111,12 +111,11 @@ pub(in crate::source) fn data_modifiers(syntax: &Syntax) -> Result<(), NatDefini
     super::super::doc_comment_slot(&parts[0])?;
     for attribute in attributes(&parts[1])? {
         if exposure_attribute(attribute)? != Some(true)
-            && !matches!(
-                executable::attribute(attribute)?,
-                Some(executable::Attribute::Unbox)
-            )
+            && !executable::attribute(attribute)?.is_some_and(|attribute| attribute.is_tag())
         {
-            return Err(refused("only expose or unbox attributes on data declarations"));
+            return Err(refused(
+                "only expose, unbox or pp_using_anonymous_constructor attributes on data declarations",
+            ));
         }
     }
     modifier(&parts[2])?;

@@ -24,6 +24,25 @@ pub(super) struct StructureTables {
 }
 
 impl<'a> Printer<'a> {
+    /// The pin accepts the tag on any declaration, but only actual structures
+    /// may use anonymous-constructor notation. In particular a nullary inductive
+    /// must remain an ordinary constant despite the older shape heuristic.
+    pub(super) fn tag_allows_structure_instance(&self, name: &Name) -> Result<bool, Unsupported> {
+        let tags = self
+            .tags
+            .as_ref()
+            .ok_or(Unsupported("an unreadable delaborator tag journal"))?;
+        if !tags.anonymous_constructor(name) {
+            return Ok(true);
+        }
+        if let Some(tables) = &self.structures {
+            return Ok(tables.imported.get(name).is_some());
+        }
+        let structures = ImportedStructures::read(self.env)
+            .map_err(|_| Unsupported("an unreadable imported structure journal"))?;
+        Ok(structures.get(name).is_some())
+    }
+
     /// `delabStructureInstance` for `ctor` at `levels` applied to `args`, its parameters and
     /// fields.
     pub(super) fn structure_instance(

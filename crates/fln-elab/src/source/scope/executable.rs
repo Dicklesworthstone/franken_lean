@@ -12,6 +12,14 @@ pub enum Attribute {
     ImplementedBy(Name),
     Extern(Vec<ExternEntry>),
     Unbox,
+    AnonymousConstructor,
+}
+
+impl Attribute {
+    /// Persistent plain tags do not replace or suppress a declaration's code.
+    pub fn is_tag(&self) -> bool {
+        matches!(self, Self::Unbox | Self::AnonymousConstructor)
+    }
 }
 
 fn implemented_error(error: crate::implemented_by::ImplementedByError) -> NatDefinitionElabError {
@@ -52,6 +60,9 @@ pub(in crate::source) fn attribute(
             if val == &Name::from_components(["unbox"]) {
                 expect_empty_null(argument, "unbox without arguments")?;
                 Attribute::Unbox
+            } else if val == &Name::from_components(["pp_using_anonymous_constructor"]) {
+                expect_empty_null(argument, "pp_using_anonymous_constructor without arguments")?;
+                Attribute::AnonymousConstructor
             } else if val == &Name::from_components(["implemented_by"]) {
                 let [Syntax::Ident { val, .. }] =
                     expect_null_args(argument, "implemented_by target")?
@@ -175,7 +186,7 @@ pub fn registrations(syntax: &Syntax) -> Result<Vec<Attribute>, NatDefinitionEla
         ]
         .iter()
         .any(|kind| declaration.kind() == Some(&parser_kind(&["Command", kind])))
-        && !(rows.iter().all(|row| matches!(row, Attribute::Unbox))
+        && !(rows.iter().all(Attribute::is_tag)
             && ["structure", "inductive"]
                 .iter()
                 .any(|kind| declaration.kind() == Some(&parser_kind(&["Command", kind]))))
@@ -185,7 +196,7 @@ pub fn registrations(syntax: &Syntax) -> Result<Vec<Attribute>, NatDefinitionEla
     Ok(rows)
 }
 
-/// Resolve a data declaration's own inline compiler tags after its checked
+/// Resolve a data declaration's own inline tags after its checked
 /// inductive bundle has been admitted. Generated constructors and projections
 /// do not acquire their type's tags.
 pub fn data_registration(
@@ -309,7 +320,7 @@ pub fn apply(
     standalone: bool,
 ) -> Result<Environment, NatDefinitionElabError> {
     if standalone
-        && rows.iter().any(|row| !matches!(row, Attribute::Unbox))
+        && rows.iter().any(|row| !row.is_tag())
         && (!matches!(environment.find(declaration), Some(ConstantInfo::Axiom(_)))
             || ExternTable::read(environment)
                 .map_err(extern_error)?
@@ -345,8 +356,8 @@ pub fn apply(
                 crate::externs::register(&result, declaration, entries.clone())
                     .map_err(extern_error)?
             }
-            Attribute::Unbox => crate::unbox::register(&result, declaration).map_err(|error| {
-                match error {
+            Attribute::Unbox => {
+                crate::unbox::register(&result, declaration).map_err(|error| match error {
                     crate::unbox::UnboxError::Limit => failure(SourceInferenceError::ResourceLimit),
                     crate::unbox::UnboxError::NotInductive(_) => {
                         refused("unbox on an inductive type")
@@ -358,8 +369,20 @@ pub fn apply(
                         refused("unbox on an admitted declaration")
                     }
                     crate::unbox::UnboxError::Malformed => refused("a valid unbox journal"),
-                }
-            })?,
+                })?
+            }
+            Attribute::AnonymousConstructor => {
+                crate::delaborator_tags::register_anonymous_constructor(&result, declaration)
+                    .map_err(|error| match error {
+                        crate::delaborator_tags::DelaboratorTagError::Limit => {
+                            failure(SourceInferenceError::ResourceLimit)
+                        }
+                        crate::delaborator_tags::DelaboratorTagError::UnknownDeclaration(_) => {
+                            refused("pp_using_anonymous_constructor on an admitted declaration")
+                        }
+                        _ => refused("a valid delaborator tag journal"),
+                    })?
+            }
         };
     }
     // Every registration validates its signature/payload, including overwritten

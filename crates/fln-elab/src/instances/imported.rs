@@ -714,10 +714,7 @@ impl ImportActivation {
     }
 
     /// Retain the owning module's checked nonrecursive inductive `[unbox]` tag.
-    pub fn register_unbox(
-        mut self,
-        declaration: &Name,
-    ) -> Result<Self, crate::unbox::UnboxError> {
+    pub fn register_unbox(mut self, declaration: &Name) -> Result<Self, crate::unbox::UnboxError> {
         self.env = crate::unbox::register(&self.env, declaration)?;
         Ok(self)
     }

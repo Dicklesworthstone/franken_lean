@@ -755,7 +755,7 @@ pub(crate) fn apply_module_control_command(
         }
         return Ok(Outcome::Complete(Vec::new()));
     }
-    // `[unbox]` is global metadata on its target, independent of the current
+    // Plain tags are global metadata on their targets, independent of the current
     // section's visibility. Stage every target first, splitting public and
     // private owners so a mixed command neither drops public tags nor exports
     // private names. Public suffixes are replayed only after all names validate.
@@ -771,7 +771,7 @@ pub(crate) fn apply_module_control_command(
             )
         };
         let (rows, names) = executable::command(syntax).map_err(frontend)?;
-        if rows.iter().all(|row| matches!(row, Attribute::Unbox)) {
+        if rows.iter().all(Attribute::is_tag) {
             let mut private_next = engine.clone();
             let mut public_next = public.engine().clone();
             for requested in names {
@@ -782,7 +782,7 @@ pub(crate) fn apply_module_control_command(
                         command,
                         offset,
                         message: format!(
-                            "unknown unbox declaration `{}`",
+                            "unknown attribute declaration `{}`",
                             requested.to_display_string()
                         ),
                     })?;
@@ -799,14 +799,9 @@ pub(crate) fn apply_module_control_command(
                 } else {
                     &mut private_next
                 };
-                target.environment = executable::apply(
-                    target.environment(),
-                    &scopes.current,
-                    &name,
-                    &rows,
-                    true,
-                )
-                .map_err(frontend)?;
+                target.environment =
+                    executable::apply(target.environment(), &scopes.current, &name, &rows, true)
+                        .map_err(frontend)?;
             }
             return match public
                 .publish(

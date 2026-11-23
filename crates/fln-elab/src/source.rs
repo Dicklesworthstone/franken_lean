@@ -7779,7 +7779,11 @@ fn definition_elaboration(
     // These still pass ordinary term elaboration and council admission, but a missing
     // runtime recursor implementation is irrelevant when no code may be generated.
     if !is_theorem && !proof_instance && !is_noncomputable {
-        if scope::executable::registrations(syntax)?.is_empty() {
+        if scope::executable::registrations(syntax)?
+            .iter()
+            .all(scope::executable::Attribute::is_tag)
+        {
+            // Plain compiler/printer tags leave ordinary code eligibility intact.
             // `[macro_inline]` generates no code (`shouldGenerateCode`), so neither is its
             // `main` checked. A failed `main` check ends compilation before any other.
             let main_failed = !scope::simp::macro_inline_requested(syntax)?

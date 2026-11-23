@@ -770,9 +770,10 @@ impl Engine {
             return Ok(result);
         };
         for syntax in members {
-            let registration = fln_elab::source::scope::executable::data_registration(syntax, scope)
-                .map_err(DefinitionFrontendError::Elaborate)
-                .map_err(EngineExecutionError::Frontend)?;
+            let registration =
+                fln_elab::source::scope::executable::data_registration(syntax, scope)
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?;
             if let Some((name, rows)) = registration {
                 batch.engine.environment = fln_elab::source::scope::executable::apply(
                     batch.engine.environment(),

@@ -683,7 +683,7 @@ pub struct Printer<'a> {
     notations: Option<&'a fln_parse::extensions::Notations>,
     /// How a dependent `let` prints ([`LetMode`]).
     lets: LetMode,
-    /// The imported delaborator tags (`pp_using_anonymous_constructor`, `pp_nodot`,
+    /// The source/imported delaborator tags (`pp_using_anonymous_constructor`, `pp_nodot`,
     /// `app_unexpander` keys), or `None` when the journal cannot be read.
     tags: Option<fln_elab::delaborator_tags::DelaboratorTags>,
     /// Whether the environment records imported delaborator tags at all: importing any `Init`
@@ -1446,7 +1446,8 @@ impl<'a> Printer<'a> {
                     && ctor.num_fields == 0
                     && self.structure_instances_for(ctor, levels)
                     && let Some(ConstantInfo::Induct(inductive)) = self.env.find(&ctor.induct)
-                    && self.structure_like(inductive) =>
+                    && self.structure_like(inductive)
+                    && self.tag_allows_structure_instance(&ctor.induct)? =>
             {
                 let ctor = ctor.clone();
                 self.structure_instance(&ctor, levels, &[])
@@ -2317,6 +2318,7 @@ impl<'a> Printer<'a> {
                 && self.structure_instances_for(ctor, levels)
                 && let Some(ConstantInfo::Induct(inductive)) = self.env.find(&ctor.induct)
                 && self.structure_like(inductive)
+                && self.tag_allows_structure_instance(&ctor.induct)?
             {
                 let ctor = ctor.clone();
                 return self.structure_instance(&ctor, levels, &args);

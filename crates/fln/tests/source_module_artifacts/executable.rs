@@ -38,6 +38,210 @@ structure Untagged (A : Type) where
 end Boxing
 "#;
 
+const ANONYMOUS_CONSTRUCTOR_BASE: &str = r#"prelude
+namespace Tagging
+@[pp_using_anonymous_constructor] structure Pair (A : Type) where
+  first : A
+  second : A
+@[pp_using_anonymous_constructor] structure Nested (A : Type) where
+  pair : Pair A
+  last : A
+@[pp_using_anonymous_constructor] structure Empty where
+@[pp_using_anonymous_constructor] inductive Atom where | mk
+@[pp_using_anonymous_constructor] inductive Phantom (A : Type) where | mk
+@[pp_using_anonymous_constructor] inductive Recursive where | stop | next (tail : Recursive)
+structure Plain (A : Type) where
+  value : A
+attribute [pp_using_anonymous_constructor] Plain.mk
+@[pp_using_anonymous_constructor] def identity (A : Type) (x : A) : A := x
+@[pp_using_anonymous_constructor] axiom arbitrary : Type
+attribute [pp_using_anonymous_constructor] Pair Pair identity
+end Tagging
+"#;
+
+#[test]
+fn anonymous_constructor_tags_survive_owned_artifacts_and_diamond_imports() {
+    let built = compiled(&[
+        ("Main", "prelude\nimport Left\nimport Right"),
+        ("Left", "prelude\nimport Base"),
+        ("Right", "prelude\nimport Base"),
+        ("Base", ANONYMOUS_CONSTRUCTOR_BASE),
+    ]);
+    let before = fln_elab::delaborator_tags::DelaboratorTags::read(
+        built.checked.checked.engine.environment(),
+    )
+    .unwrap();
+    for target in [
+        "Pair",
+        "Nested",
+        "Empty",
+        "Atom",
+        "Phantom",
+        "Recursive",
+        "Plain.mk",
+        "identity",
+        "arbitrary",
+    ] {
+        assert!(before.anonymous_constructor(&name(&format!("Tagging.{target}"))));
+    }
+    assert!(!before.anonymous_constructor(&name("Tagging.Plain")));
+    assert_eq!(
+        built
+            .artifacts
+            .iter()
+            .map(|artifact| metadata(&artifact.bytes).pp_anonymous_constructor.len())
+            .collect::<Vec<_>>(),
+        [9, 0, 0, 0]
+    );
+    let receipt = imported(&built);
+    let after =
+        fln_elab::delaborator_tags::DelaboratorTags::read(receipt.engine.environment()).unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        receipt
+            .modules
+            .iter()
+            .map(|report| report.pp_anonymous_constructor)
+            .collect::<Vec<_>>(),
+        [9, 0, 0, 0]
+    );
+    // Both nullary paths use the admitted structure table after physical import.
+    let mut printer = fln::pretty::Printer::new(receipt.engine.environment());
+    for (constructor, expected) in [
+        ("Tagging.Empty.mk", "⟨⟩"),
+        ("Tagging.Atom.mk", "Tagging.Atom.mk"),
+    ] {
+        assert_eq!(
+            printer
+                .expr(&fln::Expr::const_(name(constructor), Vec::new()), 0)
+                .unwrap(),
+            expected
+        );
+    }
+    aliases::reference_import_stdout(
+        &built,
+        r#"prelude
+import Lean
+import Main
+run_cmd do
+  let env ← Lean.getEnv
+  for decl in [`Tagging.Pair, `Tagging.Nested, `Tagging.Empty, `Tagging.Atom,
+      `Tagging.Phantom, `Tagging.Recursive, `Tagging.Plain.mk, `Tagging.identity, `Tagging.arbitrary] do
+    unless Lean.hasPPUsingAnonymousConstructorAttribute env decl do
+      throwError "missing anonymous-constructor tag: {decl}"
+  if Lean.hasPPUsingAnonymousConstructorAttribute env `Tagging.Plain then
+    throwError "a constructor tag was incorrectly transferred to its type"
+#check (Tagging.Pair.mk (A := Nat) 1 2)
+#check (Tagging.Nested.mk (A := Nat) (Tagging.Pair.mk 1 2) 3)
+#check (Tagging.Empty.mk : Tagging.Empty)
+#check (Tagging.Atom.mk : Tagging.Atom)
+#check (Tagging.Plain.mk (A := Nat) 4)
+"#,
+        true,
+        Some(
+            "⟨1, 2⟩ : Tagging.Pair Nat\n⟨⟨1, 2⟩, 3⟩ : Tagging.Nested Nat\n⟨⟩ : Tagging.Empty\nTagging.Atom.mk : Tagging.Atom\n{ value := 4 } : Tagging.Plain Nat\n",
+        ),
+    );
+}
+
+#[test]
+fn anonymous_constructor_tags_follow_target_visibility_in_a_private_section() {
+    let built = compiled(&[(
+        "Main",
+        r#"module
+prelude
+public structure Visible (A : Type) where
+  value : A
+structure Hidden (A : Type) where
+  value : A
+attribute [unbox, pp_using_anonymous_constructor] Visible Hidden
+public def visible (A : Type) (x : A) : A := x
+def hidden (A : Type) (x : A) : A := x
+attribute [pp_using_anonymous_constructor] visible hidden
+@[pp_using_anonymous_constructor] public axiom visibleA : Type
+@[pp_using_anonymous_constructor] axiom hiddenA : Type
+"#,
+    )]);
+    let exported: std::collections::BTreeSet<_> = metadata(&built.artifacts[0].bytes)
+        .pp_anonymous_constructor
+        .into_iter()
+        .collect();
+    assert_eq!(
+        exported,
+        std::collections::BTreeSet::from([name("Visible"), name("visible"), name("visibleA")])
+    );
+    assert_eq!(metadata(&built.artifacts[0].bytes).unbox, [name("Visible")]);
+    let before = fln_elab::delaborator_tags::DelaboratorTags::read(
+        built.checked.checked.engine.environment(),
+    )
+    .unwrap();
+    assert_eq!(
+        fln_elab::delaborator_tags::source_anonymous_constructors(
+            built.checked.checked.engine.environment()
+        )
+        .unwrap()
+        .len(),
+        6
+    );
+    assert_eq!(
+        before,
+        fln_elab::delaborator_tags::DelaboratorTags::read(imported(&built).engine.environment())
+            .unwrap()
+    );
+    aliases::reference_import_stdout(
+        &built,
+        r#"prelude
+import Lean
+import Main
+run_cmd do
+  let env ← Lean.getEnv
+  for decl in [`Visible, `visible, `visibleA] do
+    unless Lean.hasPPUsingAnonymousConstructorAttribute env decl do
+      throwError "public tag was lost in a private section: {decl}"
+"#,
+        true,
+        Some(""),
+    );
+}
+
+#[test]
+fn invalid_anonymous_constructor_attribute_forms_and_imported_retagging_are_refused() {
+    let engine = Engine::builder().build_empty();
+    let root = engine.logical_root(&KVMap::new());
+    for source in [
+        "prelude\n@[local pp_using_anonymous_constructor] axiom A : Type",
+        "prelude\n@[scoped pp_using_anonymous_constructor] structure S where",
+        "prelude\n@[pp_using_anonymous_constructor argument] structure S where",
+        "prelude\naxiom A : Type\nattribute [local pp_using_anonymous_constructor] A",
+        "prelude\naxiom A : Type\nattribute [scoped pp_using_anonymous_constructor] A",
+        "prelude\naxiom A : Type\nattribute [pp_using_anonymous_constructor argument] A",
+        "prelude\naxiom A : Type\nattribute [-pp_using_anonymous_constructor] A",
+        "prelude\nattribute [pp_using_anonymous_constructor] missing",
+        "prelude\naxiom A : Type\nattribute [pp_using_anonymous_constructor, unknown] A",
+    ] {
+        let error = build(&engine, &[("Main", source)], OleanWriteBudget::default()).unwrap_err();
+        assert_eq!(error.disposition().2, 1, "{source}: {error:?}");
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
+    for target in ["Tagging.Pair", "Tagging.Plain"] {
+        let source =
+            format!("prelude\nimport Base\nattribute [pp_using_anonymous_constructor] {target}");
+        let error = build(
+            &engine,
+            &[("Main", &source), ("Base", ANONYMOUS_CONSTRUCTOR_BASE)],
+            OleanWriteBudget::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot modify imported declarations"),
+            "{error:?}"
+        );
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
+}
+
 #[test]
 fn unbox_tags_survive_artifacts_and_diamond_imports_without_reexporting_inherited_tags() {
     let built = compiled(&[
@@ -69,7 +273,11 @@ fn unbox_tags_survive_artifacts_and_diamond_imports_without_reexporting_inherite
         expected
     );
     assert_eq!(
-        receipt.modules.iter().map(|report| report.unbox).collect::<Vec<_>>(),
+        receipt
+            .modules
+            .iter()
+            .map(|report| report.unbox)
+            .collect::<Vec<_>>(),
         [3, 0, 0, 0]
     );
     let probe = "theorem first (A B : Type) (a : A) (b : B) (P : A -> Prop) (h : P a) :\n\
@@ -135,7 +343,9 @@ fn invalid_unbox_attributes_and_imported_target_updates_are_refused_atomically()
         .unwrap_err();
         assert_eq!(error.disposition().2, 1, "{source}: {error:?}");
         assert!(
-            error.to_string().contains("cannot modify imported declarations"),
+            error
+                .to_string()
+                .contains("cannot modify imported declarations"),
             "{error:?}"
         );
         assert_eq!(engine.logical_root(&KVMap::new()), root);

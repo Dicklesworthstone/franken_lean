@@ -1678,7 +1678,6 @@ impl Engine {
                         .map_err(|error| {
                             let declaration = match &error {
                         fln_elab::delaborator_tags::DelaboratorTagError::UnknownDeclaration(name)
-                        | fln_elab::delaborator_tags::DelaboratorTagError::NotInductive(name)
                         | fln_elab::delaborator_tags::DelaboratorTagError::Duplicate(name) => {
                             name.clone()
                         }

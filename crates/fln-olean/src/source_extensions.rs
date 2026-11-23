@@ -218,7 +218,7 @@ pub struct SourceExtensions {
     /// Ordered initialization journals. A named initializer replaces a stored
     /// body at runtime; an anonymous parameter denotes a standalone IO action.
     pub initializers: crate::initializers::InitJournals,
-    /// Structures tagged `@[pp_using_anonymous_constructor]`, which print as `⟨…⟩`.
+    /// Plain `@[pp_using_anonymous_constructor]` tags; tagged structures print as `⟨…⟩`.
     pub pp_anonymous_constructor: Vec<Name>,
     /// Functions tagged `@[pp_nodot]`, never printed with field notation.
     pub pp_nodot: Vec<Name>,

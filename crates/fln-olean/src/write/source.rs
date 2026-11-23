@@ -52,6 +52,8 @@ pub struct SourceMetadata {
     pub noncomputable: Vec<Name>,
     /// Owned nonrecursive inductive `[unbox]` tags in the pin's `Name.quickLt` order.
     pub unbox: Vec<Name>,
+    /// Owned plain `pp_using_anonymous_constructor` tags, sorted by `Name.quickLt`.
+    pub pp_anonymous_constructor: Vec<Name>,
     /// Owned definitional-equality tags. The pin's defeq attribute also records
     /// backward_defeq; emit both sorted tag arrays, never just the subset.
     /// These flags are metadata, not a certificate of equality.
@@ -210,6 +212,13 @@ impl Encoder {
                 layout::UNBOX_EXTENSION,
                 &metadata.unbox,
                 "anonymous or duplicate unbox declaration",
+            )?);
+        }
+        if !metadata.pp_anonymous_constructor.is_empty() {
+            blocks.push(self.tagged_names_block(
+                layout::PP_ANONYMOUS_CONSTRUCTOR_EXTENSION,
+                &metadata.pp_anonymous_constructor,
+                "anonymous or duplicate pp_using_anonymous_constructor declaration",
             )?);
         }
         if !metadata.defeq.is_empty() {
@@ -495,6 +504,57 @@ mod tests {
                     input(),
                     &SourceMetadata {
                         unbox,
+                        ..SourceMetadata::default()
+                    },
+                    header(),
+                    WriteBudget::default(),
+                ),
+                Err(WriteError::Contract { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn anonymous_constructor_only_metadata_roundtrips_without_namespace() {
+        let names = vec![
+            Name::from_components(["f"]),
+            Name::from_components(["N", "S"]),
+        ];
+        let metadata = SourceMetadata {
+            pp_anonymous_constructor: names.clone(),
+            ..SourceMetadata::default()
+        };
+        let encoded = encode_module_with_source_metadata(
+            input(),
+            &metadata,
+            header(),
+            WriteBudget::default(),
+        )
+        .unwrap();
+        let blocks = crate::region::OleanView::parse(&encoded.bytes)
+            .unwrap()
+            .extension_payloads(crate::region::WalkBudget::default(), 1024 * 1024)
+            .unwrap();
+        assert_eq!(blocks.len(), 1, "plain tag-only metadata must be retained");
+        assert_eq!(
+            blocks[0].name,
+            Name::from_components(layout::PP_ANONYMOUS_CONSTRUCTOR_EXTENSION.split('.'))
+        );
+        let mut sorted = names;
+        sorted.sort_by(Name::quick_cmp);
+        let decoded = source_extensions::decode(&blocks, DecodeLimits::default()).unwrap();
+        assert_eq!(decoded.pp_anonymous_constructor, sorted);
+        assert!(decoded.uninterpreted.is_empty());
+        assert!(decoded.pp_nodot.is_empty() && decoded.app_unexpanders.is_empty());
+        for tags in [
+            vec![Name::anonymous()],
+            vec![sorted[0].clone(), sorted[0].clone()],
+        ] {
+            assert!(matches!(
+                encode_module_with_source_metadata(
+                    input(),
+                    &SourceMetadata {
+                        pp_anonymous_constructor: tags,
                         ..SourceMetadata::default()
                     },
                     header(),

@@ -1,4 +1,4 @@
-//! The pin's delaborator attributes, read from imported modules: structures tagged
+//! The pin's delaborator attributes: declarations tagged
 //! `@[pp_using_anonymous_constructor]` (`Lean.ppUsingAnonymousConstructorAttr`), functions
 //! tagged `@[pp_nodot]` (`Lean.ppNoDotAttr`), and the constants an `@[app_unexpander]`
 //! (`Lean.PrettyPrinter.Delaborator.appUnexpanderAttribute`) is registered for, vendored
@@ -8,10 +8,11 @@
 //! field notation, and an application of a key goes through compiled code this door does not
 //! run, so it is never printed as a structure instance. An unexpander's own declaration is
 //! not recorded: nothing here executes it. Each imported module contributes its own rows in
-//! one entry. A malformed journal is refused, not read as empty.
+//! one entry. Source anonymous-constructor tags have a separate owned journal;
+//! exporting that journal does not authorize losing unexpander registrations.
+//! A malformed journal is refused, not read as empty.
 use crate::instances::{InstanceRegistryError, read_name, write_name};
 use fln_core::name::Name;
-use fln_env::constants::ConstantInfo;
 use fln_env::environment::Environment;
 use fln_env::extensions::{
     CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance,
@@ -22,6 +23,9 @@ const MAGIC: &[u8] = b"FLNDLBT\x01";
 const MAX_ROWS: usize = 65_536;
 const MAX_TAGS: usize = 1 << 20;
 const MAX_ENTRY_BYTES: usize = 16 << 20;
+const SOURCE_MAGIC: &[u8] = b"FLNPPAC\x01";
+pub const MAX_SOURCE_ROWS: usize = 65_536;
+const MAX_SOURCE_ENTRY_BYTES: usize = 65_536;
 
 const ANONYMOUS_CONSTRUCTOR: u8 = 0;
 const NODOT: u8 = 1;
@@ -30,7 +34,7 @@ const UNEXPANDER: u8 = 2;
 /// One imported delaborator tag.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DelaboratorTag {
-    /// `@[pp_using_anonymous_constructor]` on a structure.
+    /// `@[pp_using_anonymous_constructor]`, a plain tag on any declaration.
     AnonymousConstructor(Name),
     /// `@[pp_nodot]` on a function.
     NoDot(Name),
@@ -44,7 +48,6 @@ pub enum DelaboratorTagError {
     Malformed,
     Limit,
     UnknownDeclaration(Name),
-    NotInductive(Name),
     Duplicate(Name),
 }
 
@@ -56,11 +59,6 @@ impl std::fmt::Display for DelaboratorTagError {
             Self::UnknownDeclaration(name) => write!(
                 f,
                 "a delaborator tag names {}, which is not admitted",
-                name.to_display_string()
-            ),
-            Self::NotInductive(name) => write!(
-                f,
-                "pp_using_anonymous_constructor tags {}, which is not an inductive type",
                 name.to_display_string()
             ),
             Self::Duplicate(name) => write!(
@@ -103,14 +101,98 @@ fn validate(env: &Environment, tag: &DelaboratorTag) -> Result<(), DelaboratorTa
     if name.is_anonymous() {
         return Err(DelaboratorTagError::Malformed);
     }
-    match (tag, env.find(name)) {
-        (_, None) => Err(DelaboratorTagError::UnknownDeclaration(name.clone())),
-        (DelaboratorTag::AnonymousConstructor(_), Some(ConstantInfo::Induct(_))) => Ok(()),
-        (DelaboratorTag::AnonymousConstructor(_), Some(_)) => {
-            Err(DelaboratorTagError::NotInductive(name.clone()))
-        }
-        (_, Some(_)) => Ok(()),
+    // The pin's registerTagAttribute has no validator for either plain tag.
+    // Structure membership is a separate printer condition, not tag authority.
+    if env.contains(name) {
+        Ok(())
+    } else {
+        Err(DelaboratorTagError::UnknownDeclaration(name.clone()))
     }
+}
+
+/// Owned source tags, independent of the import-only unexpander/no-dot journal.
+pub fn source_journal_name() -> Name {
+    Name::from_components(["FrankenLean", "sourceAnonymousConstructor", "v1"])
+}
+
+fn source_descriptor() -> ExtensionDescriptor {
+    ExtensionDescriptor {
+        name: source_journal_name(),
+        merge: MergeSemantics::AppendOrdered,
+        checkpoint: CheckpointSemantics::FullJournal,
+        provenance: PayloadProvenance::Understood,
+    }
+}
+
+pub fn supports_source(candidate: &ExtensionDescriptor) -> bool {
+    *candidate == source_descriptor()
+}
+
+/// Source admission checks global scope and module ownership before calling this.
+/// Repeated NameSet insertion is idempotent, including an inherited tag.
+pub fn register_anonymous_constructor(
+    env: &Environment,
+    name: &Name,
+) -> Result<Environment, DelaboratorTagError> {
+    validate(env, &DelaboratorTag::AnonymousConstructor(name.clone()))?;
+    if DelaboratorTags::read(env)?.anonymous_constructor(name) {
+        return Ok(env.clone());
+    }
+    let mut payload = SOURCE_MAGIC.to_vec();
+    write_name(name, &mut payload).map_err(codec)?;
+    if payload.len() > MAX_SOURCE_ENTRY_BYTES {
+        return Err(DelaboratorTagError::Limit);
+    }
+    let env = match env.extension(&source_journal_name()) {
+        Some(state) if state.len() >= MAX_SOURCE_ROWS => {
+            return Err(DelaboratorTagError::Limit);
+        }
+        Some(_) => env.clone(),
+        None => env
+            .register_extension(source_descriptor())
+            .map_err(|_| DelaboratorTagError::Malformed)?,
+    };
+    env.push_extension_entry(&source_journal_name(), payload)
+        .map_err(|_| DelaboratorTagError::Malformed)
+}
+
+/// Read the exportable source journal against each row's admitted environment.
+/// Projection-hidden declarations are validated there, then omitted here.
+pub fn source_anonymous_constructors(
+    env: &Environment,
+) -> Result<BTreeSet<Name>, DelaboratorTagError> {
+    let Some(extension) = env.extension(&source_journal_name()) else {
+        return Ok(BTreeSet::new());
+    };
+    if extension.descriptor != source_descriptor() {
+        return Err(DelaboratorTagError::Malformed);
+    }
+    if extension.len() > MAX_SOURCE_ROWS {
+        return Err(DelaboratorTagError::Limit);
+    }
+    let mut names = BTreeSet::new();
+    for (entry, validation) in env.metadata_validation_entries(&source_journal_name()) {
+        if entry.payload.len() > MAX_SOURCE_ENTRY_BYTES {
+            return Err(DelaboratorTagError::Limit);
+        }
+        let mut bytes = entry
+            .payload
+            .strip_prefix(SOURCE_MAGIC)
+            .ok_or(DelaboratorTagError::Malformed)?;
+        let name = read_name(&mut bytes).map_err(codec)?;
+        if !bytes.is_empty() {
+            return Err(DelaboratorTagError::Malformed);
+        }
+        validate(
+            validation,
+            &DelaboratorTag::AnonymousConstructor(name.clone()),
+        )?;
+        if !names.insert(name.clone()) {
+            return Err(DelaboratorTagError::Duplicate(name));
+        }
+    }
+    names.retain(|name| env.contains(name));
+    Ok(names)
 }
 
 fn encode(tag: &DelaboratorTag, payload: &mut Vec<u8>) -> Result<(), DelaboratorTagError> {
@@ -160,8 +242,8 @@ fn decode(bytes: &mut &[u8]) -> Result<DelaboratorTag, DelaboratorTagError> {
 }
 
 /// Append one imported module's tags. The importer checks that a tag attribute names this
-/// module's own declaration; here every name must be admitted, and a structure tag must name
-/// an inductive type. A tag repeated within the module is refused.
+/// module's own declaration; here every name must be admitted. The pin's plain tags
+/// impose no declaration-kind restriction. A tag repeated within the module is refused.
 pub fn register_module(
     env: &Environment,
     tags: &[DelaboratorTag],
@@ -208,7 +290,7 @@ pub fn register_module(
         .map_err(|_| DelaboratorTagError::Malformed)
 }
 
-/// The imported delaborator tags in force.
+/// The imported and source delaborator tags in force.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DelaboratorTags {
     anonymous_constructor: BTreeSet<Name>,
@@ -221,8 +303,12 @@ pub struct DelaboratorTags {
 impl DelaboratorTags {
     /// Validate and read every recorded tag, keeping each unexpander's scope.
     pub fn read(env: &Environment) -> Result<Self, DelaboratorTagError> {
+        let source = source_anonymous_constructors(env)?;
         let Some(extension) = env.extension(&journal_name()) else {
-            return Ok(Self::default());
+            return Ok(Self {
+                anonymous_constructor: source,
+                ..Self::default()
+            });
         };
         if extension.descriptor != descriptor() {
             return Err(DelaboratorTagError::Malformed);
@@ -231,7 +317,7 @@ impl DelaboratorTags {
             return Err(DelaboratorTagError::Limit);
         }
         let mut tags = Self::default();
-        let mut total = 0usize;
+        let mut total = source.len();
         for (entry, validation) in env.metadata_validation_entries(&journal_name()) {
             if entry.payload.len() > MAX_ENTRY_BYTES {
                 return Err(DelaboratorTagError::Limit);
@@ -282,14 +368,15 @@ impl DelaboratorTags {
             }
         }
         tags.anonymous_constructor.retain(|name| env.contains(name));
+        tags.anonymous_constructor.extend(source);
         tags.nodot.retain(|name| env.contains(name));
         tags.unexpanded.retain(|name, _| env.contains(name));
         Ok(tags)
     }
 
-    /// Whether `structure` is tagged `@[pp_using_anonymous_constructor]`.
-    pub fn anonymous_constructor(&self, structure: &Name) -> bool {
-        self.anonymous_constructor.contains(structure)
+    /// Whether `declaration` is tagged `@[pp_using_anonymous_constructor]`.
+    pub fn anonymous_constructor(&self, declaration: &Name) -> bool {
+        self.anonymous_constructor.contains(declaration)
     }
 
     /// Whether `function` is tagged `@[pp_nodot]`.
@@ -313,6 +400,77 @@ impl DelaboratorTags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fln_core::{expr::Expr, level::Level};
+    use fln_env::constants::{AxiomVal, ConstantInfo, ConstantVal};
+
+    fn axiom() -> (Environment, Name) {
+        let name = Name::from_components(["A"]);
+        let env = Environment::new()
+            .add_decl(ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: name.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                is_unsafe: false,
+            }))
+            .unwrap();
+        (env, name)
+    }
+
+    #[test]
+    fn anonymous_constructor_is_a_plain_idempotent_source_and_imported_tag() {
+        let (env, name) = axiom();
+        let source = register_anonymous_constructor(&env, &name).unwrap();
+        let repeated = register_anonymous_constructor(&source, &name).unwrap();
+        assert_eq!(repeated, source);
+        assert_eq!(
+            source_anonymous_constructors(&source).unwrap(),
+            BTreeSet::from([name.clone()])
+        );
+        assert!(
+            DelaboratorTags::read(&source)
+                .unwrap()
+                .anonymous_constructor(&name)
+        );
+        assert_eq!(source.extension(&source_journal_name()).unwrap().len(), 1);
+        let imported =
+            register_module(&env, &[DelaboratorTag::AnonymousConstructor(name.clone())]).unwrap();
+        assert_eq!(
+            DelaboratorTags::read(&imported).unwrap(),
+            DelaboratorTags::read(&source).unwrap()
+        );
+        assert_eq!(
+            register_anonymous_constructor(&imported, &name).unwrap(),
+            imported
+        );
+        assert!(imported.extension(&source_journal_name()).is_none());
+    }
+
+    #[test]
+    fn malformed_source_tags_are_not_ignored_or_repaired() {
+        let (env, name) = axiom();
+        for bytes in [Vec::new(), SOURCE_MAGIC.to_vec(), b"broken".to_vec()] {
+            let malformed = env
+                .register_extension(source_descriptor())
+                .unwrap()
+                .push_extension_entry(&source_journal_name(), bytes)
+                .unwrap();
+            assert_eq!(
+                DelaboratorTags::read(&malformed),
+                Err(DelaboratorTagError::Malformed)
+            );
+            assert_eq!(
+                register_anonymous_constructor(&malformed, &name),
+                Err(DelaboratorTagError::Malformed)
+            );
+        }
+        let missing = Name::from_components(["missing"]);
+        assert_eq!(
+            register_anonymous_constructor(&env, &missing),
+            Err(DelaboratorTagError::UnknownDeclaration(missing))
+        );
+    }
 
     #[test]
     fn malformed_rows_are_refused_not_read_as_empty() {

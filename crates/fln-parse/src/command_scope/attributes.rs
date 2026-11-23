@@ -799,7 +799,7 @@ pub(super) fn parse_executable(
         .any(|token| {
             matches!(
                 view.normalized().span_str(token.extent),
-                Some("implemented_by" | "extern" | "unbox")
+                Some("implemented_by" | "extern" | "unbox" | "pp_using_anonymous_constructor")
             )
         });
     if !has_executable {

@@ -685,6 +685,40 @@ impl ArtifactData {
                 metadata.unbox.push(tagged);
             }
         }
+        let anonymous_constructors = |env: &Environment, meter: &mut Meter| {
+            use fln_elab::delaborator_tags;
+            if let Some(journal) = env.extension(&delaborator_tags::source_journal_name()) {
+                for entry in journal.entries() {
+                    meter.work(1)?;
+                    meter.bytes(entry.payload.len())?;
+                }
+            }
+            delaborator_tags::source_anonymous_constructors(env).map_err(|error| match error {
+                delaborator_tags::DelaboratorTagError::Limit => SourceModuleCheckError::Limit {
+                    resource: "native anonymous-constructor tags",
+                    limit: delaborator_tags::MAX_SOURCE_ROWS,
+                },
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: delaborator_tags::source_journal_name(),
+                    reason: "invalid anonymous-constructor tag journal",
+                },
+            })
+        };
+        let inherited = anonymous_constructors(base, meter)?;
+        for tagged in anonymous_constructors(checked, meter)? {
+            meter.work(1)?;
+            if !inherited.contains(&tagged) {
+                if base.contains(&tagged) {
+                    return Err(SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::delaborator_tags::source_journal_name(),
+                        reason: "a module cannot tag an imported anonymous-constructor declaration",
+                    });
+                }
+                metadata.pp_anonymous_constructor.push(tagged);
+            }
+        }
         // Reflexivity tags are selection metadata owned by the module that
         // declared the theorem. The codec already emits both pinned tag sets;
         // export the journal delta rather than silently losing it at this edge.

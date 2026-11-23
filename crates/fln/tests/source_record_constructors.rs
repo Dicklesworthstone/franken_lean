@@ -61,7 +61,7 @@ structure Prod (A : Type u) (B : Type v) where
   fst : A
   snd : B
 attribute [unbox] Prod
-structure And (a b : Prop) : Prop where
+@[pp_using_anonymous_constructor] structure And (a b : Prop) : Prop where
   intro ::
   left : a
   right : b
@@ -80,6 +80,11 @@ def raised {A : Sort u} (a : A) : PLift A := PLift.up a
         fln_elab::unbox::read(env).unwrap(),
         std::collections::BTreeSet::from([name("Prod"), name("PLift")])
     );
+    assert!(
+        fln_elab::delaborator_tags::DelaboratorTags::read(env)
+            .unwrap()
+            .anonymous_constructor(&name("And"))
+    );
     for (record, ctor) in [("Prod", "mk"), ("And", "intro"), ("PLift", "up")] {
         let Some(ConstantInfo::Induct(family)) = env.find(&name(record)) else {
             panic!("missing source record {record}");
@@ -97,6 +102,116 @@ def raised {A : Sort u} (a : A) : PLift A := PLift.up a
     }
     assert!(base.environment().is_empty());
     assert_eq!(base.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn anonymous_constructor_tags_control_actual_printing_without_inventing_structures() {
+    let base = engine();
+    let untagged = check(
+        &base,
+        "structure Pair where\n  x : Nat\n  y : Nat\ndef pair : Pair := Pair.mk 1 2",
+    );
+    let Some(ConstantInfo::Defn(pair)) = untagged.engine.environment().find(&name("pair")) else {
+        panic!("missing checked pair");
+    };
+    assert_eq!(
+        fln::pretty::Printer::new(untagged.engine.environment())
+            .expr(&pair.value, 0)
+            .unwrap(),
+        "{ x := 1, y := 2 }"
+    );
+    let checked = check(
+        &base,
+        r#"
+structure Pair where
+  x : Nat
+  y : Nat
+attribute [pp_using_anonymous_constructor] Pair Pair
+@[pp_using_anonymous_constructor] structure Nested where
+  pair : Pair
+  last : Nat
+@[pp_using_anonymous_constructor] structure Empty where
+@[pp_using_anonymous_constructor] inductive Atom where | mk
+@[pp_using_anonymous_constructor] inductive Phantom (A : Type) where | mk
+@[pp_using_anonymous_constructor] inductive Recursive where | stop | next (tail : Recursive)
+structure CtorOnly where
+  value : Nat
+attribute [pp_using_anonymous_constructor] CtorOnly.mk
+@[pp_using_anonymous_constructor] def identity (n : Nat) : Nat := n
+@[pp_using_anonymous_constructor] axiom arbitrary : Type
+attribute [pp_using_anonymous_constructor] identity
+def pair : Pair := Pair.mk 1 2
+def nested : Nested := Nested.mk (Pair.mk 1 2) 3
+def empty : Empty := Empty.mk
+def atom : Atom := Atom.mk
+def phantom : Phantom Nat := Phantom.mk
+def ctorOnly : CtorOnly := CtorOnly.mk 4
+"#,
+    );
+    let env = checked.engine.environment();
+    let tags = fln_elab::delaborator_tags::DelaboratorTags::read(env).unwrap();
+    for tagged in [
+        "Pair",
+        "Nested",
+        "Empty",
+        "Atom",
+        "Phantom",
+        "Recursive",
+        "CtorOnly.mk",
+        "identity",
+        "arbitrary",
+    ] {
+        assert!(tags.anonymous_constructor(&name(tagged)), "{tagged}");
+    }
+    assert!(!tags.anonymous_constructor(&name("CtorOnly")));
+    let mut printer = fln::pretty::Printer::new(env);
+    for (declaration, expected) in [
+        ("pair", "⟨1, 2⟩"),
+        ("nested", "⟨⟨1, 2⟩, 3⟩"),
+        ("empty", "⟨⟩"),
+        ("atom", "Atom.mk"),
+        ("ctorOnly", "{ value := 4 }"),
+    ] {
+        let Some(ConstantInfo::Defn(value)) = env.find(&name(declaration)) else {
+            panic!("missing checked value {declaration}");
+        };
+        assert_eq!(
+            printer.expr(&value.value, 0).unwrap(),
+            expected,
+            "{declaration}"
+        );
+    }
+    let Some(ConstantInfo::Defn(phantom)) = env.find(&name("phantom")) else {
+        panic!("missing parameterized nullary inductive value");
+    };
+    let printed = printer.expr(&phantom.value, 0).unwrap();
+    assert!(
+        printed.contains("Phantom.mk") && !printed.contains('⟨'),
+        "{printed}"
+    );
+}
+
+#[test]
+fn anonymous_constructor_tags_preserve_definition_compiler_checks() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    for attribute in ["", "@[pp_using_anonymous_constructor] "] {
+        let source = format!(
+            "noncomputable def unavailable : Nat := 3\n{attribute}def use : Nat := unavailable"
+        );
+        let error = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("NoncomputableDependency"),
+            "{error:?}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
 }
 
 const COMPUTING: &str = r#"
