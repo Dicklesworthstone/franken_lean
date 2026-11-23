@@ -491,6 +491,41 @@ example : Packed Nat 7 := Packed.mk (a := 7) (by rfl)
 example : Packed Bool true := Packed.later (a := true) (by rfl) false
 "#;
 
+// The auto-bound carrier initially has an expression-hole type. Checking the
+// written field assigns that hole to `Sort ?u`; implicit result arguments must
+// still expose and constrain ?u to the universe shared by the family indices.
+const HETEROGENEOUS_CONSTRUCTOR_CARRIERS: &[&str] = &[
+    "prelude\nuniverse u\n\
+     inductive Hetero : {A : Sort u} → A → {B : Sort u} → B → Prop where\n\
+       | refl (a : A) : Hetero a a\n",
+    "prelude\nuniverse u\n\
+     inductive Hetero : {A : Sort u} → A → {B : Sort u} → B → Prop where\n\
+       | refl {A : Sort u} (a : A) : Hetero a a\n",
+    "prelude\nuniverse u\n\
+     inductive Hetero : {A : Sort u} → A → {B : Sort u} → B → Prop where\n\
+       | refl (a : A) : @Hetero A a A a\n",
+    "prelude\nuniverse u\n\
+     inductive Hetero : {A : Sort u} → A → {B : Sort u} → B → Prop where\n\
+       | refl {A : Sort u} (a : A) : @Hetero A a A a\n",
+    "prelude\nuniverse u v\n\
+     inductive Hetero : {A : Sort (max u v)} → A → {B : Sort (max u v)} → B → Prop where\n\
+       | refl (a : A) : Hetero a a\n\
+     theorem Hetero.shared {A : Sort (max u v)} (a : A) : @Hetero.{u, v} A a A a := @Hetero.refl.{u, v} A a\n",
+    "prelude\n\
+     inductive Hetero : {A : Prop} → A → {B : Prop} → B → Prop where\n\
+       | refl (a : A) : Hetero a a\n\
+     theorem Hetero.shared {A : Prop} (a : A) : Hetero a a := Hetero.refl a\n",
+];
+
+const INVALID_HETEROGENEOUS_CONSTRUCTOR_CARRIERS: &[&str] = &[
+    "prelude\nuniverse u v\n\
+     inductive Hetero : {A : Sort u} → A → {B : Sort v} → B → Prop where\n\
+       | refl (a : A) : Hetero a a\n",
+    "prelude\nuniverse u\n\
+     inductive Hetero : {A : Sort u} → A → {B : Sort u} → B → Prop where\n\
+       | refl {A : Sort (u + 1)} (a : A) : Hetero a a\n",
+];
+
 const FIELD_CARRIERS: &str = r#"
 structure FieldCarrier (α : Type) (x : α) : Type where
   compare (h : HEq a x) : HEq a x := h
@@ -623,6 +658,134 @@ fn constructor_carriers_remain_inside_each_constructor_telescope() {
         assert_eq!(found[4].0, "h");
         assert_eq!(found[4].1, BinderInfo::Default);
     }
+}
+
+#[test]
+fn constructor_auto_carriers_share_the_resolved_family_universe() {
+    for (index, source) in HETEROGENEOUS_CONSTRUCTOR_CARRIERS.iter().enumerate() {
+        let base = Engine::builder().build_empty();
+        assert!(base.environment().is_empty());
+        // This API checks commands in the explicit empty environment; the
+        // `prelude` module header remains in the separate reference fixture.
+        let commands = source.strip_prefix("prelude\n").unwrap();
+        let engine = base
+            .check_source_files(
+                &[commands.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .unwrap_or_else(|error| panic!("case {index}: {source}\n{error:?}"))
+            .into_complete()
+            .unwrap()
+            .engine;
+        let family = engine
+            .environment()
+            .find(&Name::from_components(["Hetero"]))
+            .unwrap();
+        let constructor = engine
+            .environment()
+            .find(&Name::from_components(["Hetero", "refl"]))
+            .unwrap();
+        let family = family.constant_val();
+        let constructor = constructor.constant_val();
+        assert_eq!(
+            family.level_params, constructor.level_params,
+            "case {index}"
+        );
+        let family_binders = binders(&engine, "Hetero", 4);
+        let constructor_binders = binders(&engine, "Hetero.refl", 2);
+        assert_eq!(constructor_binders[0].1, BinderInfo::Implicit);
+        let (
+            ExprNode::Sort {
+                level: constructor_universe,
+            },
+            ExprNode::Sort {
+                level: family_universe,
+            },
+        ) = (constructor_binders[0].2.node(), family_binders[0].2.node())
+        else {
+            panic!("case {index}: both carrier domains must be sorts");
+        };
+        assert_eq!(
+            constructor_universe.normalize(),
+            family_universe.normalize(),
+            "case {index}"
+        );
+        assert_eq!(constructor_binders[1].1, BinderInfo::Default);
+        assert_eq!(constructor_binders[1].2, Expr::bvar(0).unwrap());
+        assert_eq!(declaration_binder_count(&engine, "Hetero.refl"), 2);
+        for type_ in [&family.type_, &constructor.type_] {
+            assert!(!type_.has_expr_mvar(), "case {index}");
+            assert!(!type_.has_level_mvar(), "case {index}");
+        }
+        assert!(base.environment().is_empty());
+    }
+}
+
+#[test]
+fn carrier_inference_does_not_equate_incompatible_universes() {
+    for source in INVALID_HETEROGENEOUS_CONSTRUCTOR_CARRIERS {
+        let base = Engine::builder().build_empty();
+        let options = KVMap::new();
+        let root = base.logical_root(&options);
+        let commands = source.strip_prefix("prelude\n").unwrap();
+        let error = base
+            .check_source_files(
+                &[commands.as_bytes()],
+                &options,
+                SourceCheckLimits::new(limits()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.disposition(),
+            ("elaboration", false, 1),
+            "{source}\n{error:?}"
+        );
+        assert_eq!(base.logical_root(&options), root);
+        assert!(base.environment().is_empty());
+    }
+}
+
+#[test]
+fn auto_carrier_inference_checks_the_unmodified_prelude_through_heq_from_empty() {
+    use fln::source_check::modules::execution::SourceProgramLimits;
+    use fln::source_check::modules::imported::SourceOleanImport;
+    use fln::{EngineExecutionLimits, EvaluationPresentation, SourceModuleInput};
+
+    let prelude = include_str!("../../../vendor/lean4-src/src/Init/Prelude.lean");
+    let (prefix, _) = prelude
+        .split_once("/--\nThe Boolean values, `true` and `false`.")
+        .expect("the pinned prefix ends after HEq and before Bool");
+    assert!(prefix.contains("inductive HEq : {α : Sort u}"));
+    assert!(prefix.contains("| refl (a : α) : HEq a a"));
+    let options = KVMap::new();
+    let module = Name::from_components(["Init", "Prelude"]);
+    let imported = SourceOleanImport::empty(&options);
+    assert!(imported.engine.environment().is_empty());
+    let checked = imported
+        .execute_lean_source_modules_with_presentation(
+            &[SourceModuleInput {
+                name: &module,
+                source: prefix.as_bytes(),
+            }],
+            &module,
+            &options,
+            SourceProgramLimits::new(EngineExecutionLimits::new(limits().kernel)),
+            None,
+            EvaluationPresentation::Lean,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked.modules.len(), 1);
+    let environment = checked.modules[0].commands.batch.engine.environment();
+    for name in ["Eq.ndrec", "HEq", "HEq.refl", "HEq.rec"] {
+        assert!(
+            environment.contains(&Name::from_components(name.split('.'))),
+            "{name}"
+        );
+    }
+    assert!(imported.engine.environment().is_empty());
 }
 
 #[test]
@@ -789,17 +952,25 @@ fn auto_bound_carrier_programs_match_the_installed_reference() {
     let rejected_sources = INVALID_CARRIERS
         .iter()
         .chain(INVALID_INFERRED_RESULT_CARRIERS)
+        .chain(INVALID_HETEROGENEOUS_CONSTRUCTOR_CARRIERS)
         .copied()
         .map(|source| (source, false));
     for (index, (source, accepted)) in accepted_sources
         .into_iter()
         .map(|source| (source, true))
+        .chain(
+            HETEROGENEOUS_CONSTRUCTOR_CARRIERS
+                .iter()
+                .copied()
+                .map(|source| (source, true)),
+        )
         .chain(rejected_sources)
         .enumerate()
     {
         let path = root.join(format!("case-{index}.lean"));
         std::fs::write(&path, source).unwrap();
         let result = Command::new(&reference)
+            .arg("-j1")
             .arg(&path)
             .env_remove("LEAN_PATH")
             .env_remove("LEAN_SYSROOT")

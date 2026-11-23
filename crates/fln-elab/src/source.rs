@@ -1778,9 +1778,16 @@ impl Context {
             return Ok(());
         }
         if let (Some(left), Some(right)) = (self.known_type(&actual)?, self.known_type(&expected)?)
-            && (left.has_level_mvar() || right.has_level_mvar())
         {
-            self.equations.push(SourceEquation::inference(left, right));
+            // A local's declared type may still be an expression hole already
+            // assigned to `Sort ?u`. Expose that assignment before deciding
+            // whether its universe needs an inference equation (HEq.refl's
+            // auto-bound carrier is such a local).
+            let left = self.instantiate(&left)?;
+            let right = self.instantiate(&right)?;
+            if left.has_level_mvar() || right.has_level_mvar() {
+                self.equations.push(SourceEquation::inference(left, right));
+            }
         }
         self.equations
             .push(SourceEquation::inference(actual, expected));
