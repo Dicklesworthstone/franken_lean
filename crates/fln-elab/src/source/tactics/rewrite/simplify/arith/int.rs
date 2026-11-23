@@ -373,7 +373,7 @@ impl Context {
                     depth + 1,
                 )?)));
             }
-            ("Neg.neg", 3) if is_constant(args[1], "Int.instNegInt") => {
+            ("Neg.neg", 3) if self.simp_arith_constant_instance(args[1], "Int.instNegInt")? => {
                 return Ok(IntegerExpr::Neg(Box::new(self.simp_arith_integer_linear(
                     atoms,
                     args[2],
@@ -383,16 +383,43 @@ impl Context {
             ("Int.add", 2) => Some(("add", 0, 1)),
             ("Int.sub", 2) => Some(("sub", 0, 1)),
             ("Int.mul", 2) => Some(("mul", 0, 1)),
-            ("Add.add", 4) if is_constant(args[1], "Int.instAdd") => Some(("add", 2, 3)),
-            ("Sub.sub", 4) if is_constant(args[1], "Int.instSub") => Some(("sub", 2, 3)),
-            ("Mul.mul", 4) if is_constant(args[1], "Int.instMul") => Some(("mul", 2, 3)),
-            ("HAdd.hAdd", 6) if is_heterogeneous_instance(args[3], "instHAdd", "Int.instAdd") => {
+            ("Add.add", 4) if self.simp_arith_constant_instance(args[1], "Int.instAdd")? => {
+                Some(("add", 2, 3))
+            }
+            ("Sub.sub", 4) if self.simp_arith_constant_instance(args[1], "Int.instSub")? => {
+                Some(("sub", 2, 3))
+            }
+            ("Mul.mul", 4) if self.simp_arith_constant_instance(args[1], "Int.instMul")? => {
+                Some(("mul", 2, 3))
+            }
+            ("HAdd.hAdd", 6)
+                if self.simp_arith_heterogeneous_instance(
+                    args[3],
+                    integer_type(),
+                    "instHAdd",
+                    "Int.instAdd",
+                )? =>
+            {
                 Some(("add", 4, 5))
             }
-            ("HSub.hSub", 6) if is_heterogeneous_instance(args[3], "instHSub", "Int.instSub") => {
+            ("HSub.hSub", 6)
+                if self.simp_arith_heterogeneous_instance(
+                    args[3],
+                    integer_type(),
+                    "instHSub",
+                    "Int.instSub",
+                )? =>
+            {
                 Some(("sub", 4, 5))
             }
-            ("HMul.hMul", 6) if is_heterogeneous_instance(args[3], "instHMul", "Int.instMul") => {
+            ("HMul.hMul", 6)
+                if self.simp_arith_heterogeneous_instance(
+                    args[3],
+                    integer_type(),
+                    "instHMul",
+                    "Int.instMul",
+                )? =>
+            {
                 Some(("mul", 4, 5))
             }
             _ => None,
@@ -497,10 +524,18 @@ impl Context {
             let (a, b, strict) = match (head.to_display_string().as_str(), args.len()) {
                 ("Int.le", 2) => (args[0], args[1], false),
                 ("Int.lt", 2) => (args[0], args[1], true),
-                ("LE.le", 4) if is_constant(args[1], "Int.instLEInt") => (args[2], args[3], false),
-                ("LT.lt", 4) if is_constant(args[1], "Int.instLTInt") => (args[2], args[3], true),
-                ("GE.ge", 4) if is_constant(args[1], "Int.instLEInt") => (args[3], args[2], false),
-                ("GT.gt", 4) if is_constant(args[1], "Int.instLTInt") => (args[3], args[2], true),
+                ("LE.le", 4) if self.simp_arith_constant_instance(args[1], "Int.instLEInt")? => {
+                    (args[2], args[3], false)
+                }
+                ("LT.lt", 4) if self.simp_arith_constant_instance(args[1], "Int.instLTInt")? => {
+                    (args[2], args[3], true)
+                }
+                ("GE.ge", 4) if self.simp_arith_constant_instance(args[1], "Int.instLEInt")? => {
+                    (args[3], args[2], false)
+                }
+                ("GT.gt", 4) if self.simp_arith_constant_instance(args[1], "Int.instLTInt")? => {
+                    (args[3], args[2], true)
+                }
                 _ => return Ok(None),
             };
             (a, b, strict, false, head == &name("LE.le"))
@@ -667,16 +702,16 @@ impl Context {
         let (left, right) = (args[2].clone(), args[3].clone());
         let one = || integer_literal(&BigInt::from_i64(1));
         let (lemma, replacement) = match head.to_display_string().as_str() {
-            "LE.le" if is_constant(args[1], "Int.instLEInt") => {
+            "LE.le" if self.simp_arith_constant_instance(args[1], "Int.instLEInt")? => {
                 ("Int.not_le_eq", integer_le(integer_add(right, one()), left))
             }
-            "GE.ge" if is_constant(args[1], "Int.instLEInt") => {
+            "GE.ge" if self.simp_arith_constant_instance(args[1], "Int.instLEInt")? => {
                 ("Int.not_ge_eq", integer_le(integer_add(left, one()), right))
             }
-            "LT.lt" if is_constant(args[1], "Int.instLTInt") => {
+            "LT.lt" if self.simp_arith_constant_instance(args[1], "Int.instLTInt")? => {
                 ("Int.not_lt_eq", integer_le(right, left))
             }
-            "GT.gt" if is_constant(args[1], "Int.instLTInt") => {
+            "GT.gt" if self.simp_arith_constant_instance(args[1], "Int.instLTInt")? => {
                 ("Int.not_gt_eq", integer_le(left, right))
             }
             _ => return Ok(None),
@@ -725,7 +760,9 @@ impl Context {
         let Some(args) = is_application(&input, "Dvd.dvd", 4) else {
             return Ok(None);
         };
-        if !is_constant(args[0], "Int") || !is_constant(args[1], "Int.instDvd") {
+        if !is_constant(args[0], "Int")
+            || !self.simp_arith_constant_instance(args[1], "Int.instDvd")?
+        {
             return Ok(None);
         }
         let Some(divisor) = integer_value(args[2]) else {

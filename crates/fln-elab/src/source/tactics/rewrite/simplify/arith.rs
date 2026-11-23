@@ -6,8 +6,8 @@
 //! normalizer here is untrusted and a wrong normal form is a kernel rejection, never a proof.
 //!
 //! Atoms use the pin's `KExprMap` policy: the same head index and reducible definitional
-//! equality, preserving the first representative. Operators are recognized only by their
-//! canonical instance terms (the pin's `Structural` testers), not its `isDefEqI` fallback.
+//! equality, preserving the first representative. Operator recognition first checks the
+//! canonical instance, then uses the pin's `isDefEqI` fallback at instances transparency.
 mod int;
 
 use super::*;
@@ -754,17 +754,8 @@ impl Atoms {
             if head.is_none() {
                 continue;
             }
-            let mut trial = context.rewrite_trial();
-            let matched = trial.proof_types_match_at(e, atom, UnificationBudget::new(trial.kernel));
-            context.charge_rewrite_trial(&trial);
-            match matched {
-                Ok(true) => {
-                    *context = trial;
-                    return Ok(index);
-                }
-                Ok(false) => {}
-                Err(problem) if Context::rewrite_nonmatch(&problem) => {}
-                Err(problem) => return Err(problem),
+            if context.simp_arith_defeq(e, atom, UnificationTransparency::Abbreviations)? {
+                return Ok(index);
             }
         }
         self.atoms.push(e.clone());
@@ -781,6 +772,80 @@ pub(super) struct ArithStep {
 }
 
 impl Context {
+    /// Arithmetic conversion is speculative but its cost is not. Atom comparison and
+    /// instance recognition use the same checked unifier with their distinct pinned
+    /// transparency settings, independently of an enclosing tactic transparency scope.
+    fn simp_arith_defeq(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        transparency: UnificationTransparency,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let mut trial = self.rewrite_trial();
+        let mut budget = UnificationBudget::new(trial.kernel);
+        budget.transparency = transparency;
+        let matched = trial.proof_types_match_at(left, right, budget);
+        self.charge_rewrite_trial(&trial);
+        match matched {
+            Ok(true) => {
+                *self = trial;
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(problem) if Self::rewrite_nonmatch(&problem) => Ok(false),
+            Err(problem) => Err(problem),
+        }
+    }
+
+    /// NatInstTesters/IntInstTesters.DefEq: canonical syntax is the fast path;
+    /// reducible and implicit-reducible instance aliases may denote the same dictionary.
+    fn simp_arith_constant_instance(
+        &mut self,
+        instance: &Expr,
+        canonical: &str,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if is_constant(instance, canonical) {
+            return Ok(true);
+        }
+        self.simp_arith_defeq(
+            instance,
+            &constant(canonical),
+            UnificationTransparency::Instances,
+        )
+    }
+
+    fn simp_arith_heterogeneous_instance(
+        &mut self,
+        instance: &Expr,
+        carrier: Expr,
+        class: &str,
+        homogeneous: &str,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if is_heterogeneous_instance(instance, class, homogeneous) {
+            return Ok(true);
+        }
+        let canonical = apply(
+            Expr::const_(name(class), vec![Level::zero()]),
+            [carrier, constant(homogeneous)],
+        );
+        self.simp_arith_defeq(instance, &canonical, UnificationTransparency::Instances)
+    }
+
+    fn simp_arith_of_nat_instance(
+        &mut self,
+        instance: &Expr,
+        value: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if is_inst_of_nat_nat(instance) {
+            return Ok(true);
+        }
+        self.simp_arith_defeq(
+            instance,
+            &Expr::app(constant("instOfNatNat"), value.clone()),
+            UnificationTransparency::Instances,
+        )
+    }
+
     /// One `simpArith` rewrite of `target`: the first node, children before parents, that the
     /// pin's post step changes, with the proof `node = replacement`. Only closed nodes are
     /// candidates; a node under a binder that mentions it is reached by the binder walk.
@@ -1228,7 +1293,7 @@ impl Context {
         } else if head == name("Nat.lt") && args.len() == 2 {
             (false, side(self, args[0])?.inc(), side(self, args[1])?)
         } else if args.len() == 4 && (head == name("LE.le") || head == name("GE.ge")) {
-            if !is_constant(args[1], "instLENat") {
+            if !self.simp_arith_constant_instance(args[1], "instLENat")? {
                 return Ok(None);
             }
             if head == name("LE.le") {
@@ -1238,7 +1303,7 @@ impl Context {
                 (false, side(self, args[3])?, rhs)
             }
         } else if args.len() == 4 && (head == name("LT.lt") || head == name("GT.gt")) {
-            if !is_constant(args[1], "instLTNat") {
+            if !self.simp_arith_constant_instance(args[1], "instLTNat")? {
                 return Ok(None);
             }
             if head == name("LT.lt") {
@@ -1298,20 +1363,36 @@ impl Context {
             Ok::<_, NatDefinitionElabError>(Linear::Add(Box::new(a), Box::new(b)))
         };
         match (head.to_display_string().as_str(), args.len()) {
-            ("OfNat.ofNat", 3) if is_inst_of_nat_nat(args[2]) => recurse(self, atoms, args[1]),
+            ("OfNat.ofNat", 3) if self.simp_arith_of_nat_instance(args[2], args[1])? => {
+                recurse(self, atoms, args[1])
+            }
             ("Nat.succ", 1) => Ok(recurse(self, atoms, args[0])?.inc()),
             ("Nat.add", 2) => add(self, atoms, args[0], args[1]),
-            ("Add.add", 4) if is_constant(args[1], "instAddNat") => {
+            ("Add.add", 4) if self.simp_arith_constant_instance(args[1], "instAddNat")? => {
                 add(self, atoms, args[2], args[3])
             }
-            ("HAdd.hAdd", 6) if is_heterogeneous_instance(args[3], "instHAdd", "instAddNat") => {
+            ("HAdd.hAdd", 6)
+                if self.simp_arith_heterogeneous_instance(
+                    args[3],
+                    nat_type(),
+                    "instHAdd",
+                    "instAddNat",
+                )? =>
+            {
                 add(self, atoms, args[4], args[5])
             }
             ("Nat.mul", 2) => self.simp_arith_multiply(atoms, args[0], args[1], e, depth),
-            ("Mul.mul", 4) if is_constant(args[1], "instMulNat") => {
+            ("Mul.mul", 4) if self.simp_arith_constant_instance(args[1], "instMulNat")? => {
                 self.simp_arith_multiply(atoms, args[2], args[3], e, depth)
             }
-            ("HMul.hMul", 6) if is_heterogeneous_instance(args[3], "instHMul", "instMulNat") => {
+            ("HMul.hMul", 6)
+                if self.simp_arith_heterogeneous_instance(
+                    args[3],
+                    nat_type(),
+                    "instHMul",
+                    "instMulNat",
+                )? =>
+            {
                 self.simp_arith_multiply(atoms, args[4], args[5], e, depth)
             }
             _ => Ok(Linear::Var(atoms.add(self, e)?)),
@@ -1503,6 +1584,67 @@ mod tests {
 
     fn arrow(domain: Expr, range: Expr) -> Expr {
         Expr::forall_e(Name::anonymous(), domain, range, BinderInfo::Default)
+    }
+
+    #[test]
+    fn instance_conversion_obeys_its_pinned_transparency_even_inside_a_tactic_scope() {
+        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::capability::{Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+        let mut context = context();
+        let declaration = crate::check_definition_source(
+            b"def arithmeticAlias : Type := Nat",
+            &context.txn.env,
+            context.kernel,
+        )
+        .unwrap()
+        .declaration;
+        let Outcome::Complete(admitted) = admit(&context.txn.env, declaration, context.kernel)
+        else {
+            panic!("alias admission did not complete");
+        };
+        let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+        else {
+            panic!("alias was rejected");
+        };
+        let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(publication))) =
+            checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            )
+        else {
+            panic!("alias publication did not complete");
+        };
+        context.txn.env = publication.environment;
+        let alias = constant("arithmeticAlias");
+        // An enclosing tactic's broad transparency cannot turn an ordinary
+        // semireducible definition into a canonical arithmetic dictionary.
+        context.tactic_transparency = Some(UnificationTransparency::SafeDefinitions);
+        assert!(!context.simp_arith_constant_instance(&alias, "Nat").unwrap());
+        context.txn.env = crate::reducibility::register(
+            &context.txn.env,
+            &name("arithmeticAlias"),
+            crate::reducibility::Reducibility::ImplicitReducible,
+        )
+        .unwrap();
+        // The status used by instances is visible to isDefEqI but remains
+        // hidden to arithmetic atoms' reducible-only conversion.
+        assert!(context.simp_arith_constant_instance(&alias, "Nat").unwrap());
+        assert!(
+            !context
+                .simp_arith_defeq(&alias, &nat_type(), UnificationTransparency::Abbreviations)
+                .unwrap()
+        );
+        context.txn.env = crate::reducibility::register(
+            &context.txn.env,
+            &name("arithmeticAlias"),
+            crate::reducibility::Reducibility::Irreducible,
+        )
+        .unwrap();
+        assert!(!context.simp_arith_constant_instance(&alias, "Nat").unwrap());
     }
 
     #[test]

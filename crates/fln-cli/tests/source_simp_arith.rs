@@ -251,3 +251,153 @@ fn simp_arith_identifies_defeq_atoms_in_nat_and_int_constraints() {
         );
     }
 }
+
+#[test]
+fn simp_arith_recognizes_definitionally_equal_instances_without_assuming_custom_operations() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let header =
+        "prelude\nimport Init.Data.Nat.Linear\nimport Init.Data.Int.Linear\nimport Init.Guard\n";
+    // Instance definitions are implicit-reducible, not abbreviations. Exercise the
+    // pin's isDefEqI fallback while keeping expected normal forms explicitly canonical.
+    let accepted = [
+        (
+            "nonstandard_operations_remain_atoms",
+            r#"instance customAdd : Add Nat := ⟨fun a _ => a⟩
+example (x y a b : Nat) (h : a ≤ b) :
+    Nat.add (@Add.add Nat customAdd x y) a ≤ Nat.add (@Add.add Nat customAdd x y) b := by
+  simp +arith only
+  guard_target =ₛ a ≤ b
+  exact h
+"#,
+        ),
+        (
+            "nat_homogeneous_instances",
+            r#"instance addAlias : Add Nat := instAddNat
+instance mulAlias : Mul Nat := instMulNat
+example (a b : Nat) (h : a ≤ b) :
+    @Add.add Nat addAlias a 5 ≤ @Add.add Nat addAlias b 5 := by
+  simp +arith only
+  guard_target =ₛ a ≤ b
+  exact h
+example (a : Nat) : @Mul.mul Nat mulAlias 2 a = a + a := by
+  simp +arith only
+"#,
+        ),
+        (
+            "nat_heterogeneous_instances",
+            r#"instance addAlias : HAdd Nat Nat Nat := @instHAdd Nat instAddNat
+instance mulAlias : HMul Nat Nat Nat := @instHMul Nat instMulNat
+example (a : Nat) :
+    @HMul.hMul Nat Nat Nat mulAlias 2 a = @HAdd.hAdd Nat Nat Nat addAlias a a := by
+  simp +arith only
+"#,
+        ),
+        (
+            "nat_order_instances",
+            r#"instance leAlias : LE Nat := instLENat
+instance ltAlias : LT Nat := instLTNat
+example (a b : Nat) (h : @LE.le Nat instLENat a b) :
+    @LE.le Nat leAlias (Nat.add a 2) (Nat.add b 2) := by
+  simp +arith only
+  guard_target =ₛ @LE.le Nat instLENat a b
+  exact h
+example (a : Nat) : @LT.lt Nat ltAlias a (Nat.succ a) := by
+  simp +arith only
+"#,
+        ),
+        (
+            "nat_numeral_instance",
+            r#"instance numeralAlias : OfNat Nat 3 := instOfNatNat 3
+example (a : Nat) (h : 6 = a) :
+    Nat.add (@OfNat.ofNat Nat 3 numeralAlias) (@OfNat.ofNat Nat 3 numeralAlias) = a := by
+  simp +arith only
+  guard_target =ₛ 6 = a
+  exact h
+"#,
+        ),
+        (
+            "int_homogeneous_instances",
+            r#"instance addAlias : Add Int := Int.instAdd
+instance subAlias : Sub Int := Int.instSub
+instance mulAlias : Mul Int := Int.instMul
+instance negAlias : Neg Int := Int.instNegInt
+example (a : Int) : @Sub.sub Int subAlias (@Add.add Int addAlias a a) a = a := by
+  simp +arith only
+example (a : Int) : @Mul.mul Int mulAlias 2 a = @Add.add Int addAlias a a := by
+  simp +arith only
+example (a : Int) : @Neg.neg Int negAlias (@Neg.neg Int negAlias a) = a := by
+  simp +arith only
+"#,
+        ),
+        (
+            "int_heterogeneous_instances",
+            r#"instance addAlias : HAdd Int Int Int := @instHAdd Int Int.instAdd
+instance subAlias : HSub Int Int Int := @instHSub Int Int.instSub
+instance mulAlias : HMul Int Int Int := @instHMul Int Int.instMul
+example (a : Int) :
+    @HSub.hSub Int Int Int subAlias (@HAdd.hAdd Int Int Int addAlias a a) a = a := by
+  simp +arith only
+example (a : Int) :
+    @HMul.hMul Int Int Int mulAlias 2 a = @HAdd.hAdd Int Int Int addAlias a a := by
+  simp +arith only
+"#,
+        ),
+        (
+            "int_order_and_divisibility_instances",
+            r#"instance leAlias : LE Int := Int.instLEInt
+instance ltAlias : LT Int := Int.instLTInt
+instance dvdAlias : Dvd Int := Int.instDvd
+example (a : Int) : @LE.le Int leAlias a (Int.add a 2) := by
+  simp +arith only
+example (a : Int) : @LT.lt Int ltAlias a (Int.add a 1) := by
+  simp +arith only
+example (a : Int) (h : @Dvd.dvd Int Int.instDvd 2 (a + 3)) :
+    @Dvd.dvd Int dvdAlias 4 (Int.add (Int.mul 2 a) 6) := by
+  simp +arith only
+  guard_target =ₛ @Dvd.dvd Int Int.instDvd 2 (a + 3)
+  exact h
+example (a : Int) : ¬ @LT.lt Int ltAlias (Int.add a 1) a := by
+  simp +arith only
+"#,
+        ),
+    ];
+    for (name, program) in accepted {
+        let (code, stderr, pinned) = check_with_header(&lib, &root, name, header, program);
+        assert_eq!(pinned.unwrap_or(0), 0, "{name}: the pinned lean rejects it");
+        assert_eq!(code, 0, "{name}: {program}\n{stderr}");
+    }
+    for (name, program) in [
+        (
+            "nonstandard_nat_addition",
+            r#"instance wrongAdd : Add Nat := ⟨fun _ _ => 0⟩
+example : @Add.add Nat wrongAdd 1 1 = 2 := by simp +arith only
+"#,
+        ),
+        (
+            "nonstandard_int_order",
+            r#"instance wrongLE : LE Int := ⟨fun _ _ => False⟩
+example : @LE.le Int wrongLE 0 1 := by simp +arith only
+"#,
+        ),
+        (
+            "irreducible_instance_alias",
+            r#"@[irreducible] def hiddenAdd : Add Nat := instAddNat
+example (a b : Nat) (h : a ≤ b) :
+    @Add.add Nat hiddenAdd a 5 ≤ @Add.add Nat hiddenAdd b 5 := by
+  simp +arith only
+  exact h
+"#,
+        ),
+    ] {
+        let (code, stderr, pinned) = check_with_header(&lib, &root, name, header, program);
+        assert_ne!(pinned.unwrap_or(1), 0, "{name}: the pinned lean accepts it");
+        assert_ne!(code, 0, "{name}: accepted {program}");
+        assert!(
+            !stderr.contains("unexpected syntax"),
+            "{name}: refused as unsupported, not rejected\n{stderr}"
+        );
+    }
+}
