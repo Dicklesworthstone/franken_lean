@@ -18,6 +18,9 @@ use std::sync::Arc;
 
 mod data;
 mod descriptions;
+mod source;
+
+pub(crate) use source::check_local_grammar_prerequisites;
 
 #[cfg(test)]
 mod reference;

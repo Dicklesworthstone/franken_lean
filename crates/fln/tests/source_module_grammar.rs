@@ -610,6 +610,41 @@ fn olean_export_refuses_unrepresentable_grammar_instead_of_losing_it() {
 }
 
 #[test]
+fn module_local_grammar_requires_actual_meta_interfaces_from_implicit_init() {
+    let base = Engine::builder().build_empty();
+    let source = "module\nlocal syntax \"kept! \" term:max : term\nlocal macro_rules | `(kept! $value) => `($value)\npublic theorem checked (P : Prop) (h : P) : P := kept! h";
+    for init in [
+        "prelude",
+        "prelude\naxiom Lean.ParserDescr : Type\naxiom Lean.Macro : Type",
+    ] {
+        let error = check(&base, &[("Main", source), ("Init", init)])
+            .expect_err("a module name and same-named constants do not supply the meta interfaces");
+        assert!(
+            matches!(
+                &error,
+                SourceModuleCheckError::Source {
+                    error: fln::SourceCheckError::Command { error, .. }, ..
+                } if matches!(error.as_ref(), fln::EngineExecutionError::NotImplemented { feature }
+                    if feature.contains("ParserDescr and Macro meta interfaces"))
+            ),
+            "{error:?}"
+        );
+        // An unrelated ordinary module need not use any meta interface.
+        checked(
+            &base,
+            &[
+                (
+                    "Main",
+                    "module\npublic theorem identity (P : Prop) (h : P) : P := h",
+                ),
+                ("Init", init),
+            ],
+        );
+    }
+    assert!(base.environment().is_empty());
+}
+
+#[test]
 fn module_system_grammar_keeps_an_explicit_phase_and_visibility_boundary() {
     let base = Engine::builder().build_empty();
     let options = KVMap::new();
@@ -629,6 +664,14 @@ fn module_system_grammar_keeps_an_explicit_phase_and_visibility_boundary() {
     };
     for files in [
         vec![("Main", "module\nprelude\nnotation \"UnitType\" => Type")],
+        vec![
+            ("Main", "module\nnotation \"UnitType\" => Type"),
+            ("Init", "prelude"),
+        ],
+        vec![(
+            "Main",
+            "module\nprelude\nlocal notation \"UnitType\" => Type",
+        )],
         vec![
             (
                 "Main",

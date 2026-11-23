@@ -116,6 +116,13 @@ pub(crate) struct SourceGrammar {
     macro_warnings: Vec<crate::unused_variables::UnusedBinder>,
     declared_command: Option<fln_parse::ParsedSourceCommand>,
     module_system: bool,
+    /// The pin's ordinary header imports Init in both runtime and meta phases.
+    /// Explicit meta imports remain a separate, unsupported source capability.
+    implicit_init: bool,
+    /// Header-only preflight has no declaration world. Every checking path
+    /// records the result from its actual imported environment and consults it
+    /// only when a local grammar declaration is encountered.
+    local_prerequisites: Option<Result<(), EngineExecutionError>>,
     declared_syntax: bool,
 }
 
@@ -131,6 +138,8 @@ impl SourceGrammar {
             macro_warnings: Vec::new(),
             declared_command: None,
             module_system: false,
+            implicit_init: true,
+            local_prerequisites: None,
             declared_syntax: false,
         }
     }
@@ -154,10 +163,12 @@ impl SourceGrammar {
         imports: &[Name],
     ) -> Result<Self, EngineExecutionError> {
         let mut grammar = Self::for_header(module, module_system, prelude, imports);
-        if module_system && journal::present(environment) {
-            return Err(Self::module_phase_refusal());
+        if module_system && !prelude {
+            grammar.local_prerequisites = Some(
+                crate::imported_parsers::check_local_grammar_prerequisites(environment),
+            );
         }
-        journal::load(environment, &mut grammar.file)?;
+        journal::load(environment, &mut grammar.file, module_system)?;
         reserve_admitted_macro_scopes(environment, &mut grammar.file)?;
         Ok(grammar)
     }
@@ -223,14 +234,46 @@ impl SourceGrammar {
             macro_warnings: Vec::new(),
             declared_command: None,
             module_system,
+            implicit_init: !prelude,
+            local_prerequisites: None,
             declared_syntax: false,
         }
     }
 
     fn module_phase_refusal() -> EngineExecutionError {
         EngineExecutionError::NotImplemented {
-            feature: "native source grammar imports/exports with module-system visibility and meta phases",
+            feature: "native source grammar with module-system exports or without implicit Init meta imports",
         }
+    }
+
+    /// `visibility.ofAttrKind` makes these declarations private meta definitions
+    /// at the pin. Only the explicit `local` attribute establishes that boundary:
+    /// a global rule for a local syntax kind is not an equivalent declaration.
+    fn is_local_declaration(syntax: &Syntax) -> bool {
+        let Syntax::Node { kind, args, .. } = syntax else {
+            return false;
+        };
+        if !["syntax", "notation", "mixfix", "macro", "macro_rules"]
+            .iter()
+            .any(|leaf| *kind == Name::from_components(["Lean", "Parser", "Command", leaf]))
+        {
+            return false;
+        }
+        let Some(Syntax::Node { kind, args, .. }) = args.get(2) else {
+            return false;
+        };
+        if *kind != Name::from_components(["Lean", "Parser", "Term", "attrKind"]) {
+            return false;
+        }
+        let [Syntax::Node { kind, args, .. }] = args.as_slice() else {
+            return false;
+        };
+        if *kind != Name::from_components(["null"]) {
+            return false;
+        }
+        matches!(args.as_slice(), [Syntax::Node { kind, args, .. }]
+            if *kind == Name::from_components(["Lean", "Parser", "Term", "local"])
+                && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "local"))
     }
 
     pub(crate) fn import_native(
@@ -297,6 +340,7 @@ impl SourceGrammar {
             &exported,
             &self.rule_sources,
             self.declared_syntax,
+            self.module_system,
         )
     }
 
@@ -363,6 +407,12 @@ impl SourceGrammar {
         if !declaring {
             return Ok(false);
         }
+        if self.module_system && (!self.implicit_init || !Self::is_local_declaration(syntax)) {
+            return Err(Self::module_phase_refusal());
+        }
+        if let Some(prerequisites) = &self.local_prerequisites {
+            prerequisites.clone()?;
+        }
         self.file
             .declare_with_macro_pure(syntax, &|name| match resolve(name) {
                 Resolution::Global(resolved) => resolved == Name::from_components(["Pure", "pure"]),
@@ -372,6 +422,12 @@ impl SourceGrammar {
                 _ => false,
             })
             .map_err(|feature| EngineExecutionError::NotImplemented { feature })?;
+        if self.module_system {
+            // Local registrations must leave no exported activation, including
+            // rules on inherited kinds. The generated private meta declarations
+            // are still absent, so `record` retains the artifact usage marker.
+            self.export_native()?;
+        }
         let macro_rules = syntax.kind()
             == Some(&Name::from_components([
                 "Lean",
@@ -410,12 +466,6 @@ impl SourceGrammar {
             self.rule_sources.insert(kind, Arc::clone(&source));
         }
         self.declared_syntax = true;
-        if self.module_system {
-            // Module-system syntax declarations create public meta definitions.
-            // Their extra module-use/phase provenance is not yet represented by
-            // the native quoted-template journal.
-            return Err(Self::module_phase_refusal());
-        }
         self.declared_command = Some(parsed);
         Ok(true)
     }

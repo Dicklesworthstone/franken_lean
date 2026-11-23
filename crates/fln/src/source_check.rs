@@ -977,10 +977,34 @@ impl Engine {
                 scopes.set_imported_macros(session.registry());
             }
             // The syntax this file declares extends the grammar of what follows it.
-            let mut grammar = grammar::SourceGrammar::for_engine(
+            let grammar_header = if private_module.is_some() {
+                original_source
+                    .map(|(source, _)| modules::parse_source_header(source))
+                    .transpose()
+                    .map_err(|error| {
+                        command_error(
+                            file,
+                            count,
+                            fln_parse::BytePos(0),
+                            EngineExecutionError::Frontend(NatDefinitionFrontendError::Parse(
+                                error,
+                            )),
+                        )
+                    })?
+            } else {
+                None
+            };
+            let mut grammar = grammar::SourceGrammar::for_engine_with_header(
                 &engine,
                 source_module,
                 private_module.is_some(),
+                private_module.is_some()
+                    && grammar_header
+                        .as_ref()
+                        .is_none_or(|header| !header.module_system || header.prelude),
+                grammar_header
+                    .as_ref()
+                    .map_or(&[], |header| header.imports.as_slice()),
             )
             .map_err(|error| command_error(file, count, fln_parse::BytePos(0), error))?;
             if let Some(session) = macros.as_deref() {

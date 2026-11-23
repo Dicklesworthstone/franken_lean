@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 mod descriptions;
 
-const MAGIC: &[u8] = b"FLNSOURCEGRAMMAR\x06";
+const MAGIC: &[u8] = b"FLNSOURCEGRAMMAR\x07";
 const MAX_ROWS: usize = 4096;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ROW_BYTES: usize = 4 * 1024 * 1024;
@@ -31,12 +31,6 @@ fn descriptor() -> ExtensionDescriptor {
         checkpoint: CheckpointSemantics::FullJournal,
         provenance: PayloadProvenance::Understood,
     }
-}
-
-pub(super) fn present(environment: &Environment) -> bool {
-    environment
-        .extension(&name())
-        .is_some_and(|state| !state.is_empty())
 }
 
 fn malformed() -> EngineExecutionError {
@@ -301,6 +295,7 @@ pub(super) fn publish(
     module: &NativeSyntaxModule,
     sources: &BTreeMap<Name, Arc<[u8]>>,
     declared_syntax: bool,
+    module_system: bool,
 ) -> Result<Environment, EngineExecutionError> {
     if !declared_syntax {
         return Ok(environment.clone());
@@ -329,7 +324,13 @@ pub(super) fn publish(
     // Even local-only syntax creates parser/macro declarations in the pin.
     // Keep its use visible to the artifact-support gate without exporting any
     // local parser or macro activation to downstream modules.
-    payloads.push(encode(node("usage", Vec::new()), &[], &[])?);
+    // A module-system marker comes only from local declarations whose implicit
+    // Init import supplied the meta phase. Older, unqualified source usage must
+    // not acquire that provenance merely because it has no exported activation.
+    if module_system && !module.is_empty() {
+        return Err(SourceGrammar::module_phase_refusal());
+    }
+    payloads.push(encode(node("usage", vec![atom(module_system)]), &[], &[])?);
     for (category, behavior) in &module.categories {
         payloads.push(encode(
             node("category", vec![ident(category), atom(*behavior as u8)]),
@@ -407,6 +408,7 @@ pub(super) fn publish(
 pub(super) fn load(
     environment: &Environment,
     file: &mut FileGrammar,
+    module_system: bool,
 ) -> Result<(), EngineExecutionError> {
     let Some(state) = environment.extension(&name()) else {
         return Ok(());
@@ -439,11 +441,22 @@ pub(super) fn load(
         if !trees.messages.is_empty() {
             return Err(malformed());
         }
-        if children(&trees.header, "usage").is_ok_and(<[Syntax]>::is_empty) {
+        if let Ok([local_meta]) = children(&trees.header, "usage") {
             if !trees.commands.is_empty() {
                 return Err(malformed());
             }
+            let local_meta = as_bool(local_meta)?;
+            if module_system && !local_meta {
+                return Err(SourceGrammar::module_phase_refusal());
+            }
             continue;
+        }
+        // A usage marker grants no parser or macro activation. It must survive
+        // imports (and keep artifact export unsupported), but cannot make an
+        // otherwise ordinary module depend on unimplemented grammar phases.
+        // Every other row exports native grammar and retains that boundary.
+        if module_system {
+            return Err(SourceGrammar::module_phase_refusal());
         }
         let mut module = NativeSyntaxModule::default();
         if let Ok([category, behavior]) = children(&trees.header, "category") {
@@ -580,12 +593,13 @@ mod tests {
             &module,
             &BTreeMap::from([(kind.clone(), source)]),
             true,
+            false,
         )
         .unwrap();
-        assert!(!present(&base));
-        assert!(present(&recorded));
+        assert!(base.extension(&name()).is_none());
+        assert!(!recorded.extension(&name()).unwrap().is_empty());
         let mut loaded = grammar();
-        load(&recorded, &mut loaded).unwrap();
+        load(&recorded, &mut loaded, false).unwrap();
         assert_eq!(
             loaded.native_namespace_anchors(),
             std::slice::from_ref(&declaration.decl)
@@ -598,6 +612,10 @@ mod tests {
             loaded.export_native().unwrap().is_empty(),
             "imports are not recaptured as new entries"
         );
+        assert!(matches!(
+            SourceGrammar::for_environment(&recorded, None, true),
+            Err(EngineExecutionError::NotImplemented { .. })
+        ));
     }
 
     #[test]
@@ -608,18 +626,38 @@ mod tests {
             &NativeSyntaxModule::default(),
             &BTreeMap::new(),
             true,
+            false,
         )
         .unwrap();
-        assert!(present(&recorded));
         assert_eq!(recorded.extension(&name()).unwrap().len(), 1);
         let mut loaded = grammar();
-        load(&recorded, &mut loaded).unwrap();
+        load(&recorded, &mut loaded, false).unwrap();
         assert!(loaded.export_native().unwrap().is_empty());
         assert!(loaded.native_namespace_anchors().is_empty());
         assert!(matches!(
             SourceGrammar::for_environment(&recorded, None, true),
             Err(EngineExecutionError::NotImplemented { .. })
         ));
+    }
+
+    #[test]
+    fn module_local_usage_retains_its_phase_without_activating_grammar() {
+        let recorded = publish(
+            &Environment::new(),
+            &NativeSyntaxModule::default(),
+            &BTreeMap::new(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(recorded.extension(&name()).unwrap().len(), 1);
+        for module_system in [false, true] {
+            let mut loaded = grammar();
+            load(&recorded, &mut loaded, module_system).unwrap();
+            assert!(loaded.export_native().unwrap().is_empty());
+            assert!(loaded.native_namespace_anchors().is_empty());
+            assert!(SourceGrammar::for_environment(&recorded, None, module_system).is_ok());
+        }
     }
 
     #[test]
@@ -640,7 +678,7 @@ mod tests {
             .collect();
         let recorded = library.record(&Environment::new()).unwrap();
         let mut loaded = grammar();
-        load(&recorded, &mut loaded).unwrap();
+        load(&recorded, &mut loaded, false).unwrap();
         let actual: Vec<_> = loaded
             .rules()
             .map(|(kind, rule)| (kind.clone(), rule.clone()))
@@ -673,7 +711,7 @@ mod tests {
         let exported = library.export_native().unwrap();
         let recorded = library.record(&Environment::new()).unwrap();
         let mut loaded = grammar();
-        load(&recorded, &mut loaded).unwrap();
+        load(&recorded, &mut loaded, false).unwrap();
         assert_eq!(
             loaded.rules().find(|(name, _)| **name == kind).unwrap().1,
             exported.rules[&kind].as_ref()
@@ -741,10 +779,10 @@ mod tests {
 
     #[test]
     fn a_complete_older_journal_cannot_guess_registration_boundaries() {
-        let mut payload = encode(node("usage", Vec::new()), &[], &[])
+        let mut payload = encode(node("usage", vec![atom(false)]), &[], &[])
             .unwrap()
             .to_vec();
-        payload[MAGIC.len() - 1] = 5;
+        payload[MAGIC.len() - 1] = 6;
         let environment = Environment::new()
             .register_extension(descriptor())
             .unwrap()
@@ -763,17 +801,20 @@ mod tests {
             Arc::from(b"FLNSOURCEGRAMMAR\x03".as_slice()),
             Arc::from(b"FLNSOURCEGRAMMAR\x04".as_slice()),
             Arc::from(b"FLNSOURCEGRAMMAR\x05".as_slice()),
+            Arc::from(b"FLNSOURCEGRAMMAR\x06".as_slice()),
         ] {
             let env = Environment::new()
                 .register_extension(descriptor())
                 .unwrap()
                 .push_extension_entry(&name(), payload)
                 .unwrap();
-            assert!(SourceGrammar::for_environment(&env, None, false).is_err());
+            for module_system in [false, true] {
+                assert!(SourceGrammar::for_environment(&env, None, module_system).is_err());
+            }
         }
         let source = vec![0; MAX_ROW_BYTES + 1];
         assert!(matches!(
-            encode(node("usage", vec![]), &[], &source),
+            encode(node("usage", vec![atom(false)]), &[], &source),
             Err(EngineExecutionError::SourceScopeLimit { .. })
         ));
         let mut descr =

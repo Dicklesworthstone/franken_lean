@@ -3240,11 +3240,23 @@ impl Engine {
         }
         // The syntax a file declares extends the grammar of its commands after it
         // (`source_check::grammar`). The stream was partitioned before any of it was declared.
-        let mut grammar = source_check::grammar::SourceGrammar::for_engine(
-            &engine,
-            source_module,
-            private_module.is_some(),
-        )?;
+        let grammar_for_file = |engine: &Engine, source: &[u8]| {
+            if private_module.is_some() {
+                let header = source_check::modules::parse_source_header(source)
+                    .map_err(NatDefinitionFrontendError::Parse)
+                    .map_err(EngineExecutionError::Frontend)?;
+                source_check::grammar::SourceGrammar::for_engine_with_header(
+                    engine,
+                    source_module,
+                    true,
+                    !header.module_system || header.prelude,
+                    &header.imports,
+                )
+            } else {
+                source_check::grammar::SourceGrammar::for_engine(engine, source_module, false)
+            }
+        };
+        let mut grammar = grammar_for_file(&engine, source_files[source_file].0)?;
         if let Some(session) = macros.as_deref() {
             grammar.import_artifact(session.parsers())?;
             grammar.bind_imported_macros(&session.registry());
@@ -3378,11 +3390,7 @@ impl Engine {
                     scopes = source_check::scopes::Scopes::new(&engine);
                     scopes.current.private_module = private_module.cloned();
                     scopes.current.source_module = source_module.cloned();
-                    grammar = source_check::grammar::SourceGrammar::for_engine(
-                        &engine,
-                        source_module,
-                        private_module.is_some(),
-                    )?;
+                    grammar = grammar_for_file(&engine, source_files[source_file].0)?;
                     grammar.extend_scopes(&mut scopes);
                 }
                 if let Some(session) = macros.as_deref_mut() {
