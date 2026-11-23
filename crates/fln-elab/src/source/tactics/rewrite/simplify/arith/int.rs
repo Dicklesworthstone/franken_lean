@@ -304,14 +304,6 @@ impl IntegerPoly {
     }
 }
 
-fn atom(atoms: &mut Atoms, e: &Expr) -> IntegerExpr {
-    if let Some(i) = atoms.atoms.iter().position(|a| a == e) {
-        return IntegerExpr::Var(i);
-    }
-    atoms.atoms.push(e.clone());
-    IntegerExpr::Var(atoms.atoms.len() - 1)
-}
-
 /// The pin sorts Int atoms in reverse expression order because its polynomials sort
 /// variables in decreasing index order. This leaves the visible monomials in Expr.lt order.
 fn sorted_atoms(atoms: Vec<Expr>) -> (Vec<Expr>, Vec<usize>) {
@@ -364,14 +356,15 @@ impl Context {
             return self.simp_arith_integer_linear(atoms, expr, depth + 1);
         }
         let Some((head, args)) = const_application(e) else {
-            return Ok(atom(atoms, e));
+            return Ok(IntegerExpr::Var(atoms.add(self, e)?));
         };
         let head = head.to_display_string();
         let binary = match (head.as_str(), args.len()) {
             ("OfNat.ofNat", 3) => {
-                return Ok(integer_value(e)
-                    .map(IntegerExpr::Num)
-                    .unwrap_or_else(|| atom(atoms, e)));
+                return match integer_value(e) {
+                    Some(value) => Ok(IntegerExpr::Num(value)),
+                    None => Ok(IntegerExpr::Var(atoms.add(self, e)?)),
+                };
             }
             ("Int.neg", 1) => {
                 return Ok(IntegerExpr::Neg(Box::new(self.simp_arith_integer_linear(
@@ -405,7 +398,7 @@ impl Context {
             _ => None,
         };
         let Some((operation, a, b)) = binary else {
-            return Ok(atom(atoms, e));
+            return Ok(IntegerExpr::Var(atoms.add(self, e)?));
         };
         let (a, b) = (args[a], args[b]);
         if operation == "mul" {
@@ -421,7 +414,7 @@ impl Context {
                     k,
                 ));
             }
-            return Ok(atom(atoms, e));
+            return Ok(IntegerExpr::Var(atoms.add(self, e)?));
         }
         let a = Box::new(self.simp_arith_integer_linear(atoms, a, depth + 1)?);
         let b = Box::new(self.simp_arith_integer_linear(atoms, b, depth + 1)?);

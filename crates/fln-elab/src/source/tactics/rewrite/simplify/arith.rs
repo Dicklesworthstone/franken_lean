@@ -5,9 +5,9 @@
 //! siblings, closed by `eagerReduce (Eq.refl true)`), which only the kernel decides: the
 //! normalizer here is untrusted and a wrong normal form is a kernel rejection, never a proof.
 //!
-//! Atoms are identified structurally, where the pin's `KExprMap` also accepts a
-//! definitionally equal atom, and an operator is recognized only by its canonical instance
-//! term (the pin's `Structural` testers), not by the pin's `isDefEqI` fallback.
+//! Atoms use the pin's `KExprMap` policy: the same head index and reducible definitional
+//! equality, preserving the first representative. Operators are recognized only by their
+//! canonical instance terms (the pin's `Structural` testers), not its `isDefEqI` fallback.
 mod int;
 
 use super::*;
@@ -731,17 +731,45 @@ fn sort_atoms(atoms: Vec<Expr>) -> (Vec<Expr>, Vec<usize>) {
 #[derive(Default)]
 struct Atoms {
     atoms: Vec<Expr>,
+    heads: Vec<Option<super::super::matching::HeadIndex>>,
     nodes: usize,
 }
 
 impl Atoms {
-    /// `addAsVar`.
-    fn add(&mut self, e: &Expr) -> Linear {
-        if let Some(index) = self.atoms.iter().position(|atom| atom == e) {
-            return Linear::Var(index);
+    /// `addAsVar` through `KExprMap.find?` (Lean/Meta/KExprMap.lean): only entries with
+    /// the same `HeadIndex` may merge, in insertion order. Argument count is deliberately
+    /// not part of the key. Simp fixes reducible transparency even inside a tactic scope.
+    fn add(&mut self, context: &mut Context, e: &Expr) -> Result<usize, NatDefinitionElabError> {
+        let head = context.rewrite_head_key(e)?.map(|(head, _)| head);
+        for (index, (atom, previous_head)) in self.atoms.iter().zip(&self.heads).enumerate() {
+            context.tick()?;
+            if &head != previous_head {
+                continue;
+            }
+            if context.rewrite_same(e, atom)? {
+                return Ok(index);
+            }
+            // A loose bound head has no HeadIndex. The enclosing simplifier opens
+            // binders before normalization; never let two absent keys grant conversion.
+            if head.is_none() {
+                continue;
+            }
+            let mut trial = context.rewrite_trial();
+            let matched = trial.proof_types_match_at(e, atom, UnificationBudget::new(trial.kernel));
+            context.charge_rewrite_trial(&trial);
+            match matched {
+                Ok(true) => {
+                    *context = trial;
+                    return Ok(index);
+                }
+                Ok(false) => {}
+                Err(problem) if Context::rewrite_nonmatch(&problem) => {}
+                Err(problem) => return Err(problem),
+            }
         }
         self.atoms.push(e.clone());
-        Linear::Var(self.atoms.len() - 1)
+        self.heads.push(head);
+        Ok(self.atoms.len() - 1)
     }
 }
 
@@ -1255,10 +1283,10 @@ impl Context {
                 return Ok(Linear::Num(BigNat::zero()));
             }
             ExprNode::App { .. } => {}
-            _ => return Ok(atoms.add(e)),
+            _ => return Ok(Linear::Var(atoms.add(self, e)?)),
         }
         let Some((head, args)) = const_application(e) else {
-            return Ok(atoms.add(e));
+            return Ok(Linear::Var(atoms.add(self, e)?));
         };
         let head = head.clone();
         let recurse = |this: &mut Self, atoms: &mut Atoms, x: &Expr| {
@@ -1286,7 +1314,7 @@ impl Context {
             ("HMul.hMul", 6) if is_heterogeneous_instance(args[3], "instHMul", "instMulNat") => {
                 self.simp_arith_multiply(atoms, args[4], args[5], e, depth)
             }
-            _ => Ok(atoms.add(e)),
+            _ => Ok(Linear::Var(atoms.add(self, e)?)),
         }
     }
 
@@ -1307,7 +1335,7 @@ impl Context {
             let a = self.simp_arith_linear(atoms, a, depth + 1)?;
             return Ok(Linear::MulR(Box::new(a), k));
         }
-        Ok(atoms.add(whole))
+        Ok(Linear::Var(atoms.add(self, whole)?))
     }
 
     /// `evalNat` (`Lean/Meta/Offset.lean:26`): a closed `Nat` expression's value, reading
@@ -1456,6 +1484,141 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn context() -> Context {
+        let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
+        let env = crate::seed::bootstrap_nat_environment(budget).unwrap();
+        Context::new(&env, budget)
+    }
+
+    fn local(context: &mut Context, text: &str, type_: Expr) -> Expr {
+        let name = name(text);
+        let id = FVarId(name.clone());
+        context
+            .txn
+            .lctx
+            .add_param(id.clone(), name, type_, BinderInfo::Default);
+        Expr::fvar(id)
+    }
+
+    fn arrow(domain: Expr, range: Expr) -> Expr {
+        Expr::forall_e(Name::anonymous(), domain, range, BinderInfo::Default)
+    }
+
+    #[test]
+    fn atoms_merge_same_head_proof_arguments_and_keep_the_first_representative() {
+        let mut context = context();
+        let proposition = local(&mut context, "P", Expr::sort(Level::zero()));
+        let h1 = local(&mut context, "h1", proposition.clone());
+        let h2 = local(&mut context, "h2", proposition.clone());
+        let function = local(&mut context, "f", arrow(proposition, nat_type()));
+        let first = Expr::app(function.clone(), h1);
+        let second = Expr::app(function, h2);
+        assert_ne!(first, second);
+        let mut atoms = Atoms::default();
+        assert_eq!(atoms.add(&mut context, &first).unwrap(), 0);
+        assert_eq!(atoms.add(&mut context, &second).unwrap(), 0);
+        assert_eq!(atoms.atoms, vec![first]);
+    }
+
+    #[test]
+    fn atom_head_indices_do_not_merge_distinct_definitionally_equal_heads() {
+        let mut context = context();
+        let mut values = Vec::new();
+        for text in ["first", "second"] {
+            let name = name(text);
+            let id = FVarId(name.clone());
+            context
+                .txn
+                .lctx
+                .add_let(id.clone(), name, nat_type(), raw_literal(&BigNat::zero()));
+            values.push(Expr::fvar(id));
+        }
+        // This control makes the head restriction observable, rather than relying on a
+        // failed conversion of distinct values.
+        assert!(context.proof_types_match(&values[0], &values[1]).unwrap());
+        let mut atoms = Atoms::default();
+        assert_eq!(atoms.add(&mut context, &values[0]).unwrap(), 0);
+        assert_eq!(atoms.add(&mut context, &values[1]).unwrap(), 1);
+
+        // `toHeadIndex` zeta-reduces a let whose body's head is a bound variable.
+        let n = local(&mut context, "n", nat_type());
+        let function_type = arrow(nat_type(), nat_type());
+        let function = local(&mut context, "f", function_type.clone());
+        let let_head = Expr::app(
+            Expr::let_e(
+                name("alias"),
+                function_type,
+                function.clone(),
+                Expr::bvar(0).unwrap(),
+                false,
+            ),
+            n.clone(),
+        );
+        assert_eq!(atoms.add(&mut context, &let_head).unwrap(), 2);
+        assert_eq!(atoms.add(&mut context, &Expr::app(function, n)).unwrap(), 2);
+        assert_eq!(atoms.atoms[2], let_head);
+    }
+
+    #[test]
+    fn failed_atom_comparisons_do_not_leak_assignments_but_successful_ones_do() {
+        let mut context = context();
+        let x = local(&mut context, "x", nat_type());
+        let function = local(
+            &mut context,
+            "f",
+            arrow(nat_type(), arrow(nat_type(), nat_type())),
+        );
+        let zero = raw_literal(&BigNat::zero());
+        let one = raw_literal(&BigNat::from_u64(1));
+        let first = apply(function.clone(), [x.clone(), zero.clone()]);
+        let mut atoms = Atoms::default();
+        assert_eq!(atoms.add(&mut context, &first).unwrap(), 0);
+        let hole = context.hole(nat_type()).unwrap();
+        let before = context.txn.mvars.clone();
+        let spent = context.txn.budget.heartbeats_consumed;
+        let mismatch = apply(function.clone(), [hole.clone(), one]);
+        assert_eq!(atoms.add(&mut context, &mismatch).unwrap(), 1);
+        assert_eq!(context.txn.mvars, before);
+        assert!(context.txn.budget.heartbeats_consumed > spent);
+        let matching = apply(function, [hole.clone(), zero]);
+        assert_eq!(atoms.add(&mut context, &matching).unwrap(), 0);
+        assert_eq!(context.instantiate(&hole).unwrap(), x);
+    }
+
+    #[test]
+    fn atom_conversion_exhaustion_is_not_a_new_atom_or_a_match() {
+        let mut context = context();
+        let n = local(&mut context, "n", nat_type());
+        let function = local(&mut context, "f", arrow(nat_type(), nat_type()));
+        let first = Expr::app(function.clone(), n.clone());
+        let identity = Expr::lam(
+            name("x"),
+            nat_type(),
+            Expr::bvar(0).unwrap(),
+            BinderInfo::Default,
+        );
+        let second = Expr::app(function, Expr::app(identity, n));
+        let mut atoms = Atoms::default();
+        assert_eq!(atoms.add(&mut context, &first).unwrap(), 0);
+        let before = context.txn.mvars.clone();
+        context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed + 10;
+        let error = atoms.add(&mut context, &second).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)
+            ) || matches!(
+                &error,
+                NatDefinitionElabError::Inference(SourceInferenceError::Unification(error))
+                    if matches!(error.as_ref(), UnificationError::HeartbeatLimit)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(atoms.atoms, vec![first]);
+        assert_eq!(context.txn.mvars, before);
+        assert!(context.txn.budget.heartbeats_consumed >= context.txn.budget.max_heartbeats);
+    }
 
     fn var(i: usize) -> Linear {
         Linear::Var(i)

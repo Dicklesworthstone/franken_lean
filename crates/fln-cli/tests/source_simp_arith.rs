@@ -211,3 +211,43 @@ fn simp_arith_normalizes_nat_linear_arithmetic_as_the_pin_does() {
         );
     }
 }
+
+#[test]
+fn simp_arith_identifies_defeq_atoms_in_nat_and_int_constraints() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let header =
+        "prelude\nimport Init.Data.Nat.Linear\nimport Init.Data.Int.Linear\nimport Init.Guard\n";
+    // The two applications are distinct syntax with the same head and proof-irrelevant
+    // arguments. KExprMap must identify them before arithmetic can cancel their monomials.
+    let accepted = "example (P : Prop) (f : P → Nat) (h1 h2 : P) (a b : Nat) (h : a ≤ b) :\n\
+        f h1 + a ≤ f h2 + b := by\n  simp +arith only\n  guard_target =ₛ a ≤ b\n  exact h\n\
+        example (P : Prop) (f : P → Int) (h1 h2 : P) (a b : Int) (h : a = b) :\n\
+        f h1 + a = f h2 + b := by\n  simp +arith only\n  guard_target =ₛ a = b\n  exact h\n";
+    let (code, stderr, pinned) = check_with_header(&lib, &root, "defeq_atoms", header, accepted);
+    assert_eq!(pinned.unwrap_or(0), 0, "the pinned lean rejects it");
+    assert_eq!(code, 0, "{accepted}\n{stderr}");
+
+    for (name, program) in [
+        (
+            "distinct_nat_arguments",
+            "example (f : Nat → Nat) (x y a b : Nat) (h : a ≤ b) :\n\
+             f x + a ≤ f y + b := by\n  simp +arith only\n  exact h\n",
+        ),
+        (
+            "distinct_int_heads",
+            "example (P : Prop) (f g : P → Int) (h1 h2 : P) (a b : Int) (h : a = b) :\n\
+             f h1 + a = g h2 + b := by\n  simp +arith only\n  exact h\n",
+        ),
+    ] {
+        let (code, stderr, pinned) = check_with_header(&lib, &root, name, header, program);
+        assert_ne!(pinned.unwrap_or(1), 0, "{name}: the pinned lean accepts it");
+        assert_ne!(code, 0, "{name}: accepted {program}");
+        assert!(
+            !stderr.contains("unexpected syntax"),
+            "{name}: refused as unsupported, not rejected\n{stderr}"
+        );
+    }
+}
