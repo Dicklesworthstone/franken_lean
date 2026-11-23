@@ -36,6 +36,21 @@ pub(in crate::source) fn normalize<'a>(
     arguments: &[&'a Syntax],
     constructor: &ConstructorVal,
 ) -> Result<Vec<Option<&'a Syntax>>, NatDefinitionElabError> {
+    let slots = normalize_telescope(cx, arguments, &constructor.base.type_, false)?;
+    if slots.len() != constructor.num_params as usize + constructor.num_fields as usize {
+        return Err(invalid());
+    }
+    Ok(slots)
+}
+
+/// Definition patterns use the same positional/named ordering, but `@` makes
+/// implicit slots positional without making them accessible pattern binders.
+pub(in crate::source) fn normalize_telescope<'a>(
+    cx: &mut Context,
+    arguments: &[&'a Syntax],
+    type_: &Expr,
+    explicit: bool,
+) -> Result<Vec<Option<&'a Syntax>>, NatDefinitionElabError> {
     let mut positional = VecDeque::new();
     let mut named = Vec::new();
     let mut names = HashSet::new();
@@ -66,7 +81,7 @@ pub(in crate::source) fn normalize<'a>(
             positional.push_back(*argument);
         }
     }
-    let mut type_ = constructor.base.type_.clone();
+    let mut type_ = type_.clone();
     let mut slots = Vec::new();
     let mut missing = false;
     while let ExprNode::ForallE {
@@ -79,7 +94,7 @@ pub(in crate::source) fn normalize<'a>(
         cx.tick()?;
         let argument = if let Some(index) = named.iter().position(|(name, _)| name == binder_name) {
             Some(named.remove(index).1)
-        } else if *binder_info == BinderInfo::Default {
+        } else if explicit || *binder_info == BinderInfo::Default {
             let argument = positional.pop_front();
             missing |= argument.is_none() && !ellipsis;
             argument
@@ -96,9 +111,6 @@ pub(in crate::source) fn normalize<'a>(
         return Err(failure(SourceInferenceError::Match(
             matching::MatchError::WrongArity,
         )));
-    }
-    if slots.len() != constructor.num_params as usize + constructor.num_fields as usize {
-        return Err(invalid());
     }
     Ok(slots)
 }

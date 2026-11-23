@@ -19,10 +19,10 @@ use std::collections::BTreeSet;
 pub use format::{
     ALIAS_EXTENSION, APP_UNEXPANDER_EXTENSION, AUX_RECURSOR_EXTENSION, BACKWARD_DEFEQ_EXTENSION,
     CLASS_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION, DEPRECATED_EXTENSION, EXTERN_EXTENSION,
-    IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION, INSTANCE_EXTENSION, NONCOMPUTABLE_EXTENSION,
-    PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION, PROTECTED_EXTENSION,
-    REDUCIBILITY_EXTENSION, REDUCIBILITY_EXTRA_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
-    UNBOX_EXTENSION,
+    IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION, INSTANCE_EXTENSION, MATCH_PATTERN_EXTENSION,
+    NONCOMPUTABLE_EXTENSION, PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION,
+    PROTECTED_EXTENSION, REDUCIBILITY_EXTENSION, REDUCIBILITY_EXTRA_EXTENSION, SIMP_EXTENSION,
+    STRUCTURE_EXTENSION, UNBOX_EXTENSION,
 };
 mod deprecations;
 pub use deprecations::DeprecationEntry;
@@ -195,6 +195,9 @@ pub struct SourceExtensions {
     pub noncomputable: Vec<Name>,
     /// Nonrecursive inductive types carrying the pin's persistent `[unbox]` tag.
     pub unbox: Vec<Name>,
+    /// Definitions marked for pattern expansion, still awaiting checked ownership
+    /// and visible-body validation before a source consumer can unfold them.
+    pub match_patterns: Vec<Name>,
     /// The pin's defeq attribute tags, not evidence that an equation is true.
     /// Source activation must bind names to their checked owning module; each
     /// use still requires conversion and ordinary proof checking.
@@ -678,6 +681,7 @@ fn decode_batch(
         name(format::DEPRECATED_EXTENSION),
         name(format::REDUCIBILITY_EXTRA_EXTENSION),
         name(format::UNBOX_EXTENSION),
+        name(format::MATCH_PATTERN_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -688,6 +692,7 @@ fn decode_batch(
     let mut aux_recursors = BTreeSet::new();
     let mut noncomputable = BTreeSet::new();
     let mut unbox = BTreeSet::new();
+    let mut match_patterns = BTreeSet::new();
     let mut defeq = BTreeSet::new();
     let mut backward_defeq = BTreeSet::new();
     let mut pp_anonymous_constructor = BTreeSet::new();
@@ -846,7 +851,14 @@ fn decode_batch(
                     }
                     out.unbox.push(declaration);
                 }
-                _ => unreachable!("twenty-four selected extension families"),
+                24 => {
+                    let declaration = reader.name(&obj)?;
+                    if declaration.is_anonymous() || !match_patterns.insert(declaration.clone()) {
+                        return Err(shape("anonymous or repeated match-pattern declaration"));
+                    }
+                    out.match_patterns.push(declaration);
+                }
+                _ => unreachable!("twenty-five selected extension families"),
             }
         }
     }

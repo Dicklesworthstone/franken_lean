@@ -121,10 +121,27 @@ impl Context {
     /// Check a pattern term before literal canonicalization erases its
     /// dictionary. This query closes exactly its transitive local dependencies;
     /// it publishes no declaration and adds no executable term to the matcher.
-    fn check_finite_pattern_term(
+    pub(in crate::source) fn check_finite_pattern_term(
+        &mut self,
+        value: Expr,
+        expected: Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.check_erased_pattern_term(value, expected, DefinitionSafety::Unsafe)
+    }
+
+    pub(in crate::source) fn check_definition_pattern_term(
+        &mut self,
+        value: Expr,
+        expected: Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.check_erased_pattern_term(value, expected, DefinitionSafety::Safe)
+    }
+
+    fn check_erased_pattern_term(
         &mut self,
         mut value: Expr,
         mut expected: Expr,
+        safety: DefinitionSafety,
     ) -> Result<(), NatDefinitionElabError> {
         self.require_resolved(&[value.clone(), expected.clone()])?;
         let mut needed = self.elimination_reads(&value)?;
@@ -184,9 +201,9 @@ impl Context {
                 break name;
             }
         };
-        // The pin's Meta.check accepts unsafe dictionaries in literal patterns
-        // that canonicalization erases. Use the kernel's existing unsafe body
-        // typing mode only for this unpublished query, never for the matcher.
+        // Literal canonicalization selects the pin's unsafe Meta.check mode
+        // for erased dictionaries. Definition-pattern witnesses use safe mode
+        // so their erased head/arguments cannot bypass ordinary body checking.
         let declaration = Declaration::Defn(fln_env::constants::DefinitionVal {
             base: ConstantVal {
                 name: name.clone(),
@@ -195,7 +212,7 @@ impl Context {
             },
             value,
             hints: fln_env::constants::ReducibilityHints::Opaque,
-            safety: fln_env::constants::DefinitionSafety::Unsafe,
+            safety,
             all: vec![name],
         });
         let remaining = if self.txn.budget.max_heartbeats == 0 {
@@ -354,7 +371,7 @@ impl Context {
 
     /// Expose small constructors, and render larger numeric patterns with
     /// metered work per limb rather than allocating an unbounded unary tree.
-    fn finite_literal_syntax(
+    pub(super) fn finite_literal_syntax(
         &mut self,
         natural: &NatLit,
     ) -> Result<Syntax, NatDefinitionElabError> {

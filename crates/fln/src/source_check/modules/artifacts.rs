@@ -685,6 +685,41 @@ impl ArtifactData {
                 metadata.unbox.push(tagged);
             }
         }
+        let match_patterns = |env: &Environment, meter: &mut Meter| {
+            if let Some(journal) = env.extension(&fln_elab::match_pattern::journal_name()) {
+                for entry in journal.entries() {
+                    meter.work(1)?;
+                    meter.bytes(entry.payload.len())?;
+                }
+            }
+            fln_elab::match_pattern::read(env).map_err(|error| match error {
+                fln_elab::match_pattern::MatchPatternError::Limit => {
+                    SourceModuleCheckError::Limit {
+                        resource: "native match-pattern tags",
+                        limit: fln_elab::match_pattern::MAX_ROWS,
+                    }
+                }
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::match_pattern::journal_name(),
+                    reason: "invalid match-pattern journal",
+                },
+            })
+        };
+        let inherited = match_patterns(base, meter)?;
+        for tagged in match_patterns(checked, meter)? {
+            meter.work(1)?;
+            if !inherited.contains(&tagged) {
+                if base.contains(&tagged) {
+                    return Err(SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::match_pattern::journal_name(),
+                        reason: "a module cannot tag an imported match-pattern definition",
+                    });
+                }
+                metadata.match_patterns.push(tagged);
+            }
+        }
         let anonymous_constructors = |env: &Environment, meter: &mut Meter| {
             use fln_elab::delaborator_tags;
             if let Some(journal) = env.extension(&delaborator_tags::source_journal_name()) {

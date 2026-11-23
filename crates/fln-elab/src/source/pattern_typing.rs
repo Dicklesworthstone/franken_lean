@@ -88,6 +88,12 @@ struct Model<'c> {
     /// Application mode: an unassigned metavariable applied to arguments is the pin's stuck
     /// equation, which fails against a rigid term (measured, see `check_application_typing`).
     applications: bool,
+    /// Original tagged applications must additionally pass real native term
+    /// elaboration and the kernel; this rejection model is not positive typing
+    /// evidence (in particular it deliberately abstracts universe equality).
+    definition_obligations: Vec<(Syntax, Expr)>,
+    source_holes: HashMap<usize, Name>,
+    verify_definitions: bool,
 }
 
 #[derive(Clone, Default)]
@@ -96,6 +102,16 @@ struct Variables {
     /// `PatternVar.collect` creates variable-type holes in this local-context order.
     order: HashMap<Name, usize>,
     types: Vec<(Name, Expr)>,
+    witness: Vec<WitnessLocal>,
+}
+
+#[derive(Clone)]
+struct WitnessLocal {
+    name: Name,
+    id: FVarId,
+    value: Expr,
+    type_: Expr,
+    hole: bool,
 }
 
 /// Observations belong only to live source/expansion trees. Addresses are
@@ -356,6 +372,7 @@ impl Context {
         discriminants: &[(Expr, Expr)],
         alternatives: &[Syntax],
     ) -> Result<(), NatDefinitionElabError> {
+        let strict = self.has_definition_patterns(alternatives)?;
         let mut model = Model {
             cx: self,
             assigned: HashMap::new(),
@@ -363,8 +380,11 @@ impl Context {
             names: HashMap::new(),
             placeholders: HashSet::new(),
             applications: false,
+            definition_obligations: Vec::new(),
+            source_holes: HashMap::new(),
+            verify_definitions: strict,
         };
-        match model.run(discriminants, alternatives)? {
+        match model.run(discriminants, alternatives, strict)? {
             Some((actual, expected)) => Err(failure(SourceInferenceError::TypeMismatch {
                 actual,
                 expected,
@@ -401,6 +421,9 @@ impl Context {
             names: HashMap::new(),
             placeholders: HashSet::new(),
             applications: true,
+            definition_obligations: Vec::new(),
+            source_holes: HashMap::new(),
+            verify_definitions: false,
         };
         match model.application_verdict(syntax, expected)? {
             Some((actual, expected)) => Err(failure(SourceInferenceError::TypeMismatch {
@@ -701,6 +724,30 @@ impl Model<'_> {
                             .flatten()
                             .rev(),
                     );
+                } else if let Some(definition) = self.cx.pattern_definition(&resolved)? {
+                    let arguments: Vec<_> = arguments.iter().collect();
+                    let arguments = patterns::arguments::normalize_telescope(
+                        self.cx,
+                        &arguments,
+                        &definition.base.type_,
+                        false,
+                    )?;
+                    let mut type_ = definition.base.type_.clone();
+                    let mut accessible = Vec::new();
+                    for argument in arguments {
+                        self.cx.tick()?;
+                        let ExprNode::ForallE {
+                            binder_info, body, ..
+                        } = type_.node()
+                        else {
+                            return Err(failure(SourceInferenceError::Scope));
+                        };
+                        if *binder_info == BinderInfo::Default {
+                            accessible.extend(argument);
+                        }
+                        type_ = body.clone();
+                    }
+                    pending.extend(accessible.into_iter().rev());
                 } else if arguments.is_empty()
                     && !matches!(val.to_display_string().as_str(), "true" | "false")
                 {
@@ -794,30 +841,42 @@ impl Model<'_> {
         &mut self,
         discriminants: &[(Expr, Expr)],
         alternatives: &[Syntax],
+        strict: bool,
     ) -> Result<Option<(String, String)>, NatDefinitionElabError> {
+        // Unfolding changes syntax, so a definition pattern cannot rely on the
+        // old model's unknown-as-fallback convention to erase its source type.
+        let unknown = || {
+            if strict {
+                Err(patterns::definitions::unsupported(
+                    "the original definition-pattern typing obligation is outside the supported model",
+                ))
+            } else {
+                Ok(None)
+            }
+        };
         // Each `|`-separated group of patterns is an alternative of its own (`expandMatchAlts?`).
         let mut rows = Vec::new();
         for alternative in alternatives {
             self.cx.tick()?;
             let Syntax::Node { kind, args, .. } = alternative else {
-                return Ok(None);
+                return unknown();
             };
             if kind != &parser_kind(&["Term", "matchAlt"]) || args.len() != 4 {
-                return Ok(None);
+                return unknown();
             }
             let Syntax::Node { args: groups, .. } = &args[1] else {
-                return Ok(None);
+                return unknown();
             };
             for group in groups {
                 if matches!(group, Syntax::Atom { val, .. } if val == "|") {
                     continue;
                 }
                 let Syntax::Node { args: elements, .. } = group else {
-                    return Ok(None);
+                    return unknown();
                 };
                 let row: Vec<&Syntax> = elements.iter().step_by(2).collect();
                 if row.len() != discriminants.len() {
-                    return Ok(None);
+                    return unknown();
                 }
                 rows.push(row);
             }
@@ -828,7 +887,7 @@ impl Model<'_> {
             let value = self.cx.instantiate(value)?;
             let type_ = self.cx.instantiate(type_)?;
             if value.has_expr_mvar() || type_.has_expr_mvar() || type_.has_loose_bvars() {
-                return Ok(None);
+                return unknown();
             }
             // Earlier discriminants are abstracted in this one's type. A local's occurrences are
             // exact; anything else is matched up to definitional equality by `kabstract`, which
@@ -844,7 +903,7 @@ impl Model<'_> {
                     ExprNode::FVar { id } => {
                         replace_fvar(&slot, id, &Expr::fvar(placeholder.clone()))?
                     }
-                    _ if mentions_head(&slot, earlier_value) => return Ok(None),
+                    _ if mentions_head(&slot, earlier_value) => return unknown(),
                     _ => slot,
                 };
             }
@@ -861,7 +920,8 @@ impl Model<'_> {
         for _ in 0..ROUNDS {
             self.cx.tick()?;
             match self.round(&discrs, prefix, &rows)? {
-                Round::Accepted | Round::Unknown => return Ok(None),
+                Round::Accepted => return Ok(None),
+                Round::Unknown => return unknown(),
                 // An error thrown in `elabPatterns` (no path, or the retry failing) leaves the
                 // loop as itself; only the loop's own stops rethrow the first one (`throwEx`).
                 Round::Refused(mismatch) => return Ok(Some(mismatch)),
@@ -873,17 +933,17 @@ impl Model<'_> {
                     first.get_or_insert(mismatch.clone());
                     // The discriminant the failing pattern belongs to, by position.
                     let Some(owner) = discrs.get(pattern) else {
-                        return Ok(None);
+                        return unknown();
                     };
                     let index = match self.index_to_include(&owner.type_.clone(), &path)? {
                         Ok(Some(index)) => index,
                         Ok(None) => return Ok(Some(first.unwrap_or(mismatch))),
-                        Err(Stop::Unknown) | Err(Stop::Mismatch(..)) => return Ok(None),
+                        Err(Stop::Unknown) | Err(Stop::Mismatch(..)) => return unknown(),
                     };
                     for discr in &discrs {
                         match self.def_eq(&discr.value, &index)? {
                             Answer::Yes => return Ok(Some(first.unwrap_or(mismatch))),
-                            Answer::Unknown => return Ok(None),
+                            Answer::Unknown => return unknown(),
                             Answer::No => {}
                         }
                     }
@@ -892,7 +952,7 @@ impl Model<'_> {
                     if let ExprNode::FVar { id } = index.node()
                         && self.has_dependents(id, &discrs)?
                     {
-                        return Ok(None);
+                        return unknown();
                     }
                     // `updateMatchType`: abstract the index in every slot, then prepend it.
                     let placeholder = self.fresh_id("d");
@@ -904,7 +964,7 @@ impl Model<'_> {
                             }
                             _ => match self.abstract_term(&discr.slot, &index, &placeholder, 0)? {
                                 Some(slot) => slot,
-                                None => return Ok(None),
+                                None => return unknown(),
                             },
                         };
                         updated.push(Discriminant {
@@ -931,7 +991,7 @@ impl Model<'_> {
                 }
             }
         }
-        Ok(None)
+        unknown()
     }
 
     /// One pass of `elabMatchAltViews`'s loop over every alternative; the first `prefix`
@@ -944,6 +1004,8 @@ impl Model<'_> {
     ) -> Result<Round, NatDefinitionElabError> {
         for row in rows {
             self.assigned.clear();
+            self.definition_obligations.clear();
+            self.source_holes.clear();
             let mut values: Vec<(FVarId, Expr)> = Vec::new();
             let mut variables = Variables {
                 order: self.variable_order(row)?,
@@ -965,7 +1027,11 @@ impl Model<'_> {
                     continue;
                 }
                 let syntax = row[position - prefix];
-                let saved = (self.assigned.clone(), variables.clone());
+                let saved = (
+                    self.assigned.clone(),
+                    variables.clone(),
+                    self.definition_obligations.clone(),
+                );
                 match self.pattern(syntax, &expected, true, &mut variables, 0)? {
                     Ok((value, _)) => {
                         if let Some(mismatch) = self.variable_scope(&variables)? {
@@ -976,7 +1042,7 @@ impl Model<'_> {
                     }
                     Err(Stop::Unknown) => return Ok(Round::Unknown),
                     Err(Stop::Mismatch(actual, wanted)) => {
-                        (self.assigned, variables) = saved;
+                        (self.assigned, variables, self.definition_obligations) = saved;
                         let mismatch = (actual, wanted);
                         // Elaborate again against the type with its indices erased
                         // (`eraseIndices`), not requiring the type to match, and look for a path.
@@ -1005,6 +1071,7 @@ impl Model<'_> {
                     }
                 }
             }
+            self.check_definition_obligations(&variables)?;
         }
         Ok(Round::Accepted)
     }
@@ -1373,6 +1440,13 @@ impl Model<'_> {
                 let id = self.fresh_id("v");
                 self.names.insert(id.clone(), name.clone());
                 variables.types.push((name.clone(), expected.clone()));
+                variables.witness.push(WitnessLocal {
+                    name: name.clone(),
+                    id: id.clone(),
+                    value: Expr::fvar(id.clone()),
+                    type_: expected.clone(),
+                    hole: false,
+                });
                 variables.values.insert(name, Expr::fvar(id));
                 syntax = inner;
                 continue;
@@ -1382,7 +1456,12 @@ impl Model<'_> {
         let hole = parser_kind(&["Term", "hole"]);
         let synthetic = parser_kind(&["Term", "syntheticHole"]);
         if matches!(syntax.kind(), Some(kind) if kind == &hole || kind == &synthetic) {
-            return Ok(Ok((self.fresh_mvar(), expected.clone())));
+            let value = self.fresh_mvar();
+            if self.verify_definitions {
+                let name = self.witness_hole(value.clone(), expected.clone(), variables)?;
+                self.source_holes.insert(syntax_address(syntax), name);
+            }
+            return Ok(Ok((value, expected.clone())));
         }
         if let Some(record) = patterns::records::parts(syntax)? {
             let Some(expected) = self.inst(expected, 0)? else {
@@ -1418,7 +1497,7 @@ impl Model<'_> {
                 .record_pattern_model_arguments(&record.fields, &paths)?;
             let arguments = arguments.iter().collect::<Vec<_>>();
             return self.application(
-                &constructor,
+                (&constructor, false),
                 &arguments,
                 &expected,
                 ensure,
@@ -1445,21 +1524,7 @@ impl Model<'_> {
             };
             return Ok(Ok((Expr::lit(Literal::Nat(value)), expected)));
         }
-        let (head, arguments) = match syntax {
-            Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Term", "app"]) => {
-                let [
-                    head,
-                    Syntax::Node {
-                        args: arguments, ..
-                    },
-                ] = args.as_slice()
-                else {
-                    return Ok(Err(Stop::Unknown));
-                };
-                (head, arguments.iter().collect::<Vec<_>>())
-            }
-            _ => (syntax, Vec::new()),
-        };
+        let (head, arguments, explicit) = patterns::definitions::application_parts(syntax)?;
         let constructor = match head {
             Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Term", "dotIdent"]) => {
                 let [_, Syntax::Ident { val, .. }] = args.as_slice() else {
@@ -1480,7 +1545,9 @@ impl Model<'_> {
                     return Ok(Err(Stop::Unknown));
                 };
                 let resolved = resolved.unwrap_or_else(|| val.clone());
-                if self.constructor(&resolved).is_some() {
+                if self.constructor(&resolved).is_some()
+                    || self.cx.pattern_definition(&resolved)?.is_some()
+                {
                     resolved
                 } else if matches!(val.to_display_string().as_str(), "true" | "false") {
                     Name::from_components(["Bool"]).append_core(val)
@@ -1492,8 +1559,15 @@ impl Model<'_> {
                     }
                     let id = self.fresh_id("v");
                     self.names.insert(id.clone(), val.clone());
-                    let variable = Expr::fvar(id);
+                    let variable = Expr::fvar(id.clone());
                     variables.types.push((val.clone(), expected.clone()));
+                    variables.witness.push(WitnessLocal {
+                        name: val.clone(),
+                        id,
+                        value: variable.clone(),
+                        type_: expected.clone(),
+                        hole: false,
+                    });
                     variables.values.insert(val.clone(), variable.clone());
                     if let Some((actual, expected)) = self.variable_scope(variables)? {
                         return Ok(Err(Stop::Mismatch(actual, expected)));
@@ -1505,38 +1579,57 @@ impl Model<'_> {
             }
             _ => return Ok(Err(Stop::Unknown)),
         };
-        self.application(&constructor, &arguments, expected, ensure, variables, depth)
+        self.application(
+            (&constructor, explicit),
+            &arguments,
+            expected,
+            ensure,
+            variables,
+            depth,
+        )
     }
 
     /// A constructor applied to explicit argument patterns (`elabAppArgs` with the pin's order).
     fn application(
         &mut self,
-        constructor: &Name,
+        head: (&Name, bool),
         arguments: &[&Syntax],
         expected: &Expr,
         ensure: bool,
         variables: &mut Variables,
         depth: usize,
     ) -> Step<(Expr, Expr)> {
-        let Some(info) = self.constructor(constructor) else {
-            return Ok(Err(Stop::Unknown));
-        };
+        let (constructor, explicit) = head;
         // The pin collects named fields in constructor telescope order, including implicit
         // fields. Reordering source labels must not move a dependent pattern before its index
         // or turn a rigid named index into an inferred wildcard.
-        let arguments = patterns::arguments::normalize(self.cx, arguments, &info)?;
-        let levels = info
-            .base
+        let (base, parameters, definition, arguments) =
+            if let Some(info) = self.constructor(constructor) {
+                let arguments = patterns::arguments::normalize(self.cx, arguments, &info)?;
+                (info.base, info.num_params, false, arguments)
+            } else if let Some(info) = self.cx.pattern_definition(constructor)? {
+                let arguments = patterns::arguments::normalize_telescope(
+                    self.cx,
+                    arguments,
+                    &info.base.type_,
+                    explicit,
+                )?;
+                (info.base, 0, true, arguments)
+            } else {
+                return Ok(Err(Stop::Unknown));
+            };
+        let levels = base
             .level_params
             .iter()
             .cloned()
             .map(Level::param)
             .collect();
         let mut value = Expr::const_(constructor.clone(), levels);
-        let mut type_ = info.base.type_.clone();
+        let mut type_ = base.type_.clone();
         let mut remaining = arguments.into_iter();
         let mut propagated = false;
         let mut binder = 0u32;
+        let mut witness_arguments = Vec::new();
         while let ExprNode::ForallE {
             binder_type,
             body,
@@ -1549,19 +1642,28 @@ impl Model<'_> {
             let syntax = remaining
                 .next()
                 .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-            let parameter_hole = binder < info.num_params
+            let parameter_hole = binder < parameters
                 && *binder_info != BinderInfo::Default
                 && syntax.is_some_and(|syntax| {
                     matches!(syntax.kind(), Some(kind)
                     if kind == &parser_kind(&["Term", "hole"])
                         || kind == &parser_kind(&["Term", "syntheticHole"]))
                 });
-            let argument = if parameter_hole {
+            let argument = if definition && *binder_info != BinderInfo::Default {
+                if let Some(syntax) = syntax.filter(|syntax| !patterns::definitions::hole(syntax)) {
+                    match self.inaccessible_pattern_argument(syntax, &binder_type, variables)? {
+                        Ok(value) => value,
+                        Err(stop) => return Ok(Err(stop)),
+                    }
+                } else {
+                    self.fresh_mvar()
+                }
+            } else if parameter_hole {
                 self.fresh_mvar()
             } else if *binder_info == BinderInfo::Default || syntax.is_some() {
                 // An explicit parameter of the family (a promoted index) is an inaccessible
                 // position, which FrankenLean's lowering refuses by name; leave it there.
-                if binder < info.num_params {
+                if binder < parameters {
                     return Ok(Err(Stop::Unknown));
                 }
                 if !propagated {
@@ -1596,6 +1698,36 @@ impl Model<'_> {
             } else {
                 self.fresh_mvar()
             };
+            if definition {
+                let syntax = match syntax {
+                    Some(syntax)
+                        if *binder_info != BinderInfo::Default
+                            && !patterns::definitions::hole(syntax) =>
+                    {
+                        // An inaccessible term keeps the scope in which it
+                        // was read. A later pattern binder with the same user
+                        // name must not capture it during the exact witness.
+                        let name = self.cx.fresh_name()?;
+                        variables.witness.push(WitnessLocal {
+                            id: FVarId(name.clone()),
+                            name: name.clone(),
+                            value: argument.clone(),
+                            type_: binder_type.clone(),
+                            hole: false,
+                        });
+                        patterns::identifier(name)
+                    }
+                    Some(syntax) => self.definition_witness_syntax(syntax)?,
+                    None if *binder_info == BinderInfo::Default => patterns::identifier(
+                        self.witness_hole(argument.clone(), binder_type.clone(), variables)?,
+                    ),
+                    None => Syntax::node(
+                        parser_kind(&["Term", "hole"]),
+                        vec![Syntax::atom(fln_syntax::source::SourceInfo::None, "_")],
+                    ),
+                };
+                witness_arguments.push(syntax);
+            }
             type_ = body
                 .subst_loose(0, std::slice::from_ref(&argument))
                 .map_err(|_| failure(SourceInferenceError::Scope))?;
@@ -1605,12 +1737,263 @@ impl Model<'_> {
         if remaining.next().is_some() {
             return Ok(Err(Stop::Unknown));
         }
-        match self.def_eq(&type_, expected)? {
-            Answer::Yes => Ok(Ok((value, type_))),
+        // A result type alias may expose the discriminant's family. Normalize
+        // in a snapshot so no speculative model assignment reaches the caller.
+        let normalized_expected;
+        let expected = if definition {
+            let mut trial = self.cx.clone();
+            let result: Result<(Expr, Expr), NatDefinitionElabError> =
+                (|| Ok((trial.whnf(&type_)?, trial.whnf(expected)?)))();
+            self.cx.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+            (type_, normalized_expected) = result?;
+            &normalized_expected
+        } else {
+            expected
+        };
+        let result = match self.def_eq(&type_, expected)? {
+            Answer::Yes => Ok((value, type_)),
             // The retry's `elabTermAndSynthesize` does not require the type.
-            Answer::No if !ensure => Ok(Ok((value, type_))),
-            Answer::No => Ok(Err(Stop::Mismatch(
+            Answer::No if !ensure => Ok((value, type_)),
+            Answer::No => Err(Stop::Mismatch(
                 self.render(&type_, 0)?,
+                self.render(expected, 0)?,
+            )),
+            Answer::Unknown => Err(Stop::Unknown),
+        };
+        if definition && result.is_ok() {
+            let head = Syntax::node(
+                parser_kind(&["Term", "explicit"]),
+                vec![
+                    Syntax::atom(fln_syntax::source::SourceInfo::None, "@"),
+                    patterns::identifier(
+                        Name::from_components(["_root_"]).append_core(constructor),
+                    ),
+                ],
+            );
+            let syntax = if witness_arguments.is_empty() {
+                head
+            } else {
+                Syntax::node(
+                    parser_kind(&["Term", "app"]),
+                    vec![
+                        head,
+                        Syntax::node(Name::from_components(["null"]), witness_arguments),
+                    ],
+                )
+            };
+            self.definition_obligations.push((syntax, expected.clone()));
+        }
+        Ok(result)
+    }
+
+    fn witness_hole(
+        &mut self,
+        value: Expr,
+        type_: Expr,
+        variables: &mut Variables,
+    ) -> Result<Name, NatDefinitionElabError> {
+        let name = self.cx.fresh_name()?;
+        variables.witness.push(WitnessLocal {
+            name: name.clone(),
+            id: FVarId(name.clone()),
+            value,
+            type_,
+            hole: true,
+        });
+        Ok(name)
+    }
+
+    fn definition_witness_syntax(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        enum Task<'a> {
+            Visit(&'a Syntax),
+            Build(fln_syntax::source::SourceInfo, Name, usize),
+        }
+        let mut pending = vec![Task::Visit(syntax)];
+        let mut values = Vec::new();
+        while let Some(task) = pending.pop() {
+            self.cx.tick()?;
+            match task {
+                Task::Visit(syntax) => {
+                    if let Some(name) = self.source_holes.get(&syntax_address(syntax)) {
+                        values.push(patterns::identifier(name.clone()));
+                    } else if let Some((name, _)) = patterns::named::parts(syntax)? {
+                        values.push(patterns::identifier(name));
+                    } else if let Syntax::Node { info, kind, args } = syntax {
+                        pending.push(Task::Build(*info, kind.clone(), values.len()));
+                        pending.extend(args.iter().rev().map(Task::Visit));
+                    } else {
+                        values.push(syntax.clone());
+                    }
+                }
+                Task::Build(info, kind, start) => {
+                    let args = values.split_off(start);
+                    values.push(Syntax::Node { info, kind, args });
+                }
+            }
+        }
+        values
+            .pop()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))
+    }
+
+    fn check_definition_obligations(
+        &mut self,
+        variables: &Variables,
+    ) -> Result<(), NatDefinitionElabError> {
+        if self.definition_obligations.is_empty() {
+            return Ok(());
+        }
+        let unsupported = || {
+            patterns::definitions::unsupported(
+                "the original definition pattern has an unresolved typing witness",
+            )
+        };
+        // Keep solved holes as their solved values. Only genuinely unassigned
+        // source holes become fresh rigid locals, in the original binder order.
+        for local in &variables.witness {
+            if local.hole
+                && let ExprNode::MVar { id } = local.value.node()
+                && !self.assigned.contains_key(&id.0)
+            {
+                self.assigned
+                    .insert(id.0.clone(), Expr::fvar(local.id.clone()));
+            }
+        }
+        let mut locals = Vec::new();
+        for local in &variables.witness {
+            self.cx.tick()?;
+            let type_ = self.inst(&local.type_, 0)?.ok_or_else(unsupported)?;
+            let value = self.inst(&local.value, 0)?.ok_or_else(unsupported)?;
+            if type_.has_expr_mvar() || value.has_expr_mvar() {
+                return Err(unsupported());
+            }
+            locals.push((local, type_, value));
+        }
+        let obligations = std::mem::take(&mut self.definition_obligations);
+        for (syntax, expected) in obligations {
+            let expected = self.inst(&expected, 0)?.ok_or_else(unsupported)?;
+            if expected.has_expr_mvar() {
+                return Err(unsupported());
+            }
+            let mut trial = self.cx.clone();
+            let result: Result<(), NatDefinitionElabError> = (|| {
+                for (local, type_, value) in &locals {
+                    trial.tick()?;
+                    if trial
+                        .elimination_reads(type_)?
+                        .iter()
+                        .any(|id| !trial.txn.lctx.contains(id))
+                    {
+                        return Err(unsupported());
+                    }
+                    if *value == Expr::fvar(local.id.clone()) {
+                        trial.txn.lctx.add_param(
+                            local.id.clone(),
+                            local.name.clone(),
+                            type_.clone(),
+                            BinderInfo::Default,
+                        );
+                    } else {
+                        if trial
+                            .elimination_reads(value)?
+                            .iter()
+                            .any(|id| !trial.txn.lctx.contains(id))
+                        {
+                            return Err(unsupported());
+                        }
+                        trial.txn.lctx.add_let(
+                            local.id.clone(),
+                            local.name.clone(),
+                            type_.clone(),
+                            value.clone(),
+                        );
+                    }
+                }
+                if trial
+                    .elimination_reads(&expected)?
+                    .iter()
+                    .any(|id| !trial.txn.lctx.contains(id))
+                {
+                    return Err(unsupported());
+                }
+                // This is the original alias applied to the original typed
+                // arguments. Both ordinary unification (including universes)
+                // and the kernel check the actual expected type.
+                let term = trial.term(&syntax, Some(expected.clone()))?;
+                let term = trial.finish_term(term, Some(&expected))?;
+                let value = trial.instantiate(&term.value)?;
+                let expected = trial.instantiate(&expected)?;
+                trial.check_definition_pattern_term(value, expected)
+            })();
+            self.cx.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+            result?;
+        }
+        Ok(())
+    }
+
+    /// An implicit definition argument is a term in the current scope, never a
+    /// new pattern binder. Existing earlier pattern variables are model locals;
+    /// simple constants are read without running a term provider. The exact
+    /// ordinary-term/kernel witness below is the authority for their typing.
+    fn inaccessible_pattern_argument(
+        &mut self,
+        syntax: &Syntax,
+        expected: &Expr,
+        variables: &Variables,
+    ) -> Step<Expr> {
+        let mut syntax = syntax;
+        while let Some(inner) = parenthesized_inner(syntax)? {
+            syntax = inner;
+        }
+        let typed = if let Syntax::Ident { val, .. } = syntax
+            && let Some(value) = variables.values.get(val)
+            && let Some((_, type_)) = variables.types.iter().find(|(name, _)| name == val)
+        {
+            Typed {
+                value: value.clone(),
+                type_: type_.clone(),
+            }
+        } else if let Syntax::Ident { val, .. } = syntax {
+            if let Some(local) = self.cx.txn.lctx.find_by_user_name(val) {
+                Typed {
+                    value: Expr::fvar(local.id.clone()),
+                    type_: local.type_.clone(),
+                }
+            } else {
+                let (name, _) = self.cx.resolve_unambiguous_identifier_name(syntax)?;
+                let Some(info) = name.and_then(|name| self.cx.txn.env.find(&name)).cloned() else {
+                    return Ok(Err(Stop::Unknown));
+                };
+                let base = info.constant_val();
+                Typed {
+                    value: Expr::const_(
+                        base.name.clone(),
+                        base.level_params
+                            .iter()
+                            .cloned()
+                            .map(Level::param)
+                            .collect(),
+                    ),
+                    type_: base.type_.clone(),
+                }
+            }
+        } else {
+            match self.app_argument(syntax)? {
+                Argument::Numeral(value) => Typed {
+                    value: nat_literal(value),
+                    type_: nat_const(),
+                },
+                Argument::Typed(value, type_) => Typed { value, type_ },
+                _ => return Ok(Err(Stop::Unknown)),
+            }
+        };
+        match self.def_eq(&typed.type_, expected)? {
+            Answer::Yes => Ok(Ok(typed.value)),
+            Answer::No => Ok(Err(Stop::Mismatch(
+                self.render(&typed.type_, 0)?,
                 self.render(expected, 0)?,
             ))),
             Answer::Unknown => Ok(Err(Stop::Unknown)),

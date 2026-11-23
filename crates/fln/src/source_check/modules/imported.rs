@@ -150,6 +150,8 @@ pub struct SourceMetadataReport {
     pub noncomputable: usize,
     /// Persistent `[unbox]` tags on this module's nonrecursive inductive types.
     pub unbox: usize,
+    /// Owned exposed definitions carrying the pin's `[match_pattern]` tag.
+    pub match_patterns: usize,
     /// `@[defeq]` tags (the pin's `Lean.defeqAttr`), which select `dsimp`'s rfl lemmas.
     pub defeq: usize,
     /// Backward-definitional tags, retained independently so an imported
@@ -1055,6 +1057,7 @@ fn prepare_source_metadata_view(
             Name::from_components(metadata::BACKWARD_DEFEQ_EXTENSION.split('.')),
             Name::from_components(metadata::REDUCIBILITY_EXTRA_EXTENSION.split('.')),
             Name::from_components(metadata::UNBOX_EXTENSION.split('.')),
+            Name::from_components(metadata::MATCH_PATTERN_EXTENSION.split('.')),
         ])
         .collect();
     let mut blocks: Vec<_> = selected
@@ -1123,6 +1126,7 @@ fn prepare_source_metadata_view(
             aux_recursors: 0,
             noncomputable: 0,
             unbox: 0,
+            match_patterns: 0,
             defeq: 0,
             backward_defeq: 0,
             structures: 0,
@@ -1220,6 +1224,7 @@ fn prepare_source_metadata_view(
                     21 => report.backward_defeq = entries.len(),
                     22 => report.reducibility_extra = entries.len(),
                     23 => report.unbox = entries.len(),
+                    24 => report.match_patterns = entries.len(),
                     _ => {
                         return Err(SourceOleanImportError::Internal(
                             "unknown selected metadata kind",
@@ -1390,6 +1395,7 @@ impl Engine {
         let mut aux_recursors = decoded.aux_recursors.into_iter();
         let mut noncomputable = decoded.noncomputable.into_iter();
         let mut unbox = decoded.unbox.into_iter();
+        let mut match_patterns = decoded.match_patterns.into_iter();
         let mut defeq = decoded.defeq.into_iter();
         let mut backward_defeq = decoded.backward_defeq.into_iter();
         let mut pp_anonymous_constructor = decoded.pp_anonymous_constructor.into_iter();
@@ -1779,6 +1785,27 @@ impl Engine {
                         .map_err(|error| unbox_error(&report.module, error))?;
                 }
             }
+            if report.match_patterns != 0 {
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.match_patterns,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..report.match_patterns {
+                    cancelled!("source-olean/match-pattern");
+                    let declaration =
+                        match_patterns
+                            .next()
+                            .ok_or(SourceOleanImportError::Internal(
+                                "match-pattern count changed during decode",
+                            ))?;
+                    owners.validate(activation.environment(), &report.module, &declaration)?;
+                    activation = activation
+                        .register_match_pattern(&declaration)
+                        .map_err(|error| match_pattern_error(&report.module, error))?;
+                }
+            }
             if report.defeq != 0 {
                 let mut owners = AttributeOwners::new(
                     &checked.modules[index].decoded.constants,
@@ -2029,6 +2056,9 @@ impl Engine {
         })?;
         fln_elab::unbox::read(&engine.environment)
             .map_err(|error| unbox_error(&roots.first().cloned().unwrap_or_default(), error))?;
+        fln_elab::match_pattern::read(&engine.environment).map_err(|error| {
+            match_pattern_error(&roots.first().cloned().unwrap_or_default(), error)
+        })?;
         fln_elab::macro_inline::read(&engine.environment).map_err(|_| {
             SourceOleanImportError::Metadata {
                 module: roots.first().cloned().unwrap_or_default(),
@@ -2069,6 +2099,7 @@ impl Engine {
             || aux_recursors.next().is_some()
             || noncomputable.next().is_some()
             || unbox.next().is_some()
+            || match_patterns.next().is_some()
             || defeq.next().is_some()
             || backward_defeq.next().is_some()
             || pp_anonymous_constructor.next().is_some()
@@ -2367,6 +2398,10 @@ trait Registrar: Sized {
         self,
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::unbox::UnboxError>;
+    fn register_match_pattern(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::match_pattern::MatchPatternError>;
     fn register_defeq(
         self,
         declaration: &Name,
@@ -2477,6 +2512,12 @@ impl Registrar for instances::imported::ImportActivation {
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::unbox::UnboxError> {
         self.register_unbox(declaration)
+    }
+    fn register_match_pattern(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::match_pattern::MatchPatternError> {
+        self.register_match_pattern(declaration)
     }
     fn register_defeq(
         self,
@@ -2740,6 +2781,30 @@ fn auxiliary_error(
             "a definition is tagged as an auxiliary recursor twice",
         ),
         AuxRecursorError::Malformed => (module.clone(), "malformed auxiliary-recursor journal"),
+    };
+    SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration,
+        reason,
+    }
+}
+
+fn match_pattern_error(
+    module: &Name,
+    error: fln_elab::match_pattern::MatchPatternError,
+) -> SourceOleanImportError {
+    use fln_elab::match_pattern::MatchPatternError;
+    let (declaration, reason) = match error {
+        MatchPatternError::Limit => {
+            return SourceOleanImportError::Limit("match-pattern journal");
+        }
+        MatchPatternError::UnknownDeclaration(name) => {
+            (name, "a match-pattern tag names no admitted declaration")
+        }
+        MatchPatternError::NotDefinition(name) => {
+            (name, "a match-pattern tag names no exposed definition")
+        }
+        MatchPatternError::Malformed => (module.clone(), "malformed match-pattern journal"),
     };
     SourceOleanImportError::Metadata {
         module: module.clone(),
@@ -4299,6 +4364,12 @@ pub(super) mod tests {
             declaration: &Name,
         ) -> std::result::Result<Self, fln_elab::unbox::UnboxError> {
             fln_elab::unbox::register(&self.0, declaration).map(Sequential)
+        }
+        fn register_match_pattern(
+            self,
+            declaration: &Name,
+        ) -> std::result::Result<Self, fln_elab::match_pattern::MatchPatternError> {
+            fln_elab::match_pattern::register(&self.0, declaration).map(Sequential)
         }
         fn register_defeq(
             self,

@@ -15,6 +15,8 @@ mod executable;
 mod instances;
 #[path = "macro_inline.rs"]
 mod macro_inline;
+#[path = "match_patterns.rs"]
+mod match_patterns;
 #[path = "simp.rs"]
 mod simp;
 #[path = "structures.rs"]

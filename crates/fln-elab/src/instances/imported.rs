@@ -719,6 +719,16 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain a checked owning module's pattern-expansion tag without changing
+    /// cached class or instance metadata. Registration requires a visible definition.
+    pub fn register_match_pattern(
+        mut self,
+        declaration: &Name,
+    ) -> Result<Self, crate::match_pattern::MatchPatternError> {
+        self.env = crate::match_pattern::register(&self.env, declaration)?;
+        Ok(self)
+    }
+
     /// Record an imported `@[defeq]` tag
     /// ([`crate::source::scope::simp::defeq::register_imported`]). The tag journal is
     /// not one this activation keeps or reads.

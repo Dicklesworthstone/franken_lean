@@ -235,6 +235,88 @@ fn real_auxiliary_tags_roundtrip_in_the_pins_binary_search_order() {
     }
 }
 
+#[test]
+fn real_match_pattern_tags_roundtrip_in_the_pins_binary_search_order() {
+    use fln_olean::source_extensions::MATCH_PATTERN_EXTENSION;
+    use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
+    use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget};
+
+    let decoded = read(blocks()).unwrap();
+    assert!(!decoded.uninterpreted.contains(&n(MATCH_PATTERN_EXTENSION)));
+    // These exact definitions are marked together in the pinned Prelude.
+    for declaration in [
+        "Nat.add",
+        "Add.add",
+        "HAdd.hAdd",
+        "Neg.neg",
+        "Mul.mul",
+        "HMul.hMul",
+        "Inv.inv",
+    ] {
+        assert!(
+            decoded.match_patterns.contains(&n(declaration)),
+            "{declaration}"
+        );
+    }
+    assert!(!decoded.match_patterns.contains(&n("Nat.succ")));
+    assert!(
+        decoded
+            .match_patterns
+            .windows(2)
+            .all(|pair| pair[0].quick_lt(&pair[1]))
+    );
+    let mut supplied = decoded.match_patterns.clone();
+    supplied.reverse();
+    for version in fln_olean::format::OLEAN_ACCEPTED_VERSIONS {
+        let encoded = encode_module_with_source_metadata(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[],
+                extra_const_names: &[],
+            },
+            &SourceMetadata {
+                match_patterns: supplied.clone(),
+                ..SourceMetadata::default()
+            },
+            OleanWriteHeader {
+                version: *version,
+                flags: 1,
+                lean_version: fln_olean::format::PIN_TAG.strip_prefix('v').unwrap(),
+                githash: fln_olean::format::PIN_COMMIT,
+                base_addr: 2 * fln_olean::format::REGION_ALIGN as u64,
+            },
+            WriteBudget::default(),
+        )
+        .unwrap();
+        let actual = OleanView::parse(&encoded.bytes)
+            .unwrap()
+            .extension_payloads(WalkBudget::default(), 4 << 20)
+            .unwrap();
+        let actual = read(&actual).unwrap();
+        assert_eq!(actual.match_patterns, decoded.match_patterns);
+        assert!(actual.uninterpreted.is_empty());
+    }
+}
+
+#[test]
+fn match_pattern_decode_refuses_anonymous_duplicate_and_non_name_rows() {
+    use fln_olean::source_extensions::MATCH_PATTERN_EXTENSION;
+    let valid = one(MATCH_PATTERN_EXTENSION, &inject_name(&n("Palette.red")));
+    assert_eq!(read(&valid).unwrap().match_patterns, [n("Palette.red")]);
+    for object in [inject_name(&Name::anonymous()), Obj::mk_nat(7)] {
+        assert!(
+            !read(&one(MATCH_PATTERN_EXTENSION, &object))
+                .unwrap_err()
+                .is_resource()
+        );
+    }
+    let mut repeated = valid;
+    let duplicate = repeated[0].entries[0].clone();
+    repeated[0].entries.push(duplicate);
+    assert!(!read(&repeated).unwrap_err().is_resource());
+}
+
 /// The Prelude's `reducibilityCore` entries (bead fln-gkhu), against what the
 /// pinned `lean` reports through `getReducibilityStatus` for the same names:
 /// instOfNatNat, Nat.add, instAddNat, instLTNat and Nat.decLt are

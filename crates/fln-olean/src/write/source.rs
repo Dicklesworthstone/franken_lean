@@ -52,6 +52,9 @@ pub struct SourceMetadata {
     pub noncomputable: Vec<Name>,
     /// Owned nonrecursive inductive `[unbox]` tags in the pin's `Name.quickLt` order.
     pub unbox: Vec<Name>,
+    /// Owned exposed definitions carrying `[match_pattern]`, sorted by `Name.quickLt`.
+    /// These tags only select bodies for ordinary checked pattern elaboration.
+    pub match_patterns: Vec<Name>,
     /// Owned plain `pp_using_anonymous_constructor` tags, sorted by `Name.quickLt`.
     pub pp_anonymous_constructor: Vec<Name>,
     /// Owned definitional-equality tags. The pin's defeq attribute also records
@@ -212,6 +215,13 @@ impl Encoder {
                 layout::UNBOX_EXTENSION,
                 &metadata.unbox,
                 "anonymous or duplicate unbox declaration",
+            )?);
+        }
+        if !metadata.match_patterns.is_empty() {
+            blocks.push(self.tagged_names_block(
+                layout::MATCH_PATTERN_EXTENSION,
+                &metadata.match_patterns,
+                "anonymous or duplicate match-pattern declaration",
             )?);
         }
         if !metadata.pp_anonymous_constructor.is_empty() {
@@ -561,6 +571,111 @@ mod tests {
                     WriteBudget::default(),
                 ),
                 Err(WriteError::Contract { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn match_pattern_tags_roundtrip_under_exact_shared_budgets() {
+        let metadata = SourceMetadata {
+            match_patterns: vec![
+                Name::from_components(["Palette", "red"]),
+                Name::from_components(["alias"]),
+            ],
+            ..SourceMetadata::default()
+        };
+        let encoded = encode_module_with_source_metadata(
+            input(),
+            &metadata,
+            header(),
+            WriteBudget::default(),
+        )
+        .unwrap();
+        let exact = WriteBudget {
+            max_bytes: encoded.report.file_bytes,
+            max_objects: encoded.report.runtime_objects,
+        };
+        assert_eq!(
+            encode_module_with_source_metadata(input(), &metadata, header(), exact)
+                .unwrap()
+                .bytes,
+            encoded.bytes,
+        );
+        for budget in [
+            WriteBudget {
+                max_bytes: exact.max_bytes - 1,
+                ..exact
+            },
+            WriteBudget {
+                max_objects: exact.max_objects - 1,
+                ..exact
+            },
+        ] {
+            assert!(matches!(
+                encode_module_with_source_metadata(input(), &metadata, header(), budget),
+                Err(WriteError::Budget { .. }),
+            ));
+        }
+        let blocks = crate::region::OleanView::parse(&encoded.bytes)
+            .unwrap()
+            .extension_payloads(crate::region::WalkBudget::default(), 1024 * 1024)
+            .unwrap();
+        assert_eq!(blocks.len(), 1, "match-pattern-only metadata must survive");
+        assert_eq!(
+            blocks[0].name,
+            Name::from_components(layout::MATCH_PATTERN_EXTENSION.split('.'))
+        );
+        let mut sorted = metadata.match_patterns.clone();
+        sorted.sort_by(Name::quick_cmp);
+        let decoded = source_extensions::decode(&blocks, DecodeLimits::default()).unwrap();
+        assert_eq!(decoded.match_patterns, sorted);
+        assert!(decoded.uninterpreted.is_empty());
+        for limits in [
+            DecodeLimits {
+                max_entries: 1,
+                ..DecodeLimits::default()
+            },
+            DecodeLimits {
+                max_bytes: 0,
+                ..DecodeLimits::default()
+            },
+            DecodeLimits {
+                max_objects: 0,
+                ..DecodeLimits::default()
+            },
+        ] {
+            assert!(
+                source_extensions::decode(&blocks, limits)
+                    .unwrap_err()
+                    .is_resource()
+            );
+        }
+        let mut repeated = blocks.clone();
+        let duplicate = repeated[0].entries[0].clone();
+        repeated[0].entries.push(duplicate);
+        assert!(
+            !source_extensions::decode(&repeated, DecodeLimits::default())
+                .unwrap_err()
+                .is_resource()
+        );
+        for match_patterns in [
+            vec![Name::anonymous()],
+            vec![
+                metadata.match_patterns[0].clone(),
+                metadata.match_patterns[0].clone(),
+            ],
+        ] {
+            assert!(matches!(
+                encode_module_with_source_metadata(
+                    input(),
+                    &SourceMetadata {
+                        match_patterns,
+                        ..SourceMetadata::default()
+                    },
+                    header(),
+                    WriteBudget::default(),
+                ),
+                Err(WriteError::Contract { .. }),
             ));
         }
     }

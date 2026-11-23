@@ -8,6 +8,7 @@
 use super::*;
 pub(super) mod arguments;
 mod coverage;
+pub(super) mod definitions;
 mod functions;
 mod literals;
 pub(super) mod named;
@@ -60,7 +61,7 @@ fn null(args: Vec<Syntax>) -> Syntax {
 fn atom(text: &str) -> Syntax {
     Syntax::atom(SourceInfo::None, text)
 }
-fn identifier(name: Name) -> Syntax {
+pub(super) fn identifier(name: Name) -> Syntax {
     Syntax::Ident {
         info: SourceInfo::None,
         raw_val: ByteSpan::default().into(),
@@ -619,6 +620,31 @@ fn pattern_function(syntax: &Syntax) -> bool {
 }
 
 impl Context {
+    fn complex_pattern_match(&mut self, syntax: &Syntax) -> Result<bool, NatDefinitionElabError> {
+        if complex(syntax, &self.txn.env) {
+            return Ok(true);
+        }
+        if syntax.kind() != Some(&parser_kind(&["Term", "match"])) {
+            return Ok(false);
+        }
+        let parts = expect_node(
+            syntax,
+            &parser_kind(&["Term", "match"]),
+            6,
+            "pattern matrix",
+        )?;
+        let alts = expect_node(
+            &parts[5],
+            &parser_kind(&["Term", "matchAlts"]),
+            1,
+            "alternatives",
+        )?;
+        let alts = expect_null_args(&alts[0], "alternatives")?;
+        // Only an actual scoped tag overrides the ordinary flat constructor
+        // lane. Relative constructors retain their existing indexed behavior.
+        self.has_definition_patterns(alts)
+    }
+
     /// The pin's `expandLetEqnsDecl` (`Lean/Elab/Binders.lean:885-889`): the declaration
     /// `go : T | p₁, p₂ => e …` is `go : T := fun x₁ x₂ => match x₁, x₂ with | p₁, p₂ => e …`,
     /// one fresh argument per pattern of the first alternative (`expandMatchAltsIntoMatch`,
@@ -1117,10 +1143,21 @@ impl Context {
             finite_patterns |= finite.is_some();
             finite_rows.push(finite);
         }
-        for ((alt, expanded), finite) in alts.iter().zip(&expanded_patterns).zip(&finite_rows) {
+        let mut definition_rows = Vec::with_capacity(expanded_patterns.len());
+        for (expanded, finite) in expanded_patterns.iter().zip(&finite_rows) {
+            definition_rows
+                .push(self.expand_definition_pattern_row(finite.as_ref().unwrap_or(expanded))?);
+        }
+        let definition_patterns = definition_rows.iter().any(Option::is_some);
+        for (((alt, expanded), finite), definition) in alts
+            .iter()
+            .zip(&expanded_patterns)
+            .zip(&finite_rows)
+            .zip(&definition_rows)
+        {
             self.tick()?;
             let alt = expect_node(alt, &parser_kind(&["Term", "matchAlt"]), 4, "alternative")?;
-            let expanded = finite.as_ref().unwrap_or(expanded);
+            let expanded = definition.as_ref().or(finite.as_ref()).unwrap_or(expanded);
             let [row] = expect_null_args(expanded, "one pattern row")? else {
                 return Err(invalid());
             };
@@ -1212,7 +1249,8 @@ impl Context {
         // A match as written is typed as the pin types its patterns once every input is bound
         // (`pattern_typing`); the bodies play no part, so only the pattern rows are kept.
         if !recursive_root
-            && matches!(&parts[0], Syntax::Atom { info, .. } if matches!(info, SourceInfo::Original { .. }))
+            && (definition_patterns
+                || matches!(&parts[0], Syntax::Atom { info, .. } if matches!(info, SourceInfo::Original { .. })))
             && let Some((last, _)) = inputs.last()
         {
             let mut patterns = Vec::new();
@@ -1723,7 +1761,7 @@ impl Context {
         // arms and discriminant equality binders. Use the identical selection
         // as the surrounding pattern walk, rather than forcing those matches
         // through a matrix pass that cannot preserve named equalities yet.
-        if !complex(&syntax, &self.txn.env) {
+        if !self.complex_pattern_match(&syntax)? {
             return Ok(syntax);
         }
         let mut required = Vec::new();
@@ -1843,7 +1881,7 @@ impl Context {
             mutation |= do_notation::is_mutation(node);
             nested |= node.kind() == Some(&parser_kind(&["Term", "nestedAction"]));
             loops |= do_notation::is_while_loop(node);
-            needed |= complex(node, &self.txn.env)
+            needed |= self.complex_pattern_match(node)?
                 || pattern_function(node)
                 || diagnostics::is_diagnostic(node)
                 || collections::is_notation(node)
@@ -1965,7 +2003,7 @@ impl Context {
                     let node = expand_sequence(node, pattern);
                     let mut required = Vec::new();
                     let node = if local_roots.contains(&std::ptr::from_ref(original))
-                        && complex(&node, &self.txn.env)
+                        && self.complex_pattern_match(&node)?
                     {
                         // Keep all bodies inside this owned syntax tree. The
                         // term driver can borrow and retry them on its heap
@@ -1975,7 +2013,7 @@ impl Context {
                         self.local_recursive_matrices(node)?
                     } else if pattern_function(&node) {
                         self.compile_pattern_function(node)?
-                    } else if complex(&node, &self.txn.env) {
+                    } else if self.complex_pattern_match(&node)? {
                         let column = if std::ptr::eq(original, root) {
                             self.recursion.as_mut().filter(|r| r.pending).map(|r| {
                                 r.matrix = true;

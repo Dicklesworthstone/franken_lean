@@ -37,6 +37,7 @@ pub mod info;
 pub mod instances;
 pub mod lctx;
 pub mod macro_inline;
+pub mod match_pattern;
 pub mod messages;
 pub mod mvar;
 pub mod namespaces;

@@ -37,6 +37,10 @@ pub enum MatchError {
     DuplicateVariable,
     UnreachableRow,
     UnsupportedGeneralization,
+    /// A tagged definition must normalize to a checked constructor/literal
+    /// pattern while retaining every accessible source binder and type.
+    UnsupportedDefinitionPattern(&'static str),
+    InaccessiblePatternVariable,
 }
 impl std::fmt::Display for MatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -67,6 +71,10 @@ impl std::fmt::Display for MatchError {
             Self::UnreachableRow => "pattern matrix contains a redundant or unreachable source row",
             Self::UnsupportedGeneralization => {
                 "disabled match generalization requires an ordinary nonrecursive unindexed match"
+            }
+            Self::UnsupportedDefinitionPattern(reason) => reason,
+            Self::InaccessiblePatternVariable => {
+                "an explicit pattern variable occurs only in inaccessible positions after unfolding"
             }
         })
     }
@@ -466,7 +474,13 @@ impl Context {
         let constructor = resolved
             .as_ref()
             .is_some_and(|name| matches!(self.txn.env.find(name), Some(ConstantInfo::Ctor(_))));
-        !constructor && (val.parent().is_anonymous() || resolved.is_some())
+        // A nullary tagged definition is a pattern, not a catch-all binding.
+        // A malformed journal cannot turn it into a catch-all either; the
+        // matrix path reports the typed metadata failure.
+        let tagged = crate::match_pattern::read(&self.txn.env).map_or(true, |tags| {
+            resolved.as_ref().is_some_and(|name| tags.contains(name))
+        });
+        !constructor && !tagged && (val.parent().is_anonymous() || resolved.is_some())
     }
 
     pub(super) fn match_apply(

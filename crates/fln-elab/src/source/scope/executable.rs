@@ -13,12 +13,16 @@ pub enum Attribute {
     Extern(Vec<ExternEntry>),
     Unbox,
     AnonymousConstructor,
+    MatchPattern,
 }
 
 impl Attribute {
     /// Persistent plain tags do not replace or suppress a declaration's code.
     pub fn is_tag(&self) -> bool {
-        matches!(self, Self::Unbox | Self::AnonymousConstructor)
+        matches!(
+            self,
+            Self::Unbox | Self::AnonymousConstructor | Self::MatchPattern
+        )
     }
 }
 
@@ -42,6 +46,20 @@ fn refused(expected: &'static str) -> NatDefinitionElabError {
     NatDefinitionElabError::UnexpectedSyntax { expected }
 }
 
+pub(in crate::source) fn match_pattern_error(
+    error: crate::match_pattern::MatchPatternError,
+) -> NatDefinitionElabError {
+    use crate::match_pattern::MatchPatternError;
+    match error {
+        MatchPatternError::Limit => failure(SourceInferenceError::ResourceLimit),
+        MatchPatternError::NotDefinition(_) => refused("match_pattern on an exposed definition"),
+        MatchPatternError::UnknownDeclaration(_) => {
+            refused("match_pattern on an admitted declaration")
+        }
+        MatchPatternError::Malformed => refused("a valid match_pattern journal"),
+    }
+}
+
 /// Recognize only exact global attributes, retaining their source order.
 pub(in crate::source) fn attribute(
     syntax: &Syntax,
@@ -60,6 +78,9 @@ pub(in crate::source) fn attribute(
             if val == &Name::from_components(["unbox"]) {
                 expect_empty_null(argument, "unbox without arguments")?;
                 Attribute::Unbox
+            } else if val == &Name::from_components(["match_pattern"]) {
+                expect_empty_null(argument, "match_pattern without arguments")?;
+                Attribute::MatchPattern
             } else if val == &Name::from_components(["pp_using_anonymous_constructor"]) {
                 expect_empty_null(argument, "pp_using_anonymous_constructor without arguments")?;
                 Attribute::AnonymousConstructor
@@ -370,6 +391,15 @@ pub fn apply(
                     }
                     crate::unbox::UnboxError::Malformed => refused("a valid unbox journal"),
                 })?
+            }
+            Attribute::MatchPattern => {
+                // Public validation uses the exporting view at the pin. The
+                // implementation's access to a hidden public body cannot make
+                // it an exported pattern rule.
+                if !standalone && scope.exports_declaration() && !scope.expose_definitions {
+                    return Err(refused("match_pattern on an exposed public definition"));
+                }
+                crate::match_pattern::register(&result, declaration).map_err(match_pattern_error)?
             }
             Attribute::AnonymousConstructor => {
                 crate::delaborator_tags::register_anonymous_constructor(&result, declaration)
