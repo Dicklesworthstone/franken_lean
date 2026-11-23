@@ -173,6 +173,287 @@ fn proof_methods_use_the_receivers_actual_dependent_type() {
     );
 }
 
+/// Each source is also executed by the exact pinned Reference when available.
+/// In particular, the absent-minor case is a refusal: dropping its named
+/// receiver or eta-expanding past it would accept a program the pin rejects.
+const RECURSOR_METHOD_CASES: &[(&str, &str, bool)] = &[
+    (
+        "transport",
+        r#"@[simp] abbrev transfer.{u1, u2} {A : Sort u2} {a : A} {motive : A → Sort u1} (m : motive a) {b : A} (h : Eq a b) : motive b := h.rec m
+theorem transfer_refl (n : Nat) : transfer (motive := fun _ : Nat => Nat) n (Eq.refl n) = n := rfl
+"#,
+        true,
+    ),
+    (
+        "eq_dependent",
+        r#"theorem method_symm {a b : Nat} (h : a = b) : b = a := h.rec rfl
+"#,
+        true,
+    ),
+    (
+        "named_motive",
+        r#"theorem method_symm {a b : Nat} (h : a = b) : b = a := h.rec (motive := fun b _ => b = a) rfl
+"#,
+        true,
+    ),
+    (
+        "explicit_motive",
+        r#"theorem method_symm {a b : Nat} (h : a = b) : b = a := @h.rec Nat a (fun b _ => b = a) rfl b
+"#,
+        true,
+    ),
+    (
+        "nat_deferred",
+        r#"theorem count : (3).rec 0 (fun _ ih => ih + 1) = 3 := rfl
+"#,
+        true,
+    ),
+    (
+        "nat_named",
+        r#"theorem count : (3).rec (zero := 0) (succ := fun _ ih => ih + 1) = 3 := rfl
+"#,
+        true,
+    ),
+    (
+        "nat_overapplication",
+        r#"theorem count : (2).rec (fun m : Nat => m) (fun _ ih m => Nat.succ (ih m)) 3 = 5 := rfl
+"#,
+        true,
+    ),
+    (
+        "custom_dependent",
+        r#"inductive Chain where | nil | cons (head : Nat) (tail : Chain)
+theorem self_eq (c : Chain) : c = c := c.rec rfl (fun _ _ _ => rfl)
+"#,
+        true,
+    ),
+    (
+        "custom_auxiliary",
+        r#"inductive Chain where | nil | cons (head : Nat) (tail : Chain)
+theorem rec_on (c : Chain) : c = c := c.recOn rfl (fun _ _ _ => rfl)
+theorem cases_on (c : Chain) : c = c := c.casesOn rfl (fun _ _ => rfl)
+"#,
+        true,
+    ),
+    (
+        "false_noargs",
+        r#"theorem absurd_method (h : False) : 1 = 2 := h.rec
+"#,
+        true,
+    ),
+    (
+        "false_hole",
+        r#"theorem absurd_method (h : False) : 1 = 2 := h.rec _
+"#,
+        true,
+    ),
+    (
+        "deferred_expected",
+        r#"inductive Chain where | nil | cons (head : Nat) (tail : Chain)
+theorem pick {p : Prop} (x : p) (y : p) : p := x
+theorem later (c : Chain) (h : c = c) : pick (c.rec (rfl : Chain.nil = Chain.nil) (fun hd tl _ => (rfl : Chain.cons hd tl = Chain.cons hd tl))) h = h := rfl
+"#,
+        true,
+    ),
+    (
+        "receiver_once",
+        r#"axiom pickReceiver : Nat → Nat
+theorem receiver_once (n : Nat) : True := (pickReceiver n).rec True.intro (fun _ _ => True.intro)
+"#,
+        true,
+    ),
+    (
+        "underapplication",
+        r#"noncomputable def transfer {A : Type} {a b : A} {motive : A → Prop} (h : a = b) : motive a → motive b := h.rec
+"#,
+        false,
+    ),
+    (
+        "no_expected_type",
+        r#"inductive Chain where | nil | cons (head : Nat) (tail : Chain)
+example (c : Chain) := c.rec 0 (fun _ _ ih => ih + 1)
+"#,
+        false,
+    ),
+    (
+        "wrong_minor",
+        r#"def sentinelPrefix : Nat := 7
+theorem bad {a b : Nat} (h : a = b) : b = a := h.rec (0 : Nat)
+"#,
+        false,
+    ),
+    (
+        "false_result",
+        r#"def sentinelPrefix : Nat := 7
+theorem bad : (3).rec 0 (fun _ ih => ih + 1) = 4 := rfl
+"#,
+        false,
+    ),
+    (
+        "deferred_wrong_minor",
+        r#"inductive Chain where | nil | cons (head : Nat) (tail : Chain)
+theorem pick {p : Prop} (x : p) (y : p) : p := x
+theorem bad (c : Chain) (h : c = c) : pick (c.rec (rfl : Chain.nil = Chain.nil) (fun _ _ _ => (rfl : Chain.nil = Chain.nil))) h = h := rfl
+"#,
+        false,
+    ),
+];
+
+#[test]
+fn recursor_methods_share_dependent_elaboration_and_match_the_pin() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let lib = std::env::var_os("FLN_REFERENCE_LIB").map(PathBuf::from)?;
+            Some(lib.parent()?.parent()?.join("bin/lean"))
+        })
+        .filter(|path| path.is_file());
+    assert!(
+        reference.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "the pinned Reference is required for recursor-method controls",
+    );
+    if let Some(binary) = &reference {
+        let version = Command::new(binary).arg("--githash").output().unwrap();
+        assert!(version.status.success(), "{version:?}");
+        assert_eq!(
+            String::from_utf8(version.stdout).unwrap().trim(),
+            "8c9756b28d64dab099da31a4c09229a9e6a2ef35",
+        );
+    } else {
+        eprintln!("SKIP: pinned Reference absent; native recursor-method controls still run");
+    }
+    let directory = std::env::temp_dir().join(format!("fln-method-elim-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    for &(label, source, accepts) in RECURSOR_METHOD_CASES {
+        if let Some(binary) = &reference {
+            let file = directory.join(format!("{label}.lean"));
+            std::fs::write(&file, source).unwrap();
+            let output = Command::new(binary)
+                .arg("-j1")
+                .arg(&file)
+                .env_remove("LEAN_PATH")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if accepts { 0 } else { 1 }),
+                "{label}: {source}\n{output:?}",
+            );
+        }
+        let base = engine();
+        let options = KVMap::new();
+        let root = base.logical_root(&options);
+        let result = base.check_source_files(&[source.as_bytes()], &options, limits());
+        if accepts {
+            let checked = result
+                .unwrap_or_else(|error| panic!("{label}: {source}\n{error:?}"))
+                .into_complete()
+                .unwrap_or_else(|reason| panic!("{label}: {source}\n{reason:?}"));
+            assert!(
+                checked.theorems > 0,
+                "{label}: a real proof must be checked"
+            );
+            if label == "receiver_once" {
+                use fln::ExprNode;
+                use fln_env::constants::ConstantInfo;
+                let Some(ConstantInfo::Thm(theorem)) = checked
+                    .engine
+                    .environment()
+                    .find(&Name::from_components(["receiver_once"]))
+                else {
+                    panic!("the admitted receiver proof must be present")
+                };
+                let receiver = Name::from_components(["pickReceiver"]);
+                let mut occurrences = 0;
+                let mut pending = vec![theorem.value.clone()];
+                while let Some(expression) = pending.pop() {
+                    match expression.node() {
+                        ExprNode::Const { name, .. } if name == &receiver => occurrences += 1,
+                        ExprNode::App { f, a } => pending.extend([f.clone(), a.clone()]),
+                        ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            pending.extend([binder_type.clone(), body.clone()]);
+                        }
+                        ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            pending.extend([type_.clone(), value.clone(), body.clone()]);
+                        }
+                        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                            pending.push(expr.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(occurrences, 1, "the receiver is one emitted argument");
+            }
+        } else {
+            let error = result.expect_err("invalid eliminator application must be refused");
+            assert_eq!(
+                error.disposition(),
+                ("elaboration", false, 1),
+                "{label}: {error:?}"
+            );
+        }
+        assert_eq!(base.logical_root(&options), root, "{label}");
+        assert!(
+            !base
+                .environment()
+                .contains(&Name::from_components(["sentinelPrefix"]))
+        );
+    }
+}
+
+#[test]
+fn recursor_methods_elaborate_the_unmodified_prelude_equality_prefix_from_empty() {
+    use fln::source_check::modules::execution::SourceProgramLimits;
+    use fln::source_check::modules::imported::SourceOleanImport;
+    use fln::{EvaluationPresentation, SourceModuleInput};
+
+    let prelude = include_str!("../../../vendor/lean4-src/src/Init/Prelude.lean");
+    let (prefix, _) = prelude
+        .split_once("/--\nHeterogeneous equality.")
+        .expect("the pinned prefix ends after Eq.ndrec and before HEq");
+    assert!(prefix.contains("@[simp] abbrev Eq.ndrec."));
+    assert!(prefix.contains("h.rec m"));
+    let options = KVMap::new();
+    let module = Name::from_components(["Init", "Prelude"]);
+    let imported = SourceOleanImport::empty(&options);
+    assert!(imported.engine.environment().is_empty());
+    let checked = imported
+        .execute_lean_source_modules_with_presentation(
+            &[SourceModuleInput {
+                name: &module,
+                source: prefix.as_bytes(),
+            }],
+            &module,
+            &options,
+            SourceProgramLimits::new(EngineExecutionLimits::new(limits().admission.kernel)),
+            None,
+            EvaluationPresentation::Lean,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked.modules.len(), 1);
+    assert!(
+        checked.modules[0]
+            .commands
+            .batch
+            .engine
+            .environment()
+            .contains(&Name::from_components(["Eq", "ndrec"]))
+    );
+    assert!(imported.engine.environment().is_empty());
+}
+
 #[test]
 fn partial_methods_eta_expand_only_independent_missing_arguments() {
     check(
@@ -397,7 +678,15 @@ fn addition_on_a_definitional_alias_is_refused_as_the_pin_refuses_it() {
 
 #[test]
 fn methods_execute_through_the_same_compiler_and_vm() {
-    let source = b"def bump (xs : List Nat) : List Nat := xs.map (fun n => n + 1)\n#eval (([1, 2, 3]).map (fun n => n + 1)).foldr (fun n acc => n + acc) 0\n#eval (\"hello\").length";
+    let source = b"def bump (xs : List Nat) : List Nat := xs.map (fun n => n + 1)\n\
+        def directCount (n : Nat) : Nat := Nat.rec 0 (fun _ ih => Nat.succ ih) n\n\
+        def methodCount (n : Nat) : Nat := n.rec 0 (fun _ ih => Nat.succ ih)\n\
+        def namedCount (n : Nat) : Nat := n.rec (zero := 0) (succ := fun _ ih => Nat.succ ih)\n\
+        #eval (([1, 2, 3]).map (fun n => n + 1)).foldr (fun n acc => n + acc) 0\n\
+        #eval (\"hello\").length\n\
+        #eval directCount 3\n\
+        #eval methodCount 7\n\
+        #eval namedCount 9";
     let result = engine()
         .execute_source_definitions(
             &[source],
@@ -407,8 +696,13 @@ fn methods_execute_through_the_same_compiler_and_vm() {
         .unwrap()
         .into_complete()
         .unwrap();
-    assert!(result.executions.len() >= 2);
-    for (execution, expected) in result.executions.iter().rev().zip(["5", "9"]) {
+    assert!(result.executions.len() >= 5);
+    for (execution, expected) in result
+        .executions
+        .iter()
+        .rev()
+        .zip(["9", "7", "3", "5", "9"])
+    {
         let VmExit::Returned(value) = &execution.exit else {
             panic!("VM result")
         };

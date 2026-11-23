@@ -12,6 +12,7 @@ struct Named<'a> {
     value: ApplicationValue<'a>,
 }
 
+#[derive(Clone)]
 pub(super) enum ApplicationValue<'a> {
     Syntax(&'a Syntax),
     Elaborated(Typed),
@@ -93,6 +94,40 @@ pub(super) fn split_ellipsis(
 }
 
 impl Context {
+    /// Field notation inserts an already elaborated receiver into the same
+    /// positional/named argument stream as an ordinary application. The pin
+    /// then re-enters `elabAppArgs`, including its eliminator strategy.
+    pub(super) fn named_eliminator_application(
+        &mut self,
+        state: &NamedApplication<'_>,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        if state.explicit || state.ellipsis {
+            return Ok(None);
+        }
+        let Some((declared, info)) = self.eliminator_head_info(&state.function)? else {
+            return Ok(None);
+        };
+        let arguments = eliminator::EliminatorArguments::new(
+            state.positional.clone(),
+            state
+                .named
+                .iter()
+                .map(|argument| (argument.name.clone(), argument.value.clone()))
+                .collect(),
+        );
+        let Some(info) = self.eliminator_implicit_motive(declared, info, arguments.clone())? else {
+            return Ok(None);
+        };
+        let term = self.eliminator_application_with_arguments(
+            state.function.clone(),
+            arguments,
+            info,
+            state.expected.clone(),
+        )?;
+        self.finish_explicit_term(term, state.expected.as_ref())
+            .map(Some)
+    }
+
     pub(super) fn start_named_application<'a>(
         &mut self,
         function: Typed,

@@ -317,6 +317,32 @@ fn macro_inline_recursors_follow_surviving_runtime_terms() {
 }
 
 #[test]
+fn method_eliminators_preserve_the_direct_recursors_compiler_boundary() {
+    let base = "prelude\ninductive UserChain where | nil | more (tail : UserChain)\n";
+    for application in [
+        "UserChain.rec UserChain.nil (fun _ ih => ih) x",
+        "x.rec UserChain.nil (fun _ ih => ih)",
+        "x.rec (nil := UserChain.nil) (more := fun _ ih => ih)",
+    ] {
+        let source = format!("{base}def keep (x : UserChain) : UserChain := {application}\n");
+        let error =
+            run(&source, limits()).expect_err("method notation cannot hide an explicit recursor");
+        assert_eq!(error.disposition().2, 1, "{source}\n{error:?}");
+        assert!(
+            error.to_string().contains("does not support recursor"),
+            "{source}\n{error:?}"
+        );
+        assert!(
+            error.to_string().contains("UserChain.rec"),
+            "{source}\n{error:?}"
+        );
+        accepted(&format!(
+            "{base}noncomputable def keep (x : UserChain) : UserChain := {application}\n"
+        ));
+    }
+}
+
+#[test]
 fn macro_inline_source_recursors_retain_provenance_across_module_imports() {
     let library = name("Library");
     let main = name("Main");

@@ -4937,6 +4937,10 @@ impl Context {
                                             ));
                                         }
                                     }
+                                    if let Some(term) = self.named_eliminator_application(&state)? {
+                                        values.push(term);
+                                        continue;
+                                    }
                                     state.start();
                                 }
                                 let next = self.next_named_argument(&mut state);

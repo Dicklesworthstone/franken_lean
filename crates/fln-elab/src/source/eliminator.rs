@@ -24,8 +24,9 @@
 //!   imported tags follow the same checked ownership path. User-defined names
 //!   receive no eliminator semantics from their suffix. User `@[elab_as_elim]`
 //!   attributes and the pin's legacy untagged Eq helpers remain separate.
-//! - `elabAsElim?`: not under `@`, and not when the motive is supplied. An
-//!   application with any named argument keeps the ordinary elaborator.
+//! - `elabAsElim?`: not under `@` or ellipsis, and not when the motive is
+//!   supplied. Named arguments and typed field receivers use the same path;
+//!   only a named motive, rather than any named argument, disables it.
 //! - `getElabElimExprInfo` (motive position and major positions, including the
 //!   transitive closure and the "first-order" rule), `ElabElim.main`,
 //!   `finalize` with under-application (expected type specialized) and
@@ -36,13 +37,109 @@
 //! The pin also abstracts subterms that are only definitionally equal to it
 //! with the same head symbol and arity.
 use super::*;
+use application::ApplicationValue;
 use fln_env::constants::ConstantInfo;
+use std::collections::VecDeque;
 
 /// `ElabElimInfo`: the motive's parameter position and the major positions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ElimInfo {
     motive_pos: usize,
     majors: Vec<usize>,
+}
+
+/// The pin's `Arg.stx`/`Arg.expr` distinction. A field receiver is already
+/// elaborated; retaining that expression preserves its metavariables and
+/// avoids evaluating or elaborating its source a second time.
+#[derive(Clone)]
+pub(super) struct EliminatorArguments<'a> {
+    positional: VecDeque<ApplicationValue<'a>>,
+    named: Vec<(Name, ApplicationValue<'a>)>,
+}
+
+impl<'a> EliminatorArguments<'a> {
+    pub(super) fn new(
+        positional: VecDeque<ApplicationValue<'a>>,
+        named: Vec<(Name, ApplicationValue<'a>)>,
+    ) -> Self {
+        Self { positional, named }
+    }
+
+    fn from_syntax(arguments: &'a [Syntax]) -> Self {
+        Self {
+            positional: arguments.iter().map(ApplicationValue::Syntax).collect(),
+            named: Vec::new(),
+        }
+    }
+
+    fn capture(self) -> CapturedArguments {
+        CapturedArguments {
+            positional: self
+                .positional
+                .into_iter()
+                .map(CapturedArgument::new)
+                .collect(),
+            named: self
+                .named
+                .into_iter()
+                .map(|(name, value)| (name, CapturedArgument::new(value)))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum CapturedArgument {
+    Syntax(Syntax),
+    Elaborated(Typed),
+}
+
+impl CapturedArgument {
+    fn new(argument: ApplicationValue<'_>) -> Self {
+        match argument {
+            ApplicationValue::Syntax(syntax) => Self::Syntax(syntax.clone()),
+            ApplicationValue::Elaborated(value) => Self::Elaborated(value),
+        }
+    }
+
+    fn borrowed(&self) -> ApplicationValue<'_> {
+        match self {
+            Self::Syntax(syntax) => ApplicationValue::Syntax(syntax),
+            Self::Elaborated(value) => ApplicationValue::Elaborated(value.clone()),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CapturedArguments {
+    positional: Vec<CapturedArgument>,
+    named: Vec<(Name, CapturedArgument)>,
+}
+
+impl CapturedArguments {
+    fn borrowed(&self) -> EliminatorArguments<'_> {
+        EliminatorArguments {
+            positional: self
+                .positional
+                .iter()
+                .map(CapturedArgument::borrowed)
+                .collect(),
+            named: self
+                .named
+                .iter()
+                .map(|(name, value)| (name.clone(), value.borrowed()))
+                .collect(),
+        }
+    }
+}
+
+enum NextArgument<'a> {
+    Supplied {
+        value: ApplicationValue<'a>,
+        named: bool,
+    },
+    Implicit,
+    Missing,
 }
 
 /// An eliminator application waiting for its expected type. `hole` stands for
@@ -52,7 +149,7 @@ pub(super) struct PostponedEliminator {
     hole: Expr,
     expected: Expr,
     function: Typed,
-    arguments: Vec<Syntax>,
+    arguments: CapturedArguments,
     info: ElimInfo,
     lctx: LocalContext,
     options: KVMap,
@@ -168,7 +265,7 @@ fn elim_info(type_: &Expr) -> Option<ElimInfo> {
         return None;
     };
     let idx = *idx as usize;
-    if args.is_empty() || idx >= depth {
+    if idx >= depth {
         return None;
     }
     let motive_pos = depth - 1 - idx;
@@ -232,6 +329,16 @@ impl Context {
         if explicit || application::has_named(arguments) {
             return Ok(None);
         }
+        let Some((declared, info)) = self.eliminator_head_info(function)? else {
+            return Ok(None);
+        };
+        self.eliminator_implicit_motive(declared, info, EliminatorArguments::from_syntax(arguments))
+    }
+
+    pub(super) fn eliminator_head_info(
+        &mut self,
+        function: &Typed,
+    ) -> Result<Option<(Expr, ElimInfo)>, NatDefinitionElabError> {
         let ExprNode::Const { name, .. } = function.value.node() else {
             return Ok(None);
         };
@@ -248,33 +355,74 @@ impl Context {
         let Some(info) = elim_info(&declared) else {
             return Ok(None);
         };
-        // A motive written positionally is supplied unless it is `_`.
-        let mut explicit_before = 0;
+        Ok(Some((declared, info)))
+    }
+
+    pub(super) fn eliminator_implicit_motive(
+        &mut self,
+        declared: Expr,
+        info: ElimInfo,
+        mut arguments: EliminatorArguments<'_>,
+    ) -> Result<Option<ElimInfo>, NatDefinitionElabError> {
         let mut binder = declared;
         for position in 0..=info.motive_pos {
             self.tick()?;
             let ExprNode::ForallE {
-                body, binder_info, ..
+                binder_name,
+                body,
+                binder_info,
+                ..
             } = binder.node()
             else {
                 return Ok(None);
             };
-            let explicit_binder = *binder_info == BinderInfo::Default;
+            let argument =
+                self.next_eliminator_argument(&mut arguments, binder_name, *binder_info)?;
             if position == info.motive_pos {
-                if explicit_binder
-                    && let Some(written) = arguments.get(explicit_before)
-                    && !is_hole_syntax(written)
+                // A named motive is supplied even when written `_`. A
+                // positional `_` leaves the motive for expected-type inference.
+                if let NextArgument::Supplied { value, named } = argument
+                    && (named
+                        || !matches!(value, ApplicationValue::Syntax(syntax)
+                            if is_hole_syntax(syntax)))
                 {
                     return Ok(None);
                 }
                 break;
             }
-            if explicit_binder {
-                explicit_before += 1;
-            }
             binder = body.clone();
         }
         Ok(Some(info))
+    }
+
+    /// `ElabElim.getNextArg?`: named arguments consume their first matching
+    /// binder; otherwise only an explicit binder consumes a positional value.
+    fn next_eliminator_argument<'a>(
+        &mut self,
+        arguments: &mut EliminatorArguments<'a>,
+        name: &Name,
+        style: BinderInfo,
+    ) -> Result<NextArgument<'a>, NatDefinitionElabError> {
+        for index in 0..arguments.named.len() {
+            self.tick()?;
+            if arguments.named[index].0 == *name {
+                return Ok(NextArgument::Supplied {
+                    value: arguments.named.remove(index).1,
+                    named: true,
+                });
+            }
+        }
+        Ok(if style == BinderInfo::Default {
+            match arguments.positional.pop_front() {
+                Some(value) => NextArgument::Supplied {
+                    value,
+                    named: false,
+                },
+                None => NextArgument::Missing,
+            }
+        } else {
+            NextArgument::Implicit
+        })
     }
 
     /// `elabAppArgs` for an eliminator: postpone while the expected type is
@@ -283,6 +431,21 @@ impl Context {
         &mut self,
         function: Typed,
         arguments: &[Syntax],
+        info: ElimInfo,
+        expected: Option<Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        self.eliminator_application_with_arguments(
+            function,
+            EliminatorArguments::from_syntax(arguments),
+            info,
+            expected,
+        )
+    }
+
+    pub(super) fn eliminator_application_with_arguments(
+        &mut self,
+        function: Typed,
+        arguments: EliminatorArguments<'_>,
         info: ElimInfo,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
@@ -309,7 +472,7 @@ impl Context {
                     hole: hole.clone(),
                     expected: expected.clone(),
                     function,
-                    arguments: arguments.to_vec(),
+                    arguments: arguments.capture(),
                     info,
                     lctx: self.txn.lctx.clone(),
                     options: self.txn.options.clone(),
@@ -347,7 +510,7 @@ impl Context {
                 let options = std::mem::replace(&mut self.txn.options, record.options);
                 let result = self.elaborate_eliminator(
                     record.function.clone(),
-                    &record.arguments,
+                    record.arguments.borrowed(),
                     &record.info,
                     expected,
                 );
@@ -373,13 +536,12 @@ impl Context {
     fn elaborate_eliminator(
         &mut self,
         function: Typed,
-        arguments: &[Syntax],
+        mut arguments: EliminatorArguments<'_>,
         info: &ElimInfo,
         expected: Expr,
     ) -> Result<Typed, NatDefinitionElabError> {
         let mut f = function.value;
         let mut f_type = self.instantiate(&function.type_)?;
-        let mut args: std::collections::VecDeque<&Syntax> = arguments.iter().collect();
         let mut motive = None;
         let mut postponed: Vec<(Expr, &Syntax, Expr)> = Vec::new();
         let mut index = 0usize;
@@ -389,6 +551,7 @@ impl Context {
                 f_type = self.whnf(&f_type)?;
             }
             let ExprNode::ForallE {
+                binder_name,
                 binder_type,
                 body,
                 binder_info,
@@ -397,52 +560,99 @@ impl Context {
             else {
                 break;
             };
-            let (binder_type, body, binder_info) =
-                (binder_type.clone(), body.clone(), *binder_info);
-            let explicit_binder = binder_info == BinderInfo::Default;
+            let (binder_name, binder_type, body, binder_info) = (
+                binder_name.clone(),
+                binder_type.clone(),
+                body.clone(),
+                *binder_info,
+            );
+            let next = self.next_eliminator_argument(&mut arguments, &binder_name, binder_info)?;
             let argument = if index == info.motive_pos {
-                // A positional motive is `_` (checked by `eliminator_info`).
-                if explicit_binder {
-                    args.pop_front();
-                }
-                let value = self.hole(binder_type)?;
+                // A supplied motive here is the positional syntax `_`.
+                // A missing explicit motive is implicit too (`h.rec` for False).
+                let value = match next {
+                    NextArgument::Supplied { value, .. } => {
+                        self.eliminator_argument(value, Some(binder_type))?.value
+                    }
+                    NextArgument::Implicit | NextArgument::Missing => {
+                        self.eliminator_implicit_argument(binder_type, binder_info)?
+                    }
+                };
                 motive = Some(value.clone());
                 value
-            } else if explicit_binder {
-                let Some(syntax) = args.pop_front() else {
-                    break;
-                };
-                if info.majors.contains(&index) {
-                    self.term(syntax, Some(binder_type))?.value
-                } else {
-                    // `postponeElabTerm`: elaborated once the motive is known.
-                    let hole = self.hole(binder_type.clone())?;
-                    postponed.push((hole.clone(), syntax, binder_type));
-                    hole
-                }
-            } else if binder_info == BinderInfo::InstImplicit {
-                self.instance_hole(binder_type)?
             } else {
-                self.hole(binder_type)?
+                match next {
+                    NextArgument::Supplied {
+                        value: ApplicationValue::Syntax(syntax),
+                        ..
+                    } if !info.majors.contains(&index) => {
+                        // Syntax minors wait for the motive. An expression
+                        // receiver is already elaborated and checked below.
+                        let hole = self.hole(binder_type.clone())?;
+                        postponed.push((hole.clone(), syntax, binder_type));
+                        hole
+                    }
+                    NextArgument::Supplied { value, .. } => {
+                        self.eliminator_argument(value, Some(binder_type))?.value
+                    }
+                    NextArgument::Implicit => {
+                        self.eliminator_implicit_argument(binder_type, binder_info)?
+                    }
+                    NextArgument::Missing => break,
+                }
             };
             f = Expr::app(f, argument.clone());
             f_type = self.substitute(&body, &argument)?;
             index += 1;
         }
+        if !arguments.named.is_empty() {
+            return Err(eliminator("unused named arguments"));
+        }
         let Some(motive) = motive else {
             return Err(eliminator("insufficient number of arguments"));
         };
         let saved = self.txn.lctx.clone();
-        let result = self.finalize_eliminator(f, f_type, args, motive, postponed, expected);
+        let result =
+            self.finalize_eliminator(f, f_type, arguments.positional, motive, postponed, expected);
         self.txn.lctx = saved;
         result
+    }
+
+    fn eliminator_implicit_argument(
+        &mut self,
+        type_: Expr,
+        style: BinderInfo,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        if style == BinderInfo::InstImplicit {
+            self.instance_hole(type_)
+        } else {
+            self.hole(type_)
+        }
+    }
+
+    fn eliminator_argument(
+        &mut self,
+        argument: ApplicationValue<'_>,
+        expected: Option<Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        match argument {
+            ApplicationValue::Syntax(syntax) => self.term(syntax, expected),
+            ApplicationValue::Elaborated(value) => match expected {
+                Some(expected) => {
+                    let value = self.finish_term(value, Some(&expected))?;
+                    self.constrain_type(&value.type_, &expected)?;
+                    Ok(value)
+                }
+                None => Ok(value),
+            },
+        }
     }
 
     fn finalize_eliminator(
         &mut self,
         mut f: Expr,
         mut f_type: Expr,
-        args: std::collections::VecDeque<&Syntax>,
+        args: VecDeque<ApplicationValue<'_>>,
         motive: Expr,
         postponed: Vec<(Expr, &Syntax, Expr)>,
         result_type: Expr,
@@ -496,8 +706,8 @@ impl Context {
         }
         // Over-application: `revertArgs` generalizes each extra argument.
         let mut extra = Vec::new();
-        for syntax in &args {
-            extra.push(self.term(syntax, None)?);
+        for argument in args {
+            extra.push(self.eliminator_argument(argument, None)?);
         }
         let mut generalized = expected.clone();
         for value in extra.iter().rev() {
@@ -533,8 +743,9 @@ impl Context {
             let name = self.fresh_name()?;
             motive_value = Expr::lam(name, discr_type, body, BinderInfo::Default);
         }
-        self.constrain(&motive, &motive_value)
-            .map_err(|_| eliminator("invalid motive"))?;
+        // Motive solving may stop for fuel, cancellation or an internal
+        // checker outcome; retain that typed result instead of rejecting it.
+        self.constrain(&motive, &motive_value)?;
         // The postponed arguments now see the motive.
         for (hole, syntax, binder_type) in postponed {
             let binder_type = self.instantiate(&binder_type)?;
@@ -796,6 +1007,30 @@ mod tests {
                 motive_pos: 0,
                 majors: vec![3]
             })
+        );
+    }
+
+    #[test]
+    fn a_constant_motive_supports_empty_elimination() {
+        // False.rec : (motive : Sort u) -> False -> motive. Its motive has
+        // arity zero, so expected-type inference abstracts no discriminants.
+        let type_ = Expr::forall_e(
+            n("motive"),
+            Expr::sort(Level::one()),
+            Expr::forall_e(
+                n("t"),
+                Expr::const_(n("False"), vec![]),
+                Expr::bvar(1).unwrap(),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        assert_eq!(
+            elim_info(&type_),
+            Some(ElimInfo {
+                motive_pos: 0,
+                majors: vec![],
+            }),
         );
     }
 }

@@ -1043,6 +1043,9 @@ impl Context {
         // expectation: it belongs only to the final field or method.
         let mut state =
             self.start_field_application(function, receiver, &base, &[], expected.cloned(), false)?;
+        if let Some(term) = self.named_eliminator_application(&state)? {
+            return Ok(term);
+        }
         while let Some(argument) = self.next_named_argument(&mut state)? {
             let application::ApplicationValue::Elaborated(value) = argument.value else {
                 return Err(failure(SourceInferenceError::Scope));
