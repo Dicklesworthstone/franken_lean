@@ -41,7 +41,7 @@
 | Provenance | Every declaration, instance selection, simp firing, and kernel verdict is a node in a typed causal graph: impact cones, semantic blame slices, semantic diff, `fln why-trusts`, and conflict-aware semantic merge that re-checks through the kernel. |
 | Evidence | Compatibility is never a percentage: per-surface evidence levels L0–L4, per-release levels R0–R5, a machine-checked claim matrix, and documentation CI that rejects wording stronger than the evidence permits. |
 | Safety | `forbid(unsafe_code)` everywhere except three named, ledgered boundary crates. The kernel crate contains zero project-authored unsafe. |
-| Dependencies | **Closed, governed universe.** `std` + the pinned nightly + the FrankenSuite (asupersync, frankensqlite, franken_networkx, frankensearch, frankentui, franken_markdown, fastmcp_rust, atp) and its reviewed transitive closure, pinned and allowlisted per package (admitted by operator decision, 2026-09-27; none is linked yet: `Cargo.lock` holds only the 33 workspace packages). No `fln-*` crate depends directly on serde, tokio, LLVM or gmp-sys; such a package appears only inside the suite's closure, with an allowlist row naming the reason (asupersync needs serde). |
+| Dependencies | **Closed, governed universe.** `std` + the pinned nightly + the FrankenSuite (asupersync, frankensqlite, franken_networkx, frankensearch, frankentui, franken_markdown, fastmcp_rust, atp) and its reviewed transitive closure, pinned and allowlisted per package. Today `fln-cli` links the locked asupersync runtime for Lake builds and LSP. No `fln-*` crate depends directly on serde, tokio, LLVM or gmp-sys. Suite dependencies such as serde enter through the reviewed allowlist. |
 
 ---
 
@@ -303,13 +303,21 @@ log verification remain open; see
 
 Because the release layout is elan-compatible, a project's `lean-toolchain` file can simply name a FrankenLean toolchain and everything downstream — `lake`, the editor extension, CI — just works.
 
-**2. From source** (requires only the pinned nightly, which `rust-toolchain.toml` auto-selects — no prior Lean anywhere):
+**2. From source.** On Linux, use Bash, Git, and Rust with rustup. Run the provisioning script from a fresh parent directory containing the FrankenLean checkout. It fetches the exact asupersync revision from `SUITE.lock` into the required sibling directory. If that directory already exists, the script requires a clean checkout at the locked revision and preserves its contents.
 
 ```bash
 git clone https://github.com/Dicklesworthstone/franken_lean
 cd franken_lean
-cargo build --release        # the whole toolchain, no stage0, no C compiler
+bash scripts/ci/checkout_asupersync.sh
+cargo build --release --locked -p fln-cli --bins
+printf '%s\n' 'prelude' 'theorem keep (P : Prop) (h : P) : P := h' |
+  target/release/lean --stdin
 ```
+
+`rust-toolchain.toml` selects the pinned Rust nightly. The build and this
+import-free theorem check need no Lean installation. Ordinary source files
+implicitly import `Init`; provide the pinned compiled library via `LEAN_PATH`
+or install it with elan when you want to check those files.
 
 **3. Embedded, as a Rust library:**
 
@@ -626,7 +634,7 @@ A few honest boundaries:
 
 **Why should I trust a brand-new kernel?** You shouldn't — you should check it, and FrankenLean is built to make that cheap. The kernel is ≤ 12 KLOC of forbid-unsafe Rust written against a rule-by-rule judgment specification anchored to Reference source lines; two in-house engines cross-check continuously; an independent checker with its own decoder joins every attested run; foreign checkers join via the export format; and every declaration can ship a certificate a simpler verifier replays. Two implementations agreeing is evidence; two *foreign* implementations agreeing is the strongest evidence this ecosystem can currently buy.
 
-**Does building or running it require Lean to be installed?** No. `cargo build` from a cold checkout produces the whole toolchain; there is no stage0 and no bootstrap. The pinned Reference exists only inside the conformance apparatus as the differential oracle, and a release-CI check proves shipped binaries contain no path by which it could be located, spawned, or linked. Today, short of that target: no release CI exists yet, and anything beyond a headerless or `prelude` file reads the pinned toolchain's compiled library. A file with imports, `fln check-olean` on the standard library, and `lake build` of a package that imports `Init` take its `.olean` files from `LEAN_PATH`, else from under `ELAN_HOME` or `~/.elan`. They are read as data and checked; no Reference code runs.
+**Does building or running it require Lean to be installed?** Building the binaries uses the pinned Rust toolchain and the locked asupersync checkout from the source instructions above. Checking ordinary source currently uses the pinned compiled library as data. An ordinary headerless file imports `Init`; `prelude` suppresses that implicit import. Source imports can resolve compiled artifacts through `LEAN_PATH`, then through the pinned toolchain under `ELAN_HOME` or `~/.elan`. `fln check-olean` independently checks the artifact paths you supply.
 
 **What happens when Lean releases a new version?** The epoch ratchet (§22.5): fetch and hash the release, regenerate every extracted census, machine-diff the surfaces, mine new behavior into fixtures, close or classify every divergence (unclassified blocks the claim), then move the pin. Epoch toolchains install side by side and are selected by `lean-toolchain` exactly as users expect. The Ledger's epoch bridges keep provably-unaffected cache entries alive across bumps, so the monthly migration stops meaning "rebuild the world."
 
