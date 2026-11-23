@@ -18,11 +18,12 @@ use std::collections::BTreeSet;
 
 pub use format::{
     ALIAS_EXTENSION, APP_UNEXPANDER_EXTENSION, AUX_RECURSOR_EXTENSION, BACKWARD_DEFEQ_EXTENSION,
-    CLASS_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION, DEPRECATED_EXTENSION, EXTERN_EXTENSION,
-    IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION, INSTANCE_EXTENSION, MATCH_PATTERN_EXTENSION,
-    NONCOMPUTABLE_EXTENSION, PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION,
-    PROTECTED_EXTENSION, REDUCIBILITY_EXTENSION, REDUCIBILITY_EXTRA_EXTENSION, SIMP_EXTENSION,
-    STRUCTURE_EXTENSION, SYMM_EXTENSION, UNBOX_EXTENSION,
+    CLASS_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION, DEPRECATED_EXTENSION,
+    ELAB_AS_ELIM_EXTENSION, EXTERN_EXTENSION, IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION,
+    INSTANCE_EXTENSION, MATCH_PATTERN_EXTENSION, NONCOMPUTABLE_EXTENSION,
+    PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION, PROTECTED_EXTENSION,
+    REDUCIBILITY_EXTENSION, REDUCIBILITY_EXTRA_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
+    SYMM_EXTENSION, UNBOX_EXTENSION,
 };
 mod deprecations;
 pub use deprecations::DeprecationEntry;
@@ -42,6 +43,15 @@ pub fn structure_extension_name() -> Name {
     let prefix = Name::from_components([format::STRUCTURE_PRIVATE_HEADER]).append_core(&module);
     Name::num(prefix, format::STRUCTURE_EXTENSION_PRIVATE_INDEX).append_core(
         &Name::from_components(format::STRUCTURE_EXTENSION_DECLARATION.split('.')),
+    )
+}
+
+/// Pin-extracted private sparse-cases tag identity, including its numeric component.
+pub fn sparse_cases_on_extension_name() -> Name {
+    let module = Name::from_components(format::SPARSE_CASES_ON_EXTENSION_MODULE.split('.'));
+    let prefix = Name::from_components([format::STRUCTURE_PRIVATE_HEADER]).append_core(&module);
+    Name::num(prefix, format::SPARSE_CASES_ON_EXTENSION_PRIVATE_INDEX).append_core(
+        &Name::from_components(format::SPARSE_CASES_ON_EXTENSION_DECLARATION.split('.')),
     )
 }
 
@@ -201,6 +211,10 @@ pub struct SourceExtensions {
     /// Generated auxiliary recursors (the pin's `auxRecExt`), recorded only by
     /// their owning module. A suffix alone never supplies this metadata.
     pub aux_recursors: Vec<Name>,
+    /// Expected-type elaboration tags, distinct from auxiliary-recursion classification.
+    pub elab_as_elim: Vec<Name>,
+    /// Constructor-specific and sparse cases-on helpers, using the pin's private tag identity.
+    pub sparse_cases_on: Vec<Name>,
     /// Noncomputable tags, interpreted only after checking their owning module.
     pub noncomputable: Vec<Name>,
     /// Nonrecursive inductive types carrying the pin's persistent `[unbox]` tag.
@@ -717,6 +731,8 @@ fn decode_batch(
         name(format::UNBOX_EXTENSION),
         name(format::MATCH_PATTERN_EXTENSION),
         name(format::SYMM_EXTENSION),
+        name(format::ELAB_AS_ELIM_EXTENSION),
+        sparse_cases_on_extension_name(),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -725,6 +741,8 @@ fn decode_batch(
     let mut out = SourceExtensions::default();
     let mut protected = BTreeSet::new();
     let mut aux_recursors = BTreeSet::new();
+    let mut elab_as_elim = BTreeSet::new();
+    let mut sparse_cases_on = BTreeSet::new();
     let mut noncomputable = BTreeSet::new();
     let mut unbox = BTreeSet::new();
     let mut match_patterns = BTreeSet::new();
@@ -894,7 +912,19 @@ fn decode_batch(
                     out.match_patterns.push(declaration);
                 }
                 25 => out.symms.push(reader.symm(&obj)?),
-                _ => unreachable!("twenty-six selected extension families"),
+                26 | 27 => {
+                    let declaration = reader.name(&obj)?;
+                    let (seen, names) = if kind == 26 {
+                        (&mut elab_as_elim, &mut out.elab_as_elim)
+                    } else {
+                        (&mut sparse_cases_on, &mut out.sparse_cases_on)
+                    };
+                    if declaration.is_anonymous() || !seen.insert(declaration.clone()) {
+                        return Err(shape("anonymous or repeated eliminator tag"));
+                    }
+                    names.push(declaration);
+                }
+                _ => unreachable!("twenty-eight selected extension families"),
             }
         }
     }

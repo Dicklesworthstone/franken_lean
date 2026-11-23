@@ -813,7 +813,7 @@ impl Engine {
         let result = self
             .admit_declarations(&[candidate], options, limits)
             .map_err(EngineExecutionError::from)?;
-        let result = self.finish_source_inductive_auxiliaries(result, options, limits)?;
+        let result = self.finish_source_inductive_auxiliaries(result, options, limits, scope)?;
         self.finish_source_data_attributes(result, members, options, scope)
     }
 
@@ -1344,7 +1344,8 @@ impl Engine {
             let result = self
                 .admit_declarations(&[candidate], options, limits)
                 .map_err(EngineExecutionError::from)?;
-            let result = self.finish_source_inductive_auxiliaries(result, options, limits)?;
+            let result =
+                self.finish_source_inductive_auxiliaries(result, options, limits, scope)?;
             let result = self.finish_source_data_attributes(
                 result,
                 std::slice::from_ref(syntax),
@@ -1462,7 +1463,7 @@ impl Engine {
         }
         // Complete the declaration stream before adding any record journals,
         // so adjacent council receipts retain their exact predecessor roots.
-        let result = self.finish_source_inductive_auxiliaries(result, options, limits)?;
+        let result = self.finish_source_inductive_auxiliaries(result, options, limits, scope)?;
         let result = match result {
             Outcome::Complete(mut batch) => {
                 // Projection hints and reducibility status are different facts.

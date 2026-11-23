@@ -690,6 +690,9 @@ impl Scopes {
             ScopeCommand::Symm(_) => {
                 return Err("symmetry attributes require a checked environment transition".into());
             }
+            ScopeCommand::ConstructorElims(_) => {
+                return Err("constructor eliminators require checked declaration admission".into());
+            }
             ScopeCommand::OpenScoped(_) => {
                 return Err("scoped opening requires an environment transition".into());
             }

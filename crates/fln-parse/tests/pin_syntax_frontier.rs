@@ -172,6 +172,7 @@ fn scope_name(command: &ScopeCommand) -> &'static str {
         ScopeCommand::In { .. } => "in",
         ScopeCommand::Simp(_)
         | ScopeCommand::Symm(_)
+        | ScopeCommand::ConstructorElims(_)
         | ScopeCommand::Instance(_)
         | ScopeCommand::Reducibility(_)
         | ScopeCommand::Executable(_) => "attribute",

@@ -713,6 +713,17 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain an admitted module's distinct expected-type or sparse-cases tags.
+    /// Ownership is checked by the importer before native header validation.
+    pub fn register_eliminator_tags(
+        mut self,
+        kind: crate::eliminator_tags::TagKind,
+        names: &[Name],
+    ) -> Result<Self, crate::eliminator_tags::EliminatorTagError> {
+        self.env = crate::eliminator_tags::register_module(&self.env, kind, names)?;
+        Ok(self)
+    }
+
     /// Retain the owning module's checked nonrecursive inductive `[unbox]` tag.
     pub fn register_unbox(mut self, declaration: &Name) -> Result<Self, crate::unbox::UnboxError> {
         self.env = crate::unbox::register(&self.env, declaration)?;

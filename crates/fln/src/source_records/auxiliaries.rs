@@ -16,6 +16,9 @@ struct AuxiliaryMetadata {
     reducible: Vec<Name>,
     tagged: Vec<Name>,
     protected: Vec<Name>,
+    constructor_eliminators: Vec<Name>,
+    macro_inline: Vec<Name>,
+    deprecated: Vec<fln_elab::deprecations::Deprecation>,
 }
 
 #[derive(Default)]
@@ -157,6 +160,7 @@ impl Engine {
         result: Outcome<DeclarationBatchAdmission>,
         options: &KVMap,
         limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         let mut batch = match result {
             Outcome::Complete(batch) => batch,
@@ -274,6 +278,7 @@ impl Engine {
             &mut metadata,
             options,
             limits,
+            scope,
         )? {
             Outcome::Complete(batch) => batch,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -293,6 +298,20 @@ impl Engine {
         // declaration has passed both checking seats, preserving an unbroken
         // chain of kernel declaration transitions (`pair[0].result == pair[1].base`)
         // before `sizeOf` elaboration runs.
+        Self::finish_auxiliary_metadata(&mut batch, &metadata)?;
+        batch = match self.finish_source_inductive_size_of(batch, options, limits)? {
+            Outcome::Complete(batch) => batch,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        batch.result_logical_root = batch.engine.logical_root(options);
+        Ok(Outcome::Complete(batch))
+    }
+
+    fn finish_auxiliary_metadata(
+        batch: &mut DeclarationBatchAdmission,
+        metadata: &AuxiliaryMetadata,
+    ) -> Result<(), EngineExecutionError> {
         for name in &metadata.reducible {
             batch.engine.environment = fln_elab::reducibility::register(
                 batch.engine.environment(),
@@ -319,13 +338,41 @@ impl Engine {
             )
             .map_err(|error| frontend(SourceInferenceError::ProtectedJournal(error)))?;
         }
-        batch = match self.finish_source_inductive_size_of(batch, options, limits)? {
-            Outcome::Complete(batch) => batch,
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-        };
-        batch.result_logical_root = batch.engine.logical_root(options);
-        Ok(Outcome::Complete(batch))
+        if !metadata.constructor_eliminators.is_empty() {
+            batch.engine.environment = fln_elab::eliminator_tags::register_generated(
+                batch.engine.environment(),
+                &metadata.constructor_eliminators,
+            )
+            .map_err(|error| {
+                frontend(match error {
+                    fln_elab::eliminator_tags::EliminatorTagError::Limit => {
+                        SourceInferenceError::ResourceLimit
+                    }
+                    error => SourceInferenceError::EliminatorTags(error),
+                })
+            })?;
+        }
+        for name in &metadata.macro_inline {
+            batch.engine.environment =
+                fln_elab::macro_inline::register(batch.engine.environment(), name).map_err(
+                    |error| {
+                        frontend(match error {
+                            fln_elab::macro_inline::MacroInlineError::Limit => {
+                                SourceInferenceError::ResourceLimit
+                            }
+                            error => SourceInferenceError::MacroInlineJournal(error),
+                        })
+                    },
+                )?;
+        }
+        if !metadata.deprecated.is_empty() {
+            batch.engine.environment = fln_elab::deprecations::register_module(
+                batch.engine.environment(),
+                &metadata.deprecated,
+            )
+            .map_err(|error| frontend(SourceInferenceError::DeprecationJournal(error)))?;
+        }
+        Ok(())
     }
 
     fn admit_auxiliary_declarations(
@@ -356,6 +403,13 @@ impl Engine {
         metadata.reducible.extend(candidates.metadata.reducible);
         metadata.tagged.extend(candidates.metadata.tagged);
         metadata.protected.extend(candidates.metadata.protected);
+        metadata
+            .constructor_eliminators
+            .extend(candidates.metadata.constructor_eliminators);
+        metadata
+            .macro_inline
+            .extend(candidates.metadata.macro_inline);
+        metadata.deprecated.extend(candidates.metadata.deprecated);
         Ok(Outcome::Complete(()))
     }
 
@@ -365,20 +419,12 @@ impl Engine {
     /// `Lean/Meta/Constructions/CtorIdx.lean`, and `CtorElim.lean`.
     fn finish_source_inductive_ctor_auxiliaries(
         &self,
-        mut batch: DeclarationBatchAdmission,
+        batch: DeclarationBatchAdmission,
         metadata: &mut AuxiliaryMetadata,
         options: &KVMap,
         limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
-        if !options.get_bool(&Name::from_components(["genCtorIdx"]), true)
-            || !batch
-                .engine
-                .environment()
-                .contains(&Name::from_components(["Nat"]))
-        {
-            return Ok(Outcome::Complete(batch));
-        }
-        let budget = fln_elab::records::RecordBudget::default();
         let inductives: Vec<InductiveVal> = batch
             .admissions
             .iter()
@@ -388,20 +434,123 @@ impl Engine {
             })
             .flatten()
             .collect();
+        self.finish_constructor_auxiliaries(
+            batch,
+            metadata,
+            &inductives,
+            options,
+            limits,
+            scope,
+            false,
+        )
+    }
+
+    /// `gen_constructor_elims` may target a checked imported family. Candidate
+    /// construction has no admission authority and never fabricates a new
+    /// inductive receipt for the existing target.
+    pub(crate) fn generate_source_constructor_elims(
+        &self,
+        target: &Name,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let Some(ConstantInfo::Induct(inductive)) = self.environment().find(target) else {
+            return Err(EngineExecutionError::Frontend(
+                DefinitionFrontendError::Elaborate(
+                    fln_elab::NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "an admitted inductive target for gen_constructor_elims",
+                    },
+                ),
+            ));
+        };
+        let root = self.logical_root(options);
+        let mut metadata = AuxiliaryMetadata::default();
+        let mut batch = match self.finish_constructor_auxiliaries(
+            DeclarationBatchAdmission {
+                engine: self.clone(),
+                base_logical_root: root,
+                result_logical_root: root,
+                admissions: Vec::new(),
+                local_instance: None,
+                local_symm: Vec::new(),
+            },
+            &mut metadata,
+            std::slice::from_ref(inductive),
+            options,
+            limits,
+            scope,
+            true,
+        )? {
+            Outcome::Complete(batch) => batch,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        Self::finish_auxiliary_metadata(&mut batch, &metadata)?;
+        batch.result_logical_root = batch.engine.logical_root(options);
+        Ok(Outcome::Complete(batch))
+    }
+
+    /// The pin calls mkCtorIdx and then mkCtorElim independently. In particular,
+    /// a pre-existing ctorIdx never suppresses generation of missing eliminators.
+    /// Automatic bootstrap generation may precede support constants; an explicit
+    /// eligible request reports that capability boundary instead of dropping it.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_constructor_auxiliaries(
+        &self,
+        mut batch: DeclarationBatchAdmission,
+        metadata: &mut AuxiliaryMetadata,
+        inductives: &[InductiveVal],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+        explicit_request: bool,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let option = Name::from_components(["genCtorIdx"]);
+        let gen_ctor_idx = scope
+            .options
+            .get_bool(&option, options.get_bool(&option, true));
+        let budget = fln_elab::records::RecordBudget::default();
         let mut idx_candidates = Candidates::default();
         let mut elim_targets = Vec::new();
-        for inductive in &inductives {
+        for inductive in inductives {
+            if is_prop_former(inductive, budget.max_nodes)
+                .map_err(|error| frontend(SourceInferenceError::Auxiliary(error)))?
+            {
+                continue;
+            }
             let ctor_idx_name = Name::str(inductive.base.name.clone(), "ctorIdx");
-            // `CtorIdx.lean:47`: `if (← hasConst declName) then return`
-            if batch.engine.environment().contains(&ctor_idx_name) {
+            let has_index = batch.engine.environment().contains(&ctor_idx_name);
+            let generate_index = gen_ctor_idx && !has_index;
+            if !generate_index && (!has_index || inductive.ctors.len() <= 1) {
+                continue;
+            }
+            if !batch
+                .engine
+                .environment()
+                .contains(&Name::from_components(["Nat"]))
+            {
+                if explicit_request {
+                    return Err(EngineExecutionError::NotImplemented {
+                        feature: "constructor auxiliaries require admitted Nat support",
+                    });
+                }
                 continue;
             }
             let cases_on_name = Name::str(inductive.base.name.clone(), "casesOn");
             let Some(ConstantInfo::Defn(cases_on)) =
                 batch.engine.environment().find(&cases_on_name)
             else {
+                if explicit_request {
+                    return Err(EngineExecutionError::NotImplemented {
+                        feature: "constructor auxiliaries require an exposed checked casesOn",
+                    });
+                }
                 continue;
             };
+            if cases_on.base.level_params.len() <= inductive.base.level_params.len() {
+                continue;
+            }
             let mut ctors = Vec::with_capacity(inductive.ctors.len());
             for ctor_name in &inductive.ctors {
                 let Some(ConstantInfo::Ctor(ctor)) = batch.engine.environment().find(ctor_name)
@@ -412,28 +561,54 @@ impl Engine {
                 };
                 ctors.push(ctor.clone());
             }
-            let generated = ctor_idx_declarations(inductive, &ctors, cases_on, budget, |n| {
-                batch
-                    .engine
-                    .environment()
-                    .find(n)
-                    .map(CtorIdxConstMeta::from_constant)
-            })
-            .map_err(|error| frontend(SourceInferenceError::Auxiliary(error)))?;
-            let Some(cands) = generated else {
-                continue;
-            };
-            // `CtorIdx.lean:81-97`: `ctorIdx` uses `Regular(h+1)` hints and is
-            // protected, not `@[reducible]` and not an auxiliary recursor.
-            idx_candidates.push(cands.ctor_idx, false, false, true);
-            if let Some(to_ctor_idx) = cands.to_ctor_idx
-                && !batch.engine.environment().contains(&to_ctor_idx.base.name)
-            {
-                // `CtorIdx.lean:100-115`: `toCtorIdx` is protected and `@[reducible]`.
-                idx_candidates.push(to_ctor_idx, true, false, true);
+            if generate_index {
+                let generated = ctor_idx_declarations(inductive, &ctors, cases_on, budget, |n| {
+                    batch
+                        .engine
+                        .environment()
+                        .find(n)
+                        .map(CtorIdxConstMeta::from_constant)
+                })
+                .map_err(|error| frontend(SourceInferenceError::Auxiliary(error)))?;
+                let Some(cands) = generated else {
+                    continue;
+                };
+                // `ctorIdx` has regular hints and is protected. Only its
+                // single-constructor form receives macro_inline.
+                if inductive.ctors.len() == 1 {
+                    idx_candidates
+                        .metadata
+                        .macro_inline
+                        .push(cands.ctor_idx.base.name.clone());
+                }
+                idx_candidates.push(cands.ctor_idx, false, false, true);
+                if let Some(to_ctor_idx) = cands.to_ctor_idx {
+                    // The legacy enum alias is protected, reducible and
+                    // deprecated in favor of ctorIdx (CtorIdx.lean:100-117).
+                    idx_candidates
+                        .metadata
+                        .deprecated
+                        .push(fln_elab::deprecations::Deprecation {
+                            declaration: to_ctor_idx.base.name.clone(),
+                            new_name: Some(ctor_idx_name),
+                            text: None,
+                            since: Some("2025-08-25".into()),
+                        });
+                    idx_candidates.push(to_ctor_idx, true, false, true);
+                }
             }
             if inductive.ctors.len() > 1 {
-                elim_targets.push((inductive.clone(), ctors));
+                let recursor_name = Name::str(inductive.base.name.clone(), "rec");
+                let Some(ConstantInfo::Rec(recursor)) =
+                    batch.engine.environment().find(&recursor_name)
+                else {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "an admitted inductive has no checked recursor",
+                    });
+                };
+                if recursor.base.level_params.len() > inductive.base.level_params.len() {
+                    elim_targets.push((inductive.clone(), ctors));
+                }
             }
         }
         match self.admit_auxiliary_declarations(
@@ -447,7 +622,15 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         }
-        if elim_targets.is_empty() || !has_ctor_elim_deps(batch.engine.environment()) {
+        if elim_targets.is_empty() {
+            return Ok(Outcome::Complete(batch));
+        }
+        if !has_ctor_elim_deps(batch.engine.environment()) {
+            if explicit_request {
+                return Err(EngineExecutionError::NotImplemented {
+                    feature: "constructor eliminators require checked Nat, Eq, cond and PULift support",
+                });
+            }
             return Ok(Outcome::Complete(batch));
         }
         let mut elim_candidates = Candidates::default();
@@ -471,6 +654,10 @@ impl Engine {
             elim_candidates.push(cands.ctor_elim_type, true, false, true);
             elim_candidates.push(cands.ctor_elim, true, true, true);
             for ctor_elim in cands.constructor_elims {
+                elim_candidates
+                    .metadata
+                    .constructor_eliminators
+                    .push(ctor_elim.base.name.clone());
                 elim_candidates.push(ctor_elim, true, true, true);
             }
         }

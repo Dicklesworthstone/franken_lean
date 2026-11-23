@@ -1109,3 +1109,117 @@ fn symmetry_decode_preserves_repeats_and_refuses_forged_scope_or_payload_shapes(
     assert!(decoder.decode(&valid).unwrap_err().is_resource());
     assert!(decoder.decode(&[]).unwrap_err().is_resource());
 }
+
+#[test]
+fn actual_prelude_constructor_eliminator_tags_roundtrip_independently() {
+    use fln_olean::source_extensions::{ELAB_AS_ELIM_EXTENSION, sparse_cases_on_extension_name};
+    use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
+    use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget};
+    let decoded = read(blocks()).unwrap();
+    assert!(!decoded.uninterpreted.contains(&n(ELAB_AS_ELIM_EXTENSION)));
+    assert!(
+        !decoded
+            .uninterpreted
+            .contains(&sparse_cases_on_extension_name())
+    );
+    for declaration in [
+        "Bool.false.elim",
+        "Bool.true.elim",
+        "Nat.zero.elim",
+        "Nat.succ.elim",
+    ] {
+        assert!(
+            decoded.elab_as_elim.contains(&n(declaration)),
+            "{declaration}"
+        );
+        assert!(
+            decoded.sparse_cases_on.contains(&n(declaration)),
+            "{declaration}"
+        );
+    }
+    for declaration in ["Bool.ctorElim", "Nat.rec", "Eq.symm"] {
+        assert!(
+            !decoded.elab_as_elim.contains(&n(declaration)),
+            "{declaration}"
+        );
+        assert!(
+            !decoded.sparse_cases_on.contains(&n(declaration)),
+            "{declaration}"
+        );
+    }
+    for names in [&decoded.elab_as_elim, &decoded.sparse_cases_on] {
+        assert!(names.windows(2).all(|pair| pair[0].quick_lt(&pair[1])));
+    }
+    let mut elab = decoded.elab_as_elim.clone();
+    elab.reverse();
+    let mut sparse = decoded.sparse_cases_on.clone();
+    sparse.reverse();
+    for version in fln_olean::format::OLEAN_ACCEPTED_VERSIONS {
+        let encoded = encode_module_with_source_metadata(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[],
+                extra_const_names: &[],
+            },
+            &SourceMetadata {
+                elab_as_elim: elab.clone(),
+                sparse_cases_on: sparse.clone(),
+                ..SourceMetadata::default()
+            },
+            OleanWriteHeader {
+                version: *version,
+                flags: 1,
+                lean_version: fln_olean::format::PIN_TAG.strip_prefix('v').unwrap(),
+                githash: fln_olean::format::PIN_COMMIT,
+                base_addr: 2 * fln_olean::format::REGION_ALIGN as u64,
+            },
+            WriteBudget::default(),
+        )
+        .unwrap();
+        let blocks = OleanView::parse(&encoded.bytes)
+            .unwrap()
+            .extension_payloads(WalkBudget::default(), 4 << 20)
+            .unwrap();
+        let actual = read(&blocks).unwrap();
+        assert_eq!(actual.elab_as_elim, decoded.elab_as_elim);
+        assert_eq!(actual.sparse_cases_on, decoded.sparse_cases_on);
+        assert!(actual.aux_recursors.is_empty());
+    }
+}
+
+#[test]
+fn eliminator_tags_refuse_bad_names_duplicates_and_private_identity_lookalikes() {
+    use fln_olean::source_extensions::{ELAB_AS_ELIM_EXTENSION, sparse_cases_on_extension_name};
+    for extension in [n(ELAB_AS_ELIM_EXTENSION), sparse_cases_on_extension_name()] {
+        let one = |object: &Obj| {
+            vec![OpaqueExtensionBlock {
+                name: extension.clone(),
+                entries: vec![compact(object, 0).unwrap()],
+            }]
+        };
+        let valid = one(&inject_name(&n("Payload.left.elim")));
+        assert!(read(&valid).is_ok());
+        for malformed in [
+            inject_name(&Name::anonymous()),
+            Obj::mk_nat(7),
+            Obj::mk_string("Payload.left.elim"),
+        ] {
+            assert!(!read(&one(&malformed)).unwrap_err().is_resource());
+        }
+        let mut repeated = valid;
+        let duplicate = repeated[0].entries[0].clone();
+        repeated[0].entries.push(duplicate);
+        assert!(!read(&repeated).unwrap_err().is_resource());
+    }
+    let numeric = sparse_cases_on_extension_name();
+    let string_zero = n(&numeric.to_display_string());
+    assert_ne!(numeric, string_zero);
+    let lookalike = [OpaqueExtensionBlock {
+        name: string_zero.clone(),
+        entries: vec![compact(&inject_name(&n("Payload.left.elim")), 0).unwrap()],
+    }];
+    let decoded = read(&lookalike).unwrap();
+    assert!(decoded.sparse_cases_on.is_empty());
+    assert_eq!(decoded.uninterpreted, [string_zero]);
+}

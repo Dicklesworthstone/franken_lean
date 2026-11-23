@@ -22,8 +22,10 @@
 //!   explicitly tagged by the pin's auxiliary-recursion journal. Native
 //!   `casesOn`/`recOn` generation installs those tags only after admission;
 //!   imported tags follow the same checked ownership path. User-defined names
-//!   receive no eliminator semantics from their suffix. User `@[elab_as_elim]`
-//!   attributes and the pin's legacy untagged Eq helpers remain separate.
+//!   receive no eliminator semantics from their suffix. Checked imported
+//!   `elab_as_elim` tags additionally select ordinary declarations without
+//!   granting auxiliary-recursor reduction or compiler behavior. Source attribute
+//!   syntax and the pin's legacy untagged Eq helpers remain separate.
 //! - `elabAsElim?`: not under `@` or ellipsis, and not when the motive is
 //!   supplied. Named arguments and typed field receivers use the same path;
 //!   only a named motive, rather than any named argument, disables it.
@@ -350,7 +352,21 @@ impl Context {
             ConstantInfo::Defn(definition) if self.is_auxiliary_recursor(name)? => {
                 definition.base.type_
             }
-            _ => return Ok(None),
+            _ => {
+                let Some(declared) = self
+                    .eliminator_tag_cache
+                    .declared_type(&self.txn.env, name)
+                    .map_err(|error| match error {
+                        crate::eliminator_tags::EliminatorTagError::Limit => {
+                            failure(SourceInferenceError::ResourceLimit)
+                        }
+                        error => failure(SourceInferenceError::EliminatorTags(error)),
+                    })?
+                else {
+                    return Ok(None);
+                };
+                declared
+            }
         };
         let Some(info) = elim_info(&declared) else {
             return Ok(None);

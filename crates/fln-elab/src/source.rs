@@ -248,6 +248,7 @@ pub enum SourceInferenceError {
     /// The deprecation journal refused an entry.
     DeprecationJournal(crate::deprecations::DeprecationError),
     AuxiliaryJournal(crate::aux_recursors::AuxRecursorError),
+    EliminatorTags(crate::eliminator_tags::EliminatorTagError),
     ResourceLimit,
     /// Private inspection stopped at a source boundary; never an admitted declaration.
     ObservationComplete,
@@ -571,6 +572,7 @@ impl std::fmt::Display for SourceInferenceError {
             Self::ProtectedJournal(error) => write!(f, "{error}"),
             Self::DeprecationJournal(error) => write!(f, "{error}"),
             Self::AuxiliaryJournal(error) => write!(f, "{error}"),
+            Self::EliminatorTags(error) => write!(f, "{error}"),
             Self::ObservationComplete => {
                 write!(f, "source observation completed without admission")
             }
@@ -827,6 +829,8 @@ struct Context {
     // Only explicitly generated/imported auxiliary declarations receive the
     // pin's eliminator elaboration; a declaration's suffix is insufficient.
     auxiliary_cache: crate::aux_recursors::AuxRecursorCache,
+    // Explicit elab_as_elim tags do not grant auxiliary reduction or codegen behavior.
+    eliminator_tag_cache: crate::eliminator_tags::ElabAsElimCache,
     // `@[deprecated]` declarations, re-read on the same terms as the protected set.
     deprecation_cache: crate::deprecations::DeprecationCache,
     // Each resolution of a deprecated constant, in elaboration order (`deprecated.rs`). Rollback
@@ -1035,6 +1039,7 @@ impl Context {
             alias_cache: crate::aliases::AliasCache::default(),
             protected_cache: crate::protected_names::ProtectedCache::default(),
             auxiliary_cache: crate::aux_recursors::AuxRecursorCache::default(),
+            eliminator_tag_cache: crate::eliminator_tags::ElabAsElimCache::default(),
             deprecation_cache: crate::deprecations::DeprecationCache::default(),
             deprecated_uses: Vec::new(),
             check_deprecated: true,
@@ -6582,6 +6587,7 @@ impl Context {
         self.alias_cache = crate::aliases::AliasCache::default();
         self.protected_cache = crate::protected_names::ProtectedCache::default();
         self.auxiliary_cache = crate::aux_recursors::AuxRecursorCache::default();
+        self.eliminator_tag_cache = crate::eliminator_tags::ElabAsElimCache::default();
         Ok(())
     }
 }

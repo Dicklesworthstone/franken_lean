@@ -1,5 +1,6 @@
 //! Admission-only source batches. No compiler, VM, or artifact publication.
 use super::*;
+mod constructor_elims;
 pub(crate) mod grammar;
 pub mod inspect;
 pub(crate) mod instance_attributes;
@@ -227,6 +228,9 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
             | SourceInferenceError::EquationTheorem(_)
             | SourceInferenceError::UnsupportedFinLiteralPattern(_)
             | SourceInferenceError::UnsupportedRecordConstructor(_)
+            | SourceInferenceError::EliminatorTags(
+                fln_elab::eliminator_tags::EliminatorTagError::UnsupportedEliminator(_),
+            )
             | SourceInferenceError::PreresolvedReference { .. } => ("capability", false, 5),
             SourceInferenceError::SimpSet(
                 fln_elab::source::scope::simp::SimpSetError::Malformed,
@@ -239,6 +243,9 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
             )
             | SourceInferenceError::AuxiliaryJournal(
                 fln_elab::aux_recursors::AuxRecursorError::Malformed,
+            )
+            | SourceInferenceError::EliminatorTags(
+                fln_elab::eliminator_tags::EliminatorTagError::Malformed,
             ) => ("internal-fault", false, 4),
             SourceInferenceError::ResourceLimit
             | SourceInferenceError::SimpSet(fln_elab::source::scope::simp::SimpSetError::Limit)
@@ -255,6 +262,9 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
             )
             | SourceInferenceError::AuxiliaryJournal(
                 fln_elab::aux_recursors::AuxRecursorError::Limit,
+            )
+            | SourceInferenceError::EliminatorTags(
+                fln_elab::eliminator_tags::EliminatorTagError::Limit,
             )
             | SourceInferenceError::InstanceRegistry(
                 fln_elab::instances::InstanceRegistryError::Limit,
@@ -376,6 +386,11 @@ pub(crate) fn apply_control_command(
         }
         ScopeCommand::Symm(syntax) => {
             return symm::apply_private(engine, scope, &syntax, limits, position);
+        }
+        ScopeCommand::ConstructorElims(syntax) => {
+            return constructor_elims::apply_private(
+                engine, scope, &syntax, limits, position, options,
+            );
         }
         ScopeCommand::Reducibility(attribute) => {
             engine.environment =
@@ -560,6 +575,17 @@ pub(crate) fn apply_module_control_command(
             syntax,
             limits,
             position,
+            public.as_deref_mut(),
+        );
+    }
+    if let ScopeCommand::ConstructorElims(syntax) = &control {
+        return constructor_elims::apply_module(
+            engine,
+            scopes,
+            syntax,
+            limits,
+            position,
+            options,
             public.as_deref_mut(),
         );
     }
@@ -749,6 +775,7 @@ pub(crate) fn apply_module_control_command(
             | ScopeCommand::Reducibility(_)
             | ScopeCommand::Executable(_)
             | ScopeCommand::Symm(_)
+            | ScopeCommand::ConstructorElims(_)
             | ScopeCommand::Simp(_)
     ) {
         scopes

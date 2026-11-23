@@ -33,6 +33,8 @@
 //! src/Lean/Compiler/IR/UnboxResult.lean: sha256 980931c69e6cb07aead773b5c5143960ad6cff6cc4765c050e12062954e01a0a
 //! src/Lean/Meta/Match/MatchPatternAttr.lean: sha256 e61d13eabbcd6140abe257478f872b92e5032b53688fa7ec981d5ed276d560e2
 //! src/Lean/Meta/Tactic/Symm.lean: sha256 30128dc01015c517702073afcc6fa10054120e2f15b8e3acf10aaeb2e89eb244
+//! src/Lean/Elab/App.lean: sha256 3010f5f1fdb8b95701b7e201ff6af7184f9b2e762aeef1ab2261eac11a478569
+//! stage0/stdlib/Lean/AuxRecursor.c: sha256 9323e0f5dc1e4ee134c383c3970ae90f39a1a8701eabc7436e7fbb01f4386ff7
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -128,6 +130,7 @@ pub const BACKWARD_DEFEQ_EXTENSION: &str = "Lean.backwardDefeqAttr";
 pub const UNBOX_EXTENSION: &str = "Lean.IR.UnboxResult.unboxAttr";
 pub const MATCH_PATTERN_EXTENSION: &str = "Lean.matchPatternAttr";
 pub const SYMM_EXTENSION: &str = "Lean.Meta.Symm.symmExt";
+pub const ELAB_AS_ELIM_EXTENSION: &str = "Lean.Elab.Term.elabAsElim";
 pub const PP_ANONYMOUS_CONSTRUCTOR_EXTENSION: &str = "Lean.ppUsingAnonymousConstructorAttr";
 pub const PP_NODOT_EXTENSION: &str = "Lean.ppNoDotAttr";
 pub const APP_UNEXPANDER_EXTENSION: &str = "Lean.PrettyPrinter.Delaborator.appUnexpanderAttribute";
@@ -146,6 +149,9 @@ pub const STRUCTURE_PRIVATE_HEADER: &str = "_private";
 pub const NAMESPACE_EXTENSION_MODULE: &str = "Lean.Namespace";
 pub const NAMESPACE_EXTENSION_DECLARATION: &str = "Lean.namespacesExt";
 pub const NAMESPACE_EXTENSION_PRIVATE_INDEX: u64 = 0;
+pub const SPARSE_CASES_ON_EXTENSION_MODULE: &str = "Lean.AuxRecursor";
+pub const SPARSE_CASES_ON_EXTENSION_DECLARATION: &str = "Lean.sparseCasesOnExt";
+pub const SPARSE_CASES_ON_EXTENSION_PRIVATE_INDEX: u64 = 0;
 pub const KEY_STAR: u8 = 0;
 pub const KEY_OTHER: u8 = 1;
 pub const KEY_LIT: u8 = 2;

@@ -39,6 +39,9 @@ pub enum ScopeCommand {
     /// Preserve the attribute kinds and source order for checked symmetry
     /// registration, including lexical `local` and namespace `scoped` entries.
     Symm(Syntax),
+    /// Late constructor auxiliaries requested for an admitted inductive. The
+    /// driver retains the canonical tree and checks every generated definition.
+    ConstructorElims(Syntax),
     Instance(instances::InstanceAttribute),
     Reducibility(reducibility::ReducibilityAttribute),
     /// Executable metadata is checked against admitted declarations by the
@@ -892,6 +895,9 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         return variables::parse(&view, &tokens).map(|syntax| Some(ScopeCommand::Variable(syntax)));
     }
     if keyword == "attribute" {
+        if let Some(attribute) = attributes::parse_constructor_elims(&view, &tokens)? {
+            return Ok(Some(ScopeCommand::ConstructorElims(attribute)));
+        }
         if let Some(attribute) = attributes::parse_symm(&view, &tokens)? {
             return Ok(Some(ScopeCommand::Symm(attribute)));
         }

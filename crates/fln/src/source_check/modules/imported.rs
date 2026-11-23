@@ -148,6 +148,10 @@ pub struct SourceMetadataReport {
     /// Internal auxiliary-recursion tags (the pin's `auxRecExt`), activated
     /// only for this module's own admitted definitions.
     pub aux_recursors: usize,
+    /// Expected-type elimination tags, separate from auxiliary recursion.
+    pub elab_as_elim: usize,
+    /// Constructor-specific and sparse cases-on helpers under the pin's private tag.
+    pub sparse_cases_on: usize,
     /// Compilation restrictions owned by this module, including partial companions.
     pub noncomputable: usize,
     /// Persistent `[unbox]` tags on this module's nonrecursive inductive types.
@@ -507,6 +511,11 @@ pub enum SourceOleanImportError {
         module: Name,
         error: fln_elab::symm::SymmRegistryError,
     },
+    /// Preserve unsupported eliminator header normalization as native coverage.
+    EliminatorTags {
+        module: Name,
+        error: fln_elab::eliminator_tags::EliminatorTagError,
+    },
     Internal(&'static str),
 }
 impl std::fmt::Display for SourceOleanImportError {
@@ -554,6 +563,11 @@ impl std::fmt::Display for SourceOleanImportError {
                 "module {} symmetry metadata: {error}",
                 module.to_display_string(),
             ),
+            Self::EliminatorTags { module, error } => write!(
+                f,
+                "module {} eliminator metadata: {error}",
+                module.to_display_string(),
+            ),
             Self::Internal(reason) => write!(f, "source import invariant: {reason}"),
         }
     }
@@ -565,6 +579,10 @@ impl SourceOleanImportError {
     pub fn metadata_resource_exhausted(&self) -> bool {
         match self {
             Self::Limit(_)
+            | Self::EliminatorTags {
+                error: fln_elab::eliminator_tags::EliminatorTagError::Limit,
+                ..
+            }
             | Self::Symm {
                 error: fln_elab::symm::SymmRegistryError::Limit,
                 ..
@@ -1078,6 +1096,8 @@ fn prepare_source_metadata_view(
             Name::from_components(metadata::UNBOX_EXTENSION.split('.')),
             Name::from_components(metadata::MATCH_PATTERN_EXTENSION.split('.')),
             Name::from_components(metadata::SYMM_EXTENSION.split('.')),
+            Name::from_components(metadata::ELAB_AS_ELIM_EXTENSION.split('.')),
+            metadata::sparse_cases_on_extension_name(),
         ])
         .collect();
     let mut blocks: Vec<_> = selected
@@ -1144,6 +1164,8 @@ fn prepare_source_metadata_view(
             namespaces: 0,
             protected: 0,
             aux_recursors: 0,
+            elab_as_elim: 0,
+            sparse_cases_on: 0,
             noncomputable: 0,
             unbox: 0,
             match_patterns: 0,
@@ -1247,6 +1269,8 @@ fn prepare_source_metadata_view(
                     23 => report.unbox = entries.len(),
                     24 => report.match_patterns = entries.len(),
                     25 => report.symms = entries.len(),
+                    26 => report.elab_as_elim = entries.len(),
+                    27 => report.sparse_cases_on = entries.len(),
                     _ => {
                         return Err(SourceOleanImportError::Internal(
                             "unknown selected metadata kind",
@@ -1415,6 +1439,8 @@ impl Engine {
         let mut namespaces = decoded.namespaces.into_iter();
         let mut protected = decoded.protected.into_iter();
         let mut aux_recursors = decoded.aux_recursors.into_iter();
+        let mut elab_as_elim = decoded.elab_as_elim.into_iter();
+        let mut sparse_cases_on = decoded.sparse_cases_on.into_iter();
         let mut noncomputable = decoded.noncomputable.into_iter();
         let mut unbox = decoded.unbox.into_iter();
         let mut match_patterns = decoded.match_patterns.into_iter();
@@ -1949,6 +1975,48 @@ impl Engine {
                     })
                     .map_err(|error| symm::error(&report.module, error))?;
             }
+            // Like symmetry headers, eliminator headers observe this module's
+            // reducibility policies. The two tag identities stay independent.
+            for (kind, count) in [
+                (
+                    fln_elab::eliminator_tags::TagKind::ElabAsElim,
+                    report.elab_as_elim,
+                ),
+                (
+                    fln_elab::eliminator_tags::TagKind::SparseCasesOn,
+                    report.sparse_cases_on,
+                ),
+            ] {
+                if count == 0 {
+                    continue;
+                }
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    count,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                let rows = match kind {
+                    fln_elab::eliminator_tags::TagKind::ElabAsElim => &mut elab_as_elim,
+                    fln_elab::eliminator_tags::TagKind::SparseCasesOn => &mut sparse_cases_on,
+                };
+                let mut names = Vec::with_capacity(count);
+                for _ in 0..count {
+                    cancelled!("source-olean/eliminator-tags");
+                    let declaration = rows.next().ok_or(SourceOleanImportError::Internal(
+                        "eliminator tag count changed during decode",
+                    ))?;
+                    owners.validate(activation.environment(), &report.module, &declaration)?;
+                    names.push(declaration);
+                }
+                activation =
+                    activation
+                        .register_eliminator_tags(kind, &names)
+                        .map_err(|error| SourceOleanImportError::EliminatorTags {
+                            module: report.module.clone(),
+                            error,
+                        })?;
+            }
             if report.externs != 0 {
                 cancelled!("source-olean/extern-owner-index");
                 let mut owners = AttributeOwners::new(
@@ -2109,6 +2177,17 @@ impl Engine {
         })?;
         fln_elab::symm::read(&engine.environment)
             .map_err(|error| symm::error(&roots.first().cloned().unwrap_or_default(), error))?;
+        for kind in [
+            fln_elab::eliminator_tags::TagKind::ElabAsElim,
+            fln_elab::eliminator_tags::TagKind::SparseCasesOn,
+        ] {
+            fln_elab::eliminator_tags::read(&engine.environment, kind).map_err(|error| {
+                SourceOleanImportError::EliminatorTags {
+                    module: roots.first().cloned().unwrap_or_default(),
+                    error,
+                }
+            })?;
+        }
         fln_elab::macro_inline::read(&engine.environment).map_err(|_| {
             SourceOleanImportError::Metadata {
                 module: roots.first().cloned().unwrap_or_default(),
@@ -2147,6 +2226,8 @@ impl Engine {
             || namespaces.next().is_some()
             || protected.next().is_some()
             || aux_recursors.next().is_some()
+            || elab_as_elim.next().is_some()
+            || sparse_cases_on.next().is_some()
             || noncomputable.next().is_some()
             || unbox.next().is_some()
             || match_patterns.next().is_some()
@@ -2445,6 +2526,11 @@ trait Registrar: Sized {
         self,
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError>;
+    fn register_eliminator_tags(
+        self,
+        kind: fln_elab::eliminator_tags::TagKind,
+        names: &[Name],
+    ) -> std::result::Result<Self, fln_elab::eliminator_tags::EliminatorTagError>;
     fn register_unbox(
         self,
         declaration: &Name,
@@ -2561,6 +2647,13 @@ impl Registrar for instances::imported::ImportActivation {
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError> {
         self.register_noncomputable(declaration)
+    }
+    fn register_eliminator_tags(
+        self,
+        kind: fln_elab::eliminator_tags::TagKind,
+        names: &[Name],
+    ) -> std::result::Result<Self, fln_elab::eliminator_tags::EliminatorTagError> {
+        self.register_eliminator_tags(kind, names)
     }
     fn register_unbox(
         self,
@@ -4419,6 +4512,13 @@ pub(super) mod tests {
             declaration: &Name,
         ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError> {
             fln_elab::noncomputable::register(&self.0, declaration).map(Sequential)
+        }
+        fn register_eliminator_tags(
+            self,
+            kind: fln_elab::eliminator_tags::TagKind,
+            names: &[Name],
+        ) -> std::result::Result<Self, fln_elab::eliminator_tags::EliminatorTagError> {
+            fln_elab::eliminator_tags::register_module(&self.0, kind, names).map(Sequential)
         }
         fn register_unbox(
             self,

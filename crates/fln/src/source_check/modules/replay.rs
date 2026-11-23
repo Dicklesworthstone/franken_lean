@@ -37,12 +37,21 @@ pub(super) fn supports_artifact_extension(descriptor: &ExtensionDescriptor) -> b
         || fln_elab::unbox::supports(descriptor)
         || fln_elab::match_pattern::supports(descriptor)
         || fln_elab::symm::supports(descriptor)
+        || fln_elab::eliminator_tags::supports(
+            fln_elab::eliminator_tags::TagKind::ElabAsElim,
+            descriptor,
+        )
+        || fln_elab::eliminator_tags::supports(
+            fln_elab::eliminator_tags::TagKind::SparseCasesOn,
+            descriptor,
+        )
         || fln_elab::delaborator_tags::supports_source(descriptor)
         || fln_elab::source::scope::simp::export::supports(descriptor)
         || fln_elab::source::scope::simp::defeq::supports(descriptor)
         || fln_elab::source::scope::simp::equations::supports(descriptor)
         || fln_elab::reducibility::export::supports(descriptor)
         || fln_elab::macro_inline::supports(descriptor)
+        || fln_elab::deprecations::supports(descriptor)
         || fln_elab::implemented_by::supports(descriptor)
         || fln_elab::externs::supports(descriptor)
         || fln_elab::records::imported::export::supports(descriptor)

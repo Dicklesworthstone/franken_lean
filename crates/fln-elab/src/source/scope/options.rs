@@ -129,6 +129,13 @@ use Policy::*;
 /// The table, in one place. `maxRecDepth`'s default is `defaultMaxRecDepth`, 512
 /// (`Init/Prelude.lean`).
 pub const ROWS: &[Row] = &[
+    // Read by automatic and explicitly requested constructor auxiliaries.
+    row(
+        "genCtorIdx",
+        Bool(true),
+        "Lean/Meta/Constructions/CtorIdx.lean:17",
+        Honored,
+    ),
     // Read by source inductive headers. This disables only the elaborator's
     // Sort-polymorphism heuristic; constructor and recursor admission still
     // run through both checkers, and structures keep their stricter rule.

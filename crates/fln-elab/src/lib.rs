@@ -30,6 +30,7 @@ pub mod decision;
 pub mod delaborator_tags;
 pub mod deprecations;
 pub mod effects;
+pub mod eliminator_tags;
 pub mod externs;
 pub mod implemented_by;
 pub mod inductive;

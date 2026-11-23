@@ -6,15 +6,17 @@
 use super::*;
 use crate::source_extension_format as layout;
 use crate::source_extensions::{
-    AliasEntry, ClassEntry, DefaultEntry, DiscrTreeKey, ExternAttribute, ExternEntry,
-    ImplementedByEntry, InlineEntry, InstanceEntry, ReducibilityEntry, ReducibilityExtraEntry,
-    SimpEntry, SimpKind, SimpTheorem, StructureEntry, StructureField, StructureParent, SymmEntry,
+    AliasEntry, ClassEntry, DefaultEntry, DeprecationEntry, DiscrTreeKey, ExternAttribute,
+    ExternEntry, ImplementedByEntry, InlineEntry, InstanceEntry, ReducibilityEntry,
+    ReducibilityExtraEntry, SimpEntry, SimpKind, SimpTheorem, StructureEntry, StructureField,
+    StructureParent, SymmEntry,
 };
 use std::collections::HashSet;
 
 mod aliases;
 mod compiler;
 mod defaults;
+mod deprecations;
 mod executable;
 mod inlining;
 mod instances;
@@ -49,6 +51,10 @@ pub struct SourceMetadata {
     /// This module's own internally generated auxiliary recursors, written as
     /// the pin's `auxRecExt` tag array in `Name.quickLt` order.
     pub aux_recursors: Vec<Name>,
+    /// Owned expected-type elaboration tags, written in the pin's Name.quickLt order.
+    pub elab_as_elim: Vec<Name>,
+    /// Owned constructor-specific/sparse cases-on tags, kept separate from aux_recursors.
+    pub sparse_cases_on: Vec<Name>,
     /// Module-owned `Lean.noncomputableExt` tags, sorted by `Name.quickLt`.
     pub noncomputable: Vec<Name>,
     /// Owned nonrecursive inductive `[unbox]` tags in the pin's `Name.quickLt` order.
@@ -84,6 +90,8 @@ pub struct SourceMetadata {
     /// Final extern attribute per owned declaration. Preserve backend order,
     /// entry kinds and an explicitly empty list; these convey no ABI authority.
     pub externs: Vec<ExternAttribute>,
+    /// Module-owned deprecation parameters, sorted by the pin's Name.quickLt.
+    pub deprecations: Vec<DeprecationEntry>,
     /// Module-owned structure interfaces, including physical parent subobjects.
     /// The writer preserves field/parent order and sorts only the pin's indexes.
     pub structures: Vec<StructureEntry>,
@@ -172,6 +180,9 @@ impl Encoder {
         if !metadata.aliases.is_empty() {
             blocks.push(self.alias_block(&metadata.aliases)?);
         }
+        if !metadata.deprecations.is_empty() {
+            blocks.push(self.deprecation_block(&metadata.deprecations)?);
+        }
         if !metadata.structures.is_empty() {
             blocks.push(self.structure_block(&metadata.structures)?);
         }
@@ -193,6 +204,20 @@ impl Encoder {
                 layout::AUX_RECURSOR_EXTENSION,
                 &metadata.aux_recursors,
                 "anonymous or duplicate auxiliary recursor",
+            )?);
+        }
+        if !metadata.elab_as_elim.is_empty() {
+            blocks.push(self.tagged_names_block(
+                layout::ELAB_AS_ELIM_EXTENSION,
+                &metadata.elab_as_elim,
+                "anonymous or duplicate elab_as_elim declaration",
+            )?);
+        }
+        if !metadata.sparse_cases_on.is_empty() {
+            blocks.push(self.tagged_names_block_named(
+                &crate::source_extensions::sparse_cases_on_extension_name(),
+                &metadata.sparse_cases_on,
+                "anonymous or duplicate sparse cases-on declaration",
             )?);
         }
         if !metadata.reducibility.is_empty() {
@@ -310,6 +335,19 @@ impl Encoder {
         tagged: &[Name],
         invalid: &'static str,
     ) -> WResult<Obj> {
+        self.tagged_names_block_named(
+            &Name::from_components(extension.split('.')),
+            tagged,
+            invalid,
+        )
+    }
+
+    fn tagged_names_block_named(
+        &mut self,
+        extension: &Name,
+        tagged: &[Name],
+        invalid: &'static str,
+    ) -> WResult<Obj> {
         self.source_array_bound(tagged.len())?;
         let mut sorted: Vec<&Name> = tagged.iter().collect();
         sorted.sort_by(|left, right| left.quick_cmp(right));
@@ -325,13 +363,15 @@ impl Encoder {
             entries.push(self.name(name)?);
         }
         let entries = self.array(entries)?;
-        let name = self.name(&Name::from_components(extension.split('.')))?;
+        let name = self.name(extension)?;
         self.ctor(0, vec![name, entries], &[])
     }
 }
 
 #[cfg(test)]
 mod defeq_tests;
+#[cfg(test)]
+mod eliminator_tags;
 
 #[cfg(test)]
 mod tests {

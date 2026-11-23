@@ -589,6 +589,56 @@ impl ArtifactData {
                 metadata.protected.push(tagged.clone());
             }
         }
+        // Deprecation parameters belong to the declaration's defining module.
+        // Generated enum aliases use the same native journal as source attributes.
+        let deprecations = |env: &Environment, meter: &mut Meter| {
+            if let Some(journal) = env.extension(&fln_elab::deprecations::journal_name()) {
+                for entry in journal.entries() {
+                    meter.work(1)?;
+                    meter.bytes(entry.payload.len())?;
+                }
+            }
+            fln_elab::deprecations::Deprecations::read(env).map_err(|error| match error {
+                fln_elab::deprecations::DeprecationError::Limit => SourceModuleCheckError::Limit {
+                    resource: "module work",
+                    limit: meter.limits.max_work,
+                },
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::deprecations::journal_name(),
+                    reason: "invalid deprecation journal",
+                },
+            })
+        };
+        let inherited = deprecations(base, meter)?;
+        for row in deprecations(checked, meter)?.iter() {
+            meter.work(1)?;
+            if let Some(previous) = inherited.get(&row.declaration) {
+                if previous != row {
+                    return Err(SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::deprecations::journal_name(),
+                        reason: "a module cannot change an imported deprecation parameter",
+                    });
+                }
+                continue;
+            }
+            if base.contains(&row.declaration) {
+                return Err(SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::deprecations::journal_name(),
+                    reason: "a module cannot deprecate an imported declaration",
+                });
+            }
+            metadata
+                .deprecations
+                .push(fln_olean::source_extensions::DeprecationEntry {
+                    declaration: row.declaration.clone(),
+                    new_name: row.new_name.clone(),
+                    text: row.text.clone(),
+                    since: row.since.clone(),
+                });
+        }
         // Auxiliary tags belong to the module that generated the definition;
         // dependencies' tags stay in their own artifacts, including diamonds.
         let auxiliaries = |env: &Environment| {
@@ -769,6 +819,53 @@ impl ArtifactData {
                         .collect(),
                     scope: entry.namespace,
                 });
+        }
+        let eliminator_tags = |env: &Environment, kind, meter: &mut Meter| {
+            let extension = fln_elab::eliminator_tags::journal_name(kind);
+            if let Some(journal) = env.extension(&extension) {
+                for entry in journal.entries() {
+                    meter.work(1)?;
+                    meter.bytes(entry.payload.len())?;
+                }
+            }
+            fln_elab::eliminator_tags::read(env, kind).map_err(|error| match error {
+                fln_elab::eliminator_tags::EliminatorTagError::Limit => {
+                    SourceModuleCheckError::Limit {
+                        resource: "native eliminator tag journal",
+                        limit: fln_elab::eliminator_tags::MAX_ROWS,
+                    }
+                }
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension,
+                    reason: "invalid or unsupported eliminator tag journal",
+                },
+            })
+        };
+        for (kind, tags) in [
+            (
+                fln_elab::eliminator_tags::TagKind::ElabAsElim,
+                &mut metadata.elab_as_elim,
+            ),
+            (
+                fln_elab::eliminator_tags::TagKind::SparseCasesOn,
+                &mut metadata.sparse_cases_on,
+            ),
+        ] {
+            let inherited = eliminator_tags(base, kind, meter)?;
+            for tagged in eliminator_tags(checked, kind, meter)? {
+                meter.work(1)?;
+                if !inherited.contains(&tagged) {
+                    if base.contains(&tagged) {
+                        return Err(SourceModuleCheckError::Extension {
+                            module: name.clone(),
+                            extension: fln_elab::eliminator_tags::journal_name(kind),
+                            reason: "a module cannot tag an imported eliminator declaration",
+                        });
+                    }
+                    tags.push(tagged);
+                }
+            }
         }
         let anonymous_constructors = |env: &Environment, meter: &mut Meter| {
             use fln_elab::delaborator_tags;
