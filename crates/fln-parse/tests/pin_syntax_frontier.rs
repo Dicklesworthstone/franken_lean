@@ -176,6 +176,7 @@ fn scope_name(command: &ScopeCommand) -> &'static str {
         | ScopeCommand::Reducibility(_)
         | ScopeCommand::Executable(_) => "attribute",
         ScopeCommand::Trivia => "trivia",
+        ScopeCommand::InitQuot => "init_quot",
         ScopeCommand::Exit => "exit",
     }
 }

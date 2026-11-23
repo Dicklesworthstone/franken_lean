@@ -14,6 +14,9 @@ pub mod variables;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeCommand {
+    /// The kernel quotient initialization command. It declares one checked
+    /// primitive quartet, with root names independent of the lexical scope.
+    InitQuot,
     Namespace(Name),
     Section(Option<Name>),
     /// The pin's `sectionHeader` public and exposure defaults. These are lexical
@@ -863,6 +866,19 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     };
     if keyword == "#exit" && tokens.len() == 1 {
         return Ok(Some(ScopeCommand::Exit));
+    }
+    if keyword == "init_quot" {
+        // Consult the generated command parser even for this one-token form:
+        // trailing input and an entered grammar's different production must
+        // never acquire the builtin command's declaration authority.
+        let parsed = crate::parse_source_command(source)?;
+        if crate::extensions::is_active_command_macro(parsed.syntax()) {
+            return Ok(None);
+        }
+        return Ok(matches!(parsed.syntax(), Syntax::Node { kind, args, .. }
+            if *kind == parser_kind(&["Command", "init_quot"])
+                && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "init_quot"))
+        .then_some(ScopeCommand::InitQuot));
     }
     if matches!(keyword.as_str(), "public" | "noncomputable" | "@[")
         && let Some(section) = trees::modified_section(&view, &tokens)

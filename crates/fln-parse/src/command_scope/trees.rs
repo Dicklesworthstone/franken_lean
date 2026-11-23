@@ -12,6 +12,7 @@ fn is_scope_command_kind(kind: Option<&Name>) -> bool {
         return false;
     };
     *kind == parser_kind(&["Command", "moduleDoc"])
+        || *kind == parser_kind(&["Command", "init_quot"])
         || *kind == parser_kind(&["Command", "exit"])
         || *kind == parser_kind(&["Command", "namespace"])
         || *kind == parser_kind(&["Command", "section"])

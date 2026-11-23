@@ -327,6 +327,28 @@ pub(crate) fn apply_control_command(
     use fln_parse::command_scope::ScopeCommand;
 
     match control {
+        ScopeCommand::InitQuot => {
+            // BuiltinCommand.elabInitQuot submits Declaration.quotDecl. Reuse
+            // the canonical candidate builder, then require both admission
+            // seats before publishing any of its four constants. Quot.sound
+            // is a separate source axiom and is deliberately absent here.
+            let batch = engine
+                .admit_declarations(
+                    &[fln_elab::seed::quotient_seed_declaration()],
+                    options,
+                    limits,
+                )
+                .map_err(EngineExecutionError::from)
+                .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?;
+            return Ok(match batch {
+                Outcome::Complete(batch) => {
+                    *engine = batch.engine;
+                    Outcome::Complete(batch.admissions)
+                }
+                Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+            });
+        }
         ScopeCommand::Variable(syntax) => {
             let variables =
                 source_records::elaboration_outcome(fln_elab::source::scope::variables::declare(
@@ -722,6 +744,7 @@ pub(crate) fn apply_module_control_command(
     if !matches!(
         control,
         ScopeCommand::Variable(_)
+            | ScopeCommand::InitQuot
             | ScopeCommand::Instance(_)
             | ScopeCommand::Reducibility(_)
             | ScopeCommand::Executable(_)
@@ -865,7 +888,11 @@ pub(crate) fn apply_module_control_command(
             Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
         };
     }
-    let Some(public) = public.filter(|_| scopes.current.exports_declaration()) else {
+    // Quotient primitives enter both worlds even in a module's default-private
+    // section. Their canonical root names are never namespace-prefixed or
+    // abstracted over section variables (Environment.addDeclCore at the pin).
+    let init_quot = matches!(control, ScopeCommand::InitQuot);
+    let Some(public) = public.filter(|_| init_quot || scopes.current.exports_declaration()) else {
         return apply_control_command(
             engine,
             &mut scopes.current,
@@ -877,6 +904,10 @@ pub(crate) fn apply_module_control_command(
         );
     };
     let mut scope = scopes.public_scope();
+    if init_quot {
+        scope.public_declarations = true;
+        scope.expose_definitions = true;
+    }
     let mut next = public.engine().clone();
     let admissions = match apply_control_command(
         &mut next,
@@ -904,7 +935,9 @@ pub(crate) fn apply_module_control_command(
             *engine = next;
             // Variable declarations are the only material control with a
             // lexical effect. Preserve the private journal's activation anchor.
-            scopes.current.variables = scope.variables;
+            if !init_quot {
+                scopes.current.variables = scope.variables;
+            }
         }
         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),

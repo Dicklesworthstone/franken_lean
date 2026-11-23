@@ -274,6 +274,27 @@ impl Engine {
         scope: &fln_elab::source::scope::SourceScope,
         source_base: Option<&Environment>,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        // `init_quot` is a checked primitive block, not a named definition with
+        // modifiers. The file drivers use the identical control-command path.
+        // This byte search is only a prefilter; canonical parsing decides.
+        if source
+            .windows(b"init_quot".len())
+            .any(|part| part == b"init_quot")
+            && matches!(
+                fln_parse::command_scope::parse(source)
+                    .map_err(DefinitionFrontendError::Parse)
+                    .map_err(EngineExecutionError::Frontend)?,
+                Some(fln_parse::command_scope::ScopeCommand::InitQuot)
+            )
+        {
+            return self
+                .admit_declarations(
+                    &[fln_elab::seed::quotient_seed_declaration()],
+                    options,
+                    limits,
+                )
+                .map_err(EngineExecutionError::from);
+        }
         let mut scope = scope.clone();
         if scope.source_site.is_none() {
             scope.source_site = Some(source_check::source_site(source)?);
