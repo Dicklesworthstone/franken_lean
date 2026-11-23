@@ -317,10 +317,73 @@ impl BuildCommand {
     }
 }
 
+/// The pin's `resolveTargetBaseSpec` tries an existing source file before
+/// interpreting an unprefixed target as a package/name selector
+/// (`Lake/CLI/Build.lean`). The path is relative to the invocation directory,
+/// even when `--dir` selects a different workspace. Reuse the same configured
+/// source-to-module mapping as `lake lean`, retaining the selected package's
+/// configuration and output directory throughout the build.
+fn source_file_target<'a>(
+    sources: &'a local_dependencies::Sources,
+    target: &str,
+) -> Result<Option<(Name, &'a local_dependencies::Package)>, Failure> {
+    if target.starts_with(['+', '@']) {
+        return Ok(None);
+    }
+    let path =
+        std::path::absolute(target).map_err(|error| Failure::io(Path::new(target), error))?;
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Failure::io(&path, error)),
+    };
+    if metadata.is_dir() {
+        return Ok(None);
+    }
+    // Check every component before canonicalizing: resolving a symlink first
+    // would erase the existing source-containment guard's refusal evidence.
+    let filesystem_root = path
+        .ancestors()
+        .last()
+        .ok_or_else(|| Failure::input("source target has no filesystem root"))?;
+    check_path(filesystem_root, &path, false)?;
+    if !metadata.is_file() {
+        return Err(Failure::input(format!(
+            "source target is not a regular file: {}",
+            path.display(),
+        )));
+    }
+    let path = path
+        .canonicalize()
+        .map_err(|error| Failure::io(&path, error))?;
+    let Some((module, location)) = sources.source_file(&path)? else {
+        // An unrelated existing file must not hide a declared target with
+        // the same spelling. The pin resumes ordinary target-name lookup.
+        return Ok(None);
+    };
+    for package in &sources.packages {
+        if package.root == location.package && package.target_path(&module)?.as_ref() == Some(&path)
+        {
+            return Ok(Some((module, package)));
+        }
+    }
+    // A library and executable may share a module name but select different
+    // files. The name-keyed compilation graph cannot silently substitute the
+    // executable's source for the library file the user actually selected.
+    Err(Failure::unsupported(format!(
+        "source file `{}` conflicts with another target owning module `{}`",
+        path.display(),
+        module.to_display_string(),
+    )))
+}
+
 fn module_target<'a>(
     sources: &'a local_dependencies::Sources,
     target: &str,
 ) -> Result<(Name, &'a local_dependencies::Package), Failure> {
+    if let Some(selected) = source_file_target(sources, target)? {
+        return Ok(selected);
+    }
     let (package, module) = if !target.starts_with('+')
         && let Some((package, module)) = target.split_once('/')
     {

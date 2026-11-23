@@ -42,9 +42,11 @@ jobs:
     env:
       CARGO_TERM_COLOR: never
       CARGO_INCREMENTAL: '0'
-      CARGO_BUILD_JOBS: '2'
+      CARGO_BUILD_JOBS: '1'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_CODEGEN_UNITS: '256'
+      CARGO_PROFILE_TEST_CODEGEN_UNITS: '256'
       FLN_REQUIRE_REFERENCE: '1'
       FLN_REFERENCE_PARTITION: ${{ github.workspace }}/contracts/builtin_partition.tsv
       FLN_IR_REFERENCE_ARTIFACTS: ${{ github.workspace }}/target/imported-ir-reference/live
@@ -52,6 +54,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Provision the locked Asupersync dependency
+        run: bash scripts/ci/checkout_asupersync.sh
       - name: Record source and install the pinned Rust compiler
         shell: bash
         run: |
@@ -61,20 +65,6 @@ jobs:
           git rev-parse 'HEAD^{tree}' > target/imported-ir-reference/tree.txt
           rustup show active-toolchain
           rustc -Vv > target/imported-ir-reference/rustc.txt
-      - name: Check cancellable import reconstruction
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked -p fln-admission --lib reuse -- --nocapture \
-            2>&1 | tee target/imported-ir-reference/import-cancellation.log
-      - name: Check native metaprogram primitives and conversion
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked -p fln-vm --lib _native --no-fail-fast -- --nocapture \
-            2>&1 | tee target/imported-ir-reference/macro-vm.log
-          cargo test --locked -p fln-vm --test name_native --test level_native --no-fail-fast
-          cargo test --locked -p fln-rt --test native_convert --no-fail-fast
       - name: Install the SUITE.lock Reference for test-only code generation
         shell: bash
         run: |
@@ -103,6 +93,30 @@ jobs:
           test "$("$toolchain_root/bin/lean" --githash)" = "$pin_commit"
           printf 'FLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\n' \
             "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
+      - name: Check native Thunk linkage against real pinned IR
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --lib thunk_ -- --nocapture --test-threads=1 \
+            2>&1 | tee target/imported-ir-reference/thunks.log
+          grep -Fq 'test imported_ir::native_signature::tests::live_pinned_thunk_ir_preserves_native_prototypes_laziness_and_boxed_calls' \
+            target/imported-ir-reference/thunks.log
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' \
+            target/imported-ir-reference/thunks.log
+      - name: Check cancellable import reconstruction
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-admission --lib reuse -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/import-cancellation.log
+      - name: Check native metaprogram primitives and conversion
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-vm --lib _native --no-fail-fast -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/macro-vm.log
+          cargo test --locked -p fln-vm --test name_native --test level_native --no-fail-fast
+          cargo test --locked -p fln-rt --test native_convert --no-fail-fast
       - name: Materialize and verify the pinned execution partition
         shell: bash
         run: scripts/extract/census_materialize.sh

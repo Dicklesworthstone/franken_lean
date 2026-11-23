@@ -864,6 +864,334 @@ fn module_library() -> Package {
     package
 }
 
+fn file_target_command(package: &Package, cwd: &Path, command: &str, targets: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lake"))
+        .current_dir(cwd)
+        .arg("--dir")
+        .arg(&package.0)
+        .args(["--json", command])
+        .args(targets)
+        .env("LEAN_PATH", package.0.join("no-imports"))
+        .env("FLN_IMPORT_REUSE_DIR", package.0.join(".records"))
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn source_file_facets_use_configured_directories_and_publish_importable_products() {
+    let package = Package::new(concat!(
+        "name = \"path-build\"\nsrcDir = \"source\"\nbuildDir = \"out\"\n",
+        "[[lean_lib]]\nname = \"Library\"\nroots = [\"Lib\"]\nsrcDir = \"logical\"\n",
+    ));
+    package.write(
+        "source/logical/Lib/Base.lean",
+        "prelude\ntheorem Lib.identity (P : Prop) (h : P) : P := h\n",
+    );
+    package.write(
+        "source/logical/Lib/Top.lean",
+        "prelude\nimport Lib.Base\ntheorem Lib.again (P : Prop) (h : P) : P := Lib.identity P h\n",
+    );
+    let target = "./source/logical/Lib/Top.lean:ilean";
+    let report = success(&file_target_command(
+        &package,
+        &package.0,
+        "build",
+        &[target],
+    ));
+    assert!(report.contains("\"modules_built\":2"), "{report}");
+    assert!(report.contains("\"metadata_modules\":2"), "{report}");
+    let directory = package.0.join("out/lib/lean");
+    let artifact = directory.join("Lib/Top.olean");
+    let metadata_path = artifact.with_extension("ilean");
+    let original = std::fs::read(&artifact).unwrap();
+    let metadata = std::fs::read(&metadata_path).unwrap();
+    assert!(inspect(&artifact).contains("Lib.again"));
+    assert!(directory.join("Lib/Base.olean").is_file());
+    assert_eq!(
+        fln::decode_ilean(&metadata, fln::IleanBudget::default())
+            .unwrap()
+            .module,
+        "Lib.Top",
+    );
+    let absolute = format!(
+        "{}:ilean",
+        package.0.join("source/logical/Lib/Top.lean").display()
+    );
+    let warm = success(&package.build(&[&absolute]));
+    assert!(warm.contains("\"modules_cached\":2"), "{warm}");
+    assert_eq!(std::fs::read(&artifact).unwrap(), original);
+    assert_eq!(std::fs::read(&metadata_path).unwrap(), metadata);
+    // All three selectors name one checked module, not three separately
+    // reconstructed source worlds. Query order and duplicates are retained.
+    let query = success(&file_target_command(
+        &package,
+        &package.0,
+        "query",
+        &[target, "/+Lib.Top:ilean", "@/+Lib.Top:ilean"],
+    ));
+    let lines: Vec<_> = query.lines().collect();
+    assert_eq!(lines.len(), 3, "{query}");
+    assert!(lines.iter().all(|line| *line == lines[0]), "{query}");
+    assert!(
+        query.contains(&metadata_path.display().to_string()),
+        "{query}"
+    );
+
+    package.write(
+        "Consumer.lean",
+        "prelude\nimport Lib.Top\ntheorem downstream (P : Prop) (h : P) : P := Lib.again P h\n",
+    );
+    let mut consumers = vec![PathBuf::from(env!("CARGO_BIN_EXE_lean"))];
+    if let Some(reference) = pinned_family_reference() {
+        consumers.push(reference);
+    }
+    for binary in consumers {
+        let output = Command::new(&binary)
+            .current_dir(&package.0)
+            .arg("Consumer.lean")
+            .env("LEAN_PATH", &directory)
+            .env("FLN_IMPORT_REUSE_DIR", package.0.join(".consumer-records"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}: {output:?}", binary.display());
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+}
+
+#[test]
+fn source_file_ir_facets_use_the_same_tripartite_checked_artifact_pipeline() {
+    let package = module_library();
+    let targets = ["Lib/Top.lean:ir", "Lib/Top.lean:ilean"];
+    let report = success(&file_target_command(
+        &package, &package.0, "build", &targets,
+    ));
+    assert!(report.contains("\"executable_modules\":2"), "{report}");
+    let mut originals = Vec::new();
+    for module in ["Lib.Base", "Lib.Top"] {
+        let artifact = package.artifact(module);
+        originals.push(family_bytes(&package, module));
+        let ir = std::fs::read(artifact.with_extension("ir")).unwrap();
+        let view = fln_olean::region::OleanView::parse(&ir).unwrap();
+        let blocks = view
+            .extension_payloads(fln_olean::region::WalkBudget::default(), 16 << 20)
+            .unwrap();
+        let decoded =
+            fln_olean::ir::decode_ir(&blocks, fln_olean::ir::IrDecodeLimits::default()).unwrap();
+        if module == "Lib.Base" {
+            assert!(
+                !decoded.decls.is_empty(),
+                "the data/identity module must emit code"
+            );
+        }
+        assert!(artifact.with_extension("ilean").is_file());
+    }
+    let warm = success(&package.build(&["+Lib.Top:ir", "+Lib.Top:ilean"]));
+    assert!(warm.contains("\"modules_cached\":2"), "{warm}");
+    for (module, original) in ["Lib.Base", "Lib.Top"].into_iter().zip(originals) {
+        assert_eq!(family_bytes(&package, module), original);
+    }
+}
+
+#[test]
+fn source_file_targets_keep_dependency_package_output_ownership() {
+    let package = Package::new(concat!(
+        "name = \"root\"\nsrcDir = \"src\"\nbuildDir = \"root-out\"\n",
+        "[[require]]\nname = \"dependency\"\npath = \"dependency\"\n",
+        "[[lean_lib]]\nname = \"Application\"\nroots = [\"App\"]\n",
+    ));
+    package.write(
+        "dependency/lakefile.toml",
+        concat!(
+            "name = \"provider\"\nsrcDir = \"source\"\nbuildDir = \"dep-out\"\n",
+            "[[lean_lib]]\nname = \"Provider\"\nroots = [\"Dep\"]\nsrcDir = \"logical\"\n",
+        ),
+    );
+    package.write(
+        "dependency/source/logical/Dep/Base.lean",
+        "prelude\ntheorem Dep.proof (P : Prop) (h : P) : P := h\n",
+    );
+    package.write(
+        "src/App/Top.lean",
+        "prelude\nimport Dep.Base\ntheorem App.proof (P : Prop) (h : P) : P := Dep.proof P h\n",
+    );
+    let target = "src/App/Top.lean:ilean";
+    success(&file_target_command(
+        &package,
+        &package.0,
+        "build",
+        &[target],
+    ));
+    let dep_artifact = package.0.join("dependency/dep-out/lib/lean/Dep/Base.olean");
+    let app_artifact = package.0.join("root-out/lib/lean/App/Top.olean");
+    assert!(inspect(&dep_artifact).contains("Dep.proof"));
+    assert!(inspect(&app_artifact).contains("App.proof"));
+    assert!(!package.0.join("root-out/lib/lean/Dep/Base.olean").exists());
+    let dep_target = "dependency/source/logical/Dep/Base.lean:ilean";
+    let query = success(&file_target_command(
+        &package,
+        &package.0,
+        "query",
+        &[dep_target, "@dependency/+Dep.Base:ilean", target],
+    ));
+    let lines: Vec<_> = query.lines().collect();
+    assert_eq!(lines.len(), 3, "{query}");
+    assert_eq!(lines[0], lines[1]);
+    assert!(lines[0].contains("dependency/dep-out/lib/lean/Dep/Base.ilean"));
+    assert!(lines[2].contains("root-out/lib/lean/App/Top.ilean"));
+}
+
+#[test]
+fn source_file_targets_obey_globs_and_caller_directory_without_partial_publication() {
+    let package = Package::new(concat!(
+        "name = \"selected\"\n[[lean_lib]]\nname = \"Library\"\n",
+        "roots = [\"Lib\"]\nglobs = [\"Lib.Top\"]\n",
+    ));
+    let source = "prelude\ntheorem checked (P : Prop) (h : P) : P := h\n";
+    for path in [
+        "Lib/Top.lean",
+        "Lib/Excluded.lean",
+        "Undeclared.lean",
+        "caller/Lib/Top.lean",
+    ] {
+        package.write(path, source);
+    }
+    for target in ["Lib/Excluded.lean:olean", "Undeclared.lean:olean"] {
+        let error = failure(&file_target_command(
+            &package,
+            &package.0,
+            "build",
+            &[target],
+        ));
+        assert!(error.contains("\"authority\":false"), "{error}");
+        assert!(!package.0.join(".lake").exists());
+    }
+    let caller = package.0.join("caller");
+    let error = failure(&file_target_command(
+        &package,
+        &caller,
+        "build",
+        &["Lib/Top.lean:olean"],
+    ));
+    assert!(error.contains("\"authority\":false"), "{error}");
+    assert!(!package.0.join(".lake").exists());
+    success(&file_target_command(
+        &package,
+        &caller,
+        "build",
+        &["../Lib/Top.lean:olean"],
+    ));
+    let original = std::fs::read(package.artifact("Lib.Top")).unwrap();
+    let snapshot = package.0.join(".lake/build/fln-build.snapshot");
+    let original_snapshot = std::fs::read(&snapshot).unwrap();
+    let error = failure(&file_target_command(
+        &package,
+        &package.0,
+        "build",
+        &["Lib/Top.lean:olean", "Lib/Excluded.lean:olean"],
+    ));
+    assert!(error.contains("\"authority\":false"), "{error}");
+    assert_eq!(
+        std::fs::read(package.artifact("Lib.Top")).unwrap(),
+        original
+    );
+    assert_eq!(std::fs::read(snapshot).unwrap(), original_snapshot);
+}
+
+#[test]
+fn source_file_lookup_does_not_hide_named_targets_behind_unrelated_files() {
+    let package = Package::new(CONFIG);
+    package.write(
+        "Lib.Top",
+        "this is an unrelated file, not the module source",
+    );
+    package.write(
+        "Lib/Top.lean",
+        "prelude\ntheorem selected (P : Prop) (h : P) : P := h\n",
+    );
+    success(&file_target_command(
+        &package,
+        &package.0,
+        "build",
+        &["Lib.Top:olean"],
+    ));
+    assert!(inspect(&package.artifact("Lib.Top")).contains("selected"));
+}
+
+#[test]
+fn source_file_targets_preserve_explicit_owner_and_refuse_conflicting_modules() {
+    let package = Package::new(concat!(
+        "name = \"root\"\nsrcDir = \"one\"\n",
+        "[[require]]\nname = \"dependency\"\npath = \"dependency\"\n",
+        "[[lean_lib]]\nname = \"RootLibrary\"\nroots = [\"Shared\"]\n",
+    ));
+    package.write(
+        "dependency/lakefile.toml",
+        concat!(
+            "name = \"provider\"\nsrcDir = \"two\"\nbuildDir = \"out\"\n",
+            "[[lean_lib]]\nname = \"DependencyLibrary\"\nroots = [\"Shared\"]\n",
+        ),
+    );
+    package.write(
+        "one/Shared.lean",
+        "prelude\ntheorem fromRoot (P : Prop) (h : P) : P := h\n",
+    );
+    package.write(
+        "dependency/two/Shared.lean",
+        "prelude\ntheorem fromDependency (P : Prop) (h : P) : P := h\n",
+    );
+    let dependency = "dependency/two/Shared.lean:olean";
+    success(&file_target_command(
+        &package,
+        &package.0,
+        "build",
+        &[dependency],
+    ));
+    let artifact = package.0.join("dependency/out/lib/lean/Shared.olean");
+    let original = std::fs::read(&artifact).unwrap();
+    let inspected = inspect(&artifact);
+    assert!(inspected.contains("fromDependency"));
+    assert!(!inspected.contains("fromRoot"));
+    assert!(!package.artifact("Shared").exists());
+    let error = failure(&file_target_command(
+        &package,
+        &package.0,
+        "build",
+        &["one/Shared.lean:olean", dependency],
+    ));
+    assert!(error.contains("different packages"), "{error}");
+    assert_eq!(std::fs::read(artifact).unwrap(), original);
+    assert!(!package.artifact("Shared").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn source_file_targets_refuse_file_and_directory_symlinks_before_canonicalizing() {
+    let package = Package::new(CONFIG);
+    package.write(
+        "Lib/Top.lean",
+        "prelude\ntheorem selected (P : Prop) (h : P) : P := h\n",
+    );
+    std::os::unix::fs::symlink("Lib/Top.lean", package.0.join("Entry.lean")).unwrap();
+    std::os::unix::fs::symlink("Lib", package.0.join("shortcut")).unwrap();
+    for target in ["Entry.lean:olean", "shortcut/Top.lean:olean"] {
+        let error = failure(&file_target_command(
+            &package,
+            &package.0,
+            "build",
+            &[target],
+        ));
+        assert!(error.contains("refusing symlink"), "{error}");
+        assert!(!package.0.join(".lake").exists());
+    }
+    success(&file_target_command(
+        &package,
+        &package.0,
+        "build",
+        &["Lib/Top.lean:olean"],
+    ));
+    assert!(package.artifact("Lib.Top").is_file());
+}
+
 #[test]
 fn fieldless_enum_ir_facets_preserve_admission_and_replay_from_checked_cache() {
     // This exact two-constructor module used to refuse its executable facet.
@@ -1614,7 +1942,7 @@ fn opaque_module_ir_preserves_opacity_and_executes_in_the_pinned_reference() {
     for (declaration, diagnostic) in [
         (
             "public unsafe opaque Lib.unsafeValue : Nat := 9",
-            "expected unsafe def, abbrev, or data instance without partial",
+            "expected unsafe axiom, def, abbrev, or data instance without partial",
         ),
         (
             "public unsafe def Lib.unsafeValue : Nat := 9",

@@ -4,9 +4,24 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/native-source-modules.yml'
+      - 'Cargo.lock'
+      - 'SUITE.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/ci/checkout_asupersync.sh'
+      - 'crates/fln/src/lib.rs'
+      - 'crates/fln/src/linters.rs'
+      - 'crates/fln/src/runtime.rs'
+      - 'crates/fln/src/runtime/compiler_types.rs'
+      - 'crates/fln/src/runtime/specialize.rs'
       - 'crates/fln/src/source_check.rs'
+      - 'crates/fln/src/source_records.rs'
+      - 'crates/fln/src/source_check/grammar.rs'
       - 'crates/fln/src/source_check/modules/**'
       - 'crates/fln/src/source_check/modules.rs'
+      - 'crates/fln-elab/src/source.rs'
+      - 'crates/fln-elab/src/source/codegen.rs'
+      - 'crates/fln-elab/src/source/codegen/**'
+      - 'crates/fln-elab/src/source/scope/options.rs'
       - 'crates/fln-elab/src/source/scope/simp.rs'
       - 'crates/fln-elab/src/source/scope/simp/**'
       - 'crates/fln-parse/src/command_scope/imports.rs'
@@ -14,21 +29,50 @@ on:
       - 'crates/fln/tests/source_module_session.rs'
       - 'crates/fln/tests/source_module_artifacts.rs'
       - 'crates/fln/tests/source_module_artifacts/**'
+      - 'crates/fln/tests/source_module_build_session.rs'
+      - 'crates/fln/tests/source_module_validation.rs'
+      - 'crates/fln/tests/source_module_visibility.rs'
+      - 'crates/fln/tests/source_compiler_prerequisites.rs'
+      - 'crates/fln/tests/source_set_option.rs'
+      - 'crates/fln/tests/source_unsafe_axioms.rs'
       - 'crates/fln-cli/src/source_check.rs'
       - 'crates/fln-cli/src/source_check/**'
       - 'examples/native_modules/**'
       - 'crates/fln-cli/tests/source_module_check.rs'
+      - 'crates/fln-cli/tests/source_noncomputable.rs'
+      - 'crates/fln-cli/tests/source_compiler_prerequisites.rs'
+      - 'crates/fln-cli/tests/unused_variables_lint.rs'
+      - 'crates/fln-cli/tests/lake_module_build.rs'
+      - 'crates/fln-cli/tests/lake_module_records.rs'
+      - 'crates/fln-cli/tests/lake_lean_config.rs'
+      - 'crates/fln-cli/tests/lake_local_dependencies.rs'
+      - 'crates/fln-cli/tests/lake_local_dependencies/**'
+      - 'crates/fln-cli/tests/build_explain.rs'
+      - 'crates/fln-cli/tests/source_module_visibility.rs'
+      - 'crates/fln-cli/tests/lsp_proof_modules.rs'
+      - 'crates/fln-cli/tests/lsp_proof_modules/**'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   source-modules:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_CODEGEN_UNITS: '256'
+      CARGO_PROFILE_TEST_CODEGEN_UNITS: '256'
+      FLN_REQUIRE_REFERENCE: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Provision the locked Asupersync dependency
+        run: bash scripts/ci/checkout_asupersync.sh
       - name: Install the repository toolchain and identify source
         shell: bash
         run: |
@@ -37,6 +81,39 @@ jobs:
           toolchain=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
           rustup toolchain install "$toolchain" --profile minimal --component clippy,rustfmt
           rustc -Vv
+      - name: Install and verify the SUITE.lock Reference for source diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="$RUNNER_TEMP/source-elan-bin"
+          archive="$RUNNER_TEMP/source-elan.tar.gz"
+          mkdir "$tool_root"
+          curl --user-agent 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)' \
+            --fail --location --retry 3 --output "$archive" \
+            https://github.com/leanprover/elan/releases/download/v4.2.1/elan-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            4e717523217af592fa2d7b9c479410a31816c065d66ccbf0c2149337cfec0f5c \
+            "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$tool_root"
+          export ELAN_HOME="$RUNNER_TEMP/source-elan-home"
+          "$tool_root/elan-init" -y --no-modify-path --default-toolchain none
+          export PATH="$ELAN_HOME/bin:$PATH"
+          mapfile -t reference_rows < <(grep -E '^reference ' SUITE.lock)
+          test "${#reference_rows[@]}" -eq 1
+          pin_tag="$(sed -nE 's/.* tag=([^ ]+).*/\1/p' <<<"${reference_rows[0]}")"
+          pin_commit="$(sed -nE 's/.* commit=([0-9a-f]{40}).*/\1/p' <<<"${reference_rows[0]}")"
+          [[ "$pin_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]
+          test -n "$pin_commit"
+          elan toolchain install "leanprover/lean4:$pin_tag"
+          toolchain_root="$ELAN_HOME/toolchains/leanprover--lean4---$pin_tag"
+          test "$("$toolchain_root/bin/lean" --githash)" = "$pin_commit"
+          for module in Init/Prelude Init/Core; do
+            for suffix in olean olean.server olean.private; do
+              test -s "$toolchain_root/lib/lean/$module.$suffix"
+            done
+          done
+          printf 'FLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\n' \
+            "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
       - name: Read active core beads
         shell: bash
         run: |
@@ -48,26 +125,77 @@ jobs:
               if row.get('status') != 'closed' and any(word in title.lower() for word in ('module', 'import', 'elaboration', 'unifier', 'kernel')):
                   print(row['id'], row.get('status'), row.get('priority'), title)
           PY
-      - name: Check parser, isolated imports, installed commands and downstream consumers
+      - name: Check diagnostics, compilation, isolated imports and downstream consumers
         shell: bash
         run: |
           python3 -I - <<'PY'
           import subprocess
-          commands = [
+          failed = []
+
+          def run_checks(commands):
+              for command in commands:
+                  print('RUN', ' '.join(command), flush=True)
+                  if subprocess.run(command).returncode:
+                      failed.append(' '.join(command))
+
+          # Run the changed source paths before the broader module regressions.
+          run_checks([
+              ['cargo', 'test', '--locked', '-p', 'fln-elab', '--lib', 'source::scope::options', '--', '--nocapture', '--test-threads=1'],
+              ['cargo', 'test', '--locked', '-p', 'fln-elab', '--lib', 'macro_inline', '--', '--nocapture', '--test-threads=1'],
+              ['cargo', 'test', '--locked', '-p', 'fln', '--lib', 'runtime::compiler_types::tests', '--', '--nocapture', '--test-threads=1'],
+              ['cargo', 'test', '--locked', '-p', 'fln', '--lib', 'source_records::tests::unsafe_header_classification_preserves_errors_budget_and_safety', '--', '--exact', '--nocapture', '--test-threads=1'],
+              ['cargo', 'test', '--locked', '-p', 'fln', '--lib', 'missing_docs', '--', '--nocapture', '--test-threads=1'],
+              ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_set_option', '--test', 'source_module_validation', '--test', 'source_compiler_prerequisites', '--test', 'source_unsafe_axioms', '--no-fail-fast', '--', '--nocapture', '--test-threads=1'],
+              ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'unused_variables_lint', '--test', 'source_noncomputable', '--test', 'source_compiler_prerequisites', '--no-fail-fast', '--', '--nocapture', '--test-threads=1'],
+          ])
+
+          # Observe the actual empty-world Prelude after the CLI binaries build.
+          # Full Prelude support is still incomplete: an ordinary refusal records
+          # the next source boundary, while crashes and resource stops fail this job.
+          probe = ['target/debug/lean', '-j1', 'vendor/lean4-src/src/Init/Prelude.lean']
+          print('OBSERVE', ' '.join(probe), flush=True)
+
+          def print_stream(name, value):
+              if value:
+                  if isinstance(value, bytes):
+                      value = value.decode('utf-8', errors='replace')
+                  print(f'PRELUDE {name}:\n{value}', flush=True)
+
+          try:
+              observed = subprocess.run(probe, capture_output=True, timeout=180)
+          except subprocess.TimeoutExpired as error:
+              print_stream('stdout', error.stdout)
+              print_stream('stderr', error.stderr)
+              print('PRELUDE timeout after 180 seconds; no source verdict', flush=True)
+              failed.append('Prelude observation timed out')
+          except OSError as error:
+              print(f'PRELUDE could not start: {error}', flush=True)
+              failed.append('Prelude observation could not start')
+          else:
+              print_stream('stdout', observed.stdout)
+              print_stream('stderr', observed.stderr)
+              if observed.returncode == 0:
+                  outcome = 'accepted'
+              elif observed.returncode == 1:
+                  outcome = 'source refusal; remaining Prelude support is incomplete'
+              elif observed.returncode == 5:
+                  outcome = 'capability not implemented; remaining Prelude support is incomplete'
+              else:
+                  outcome = 'crash, invalid invocation, internal fault, or resource stop; no source verdict'
+                  failed.append(f'Prelude observation exited {observed.returncode}')
+              print(f'PRELUDE exit={observed.returncode}: {outcome}', flush=True)
+
+          run_checks([
               ['cargo', 'test', '--locked', '-p', 'fln-parse', 'command_scope', '--', '--nocapture'],
-              ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_module_check', '--test', 'source_module_session', '--test', 'source_module_artifacts', '--no-fail-fast'],
+              ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_module_check', '--test', 'source_module_session', '--test', 'source_module_artifacts', '--test', 'source_module_visibility', '--test', 'source_module_build_session', '--no-fail-fast', '--', '--nocapture', '--test-threads=1'],
               ['cargo', 'test', '--locked', '-p', 'fln', '--lib', 'source_check::modules::persisted::tests', '--no-fail-fast'],
               ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_module_check', '--', '--nocapture'],
+              ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'lake_module_build', '--test', 'lake_module_records', '--test', 'lake_lean_config', '--test', 'lake_local_dependencies', '--test', 'build_explain', '--test', 'source_module_visibility', '--test', 'lsp_proof_modules', '--no-fail-fast', '--', '--nocapture', '--test-threads=1'],
               ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_default_simp', '--test', 'source_instances', '--no-fail-fast'],
               ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_check'],
               ['cargo', 'clippy', '--locked', '-p', 'fln', '--all-targets', '--', '-D', 'warnings'],
               ['cargo', 'check', '--locked', '--workspace', '--all-targets'],
-          ]
-          failed = []
-          for command in commands:
-              print('RUN', ' '.join(command), flush=True)
-              if subprocess.run(command).returncode:
-                  failed.append(' '.join(command))
+          ])
           for command in failed:
               print('FAILED', command, flush=True)
           raise SystemExit(bool(failed))

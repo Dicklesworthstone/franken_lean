@@ -4,6 +4,7 @@
 //! `Lean/Elab/Inductive.lean:88`), `linter.defProp` (`Lean/Linter/DefProp.lean`), and the two
 //! reducibility warnings a declaration's elaboration logs for an `instance` attribute and a
 //! class-typed `def` (`Lean/Meta/Instances.lean:281-289`, `Lean/Elab/MutualDef.lean:1246-1256`).
+//! The opt-in missing-documentation linter reads the same source syntax and lexical scopes.
 //! The unused-variables linter has its own module.
 use crate::unused_variables::{linter_value, parser_kind};
 use fln_core::expr::{Expr, ExprNode};
@@ -37,6 +38,362 @@ fn original_pos(syntax: &Syntax) -> Option<usize> {
 
 fn is_kind(syntax: &Syntax, kind: &[&str]) -> bool {
     syntax.kind() == Some(&parser_kind(kind))
+}
+
+fn syntax_at<'a>(syntax: &'a Syntax, path: &[usize]) -> Option<&'a Syntax> {
+    path.iter()
+        .try_fold(syntax, |syntax, index| args(syntax).get(*index))
+}
+
+/// Unlike the default-on linters, missing documentation is disabled unless an explicit
+/// option (or `linter.all`) enables it. Explicit settings override the aggregate setting.
+pub(crate) fn missing_docs_enabled(options: &KVMap) -> bool {
+    options.get_bool(
+        &Name::from_components(["linter", "missingDocs"]),
+        options.get_bool(&Name::from_components(["linter", "all"]), false),
+    )
+}
+
+/// `None` is a nonempty comment; `Some(false)` is absent, `Some(true)` is empty.
+/// The plain comment atom includes its closing `-/`. Verso's parsed document is already
+/// nonempty syntax, exactly the distinction made by `MissingDocs.isEmptyDocString`.
+fn doc_status(slot: Option<&Syntax>) -> Option<bool> {
+    let Some(comment) = slot.and_then(|slot| args(slot).first()) else {
+        return Some(false);
+    };
+    let body = args(comment).get(1)?;
+    let text = match body {
+        Syntax::Atom { val, .. } => val.strip_suffix("-/").unwrap_or(val),
+        _ if is_kind(body, &["Command", "versoCommentBody"]) => {
+            let Syntax::Atom { val, .. } = args(body).first()? else {
+                return None;
+            };
+            val.as_str()
+        }
+        _ => return None,
+    };
+    text.trim_ascii().is_empty().then_some(true)
+}
+
+fn inherited_docs(attrs: Option<&Syntax>, tactic_alt: bool) -> bool {
+    attrs
+        .and_then(|attrs| syntax_at(attrs, &[0, 1]))
+        .map_or(&[][..], args)
+        .iter()
+        .step_by(2)
+        .filter_map(|attribute| args(attribute).get(1))
+        .any(|attribute| {
+            (tactic_alt && is_kind(attribute, &["Attr", "tactic_alt"]))
+                || (is_kind(attribute, &["Attr", "simple"])
+                    && matches!(args(attribute).first(), Some(Syntax::Ident { val, .. })
+                        if val.erase_macro_scopes() == Name::from_components(["inherit_doc"])))
+        })
+}
+
+fn modifiers_doc_status(
+    modifiers: &Syntax,
+    scope: &fln_elab::source::scope::SourceScope,
+) -> Option<bool> {
+    let visibility = syntax_at(modifiers, &[2, 0]);
+    let public = if scope.private_module.is_some() && !scope.public_declarations {
+        visibility.is_some_and(|syntax| is_kind(syntax, &["Command", "public"]))
+    } else {
+        !visibility.is_some_and(|syntax| is_kind(syntax, &["Command", "private"]))
+    };
+    if !public || inherited_docs(args(modifiers).get(1), false) {
+        return None;
+    }
+    doc_status(args(modifiers).first())
+}
+
+fn documentation_name(syntax: &Syntax) -> String {
+    match syntax {
+        Syntax::Ident { val, .. } if !val.is_anonymous() => crate::pretty::message_name(val),
+        _ => Name::anonymous().to_display_string(),
+    }
+}
+
+fn documentation_warning(
+    output: &mut Vec<Lint>,
+    syntax: &Syntax,
+    empty: bool,
+    description: String,
+) {
+    if let Some(at) = first_position(syntax) {
+        let status = if empty { "empty" } else { "missing" };
+        output.push(Lint {
+            at,
+            message: format!(
+                "{status} doc string for {description}\n\nNote: This linter can be disabled with \
+                 `set_option linter.missingDocs false`"
+            ),
+        });
+    }
+}
+
+/// The handlers of the pin's `Lean/Linter/MissingDocs.lean`. A command's `in` wrappers and
+/// mutual members are visited by the executor under their own lexical scopes.
+pub(crate) fn has_missing_docs_handler(syntax: &Syntax) -> bool {
+    [
+        "declaration",
+        "initialize",
+        "notation",
+        "mixfix",
+        "syntax",
+        "syntaxAbbrev",
+        "syntaxCat",
+        "macro",
+        "elab",
+        "classAbbrev",
+        "registerSimpAttr",
+    ]
+    .iter()
+    .any(|kind| is_kind(syntax, &["Command", kind]))
+        || is_kind(syntax, &["Tactic", "declareSimpLikeTactic"])
+        || is_kind(syntax, &["Option", "registerBuiltinOption"])
+        || is_kind(syntax, &["Option", "registerOption"])
+}
+
+/// Missing-documentation warnings need the authored structure metadata only for fields
+/// that redeclare inherited fields. Cache that validated journal once for the source batch.
+pub(crate) struct MissingDocs<'a> {
+    environment: &'a fln_env::environment::Environment,
+    structures: Option<fln_elab::records::imported::ImportedStructures>,
+}
+
+impl<'a> MissingDocs<'a> {
+    pub(crate) fn new(environment: &'a fln_env::environment::Environment) -> Self {
+        Self {
+            environment,
+            structures: None,
+        }
+    }
+
+    fn inherited_fields(
+        &mut self,
+        command: &Syntax,
+        scope: &fln_elab::source::scope::SourceScope,
+        name: &Syntax,
+    ) -> Result<std::collections::BTreeSet<Name>, &'static str> {
+        let Syntax::Ident { val, .. } = name else {
+            return Err("a structure name for missing-documentation warnings");
+        };
+        let name = scope
+            .for_declaration(command)
+            .ok()
+            .and_then(|scope| scope.declaration_name(val).ok())
+            .ok_or("a structure scope for missing-documentation warnings")?;
+        if self.structures.is_none() {
+            self.structures = Some(
+                fln_elab::records::imported::ImportedStructures::read(self.environment).map_err(
+                    |_| "readable structure metadata for missing-documentation warnings",
+                )?,
+            );
+        }
+        let structures = self.structures.as_ref().expect("initialized above");
+        let order = structures
+            .resolution_order(&name, fln_elab::records::RecordBudget::default())
+            .map_err(|_| "readable structure inheritance for missing-documentation warnings")?;
+        Ok(order
+            .iter()
+            .skip(1)
+            .filter_map(|name| structures.get(name))
+            .flat_map(|structure| structure.fields.iter().map(|field| field.name.clone()))
+            .collect())
+    }
+
+    pub(crate) fn lint(
+        &mut self,
+        command: &Syntax,
+        options: &KVMap,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Vec<Lint>, &'static str> {
+        let mut output = Vec::new();
+        if !missing_docs_enabled(options) {
+            return Ok(output);
+        }
+        if is_kind(command, &["Command", "declaration"]) {
+            let [modifiers, declaration] = args(command) else {
+                return Ok(output);
+            };
+            if syntax_at(modifiers, &[2, 0])
+                .is_some_and(|syntax| is_kind(syntax, &["Command", "private"]))
+            {
+                return Ok(output);
+            }
+            let Some(name) = syntax_at(declaration, &[1, 0]) else {
+                return Ok(output);
+            };
+            if let Some(empty) = modifiers_doc_status(modifiers, scope) {
+                let label = [
+                    ("abbrev", "abbrev"),
+                    ("definition", "def"),
+                    ("opaque", "opaque"),
+                    ("axiom", "axiom"),
+                    ("inductive", "inductive"),
+                    ("classInductive", "inductive"),
+                    ("structure", "structure"),
+                ]
+                .into_iter()
+                .find_map(|(kind, label)| {
+                    is_kind(declaration, &["Command", kind]).then_some(label)
+                });
+                if let Some(label) = label {
+                    documentation_warning(
+                        &mut output,
+                        name,
+                        empty,
+                        format!("public {label} {}", documentation_name(name)),
+                    );
+                }
+            }
+            let field_warning = |output: &mut Vec<Lint>, field: &Syntax, empty, label| {
+                documentation_warning(
+                    output,
+                    field,
+                    empty,
+                    format!(
+                        "{label} {}.{}",
+                        documentation_name(name),
+                        documentation_name(field)
+                    ),
+                );
+            };
+            if is_kind(declaration, &["Command", "inductive"])
+                || is_kind(declaration, &["Command", "classInductive"])
+            {
+                for constructor in args(declaration).get(4).map_or(&[][..], args) {
+                    if let Some(leading_empty) = doc_status(args(constructor).first())
+                        && let Some(modifiers) = args(constructor).get(2)
+                        && let Some(empty) = modifiers_doc_status(modifiers, scope)
+                        && let Some(field) = args(constructor).get(3)
+                    {
+                        field_warning(
+                            &mut output,
+                            field,
+                            leading_empty || empty,
+                            "public constructor",
+                        );
+                    }
+                }
+                if let Some(fields) = syntax_at(declaration, &[5, 0])
+                    && is_kind(fields, &["Command", "computedFields"])
+                {
+                    for field in args(fields).get(1).map_or(&[][..], args) {
+                        if let Some(modifiers) = args(field).first()
+                            && let Some(empty) = modifiers_doc_status(modifiers, scope)
+                            && let Some(field) = args(field).get(1)
+                        {
+                            field_warning(&mut output, field, empty, "computed field");
+                        }
+                    }
+                }
+            } else if is_kind(declaration, &["Command", "structure"]) {
+                let inherited = if args(declaration)
+                    .get(3)
+                    .is_some_and(|slot| !args(slot).is_empty())
+                {
+                    self.inherited_fields(command, scope, name)?
+                } else {
+                    std::collections::BTreeSet::new()
+                };
+                for field in syntax_at(declaration, &[4, 2, 0]).map_or(&[][..], args) {
+                    let Some(empty) = args(field)
+                        .first()
+                        .and_then(|mods| modifiers_doc_status(mods, scope))
+                    else {
+                        continue;
+                    };
+                    let names = if is_kind(field, &["Command", "structSimpleBinder"]) {
+                        args(field).get(1).map_or(&[][..], std::slice::from_ref)
+                    } else {
+                        args(field).get(2).map_or(&[][..], args)
+                    };
+                    for field in names {
+                        if !matches!(field, Syntax::Ident { val, .. } if inherited.contains(val)) {
+                            field_warning(&mut output, field, empty, "public field");
+                        }
+                    }
+                }
+            }
+        } else if ["notation", "mixfix", "syntax", "macro", "elab"]
+            .iter()
+            .any(|kind| is_kind(command, &["Command", kind]))
+        {
+            // `attrKind` uses Parser.Term.local for syntax declarations too.
+            let local = syntax_at(command, &[2, 0, 0])
+                .is_some_and(|syntax| is_kind(syntax, &["Term", "local"]));
+            let tactic_alt = ["syntax", "macro", "elab"]
+                .iter()
+                .any(|kind| is_kind(command, &["Command", kind]));
+            if !local
+                && !inherited_docs(args(command).get(1), tactic_alt)
+                && let Some(empty) = doc_status(args(command).first())
+                && let Some(keyword) = args(command).get(3)
+            {
+                let label = if is_kind(command, &["Command", "mixfix"]) {
+                    match args(keyword).first() {
+                        Some(Syntax::Atom { val, .. }) => val.as_str(),
+                        _ => return Ok(output),
+                    }
+                } else {
+                    match keyword {
+                        Syntax::Atom { val, .. } => val.as_str(),
+                        _ => return Ok(output),
+                    }
+                };
+                let (site, description) = match syntax_at(command, &[5, 0, 3]) {
+                    Some(name) => (name, format!("{label} {}", documentation_name(name))),
+                    None => (keyword, label.to_owned()),
+                };
+                documentation_warning(&mut output, site, empty, description);
+            }
+        } else {
+            let handler = [
+                (&["Command", "syntaxAbbrev"][..], "syntax", 2, false),
+                (&["Command", "syntaxCat"][..], "syntax category", 2, false),
+                (&["Command", "classAbbrev"][..], "class abbrev", 3, true),
+                (&["Command", "registerSimpAttr"][..], "simp attr", 2, false),
+                (
+                    &["Tactic", "declareSimpLikeTactic"][..],
+                    "simp-like tactic",
+                    2,
+                    false,
+                ),
+                (&["Option", "registerBuiltinOption"][..], "option", 3, false),
+                (&["Option", "registerOption"][..], "option", 2, true),
+            ]
+            .into_iter()
+            .find(|(kind, _, _, _)| is_kind(command, kind));
+            let selected = if is_kind(command, &["Command", "initialize"]) {
+                syntax_at(command, &[2, 0]).map(|name| (name, "initializer", true))
+            } else {
+                handler.and_then(|(_, label, index, modifiers)| {
+                    args(command)
+                        .get(index)
+                        .map(|name| (name, label, modifiers))
+                })
+            };
+            if let Some((name, label, modifiers)) = selected {
+                let status = if modifiers {
+                    args(command)
+                        .first()
+                        .and_then(|mods| modifiers_doc_status(mods, scope))
+                } else {
+                    doc_status(args(command).first())
+                };
+                if let Some(empty) = status {
+                    documentation_warning(
+                        &mut output,
+                        name,
+                        empty,
+                        format!("{label} {}", documentation_name(name)),
+                    );
+                }
+            }
+        }
+        Ok(output)
+    }
 }
 
 /// The pin's note on the old `:=` form of a `structure`, `class` or `inductive`, at the
@@ -570,6 +927,196 @@ pub(crate) fn deprecation_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn missing_doc_messages(source: &str, module: bool, public: bool) -> Vec<(usize, String)> {
+        let parsed = fln_parse::parse_source_command(source.as_bytes())
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        let environment = fln_env::environment::Environment::new();
+        let scope = fln_elab::source::scope::SourceScope {
+            private_module: module.then(|| Name::from_components(["Docs"])),
+            public_declarations: public,
+            ..Default::default()
+        };
+        let mut options = KVMap::new();
+        options.insert(
+            Name::from_components(["linter", "missingDocs"]),
+            fln_core::options::DataValue::OfBool(true),
+        );
+        MissingDocs::new(&environment)
+            .lint(parsed.syntax(), &options, &scope)
+            .unwrap()
+            .into_iter()
+            .map(|lint| (lint.at, lint.message.lines().next().unwrap().to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn missing_docs_distinguishes_empty_comments_and_inherited_documentation() {
+        for (source, expected) in [
+            (
+                "def value := 1",
+                Some("missing doc string for public def value"),
+            ),
+            (
+                "/-- -/ def value := 1",
+                Some("empty doc string for public def value"),
+            ),
+            (
+                "/-- \n   -/ def value := 1",
+                Some("empty doc string for public def value"),
+            ),
+            ("/-- documented -/ def value := 1", None),
+            ("/-- \u{a0} -/ def value := 1", None),
+            ("@[inherit_doc Nat.zero] def value := 1", None),
+            ("theorem value : 1 = 1 := rfl", None),
+            ("example : Nat := 1", None),
+            ("instance : Inhabited Nat := ⟨0⟩", None),
+            ("private def value := 1", None),
+        ] {
+            let actual = missing_doc_messages(source, false, false);
+            let expected = expected
+                .into_iter()
+                .map(|message| (source.find("value").unwrap(), message.to_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{source}");
+        }
+        assert_eq!(
+            missing_doc_messages("def «hello world» : Nat := 1", false, false),
+            vec![(
+                4,
+                "missing doc string for public def «hello world»".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn missing_docs_reads_both_constructor_comment_positions() {
+        let source = "inductive Choice where\n\
+          | first\n\
+          /-- -/ | second\n\
+          | /-- -/ third\n\
+          /-- documented -/ | /-- -/ fourth\n\
+          /-- -/ | /-- documented -/ fifth\n";
+        let messages = missing_doc_messages(source, false, false);
+        let expected = [
+            ("Choice", "missing doc string for public inductive Choice"),
+            (
+                "first",
+                "missing doc string for public constructor Choice.first",
+            ),
+            (
+                "second",
+                "empty doc string for public constructor Choice.second",
+            ),
+            (
+                "third",
+                "empty doc string for public constructor Choice.third",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, message)| (source.find(name).unwrap(), message.to_owned()))
+        .collect::<Vec<_>>();
+        assert_eq!(messages, expected);
+    }
+
+    #[test]
+    fn missing_docs_uses_lexical_module_visibility_for_nested_declarations() {
+        let fields = "structure Box where\n  value : Nat\n  /-- -/ (left right : Nat)\n";
+        assert!(missing_doc_messages(fields, true, false).is_empty());
+        let explicit = format!("public {fields}");
+        assert_eq!(
+            missing_doc_messages(&explicit, true, false),
+            vec![(
+                explicit.find("Box").unwrap(),
+                "missing doc string for public structure Box".into()
+            )]
+        );
+        assert_eq!(missing_doc_messages(fields, true, true).len(), 4);
+        assert!(missing_doc_messages(&format!("private {fields}"), true, true).is_empty());
+    }
+
+    #[test]
+    fn missing_docs_reads_named_local_and_inherited_syntax_declarations() {
+        for (source, expected) in [
+            (
+                "syntax (name := named) \"fancy\" : term",
+                Some("missing doc string for syntax named"),
+            ),
+            (
+                "/-- -/ syntax \"fancy\" : term",
+                Some("empty doc string for syntax"),
+            ),
+            (
+                "syntax piece := ident",
+                Some("missing doc string for syntax [anonymous]"),
+            ),
+            (
+                "declare_syntax_cat piece",
+                Some("missing doc string for syntax category piece"),
+            ),
+            (
+                "infix:65 \" +++ \" => Nat.add",
+                Some("missing doc string for infix"),
+            ),
+            (
+                "macro (name := named) \"answer\" : term => `(42)",
+                Some("missing doc string for macro named"),
+            ),
+            (
+                "notation \"answer\" => 42",
+                Some("missing doc string for notation"),
+            ),
+            (
+                "scoped notation \"answer\" => 42",
+                Some("missing doc string for notation"),
+            ),
+            ("local notation \"answer\" => 42", None),
+            ("local infix:65 \" +++ \" => Nat.add", None),
+            ("local syntax \"fancy\" : term", None),
+            ("local macro \"answer\" : term => `(42)", None),
+            (
+                "local elab \"answer\" : term => pure (Lean.mkNatLit 42)",
+                None,
+            ),
+            ("/-- documented -/ notation \"answer\" => 42", None),
+            ("@[inherit_doc Nat.zero] syntax \"fancy\" : term", None),
+        ] {
+            let actual = missing_doc_messages(source, false, false)
+                .into_iter()
+                .map(|(_, message)| message)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                expected.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_docs_options_default_off_and_explicit_settings_override_all() {
+        let mut options = KVMap::new();
+        assert!(!missing_docs_enabled(&options));
+        options.insert(
+            Name::from_components(["linter", "all"]),
+            fln_core::options::DataValue::OfBool(true),
+        );
+        assert!(missing_docs_enabled(&options));
+        options.insert(
+            Name::from_components(["linter", "missingDocs"]),
+            fln_core::options::DataValue::OfBool(false),
+        );
+        assert!(!missing_docs_enabled(&options));
+        options.insert(
+            Name::from_components(["linter", "all"]),
+            fln_core::options::DataValue::OfBool(false),
+        );
+        options.insert(
+            Name::from_components(["linter", "missingDocs"]),
+            fln_core::options::DataValue::OfBool(true),
+        );
+        assert!(missing_docs_enabled(&options));
+    }
 
     fn names(params: &[&str]) -> Vec<Name> {
         params

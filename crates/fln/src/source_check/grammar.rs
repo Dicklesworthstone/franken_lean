@@ -114,6 +114,7 @@ pub(crate) struct SourceGrammar {
     file: FileGrammar,
     rule_sources: BTreeMap<Name, Arc<[u8]>>,
     macro_warnings: Vec<crate::unused_variables::UnusedBinder>,
+    declared_command: Option<fln_parse::ParsedSourceCommand>,
     module_system: bool,
     declared_syntax: bool,
 }
@@ -128,6 +129,7 @@ impl SourceGrammar {
                 .own_syntax_only(),
             rule_sources: BTreeMap::new(),
             macro_warnings: Vec::new(),
+            declared_command: None,
             module_system: false,
             declared_syntax: false,
         }
@@ -219,6 +221,7 @@ impl SourceGrammar {
             file: file.own_syntax_only(),
             rule_sources: BTreeMap::new(),
             macro_warnings: Vec::new(),
+            declared_command: None,
             module_system,
             declared_syntax: false,
         }
@@ -344,6 +347,7 @@ impl SourceGrammar {
         resolve: impl Fn(&Name) -> Resolution,
     ) -> Result<bool, EngineExecutionError> {
         self.macro_warnings.clear();
+        self.declared_command = None;
         if !may_declare(command) {
             return Ok(false);
         }
@@ -412,7 +416,14 @@ impl SourceGrammar {
             // the native quoted-template journal.
             return Err(Self::module_phase_refusal());
         }
+        self.declared_command = Some(parsed);
         Ok(true)
+    }
+
+    /// The syntax just registered, parsed before it could change its own grammar. Linters
+    /// must read this tree, not parse the command again under its newly installed syntax.
+    pub(crate) fn declared_command(&self) -> Option<&fln_parse::ParsedSourceCommand> {
+        self.declared_command.as_ref()
     }
 
     /// Warnings for the last successful macro registration. Imported and older

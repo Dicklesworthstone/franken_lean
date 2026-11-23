@@ -278,7 +278,7 @@ pub const ROWS: &[Row] = &[
         "linter.missingDocs",
         Bool(false),
         "Lean/Linter/MissingDocs.lean:20",
-        Silent,
+        Honored,
     ),
     row(
         "linter.deprecated",
@@ -877,6 +877,8 @@ mod tests {
             ("linter.unusedVariables", false),
             ("linter.unusedVariables", true),
             ("linter.unusedVariables.funArgs", false),
+            ("linter.missingDocs", false),
+            ("linter.missingDocs", true),
             ("linter.all", false),
         ] {
             assert_eq!(
@@ -889,13 +891,7 @@ mod tests {
             admitted("linter.all", DataValue::OfBool(true)),
             Err(OptionRefusal::Unsupported { .. })
         ));
-        // Off by default: switching it on would print what this engine does not.
-        assert!(matches!(
-            admitted("linter.missingDocs", DataValue::OfBool(true)),
-            Err(OptionRefusal::Unsupported { .. })
-        ));
-        // The same holds for every builtin linter row: a default-off one may only stay off,
-        // a default-on one may be switched off or left on.
+        // Unimplemented linters may only stay silent; honored linters above have consumers.
         for (name, value, admits) in [
             ("linter.omit", false, true),
             ("linter.omit", true, false),
@@ -1056,7 +1052,7 @@ mod tests {
         // `autoImplicit`: `auto_bound_name` (source.rs); `source_auto_bound_implicits` sets it false.
         // `Elab.async`: the names `native_decide` gives its axioms (source.rs,
         // tactics/decision.rs); `source_native_decide` sets it false.
-        // `linter.*`: the unused-variables, deprecated-syntax, defProp and checkUnivs warnings
+        // `linter.*`: the missing-docs, unused-variables, deprecated-syntax, defProp and checkUnivs warnings
         // (`fln`, `unused_variables.rs` and `linters.rs`); `unused_variables_lint` sets each one.
         // `warn.sorry`: the source executor's "declaration uses `sorry`" warning (`fln`,
         // `execute_source_command_stream`); `sorry_is_admitted_with_the_pins_warnings` sets it false.
@@ -1094,6 +1090,7 @@ mod tests {
                 "Elab.async",
                 "linter.all",
                 "linter.unusedVariables",
+                "linter.missingDocs",
                 "linter.deprecated",
                 "linter.defProp",
                 "linter.unusedVariables.funArgs",

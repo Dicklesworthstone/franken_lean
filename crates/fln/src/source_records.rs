@@ -31,26 +31,53 @@ pub(crate) struct PublicSourceAdmission {
 pub(super) fn declaration_is_proposition(
     environment: &Environment,
     base: &ConstantVal,
+    is_unsafe: bool,
     kernel: Budget,
 ) -> Result<Outcome<bool>, EngineExecutionError> {
     let opaque_definitions = BTreeSet::new();
-    let outcome = fln_kernel::check_type_with_unfolding(
-        environment,
-        &base.level_params,
-        &base.type_,
-        &Expr::sort(Level::zero()),
-        kernel,
-        fln_kernel::DefEqUnfolding {
-            opaque_definitions: &opaque_definitions,
-            unfold_theorems: true,
-        },
-    );
+    let (outcome, non_proposition) = if is_unsafe {
+        // The standalone conversion query deliberately has a safe context.
+        // Reuse ordinary unsafe declaration checking to ask whether this
+        // header has type Prop; neither this private probe nor its verdict
+        // publishes a declaration. The original declaration still needs both
+        // admission seats under its unchanged safety annotation.
+        let probe_name = fresh_generated_command_name(environment, 0)?;
+        let probe = Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: probe_name.clone(),
+                level_params: base.level_params.clone(),
+                type_: Expr::sort(Level::zero()),
+            },
+            value: base.type_.clone(),
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Unsafe,
+            all: vec![probe_name],
+        });
+        (
+            fln_kernel::check(environment, &probe, kernel),
+            RejectClass::DefinitionTypeMismatch,
+        )
+    } else {
+        (
+            fln_kernel::check_type_with_unfolding(
+                environment,
+                &base.level_params,
+                &base.type_,
+                &Expr::sort(Level::zero()),
+                kernel,
+                fln_kernel::DefEqUnfolding {
+                    opaque_definitions: &opaque_definitions,
+                    unfold_theorems: true,
+                },
+            ),
+            RejectClass::NotDefEq,
+        )
+    };
     match outcome {
         Outcome::Complete(Verdict::Accepted { .. }) => Ok(Outcome::Complete(true)),
-        Outcome::Complete(Verdict::Rejected {
-            class: RejectClass::NotDefEq,
-            ..
-        }) => Ok(Outcome::Complete(false)),
+        Outcome::Complete(Verdict::Rejected { class, .. }) if class == non_proposition => {
+            Ok(Outcome::Complete(false))
+        }
         Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
         Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
         other => Err(EngineExecutionError::Frontend(
@@ -1105,14 +1132,27 @@ impl Engine {
                 ),
             ));
         }
-        let base = self
+        let info = self
             .environment()
             .find(name)
             .ok_or(EngineExecutionError::NotImplemented {
                 feature: "instance metadata requires an already admitted declaration",
-            })?
-            .constant_val();
-        let proof = match declaration_is_proposition(self.environment(), base, kernel)? {
+            })?;
+        let is_unsafe = match info {
+            ConstantInfo::Axiom(value) => value.is_unsafe,
+            ConstantInfo::Defn(value) => value.safety == DefinitionSafety::Unsafe,
+            ConstantInfo::Opaque(value) => value.is_unsafe,
+            ConstantInfo::Induct(value) => value.is_unsafe,
+            ConstantInfo::Ctor(value) => value.is_unsafe,
+            ConstantInfo::Rec(value) => value.is_unsafe,
+            ConstantInfo::Thm(_) | ConstantInfo::Quot(_) => false,
+        };
+        let proof = match declaration_is_proposition(
+            self.environment(),
+            info.constant_val(),
+            is_unsafe,
+            kernel,
+        )? {
             Outcome::Complete(proof) => proof,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -1922,6 +1962,95 @@ mod tests {
     use fln_elab::constraint::{ConstraintId, unify::UnificationError};
     use fln_elab::source::SourceInferenceError;
     use fln_kernel::verdict::{Consumption, RejectClass, Verdict};
+
+    #[test]
+    fn unsafe_header_classification_preserves_errors_budget_and_safety() {
+        let kernel = Budget::for_stack_bytes(2 * 1024 * 1024);
+        let options = KVMap::new();
+        let carrier = Name::from_components(["UnsafeCarrier"]);
+        let proposition = Name::from_components(["UnsafeProposition"]);
+        let declarations = [
+            (carrier.clone(), Expr::sort(Level::one())),
+            (proposition.clone(), Expr::sort(Level::zero())),
+            (Name::num(Name::anonymous(), 0), Expr::sort(Level::zero())),
+        ]
+        .map(|(name, type_)| {
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name,
+                    level_params: Vec::new(),
+                    type_,
+                },
+                is_unsafe: true,
+            })
+        });
+        let admitted = Engine::from_environment(Environment::new())
+            .admit_declarations(&declarations, &options, EngineAdmissionLimits::new(kernel))
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let environment = admitted.engine.environment();
+        let header = |type_| ConstantVal {
+            name: Name::from_components(["candidate"]),
+            level_params: Vec::new(),
+            type_,
+        };
+        for (name, proof) in [(carrier, false), (proposition.clone(), true)] {
+            assert_eq!(
+                declaration_is_proposition(
+                    environment,
+                    &header(Expr::const_(name, Vec::new())),
+                    true,
+                    kernel,
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap(),
+                proof,
+            );
+        }
+        for (type_, is_unsafe, class) in [
+            (
+                Expr::const_(proposition.clone(), Vec::new()),
+                false,
+                RejectClass::SafetyViolation,
+            ),
+            (
+                Expr::app(Expr::sort(Level::zero()), Expr::sort(Level::zero())),
+                true,
+                RejectClass::FunctionExpected,
+            ),
+            (
+                Expr::const_(Name::from_components(["unknown"]), Vec::new()),
+                true,
+                RejectClass::UnknownConstant,
+            ),
+        ] {
+            let error = declaration_is_proposition(environment, &header(type_), is_unsafe, kernel)
+                .unwrap_err();
+            let EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(outcome)),
+            )) = error
+            else {
+                panic!("expected the original type obligation error: {error:?}");
+            };
+            assert!(
+                matches!(*outcome, Outcome::Complete(Verdict::Rejected { class: actual, .. }) if actual == class)
+            );
+        }
+        assert!(matches!(
+            declaration_is_proposition(
+                environment,
+                &header(Expr::const_(proposition, Vec::new())),
+                true,
+                kernel.narrowed(0, kernel.depth),
+            )
+            .unwrap(),
+            Outcome::Inconclusive(_),
+        ));
+        assert_eq!(environment.len(), declarations.len());
+        assert!(!environment.contains(&Name::num(Name::anonymous(), 1)));
+    }
 
     #[test]
     fn raw_command_parser_preserves_templates_for_the_external_expander() {

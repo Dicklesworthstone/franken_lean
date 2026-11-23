@@ -853,28 +853,7 @@ fn check_root_kind(kind: &Name) -> Result<(), &'static str> {
 // without globally reserving that identifier. Other category behaviors and
 // includeIdent=true still need different lookup semantics and remain refused.
 fn dispatchable_heads(descr: &Descr, depth: usize, tactic: bool) -> bool {
-    if depth > MAX_DESCR_DEPTH {
-        return false;
-    }
-    match descr {
-        Descr::Symbol(_) | Descr::UnicodeSymbol(..) => true,
-        Descr::NonReservedSymbol(_, false) => tactic,
-        Descr::Node { body, .. } | Descr::NodeWithAntiquot(_, _, body) => {
-            dispatchable_heads(body, depth + 1, tactic)
-        }
-        Descr::Unary(name, body) if input_wrapper(name) => {
-            dispatchable_heads(body, depth + 1, tactic)
-        }
-        Descr::Binary(name, left, right) => match simple(name).as_deref() {
-            Some("andthen") => dispatchable_heads(left, depth + 1, tactic),
-            Some("orelse") => {
-                dispatchable_heads(left, depth + 1, tactic)
-                    && dispatchable_heads(right, depth + 1, tactic)
-            }
-            _ => false,
-        },
-        _ => false,
-    }
+    description_heads(descr, depth, tactic).complete
 }
 
 /// Check every constructor and return whether it may consume no input. The

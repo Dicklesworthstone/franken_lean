@@ -3147,6 +3147,7 @@ impl Engine {
         // is neither `@[reducible]` nor `@[implicit_reducible]` (`Lean/Meta/Instances.lean:288`).
         let mut instance_attribute_warnings: Vec<SourceWarning> = Vec::new();
         let mut macro_pattern_warnings: Vec<SourceWarning> = Vec::new();
+        let mut syntax_documentation_warnings: Vec<SourceWarning> = Vec::new();
         // The pin's deprecation warnings, logged while each command elaborates
         // (`Linter.checkDeprecated`). This thread's elaborations publish their uses here; the
         // uses of a command are read at the next step, before anything else runs, with the
@@ -3172,6 +3173,56 @@ impl Engine {
             })?;
         let base_logical_root = self.logical_root(options);
         let mut engine = self.clone();
+        // A real Lean module compiles ordinary declarations even when their
+        // values are never evaluated. Raw command/seed APIs keep their existing
+        // admission-and-evaluation contract; neither path runs a body here.
+        let check_compilation = |environment: &Environment,
+                                 admission: &DeclarationBatchAdmission,
+                                 index: usize,
+                                 at: fln_parse::BytePos,
+                                 scope: &fln_elab::source::scope::SourceScope|
+         -> Result<Vec<usize>, EngineExecutionError> {
+            if presentation == EvaluationPresentation::Lean && source_module.is_some() {
+                runtime::check_source_compiler_prerequisites(
+                    environment,
+                    admission,
+                    limits.ingress,
+                    scope.noncomputable_section,
+                )
+                .map_err(|error| EngineExecutionError::BatchCommand {
+                    index,
+                    error: Box::new(error),
+                    at: Some(at),
+                })
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let retain_noncomputable = |admission: &mut DeclarationBatchAdmission,
+                                    declarations: &[usize],
+                                    index: usize,
+                                    at: fln_parse::BytePos,
+                                    scope: &fln_elab::source::scope::SourceScope|
+         -> Result<(), EngineExecutionError> {
+            if declarations.is_empty() {
+                return Ok(());
+            }
+            for &declaration in declarations {
+                admission.engine.environment = source_records::tag_noncomputable(
+                    &admission.engine,
+                    &admission.admissions[declaration].declaration,
+                    &Name::anonymous(),
+                    scope,
+                )
+                .map_err(|error| EngineExecutionError::BatchCommand {
+                    index,
+                    error: Box::new(error),
+                    at: Some(at),
+                })?;
+            }
+            admission.result_logical_root = admission.engine.logical_root(options);
+            Ok(())
+        };
         // Lexical scopes (`namespace`, `section`, `open`, `open … in`), as `check-source`
         // keeps them: they change name resolution and declaration names, never the
         // environment. `open A in c` is the pin's `section open A c end`.
@@ -3741,6 +3792,34 @@ impl Engine {
                                 follows_output: true,
                             }),
                     );
+                    // Grammar declarations take this early route instead of ordinary declaration
+                    // admission. They still run the documentation linter under their own options.
+                    if linters::missing_docs_enabled(&scopes.current.options)
+                        && let Some(parsed) = grammar.declared_command()
+                    {
+                        let lints = linters::MissingDocs::new(engine.environment())
+                            .lint(parsed.syntax(), &scopes.current.options, &scopes.current)
+                            .map_err(|feature| EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(EngineExecutionError::NotImplemented { feature }),
+                                at: Some(original_offset),
+                            })?;
+                        syntax_documentation_warnings.extend(lints.into_iter().map(|lint| {
+                            SourceWarning {
+                                command_index,
+                                at: fln_parse::BytePos(
+                                    original_offset.0
+                                        + parsed
+                                            .source_view()
+                                            .to_original(fln_parse::BytePos(lint.at))
+                                            .0,
+                                ),
+                                message: lint.message,
+                                severity: SourceSeverity::Warning,
+                                follows_output: true,
+                            }
+                        }));
+                    }
                     grammar.extend_scopes(&mut scopes);
                     continue;
                 }
@@ -3926,7 +4005,8 @@ impl Engine {
                                 parsed.syntax().kind()
                                     == Some(&unused_variables::parser_kind(&["Command", kind]))
                             })
-                            || unused_variables::is_reduce(parsed.syntax()) =>
+                            || unused_variables::is_reduce(parsed.syntax())
+                            || linters::has_missing_docs_handler(parsed.syntax()) =>
                     {
                         (vec![(fln_parse::BytePos(0), parsed.syntax().clone())], None)
                     }
@@ -3950,7 +4030,9 @@ impl Engine {
                             syntax,
                             scope.options.clone(),
                             block,
-                            scope.clone(),
+                            // Documentation visibility is the lexical default, before this
+                            // declaration's explicit `public`/`private` modifier is applied.
+                            scopes.current.clone(),
                         ),
                     );
                 }
@@ -3972,7 +4054,7 @@ impl Engine {
                     // Public interfaces are fixed in the export world; a theorem
                     // alone checks its hidden proof privately before publication.
                     // Queries continue to observe the complete private world.
-                    let (next, admission) = match grammar
+                    let (mut next, mut admission) = match grammar
                         .enter(|| match expanded.take() {
                             Some(parsed) => public.admit_command_syntax(
                                 &engine,
@@ -4006,6 +4088,55 @@ impl Engine {
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     };
+                    let noncomputable = check_compilation(
+                        next.environment(),
+                        &admission,
+                        command_index,
+                        original_offset,
+                        &scope,
+                    )?;
+                    if !noncomputable.is_empty() {
+                        // Preserve the checked public/private split. Publish
+                        // only the new compiler-effect metadata into both
+                        // worlds; never replay the public axiom over a private
+                        // implementation or duplicate a private registration.
+                        let mut tagged_public = public.engine().clone();
+                        for &declaration in &noncomputable {
+                            tagged_public.environment = source_records::tag_noncomputable(
+                                &tagged_public,
+                                &admission.admissions[declaration].declaration,
+                                &Name::anonymous(),
+                                &scope,
+                            )
+                            .map_err(|error| EngineExecutionError::BatchCommand {
+                                index: command_index,
+                                error: Box::new(error),
+                                at: Some(original_offset),
+                            })?;
+                        }
+                        next = match public.publish(
+                            &next,
+                            tagged_public,
+                            Vec::new(),
+                            &scope,
+                            options,
+                        )? {
+                            Outcome::Complete(engine) => engine,
+                            Outcome::Inconclusive(reason) => {
+                                return Ok(Outcome::Inconclusive(reason));
+                            }
+                            Outcome::InternalFault(fault) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
+                        };
+                        retain_noncomputable(
+                            &mut admission,
+                            &noncomputable,
+                            command_index,
+                            original_offset,
+                            &scope,
+                        )?;
+                    }
                     engine = next;
                     scopes
                         .admitted_batch(
@@ -4045,7 +4176,7 @@ impl Engine {
                     // Keep complete mutual and standalone deriving groups on the existing two-checker
                     // admission path. Never publish members sequentially or treat
                     // declarations as VM executions merely to advance the stream.
-                    let admission = match grammar
+                    let mut admission = match grammar
                         .enter(|| match expanded.take() {
                             Some(parsed) => engine.admit_scoped_command_syntax_with_base(
                                 command_source,
@@ -4076,6 +4207,20 @@ impl Engine {
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     };
+                    let noncomputable = check_compilation(
+                        admission.engine.environment(),
+                        &admission,
+                        command_index,
+                        original_offset,
+                        &scope,
+                    )?;
+                    retain_noncomputable(
+                        &mut admission,
+                        &noncomputable,
+                        command_index,
+                        original_offset,
+                        &scope,
+                    )?;
                     scopes
                         .admitted_batch(&admission, admission.engine.environment(), None)
                         .map_err(|error| {
@@ -4458,7 +4603,7 @@ impl Engine {
                     || (scope.noncomputable_section
                         && parsed.kind() == fln_parse::SourceCommandKind::Definition)
                 {
-                    let (admission, traces) = match grammar
+                    let (mut admission, traces) = match grammar
                         .enter(|| {
                             if fln_elab::source::trace::contains_trace(parsed.syntax()) {
                                 engine
@@ -4522,6 +4667,20 @@ impl Engine {
                         command_index,
                         original_offset,
                         Some(&grammar.notations()),
+                    )?;
+                    let noncomputable = check_compilation(
+                        admission.engine.environment(),
+                        &admission,
+                        command_index,
+                        original_offset,
+                        &scope,
+                    )?;
+                    retain_noncomputable(
+                        &mut admission,
+                        &noncomputable,
+                        command_index,
+                        original_offset,
+                        &scope,
                     )?;
                     scopes
                         .admitted_batch(&admission, admission.engine.environment(), None)
@@ -4813,6 +4972,7 @@ impl Engine {
                         match source_records::declaration_is_proposition(
                             engine.environment(),
                             &definition.base,
+                            definition.safety == DefinitionSafety::Unsafe,
                             limits.kernel,
                         )
                         .map_err(|error| {
@@ -4977,6 +5137,20 @@ impl Engine {
                         admission.base_logical_root = auxiliaries.base_logical_root;
                         admission.admissions.splice(0..0, auxiliaries.admissions);
                     }
+                    let noncomputable = check_compilation(
+                        admission.engine.environment(),
+                        &admission,
+                        command_index,
+                        original_offset,
+                        &scope,
+                    )?;
+                    retain_noncomputable(
+                        &mut admission,
+                        &noncomputable,
+                        command_index,
+                        original_offset,
+                        &scope,
+                    )?;
                     scopes
                         .admitted_batch(&admission, admission.engine.environment(), None)
                         .map_err(|error| {
@@ -5308,6 +5482,7 @@ impl Engine {
                 deprecations.retain(|warning| warning.command_index < end);
                 instance_attribute_warnings.retain(|warning| warning.command_index < end);
                 macro_pattern_warnings.retain(|warning| warning.command_index < end);
+                syntax_documentation_warnings.retain(|warning| warning.command_index < end);
                 warning_sites.retain(|command, _| *command < end);
                 lint_sites.retain(|(command, _), _| *command < end);
                 exit_warning = exit_warning.filter(|warning| warning.command_index < end);
@@ -5395,12 +5570,26 @@ impl Engine {
             let mut warnings: Vec<SourceWarning> = deprecations;
             if pin_world {
                 warnings.extend(instance_attribute_warnings);
-                warnings.extend(macro_pattern_warnings);
                 warnings.extend(declaration_reducibility_warnings(
                     &lint_sites,
                     &linted,
                     engine.environment(),
                 ));
+                // The deprecated assignment note is an elaboration warning, before both
+                // `sorry` and the command's documentation/unused-variable linters.
+                for (&(command, _), (offset, syntax, options, _, _)) in &lint_sites {
+                    warnings.extend(
+                        linters::deprecated_assignment_syntax(syntax, options)
+                            .into_iter()
+                            .map(|lint| SourceWarning {
+                                command_index: command,
+                                at: fln_parse::BytePos(offset.0 + lint.at),
+                                message: lint.message,
+                                severity: SourceSeverity::Warning,
+                                follows_output: false,
+                            }),
+                    );
+                }
             }
             warnings.extend(sorry_commands.iter().copied().filter_map(|command| {
                 let &(offset, source, warn) = warning_sites.get(&command)?;
@@ -5416,9 +5605,52 @@ impl Engine {
                     follows_output: false,
                 })
             }));
+            // MissingDocs precedes the default-on linters, including across every member of
+            // a mutual block. It also runs in the source seed and on declarations using sorry.
+            warnings.extend(syntax_documentation_warnings);
+            let mut documentation = linters::MissingDocs::new(engine.environment());
+            for (&(command, _), (offset, syntax, options, _, scope)) in &lint_sites {
+                if guarded_errors
+                    .iter()
+                    .any(|error| error.command_index == command)
+                {
+                    continue;
+                }
+                let lints = documentation
+                    .lint(syntax, options, scope)
+                    .map_err(|feature| EngineExecutionError::BatchCommand {
+                        index: command,
+                        error: Box::new(EngineExecutionError::NotImplemented { feature }),
+                        at: Some(*offset),
+                    })?;
+                for lint in lints {
+                    let at = scope
+                        .source_site
+                        .as_ref()
+                        .and_then(|site| {
+                            site.view
+                                .from_original(*offset)
+                                .or_else(|| {
+                                    site.view.from_original(fln_parse::BytePos(offset.0 + 1))
+                                })
+                                .map(|start| {
+                                    site.view.to_original(fln_parse::BytePos(start.0 + lint.at))
+                                })
+                        })
+                        .unwrap_or(fln_parse::BytePos(offset.0 + lint.at));
+                    warnings.push(SourceWarning {
+                        command_index: command,
+                        at,
+                        message: lint.message,
+                        severity: SourceSeverity::Warning,
+                        follows_output: true,
+                    });
+                }
+            }
             // The pin's `linter.unusedVariables` runs after each command that logged no error and
             // contains no `sorry`.
             if pin_world {
+                warnings.extend(macro_pattern_warnings);
                 // Every constructor spelling, for telling a pattern variable from a constructor, and
                 // the indexed families' constructors with the fields a pattern leaves unread.
                 let spelling = |name: &Name| match name.leaf_view() {
@@ -5510,16 +5742,9 @@ impl Engine {
                             .collect(),
                         None => spellings.clone(),
                     };
-                    // In the pin's order: the `:=` note while the command elaborates (`sorry` does
-                    // not suppress it), then the unused-variables linter (skipped with `sorry`),
-                    // then `linter.defProp`.
+                    // The documentation linter ran above, before these default-on linters.
                     let declared = linted_declaration(syntax, &linted, command);
-                    let mut lints: Vec<linters::Lint> =
-                        linters::deprecated_assignment_syntax(syntax, options)
-                            .into_iter()
-                            .collect();
-                    // The `:=` note is logged while the command elaborates; the linters after it.
-                    let elaboration_notes = lints.len();
+                    let mut lints: Vec<linters::Lint> = Vec::new();
                     // The pin runs no linter after a command that logged an error.
                     let errored = guarded_errors
                         .iter()
@@ -5622,13 +5847,13 @@ impl Engine {
                             options,
                         ));
                     }
-                    for (index, lint) in lints.into_iter().enumerate() {
+                    for lint in lints {
                         warnings.push(SourceWarning {
                             command_index: command,
                             at: fln_parse::BytePos(offset.0 + lint.at),
                             message: lint.message,
                             severity: SourceSeverity::Warning,
-                            follows_output: index >= elaboration_notes,
+                            follows_output: true,
                         });
                     }
                 }
@@ -8865,6 +9090,8 @@ fn reproduced_warning(line: &str, environment: &Environment) -> bool {
             })
     };
     line == "warning: declaration uses `sorry`"
+        || line.starts_with("warning: missing doc string for ")
+        || line.starts_with("warning: empty doc string for ")
         || EXACT.contains(&line)
         || deprecated_constant()
         || line
@@ -9733,6 +9960,11 @@ pub enum EngineExecutionError {
     /// `#eval` of an expression that depends on `sorryAx`, which the pin refuses before running it
     /// (`addAndCompileExprForEval`, vendored `Lean/Elab/BuiltinEvalCommand.lean:104-113`).
     EvaluationDependsOnSorry,
+    /// Logical admission succeeded, but the source function's runtime signature
+    /// needs a compiler marker absent from this module's admitted import world.
+    MissingCompilerConstant {
+        name: Name,
+    },
     /// A `namespace`/`section`/`end`/`open` command the scope stack refused (an
     /// unmatched `end`, an unknown namespace), in the pin's words where it has them.
     ScopeTransition {
@@ -9887,6 +10119,9 @@ impl fmt::Display for EngineExecutionError {
                  lead to runtime instability and crashes.\n\nTo attempt to evaluate anyway \
                  despite the risks, use the '#eval!' command.",
             ),
+            Self::MissingCompilerConstant { name } => {
+                write!(formatter, "Unknown constant `{}`", name.to_display_string())
+            }
             Self::ScopeTransition { message } => formatter.write_str(message),
             Self::SourceScopeLimit { resource, limit } => {
                 write!(formatter, "source command exceeds {resource} limit {limit}")

@@ -236,6 +236,8 @@ pub enum SourceInferenceError {
     NoncomputableJournal(crate::noncomputable::NoncomputableError),
     ExternJournal(crate::externs::ExternError),
     ImplementedByJournal(crate::implemented_by::ImplementedByError),
+    MacroInlineJournal(crate::macro_inline::MacroInlineError),
+    InvalidMacroInlineProvenance,
     InvalidInstanceBinder,
     InstanceRegistry(crate::instances::InstanceRegistryError),
     Option(scope::options::OptionRefusal),
@@ -554,6 +556,10 @@ impl std::fmt::Display for SourceInferenceError {
             Self::NoncomputableJournal(error) => write!(f, "{error}"),
             Self::ExternJournal(error) => write!(f, "{error}"),
             Self::ImplementedByJournal(error) => write!(f, "{error}"),
+            Self::MacroInlineJournal(error) => write!(f, "{error}"),
+            Self::InvalidMacroInlineProvenance => {
+                f.write_str("malformed native macro-inline recursor provenance")
+            }
             Self::InvalidInstanceBinder => write!(
                 f,
                 "instance binder must end in a registered class with inferable parameters"
@@ -7186,24 +7192,25 @@ fn definition_elaboration(
     let is_axiom = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","axiom"]));
     if is_unsafe {
         // MutualDef.check at the pin forbids unsafe theorems and unsafe
-        // partial declarations. Opaque/axiom forms need a separate source
-        // door; do not accidentally give them recursive-definition machinery.
+        // partial declarations. An axiom uses only its header below; it must
+        // not acquire the recursive-definition state used by unsafe bodies.
         if is_theorem
             || is_opaque
-            || is_axiom
             || context
                 .partial
                 .as_ref()
                 .is_some_and(|state| state.kind != partial::Kind::Unsafe)
         {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "unsafe def, abbrev, or data instance without partial",
+                expected: "unsafe axiom, def, abbrev, or data instance without partial",
             });
         }
-        context.partial.get_or_insert(partial::State {
-            kind: partial::Kind::Unsafe,
-            ..partial::State::default()
-        });
+        if !is_axiom {
+            context.partial.get_or_insert(partial::State {
+                kind: partial::Kind::Unsafe,
+                ..partial::State::default()
+            });
+        }
     }
     if is_opaque {
         let parts = expect_node(
@@ -7475,7 +7482,7 @@ fn definition_elaboration(
             .is_some_and(|group| group.header_only)
     {
         let expected = expected.ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
-        return axiom_from_header(context, name, parameters, expected);
+        return axiom_from_header(context, name, parameters, expected, is_axiom && is_unsafe);
     }
     let theorem_section_parameters = if is_theorem {
         let mut roots: Vec<_> = parameters.iter().map(|local| local.type_.clone()).collect();
@@ -7782,12 +7789,11 @@ fn definition_elaboration(
         if scope::executable::registrations(syntax)?
             .iter()
             .all(scope::executable::Attribute::is_tag)
+            && !scope::simp::macro_inline(syntax)?
         {
             // Plain compiler/printer tags leave ordinary code eligibility intact.
-            // `[macro_inline]` generates no code (`shouldGenerateCode`), so neither is its
-            // `main` checked. A failed `main` check ends compilation before any other.
-            let main_failed = !scope::simp::macro_inline_requested(syntax)?
-                && context.check_main_type(name, &term.type_)?;
+            // A failed `main` check ends compilation before any other.
+            let main_failed = context.check_main_type(name, &term.type_)?;
             // The pin compiles the recursive pre-definition, not the logical
             // `WellFounded.fix` term whose accessibility proof is erased.
             // Keep self as a typed local while checking dependencies; only
@@ -7802,6 +7808,8 @@ fn definition_elaboration(
         } else {
             // The declared body remains fully typed and checked, but the pin
             // compiles the executable replacement instead of that logical body.
+            // Effective `[macro_inline]` declarations generate no standalone
+            // code; their unevaluated bodies are checked at compiled callers.
             context.validate_codegen_metadata()?;
         }
     }
@@ -7867,7 +7875,7 @@ fn definition_elaboration(
             .partial
             .as_ref()
             .is_some_and(|state| state.reference.is_some());
-        let definition = DefinitionVal {
+        let mut definition = DefinitionVal {
             base,
             value: term.value,
             hints: if recursive {
@@ -7880,6 +7888,10 @@ fn definition_elaboration(
             safety: DefinitionSafety::Unsafe,
             all: vec![name.clone()],
         };
+        if scope::simp::macro_inline(syntax)? {
+            definition.value = context
+                .mark_source_recursors(&definition.value, &context.source_recursors.clone())?;
+        }
         if context
             .partial
             .as_ref()
@@ -7903,7 +7915,7 @@ fn definition_elaboration(
             safety: DefinitionSafety::Partial,
         }]))
     } else {
-        let definition = DefinitionVal {
+        let mut definition = DefinitionVal {
             base,
             value: term.value,
             hints: if is_abbrev {
@@ -7916,6 +7928,10 @@ fn definition_elaboration(
         };
         context.equation_info =
             context.capture_equation_info(&definition, body, partial_captures.len())?;
+        if scope::simp::macro_inline(syntax)? {
+            definition.value = context
+                .mark_source_recursors(&definition.value, &context.source_recursors.clone())?;
+        }
         context.tick()?;
         Ok(Declaration::Defn(definition))
     }
@@ -7929,6 +7945,7 @@ fn axiom_from_header(
     name: &Name,
     mut parameters: Vec<LocalDecl>,
     expected: Expr,
+    is_unsafe: bool,
 ) -> Result<Declaration, NatDefinitionElabError> {
     context.resolve_instances(true)?;
     context.resume_postponed_eliminators(true)?;
@@ -7970,7 +7987,7 @@ fn axiom_from_header(
             level_params,
             type_,
         },
-        is_unsafe: false,
+        is_unsafe,
     }))
 }
 

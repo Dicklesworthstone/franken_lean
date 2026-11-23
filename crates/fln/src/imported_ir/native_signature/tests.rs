@@ -855,3 +855,554 @@ fn a_forged_native_body_cannot_replace_its_published_runtime_signature() {
     let compiled = compile_declarations(vec![array_entry(), forged]).unwrap();
     assert_nat(&compiled, "1");
 }
+
+#[test]
+fn imported_thunk_calls_accept_erased_types_and_boxed_partial_applications() {
+    for boxed in [false, true] {
+        let mut statements = vec![num(1, 42)];
+        for (target, input, output) in [("Thunk.pure", 1, 3), ("Thunk.get", 3, 5)] {
+            if boxed {
+                statements.push(bind(
+                    output - 1,
+                    IrExpr::Pap {
+                        function: Name::str(name(target), "_boxed"),
+                        args: vec![IrArg::Erased],
+                    },
+                ));
+                statements.push(bind(
+                    output,
+                    IrExpr::Ap {
+                        x: output - 1,
+                        args: vec![var(input)],
+                    },
+                ));
+            } else {
+                statements.push(bind(
+                    output,
+                    IrExpr::Fap {
+                        function: name(target),
+                        args: vec![IrArg::Erased, var(input)],
+                    },
+                ));
+            }
+        }
+        let compiled = compile_declarations(vec![entry(statements, 5)]).unwrap();
+        assert_nat(&compiled, "42");
+        assert_eq!(
+            compiled.native_externs(),
+            ["extern:Thunk.get", "extern:Thunk.pure"],
+            "boxed wrappers retain the same native primitives"
+        );
+    }
+}
+
+#[test]
+fn imported_thunk_creation_stays_lazy_and_boxed_forcing_caches_once() {
+    let body = IrDecl::Function {
+        name: name("Arity.force"),
+        params: (1..=2)
+            .map(|x| IrParam {
+                x,
+                borrow: false,
+                ty: IrType::TObject,
+            })
+            .collect(),
+        result: IrType::TObject,
+        body: IrBody {
+            stmts: vec![
+                call(3, "ST.Prim.Ref.get", &[1]),
+                num(4, 1),
+                call(5, "Nat.add", &[3, 4]),
+                call(6, "ST.Prim.Ref.set", &[1, 5]),
+            ],
+            terminal: Box::new(IrTerminal::Ret(var(5))),
+        },
+        sorry_dep: None,
+    };
+    for boxed in [false, true] {
+        let mut statements = vec![
+            num(1, 0),
+            call(2, "ST.Prim.mkRef", &[1]),
+            bind(
+                3,
+                IrExpr::Pap {
+                    function: name("Arity.force"),
+                    args: vec![var(2)],
+                },
+            ),
+        ];
+        if boxed {
+            statements.extend([
+                bind(
+                    4,
+                    IrExpr::Pap {
+                        function: name("Thunk.mk._boxed"),
+                        args: vec![IrArg::Erased],
+                    },
+                ),
+                bind(
+                    5,
+                    IrExpr::Ap {
+                        x: 4,
+                        args: vec![var(3)],
+                    },
+                ),
+            ]);
+        } else {
+            statements.push(bind(
+                5,
+                IrExpr::Fap {
+                    function: name("Thunk.mk"),
+                    args: vec![IrArg::Erased, var(3)],
+                },
+            ));
+        }
+        statements.extend([
+            call(6, "ST.Prim.Ref.get", &[2]),
+            bind(
+                7,
+                IrExpr::Pap {
+                    function: name("Thunk.get._boxed"),
+                    args: vec![IrArg::Erased],
+                },
+            ),
+            bind(
+                8,
+                IrExpr::Ap {
+                    x: 7,
+                    args: vec![var(5)],
+                },
+            ),
+            bind(
+                9,
+                IrExpr::Ap {
+                    x: 7,
+                    args: vec![var(5)],
+                },
+            ),
+            call(10, "ST.Prim.Ref.get", &[2]),
+            num(11, 10),
+            call(12, "Nat.mul", &[6, 11]),
+            call(13, "Nat.add", &[12, 8]),
+            call(14, "Nat.mul", &[13, 11]),
+            call(15, "Nat.add", &[14, 9]),
+            call(16, "Nat.mul", &[15, 11]),
+            call(17, "Nat.add", &[16, 10]),
+        ]);
+        let compiled = compile(
+            &[IrModule {
+                decls: vec![entry(statements, 17), body.clone()],
+                ..IrModule::default()
+            }],
+            &name("Arity.main"),
+            &[],
+            &VerifiedPartition::user_fixture(),
+            &BTreeSet::from([name("Arity.main"), name("Arity.force")]),
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        // Digits encode the captured cell before forcing, first and second
+        // results, and the cell afterwards. Eager construction gives 1111;
+        // repeated execution gives 122. Only lazy, cached forcing gives 111.
+        arrays_reference::assert_nat_replay(&compiled, "111");
+        assert_eq!(compiled.reference_functions().len(), 2);
+        assert!(
+            compiled
+                .reference_functions()
+                .iter()
+                .all(|function| function.producer() == "reference")
+        );
+    }
+}
+
+#[test]
+fn thunk_native_and_boxed_telescopes_remain_bound_to_the_generated_contract() {
+    for (target, parameter, result, borrowed) in [
+        ("Thunk.pure", IrType::TObject, IrType::Object, false),
+        ("Thunk.mk", IrType::TObject, IrType::Object, false),
+        ("Thunk.get", IrType::Object, IrType::TObject, true),
+    ] {
+        let row = crate::imported_ir::native_row(&name(target)).unwrap();
+        let bridge = BoxedNative::from_row(row).unwrap().unwrap();
+        assert_eq!(bridge.arity(), 2);
+        assert_eq!(bridge.runtime_parameters(), 1..2);
+        let params = vec![
+            IrParam {
+                x: 0,
+                ty: IrType::Erased,
+                borrow: false,
+            },
+            IrParam {
+                x: 1,
+                ty: parameter,
+                borrow: borrowed,
+            },
+        ];
+        validate_extern_signature(row, &params, &result).unwrap();
+        let boxed = IrDecl::Extern {
+            name: Name::str(name(target), "_boxed"),
+            params: vec![
+                IrParam {
+                    x: 0,
+                    ty: IrType::TObject,
+                    borrow: false,
+                },
+                IrParam {
+                    borrow: false,
+                    ..params[1].clone()
+                },
+            ],
+            result: result.clone(),
+            entries: vec![],
+        };
+        bridge.validate_declaration(&boxed).unwrap();
+        for index in 0..params.len() {
+            let mut wrong = params.clone();
+            wrong[index].borrow = !wrong[index].borrow;
+            assert!(matches!(
+                validate_extern_signature(row, &wrong, &result),
+                Err(IrExecutionError::NativeContract { .. })
+            ));
+            wrong = params.clone();
+            wrong[index].ty = IrType::UInt64;
+            assert!(matches!(
+                validate_extern_signature(row, &wrong, &result),
+                Err(IrExecutionError::NativeContract { .. })
+            ));
+        }
+        for changed in [
+            GeneratedExternRow {
+                symbol: "foreign_thunk",
+                ..*row
+            },
+            GeneratedExternRow { arity: 1, ..*row },
+            GeneratedExternRow { levels: 0, ..*row },
+            GeneratedExternRow {
+                effect: "task",
+                ..*row
+            },
+            GeneratedExternRow {
+                ownership: "rule(borrowed-args,owned-result)",
+                ..*row
+            },
+        ] {
+            assert!(matches!(
+                BoxedNative::from_row(&changed),
+                Err(IrExecutionError::NativeContract { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn thunk_erasure_cannot_hide_runtime_operands_or_rebind_native_wrappers() {
+    let produce = |type_arg| {
+        entry(
+            vec![
+                num(1, 42),
+                bind(
+                    2,
+                    IrExpr::Fap {
+                        function: name("Thunk.pure"),
+                        args: vec![type_arg, var(1)],
+                    },
+                ),
+                call(3, "Thunk.get", &[2]),
+            ],
+            3,
+        )
+    };
+    for type_arg in [var(1), var(999)] {
+        assert!(matches!(
+            compile_declarations(vec![produce(type_arg)]),
+            Err(IrExecutionError::Unsupported { .. })
+        ));
+    }
+    let mut forged = entry(vec![num(1, 999)], 1);
+    let IrDecl::Function {
+        name: target,
+        params,
+        result,
+        ..
+    } = &mut forged
+    else {
+        unreachable!()
+    };
+    *target = name("Thunk.pure._boxed");
+    *params = (2..=3)
+        .map(|x| IrParam {
+            x,
+            ty: IrType::TObject,
+            borrow: false,
+        })
+        .collect();
+    *result = IrType::Object;
+    let caller = entry(
+        vec![
+            num(1, 42),
+            bind(
+                2,
+                IrExpr::Fap {
+                    function: name("Thunk.pure._boxed"),
+                    args: vec![IrArg::Erased, var(1)],
+                },
+            ),
+            call(3, "Thunk.get", &[2]),
+        ],
+        3,
+    );
+    assert_nat(
+        &compile_declarations(vec![caller.clone(), forged.clone()]).unwrap(),
+        "42",
+    );
+    assert!(matches!(compile(
+        &[IrModule { decls: vec![caller, forged], ..IrModule::default() }],
+        &name("Arity.main"),
+        &[],
+        &VerifiedPartition::user_fixture(),
+        &BTreeSet::from([name("Arity.main"), name("Thunk.pure._boxed")]),
+        IrExecutionLimits::default(),
+    ), Err(IrExecutionError::UserOverridesCensus(found)) if found == name("Thunk.pure._boxed")));
+}
+
+#[test]
+fn live_pinned_thunk_ir_preserves_native_prototypes_laziness_and_boxed_calls() {
+    use crate::imported_ir::EntryArgument;
+    use fln_core::diag::ResourceReason;
+    use fln_core::outcome::InconclusiveCause;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let library = PathBuf::from(std::env::var_os("FLN_REFERENCE_LIB")?);
+            Some(library.parent()?.parent()?.join("bin/lean"))
+        });
+    let Some(reference) = reference else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "pinned Reference required for imported Thunk execution"
+        );
+        eprintln!("SKIP: imported Thunk execution requires FLN_REFERENCE_LEAN");
+        return;
+    };
+    let pin = include_str!("../../../../../SUITE.lock")
+        .lines()
+        .find(|line| line.starts_with("reference "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|part| part.strip_prefix("commit="))
+        })
+        .expect("SUITE.lock Reference commit");
+    let version = Command::new(&reference).arg("--githash").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(String::from_utf8(version.stdout).unwrap().trim(), pin);
+    let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = root.join(format!("thunk-reference-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = include_str!("../../../../fln-olean/fixtures/ir/NativeThunkModule.lean");
+    std::fs::write(directory.join("NativeThunkModule.lean"), source).unwrap();
+    let generated = Command::new(&reference)
+        .current_dir(&directory)
+        .args([
+            "-j1",
+            "-o",
+            "NativeThunkModule.olean",
+            "NativeThunkModule.lean",
+        ])
+        .output()
+        .unwrap();
+    std::fs::write(directory.join("compile.stdout"), &generated.stdout).unwrap();
+    std::fs::write(directory.join("compile.stderr"), &generated.stderr).unwrap();
+    assert!(
+        generated.status.success(),
+        "{directory:?}: {}{}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let module = crate::decode_ir_artifact(
+        &std::fs::read(directory.join("NativeThunkModule.ir")).unwrap(),
+        32 * 1024 * 1024,
+    )
+    .unwrap();
+    std::fs::write(directory.join("decoded-ir.txt"), format!("{module:#?}")).unwrap();
+    let users: BTreeSet<_> = module
+        .decls
+        .iter()
+        .filter(|declaration| matches!(declaration, IrDecl::Function { .. }))
+        .map(|declaration| declaration.name().clone())
+        .collect();
+    let partials: BTreeSet<_> = module
+        .decls
+        .iter()
+        .flat_map(|declaration| match declaration {
+            IrDecl::Function { body, .. } => body.bodies(),
+            IrDecl::Extern { .. } => Vec::new(),
+        })
+        .flat_map(|body| &body.stmts)
+        .filter_map(|statement| match statement {
+            IrStmt::VDecl {
+                expr: IrExpr::Pap { function, .. },
+                ..
+            } => Some(function.clone()),
+            _ => None,
+        })
+        .collect();
+    for target in ["Thunk.pure._boxed", "Thunk.get._boxed"] {
+        assert!(partials.contains(&name(target)), "{target} optimized away");
+    }
+
+    let library = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            reference
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("lib/lean")
+        });
+    let core = crate::decode_ir_artifact(
+        &std::fs::read(library.join("Init/Core.ir")).unwrap(),
+        32 * 1024 * 1024,
+    )
+    .unwrap();
+    let targets = ["Thunk.pure", "Thunk.mk", "Thunk.get"].map(name);
+    let prototypes = IrModule {
+        decls: core
+            .decls
+            .into_iter()
+            .filter(|declaration| {
+                targets.iter().any(|target| {
+                    declaration.name() == target
+                        || *declaration.name() == Name::str(target.clone(), "_boxed")
+                })
+            })
+            .collect(),
+        ..IrModule::default()
+    };
+    for target in &targets {
+        assert!(
+            prototypes
+                .decls
+                .iter()
+                .any(|declaration| declaration.name() == target)
+        );
+        assert!(!users.contains(target));
+    }
+    let cases: Vec<_> = [
+        "thunkDirect",
+        "thunkConstructor",
+        "thunkPure",
+        "thunkGet",
+        "thunkCaptured",
+    ]
+    .into_iter()
+    .flat_map(|target| {
+        [0, 42, u64::MAX]
+            .into_iter()
+            .map(move |value| (target, value))
+    })
+    .chain(std::iter::once(("thunkLazy", 0)))
+    .collect();
+    // The executable fixture needs only Core. The oracle's printed Nat
+    // results additionally need the upstream Repr instance.
+    let mut oracle_source = source.replacen(
+        "public import Init.Core",
+        "public import Init.Core\npublic meta import Init.Data.Repr",
+        1,
+    );
+    for (target, value) in &cases {
+        oracle_source.push_str(&format!("\n#eval {target} {value}\n"));
+    }
+    std::fs::write(directory.join("Oracle.lean"), oracle_source).unwrap();
+    let oracle = Command::new(&reference)
+        .current_dir(&directory)
+        .args(["-j1", "Oracle.lean"])
+        .output()
+        .unwrap();
+    std::fs::write(directory.join("oracle.stdout"), &oracle.stdout).unwrap();
+    std::fs::write(directory.join("oracle.stderr"), &oracle.stderr).unwrap();
+    assert!(
+        oracle.status.success(),
+        "{directory:?}: {}{}",
+        String::from_utf8_lossy(&oracle.stdout),
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+    let output = String::from_utf8(oracle.stdout).unwrap();
+    let expected: Vec<_> = output.lines().collect();
+    assert_eq!(expected.len(), cases.len(), "{output}");
+    for ((target, value), expected) in cases.into_iter().zip(expected) {
+        for include_prototypes in [false, true] {
+            let modules = if include_prototypes {
+                vec![module.clone(), prototypes.clone()]
+            } else {
+                vec![module.clone()]
+            };
+            let compiled = compile(
+                &modules,
+                &name(target),
+                &[EntryArgument::Nat(IrNat::Small(value))],
+                &VerifiedPartition::user_fixture(),
+                &users,
+                IrExecutionLimits::default(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("{target} {value}, prototypes={include_prototypes}: {error}; {directory:?}")
+            });
+            let constructor = if matches!(target, "thunkDirect" | "thunkPure") {
+                "extern:Thunk.pure"
+            } else {
+                "extern:Thunk.mk"
+            };
+            for native in [constructor, "extern:Thunk.get"] {
+                assert!(
+                    compiled.native_externs().iter().any(|row| row == native),
+                    "{target} no longer exercises {native}"
+                );
+            }
+            arrays_reference::assert_nat_replay(&compiled, expected);
+            assert!(
+                compiled
+                    .reference_functions()
+                    .iter()
+                    .all(|function| users.contains(&function.name))
+            );
+        }
+    }
+    let divergent = compile(
+        &[module, prototypes],
+        &name("thunkLazy"),
+        &[EntryArgument::Nat(IrNat::Small(1))],
+        &VerifiedPartition::user_fixture(),
+        &users,
+        IrExecutionLimits::default(),
+    )
+    .unwrap();
+    // Selecting the other branch forces the same diverging callback. It
+    // must stop under the VM budget; the unforced branch above returns 0.
+    let stopped = divergent.execute(
+        ExecutionLimits {
+            max_steps: 1_000,
+            ..ExecutionLimits::default()
+        },
+        None,
+    );
+    let Outcome::Inconclusive(inconclusive) = stopped.outcome else {
+        panic!("forcing the diverging thunk did not exhaust its budget");
+    };
+    let InconclusiveCause::ResourceExhausted { usage } = &inconclusive.cause else {
+        panic!("forcing the diverging thunk refused without running: {inconclusive:?}");
+    };
+    assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
+    assert_eq!(usage.allowed, 1_000);
+    assert!(usage.observed > usage.allowed);
+    eprintln!("Thunk Reference differential retained in {directory:?}");
+}

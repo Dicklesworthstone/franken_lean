@@ -392,6 +392,7 @@ fn outputs_under(
     std::fs::write(root.join(&entry), format!("{header}{program}")).unwrap();
     let run = |binary: &Path| {
         let output = Command::new(binary)
+            .arg("-j1")
             .arg(&entry)
             .current_dir(root)
             .env("LEAN_PATH", lib)
@@ -428,6 +429,128 @@ fn messages(output: &str) -> Vec<String> {
         }
     }
     messages
+}
+
+#[test]
+fn missing_docs_declarations_scopes_and_warning_order_match_the_pin() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "set_option linter.missingDocs true
+namespace Docs
+def missing (unused : Nat) : Nat := 0
+def «hello world» : Nat := 1
+/-- -/ abbrev Empty := Nat
+/-- documented -/ def documented : Nat := 2
+private def hidden : Nat := 3
+axiom Abstract : Type
+opaque opaqueValue : Nat := 4
+theorem exempt : 1 = 1 := rfl
+inductive Choice where
+  | first
+  /-- -/ | second
+  /-- documented -/ | third
+  | /-- -/ fourth
+/-- Pair. -/ structure Pair where
+  left : Nat
+  /-- -/ right : Nat
+  /-- documented -/ extra : Nat
+/-- Base. -/ structure Base where
+  /-- Value. -/ value : Nat
+/-- Child. -/ structure Child extends Base where
+  /-- -/ value := 2
+  added : Nat
+mutual
+  def one (x : Nat) : Nat := 0
+  def two (y : Nat) : Nat := 1
+end
+section
+set_option linter.missingDocs false
+def quiet : Nat := 0
+end
+set_option linter.missingDocs false in
+def scopedQuiet : Nat := 0
+open Nat in
+def visibleAgain : Nat := 0
+set_option linter.all false in
+def explicitSettingWins : Nat := 0
+def unfinished : Nat := sorry
+/--
+warning: missing doc string for public def guarded
+
+Note: This linter can be disabled with `set_option linter.missingDocs false`
+-/
+#guard_msgs in
+def guarded : Nat := 0
+end Docs
+";
+    let (ours, pin) = outputs(&lib, &root, "missing_docs_declarations", program);
+    assert_eq!(ours, pin, "{program}");
+    assert!(ours.contains("missing doc string for public def missing"));
+    assert!(ours.contains("empty doc string for public constructor Choice.second"));
+    assert!(!ours.contains("doc string for public field Child.value"));
+    assert!(!ours.contains("doc string for public def guarded"));
+}
+
+#[test]
+fn missing_docs_syntax_declarations_match_the_pin() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "set_option linter.missingDocs true
+syntax (name := fancy) \"fancy\" : term
+/-- -/ syntax \"emptyFancy\" : term
+syntax piece := ident
+declare_syntax_cat extra
+notation \"answer\" => 42
+infix:65 \" +++ \" => Nat.add
+macro (name := answerMacro) \"answerMacro\" : term => `(42)
+local notation \"localAnswer\" => 42
+/-- Documented. -/ notation \"documentedAnswer\" => 42
+set_option linter.missingDocs false in
+syntax \"quietFancy\" : term
+";
+    let (ours, pin) = outputs(&lib, &root, "missing_docs_syntax", program);
+    assert_eq!(ours, pin, "{program}");
+    assert_eq!(ours.matches("doc string for").count(), 7);
+}
+
+#[test]
+fn missing_docs_module_visibility_matches_the_pin() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "set_option linter.missingDocs true
+def hiddenByDefault : Nat := 0
+public def visible : Nat := 1
+public structure Visible where
+  field : Nat
+public inductive Pick where
+  | first
+public section
+/-- Published. -/ structure Published where
+  field : Nat
+inductive PublishedChoice where
+  | first
+private structure Private where
+  field : Nat
+end
+def hiddenAgain : Nat := 0
+";
+    let (ours, pin) = outputs_under(
+        &lib,
+        &root,
+        "missing_docs_visibility",
+        "module\nprelude\npublic import Init.Core\n",
+        program,
+    );
+    assert_eq!(ours, pin, "{program}");
+    assert_eq!(ours.matches("doc string for").count(), 6);
+    assert!(!ours.contains("doc string for public field Visible.field"));
+    assert!(!ours.contains("doc string for public constructor Pick.first"));
 }
 
 #[test]
