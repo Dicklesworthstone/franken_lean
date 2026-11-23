@@ -3567,9 +3567,111 @@ enum SameHeadArguments {
     Undecided,
 }
 
+/// Collect argument pairs to compare for two terms that share identical outer
+/// `(Apply args)` / `(Projection structure_name, index)` wrappers down to the
+/// same `Regular` definition at equal universe levels (Pin `is_def_eq_args`
+/// `type_checker.cpp:786` and `lazy_delta_proj_reduction` `type_checker.cpp:1037`).
+///
+/// Pairs are returned in last-to-first order (outermost trailing arguments
+/// first, then inner regular-application trailing arguments) so differing
+/// value/index arguments fail fast before leading typeclass instances are
+/// compared.
+fn collect_matching_regular_spine_args(
+    mut left: DefEqTerm,
+    mut right: DefEqTerm,
+    sources: TermSources<'_>,
+    context: &WhnfContext,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Option<Vec<(DefEqTerm, DefEqTerm)>>, SlowHalt> {
+    let mut arg_pairs = Vec::new();
+    let mut peeled_projection = false;
+    loop {
+        let (left_head, left_args) = collect_constructor_spine(left, sources, control, cancelled)?;
+        let (right_head, right_args) =
+            collect_constructor_spine(right, sources, control, cancelled)?;
+        if left_args.len() != right_args.len() {
+            return Ok(None);
+        }
+        for (&left_arg, &right_arg) in left_args.iter().zip(&right_args).rev() {
+            arg_pairs.push((left_arg, right_arg));
+        }
+        let left_arena = sources.source(left_head)?;
+        let right_arena = sources.source(right_head)?;
+        match (
+            left_arena.node(left_head.root),
+            right_arena.node(right_head.root),
+        ) {
+            (
+                Some(ExprNode::Projection {
+                    structure_name: left_struct,
+                    index: left_index,
+                    expression: left_expr,
+                }),
+                Some(ExprNode::Projection {
+                    structure_name: right_struct,
+                    index: right_index,
+                    expression: right_expr,
+                }),
+            ) if left_struct == right_struct && left_index == right_index => {
+                peeled_projection = true;
+                left = child(left_head, *left_expr)?;
+                right = child(right_head, *right_expr)?;
+            }
+            (
+                Some(ExprNode::Constant {
+                    name: left_name,
+                    levels: left_levels,
+                }),
+                Some(ExprNode::Constant {
+                    name: right_name,
+                    levels: right_levels,
+                }),
+            ) => {
+                if left_name != right_name || left_levels.len() != right_levels.len() {
+                    return Ok(None);
+                }
+                if arg_pairs.is_empty() && !peeled_projection {
+                    return Ok(None);
+                }
+                for (left_level, right_level) in left_levels.iter().zip(right_levels) {
+                    let equal = level_roots_equal(
+                        left_arena.levels(),
+                        *left_level,
+                        right_arena.levels(),
+                        *right_level,
+                    )
+                    .map_err(|error| {
+                        SlowHalt::Fault(DefEqFault::Universe {
+                            left: left_head.location(),
+                            right: right_head.location(),
+                            error,
+                        })
+                    })?;
+                    if !equal {
+                        return Ok(None);
+                    }
+                }
+                let is_regular = context
+                    .constants()
+                    .find(left_name)
+                    .and_then(|constant| context.delta_body(constant))
+                    .map(|definition| matches!(definition.hint(), ReducibilityHint::Regular(_)))
+                    .unwrap_or(false);
+                if !is_regular {
+                    return Ok(None);
+                }
+                return Ok(Some(arg_pairs));
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
 /// Upstream Lean 4 / K1 equal-regular-definition shortcut:
-/// Before unfolding two applications of the SAME regular definition,
-/// check whether all arguments are definitionally equal.
+/// Before unfolding two applications (or identical-field projections thereof)
+/// of the SAME regular definition, check whether all arguments are
+/// definitionally equal (last-to-first, matching `type_checker.cpp:786`).
 /// If all arguments are defeq, congruence proves definitional equality
 /// directly, skipping delta reduction. Otherwise lazy delta continues with
 /// normal height ordering, unless an argument pair deferred and the scope
@@ -3588,73 +3690,19 @@ fn regular_same_head_apps_def_eq(
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<SameHeadArguments, SlowHalt> {
     let sources = TermSources::new(left, right, generated);
-    let (left_head, left_args) =
-        collect_constructor_spine(left_reference, sources, control, cancelled)?;
-    if left_args.is_empty() {
-        return Ok(SameHeadArguments::Unfold);
-    }
-    let sources = TermSources::new(left, right, generated);
-    let (right_head, right_args) =
-        collect_constructor_spine(right_reference, sources, control, cancelled)?;
-    if left_args.len() != right_args.len() {
-        return Ok(SameHeadArguments::Unfold);
-    }
-
-    let sources = TermSources::new(left, right, generated);
-    let left_arena = sources.source(left_head)?;
-    let right_arena = sources.source(right_head)?;
-    let (
-        Some(ExprNode::Constant {
-            name: left_name,
-            levels: left_levels,
-        }),
-        Some(ExprNode::Constant {
-            name: right_name,
-            levels: right_levels,
-        }),
-    ) = (
-        left_arena.node(left_head.root),
-        right_arena.node(right_head.root),
-    )
+    let Some(arg_pairs) = collect_matching_regular_spine_args(
+        left_reference,
+        right_reference,
+        sources,
+        context,
+        control,
+        cancelled,
+    )?
     else {
         return Ok(SameHeadArguments::Unfold);
     };
 
-    if left_name != right_name || left_levels.len() != right_levels.len() {
-        return Ok(SameHeadArguments::Unfold);
-    }
-
-    for (left_level, right_level) in left_levels.iter().zip(right_levels) {
-        let equal = level_roots_equal(
-            left_arena.levels(),
-            *left_level,
-            right_arena.levels(),
-            *right_level,
-        )
-        .map_err(|error| {
-            SlowHalt::Fault(DefEqFault::Universe {
-                left: left_reference.location(),
-                right: right_reference.location(),
-                error,
-            })
-        })?;
-        if !equal {
-            return Ok(SameHeadArguments::Unfold);
-        }
-    }
-
-    let is_regular = context
-        .constants()
-        .find(left_name)
-        .and_then(|constant| context.delta_body(constant))
-        .map(|definition| matches!(definition.hint(), ReducibilityHint::Regular(_)))
-        .unwrap_or(false);
-
-    if !is_regular {
-        return Ok(SameHeadArguments::Unfold);
-    }
-
-    for (&left_arg, &right_arg) in left_args.iter().zip(&right_args) {
+    for (left_arg, right_arg) in arg_pairs {
         let sources = TermSources::new(left, right, generated);
         let left_visible = eta_visible(left_arg, sources, control, cancelled)?;
         let right_visible = eta_visible(right_arg, sources, control, cancelled)?;
@@ -3726,7 +3774,8 @@ fn regular_same_head_apps_def_eq(
         // before, at an earlier unfolding step or deeper in a nested comparison.
         match memo.recall(&left_wire, &right_wire, scope.nat) {
             Some(Remembered::Equal) => continue,
-            Some(Remembered::NotProven) => return Ok(SameHeadArguments::Unfold),
+            Some(Remembered::NotEqual) => return Ok(SameHeadArguments::Unfold),
+            Some(Remembered::Deferred) => return Ok(SameHeadArguments::Undecided),
             None => {}
         }
         let remaining = control.remaining_defeq_budget();
@@ -3759,7 +3808,7 @@ fn regular_same_head_apps_def_eq(
             && let DefEqOutcome::Inconclusive(stop) = &outcome
         {
             control.absorb_defeq_progress(&stop_progress(stop));
-            memo.remember(left_wire, right_wire, scope.nat, Remembered::NotProven);
+            memo.remember(left_wire, right_wire, scope.nat, Remembered::Deferred);
             return Ok(SameHeadArguments::Undecided);
         }
         match outcome {
@@ -3769,14 +3818,12 @@ fn regular_same_head_apps_def_eq(
             }
             DefEqOutcome::NotEqual { progress, .. } => {
                 control.absorb_defeq_progress(&progress);
-                memo.remember(left_wire, right_wire, scope.nat, Remembered::NotProven);
+                memo.remember(left_wire, right_wire, scope.nat, Remembered::NotEqual);
                 return Ok(SameHeadArguments::Unfold);
             }
-            // Remembered as not proven: under `Defer` the first undecided
-            // argument ends the conversion, so only `Unfold` ever recalls it.
             DefEqOutcome::Deferred { progress, .. } => {
                 control.absorb_defeq_progress(&progress);
-                memo.remember(left_wire, right_wire, scope.nat, Remembered::NotProven);
+                memo.remember(left_wire, right_wire, scope.nat, Remembered::Deferred);
                 return Ok(SameHeadArguments::Undecided);
             }
             DefEqOutcome::Inconclusive(stop) => {

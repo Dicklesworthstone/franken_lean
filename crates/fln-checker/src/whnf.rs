@@ -3560,6 +3560,15 @@ impl<'a, 'c> Reducer<'a, 'c> {
         let (memo, bindings) = self.context.source.whnf_memo();
         let (delta_mode, budget) = (self.delta_mode, self.control.budget);
         if let Some((result, copied)) = memo.recall(&current.arena, delta_mode, &budget, bindings) {
+            if skipped_initial_copy && result.reductions == 0 && !result.has_auxiliary_work {
+                return Ok(WhnfCoreOutcome::Unchanged {
+                    steps: self.control.steps.saturating_add(result.steps),
+                    reductions: 0,
+                    delta_reductions: 0,
+                    has_auxiliary_work: false,
+                    string_progress: result.string_progress,
+                });
+            }
             return Ok(WhnfCoreOutcome::Complete { result, copied });
         }
         let input = Arc::clone(&current.arena);
@@ -5476,6 +5485,7 @@ fn is_already_whnf_core(
 ) -> Result<bool, Halt> {
     let mut head = root;
     let mut arg_count = 0_usize;
+    let mut inside_projection = false;
     loop {
         control.step(head.index(), cancelled)?;
         let node = arena
@@ -5496,21 +5506,43 @@ fn is_already_whnf_core(
                 arg_count = arg_count.saturating_add(1);
                 head = *function;
             }
+            ExprNode::Projection { expression, .. } => {
+                if expression.index() >= head.index() {
+                    return Err(Halt::Fault(WhnfFault::NonBackwardExpressionReference {
+                        input: 0,
+                        parent: head.index(),
+                        child: expression.index(),
+                    }));
+                }
+                inside_projection = true;
+                arg_count = 0;
+                head = *expression;
+            }
             ExprNode::Bound { .. }
             | ExprNode::Meta { .. }
             | ExprNode::Sort { .. }
             | ExprNode::Forall { .. }
-            | ExprNode::NatLiteral { .. }
-            | ExprNode::StringLiteral(_) => return Ok(true),
+            | ExprNode::NatLiteral { .. } => return Ok(true),
+            ExprNode::StringLiteral(_) => return Ok(!inside_projection),
             ExprNode::Lambda { .. } => return Ok(arg_count == 0),
             ExprNode::Free { name } => return Ok(!prepared.free_bindings.contains_key(name)),
             ExprNode::Constant { name, .. } => {
+                let entry = prepared.source.constants().find(name);
+                if inside_projection
+                    && (!prepared.projection_rules.is_empty()
+                        || entry.is_none()
+                        || entry.is_some_and(|e| {
+                            e.kind() == crate::environment::ConstantKind::Constructor
+                        }))
+                {
+                    return Ok(false);
+                }
+                let Some(entry) = entry else {
+                    return Ok(true);
+                };
                 if arg_count == 0 {
                     return Ok(true);
                 }
-                let Some(entry) = prepared.source.constants().find(name) else {
-                    return Ok(true);
-                };
                 if let Some(kind) = entry.quotient_kind() {
                     let major = match kind {
                         crate::environment::QuotientKind::Lift => Some(5_usize),
@@ -5539,7 +5571,7 @@ fn is_already_whnf_core(
                 }
                 return Ok(true);
             }
-            ExprNode::Metadata { .. } | ExprNode::Let { .. } | ExprNode::Projection { .. } => {
+            ExprNode::Metadata { .. } | ExprNode::Let { .. } => {
                 return Ok(false);
             }
         }

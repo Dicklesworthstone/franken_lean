@@ -408,3 +408,176 @@ fn same_projection_over_reducible_structures_reduces_before_congruence() {
         DefEqOutcome::NotEqual { .. }
     ));
 }
+
+#[test]
+fn same_projection_over_regular_head_closes_by_congruence_without_unfolding() {
+    // Pin `lazy_delta_proj_reduction` (type_checker.cpp:1037-1054): when both
+    // sides share the same `(structure_name, index)` projection over the same
+    // `Regular` definition head, equal arguments close the projection by
+    // congruence without unfolding the definition body, while differing
+    // arguments fall back to unfolding so discarded fields still reduce.
+    let struct_wire = checker_name("Pair");
+    let ctor_wire = checker_name("MkPair");
+    let induct_meta =
+        InductiveDeclaration::new(0, 0, Vec::new(), vec![ctor_wire.clone()], 0, false, false);
+    let ctor_meta = ConstructorDeclaration::new(struct_wire.clone(), 0, 0, 2);
+    let pair_body = Expr::lam(
+        name("a"),
+        Expr::sort(Level::zero()),
+        Expr::lam(
+            name("b"),
+            Expr::sort(Level::zero()),
+            Expr::app(
+                Expr::app(constant("MkPair"), Expr::bvar(1).unwrap()),
+                Expr::bvar(0).unwrap(),
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let context = definition_context(vec![
+        ConstantEntry::new(
+            struct_wire,
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&Expr::sort(Level::zero())),
+                ConstantSafety::Safe,
+                induct_meta,
+            ),
+        ),
+        ConstantEntry::new(
+            ctor_wire,
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&Expr::sort(Level::zero())),
+                ConstantSafety::Safe,
+                ctor_meta,
+            ),
+        ),
+        definition_entry(
+            "mkRec",
+            decoded(&pair_body),
+            ReducibilityHint::Regular(5),
+            DefinitionSafety::Safe,
+        ),
+    ]);
+
+    let call = |a: Expr, b: Expr| Expr::app(Expr::app(constant("mkRec"), a), b);
+    let beta_seven = Expr::app(identity(), nat_literal(7));
+
+    // Equal arguments after beta: closes by same-head projection congruence
+    // with ZERO delta unfolds of `mkRec`.
+    let lhs = decoded(&Expr::proj(
+        name("Pair"),
+        0,
+        call(beta_seven, nat_literal(1)),
+    ));
+    let rhs = decoded(&Expr::proj(
+        name("Pair"),
+        0,
+        call(nat_literal(7), nat_literal(1)),
+    ));
+    let progress = slow_equal(&lhs, &rhs, &context);
+    assert_eq!(
+        progress.delta_unfolds, 0,
+        "identical projection over same regular head must close without unfolding mkRec"
+    );
+
+    // Differing unused field: congruence fails fast on trailing arg (1 != 2),
+    // falls back to unfolding `mkRec` on both sides, and projects equal field 0.
+    let diff_left0 = decoded(&Expr::proj(
+        name("Pair"),
+        0,
+        call(nat_literal(7), nat_literal(1)),
+    ));
+    let diff_right0 = decoded(&Expr::proj(
+        name("Pair"),
+        0,
+        call(nat_literal(7), nat_literal(2)),
+    ));
+    let fallback = slow_equal(&diff_left0, &diff_right0, &context);
+    assert!(
+        fallback.delta_unfolds >= 2,
+        "differing discarded field must still fall back to unfolding mkRec"
+    );
+
+    // Differing projected field stays NotEqual.
+    let diff_left1 = decoded(&Expr::proj(
+        name("Pair"),
+        1,
+        call(nat_literal(7), nat_literal(1)),
+    ));
+    let diff_right1 = decoded(&Expr::proj(
+        name("Pair"),
+        1,
+        call(nat_literal(7), nat_literal(2)),
+    ));
+    assert!(matches!(
+        def_eq(
+            &diff_left1,
+            &diff_right1,
+            &context,
+            DefEqBudget::unlimited()
+        ),
+        DefEqOutcome::NotEqual { .. }
+    ));
+}
+
+#[test]
+fn regular_same_head_arguments_fail_fast_on_trailing_argument() {
+    // Pin `is_def_eq_args` (type_checker.cpp:786): check arguments last-to-first
+    // so differing trailing value/index arguments fail fast without unfolding
+    // an expensive leading typeclass-instance chain.
+    let mut entries = Vec::new();
+    entries.push(definition_entry(
+        "d0",
+        decoded(&nat_literal(0)),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    ));
+    for i in 1..=15_u32 {
+        entries.push(definition_entry(
+            &format!("d{i}"),
+            decoded(&constant(&format!("d{}", i - 1))),
+            ReducibilityHint::Regular(i + 1),
+            DefinitionSafety::Safe,
+        ));
+    }
+    let outer_body = Expr::lam(
+        name("inst"),
+        Expr::sort(Level::zero()),
+        Expr::lam(
+            name("tag"),
+            Expr::sort(Level::zero()),
+            Expr::bvar(0).unwrap(),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    entries.push(definition_entry(
+        "outer",
+        decoded(&outer_body),
+        ReducibilityHint::Regular(20),
+        DefinitionSafety::Safe,
+    ));
+    let context = definition_context(entries);
+
+    let lhs = decoded(&Expr::app(
+        Expr::app(constant("outer"), constant("d15")),
+        nat_literal(1),
+    ));
+    let rhs = decoded(&Expr::app(
+        Expr::app(constant("outer"), constant("d0")),
+        nat_literal(2),
+    ));
+    let outcome = def_eq(&lhs, &rhs, &context, DefEqBudget::unlimited());
+    match outcome {
+        DefEqOutcome::NotEqual { progress, .. } => {
+            assert_eq!(
+                progress.delta_unfolds, 2,
+                "trailing mismatch (1 != 2) must fail fast without unfolding leading d15..d1 chain"
+            );
+        }
+        other => panic!("expected NotEqual, got {other:?}"),
+    }
+}

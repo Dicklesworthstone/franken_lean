@@ -606,10 +606,33 @@ impl Probe<'_> {
         };
         let (left_head, left_arguments) = spine(left);
         let (right_head, right_arguments) = spine(right);
-        if left_arguments.is_empty() || left_arguments.len() != right_arguments.len() {
+        if left_arguments.len() != right_arguments.len() {
             return Ok(None);
         }
         self.tick()?;
+        if let (
+            Some(ExprNode::Projection {
+                structure_name: left_structure,
+                index: left_index,
+                expression: left_expr,
+            }),
+            Some(ExprNode::Projection {
+                structure_name: right_structure,
+                index: right_index,
+                expression: right_expr,
+            }),
+        ) = (left.node(left_head), right.node(right_head))
+            && left_structure == right_structure
+            && left_index == right_index
+        {
+            let mut pairs = Vec::with_capacity(1 + left_arguments.len());
+            pairs.push((*left_expr, *right_expr));
+            pairs.extend(left_arguments.into_iter().zip(right_arguments));
+            return Ok(Some(pairs));
+        }
+        if left_arguments.is_empty() {
+            return Ok(None);
+        }
         let same_head = match (left.node(left_head), right.node(right_head)) {
             (
                 Some(ExprNode::Constant {
@@ -1483,7 +1506,11 @@ impl Probe<'_> {
                     trail: trail.len(),
                 });
                 attempts += 1;
-                work.extend(obligations.into_iter().rev());
+                // Push in forward order so the LIFO stack compares trailing
+                // arguments first (matching `type_checker.cpp:786` `is_def_eq_args`),
+                // failing fast on differing value/index arguments before leading
+                // typeclass instances.
+                work.extend(obligations);
                 continue;
             }
             // Both witnesses must independently type-check as proofs. The two

@@ -22,7 +22,8 @@ use std::hash::{Hash, Hasher};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Remembered {
     Equal,
-    NotProven,
+    NotEqual,
+    Deferred,
 }
 
 struct Entry {
@@ -121,8 +122,8 @@ mod tests {
         let (one, two) = (nat(1), nat(2));
         assert_eq!(memo.recall(&one, &two, closed), None);
 
-        memo.remember(one.clone(), two.clone(), closed, Remembered::NotProven);
-        assert_eq!(memo.recall(&one, &two, closed), Some(Remembered::NotProven));
+        memo.remember(one.clone(), two.clone(), closed, Remembered::NotEqual);
+        assert_eq!(memo.recall(&one, &two, closed), Some(Remembered::NotEqual));
         assert_eq!(
             memo.recall(&two, &one, closed),
             None,
@@ -139,7 +140,7 @@ mod tests {
         assert_eq!(memo.recall(&one, &one, closed), Some(Remembered::Equal));
         assert_eq!(
             memo.recall(&one, &two, closed),
-            Some(Remembered::NotProven),
+            Some(Remembered::NotEqual),
             "a second pair leaves the first pair's answer alone"
         );
     }
