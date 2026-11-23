@@ -2056,17 +2056,21 @@ impl Admitted {
                 cancelled = cancelled || cancellation.is_some_and(CancellationProbe::is_cancelled);
 
                 // First settle any Phase-2 candidate whose dependency became
-                // non-assumable (failed/internal-fault/un-decodable) or was cancelled.
+                // non-assumable (failed/internal-fault/un-decodable) or was cancelled,
+                // including a module whose memory retry has not started yet.
                 let mut ready = Vec::new();
                 for &index in order {
                     if !phase2_candidates.contains(&index)
                         || phase2_decided[index]
                         || phase2_running[index]
-                        || retry_pending.contains(&(position[index], index))
                     {
                         continue;
                     }
                     if cancelled {
+                        retry_pending.remove(&(position[index], index));
+                        let elapsed = phase2_memory_retries[index]
+                            .take()
+                            .map_or(std::time::Duration::ZERO, |retry| retry.first_elapsed);
                         phase2_decided[index] = true;
                         release_consumers(
                             index,
@@ -2089,7 +2093,7 @@ impl Admitted {
                             assumes: Vec::new(),
                             assumed_declarations: 0,
                             k1_steps: 0,
-                            elapsed: std::time::Duration::ZERO,
+                            elapsed,
                             memory_retry: None,
                             decode_memory_retry: None,
                             memory: p1.memory.with_schedule_context(
@@ -2104,6 +2108,9 @@ impl Admitted {
                             cb(phase2_completed, phase2_total, &row);
                         }
                         phase2_rows[index] = Some(row);
+                        continue;
+                    }
+                    if retry_pending.contains(&(position[index], index)) {
                         continue;
                     }
                     let deps_done = dependencies[index]
@@ -2163,7 +2170,8 @@ impl Admitted {
                 }
 
                 // Isolated single-threaded memory retry once in-flight workers drain.
-                if isolated_running.is_none()
+                if !cancelled
+                    && isolated_running.is_none()
                     && in_flight == 0
                     && let Some((_, retry_idx)) = retry_pending.pop_first()
                 {
@@ -2370,10 +2378,10 @@ impl Admitted {
                     &mut phase2_payloads,
                     &mut phase2_envs,
                 );
-                done.row.memory = done.row.memory.with_schedule_context(
-                    estimated_bytes[idx],
-                    admission_deferrals[idx],
-                );
+                done.row.memory = done
+                    .row
+                    .memory
+                    .with_schedule_context(estimated_bytes[idx], admission_deferrals[idx]);
                 phase2_completed += 1;
                 if let Some(cb) = on_phase2.as_deref_mut() {
                     cb(phase2_completed, phase2_total, &done.row);

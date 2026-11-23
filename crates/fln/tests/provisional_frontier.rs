@@ -1195,3 +1195,113 @@ fn phase2_memory_admission_accounts_for_retained_rss_and_inflight_estimates() {
             .all(|row| row.memory.admission_deferrals == 0)
     );
 }
+
+#[test]
+fn phase2_cancellation_settles_a_pending_memory_retry_without_running_it() {
+    use std::sync::atomic::AtomicUsize;
+
+    let fixture = chain_fixture();
+    let inputs = to_inputs(&fixture);
+    let limits = limits_with_steps(120);
+    let options = KVMap::new();
+    let cancelled = AtomicBool::new(false);
+    let probe = FlagProbe(&cancelled);
+    let c_calls = AtomicUsize::new(0);
+    let d_calls = AtomicUsize::new(0);
+    let admitted = fln_admission::Admitted {
+        environment: Environment::new(),
+        checker_environment: None,
+        imported_modules: Default::default(),
+        imported_environment: None,
+        imported_module_dependencies: Default::default(),
+        executable_opaques: Default::default(),
+        runtime_initializers: Default::default(),
+        options: KVMap::new(),
+    };
+
+    let stopped = admitted
+        .check_olean_frontier_provisional_using(
+            &inputs,
+            limits,
+            jobs(4),
+            Some(&probe),
+            &mut |_| {},
+            fln_admission::FrontierRunHooks {
+                check: &|job| admitted.frontier_check_module(job, &options, limits),
+                decode: &|index| {
+                    if index == 2 && c_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                        // Phase 1 already decoded C. Cancel during its first
+                        // Phase-2 attempt, before the scheduler can enqueue the
+                        // memory retry. No timing or sibling ordering is involved.
+                        cancelled.store(true, Ordering::SeqCst);
+                        std::panic::panic_any(fln_admission::HostAllocationFailure {
+                            requested: 65_536,
+                        });
+                    }
+                    if index == 3 {
+                        d_calls.fetch_add(1, Ordering::SeqCst);
+                    }
+                    fln_admission::decode_olean_module_input(&inputs[index], limits)
+                },
+                memory: &fln_admission::HostProcessMemorySource,
+            },
+        )
+        .expect("cancellation must settle the queued retry without stalling");
+
+    assert_eq!(
+        c_calls.load(Ordering::SeqCst),
+        2,
+        "C's isolated retry must not start after cancellation was observed"
+    );
+    assert_eq!(
+        d_calls.load(Ordering::SeqCst),
+        1,
+        "D must not run in Phase 2 after its import was cancelled"
+    );
+    let counts = stopped.counts();
+    assert_eq!(counts.modules, 4);
+    assert_eq!(counts.accepted, 1);
+    assert_eq!(counts.inconclusive, 3);
+    assert_eq!(counts.accepted_under_assumptions, 0);
+    assert_eq!(counts.failed + counts.blocked + counts.internal_fault, 0);
+    assert!(!stopped.is_authoritative());
+    assert_eq!(stopped.exit_code(), 3);
+    for module in ["C", "D"] {
+        let row = stopped
+            .rows
+            .iter()
+            .find(|row| row.name == n(module))
+            .expect("every module has a row");
+        assert!(
+            matches!(
+                &row.verdict,
+                ProvisionalModuleVerdict::Inconclusive { reason, .. }
+                    if matches!(
+                        &reason.cause,
+                        fln_core::outcome::InconclusiveCause::Cancelled { .. }
+                    )
+            ),
+            "{module} must remain a typed cancellation: {:?}",
+            row.verdict
+        );
+        assert!(
+            row.memory_retry.is_none(),
+            "cancelling a queued retry must not claim a second attempt ran"
+        );
+    }
+
+    cancelled.store(false, Ordering::SeqCst);
+    let recovered = admitted
+        .check_olean_frontier_provisional_scheduled(
+            &inputs,
+            &options,
+            limits,
+            jobs(4),
+            Some(&probe),
+            &mut |_| {},
+        )
+        .expect("a fresh run after cancellation can explore the same closure");
+    assert_eq!(recovered.counts().accepted_under_assumptions, 2);
+    assert_eq!(recovered.counts().inconclusive, 1);
+    assert!(!recovered.is_authoritative());
+}
