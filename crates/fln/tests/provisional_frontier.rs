@@ -180,7 +180,7 @@ fn to_inputs(mods: &[(Name, Vec<u8>)]) -> Vec<OleanModuleInput<'_>> {
 
 type RowSignature = (String, u8, &'static str, Vec<String>, usize, Vec<String>);
 
-fn row_signature(frontier: &fln::ProvisionalFrontier) -> Vec<RowSignature> {
+fn row_signature<E>(frontier: &fln::ProvisionalFrontier<E>) -> Vec<RowSignature> {
     frontier
         .rows
         .iter()
@@ -1048,5 +1048,150 @@ fn phase2_host_allocation_failure_retries_isolated_and_never_deadlocks_workers()
         ),
         "BehindDoomed must settle cleanly as Blocked by Doomed: {:?}",
         behind.verdict
+    );
+}
+
+#[test]
+fn phase2_memory_admission_accounts_for_retained_rss_and_inflight_estimates() {
+    struct RetainedMemory {
+        phase2: AtomicBool,
+        limit: Option<u64>,
+    }
+
+    impl fln_admission::FrontierMemorySource for RetainedMemory {
+        fn sample(&self) -> fln_admission::FrontierMemorySample {
+            fln_admission::FrontierMemorySample {
+                // Model the import environments retained after Phase 1. Their
+                // bytes are absent from the new workers' closure reservations.
+                rss_bytes: if self.phase2.load(Ordering::SeqCst) {
+                    80
+                } else {
+                    0
+                },
+                limit_bytes: self.limit,
+            }
+        }
+
+        fn estimate_bytes(&self, _: usize, _: u64) -> u64 {
+            15
+        }
+    }
+
+    let mut fixture = chain_fixture();
+    // C and E become ready together once B has been explored. D consumes C's
+    // provisional environment, exercising reservation release across batches.
+    fixture.push((
+        n("E"),
+        encode_module(
+            &["B"],
+            &[safe_def(
+                "E.useB",
+                Expr::const_(n("A.P"), Vec::new()),
+                Expr::const_(n("B.heavy"), Vec::new()),
+            )],
+        ),
+    ));
+    let inputs = to_inputs(&fixture);
+    let limits = limits_with_steps(120);
+    let options = KVMap::new();
+    let admitted = fln_admission::Admitted {
+        environment: Environment::new(),
+        checker_environment: None,
+        imported_modules: Default::default(),
+        imported_environment: None,
+        imported_module_dependencies: Default::default(),
+        executable_opaques: Default::default(),
+        runtime_initializers: Default::default(),
+        options: KVMap::new(),
+    };
+    let run = |threads, limit| {
+        let memory = RetainedMemory {
+            phase2: AtomicBool::new(false),
+            limit,
+        };
+        let mut progress = BTreeMap::new();
+        let frontier = admitted
+            .check_olean_frontier_provisional_using_with_progress(
+                &inputs,
+                limits,
+                jobs(threads),
+                None,
+                &mut |event| {
+                    if matches!(
+                        event,
+                        fln::OleanFrontierEvent::Decided {
+                            position, total, ..
+                        } if position == total
+                    ) {
+                        memory.phase2.store(true, Ordering::SeqCst);
+                    }
+                },
+                Some(&mut |_, _, row| {
+                    assert!(
+                        progress
+                            .insert(row.name.clone(), row.memory.admission_deferrals)
+                            .is_none(),
+                        "each Phase-2 row is reported once"
+                    );
+                }),
+                fln_admission::FrontierRunHooks {
+                    check: &|job| admitted.frontier_check_module(job, &options, limits),
+                    decode: &|index| {
+                        fln_admission::decode_olean_module_input(&inputs[index], limits)
+                    },
+                    memory: &memory,
+                },
+            )
+            .expect("memory estimates must defer work without inventing a verdict");
+        let counts = frontier.counts();
+        assert_eq!(counts.modules, 5);
+        assert_eq!(counts.accepted, 1);
+        assert_eq!(counts.inconclusive, 1);
+        assert_eq!(counts.accepted_under_assumptions, 3);
+        assert_eq!(counts.failed + counts.blocked + counts.internal_fault, 0);
+        assert!(!frontier.is_authoritative());
+        assert!(
+            frontier
+                .phase1_rows
+                .iter()
+                .all(|row| row.memory.admission_deferrals == 0),
+            "the scheduling pressure begins in Phase 2"
+        );
+        for row in frontier.rows.iter().filter(|row| row.phase == 2) {
+            assert_eq!(row.memory.estimated_bytes, 15);
+            assert_eq!(
+                progress.get(&row.name),
+                Some(&row.memory.admission_deferrals),
+                "streamed and final memory attribution must agree"
+            );
+        }
+        frontier
+    };
+
+    let serial = run(1, Some(100));
+    let bounded = run(4, Some(100));
+    assert_eq!(row_signature(&serial), row_signature(&bounded));
+    assert!(
+        bounded
+            .rows
+            .iter()
+            .any(|row| row.memory.admission_deferrals > 0),
+        "80 retained + 15 reserved + 15 next exceeds 100, although live RSS alone does not"
+    );
+
+    // An idle worker must still try when its estimate alone exceeds the cap:
+    // only the actual decoder/checkers can produce a resource non-answer.
+    let below_retained = run(4, Some(10));
+    assert_eq!(row_signature(&serial), row_signature(&below_retained));
+
+    // Without a ceiling, --jobs keeps its ordinary parallel scheduling; there
+    // is no arbitrary Phase-2 cap masquerading as memory admission control.
+    let unbounded = run(4, None);
+    assert_eq!(row_signature(&serial), row_signature(&unbounded));
+    assert!(
+        unbounded
+            .rows
+            .iter()
+            .all(|row| row.memory.admission_deferrals == 0)
     );
 }

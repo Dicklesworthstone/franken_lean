@@ -1194,16 +1194,19 @@ fn phase2_error_verdict(error: OleanCheckError) -> ProvisionalModuleVerdict {
 fn phase2_guarded(
     base: &Environment,
     module_name: &Name,
-    work: Phase2Work,
+    mut work: Phase2Work,
     limits: OleanCheckLimits,
     decode: &(dyn Fn(usize) -> Result<DecodedOlean, OleanCheckError> + Sync),
 ) -> Phase2Done {
     let started = std::time::Instant::now();
     let index = work.index;
     let estimated_bytes = work.estimated_bytes;
-    let assumes = work.assumes.clone();
+    // This is reporting metadata; checking uses the provisional environment.
+    // Keep it outside the unwind boundary without cloning: cloning here could
+    // itself exhaust memory before the worker's guard was active.
+    let assumes = std::mem::take(&mut work.assumes);
     let policy = limits.admission.policy;
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let mut done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_phase2_module(base, module_name, work, limits, decode)
     }))
     .unwrap_or_else(|payload| {
@@ -1218,7 +1221,7 @@ fn phase2_guarded(
                 name: module_name.clone(),
                 phase: 2,
                 verdict: phase2_error_verdict(error),
-                assumes,
+                assumes: Vec::new(),
                 assumed_declarations: 0,
                 k1_steps: 0,
                 elapsed: started.elapsed(),
@@ -1238,7 +1241,9 @@ fn phase2_guarded(
             payload: None,
             final_env: None,
         }
-    })
+    });
+    done.row.assumes = assumes;
+    done
 }
 
 fn run_phase2_module(
@@ -1897,6 +1902,7 @@ impl Admitted {
         let threads = jobs.threads.get();
         let base_env = &self.environment;
         let decode = hooks.decode;
+        let memory = hooks.memory;
 
         std::thread::scope(|scope| -> Result<(), OleanCheckError> {
             let (work_tx, work_rx) = std::sync::mpsc::channel::<Phase2Work>();
@@ -2033,6 +2039,16 @@ impl Admitted {
             };
 
             let mut in_flight = 0_usize;
+            let mut in_flight_estimated_bytes = 0_u64;
+            let mut idle_rss_bytes = memory.sample().rss_bytes;
+            let estimated_bytes: Vec<u64> = phase1_by_index
+                .iter()
+                .map(|row| row.expect("phase1 row").memory.estimated_bytes)
+                .collect();
+            let mut admission_deferrals: Vec<u64> = phase1_by_index
+                .iter()
+                .map(|row| row.expect("phase1 row").memory.admission_deferrals)
+                .collect();
             let mut cancelled = false;
             let phase2_total = phase2_candidates.len();
             let mut phase2_completed = 0_usize;
@@ -2076,7 +2092,10 @@ impl Admitted {
                             elapsed: std::time::Duration::ZERO,
                             memory_retry: None,
                             decode_memory_retry: None,
-                            memory: p1.memory,
+                            memory: p1.memory.with_schedule_context(
+                                estimated_bytes[index],
+                                admission_deferrals[index],
+                            ),
                             policy_summary: CheckerPolicySummary::empty(limits.admission.policy),
                             unit_reports: Vec::new(),
                         };
@@ -2121,7 +2140,10 @@ impl Admitted {
                             elapsed: std::time::Duration::ZERO,
                             memory_retry: None,
                             decode_memory_retry: None,
-                            memory: p1.memory,
+                            memory: p1.memory.with_schedule_context(
+                                estimated_bytes[index],
+                                admission_deferrals[index],
+                            ),
                             policy_summary: CheckerPolicySummary::empty(limits.admission.policy),
                             unit_reports: Vec::new(),
                         };
@@ -2157,10 +2179,12 @@ impl Admitted {
                     phase2_running[retry_idx] = true;
                     isolated_running = Some(retry_idx);
                     in_flight = 1;
+                    in_flight_estimated_bytes = estimated_bytes[retry_idx];
                     if threads == 1 {
                         let mut done =
                             phase2_guarded(base_env, modules[retry_idx].name, work, limits, decode);
                         in_flight = 0;
+                        in_flight_estimated_bytes = 0;
                         isolated_running = None;
                         phase2_running[retry_idx] = false;
                         phase2_decided[retry_idx] = true;
@@ -2184,6 +2208,10 @@ impl Admitted {
                             &mut phase2_payloads,
                             &mut phase2_envs,
                         );
+                        done.row.memory = done.row.memory.with_schedule_context(
+                            estimated_bytes[retry_idx],
+                            admission_deferrals[retry_idx],
+                        );
                         phase2_completed += 1;
                         if let Some(cb) = on_phase2.as_deref_mut() {
                             cb(phase2_completed, phase2_total, &done.row);
@@ -2206,6 +2234,24 @@ impl Admitted {
                     if in_flight >= threads {
                         break;
                     }
+                    // Phase 1's retained import payloads remain resident here.
+                    // Account for that live baseline and reserve each in-flight
+                    // closure estimate before admitting another worker, just as
+                    // the authoritative frontier does. A lone module is always
+                    // allowed to try: an estimate is not a resource verdict.
+                    let sample = memory.sample();
+                    if in_flight == 0 {
+                        idle_rss_bytes = sample.rss_bytes;
+                    } else if let Some(limit_bytes) = sample.limit_bytes {
+                        let committed_bytes = sample
+                            .rss_bytes
+                            .max(idle_rss_bytes.saturating_add(in_flight_estimated_bytes));
+                        if committed_bytes.saturating_add(estimated_bytes[index]) > limit_bytes {
+                            admission_deferrals[index] =
+                                admission_deferrals[index].saturating_add(1);
+                            continue;
+                        }
+                    }
                     let work = build_work(
                         index,
                         base_env_consumers[index] > 0,
@@ -2217,10 +2263,14 @@ impl Admitted {
                     );
                     phase2_running[index] = true;
                     in_flight += 1;
+                    in_flight_estimated_bytes =
+                        in_flight_estimated_bytes.saturating_add(estimated_bytes[index]);
                     if threads == 1 {
                         let mut done =
                             phase2_guarded(base_env, modules[index].name, work, limits, decode);
                         in_flight -= 1;
+                        in_flight_estimated_bytes =
+                            in_flight_estimated_bytes.saturating_sub(estimated_bytes[index]);
                         phase2_running[index] = false;
                         phase2_decided[index] = true;
                         phase2_usable[index] = done.usable;
@@ -2239,6 +2289,10 @@ impl Admitted {
                             &mut phase1_accepted,
                             &mut phase2_payloads,
                             &mut phase2_envs,
+                        );
+                        done.row.memory = done.row.memory.with_schedule_context(
+                            estimated_bytes[index],
+                            admission_deferrals[index],
                         );
                         phase2_completed += 1;
                         if let Some(cb) = on_phase2.as_deref_mut() {
@@ -2272,6 +2326,8 @@ impl Admitted {
                     })?;
                 in_flight -= 1;
                 let idx = done.index;
+                in_flight_estimated_bytes =
+                    in_flight_estimated_bytes.saturating_sub(estimated_bytes[idx]);
                 phase2_running[idx] = false;
                 if done.host_memory_refusal
                     && isolated_running != Some(idx)
@@ -2313,6 +2369,10 @@ impl Admitted {
                     &mut phase1_accepted,
                     &mut phase2_payloads,
                     &mut phase2_envs,
+                );
+                done.row.memory = done.row.memory.with_schedule_context(
+                    estimated_bytes[idx],
+                    admission_deferrals[idx],
                 );
                 phase2_completed += 1;
                 if let Some(cb) = on_phase2.as_deref_mut() {

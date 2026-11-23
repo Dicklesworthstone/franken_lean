@@ -1,45 +1,70 @@
 name: Native checker frontier
-'on':
+
+on:
   push:
     branches: [main]
-    paths: ['.github/workflows/native-checker-frontier.yml']
+    paths:
+      - crates/fln-admission/**
+      - crates/fln/tests/provisional_frontier.rs
+      - Cargo.lock
+      - SUITE.lock
+      - rust-toolchain.toml
+      - .github/workflows/native-checker-frontier.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - crates/fln-admission/**
+      - crates/fln/tests/provisional_frontier.rs
+      - Cargo.lock
+      - SUITE.lock
+      - rust-toolchain.toml
+      - .github/workflows/native-checker-frontier.yml
   workflow_dispatch:
+
 permissions:
   contents: read
+
+concurrency:
+  group: native-checker-frontier-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  validated-source-objects:
+  frontier:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      contents: write
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Reproduce and validate the exact checker repair
-        shell: python
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CARGO_TARGET_DIR: ${{ runner.temp }}/checker-cycle-target
-          CARGO_BUILD_JOBS: 2
+      - name: Provision the locked suite dependency
+        run: bash scripts/ci/checkout_asupersync.sh
+      - name: Install the pinned toolchain
+        shell: bash
         run: |
-          import base64, hashlib, json, os, pathlib, subprocess, sys, urllib.request
-          sha = '1576bf8a2ce55bac015cb27e47d1c20f366f92dc'
-          request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha,
-              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-          with urllib.request.urlopen(request, timeout=60) as response:
-              blob = json.load(response)
-          assert blob['encoding'] == 'base64'
-          data = base64.b64decode(blob['content'])
-          assert hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest() == sha
-          target = pathlib.Path(os.environ['RUNNER_TEMP']) / 'checker-cycle-repair.py'
-          with target.open('xb') as output:
-              output.write(data)
-          subprocess.run([sys.executable, str(target)], check=True)
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: checker-cycle-evidence-${{ github.sha }}
-          path: ${{ runner.temp }}/checker-cycle-evidence
-          retention-days: 7
-          if-no-files-found: error
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          rustc --version
+      - name: Format the frontier implementation and regression tests
+        run: rustfmt --edition 2024 --check crates/fln-admission/src/provisional.rs crates/fln/tests/provisional_frontier.rs
+      - name: Check admission targets and provisional integration tests
+        if: ${{ !cancelled() }}
+        run: |
+          cargo check --locked -p fln-admission --all-targets
+          cargo check --locked -p fln --test provisional_frontier
+      - name: Test admission and provisional scheduling
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p fln-admission --no-fail-fast
+          cargo test --locked -p fln --test provisional_frontier --no-fail-fast
+      - name: Clippy admission targets and provisional integration tests
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy --locked -p fln-admission --all-targets -- -D warnings
+          cargo clippy --locked -p fln --test provisional_frontier -- -D warnings
