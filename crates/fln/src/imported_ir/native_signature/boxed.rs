@@ -96,7 +96,7 @@ impl BoxedNative {
             return Ok(None);
         };
         // These types come from the pin's actual extern declarations in
-        // Init.Prelude, Init.Data.Array.{Basic,Set} and ByteArray.Basic.
+        // Init.{Prelude,Core}, Init.Data.Array.{Basic,Set} and ByteArray.Basic.
         // The ABI row alone cannot distinguish Object/TObject/Tagged or
         // identify which scalar carrier the compiler must box.
         let (parameters, result): (&'static [IrType], &'static IrType) = match row.id {
@@ -132,6 +132,9 @@ impl BoxedNative {
                 &[IrType::Object, IrType::USize, IrType::TObject],
                 &IrType::Object,
             ),
+            "extern:Thunk.pure" => (&[IrType::TObject], &IrType::Object),
+            "extern:Thunk.mk" => (&[IrType::TObject], &IrType::Object),
+            "extern:Thunk.get" => (&[IrType::Object], &IrType::TObject),
             "extern:FloatArray.get" => (&[IrType::Object, IrType::TObject], &IrType::Float),
             "extern:FloatArray.set" => (
                 &[IrType::Object, IrType::TObject, IrType::Float],
