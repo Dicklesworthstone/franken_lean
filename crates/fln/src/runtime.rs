@@ -55,6 +55,10 @@ pub(super) struct Preparation<'a> {
     environment: &'a Environment,
     limits: IngressLimits,
     visited: usize,
+    /// Set only at construction of a source-signature prerequisite query,
+    /// before any type cache is populated. Ordinary executable preparation
+    /// keeps unsafe definitions opaque to type normalization.
+    compiler_signature_type_aliases: bool,
     // One immutable admitted environment per preparation; cache only successful reads.
     pub(super) externs: Option<fln_elab::externs::ExternTable>,
     implementations: Option<fln_elab::implemented_by::ImplementedByTable>,
@@ -174,6 +178,7 @@ impl<'a> Preparation<'a> {
             environment,
             limits,
             visited: 0,
+            compiler_signature_type_aliases: false,
             externs: None,
             implementations: None,
             name_model_checked: false,

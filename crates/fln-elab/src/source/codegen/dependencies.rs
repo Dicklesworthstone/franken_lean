@@ -16,12 +16,13 @@ pub(super) struct Dependencies {
     names: BTreeSet<Name>,
     implemented_by: ImplementedByTable,
     externs: ExternTable,
+    macro_inline: BTreeSet<Name>,
     well_founded: well_founded::Cache,
 }
 
 impl Dependencies {
     pub(super) fn read(context: &mut Context) -> Result<Self, NatDefinitionElabError> {
-        // Hold the same immutable snapshot across all three reads. Charge row
+        // Hold the same immutable snapshot across the journal reads. Charge row
         // visits and payload bytes before the decoder can allocate their names.
         let logical = context.txn.env.clone();
         let provider = context.source_scope.computability.clone();
@@ -75,13 +76,74 @@ impl Dependencies {
                     failure(SourceInferenceError::ExternJournal(error))
                 }
             })?;
+        if let Some(extension) = env.extension(&crate::macro_inline::journal_name()) {
+            charge(extension.len())?;
+            for entry in extension.entries() {
+                charge(entry.payload.len())?;
+            }
+        }
+        let macro_inline = crate::macro_inline::read(&env).map_err(|error| match error {
+            crate::macro_inline::MacroInlineError::Limit => {
+                failure(SourceInferenceError::ResourceLimit)
+            }
+            error => failure(SourceInferenceError::MacroInlineJournal(error)),
+        })?;
         Ok(Self {
             environment: env,
             names,
             implemented_by,
             externs,
+            macro_inline,
             well_founded: well_founded::Cache::default(),
         })
+    }
+
+    /// LCNF.macroInline precedes executable dependency checking: instantiate
+    /// the tagged body's universes and beta-reduce its unevaluated arguments.
+    /// This grants no unfolding to an ordinary definition or logical reducer.
+    pub(super) fn expand_macro_inline(
+        &self,
+        context: &mut Context,
+        declaration: &Name,
+        levels: &[Level],
+        arguments: &[Expr],
+        named: &[Name],
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        if !self.macro_inline.contains(declaration) {
+            return Ok(None);
+        }
+        let Some(ConstantInfo::Defn(definition)) = self.environment.find(declaration) else {
+            return Err(failure(SourceInferenceError::MacroInlineJournal(
+                crate::macro_inline::MacroInlineError::NotADefinition(declaration.clone()),
+            )));
+        };
+        if definition.base.level_params.len() != levels.len() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let mut body =
+            context.instantiate_params(&definition.value, &definition.base.level_params, levels)?;
+        let mut rest = arguments.iter();
+        for argument in rest.by_ref() {
+            context.tick()?;
+            let argument = context.mark_source_recursors(argument, named)?;
+            while let ExprNode::MData { data, expr } = body.node() {
+                if context.has_source_rec_provenance(data)? {
+                    break;
+                }
+                context.tick()?;
+                body = expr.clone();
+            }
+            let ExprNode::Lam { body: next, .. } = body.node() else {
+                body = Expr::app(body, argument);
+                break;
+            };
+            body = context.substitute(next, &argument)?;
+        }
+        for argument in rest {
+            context.tick()?;
+            body = Expr::app(body, context.mark_source_recursors(argument, named)?);
+        }
+        Ok(Some(body))
     }
 
     /// Check the terminal executable dependency without rewriting the checked term.
@@ -211,6 +273,108 @@ mod tests {
             is_unsafe: false,
         }))
         .unwrap()
+    }
+
+    fn definition(
+        env: &fln_env::environment::Environment,
+        label: &str,
+        type_: Expr,
+        value: Expr,
+    ) -> fln_env::environment::Environment {
+        env.add_decl(ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: n(label),
+                level_params: vec![],
+                type_,
+            },
+            value,
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![n(label)],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn macro_inline_expansion_checks_bodies_and_only_surviving_arguments() {
+        let nat = Expr::const_(n("Nat"), vec![]);
+        let bodyless = Expr::const_(n("bodyless"), vec![]);
+        let base = axiom_environment();
+        let bare = definition(&base, "inlineValue", nat.clone(), bodyless.clone());
+        let bare = crate::macro_inline::register(&bare, &n("inlineValue")).unwrap();
+        assert!(matches!(
+            Context::new(&bare, Budget::DEFAULT)
+                .check_definition_codegen(&term("inlineValue")),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::NoncomputableDependency(name)
+            )) if name == n("bodyless")
+        ));
+
+        let type_ = Expr::forall_e(n("unused"), nat.clone(), nat.clone(), BinderInfo::Default);
+        let value = Expr::lam(
+            n("unused"),
+            nat.clone(),
+            Expr::lit(fln_core::expr::Literal::Nat(
+                fln_core::expr::NatLit::from_u64(7),
+            )),
+            BinderInfo::Default,
+        );
+        let ordinary = definition(&base, "discard", type_, value);
+        let tagged = crate::macro_inline::register(&ordinary, &n("discard")).unwrap();
+        let application = Typed {
+            type_: nat,
+            value: Expr::app(Expr::const_(n("discard"), vec![]), bodyless),
+        };
+        assert_eq!(
+            Context::new(&tagged, Budget::DEFAULT).check_definition_codegen(&application),
+            Ok(false)
+        );
+        assert!(matches!(
+            Context::new(&ordinary, Budget::DEFAULT).check_definition_codegen(&application),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::NoncomputableDependency(name)
+            )) if name == n("bodyless")
+        ));
+    }
+
+    #[test]
+    fn macro_inline_metadata_and_cyclic_expansion_never_become_success() {
+        let nat = Expr::const_(n("Nat"), vec![]);
+        let body = Expr::let_e(
+            n("unused"),
+            nat.clone(),
+            Expr::const_(n("Nat.zero"), vec![]),
+            Expr::const_(n("inlineCycle"), vec![]),
+            false,
+        );
+        // Source admission forbids recursive macro-inline definitions. This
+        // deliberately forged table still cannot pass by revisiting a seen let.
+        let env = definition(&axiom_environment(), "inlineCycle", nat, body);
+        let env = crate::macro_inline::register(&env, &n("inlineCycle")).unwrap();
+        let mut context = Context::new(&env, Budget::DEFAULT);
+        context.txn.budget.max_heartbeats = 512;
+        context.source_scope.noncomputable_section = true;
+        let locals = context.txn.lctx.clone();
+        assert!(matches!(
+            context.check_definition_codegen(&term("inlineCycle")),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
+        assert_eq!(context.txn.lctx, locals);
+        assert_eq!(context.txn.env, env);
+
+        let broken = env
+            .push_extension_entry(&crate::macro_inline::journal_name(), b"bad".to_vec())
+            .unwrap();
+        let mut context = Context::new(&broken, Budget::DEFAULT);
+        context.source_scope.noncomputable_section = true;
+        assert!(matches!(
+            context.check_definition_codegen(&term("inlineCycle")),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::MacroInlineJournal(_)
+            ))
+        ));
     }
 
     #[test]

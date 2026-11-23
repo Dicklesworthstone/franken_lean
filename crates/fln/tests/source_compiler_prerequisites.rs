@@ -5,12 +5,13 @@
 
 #![forbid(unsafe_code)]
 
-use fln::source_check::modules::SourceModuleCheckError;
 use fln::source_check::modules::execution::{SourceProgramExecution, SourceProgramLimits};
-use fln::source_check::modules::imported::SourceOleanImport;
+use fln::source_check::modules::imported::{SourceOleanImport, SourceOleanImportLimits};
+use fln::source_check::modules::{SourceModuleCheckError, SourceModuleCheckLimits};
 use fln::{
     Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, EvaluationPresentation, KVMap,
-    Name, Outcome, SourceCheckLimits, SourceModuleInput,
+    Name, OleanCheckLimits, OleanModuleInput, OleanWriteBudget, Outcome, SourceCheckLimits,
+    SourceModuleInput,
 };
 
 const POLY: &str = "universe u\ndef ident (A : Type u) (x : A) : A := x\n";
@@ -56,7 +57,9 @@ fn missing(source: &str, marker: &str) {
     let error = run(source, limits()).expect_err("missing compiler prerequisite must fail");
     assert_eq!(error.disposition(), ("compilation", false, 1), "{error:?}");
     assert!(
-        error.to_string().contains(&format!("Unknown constant `{marker}`")),
+        error
+            .to_string()
+            .contains(&format!("Unknown constant `{marker}`")),
         "{source}\n{error:?}",
     );
 }
@@ -109,9 +112,8 @@ fn noncomputable_sections_record_only_actual_compiler_failures() {
             "{source}",
         );
     }
-    let use_outside = format!(
-        "prelude\n{ENUM}noncomputable section\n{POLY}end\ndef value : E := ident E E.a\n",
-    );
+    let use_outside =
+        format!("prelude\n{ENUM}noncomputable section\n{POLY}end\ndef value : E := ident E E.a\n",);
     let error = run(&use_outside, limits()).expect_err("the retained tag blocks later codegen");
     assert_eq!(error.disposition().2, 1, "{error:?}");
     assert!(error.to_string().contains("noncomputable"), "{error:?}");
@@ -214,6 +216,226 @@ fn closure_parameters_and_eliminated_body_binders_do_not_require_markers() {
 }
 
 #[test]
+fn compiler_type_aliases_preserve_concrete_carriers_and_erased_parameters() {
+    for declaration in [
+        "@[irreducible] def Data : Type := E\ndef ident (x : Data) : Data := x\n",
+        "unsafe def Data : Type := E\nunsafe def ident (x : Data) : Data := x\n",
+        "unsafe def Callback : Type := E → E\nunsafe def ignore (f : Callback) : E := E.a\n",
+        "unsafe def Callback : Type := E → E\nunsafe def ident (f : Callback) : Callback := f\n",
+        "universe u\nunsafe def Carrier (A : Type u) : Type u := A\nunsafe def ident (x : Carrier E) : Carrier E := x\n",
+        "axiom Q : Prop\nunsafe def P : Prop := Q\nunsafe def ident (p : P) : P := p\n",
+        "axiom Q : Prop\nunsafe def Predicate : E → Prop := fun _ => Q\nunsafe def ident (e : E) (p : Predicate e) : Predicate e := p\n",
+    ] {
+        accepted(&format!("prelude\n{ENUM}{declaration}"));
+    }
+
+    let predicate =
+        "unsafe def Predicate : Type 1 := E → Type\nunsafe def ignore (p : Predicate) : E := E.a\n";
+    missing(&format!("prelude\n{ENUM}{predicate}"), "lcErased");
+    accepted(&format!(
+        "prelude\n{ENUM}axiom lcErased : Type\n{predicate}"
+    ));
+
+    let abstract_alias =
+        "axiom A : Type\nunsafe def Data : Type := A\nunsafe def ident (x : Data) : Data := x\n";
+    missing(&format!("prelude\n{ENUM}{abstract_alias}"), "lcAny");
+    accepted(&format!(
+        "prelude\n{ENUM}axiom lcAny : Type\n{abstract_alias}"
+    ));
+    missing(
+        &format!("prelude\n{ENUM}opaque Data : Type := E\ndef ident (x : Data) : Data := x\n"),
+        "lcAny",
+    );
+}
+
+#[test]
+fn macro_inline_bodies_are_checked_when_a_runtime_caller_uses_them() {
+    let base = format!("prelude\n{ENUM}axiom value : E\n");
+    for declaration in [
+        "@[macro_inline] def f : E := value\n",
+        "@[noinline, macro_inline] def f : E := value\n",
+        "@[macro_inline] def discard (_ : E) : E := E.a\ndef use : E := discard value\n",
+    ] {
+        accepted(&format!("{base}{declaration}"));
+    }
+    for declaration in [
+        "def f : E := value\n",
+        "@[macro_inline] def f : E := value\ndef g : E := f\n",
+        "@[macro_inline, noinline] def f : E := value\n",
+        "@[macro_inline] def keep (x : E) : E := x\ndef use : E := keep value\n",
+    ] {
+        let source = format!("{base}{declaration}");
+        let error = run(&source, limits()).expect_err("a runtime entry cannot use the axiom");
+        assert_eq!(error.disposition().2, 1, "{error:?}");
+        assert!(
+            error.to_string().contains("noncomputable"),
+            "{source}\n{error:?}"
+        );
+        assert!(error.to_string().contains("value"), "{source}\n{error:?}");
+    }
+}
+
+#[test]
+fn macro_inline_recursors_follow_surviving_runtime_terms() {
+    let base = "prelude\ninductive N where | zero | succ (n : N)\n";
+    let recursor = "N.rec (motive := fun _ => N) N.zero (fun _ ih => ih) n";
+    let fold = format!("@[macro_inline] def fold (n : N) : N := {recursor}\n");
+    for declaration in [
+        fold.clone(),
+        format!(
+            "{fold}@[macro_inline] def discard (_ : N) : N := N.zero\ndef use (n : N) : N := discard (fold n)\n"
+        ),
+        format!(
+            "@[macro_inline] def discard (_ : N) : N := N.zero\n@[macro_inline] def fold (n : N) : N := discard ({recursor})\ndef use (n : N) : N := fold n\n"
+        ),
+        format!("{fold}def Proof (n : N) : Prop := (P : N → Prop) → P (fold n) → P (fold n)\n"),
+    ] {
+        accepted(&format!("{base}{declaration}"));
+    }
+    for (declaration, diagnostic) in [
+        (
+            format!("{fold}def use (n : N) : N := fold n\n"),
+            "does not support recursor",
+        ),
+        (
+            format!(
+                "@[macro_inline] def keep (x : N) : N := x\n@[macro_inline] def fold (n : N) : N := keep ({recursor})\ndef use (n : N) : N := fold n\n"
+            ),
+            "does not support recursor",
+        ),
+        (
+            "@[macro_inline] def fold (n : N) : N := N.recOn (motive := fun _ => N) n N.zero (fun _ ih => ih)\ndef use (n : N) : N := fold n\n".to_owned(),
+            "Failed to find LCNF signature",
+        ),
+    ] {
+        let source = format!("{base}{declaration}");
+        let error = run(&source, limits()).expect_err("the surviving recursor has no native entry");
+        assert_eq!(error.disposition().2, 1, "{error:?}");
+        assert!(error.to_string().contains(diagnostic), "{source}\n{error:?}");
+        assert!(error.to_string().contains("N.rec"), "{source}\n{error:?}");
+    }
+}
+
+#[test]
+fn macro_inline_source_recursors_retain_provenance_across_module_imports() {
+    let library = name("Library");
+    let main = name("Main");
+    let result = SourceOleanImport::empty(&KVMap::new())
+        .execute_lean_source_modules_with_presentation(
+            &[
+                SourceModuleInput {
+                    name: &library,
+                    source: b"prelude\ninductive N where | zero | succ (n : N)\n@[macro_inline] def fold (n : N) : N := N.rec (motive := fun _ => N) N.zero (fun _ ih => ih) n\n",
+                },
+                SourceModuleInput {
+                    name: &main,
+                    source: b"prelude\nimport Library\ndef use (n : N) : N := fold n\n",
+                },
+            ],
+            &main,
+            &KVMap::new(),
+            SourceProgramLimits::new(limits()),
+            None,
+            EvaluationPresentation::Lean,
+        );
+    let error = result.expect_err("an imported macro cannot hide its explicit recursor");
+    assert_eq!(error.disposition().2, 1, "{error:?}");
+    assert!(
+        error.to_string().contains("does not support recursor"),
+        "{error:?}",
+    );
+    assert!(error.to_string().contains("N.rec"), "{error:?}");
+    assert!(error.to_string().contains("Main"), "{error:?}");
+}
+
+#[test]
+fn macro_inline_recursors_survive_physical_olean_import_into_a_fresh_engine() {
+    let library = name("Library");
+    let main = name("Main");
+    let source = b"prelude\ninductive N where | zero | succ (n : N)\n@[macro_inline] def fold (n : N) : N := N.rec (motive := fun _ => N) N.zero (fun _ ih => ih) n\n";
+    let artifacts = Engine::builder()
+        .build_empty()
+        .compile_source_modules(
+            &[SourceModuleInput {
+                name: &library,
+                source,
+            }],
+            &library,
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(EngineAdmissionLimits::new(
+                limits().kernel,
+            ))),
+            OleanWriteBudget::default(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .artifacts;
+    let inputs: Vec<_> = artifacts
+        .iter()
+        .map(|artifact| OleanModuleInput {
+            name: &artifact.name,
+            artifact: &artifact.bytes,
+            server_artifact: artifact
+                .companions
+                .as_ref()
+                .map(|parts| parts.server.as_slice()),
+            private_artifact: artifact
+                .companions
+                .as_ref()
+                .map(|parts| parts.private.as_slice()),
+        })
+        .collect();
+    // The producer engine has been dropped. Only physical module bytes cross
+    // this boundary, including the macro tag and the expression's provenance.
+    let imported = Engine::builder()
+        .build_empty()
+        .import_olean_modules_for_source(
+            &inputs,
+            std::slice::from_ref(&library),
+            &KVMap::new(),
+            SourceOleanImportLimits::new(OleanCheckLimits::new(4 * 1024 * 1024, limits().kernel)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    for (source, rejects) in [
+        (
+            "prelude\nimport Library\ndef use (n : N) : N := fold n\n",
+            true,
+        ),
+        (
+            "prelude\nimport Library\ndef Proof (n : N) : Prop := (P : N → Prop) → P (fold n) → P (fold n)\n",
+            false,
+        ),
+    ] {
+        let result = imported.execute_lean_source_modules_with_presentation(
+            &[SourceModuleInput {
+                name: &main,
+                source: source.as_bytes(),
+            }],
+            &main,
+            &KVMap::new(),
+            SourceProgramLimits::new(limits()),
+            None,
+            EvaluationPresentation::Lean,
+        );
+        if rejects {
+            let error =
+                result.expect_err("physical import cannot lose explicit recursor provenance");
+            assert_eq!(error.disposition().2, 1, "{error:?}");
+            assert!(
+                error.to_string().contains("does not support recursor"),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains("N.rec"), "{error:?}");
+        } else {
+            result.unwrap().into_complete().unwrap();
+        }
+    }
+}
+
+#[test]
 fn public_module_declarations_observe_the_same_compiler_boundary() {
     missing(
         "module\nprelude\nuniverse u\npublic def ident (A : Type u) (x : A) : A := x\n",
@@ -260,7 +482,11 @@ fn admitted_marker_imports_are_isolated_from_sibling_modules_and_failed_retries(
     for imports_markers in [false, true, false] {
         let consumer_source = format!(
             "prelude\n{}{POLY}",
-            if imports_markers { "import Markers\n" } else { "" },
+            if imports_markers {
+                "import Markers\n"
+            } else {
+                ""
+            },
         );
         let outcome = receipt.execute_lean_source_modules_with_presentation(
             &[
@@ -285,7 +511,14 @@ fn admitted_marker_imports_are_isolated_from_sibling_modules_and_failed_retries(
         );
         if imports_markers {
             let completed = outcome.unwrap().into_complete().unwrap();
-            let environment = completed.modules.last().unwrap().commands.batch.engine.environment();
+            let environment = completed
+                .modules
+                .last()
+                .unwrap()
+                .commands
+                .batch
+                .engine
+                .environment();
             assert!(environment.contains(&name("ident")));
             assert!(environment.contains(&name("lcAny")));
             assert!(environment.contains(&name("lcErased")));

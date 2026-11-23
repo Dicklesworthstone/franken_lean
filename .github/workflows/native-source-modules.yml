@@ -12,7 +12,9 @@ on:
       - 'crates/fln/src/linters.rs'
       - 'crates/fln/src/runtime.rs'
       - 'crates/fln/src/runtime/compiler_types.rs'
+      - 'crates/fln/src/runtime/specialize.rs'
       - 'crates/fln/src/source_check.rs'
+      - 'crates/fln/src/source_records.rs'
       - 'crates/fln/src/source_check/grammar.rs'
       - 'crates/fln/src/source_check/modules/**'
       - 'crates/fln/src/source_check/modules.rs'
@@ -32,6 +34,7 @@ on:
       - 'crates/fln/tests/source_module_visibility.rs'
       - 'crates/fln/tests/source_compiler_prerequisites.rs'
       - 'crates/fln/tests/source_set_option.rs'
+      - 'crates/fln/tests/source_unsafe_axioms.rs'
       - 'crates/fln-cli/src/source_check.rs'
       - 'crates/fln-cli/src/source_check/**'
       - 'examples/native_modules/**'
@@ -138,9 +141,11 @@ jobs:
           # Run the changed source paths before the broader module regressions.
           run_checks([
               ['cargo', 'test', '--locked', '-p', 'fln-elab', '--lib', 'source::scope::options', '--', '--nocapture', '--test-threads=1'],
-              ['cargo', 'test', '--locked', '-p', 'fln-elab', '--lib', 'source::codegen::types::tests', '--', '--nocapture', '--test-threads=1'],
+              ['cargo', 'test', '--locked', '-p', 'fln-elab', '--lib', 'macro_inline', '--', '--nocapture', '--test-threads=1'],
+              ['cargo', 'test', '--locked', '-p', 'fln', '--lib', 'runtime::compiler_types::tests', '--', '--nocapture', '--test-threads=1'],
+              ['cargo', 'test', '--locked', '-p', 'fln', '--lib', 'source_records::tests::unsafe_header_classification_preserves_errors_budget_and_safety', '--', '--exact', '--nocapture', '--test-threads=1'],
               ['cargo', 'test', '--locked', '-p', 'fln', '--lib', 'missing_docs', '--', '--nocapture', '--test-threads=1'],
-              ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_set_option', '--test', 'source_module_validation', '--test', 'source_compiler_prerequisites', '--no-fail-fast', '--', '--nocapture', '--test-threads=1'],
+              ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_set_option', '--test', 'source_module_validation', '--test', 'source_compiler_prerequisites', '--test', 'source_unsafe_axioms', '--no-fail-fast', '--', '--nocapture', '--test-threads=1'],
               ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'unused_variables_lint', '--test', 'source_noncomputable', '--test', 'source_compiler_prerequisites', '--no-fail-fast', '--', '--nocapture', '--test-threads=1'],
           ])
 

@@ -320,8 +320,9 @@ impl<'a> MissingDocs<'a> {
             .iter()
             .any(|kind| is_kind(command, &["Command", kind]))
         {
+            // `attrKind` uses Parser.Term.local for syntax declarations too.
             let local = syntax_at(command, &[2, 0, 0])
-                .is_some_and(|syntax| is_kind(syntax, &["Command", "local"]));
+                .is_some_and(|syntax| is_kind(syntax, &["Term", "local"]));
             let tactic_alt = ["syntax", "macro", "elab"]
                 .iter()
                 .any(|kind| is_kind(command, &["Command", kind]));
@@ -961,7 +962,7 @@ mod tests {
                 Some("empty doc string for public def value"),
             ),
             (
-                "/-- \n \t -/ def value := 1",
+                "/-- \n   -/ def value := 1",
                 Some("empty doc string for public def value"),
             ),
             ("/-- documented -/ def value := 1", None),
@@ -1061,7 +1062,22 @@ mod tests {
                 "macro (name := named) \"answer\" : term => `(42)",
                 Some("missing doc string for macro named"),
             ),
+            (
+                "notation \"answer\" => 42",
+                Some("missing doc string for notation"),
+            ),
+            (
+                "scoped notation \"answer\" => 42",
+                Some("missing doc string for notation"),
+            ),
             ("local notation \"answer\" => 42", None),
+            ("local infix:65 \" +++ \" => Nat.add", None),
+            ("local syntax \"fancy\" : term", None),
+            ("local macro \"answer\" : term => `(42)", None),
+            (
+                "local elab \"answer\" : term => pure (Lean.mkNatLit 42)",
+                None,
+            ),
             ("/-- documented -/ notation \"answer\" => 42", None),
             ("@[inherit_doc Nat.zero] syntax \"fancy\" : term", None),
         ] {

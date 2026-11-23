@@ -40,6 +40,10 @@ pub(crate) fn check(
     }
     let mut noncomputable = Vec::new();
     let mut preparation = Preparation::new(environment, limits);
+    // LCNF/Types.lean normalizes types with transparency `all`, including
+    // unsafe aliases. Fix the mode before any inference or memoized query;
+    // this preparation never compiles or evaluates executable values.
+    preparation.compiler_signature_type_aliases = true;
     let auxiliaries = preparation
         .compiler_aux_recursors()
         .map_err(EngineExecutionError::Ingress)?;
@@ -115,9 +119,8 @@ impl Preparation<'_> {
                 } => {
                     let marker = self.compiler_carrier_marker(binder_type, &context)?;
                     if parameter_missing.is_none() {
-                        parameter_missing = marker.filter(|marker| {
-                            !self.environment.contains(&marker.name())
-                        });
+                        parameter_missing =
+                            marker.filter(|marker| !self.environment.contains(&marker.name()));
                     }
                     self.proof_context_depth(context.len().saturating_add(1))?;
                     reserve(&mut context, self.limits.max_context_depth)?;
@@ -187,16 +190,16 @@ impl Preparation<'_> {
     fn compiler_macro_inline(&mut self, declaration: &Name) -> Result<bool, IngressError> {
         if self.macro_inline.is_none() {
             self.compiler_metadata_work(&fln_elab::macro_inline::journal_name())?;
-            self.macro_inline = Some(
-                fln_elab::macro_inline::read(self.environment).map_err(|error| match error {
+            self.macro_inline = Some(fln_elab::macro_inline::read(self.environment).map_err(
+                |error| match error {
                     fln_elab::macro_inline::MacroInlineError::Limit => {
                         IngressError::MetadataResourceExhausted {
                             kind: "native macro_inline journal capacity",
                         }
                     }
                     _ => unsupported("malformed native macro_inline journal"),
-                })?,
-            );
+                },
+            )?);
         }
         Ok(self
             .macro_inline
@@ -222,5 +225,78 @@ impl Preparation<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fln_core::level::Level;
+    use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
+
+    #[test]
+    fn compiler_type_transparency_is_isolated_and_resource_bounded() {
+        let proposition = Expr::sort(Level::zero());
+        let mut environment = Environment::new();
+        for (label, safety, value) in [
+            ("UnsafeAlias", DefinitionSafety::Unsafe, proposition.clone()),
+            (
+                "PartialAlias",
+                DefinitionSafety::Partial,
+                proposition.clone(),
+            ),
+            (
+                "RecursiveAlias",
+                DefinitionSafety::Unsafe,
+                Expr::const_(name("RecursiveAlias"), Vec::new()),
+            ),
+        ] {
+            environment = environment
+                .add_decl(ConstantInfo::Defn(DefinitionVal {
+                    base: ConstantVal {
+                        name: name(label),
+                        level_params: Vec::new(),
+                        type_: Expr::sort(Level::one()),
+                    },
+                    value,
+                    hints: ReducibilityHints::Opaque,
+                    safety,
+                    all: Vec::new(),
+                }))
+                .unwrap();
+        }
+        let alias = Expr::const_(name("UnsafeAlias"), Vec::new());
+        let partial = Expr::const_(name("PartialAlias"), Vec::new());
+        let mut ordinary = Preparation::new(&environment, IngressLimits::default());
+        assert_eq!(ordinary.type_head(&alias).unwrap(), alias);
+        let mut signature = Preparation::new(&environment, IngressLimits::default());
+        signature.compiler_signature_type_aliases = true;
+        assert_eq!(signature.type_head(&alias).unwrap(), proposition);
+        assert_eq!(signature.type_head(&partial).unwrap(), partial);
+        // Neither the admitted world nor an existing ordinary memo table was
+        // changed by the more transparent signature query.
+        assert_eq!(ordinary.type_head(&alias).unwrap(), alias);
+        assert_eq!(
+            Preparation::new(&environment, IngressLimits::default())
+                .type_head(&alias)
+                .unwrap(),
+            alias,
+        );
+
+        let mut bounded = Preparation::new(
+            &environment,
+            IngressLimits {
+                max_nodes: 64,
+                ..IngressLimits::default()
+            },
+        );
+        bounded.compiler_signature_type_aliases = true;
+        assert!(matches!(
+            bounded.type_head(&Expr::const_(name("RecursiveAlias"), Vec::new())),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                ..
+            }),
+        ));
     }
 }

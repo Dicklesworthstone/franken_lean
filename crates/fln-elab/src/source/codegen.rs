@@ -39,6 +39,7 @@ use fln_env::constants::ConstantInfo;
 use std::collections::{BTreeSet, HashSet};
 
 mod dependencies;
+mod provenance;
 mod types;
 
 #[cfg(test)]
@@ -320,17 +321,24 @@ impl Context {
             Visit(Expr),
             OpenLet(Name, Expr, Expr, Expr),
             Restore(LocalContext),
+            RestoreNames(Vec<Name>),
         }
         // Every binder is opened with a fresh local identity. Exact expression
         // keys therefore cannot confuse one de Bruijn node used in two scopes,
         // and retaining expressions prevents allocation-address reuse.
         let mut seen = HashSet::new();
         let mut work = vec![Work::Visit(value.clone())];
+        let mut active_named = named.to_vec();
         while let Some(task) = work.pop() {
             self.tick()?;
             let expr = match task {
                 Work::Restore(saved) => {
                     self.txn.lctx = saved;
+                    continue;
+                }
+                Work::RestoreNames(saved) => {
+                    active_named = saved;
+                    seen.clear();
                     continue;
                 }
                 Work::OpenLet(name, type_, value, body) => {
@@ -348,17 +356,41 @@ impl Context {
                 continue;
             }
             match expr.node() {
-                ExprNode::App { .. } | ExprNode::Const { .. } => {
+                ExprNode::App { .. } | ExprNode::Const { .. } | ExprNode::MData { .. } => {
                     let mut args = Vec::new();
                     let mut head = &expr;
-                    while let ExprNode::App { f, a } = head.node() {
+                    let mut explicit_rec = false;
+                    loop {
                         self.tick()?;
-                        args.push(a.clone());
-                        head = f;
+                        match head.node() {
+                            ExprNode::App { f, a } => {
+                                args.push(a.clone());
+                                head = f;
+                            }
+                            ExprNode::MData { data, expr } => {
+                                explicit_rec |= self.source_rec_provenance(data, expr)?;
+                                head = expr;
+                            }
+                            _ => break,
+                        }
                     }
                     args.reverse();
                     let mut erased_params = 0;
                     if let ExprNode::Const { name, levels } = head.node() {
+                        if let Some(inlined) = dependencies.expand_macro_inline(
+                            self,
+                            name,
+                            levels,
+                            &args,
+                            &active_named,
+                        )? {
+                            // Expansion can revisit any earlier body node.
+                            // Do not let memoization hide a forged inline cycle.
+                            seen.clear();
+                            work.push(Work::RestoreNames(std::mem::take(&mut active_named)));
+                            work.push(Work::Visit(inlined));
+                            continue;
+                        }
                         dependencies.check_compiled(self, name)?;
                         // Datatype parameters are static in both construction
                         // and elimination. Source match/cases lower to Rec here,
@@ -384,7 +416,12 @@ impl Context {
                             _ => 0,
                         }
                         .min(args.len());
-                        if named.contains(name) && self.compiled_application(name, levels, &args)? {
+                        if (active_named.contains(name)
+                            || (explicit_rec
+                                && !self.source_scope.frontier_recursors
+                                && !compiles(name)))
+                            && self.compiled_application(name, levels, &args)?
+                        {
                             if matches!(self.txn.env.find(name), Some(ConstantInfo::Defn(_))) {
                                 return Err(failure(SourceInferenceError::AuxiliaryNotCompiled(
                                     name.clone(),
@@ -436,7 +473,7 @@ impl Context {
                     ));
                     work.push(Work::Visit(value.clone()));
                 }
-                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                ExprNode::Proj { expr, .. } => {
                     work.push(Work::Visit(expr.clone()));
                 }
                 _ => {}

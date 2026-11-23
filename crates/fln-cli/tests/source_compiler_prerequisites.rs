@@ -66,9 +66,13 @@ fn reference() -> Option<&'static Path> {
 
 fn run(binary: &Path, source: &Path) -> Output {
     Command::new(binary)
+        .arg("-j1")
         .arg(source)
         .env_remove("LEAN_PATH")
-        .env("FLN_IMPORT_REUSE_DIR", source.parent().unwrap().join("records"))
+        .env(
+            "FLN_IMPORT_REUSE_DIR",
+            source.parent().unwrap().join("records"),
+        )
         .output()
         .unwrap()
 }
@@ -81,7 +85,10 @@ fn assert_result(output: &Output, code: i32, marker: Option<&str>, source: &str)
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        assert!(diagnostic.contains("Unknown constant"), "{source}\n{diagnostic}");
+        assert!(
+            diagnostic.contains("Unknown constant"),
+            "{source}\n{diagnostic}"
+        );
         assert!(diagnostic.contains(marker), "{source}\n{diagnostic}");
     }
 }
@@ -195,6 +202,78 @@ fn prelude_compiler_signatures_match_the_pinned_acceptance_controls() {
             None,
         ),
         (
+            "irreducible_alias",
+            format!("prelude\n{ENUM}@[irreducible] def Data : Type := E\ndef ident (x : Data) : Data := x\n"),
+            0,
+            None,
+        ),
+        (
+            "unsafe_alias",
+            format!("prelude\n{ENUM}unsafe def Data : Type := E\nunsafe def ident (x : Data) : Data := x\n"),
+            0,
+            None,
+        ),
+        (
+            "unsafe_callback_alias",
+            format!("prelude\n{ENUM}unsafe def Callback : Type := E → E\nunsafe def ignore (f : Callback) : E := E.a\n"),
+            0,
+            None,
+        ),
+        (
+            "unsafe_returned_callback_alias",
+            format!("prelude\n{ENUM}unsafe def Callback : Type := E → E\nunsafe def ident (f : Callback) : Callback := f\n"),
+            0,
+            None,
+        ),
+        (
+            "unsafe_generic_alias",
+            format!("prelude\n{ENUM}universe u\nunsafe def Carrier (A : Type u) : Type u := A\nunsafe def ident (x : Carrier E) : Carrier E := x\n"),
+            0,
+            None,
+        ),
+        (
+            "unsafe_proposition_alias",
+            format!("prelude\n{ENUM}axiom Q : Prop\nunsafe def P : Prop := Q\nunsafe def ident (p : P) : P := p\n"),
+            0,
+            None,
+        ),
+        (
+            "unsafe_predicate_alias",
+            format!("prelude\n{ENUM}axiom Q : Prop\nunsafe def Predicate : E → Prop := fun _ => Q\nunsafe def ident (e : E) (p : Predicate e) : Predicate e := p\n"),
+            0,
+            None,
+        ),
+        (
+            "unsafe_typeformer_alias",
+            format!("prelude\n{ENUM}unsafe def Predicate : Type 1 := E → Type\nunsafe def ignore (p : Predicate) : E := E.a\n"),
+            1,
+            Some("lcErased"),
+        ),
+        (
+            "unsafe_typeformer_alias_erased",
+            format!("prelude\n{ENUM}axiom lcErased : Type\nunsafe def Predicate : Type 1 := E → Type\nunsafe def ignore (p : Predicate) : E := E.a\n"),
+            0,
+            None,
+        ),
+        (
+            "unsafe_abstract_alias",
+            format!("prelude\n{ENUM}axiom A : Type\nunsafe def Data : Type := A\nunsafe def ident (x : Data) : Data := x\n"),
+            1,
+            Some("lcAny"),
+        ),
+        (
+            "unsafe_abstract_alias_any",
+            format!("prelude\n{ENUM}axiom lcAny : Type\naxiom A : Type\nunsafe def Data : Type := A\nunsafe def ident (x : Data) : Data := x\n"),
+            0,
+            None,
+        ),
+        (
+            "opaque_alias",
+            format!("prelude\n{ENUM}opaque Data : Type := E\ndef ident (x : Data) : Data := x\n"),
+            1,
+            Some("lcAny"),
+        ),
+        (
             "module",
             "module\nprelude\nuniverse u\npublic def ident (A : Type u) (x : A) : A := x\n".to_owned(),
             1,
@@ -211,6 +290,160 @@ fn prelude_compiler_signatures_match_the_pinned_acceptance_controls() {
         );
         if let Some(reference) = reference() {
             assert_result(&run(reference, &path), code, marker, &source);
+        }
+    }
+}
+
+#[test]
+fn macro_inline_runtime_dependencies_match_the_pin() {
+    let directory = Directory::new();
+    let cases = [
+        ("deferred", "@[macro_inline] def f : E := value\n", 0),
+        ("ordinary", "def f : E := value\n", 1),
+        (
+            "called",
+            "@[macro_inline] def f : E := value\ndef g : E := f\n",
+            1,
+        ),
+        (
+            "enabled_last",
+            "@[noinline, macro_inline] def f : E := value\n",
+            0,
+        ),
+        (
+            "disabled_last",
+            "@[macro_inline, noinline] def f : E := value\n",
+            1,
+        ),
+        (
+            "discarded_argument",
+            "@[macro_inline] def discard (_ : E) : E := E.a\ndef use : E := discard value\n",
+            0,
+        ),
+        (
+            "used_argument",
+            "@[macro_inline] def keep (x : E) : E := x\ndef use : E := keep value\n",
+            1,
+        ),
+    ];
+    for (label, declaration, code) in cases {
+        let source = format!("prelude\n{ENUM}axiom value : E\n{declaration}");
+        let path = directory.source(label, &source);
+        for binary in std::iter::once(Path::new(env!("CARGO_BIN_EXE_lean"))).chain(reference()) {
+            let output = run(binary, &path);
+            assert_result(&output, code, None, &source);
+            if code != 0 {
+                let diagnostic = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                assert!(
+                    diagnostic.contains("noncomputable"),
+                    "{source}\n{diagnostic}"
+                );
+                assert!(diagnostic.contains("value"), "{source}\n{diagnostic}");
+            }
+        }
+    }
+}
+
+#[test]
+fn macro_inline_recursors_and_erased_arguments_match_the_pin() {
+    let directory = Directory::new();
+    let base = "prelude\ninductive N where | zero | succ (n : N)\n";
+    let recursor = "N.rec (motive := fun _ => N) N.zero (fun _ ih => ih) n";
+    let fold = format!("@[macro_inline] def fold (n : N) : N := {recursor}\n");
+    let cases = [
+        ("standalone", fold.clone(), None),
+        (
+            "called",
+            format!("{fold}def use (n : N) : N := fold n\n"),
+            Some("does not support recursor"),
+        ),
+        (
+            "discarded_outer",
+            format!("{fold}@[macro_inline] def discard (_ : N) : N := N.zero\ndef use (n : N) : N := discard (fold n)\n"),
+            None,
+        ),
+        (
+            "discarded_inner",
+            format!("@[macro_inline] def discard (_ : N) : N := N.zero\n@[macro_inline] def fold (n : N) : N := discard ({recursor})\ndef use (n : N) : N := fold n\n"),
+            None,
+        ),
+        (
+            "proof_only",
+            format!("{fold}def Proof (n : N) : Prop := (P : N → Prop) → P (fold n) → P (fold n)\n"),
+            None,
+        ),
+        (
+            "argument_provenance",
+            format!("@[macro_inline] def keep (x : N) : N := x\n@[macro_inline] def fold (n : N) : N := keep ({recursor})\ndef use (n : N) : N := fold n\n"),
+            Some("does not support recursor"),
+        ),
+        (
+            "auxiliary",
+            "@[macro_inline] def fold (n : N) : N := N.recOn (motive := fun _ => N) n N.zero (fun _ ih => ih)\ndef use (n : N) : N := fold n\n".to_owned(),
+            Some("Failed to find LCNF signature"),
+        ),
+    ];
+    for (label, declaration, diagnostic) in cases {
+        let source = format!("{base}{declaration}");
+        let path = directory.source(label, &source);
+        for binary in std::iter::once(Path::new(env!("CARGO_BIN_EXE_lean"))).chain(reference()) {
+            let output = run(binary, &path);
+            assert_result(&output, i32::from(diagnostic.is_some()), None, &source);
+            if let Some(expected) = diagnostic {
+                let message = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                assert!(message.contains(expected), "{source}\n{message}");
+                assert!(message.contains("N.rec"), "{source}\n{message}");
+            }
+        }
+    }
+}
+
+#[test]
+fn macro_inline_generated_matches_do_not_inherit_discarded_recursors() {
+    let Some(library) = std::env::var_os("FLN_REFERENCE_LIB").map(PathBuf::from) else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "the pinned Reference library is required",
+        );
+        eprintln!("SKIP: set FLN_REFERENCE_LIB to the pinned lib/lean");
+        return;
+    };
+    let reference = reference().expect("the imported Prelude controls require the pinned oracle");
+    let directory = Directory::new();
+    let base = "prelude\nimport Init.Prelude\ninductive MacroChoice where | first | second\n@[macro_inline] def macroMatch (_ignored : MacroChoice) (e : MacroChoice) : MacroChoice :=\n match e with\n | .first => .second\n | .second => .first\n";
+    let recursor =
+        "MacroChoice.rec (motive := fun _ => MacroChoice) MacroChoice.first MacroChoice.second e";
+    for (label, caller) in [
+        (
+            "generated",
+            "def macroCaller (e : MacroChoice) : MacroChoice := macroMatch e e\n".to_owned(),
+        ),
+        (
+            "discarded",
+            format!(
+                "@[macro_inline] def macroExplicit (e : MacroChoice) : MacroChoice := macroMatch ({recursor}) e\ndef macroCaller (e : MacroChoice) : MacroChoice := macroExplicit e\n"
+            ),
+        ),
+    ] {
+        let source = format!("{base}{caller}");
+        let path = directory.source(label, &source);
+        for binary in [Path::new(env!("CARGO_BIN_EXE_lean")), reference] {
+            let output = Command::new(binary)
+                .arg("-j1")
+                .arg(&path)
+                .env("LEAN_PATH", &library)
+                .env("FLN_IMPORT_REUSE_DIR", directory.0.join("records"))
+                .output()
+                .unwrap();
+            assert_result(&output, 0, None, &source);
         }
     }
 }
@@ -268,7 +501,10 @@ fn unsupported_postponement_stops_before_a_compiler_marker_verdict() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    assert!(diagnostic.contains("compiler.postponeCompile"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("compiler.postponeCompile"),
+        "{diagnostic}"
+    );
     assert!(!diagnostic.contains("Unknown constant"), "{diagnostic}");
     // The native option remains unsupported. The pin accepts this declaration
     // while postponing compilation, so it must not become a marker rejection.

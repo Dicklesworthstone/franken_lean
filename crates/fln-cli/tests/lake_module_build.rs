@@ -1942,7 +1942,7 @@ fn opaque_module_ir_preserves_opacity_and_executes_in_the_pinned_reference() {
     for (declaration, diagnostic) in [
         (
             "public unsafe opaque Lib.unsafeValue : Nat := 9",
-            "expected unsafe def, abbrev, or data instance without partial",
+            "expected unsafe axiom, def, abbrev, or data instance without partial",
         ),
         (
             "public unsafe def Lib.unsafeValue : Nat := 9",

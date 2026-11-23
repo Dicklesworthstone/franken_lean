@@ -1312,7 +1312,13 @@ fn live_pinned_thunk_ir_preserves_native_prototypes_laziness_and_boxed_calls() {
     })
     .chain(std::iter::once(("thunkLazy", 0)))
     .collect();
-    let mut oracle_source = source.to_owned();
+    // The executable fixture needs only Core. The oracle's printed Nat
+    // results additionally need the upstream Repr instance.
+    let mut oracle_source = source.replacen(
+        "public import Init.Core",
+        "public import Init.Core\npublic meta import Init.Data.Repr",
+        1,
+    );
     for (target, value) in &cases {
         oracle_source.push_str(&format!("\n#eval {target} {value}\n"));
     }

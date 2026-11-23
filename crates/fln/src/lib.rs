@@ -4972,6 +4972,7 @@ impl Engine {
                         match source_records::declaration_is_proposition(
                             engine.environment(),
                             &definition.base,
+                            definition.safety == DefinitionSafety::Unsafe,
                             limits.kernel,
                         )
                         .map_err(|error| {

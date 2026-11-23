@@ -359,7 +359,22 @@ impl Preparation<'_> {
                         args.clear();
                         continue;
                     }
-                    if let Some(definition) = self.definition(name)
+                    let definition = self.definition(name).or_else(|| {
+                        // Source-signature prerequisites use the pinned
+                        // compiler's type transparency. This private mode is
+                        // never enabled for ordinary executable preparation;
+                        // Partial and Opaque declarations remain barriers.
+                        if self.compiler_signature_type_aliases
+                            && let Some(ConstantInfo::Defn(definition)) =
+                                self.environment.find(name)
+                            && definition.safety == DefinitionSafety::Unsafe
+                        {
+                            Some(definition.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(definition) = definition
                         && definition.base.level_params.len() == levels.len()
                     {
                         head = self.universe_instance(
