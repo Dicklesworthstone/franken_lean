@@ -438,12 +438,17 @@ pub fn registration(
         Syntax::Node { kind, .. } if kind == &parser_kind(&["Command", "definition"]) => {
             expect_node(&declaration[1], kind, 5, "definition")?
         }
+        Syntax::Node { kind, .. } if kind == &parser_kind(&["Command", "abbrev"]) => {
+            // Abbreviations use the same checked definition/unfold registry,
+            // but their syntax has no trailing deriving slot.
+            expect_node(&declaration[1], kind, 4, "abbreviation")?
+        }
         Syntax::Node { kind, .. } if kind == &parser_kind(&["Command", "theorem"]) => {
             expect_node(&declaration[1], kind, 4, "theorem")?
         }
         _ => {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "simp definition or theorem",
+                expected: "simp definition, abbreviation or theorem",
             });
         }
     };
@@ -924,11 +929,38 @@ fn read_state(env: &Environment) -> Result<SimpState, SimpSetError> {
     let mut erase_work = MAX_JOURNAL_BYTES;
     for (order, (row, validation)) in env.metadata_validation_entries(&expected.name).enumerate() {
         match decode_entry(&row.payload, order)? {
-            JournalEntry::Add { mut entry, .. } if entry.proof.is_none() => {
+            JournalEntry::Add {
+                mut entry,
+                snapshot,
+            } if entry.proof.is_none() => {
                 validate(validation, &entry.declaration, entry.reverse)?;
+                if matches!(snapshot, Some(export::Snapshot::Theorem { .. }))
+                    && let Some(ConstantInfo::Defn(definition)) =
+                        validation.find(&entry.declaration)
+                    && definition.safety == DefinitionSafety::Safe
+                {
+                    // A captured proof-valued definition selects its evidence,
+                    // not occurrences of its name to unfold. Reuse the bounded
+                    // proposition classifier so alias headers remain proofs;
+                    // a forged theorem snapshot cannot reclassify data.
+                    let mut meter = export::Meter {
+                        remaining: MAX_TYPE_STEPS,
+                        bytes: 0,
+                    };
+                    if !export::definition_type_is_proposition(
+                        validation,
+                        &definition.base.type_,
+                        &mut meter,
+                    )? {
+                        return Err(SimpSetError::Malformed);
+                    }
+                    entry.proof = Some(entry.declaration.clone());
+                }
                 entry.order = *positions
                     .entry((entry.declaration.clone(), entry.reverse))
                     .or_insert(order);
+                // This remains the ordinary source-origin slot. A later
+                // imported auxiliary group must replace it with remove(None).
                 active.insert(entry.declaration.clone(), BTreeMap::from([(None, entry)]));
             }
             JournalEntry::Erase(declaration) => {

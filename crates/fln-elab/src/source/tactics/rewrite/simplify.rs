@@ -2265,6 +2265,10 @@ fn simp_rule_keys(
         }
         // A refutation `p → False` loses its premise binder above; keep it unkeyed.
         ExprNode::Const { name, .. } if *name == named(&["False"]) => (None, None),
+        // A reducible conclusion may expose Eq/Iff instead of a proposition
+        // fact. Keying the whole reduced conclusion would then exclude its
+        // actual rewrite lhs. Leave that classification to the checked matcher.
+        ExprNode::Const { name, .. } if simp_key_unfolds(env, table, name) => (None, None),
         ExprNode::Const { .. } => (Some(body), None),
         _ => (None, None),
     };

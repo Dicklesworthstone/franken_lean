@@ -36,6 +36,213 @@ const WRAP: &str = "def wrap.{u} {A : Sort u} (x : A) : A := x\n\
     theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl\n";
 
 #[test]
+fn simp_abbreviations_publish_real_unfold_entries_without_equation_theorems() {
+    let base = engine();
+    let admitted = base
+        .admit_source_declaration(
+            b"@[simp 700] abbrev wrap.{u} {A : Sort u} (x : A) : A := x",
+            &KVMap::new(),
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(admitted.admissions.len(), 1);
+    assert!(
+        !admitted
+            .engine
+            .environment()
+            .contains(&Name::from_components(["wrap", "eq_1"])),
+        "reducible abbreviations register unfolding without generating equations",
+    );
+    let rows = simp::read(admitted.engine.environment()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].declaration, Name::from_components(["wrap"]));
+    assert_eq!(rows[0].priority, 700);
+    assert!(!rows[0].reverse);
+    let exported =
+        simp::export::registrations(base.environment(), admitted.engine.environment(), 1 << 20)
+            .unwrap();
+    assert!(matches!(
+        exported.entries.as_slice(),
+        [simp::export::Kind::Unfold(name)] if name == &Name::from_components(["wrap"])
+    ));
+    checked(
+        &admitted.engine,
+        &["theorem use (n : Nat) : wrap (wrap n) = n := by simp"],
+    );
+    assert!(simp::read(base.environment()).unwrap().is_empty());
+}
+
+#[test]
+fn simp_abbreviations_drive_checked_proofs_and_match_the_pin() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let lib = std::env::var_os("FLN_REFERENCE_LIB").map(PathBuf::from)?;
+            Some(lib.parent()?.parent()?.join("bin/lean"))
+        })
+        .filter(|path| path.is_file());
+    assert!(
+        reference.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "the pinned Reference is required for simp abbreviation controls",
+    );
+    if let Some(binary) = &reference {
+        let output = Command::new(binary).arg("--githash").output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "8c9756b28d64dab099da31a4c09229a9e6a2ef35",
+        );
+    } else {
+        eprintln!("SKIP: pinned Reference absent; native abbreviation controls still run");
+    }
+    let root = std::env::temp_dir().join(format!("fln-simp-abbrev-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let law = "axiom mystery : Nat → Nat\naxiom law (n : Nat) : mystery n = n\n";
+    let fact = "abbrev fact (n : Nat) : mystery n = n := law n\n";
+    let proof = "theorem works (n : Nat) : mystery n = n := by simp\n";
+    for (label, source, accepted) in [
+        ("tagged", format!("{law}@[simp] {fact}{proof}"), true),
+        (
+            "definition",
+            format!("{law}@[simp] def fact (n : Nat) : mystery n = n := law n\n{proof}"),
+            true,
+        ),
+        (
+            "aliased_proof",
+            format!("{law}abbrev Relation (n : Nat) : Prop := mystery n = n\n@[simp] def fact (n : Nat) : Relation n := law n\n{proof}"),
+            true,
+        ),
+        (
+            "aliased_theorem",
+            format!("{law}abbrev Relation (n : Nat) : Prop := mystery n = n\n@[simp] theorem fact (n : Nat) : Relation n := law n\n{proof}"),
+            true,
+        ),
+        ("missing", format!("{law}{fact}{proof}"), false),
+        (
+            "erased",
+            format!("{law}@[simp] {fact}attribute [-simp] fact\n{proof}"),
+            false,
+        ),
+        (
+            "data",
+            "@[simp 700] abbrev wrap.{u} {A : Sort u} (x : A) : A := x\ntheorem use (n : Nat) : wrap (wrap n) = n := by simp\n".to_owned(),
+            true,
+        ),
+        (
+            "reverse_data",
+            "@[simp ←] abbrev shifted (n : Nat) : Nat := n + 1\n".to_owned(),
+            false,
+        ),
+    ] {
+        let base = engine();
+        let before = base.logical_root(&KVMap::new());
+        let result = base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        );
+        if accepted {
+            let complete = result
+                .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+                .into_complete()
+                .expect("both native checkers finish the proof");
+            assert_eq!(
+                complete.theorems,
+                if label == "aliased_theorem" { 2 } else { 1 },
+                "{source}",
+            );
+        } else {
+            let error = result.expect_err("a missing rule or invalid orientation must refuse");
+            assert_eq!(error.disposition().2, 1, "{source}\n{error:?}");
+        }
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+        if let Some(binary) = &reference {
+            let path = root.join(format!("{label}.lean"));
+            std::fs::write(&path, &source).unwrap();
+            let output = Command::new(binary)
+                .arg("-j1")
+                .arg(&path)
+                .env_remove("LEAN_PATH")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if accepted { 0 } else { 1 }),
+                "{source}\n{output:?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn simp_abbreviations_keep_proof_origins_replaceable_and_reject_forged_data_snapshots() {
+    use fln::{Expr, Level};
+    use fln_env::constants::{
+        ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
+    };
+    use fln_env::environment::Environment;
+
+    let selected = checked(
+        &engine(),
+        &[
+            "axiom mystery : Nat → Nat\naxiom law (n : Nat) : mystery n = n\n@[simp] abbrev fact (n : Nat) : mystery n = n := law n\ntheorem alternate (n : Nat) : mystery n = n := law n",
+        ],
+    );
+    let origin = Name::from_components(["fact"]);
+    let auxiliary = Name::from_components(["alternate"]);
+    let rows = simp::read(selected.engine.environment()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].proof.as_ref(), Some(&origin));
+    let replaced =
+        simp::register_imported_proof(selected.engine.environment(), &origin, &auxiliary, 800)
+            .unwrap();
+    let rows = simp::read(&replaced).unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the auxiliary replaces the source-origin slot"
+    );
+    assert_eq!(rows[0].proof.as_ref(), Some(&auxiliary));
+    let erased = simp::update(&replaced, &origin, None).unwrap();
+    assert!(simp::read(&erased).unwrap().is_empty());
+    let restored = simp::update(&erased, &origin, Some((700, false))).unwrap();
+    let rows = simp::read(&restored).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].proof.as_ref(), Some(&origin));
+    assert_eq!(rows[0].priority, 700);
+
+    let journal = selected
+        .engine
+        .environment()
+        .extension(&simp::export::journal_name())
+        .unwrap();
+    let payload = journal.entries().next().unwrap().payload.clone();
+    let forged = Environment::new()
+        .add_decl(ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: origin.clone(),
+                level_params: vec![],
+                type_: Expr::sort(Level::one()),
+            },
+            value: Expr::sort(Level::zero()),
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![origin],
+        }))
+        .unwrap()
+        .register_extension(journal.descriptor.clone())
+        .unwrap()
+        .push_extension_entry(&journal.descriptor.name, payload)
+        .unwrap();
+    assert_eq!(simp::read(&forged), Err(simp::SimpSetError::Malformed));
+}
+
+#[test]
 fn simp_preserves_terminal_predicates_while_opening_rule_binders() {
     let base = engine();
     // The pin accepts the selected fact at its declared predicate and refuses
