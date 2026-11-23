@@ -51,14 +51,8 @@ fn native_imported_nullable_prefixes_partition_and_parse_complete_commands() {
             r#"sepBy("native_item", ",") "native_done " ident"#,
             &["native_done x", "native_item,native_item native_done y"],
         ),
-        (
-            r#"ppSpace "native_done " ident"#,
-            &["native_done x"],
-        ),
-        (
-            r#"orelse("native_done ", ident)"#,
-            &["native_done"],
-        ),
+        (r#"ppSpace "native_done " ident"#, &["native_done x"]),
+        (r#"orelse("native_done ", ident)"#, &["native_done"]),
     ];
     for (items, invocations) in cases {
         let mut library = grammar();
@@ -191,7 +185,10 @@ fn incomplete_or_empty_artifact_command_starts_refuse_transactionally() {
             symbol("artifact_done"),
         ),
         sequence(
-            unary("optional", Descr::NonReservedSymbol("artifact_prefix".into(), true)),
+            unary(
+                "optional",
+                Descr::NonReservedSymbol("artifact_prefix".into(), true),
+            ),
             symbol("artifact_done"),
         ),
         unary("optional", symbol("artifact_done")),

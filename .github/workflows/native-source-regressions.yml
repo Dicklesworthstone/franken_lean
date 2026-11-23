@@ -14,6 +14,11 @@ on:
       - 'crates/fln/tests/source_simp_auto_unfold.rs'
       - 'crates/fln/tests/source_simp_auto_unfold.lean'
       - 'crates/fln/tests/source_as_aux_lemma.rs'
+      - 'crates/fln/src/lib.rs'
+      - 'crates/fln/src/runtime.rs'
+      - 'crates/fln/src/runtime/**'
+      - 'crates/fln/tests/source_compiler_prerequisites.rs'
+      - 'crates/fln-cli/tests/source_compiler_prerequisites.rs'
       - 'crates/fln/src/source_check/**'
       - 'crates/fln/src/source_check.rs'
       - 'crates/fln/src/source_records.rs'
@@ -54,6 +59,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Parser grouping source reconstruction and bounded-stack regressions
         run: cargo test --locked -p fln-parse --no-fail-fast
+      - name: Check source compiler prerequisites and import isolation
+        run: cargo test --locked -p fln --test source_compiler_prerequisites --no-fail-fast -- --test-threads=1
       - name: Check transactional goal mapping and backtracking
         run: cargo test --locked -p fln --test source_goal_control --test source_backtracking --no-fail-fast -- --test-threads=1
       - name: Check match-aware simplification through the native kernel
@@ -66,7 +73,26 @@ jobs:
         run: cargo test --locked -p fln --test source_command_macros --test source_command_macro_hygiene --no-fail-fast -- --test-threads=1
       - name: Check quotation expansion through the native elaborator and kernel
         run: cargo test --locked -p fln --test source_quoted_capture_kinds --test source_quotation_repetitions --no-fail-fast
-      - name: Check command syntax formatting
+      - name: Install the pinned Reference for compiler parity
+        run: |
+          set -euo pipefail
+          pin_commit="$(sed -nE 's/^reference leanprover\/lean4 .*commit=([0-9a-f]{40}).*/\1/p' SUITE.lock)"
+          test "$pin_commit" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          archive="$RUNNER_TEMP/lean-4.32.0-linux.tar.zst"
+          curl --fail --location --retry 3 --output "$archive" \
+            https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          printf '%s  %s\n' fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516 "$archive" | sha256sum --check
+          tar --zstd --no-same-owner -xf "$archive" -C "$RUNNER_TEMP"
+          reference_root="$RUNNER_TEMP/lean-4.32.0-linux"
+          test "$("$reference_root/bin/lean" --githash)" = "$pin_commit"
+          for suffix in olean olean.server olean.private; do
+            test -s "$reference_root/lib/lean/Init/Prelude.$suffix"
+          done
+          printf 'FLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\nFLN_REQUIRE_REFERENCE=1\n' \
+            "$reference_root" "$reference_root" >> "$GITHUB_ENV"
+      - name: Check the installed Lean compiler against the Reference
+        run: cargo test --locked -p fln-cli --test source_compiler_prerequisites --no-fail-fast -- --test-threads=1
+      - name: Check changed source formatting
         if: ${{ !cancelled() }}
         run: |
           rustfmt --check --edition 2024 --config skip_children=true \
@@ -74,7 +100,17 @@ jobs:
             crates/fln-parse/src/extensions.rs \
             crates/fln-parse/src/extensions/artifacts.rs \
             crates/fln-parse/src/extensions/artifacts/tests.rs \
-            crates/fln-parse/src/extensions/artifacts/tests/nullable_heads.rs
+            crates/fln-parse/src/extensions/artifacts/tests/nullable_heads.rs \
+            crates/fln/src/lib.rs \
+            crates/fln/src/runtime.rs \
+            crates/fln/src/runtime/compiler_types.rs \
+            crates/fln/src/source_check.rs \
+            crates/fln/tests/source_compiler_prerequisites.rs \
+            crates/fln/tests/source_command_macros.rs \
+            crates/fln-cli/tests/source_compiler_prerequisites.rs
       - name: Lint the native parser
         if: ${{ !cancelled() }}
         run: cargo clippy --locked -p fln-parse --all-targets -- -D warnings
+      - name: Lint source compiler prerequisites
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked -p fln -p fln-cli --test source_compiler_prerequisites -- -D warnings

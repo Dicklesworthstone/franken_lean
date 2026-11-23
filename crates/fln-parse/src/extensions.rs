@@ -3987,7 +3987,10 @@ fn partition_sequence_heads(items: &[StxItem]) -> Option<PartitionSyntaxHeads> {
 fn partition_item_heads(item: &StxItem) -> Option<PartitionSyntaxHeads> {
     let atom = |text: &str| {
         valid_atom(text).ok()?;
-        Some(text.trim_matches(|c: char| c.is_ascii_whitespace()).to_owned())
+        Some(
+            text.trim_matches(|c: char| c.is_ascii_whitespace())
+                .to_owned(),
+        )
     };
     let empty = || (BTreeSet::new(), true);
     let unknown = || (BTreeSet::new(), false);

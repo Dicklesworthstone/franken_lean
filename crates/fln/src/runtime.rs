@@ -7,6 +7,8 @@ mod array_fold;
 mod array_iteration;
 mod arrays;
 mod callables;
+mod compiler_types;
+pub(super) use compiler_types::check as check_source_compiler_prerequisites;
 mod conditionals;
 mod data_recursion;
 mod decisions;

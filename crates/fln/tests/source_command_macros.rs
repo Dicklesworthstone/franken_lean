@@ -52,6 +52,29 @@ theorem message_ok : message = "kept bytes" := rfl
 }
 
 #[test]
+fn grouped_command_heads_reach_native_kernel_admission() {
+    let source = r#"
+def before : Nat := 0
+syntax ("left_value " <|> "right_value ") ident " := " term : command
+macro_rules
+  | `(left_value $n:ident := $v:term) => `(def $n : Nat := $v)
+  | `(right_value $n:ident := $v:term) => `(def $n : Nat := $v)
+left_value leftValue := 11
+right_value rightValue := 31
+theorem left_ok : leftValue = 11 := rfl
+theorem right_ok : rightValue = 31 := rfl
+macro ("pass_first " <|> "pass_second ") c:command : command => `($c:command)
+pass_first def forwarded : Nat := 43
+pass_second
+  theorem forwarded_ok : forwarded = 43 := rfl
+"#;
+    assert_eq!(check(source).unwrap(), 3);
+    assert!(check(&source.replace("leftValue = 11", "leftValue = 12")).is_err());
+    assert!(check(&source.replace("rightValue = 31", "rightValue = 32")).is_err());
+    assert!(check(&source.replace("forwarded = 43", "forwarded = 44")).is_err());
+}
+
+#[test]
 fn pure_command_macro_bodies_apply_declaration_name_coercions() {
     let source = r#"
 macro "pure_named " n:ident " := " v:term : command => do

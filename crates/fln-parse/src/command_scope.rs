@@ -1600,10 +1600,7 @@ def after : Nat := 0
                 r#"syntax (("prefix ")? "body ") "tail " ident : command"#,
                 &["body", "prefix"],
             ),
-            (
-                r#"syntax !("forbidden ") "actual " : command"#,
-                &["actual"],
-            ),
+            (r#"syntax !("forbidden ") "actual " : command"#, &["actual"]),
             (
                 r#"syntax sepBy("item", ",") "done" : command"#,
                 &["done", "item"],
