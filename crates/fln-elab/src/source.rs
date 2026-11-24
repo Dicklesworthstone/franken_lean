@@ -32,6 +32,7 @@ use scope::SourceScope;
 pub mod equation_theorems;
 mod equations;
 pub mod evaluation;
+pub mod grind_patterns;
 mod inductive;
 mod infer;
 mod instance_command;
@@ -241,6 +242,7 @@ pub enum SourceInferenceError {
     InvalidInstanceBinder,
     InstanceRegistry(crate::instances::InstanceRegistryError),
     Symm(crate::symm::SymmRegistryError),
+    GrindPattern(crate::grind_patterns::GrindPatternError),
     Option(scope::options::OptionRefusal),
     SimpSet(scope::simp::SimpSetError),
     /// The protected-declaration journal refused a tag.
@@ -568,6 +570,7 @@ impl std::fmt::Display for SourceInferenceError {
             ),
             Self::InstanceRegistry(error) => write!(f, "{error}"),
             Self::Symm(error) => write!(f, "{error}"),
+            Self::GrindPattern(error) => write!(f, "{error}"),
             Self::SimpSet(error) => write!(f, "{error}"),
             Self::ProtectedJournal(error) => write!(f, "{error}"),
             Self::DeprecationJournal(error) => write!(f, "{error}"),

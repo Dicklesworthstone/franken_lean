@@ -32,6 +32,7 @@ pub mod deprecations;
 pub mod effects;
 pub mod eliminator_tags;
 pub mod externs;
+pub mod grind_patterns;
 pub mod implemented_by;
 pub mod inductive;
 pub mod info;
