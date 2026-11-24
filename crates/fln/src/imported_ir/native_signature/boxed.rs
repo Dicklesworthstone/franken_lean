@@ -15,6 +15,7 @@
 use super::{
     ErasedOperands, GeneratedExternRow, IrDecl, IrExecutionError, IrParam, IrType, Name, Ownership,
     array_proofs, erased_type_runtime_arity, extern_row, primitives, state_runtime_arity,
+    string_proofs,
 };
 
 /// Recognize the compiler's structural suffix, not a dotted-name string or
@@ -49,6 +50,16 @@ impl BoxedNative {
                 parameters: signature.parameters,
                 result: signature.result,
                 exact_borrowed: signature.exact_borrowed,
+            }));
+        }
+        if let Some(signature) = string_proofs::signature(row)? {
+            return Ok(Some(Self {
+                erased_prefix: 0,
+                erased_suffix: 1,
+                world_suffix: false,
+                parameters: &[IrType::Object, IrType::TObject],
+                result: signature.result,
+                exact_borrowed: Some(signature.borrowed),
             }));
         }
         if let Some(runtime) = state_runtime_arity(row)? {

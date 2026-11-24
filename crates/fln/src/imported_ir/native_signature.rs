@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 mod array_proofs;
 mod boxed;
 mod primitives;
+mod string_proofs;
 
 pub(super) use boxed::{BoxedNative, boxed_row};
 
@@ -54,7 +55,7 @@ pub(super) fn erase_type_arguments(
                 proof_suffix: 0,
             })
         } else {
-            array_proofs::erased_operands(row)?
+            array_proofs::erased_operands(row)?.or(string_proofs::erased_operands(row)?)
         };
         if let Some(bridge) = bridge {
             bridges.insert(name.clone(), bridge);

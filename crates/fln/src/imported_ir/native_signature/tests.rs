@@ -16,6 +16,9 @@ mod arrays_reference;
 #[path = "tests/array_proofs.rs"]
 mod array_proofs;
 
+#[path = "tests/string_proofs.rs"]
+mod string_proofs;
+
 #[path = "tests/array_operations.rs"]
 mod array_operations;
 
