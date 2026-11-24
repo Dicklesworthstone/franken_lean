@@ -64,56 +64,38 @@ partial def countSites (pick : Expr → Bool) : Expr → Nat
   | e@(.proj _ _ i) => (if pick e then 1 else 0) + countSites pick i
   | e => if pick e then 1 else 0
 
-/-- Rewrite the `n`-th site (pre-order) that `pick` admits, with `rw`. Returns
-`none` when fewer than `n + 1` sites exist. State is the countdown. -/
-partial def rewriteSite (pick : Expr → Bool) (rw : Expr → Expr) :
-    Expr → Nat → Option (Expr × Nat)
-  | e, n =>
-    let step (e : Expr) (n : Nat) : Option (Expr × Nat) :=
-      match e with
-      | .app f a =>
-        match rewriteSite pick rw f n with
-        | some (f', n') => some (.app f' a, n')
-        | none =>
-          match rewriteSite pick rw a n with
-          | some (a', n') => some (.app f a', n')
-          | none => none
-      | .lam nm t v i =>
-        match rewriteSite pick rw t n with
-        | some (t', n') => some (.lam nm t' v i, n')
-        | none =>
-          match rewriteSite pick rw v n with
-          | some (v', n') => some (.lam nm t v' i, n')
-          | none => none
-      | .forallE nm t v i =>
-        match rewriteSite pick rw t n with
-        | some (t', n') => some (.forallE nm t' v i, n')
-        | none =>
-          match rewriteSite pick rw v n with
-          | some (v', n') => some (.forallE nm t v' i, n')
-          | none => none
-      | .letE nm t v b nd =>
-        match rewriteSite pick rw t n with
-        | some (t', n') => some (.letE nm t' v b nd, n')
-        | none =>
-          match rewriteSite pick rw v n with
-          | some (v', n') => some (.letE nm t v' b nd, n')
-          | none =>
-            match rewriteSite pick rw b n with
-            | some (b', n') => some (.letE nm t v b' nd, n')
-            | none => none
-      | .mdata m i =>
-        (rewriteSite pick rw i n).map (fun (i', n') => (.mdata m i', n'))
-      | .proj s ix i =>
-        (rewriteSite pick rw i n).map (fun (i', n') => (.proj s ix i', n'))
-      | _ => none
-    if pick e then
-      if n == 0 then some (rw e, 0)
-      else
-        match step e (n - 1) with
-        | some (e', n') => some (e', n' + 1)
-        | none => none
-    else step e n
+/-- Rewrite exactly the selected pre-order occurrence. The remaining count is
+shared across siblings, and `none` stops the walk after the selected site. -/
+private partial def visitSite (pick : Expr → Bool) (rw : Expr → Expr) (e : Expr) :
+    StateM (Option Nat) Expr := do
+  let some remaining ← get | return e
+  if pick e then
+    match remaining with
+    | 0 =>
+      set (none : Option Nat)
+      return rw e
+    | n + 1 => set (some n)
+  e.traverseChildren (visitSite pick rw)
+
+def rewriteSite (pick : Expr → Bool) (rw : Expr → Expr) (e : Expr) (index : Nat) :
+    Option Expr :=
+  match (visitSite pick rw e).run (some index) with
+  | (result, none) => some result
+  | _ => none
+
+-- Repeated occurrences of a shared subterm are distinct sites. In particular,
+-- selecting the right argument must consume both sites in the left subtree.
+private def siteFixture := mkApp2 (mkConst `f) (mkRawNatLit 1) (mkRawNatLit 1)
+private def pickSiteFixture (e : Expr) := e.isApp || e.isLit
+#guard countSites pickSiteFixture siteFixture == 4
+#guard rewriteSite pickSiteFixture (fun _ => mkRawNatLit 9) siteFixture 0 == some (mkRawNatLit 9)
+#guard rewriteSite pickSiteFixture (fun _ => mkRawNatLit 9) siteFixture 1 ==
+  some (mkApp (mkRawNatLit 9) (mkRawNatLit 1))
+#guard rewriteSite pickSiteFixture (fun _ => mkRawNatLit 9) siteFixture 2 ==
+  some (mkApp2 (mkConst `f) (mkRawNatLit 9) (mkRawNatLit 1))
+#guard rewriteSite pickSiteFixture (fun _ => mkRawNatLit 9) siteFixture 3 ==
+  some (mkApp2 (mkConst `f) (mkRawNatLit 1) (mkRawNatLit 9))
+#guard (rewriteSite pickSiteFixture id siteFixture 4).isNone
 
 structure Op where
   name : String
@@ -185,8 +167,8 @@ unsafe def run (target : Name) (seed mutantsPerDecl maxDecls : Nat)
         continue
       let (siteIx, rng'') := randNat rng 0 (sites - 1)
       rng := rng''
-      let some (mutated, _) := rewriteSite op.pick op.rw value siteIx
-        | continue
+      let some mutated := rewriteSite op.pick op.rw value siteIx
+        | throw <| IO.userError s!"missing mutation site {siteIx}/{sites} for {n} ({op.name})"
       if mutated == value then
         continue
       let fresh := Name.str n s!"_bemc_{idx}"
@@ -205,15 +187,16 @@ unsafe def run (target : Name) (seed mutantsPerDecl maxDecls : Nat)
       let (verdict, cls) :=
         match env.addDeclCore 0 decl none (doCheck := true) with
         | .ok _ => ("accept", "")
+        | .error e@(.deterministicTimeout ..) | .error e@(.excessiveMemory ..)
+        | .error e@(.deepRecursion ..) | .error e@(.interrupted ..) =>
+          ("inconclusive", exKind e)
         | .error e => ("reject", exKind e)
       rows := rows.push { origin := n, fresh, op := op.name, verdict, cls }
       -- every judged mutant rides in the synthetic module, unchecked
       match transport.addDeclCore 0 decl none (doCheck := false) with
       | .ok t => transport := t
       | .error e =>
-        rows := rows.push
-          { origin := n, fresh, op := op.name
-            verdict := "transport-failed", cls := exKind e }
+        throw <| IO.userError s!"failed to transport {fresh}: {exKind e}"
   -- The synthetic module lives under the `Bemc` prefix so the FrankenLean
   -- harness can route it with one extra root entry, and its on-disk path
   -- mirrors its module name component-for-component (the name↔path law every
@@ -233,8 +216,9 @@ unsafe def run (target : Name) (seed mutantsPerDecl maxDecls : Nat)
   IO.FS.writeFile tsvPath (tsv ++ "\n")
   let rejects := rows.filter (·.verdict == "reject") |>.size
   let accepts := rows.filter (·.verdict == "accept") |>.size
+  let inconclusive := rows.size - rejects - accepts
   IO.println s!"bemc-generator module={target} decls={chosen.length} mutants={rows.size} \
-pin_reject={rejects} pin_accept={accepts} seed={seed}"
+pin_reject={rejects} pin_accept={accepts} pin_inconclusive={inconclusive} seed={seed}"
 
 unsafe def main (args : List String) : IO Unit := do
   match args with
