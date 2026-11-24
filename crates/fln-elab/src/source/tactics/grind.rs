@@ -852,6 +852,13 @@ impl Context {
         let Syntax::Node { kind, args, .. } = modifier else {
             return Err(unsupported());
         };
+        if *kind == parser_kind(&["Attr", "grindUsr"]) {
+            let [keyword] = args.as_slice() else {
+                return Err(unsupported());
+            };
+            expect_atom(keyword, "usr", "registered grind patterns")?;
+            return Ok(Some(PatternKind::User));
+        }
         for (node, atoms, selection) in [
             ("grindEq", &["="][..], PatternKind::EqualityLeft),
             ("grindEqRhs", &["=", "_"][..], PatternKind::EqualityRight),
@@ -965,18 +972,31 @@ impl Context {
     }
 
     fn grind_global_lemma(&mut self, resolved: &Name) -> Result<(Typed, Vec<Name>), Error> {
+        self.grind_global_evidence(resolved, false)
+    }
+
+    fn grind_global_evidence(
+        &mut self,
+        resolved: &Name,
+        user_pattern: bool,
+    ) -> Result<(Typed, Vec<Name>), Error> {
         let info = self
             .txn
             .env
             .find(resolved)
             .cloned()
             .ok_or_else(unsupported)?;
-        if !matches!(
-            info,
+        let admitted = match &info {
             fln_env::constants::ConstantInfo::Thm(_)
-                | fln_env::constants::ConstantInfo::Axiom(_)
-                | fln_env::constants::ConstantInfo::Ctor(_)
-        ) {
+            | fln_env::constants::ConstantInfo::Axiom(_)
+            | fln_env::constants::ConstantInfo::Ctor(_) => true,
+            fln_env::constants::ConstantInfo::Defn(definition) => {
+                user_pattern && definition.safety == fln_env::constants::DefinitionSafety::Safe
+            }
+            fln_env::constants::ConstantInfo::Opaque(value) => user_pattern && !value.is_unsafe,
+            _ => false,
+        };
+        if !admitted {
             return Err(unsupported());
         }
         let base = info.constant_val();
@@ -1000,6 +1020,16 @@ impl Context {
             return Err(unsupported());
         }
         Ok((evidence, level_params))
+    }
+
+    fn grind_registered_pattern(
+        &mut self,
+        quantifiers: &mut Quantifiers,
+        row: &crate::grind_patterns::GrindPattern,
+    ) -> Result<(), Error> {
+        self.tick()?;
+        let (evidence, level_params) = self.grind_global_evidence(&row.declaration, true)?;
+        quantifiers.register_explicit(self, &evidence, &level_params, row)
     }
 
     /// A selected definition contributes its admitted equations, each with its
@@ -1105,13 +1135,14 @@ impl Context {
         if expect_default_config(config, "grind configuration").is_err() {
             return Err(unsupported());
         }
-        match expect_null_args(only, "grind only")? {
-            [] => {}
+        let only = match expect_null_args(only, "grind only")? {
+            [] => false,
             [keyword] => {
                 expect_atom(keyword, "only", "grind only")?;
+                true
             }
             _ => return Err(unsupported()),
-        }
+        };
         if !expect_null_args(interactive, "grind interactive block")?.is_empty() {
             return Err(unsupported());
         }
@@ -1150,7 +1181,38 @@ impl Context {
                     )?;
                 }
             }
+            let registered = crate::grind_patterns::read(&self.txn.env)
+                .map_err(crate::source::grind_patterns::registry_error)?;
+            if !only {
+                for row in &registered {
+                    self.grind_registered_pattern(&mut state.quantifiers, row)?;
+                }
+            }
             for (parameter, modifier) in parameters {
+                if modifier == Some(PatternKind::User) {
+                    // The pin uses `usr` only to restore a declaration's user
+                    // patterns in `grind only`; ordinary `[thm]` infers patterns.
+                    if !only || !matches!(parameter, Syntax::Ident { .. }) {
+                        return Err(unsupported());
+                    }
+                    let (Some(resolved), _) =
+                        self.resolve_unambiguous_identifier_name(parameter)?
+                    else {
+                        return Err(unsupported());
+                    };
+                    let mut found = false;
+                    for row in &registered {
+                        self.tick()?;
+                        if row.declaration == resolved {
+                            self.grind_registered_pattern(&mut state.quantifiers, row)?;
+                            found = true;
+                        }
+                    }
+                    if !found {
+                        return Err(unsupported());
+                    }
+                    continue;
+                }
                 if let Some(equations) = self.grind_definition_equations(parameter, modifier)? {
                     for equation in equations {
                         self.tick()?;

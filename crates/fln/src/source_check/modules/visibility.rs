@@ -765,6 +765,93 @@ impl<'a> PublicWorld<'a> {
         Ok(Outcome::Complete(next))
     }
 
+    /// Keep compiled trigger groups in source order in both checked worlds.
+    /// The native journal is replayable in memory; pinned artifact emission
+    /// remains explicitly refused by the separate codec support whitelist.
+    pub(crate) fn publish_grind_patterns(
+        &mut self,
+        private: &Engine,
+        next_private: Environment,
+        next_public: Environment,
+    ) -> Result<Outcome<Engine>, EngineExecutionError> {
+        let cancelled =
+            || Outcome::Inconclusive(Inconclusive::cancelled("source-module/grind-patterns"));
+        if self
+            .cancellation
+            .is_some_and(CancellationProbe::is_cancelled)
+        {
+            return Ok(cancelled());
+        }
+        let journal = fln_elab::grind_patterns::journal_name();
+        for environment in [
+            private.environment(),
+            &next_private,
+            self.engine.environment(),
+            &next_public,
+        ] {
+            if let Some(extension) = environment.extension(&journal) {
+                self.meter.work(extension.len()).map_err(execution_error)?;
+                for entry in extension.entries() {
+                    self.meter
+                        .bytes(entry.payload.len())
+                        .map_err(execution_error)?;
+                }
+            }
+        }
+        let invalid = || {
+            execution_error(SourceModuleCheckError::Extension {
+                module: self.module.clone(),
+                extension: journal.clone(),
+                reason: "grind patterns require checked chronological journals",
+            })
+        };
+        let work_limit = self.meter.limits.max_work;
+        let registry_error = |error| match fln_elab::source::grind_patterns::registry_error(error) {
+            fln_elab::NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::ResourceLimit,
+            ) => execution_error(SourceModuleCheckError::Limit {
+                resource: "module work",
+                limit: work_limit,
+            }),
+            _ => invalid(),
+        };
+        let before =
+            fln_elab::grind_patterns::read(private.environment()).map_err(registry_error)?;
+        let after = fln_elab::grind_patterns::read(&next_private).map_err(registry_error)?;
+        let public_before =
+            fln_elab::grind_patterns::read(self.engine.environment()).map_err(registry_error)?;
+        let public_after = fln_elab::grind_patterns::read(&next_public).map_err(registry_error)?;
+        if !after.starts_with(&before) || !public_after.starts_with(&public_before) {
+            return Err(invalid());
+        }
+        let exported: Vec<_> = after[before.len()..]
+            .iter()
+            .filter(|entry| self.engine.environment().contains(&entry.declaration))
+            .cloned()
+            .collect();
+        if public_after[public_before.len()..] != exported {
+            return Err(invalid());
+        }
+        replay::Export::capture(
+            &self.module,
+            self.engine.environment(),
+            &next_public,
+            Vec::new(),
+            self.meter,
+        )
+        .map_err(execution_error)?;
+        if self
+            .cancellation
+            .is_some_and(CancellationProbe::is_cancelled)
+        {
+            return Ok(cancelled());
+        }
+        let mut next = private.clone();
+        next.environment = next_private;
+        self.engine.environment = next_public;
+        Ok(Outcome::Complete(next))
+    }
+
     /// Preserve the private command's exact insertion order while exporting its
     /// public subset. Replaying that subset into the private journal would add
     /// synthetic duplicate rows and move local activation boundaries.

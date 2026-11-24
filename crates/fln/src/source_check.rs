@@ -2,6 +2,7 @@
 use super::*;
 mod constructor_elims;
 pub(crate) mod grammar;
+mod grind_patterns;
 pub mod inspect;
 pub(crate) mod instance_attributes;
 pub mod modules;
@@ -415,6 +416,9 @@ pub(crate) fn apply_control_command(
                 offset,
             )?;
         }
+        ScopeCommand::GrindPattern(syntax) => {
+            return grind_patterns::apply_private(engine, scope, &syntax, limits, position);
+        }
         ScopeCommand::Symm(syntax) => {
             return symm::apply_private(engine, scope, &syntax, limits, position);
         }
@@ -614,6 +618,16 @@ pub(crate) fn apply_module_control_command(
         }
         engine.environment = environment;
         return Ok(Outcome::Complete(Vec::new()));
+    }
+    if let ScopeCommand::GrindPattern(syntax) = &control {
+        return grind_patterns::apply_module(
+            engine,
+            scopes,
+            syntax,
+            limits,
+            position,
+            public.as_deref_mut(),
+        );
     }
     if let ScopeCommand::Symm(syntax) = &control {
         return symm::apply_module(
@@ -822,6 +836,7 @@ pub(crate) fn apply_module_control_command(
             | ScopeCommand::Reducibility(_)
             | ScopeCommand::Executable(_)
             | ScopeCommand::Symm(_)
+            | ScopeCommand::GrindPattern(_)
             | ScopeCommand::ConstructorElims(_)
             | ScopeCommand::Simp(_)
     ) {

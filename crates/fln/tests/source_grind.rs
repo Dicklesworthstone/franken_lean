@@ -20,6 +20,8 @@ mod definitions;
 mod existentials;
 #[path = "source_grind/modifiers.rs"]
 mod modifiers;
+#[path = "source_grind/patterns.rs"]
+mod patterns;
 
 const STACK: usize = 128 * 1024 * 1024;
 const ROOTS: &[&str] = &[

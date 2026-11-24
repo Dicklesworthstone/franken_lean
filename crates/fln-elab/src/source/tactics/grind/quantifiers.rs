@@ -33,6 +33,8 @@ pub(super) enum PatternKind {
     Backward,
     LeftRight,
     RightLeft,
+    /// Select registered user patterns; never run inferred-pattern preparation.
+    User,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -146,6 +148,23 @@ fn pattern_head(
     })
 }
 
+/// Ground expressions can retain raw kernel projections while stored user
+/// patterns use their checked declaration applications. Fold only for matching;
+/// theorem arguments and the congruence graph keep their original expressions.
+fn folded_projection(context: &mut Context, expression: &Expr) -> Result<Expr, Error> {
+    if let ExprNode::Proj {
+        struct_name,
+        idx,
+        expr,
+    } = expression.node()
+    {
+        return Ok(context
+            .grind_fold_projection(struct_name, *idx, expr)?
+            .unwrap_or_else(|| expression.clone()));
+    }
+    Ok(expression.clone())
+}
+
 fn matching_heads(
     context: &mut Context,
     graph: &Equalities,
@@ -167,8 +186,10 @@ fn matching_heads(
             }
         }
     };
-    let (left, a) = head(context, pattern)?;
-    let (right, b) = head(context, ground)?;
+    let pattern = folded_projection(context, pattern)?;
+    let ground = folded_projection(context, ground)?;
+    let (left, a) = head(context, &pattern)?;
+    let (right, b) = head(context, &ground)?;
     if a != b {
         return Ok(false);
     }
@@ -410,6 +431,7 @@ impl Theorem {
                         places
                     }
                     PatternKind::Local => unreachable!("local patterns selected above"),
+                    PatternKind::User => return Err(unsupported()),
                 }
             };
             if let Some(group) = collect_group(context, &parameters, &places)?
@@ -432,6 +454,127 @@ impl Theorem {
         })();
         // A cutoff while opening the telescope must not leave its pattern
         // variables visible to later goals, instance search or source lookup.
+        context.txn.lctx = saved;
+        result
+    }
+
+    /// Open one user-specified simultaneous pattern group. Serialized patterns
+    /// are abstracted over the *entire* telescope, including proof premises;
+    /// matching binds only its data prefix and leaves premises on the proof.
+    fn prepare_explicit(
+        context: &mut Context,
+        evidence: &Typed,
+        level_params: &[Name],
+        row: &crate::grind_patterns::GrindPattern,
+    ) -> Result<Self, Error> {
+        if row.num_params as usize > MAX_PARAMETERS || row.patterns.len() > MAX_PATTERNS {
+            return Err(resource());
+        }
+        if row.data_params > row.num_params || row.patterns.is_empty() {
+            return Err(unsupported());
+        }
+        let declaration_levels = context
+            .txn
+            .env
+            .find(&row.declaration)
+            .ok_or_else(unsupported)?
+            .constant_val()
+            .level_params
+            .clone();
+        if declaration_levels.len() != level_params.len() {
+            return Err(unsupported());
+        }
+        let levels: Vec<_> = level_params.iter().cloned().map(Level::param).collect();
+        let saved = context.txn.lctx.clone();
+        let result = (|| {
+            let mut type_ = normalize(context, &evidence.type_)?;
+            let mut parameters = Vec::new();
+            let mut locals = Vec::new();
+            for _ in 0..row.data_params {
+                context.tick()?;
+                let ExprNode::ForallE {
+                    binder_type,
+                    body,
+                    binder_info,
+                    ..
+                } = type_.node()
+                else {
+                    return Err(unsupported());
+                };
+                if is_prop(context, binder_type)? {
+                    return Err(unsupported());
+                }
+                let local = context.equality_local(binder_type.clone())?;
+                context.txn.lctx.add_param(
+                    local.id.clone(),
+                    local.user_name,
+                    binder_type.clone(),
+                    *binder_info,
+                );
+                parameters.push(Parameter {
+                    id: local.id.clone(),
+                });
+                let value = Expr::fvar(local.id);
+                let opened = context.substitute(body, &value)?;
+                locals.push(value);
+                type_ = normalize(context, &opened)?;
+            }
+            let mut conclusion = type_;
+            for _ in row.data_params..row.num_params {
+                context.tick()?;
+                let ExprNode::ForallE {
+                    binder_type, body, ..
+                } = conclusion.node()
+                else {
+                    return Err(unsupported());
+                };
+                if body.has_loose_bvars() || !is_prop(context, binder_type)? {
+                    return Err(unsupported());
+                }
+                conclusion = normalize(context, body)?;
+            }
+            if matches!(conclusion.node(), ExprNode::ForallE { .. })
+                || !is_prop(context, &conclusion)?
+            {
+                return Err(unsupported());
+            }
+            let mut group = Vec::new();
+            let mut covered = vec![false; parameters.len()];
+            for pattern in &row.patterns {
+                context.tick()?;
+                let pattern = context.instantiate_params(pattern, &declaration_levels, &levels)?;
+                // subst_loose expects the original outer-to-inner order. The
+                // trailing proof binders occupy the indices below this cutoff.
+                let pattern = pattern
+                    .subst_loose(row.num_params - row.data_params, &locals)
+                    .map_err(|_| resource())?;
+                let pattern = normalize(context, &pattern)?;
+                let pattern = folded_projection(context, &pattern)?;
+                if !matches!(
+                    pattern.node(),
+                    ExprNode::App { .. } | ExprNode::Const { .. }
+                ) || !pattern_head(context, &parameters, &pattern)?
+                {
+                    return Err(unsupported());
+                }
+                let Some(found) = variables(context, &parameters, &pattern)? else {
+                    return Err(unsupported());
+                };
+                for (covered, found) in covered.iter_mut().zip(found) {
+                    *covered |= found;
+                }
+                group.push(pattern);
+            }
+            if !covered.iter().all(|covered| *covered) {
+                return Err(unsupported());
+            }
+            Ok(Self {
+                evidence: evidence.clone(),
+                level_params: level_params.to_vec(),
+                parameters,
+                patterns: vec![group],
+            })
+        })();
         context.txn.lctx = saved;
         result
     }
@@ -487,6 +630,21 @@ impl Quantifiers {
         }
         self.theorems.push(theorem);
         Ok(true)
+    }
+
+    pub fn register_explicit(
+        &mut self,
+        context: &mut Context,
+        evidence: &Typed,
+        level_params: &[Name],
+        row: &crate::grind_patterns::GrindPattern,
+    ) -> Result<(), Error> {
+        if self.theorems.len() >= MAX_THEOREMS {
+            return Err(resource());
+        }
+        let theorem = Theorem::prepare_explicit(context, evidence, level_params, row)?;
+        self.theorems.push(theorem);
+        Ok(())
     }
 
     fn tick(&mut self, context: &mut Context) -> Result<(), Error> {
@@ -576,6 +734,8 @@ impl Quantifiers {
             substitution.terms[index] = Some(original_ground.clone());
             return Ok(vec![substitution]);
         }
+        let ground = folded_projection(context, ground)?;
+        let ground = &ground;
         let Some(found) = variables(context, &theorem.parameters, pattern)? else {
             return Ok(Vec::new());
         };
@@ -640,6 +800,7 @@ impl Quantifiers {
         let mut seen = HashSet::new();
         for equivalent in graph.class_terms(context, ground)? {
             self.tick(context)?;
+            let equivalent = folded_projection(context, &equivalent)?;
             let ExprNode::App { f, a } = equivalent.node() else {
                 continue;
             };
@@ -684,6 +845,7 @@ impl Quantifiers {
             .iter()
             .filter(|node| {
                 node.application.is_some()
+                    || matches!(node.term.node(), ExprNode::Proj { .. })
                     || (ground_patterns && matches!(node.term.node(), ExprNode::Const { .. }))
             })
             .map(|node| node.term.clone())
@@ -757,3 +919,6 @@ impl Quantifiers {
         Ok(instances)
     }
 }
+
+#[cfg(test)]
+mod tests;

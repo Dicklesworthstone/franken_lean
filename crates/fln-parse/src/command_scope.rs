@@ -44,6 +44,8 @@ pub enum ScopeCommand {
     /// Preserve the attribute kinds and source order for checked symmetry
     /// registration, including lexical `local` and namespace `scoped` entries.
     Symm(Syntax),
+    /// Explicit E-matching triggers, elaborated in the named proof's telescope.
+    GrindPattern(Syntax),
     /// Late constructor auxiliaries requested for an admitted inductive. The
     /// driver retains the canonical tree and checks every generated definition.
     ConstructorElims(Syntax),
@@ -931,6 +933,22 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     }
     if let Some(command) = generic_in(&view, &tokens, keyword, source.len()) {
         return Ok(Some(command));
+    }
+    if keyword == "grind_pattern"
+        || (matches!(keyword.as_str(), "local" | "scoped")
+            && matches!(tokens.get(1).map(|token| &token.kind),
+                Some(TokenKind::Symbol(command)) if command == "grind_pattern"))
+    {
+        // Preserve the active production's complete term trees. A command
+        // macro must remain on the ordinary expansion path.
+        let parsed = crate::parse_source_command(source)?;
+        if crate::extensions::is_active_command_macro(parsed.syntax()) {
+            return Ok(None);
+        }
+        return Ok(
+            (parsed.syntax().kind() == Some(&parser_kind(&["Command", "grindPattern"])))
+                .then(|| ScopeCommand::GrindPattern(parsed.syntax().clone())),
+        );
     }
     if keyword == "variable" {
         return variables::parse(&view, &tokens).map(|syntax| Some(ScopeCommand::Variable(syntax)));

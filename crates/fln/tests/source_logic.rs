@@ -1477,24 +1477,87 @@ fn a_boolean_conditional_selects_its_branch() {
     );
 }
 
-/// `grind_pattern` parses as the pin's `Command.grindPattern`; the checker does not read the
-/// pattern, so it refuses the command rather than ignoring it.
 #[test]
-fn grind_patterns_are_refused_not_ignored() {
-    check("theorem plain : True := True.intro\n");
-    let (engine, limits) = engine();
-    let source = "theorem plain : True := True.intro\ngrind_pattern plain => True\n";
-    assert!(
-        !matches!(
-            engine.check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits),
-            ),
-            Ok(fln::Outcome::Complete(_))
-        ),
-        "{source}"
+fn grind_patterns_record_full_telescope_groups_and_preserve_alternatives() {
+    let checked = checked_environment(
+        r#"
+        axiom gpRelation : Nat → Nat → Prop
+        axiom gpStep (x y z : Nat) : gpRelation x y → gpRelation y z → gpRelation x z
+        grind_pattern gpStep => gpRelation x y, gpRelation y z
+        grind_pattern gpStep => gpRelation x z, gpRelation y z
+        theorem gpPlain : True := True.intro
+        grind_pattern gpPlain => True
+        "#,
     );
+    let rows = fln_elab::grind_patterns::read(checked.engine.environment()).unwrap();
+    assert_eq!(rows.len(), 3);
+    let relation = |left, right| {
+        fln::Expr::app(
+            fln::Expr::app(constant("gpRelation"), fln::Expr::bvar(left).unwrap()),
+            fln::Expr::bvar(right).unwrap(),
+        )
+    };
+    for row in &rows[..2] {
+        assert_eq!(row.declaration, Name::from_components(["gpStep"]));
+        assert_eq!(row.num_params, 5);
+        assert_eq!(row.data_params, 3);
+    }
+    // Two proof premises occupy indices 0 and 1. Each row is a simultaneous
+    // group; separate commands retain separate alternatives in source order.
+    assert_eq!(rows[0].patterns, vec![relation(4, 3), relation(3, 2)]);
+    assert_eq!(rows[1].patterns, vec![relation(4, 2), relation(3, 2)]);
+    assert_eq!(rows[2].declaration, Name::from_components(["gpPlain"]));
+    assert_eq!((rows[2].num_params, rows[2].data_params), (0, 0));
+    assert_eq!(rows[2].patterns, vec![constant("True")]);
+}
+
+#[test]
+fn invalid_grind_patterns_refuse_transactionally() {
+    let (engine, limits) = engine();
+    let options = KVMap::new();
+    let before = engine.logical_root(&options);
+    let declarations = "axiom gpF : Nat → Nat\naxiom gpG : Nat → Nat\naxiom gpInverse (x : Nat) : gpG (gpF x) = x\n";
+    for command in [
+        "grind_pattern gpInverse => x",
+        "grind_pattern gpInverse => gpF 0",
+        "grind_pattern gpInverse => gpF missing",
+        "grind_pattern gpF => gpF x",
+        "grind_pattern absent => gpF 0",
+    ] {
+        let source = format!("{declarations}grind_pattern gpInverse => gpF x\n{command}\n");
+        let error = engine
+            .check_source_files(
+                &[source.as_bytes()],
+                &options,
+                SourceCheckLimits::new(limits),
+            )
+            .unwrap_err();
+        assert_eq!(error.disposition().0, "elaboration", "{source}\n{error:?}");
+        assert_eq!(error.disposition().2, 1, "{source}\n{error:?}");
+        assert_eq!(engine.logical_root(&options), before);
+        assert!(
+            fln_elab::grind_patterns::read(engine.environment())
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let source = format!("{declarations}grind_pattern gpInverse => gpF x\n");
+    let checked = engine
+        .check_source_files(
+            &[source.as_bytes()],
+            &options,
+            SourceCheckLimits::new(limits),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        fln_elab::grind_patterns::read(checked.engine.environment())
+            .unwrap()
+            .len(),
+        1,
+    );
+    assert_eq!(engine.logical_root(&options), before);
 }
 
 /// A `section` with a header parses as the pin's `Command.section` with its `sectionHeader`, and

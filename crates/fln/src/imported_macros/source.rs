@@ -570,6 +570,7 @@ impl<'a> FileSession<'a> {
             ScopeCommand::Variable(_)
             | ScopeCommand::Executable(_)
             | ScopeCommand::Symm(_)
+            | ScopeCommand::GrindPattern(_)
             | ScopeCommand::ConstructorElims(_)
             | ScopeCommand::Trivia => {
                 return Ok(());
@@ -1112,11 +1113,12 @@ impl<'a> FileSession<'a> {
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Outcome<Result<fln_parse::command_scope::ScopeCommand, SourceMacroError>> {
         use fln_parse::command_scope::ScopeCommand;
-        let (syntax, variable, symm, constructor_elims) = match control {
-            ScopeCommand::Variable(syntax) => (syntax, true, false, false),
-            ScopeCommand::Executable(syntax) => (syntax, false, false, false),
-            ScopeCommand::Symm(syntax) => (syntax, false, true, false),
-            ScopeCommand::ConstructorElims(syntax) => (syntax, false, false, true),
+        let (syntax, variable, symm, constructor_elims, grind_pattern) = match control {
+            ScopeCommand::Variable(syntax) => (syntax, true, false, false, false),
+            ScopeCommand::Executable(syntax) => (syntax, false, false, false, false),
+            ScopeCommand::Symm(syntax) => (syntax, false, true, false, false),
+            ScopeCommand::ConstructorElims(syntax) => (syntax, false, false, true, false),
+            ScopeCommand::GrindPattern(syntax) => (syntax, false, false, false, true),
             other => return Outcome::Complete(Ok(other)),
         };
         match source_preflight(engine, registry, source, self.limits, self.cancellation) {
@@ -1179,6 +1181,8 @@ impl<'a> FileSession<'a> {
                     Ok(ScopeCommand::Symm(syntax))
                 } else if constructor_elims {
                     Ok(ScopeCommand::ConstructorElims(syntax))
+                } else if grind_pattern {
+                    Ok(ScopeCommand::GrindPattern(syntax))
                 } else {
                     Ok(ScopeCommand::Executable(syntax))
                 }
