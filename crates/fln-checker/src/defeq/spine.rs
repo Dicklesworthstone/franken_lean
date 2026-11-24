@@ -1,10 +1,12 @@
-//! Query-local, metered redex routing for application congruence.
+//! Query-local, metered head classification for application congruence.
 //!
 //! A reducible head may discard arguments, so decomposition must not precede
 //! reduction. Caching the demand of each immutable arena node avoids rescanning
 //! an n-argument spine n times. The cache records remaining arity, not a Boolean:
 //! a partial recursor can become saturated at an enclosing application. It is a
-//! routing hint only; the independent reducer still validates every rule.
+//! routing hint for the independent reducer, which validates each reduction.
+//! Registered inductive type formers also retain their constant and remaining
+//! arity, allowing their injectivity and distinct heads to decide mismatches.
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -12,6 +14,12 @@ pub(super) enum Demand {
     Never,
     Always,
     Constructor,
+    /// A registered inductive type former with this many arguments remaining.
+    /// Its applications are injective while the declared telescope is intact.
+    Inductive {
+        head: ExprId,
+        remaining: u32,
+    },
     /// Additional applications needed before an eliminator demands its major.
     Arguments(u64),
 }
@@ -77,8 +85,21 @@ impl SlowControl {
                     }
                     if found { Demand::Always } else { Demand::Never }
                 }
-                ExprNode::Constant { name, .. } => match context.constants().find(name) {
+                ExprNode::Constant { name, levels } => match context.constants().find(name) {
                     Some(entry) if context.delta_body(entry).is_some() => Demand::Always,
+                    Some(entry)
+                        if entry.level_parameters().len() == levels.len()
+                            && entry.inductive_metadata().is_some() =>
+                    {
+                        let family = entry.inductive_metadata().expect("inductive head");
+                        family
+                            .num_parameters()
+                            .checked_add(family.num_indices())
+                            .map_or(Demand::Never, |remaining| Demand::Inductive {
+                                head: current.root,
+                                remaining,
+                            })
+                    }
                     Some(entry)
                         if entry.kind() == crate::environment::ConstantKind::Constructor =>
                     {
@@ -112,6 +133,11 @@ impl SlowControl {
             demand = match step {
                 PathStep::Apply => match demand {
                     Demand::Arguments(remaining) => Demand::Arguments(remaining.saturating_sub(1)),
+                    Demand::Inductive { head, remaining } => {
+                        remaining.checked_sub(1).map_or(Demand::Never, |remaining| {
+                            Demand::Inductive { head, remaining }
+                        })
+                    }
                     other => other,
                 },
                 PathStep::Metadata => demand,

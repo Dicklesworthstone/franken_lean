@@ -190,6 +190,55 @@ fn proofs_that_differ_only_in_a_literal_are_still_one_proof() {
         &candidate("literal_data", app(c("S"), [nat(1)]), c("v")),
     );
 }
+
+#[test]
+fn inductive_type_arguments_refute_data_without_refuting_equal_proofs() {
+    let nat = |value| Expr::lit(Literal::Nat(NatLit::from_u64(value)));
+    let indexed = |label: &str, domain: Expr| {
+        let id = checker_name(label);
+        ConstantEntry::new(
+            id.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&pi(domain, Expr::sort(Level::one()))),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(0, 1, vec![id], Vec::new(), 0, false, false),
+            ),
+        )
+    };
+    let proof_type = |n| app(c("ProofIndex"), [app(c("mk"), [nat(n)])]);
+    let data_type = |n| app(c("DataIndex"), [nat(n)]);
+    let env = environment_of(vec![
+        entry("Nat", Expr::sort(Level::one())),
+        entry("P", Expr::sort(Level::zero())),
+        entry("mk", pi(c("Nat"), c("P"))),
+        indexed("ProofIndex", c("P")),
+        indexed("DataIndex", c("Nat")),
+        indexed("OtherIndex", c("Nat")),
+        entry("proof0", proof_type(0)),
+        entry("data0", data_type(0)),
+    ]);
+    accepted(&env, &candidate("proof_index", proof_type(1), c("proof0")));
+    assert!(matches!(
+        admit(
+            &env,
+            &candidate("data_index", data_type(1), c("data0")),
+            AdmissionBudget::unlimited()
+        ),
+        Verdict::Rejected(AdmissionRejection::BodyTypeMismatch { mismatch, .. })
+            if matches!(*mismatch, fln_checker::defeq::DefEqMismatch::NatLiterals { .. })
+    ));
+    assert!(matches!(
+        admit(
+            &env,
+            &candidate("other_family", app(c("OtherIndex"), [nat(0)]), c("data0")),
+            AdmissionBudget::unlimited()
+        ),
+        Verdict::Rejected(AdmissionRejection::BodyTypeMismatch { mismatch, .. })
+            if matches!(*mismatch, fln_checker::defeq::DefEqMismatch::InductiveHeads { .. })
+    ));
+}
+
 #[test]
 fn proof_arguments_cannot_hide_invalid_unused_annotations() {
     let env = environment();

@@ -430,6 +430,256 @@ fn sort_clashes_only_with_a_saturated_rigid_inductive() {
 }
 
 #[test]
+fn pi_and_inductive_type_injectivity_preserve_nested_mismatches() {
+    let prop = Expr::sort(Level::zero());
+    let type_ = Expr::sort(Level::one());
+    let pi = |domain, body| Expr::forall_e(name("x"), domain, body, BinderInfo::Default);
+    let family = checker_name("Indexed");
+    let context = definition_context(vec![ConstantEntry::new(
+        family.clone(),
+        ConstantDeclaration::inductive(
+            Vec::new(),
+            decoded(&pi(constant("Nat"), pi(constant("Nat"), type_.clone()))),
+            ConstantSafety::Safe,
+            InductiveDeclaration::new(0, 2, vec![family], Vec::new(), 0, false, false),
+        ),
+    )]);
+    let indexed = |first, second| Expr::app(Expr::app(constant("Indexed"), first), second);
+    let zero = nat_literal(0);
+    let one = nat_literal(1);
+    let bound = Expr::bvar(0).unwrap();
+    let pairs = [
+        (
+            pi(prop.clone(), prop.clone()),
+            pi(type_.clone(), prop.clone()),
+        ),
+        (
+            pi(prop.clone(), prop.clone()),
+            pi(prop.clone(), type_.clone()),
+        ),
+        (
+            indexed(zero.clone(), zero.clone()),
+            indexed(one.clone(), zero.clone()),
+        ),
+        (
+            indexed(zero.clone(), zero.clone()),
+            indexed(zero.clone(), one.clone()),
+        ),
+        (
+            pi(constant("Nat"), indexed(zero.clone(), bound.clone())),
+            pi(constant("Nat"), indexed(one.clone(), bound)),
+        ),
+        (
+            Expr::app(constant("Indexed"), zero.clone()),
+            Expr::app(constant("Indexed"), one.clone()),
+        ),
+    ];
+    let compare =
+        |a: &Expr, b: &Expr| def_eq(&decoded(a), &decoded(b), &context, DefEqBudget::unlimited());
+    for (left, right) in pairs {
+        for (a, b) in [(&left, &right), (&right, &left)] {
+            assert!(matches!(compare(a, b), DefEqOutcome::NotEqual { .. }));
+            // A rigid child cannot restore injectivity lost at its parent.
+            assert!(matches!(
+                compare(
+                    &Expr::app(constant("unknown"), a.clone()),
+                    &Expr::app(constant("unknown"), b.clone()),
+                ),
+                DefEqOutcome::Deferred { .. }
+            ));
+            let erase = Expr::lam(
+                name("ignored"),
+                type_.clone(),
+                zero.clone(),
+                BinderInfo::Default,
+            );
+            assert!(matches!(
+                compare(
+                    &Expr::app(erase.clone(), a.clone()),
+                    &Expr::app(erase, b.clone())
+                ),
+                DefEqOutcome::Equal(_)
+            ));
+        }
+    }
+    // Arity is part of the rigidity evidence. Overapplication and an unknown
+    // universe instantiation cannot borrow the family's injectivity.
+    for (left, right) in [
+        (
+            Expr::app(indexed(zero.clone(), zero.clone()), zero.clone()),
+            Expr::app(indexed(zero.clone(), zero.clone()), one.clone()),
+        ),
+        (
+            Expr::app(
+                Expr::const_(name("Indexed"), vec![Level::one()]),
+                zero.clone(),
+            ),
+            Expr::app(
+                Expr::const_(name("Indexed"), vec![Level::one()]),
+                one.clone(),
+            ),
+        ),
+    ] {
+        assert!(matches!(
+            compare(&left, &right),
+            DefEqOutcome::Deferred { .. }
+        ));
+    }
+    assert!(matches!(
+        def_eq(
+            &decoded(&indexed(zero.clone(), zero)),
+            &decoded(&indexed(one.clone(), one)),
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+        ),
+        DefEqOutcome::Deferred { .. }
+    ));
+}
+
+#[test]
+fn injective_type_refutation_retains_resource_and_cancellation_boundaries() {
+    let left = decoded(&Expr::forall_e(
+        name("p"),
+        Expr::sort(Level::zero()),
+        Expr::sort(Level::zero()),
+        BinderInfo::Default,
+    ));
+    let right = decoded(&Expr::forall_e(
+        name("p"),
+        Expr::sort(Level::zero()),
+        Expr::sort(Level::one()),
+        BinderInfo::Default,
+    ));
+    let context = WhnfContext::default();
+    let DefEqOutcome::NotEqual { progress, .. } =
+        def_eq(&left, &right, &context, DefEqBudget::unlimited())
+    else {
+        panic!("Pi codomains have distinct universes");
+    };
+    let mut budget = DefEqBudget::unlimited();
+    budget.max_slow_comparisons = progress.slow_comparisons - 1;
+    assert!(matches!(
+        def_eq(&left, &right, &context, budget),
+        DefEqOutcome::Inconclusive(DefEqStop::Resource {
+            limit: DefEqLimit::SlowComparisons,
+            ..
+        })
+    ));
+    assert!(matches!(
+        def_eq_with(&left, &right, &context, DefEqBudget::unlimited(), || true),
+        DefEqOutcome::Inconclusive(_)
+    ));
+    assert!(matches!(
+        def_eq(&left, &right, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::NotEqual { .. }
+    ));
+}
+
+#[test]
+fn distinct_inductive_types_refute_only_registered_complete_heads() {
+    let type_ = Expr::sort(Level::one());
+    let family_type = Expr::forall_e(
+        name("n"),
+        constant("Nat"),
+        type_.clone(),
+        BinderInfo::Default,
+    );
+    let entry = |label: &str, ty: &Expr, indices| {
+        let id = checker_name(label);
+        ConstantEntry::new(
+            id.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(ty),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(0, indices, vec![id], Vec::new(), 0, false, false),
+            ),
+        )
+    };
+    let context = definition_context(vec![
+        entry("Nat", &type_, 0),
+        entry("Bool", &type_, 0),
+        entry("Family", &family_type, 1),
+        entry("Other", &family_type, 1),
+        definition_entry(
+            "Alias",
+            decoded(&constant("Nat")),
+            ReducibilityHint::Abbrev,
+            DefinitionSafety::Safe,
+        ),
+    ]);
+    let compare =
+        |a: &Expr, b: &Expr| def_eq(&decoded(a), &decoded(b), &context, DefEqBudget::unlimited());
+    let applied = |label| Expr::app(constant(label), nat_literal(0));
+    let wrap = |a| Expr::forall_e(name("x"), constant("Nat"), a, BinderInfo::Default);
+    for (left, right) in [
+        (constant("Nat"), constant("Bool")),
+        (constant("Alias"), constant("Bool")),
+        (applied("Family"), applied("Other")),
+        (wrap(applied("Family")), wrap(applied("Other"))),
+        (
+            Expr::app(
+                Expr::mdata(KVMap::new(), constant("Family")),
+                nat_literal(0),
+            ),
+            applied("Other"),
+        ),
+    ] {
+        for (a, b) in [(&left, &right), (&right, &left)] {
+            assert!(matches!(
+                compare(a, b),
+                DefEqOutcome::NotEqual {
+                    mismatch: DefEqMismatch::InductiveHeads { .. },
+                    ..
+                }
+            ));
+            assert!(matches!(
+                compare(
+                    &Expr::app(constant("f"), a.clone()),
+                    &Expr::app(constant("f"), b.clone())
+                ),
+                DefEqOutcome::Deferred { .. }
+            ));
+            let erase = Expr::lam(
+                name("ignored"),
+                type_.clone(),
+                nat_literal(7),
+                BinderInfo::Default,
+            );
+            assert!(matches!(
+                compare(
+                    &Expr::app(erase.clone(), a.clone()),
+                    &Expr::app(erase, b.clone())
+                ),
+                DefEqOutcome::Equal(_)
+            ));
+        }
+    }
+    for (left, right) in [
+        (constant("Family"), constant("Other")),
+        (constant("Unknown"), constant("Nat")),
+        (
+            Expr::const_(name("Nat"), vec![Level::zero()]),
+            constant("Bool"),
+        ),
+        (applied("Nat"), applied("Bool")),
+        (
+            Expr::app(applied("Family"), nat_literal(0)),
+            Expr::app(applied("Other"), nat_literal(0)),
+        ),
+    ] {
+        assert!(matches!(
+            compare(&left, &right),
+            DefEqOutcome::Deferred { .. }
+        ));
+    }
+    assert!(matches!(
+        compare(&constant("Alias"), &constant("Nat")),
+        DefEqOutcome::Equal(_)
+    ));
+}
+
+#[test]
 fn slow_or_environment_sensitive_cases_defer_instead_of_rejecting() {
     let left = decoded(&Expr::const_(name("C"), vec![Level::zero()]));
     let right = decoded(&Expr::const_(name("C"), vec![Level::one()]));

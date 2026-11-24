@@ -295,6 +295,11 @@ pub struct DefEqDeferred {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefEqMismatch {
+    /// Fully applied inductive types with distinct registered heads.
+    InductiveHeads {
+        left: DefEqLocation,
+        right: DefEqLocation,
+    },
     /// A universe and a fully applied, registered inductive family.
     SortInductive {
         left: DefEqLocation,
@@ -1521,7 +1526,11 @@ enum PairAction {
     /// The same comparison with metadata stripped: not a decomposition.
     Strip((DefEqTerm, DefEqTerm)),
     Push1((DefEqTerm, DefEqTerm)),
-    Push2((DefEqTerm, DefEqTerm), (DefEqTerm, DefEqTerm)),
+    Push2 {
+        first: (DefEqTerm, DefEqTerm),
+        second: (DefEqTerm, DefEqTerm),
+        injective: bool,
+    },
     NotEqual(DefEqMismatch),
     Normalize(DefEqDeferred),
 }
@@ -1748,16 +1757,46 @@ fn compare_pair(
                     right_node,
                 ));
             }
-            Ok(PairAction::Push2(
-                (
+            // An inductive type former is rigid and its result is a type,
+            // including its partially applied prefixes. It cannot be equated
+            // by proof irrelevance or discard a differing argument. The spine
+            // scan already checked universe and term arity under this budget.
+            let injective = matches!(
+                control.spines.get(&left_reference),
+                Some(spine::Demand::Inductive { .. })
+            ) && matches!(
+                control.spines.get(&right_reference),
+                Some(spine::Demand::Inductive { .. })
+            );
+            if injective
+                && let (Some(left_head), Some(right_head)) = (
+                    saturated_inductive_head(left_reference, sources, context, control, cancelled)?,
+                    saturated_inductive_head(
+                        right_reference,
+                        sources,
+                        context,
+                        control,
+                        cancelled,
+                    )?,
+                )
+                && left_head != right_head
+            {
+                return Ok(PairAction::NotEqual(DefEqMismatch::InductiveHeads {
+                    left: left_reference.location(),
+                    right: right_reference.location(),
+                }));
+            }
+            Ok(PairAction::Push2 {
+                first: (
                     child(left_reference, *left_function)?,
                     child(right_reference, *right_function)?,
                 ),
-                (
+                second: (
                     child(left_reference, *left_argument)?,
                     child(right_reference, *right_argument)?,
                 ),
-            ))
+                injective,
+            })
         }
         (
             ExprNode::Lambda {
@@ -1782,16 +1821,19 @@ fn compare_pair(
                 body: right_body,
                 ..
             },
-        ) => Ok(PairAction::Push2(
-            (
+        ) => Ok(PairAction::Push2 {
+            first: (
                 child(left_reference, *left_type)?,
                 child(right_reference, *right_type)?,
             ),
-            (
+            second: (
                 child(left_reference, *left_body)?,
                 child(right_reference, *right_body)?,
             ),
-        )),
+            // Pi types are injective in their domains and opened bodies.
+            // Lambdas may instead be proofs of a proposition.
+            injective: matches!(left_node, ExprNode::Forall { .. }),
+        }),
         (ExprNode::Let { .. }, ExprNode::Let { .. }) => Ok(defer_pair(
             left_reference,
             right_reference,
@@ -3266,46 +3308,34 @@ fn unit_like_inductive_for_binder(
     Ok(None)
 }
 
-/// A fully applied inductive type is a rigid type constructor. Check metadata
-/// from the independent environment, counting its parameters and indices on
-/// the actual spine. Never infer rigidity from the constant's spelling.
-fn is_saturated_inductive(
-    mut head: DefEqTerm,
+/// Recover a fully applied inductive head from the metered spine classification.
+/// Its cached constant node belongs to the same immutable arena as the spine.
+fn saturated_inductive_head(
+    reference: DefEqTerm,
     sources: TermSources<'_>,
     context: &WhnfContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
-) -> Result<bool, SlowHalt> {
-    let mut arguments = 0_u64;
-    loop {
-        control.comparison(cancelled)?;
-        let arena = sources.source(head)?;
-        let node = arena
-            .node(head.root)
-            .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
-                location: head.location(),
-            }))?;
-        match node {
-            ExprNode::Apply { function, .. } => {
-                arguments += 1;
-                head = child(head, *function)?;
-            }
-            ExprNode::Metadata { expression, .. } => {
-                head = child(head, *expression)?;
-            }
-            ExprNode::Constant { name, levels } => {
-                let Some(declaration) = context.constants().find(name) else {
-                    return Ok(false);
-                };
-                return Ok(declaration.level_parameters().len() == levels.len()
-                    && declaration.inductive_metadata().is_some_and(|family| {
-                        arguments
-                            == u64::from(family.num_parameters()) + u64::from(family.num_indices())
-                    }));
-            }
-            _ => return Ok(false),
-        }
-    }
+) -> Result<Option<WireName>, SlowHalt> {
+    control.spine_head_reduces(reference, sources, context, true, cancelled)?;
+    let Some(spine::Demand::Inductive { head, remaining: 0 }) =
+        control.spines.get(&reference).copied()
+    else {
+        return Ok(None);
+    };
+    let (_, node) = slow_node(
+        DefEqTerm {
+            root: head,
+            ..reference
+        },
+        sources.left,
+        sources.right,
+        sources.generated,
+    )?;
+    Ok(match node {
+        ExprNode::Constant { name, .. } => Some(name.clone()),
+        _ => None,
+    })
 }
 
 fn collect_constructor_spine(
@@ -4023,13 +4053,12 @@ fn run_slow(
     )];
     let mut seen = BTreeSet::new();
 
-    // `decomposed` marks a pair reached by splitting an enclosing comparison
-    // (congruence, binders, projections, structure-eta fields) rather than by
-    // rewriting it. Without types, two different literals or sorts found there
-    // prove nothing about the enclosing terms: those may be proofs, equal by
-    // proof irrelevance, or may reduce away the differing part. So, as in quick
-    // conversion, only a mismatch on an undecomposed pair is a final negative
-    // verdict, and below the root it defers to conversion that has types. A
+    // `decomposed` marks a pair reached through a comparison whose injectivity
+    // is unknown (ordinary applications, lambdas, projections, structure-eta
+    // fields). A differing child may be erased or its parents may be proofs,
+    // so its mismatch defers to conversion that has types. Pi types and
+    // registered inductive type formers preserve decisive mismatches through
+    // their children; they cannot turn an already speculative pair decisive. A
     // matched string expansion is the exception: its pairs are `String`,
     // `List Char`, `Char` and `Nat` data, never proofs, and stay decisive.
     loop {
@@ -4071,9 +4100,20 @@ fn run_slow(
             PairAction::Push1((next_left, next_right)) => {
                 pending.push((next_left, next_right, offset_context, string_context, true));
             }
-            PairAction::Push2(first, second) => {
-                pending.push((second.0, second.1, offset_context, string_context, true));
-                pending.push((first.0, first.1, offset_context, string_context, true));
+            PairAction::Push2 {
+                first,
+                second,
+                injective,
+            } => {
+                let decomposed = decomposed || !injective;
+                pending.push((
+                    second.0,
+                    second.1,
+                    offset_context,
+                    string_context,
+                    decomposed,
+                ));
+                pending.push((first.0, first.1, offset_context, string_context, decomposed));
             }
             PairAction::NotEqual(mismatch) => {
                 return mismatch_outcome(
@@ -4212,9 +4252,26 @@ fn run_slow(
                         pending.push((first, second, offset_context, string_context, true));
                         continue;
                     }
-                    PairAction::Push2(first, second) => {
-                        pending.push((second.0, second.1, offset_context, string_context, true));
-                        pending.push((first.0, first.1, offset_context, string_context, true));
+                    PairAction::Push2 {
+                        first,
+                        second,
+                        injective,
+                    } => {
+                        let decomposed = decomposed || !injective;
+                        pending.push((
+                            second.0,
+                            second.1,
+                            offset_context,
+                            string_context,
+                            decomposed,
+                        ));
+                        pending.push((
+                            first.0,
+                            first.1,
+                            offset_context,
+                            string_context,
+                            decomposed,
+                        ));
                         continue;
                     }
                     _ => {}
@@ -4371,34 +4428,55 @@ fn run_slow(
                         }
                         // A negative answer from a child compared by congruence does
                         // not decide its parents: their function might erase it.
-                        let inductive_side = match (need.left_class, need.right_class) {
-                            (
-                                ExpressionClass::Sort,
-                                ExpressionClass::Apply | ExpressionClass::Constant,
-                            ) => Some(right_reference),
-                            (
-                                ExpressionClass::Apply | ExpressionClass::Constant,
-                                ExpressionClass::Sort,
-                            ) => Some(left_reference),
-                            _ => None,
-                        };
-                        if !decomposed
-                            && let Some(side) = inductive_side
-                            && is_saturated_inductive(
-                                side,
-                                TermSources::new(left, right, &generated),
-                                context,
-                                &mut control,
-                                cancelled,
-                            )?
-                        {
-                            return Ok(DefEqOutcome::NotEqual {
-                                mismatch: DefEqMismatch::SortInductive {
-                                    left: left_reference.location(),
-                                    right: right_reference.location(),
+                        if !decomposed {
+                            let mut head = |reference| {
+                                saturated_inductive_head(
+                                    reference,
+                                    TermSources::new(left, right, &generated),
+                                    context,
+                                    &mut control,
+                                    cancelled,
+                                )
+                            };
+                            let mismatch = match (need.left_class, need.right_class) {
+                                (
+                                    ExpressionClass::Sort,
+                                    ExpressionClass::Apply | ExpressionClass::Constant,
+                                ) if head(right_reference)?.is_some() => {
+                                    Some(DefEqMismatch::SortInductive {
+                                        left: left_reference.location(),
+                                        right: right_reference.location(),
+                                    })
+                                }
+                                (
+                                    ExpressionClass::Apply | ExpressionClass::Constant,
+                                    ExpressionClass::Sort,
+                                ) if head(left_reference)?.is_some() => {
+                                    Some(DefEqMismatch::SortInductive {
+                                        left: left_reference.location(),
+                                        right: right_reference.location(),
+                                    })
+                                }
+                                (
+                                    ExpressionClass::Apply | ExpressionClass::Constant,
+                                    ExpressionClass::Apply | ExpressionClass::Constant,
+                                ) => match (head(left_reference)?, head(right_reference)?) {
+                                    (Some(a), Some(b)) if a != b => {
+                                        Some(DefEqMismatch::InductiveHeads {
+                                            left: left_reference.location(),
+                                            right: right_reference.location(),
+                                        })
+                                    }
+                                    _ => None,
                                 },
-                                progress: control.progress,
-                            });
+                                _ => None,
+                            };
+                            if let Some(mismatch) = mismatch {
+                                return Ok(DefEqOutcome::NotEqual {
+                                    mismatch,
+                                    progress: control.progress,
+                                });
+                            }
                         }
                         trace_unresolved(
                             &need,
