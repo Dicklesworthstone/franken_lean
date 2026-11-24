@@ -275,6 +275,51 @@ fn rigid_sort_and_literal_mismatches_are_exact_non_equal_answers() {
 }
 
 #[test]
+fn string_expansion_retains_uncertainty_from_an_enclosing_function() {
+    let empty = Expr::app(
+        Expr::const_(qualified("String", "ofList"), Vec::new()),
+        Expr::app(
+            Expr::const_(qualified("List", "nil"), vec![Level::zero()]),
+            constant("Char"),
+        ),
+    );
+    let context = WhnfContext::default();
+    for value in ["", "a"] {
+        let literal = Expr::lit(Literal::Str(value.to_owned()));
+        for (left, right) in [(&literal, &empty), (&empty, &literal)] {
+            let direct = def_eq(
+                &decoded(left),
+                &decoded(right),
+                &context,
+                DefEqBudget::unlimited(),
+            );
+            assert!(
+                if value.is_empty() {
+                    matches!(direct, DefEqOutcome::Equal(_))
+                } else {
+                    matches!(direct, DefEqOutcome::NotEqual { .. })
+                },
+                "direct string comparison: {direct:?}"
+            );
+            let enclosed = def_eq(
+                &decoded(&Expr::app(constant("f"), left.clone())),
+                &decoded(&Expr::app(constant("f"), right.clone())),
+                &context,
+                DefEqBudget::unlimited(),
+            );
+            assert!(
+                if value.is_empty() {
+                    matches!(enclosed, DefEqOutcome::Equal(_))
+                } else {
+                    matches!(enclosed, DefEqOutcome::Deferred { .. })
+                },
+                "an unknown function may erase a differing string: {enclosed:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_mismatch_below_the_root_defers_instead_of_rejecting() {
     // Untyped conversion cannot see types, so a literal mismatch it reaches by
     // congruence says nothing about the terms enclosing it: `g 0` and `g 1`

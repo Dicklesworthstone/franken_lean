@@ -4284,6 +4284,14 @@ fn run_slow(
                     &mut control,
                     cancelled,
                 )? {
+                    // The enclosing function may erase this argument, or
+                    // return a proof whose value is irrelevant. Expanding a
+                    // string cannot restore negative authority lost above it.
+                    let next_string_context = if decomposed {
+                        string_context
+                    } else {
+                        StringComparisonContext::MatchedExpansion
+                    };
                     match side {
                         DefEqSide::Left => {
                             let next_left = retain_generated(&mut generated, DefEqSide::Left, term);
@@ -4291,7 +4299,7 @@ fn run_slow(
                                 next_left,
                                 right_reference,
                                 offset_context,
-                                StringComparisonContext::MatchedExpansion,
+                                next_string_context,
                                 decomposed,
                             ));
                         }
@@ -4302,7 +4310,7 @@ fn run_slow(
                                 left_reference,
                                 next_right,
                                 offset_context,
-                                StringComparisonContext::MatchedExpansion,
+                                next_string_context,
                                 decomposed,
                             ));
                         }

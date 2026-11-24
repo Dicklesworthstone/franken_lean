@@ -240,6 +240,97 @@ fn inductive_type_arguments_refute_data_without_refuting_equal_proofs() {
 }
 
 #[test]
+fn string_expansion_refutes_data_without_refuting_equal_proofs() {
+    let u = Level::param(primary_name("u"));
+    let type_u = Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
+    let list = |level, element| app(Expr::const_(primary_name("List"), vec![level]), [element]);
+    let of_list = Expr::const_(Name::from_components(["String", "ofList"]), Vec::new());
+    let empty = app(
+        of_list,
+        [app(
+            Expr::const_(Name::from_components(["List", "nil"]), vec![Level::zero()]),
+            [c("Char")],
+        )],
+    );
+    let literal = Expr::lit(Literal::Str("a".to_owned()));
+    let indexed = |label: &str, domain| {
+        let id = checker_name(label);
+        ConstantEntry::new(
+            id.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&pi(domain, Expr::sort(Level::one()))),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(0, 1, vec![id], Vec::new(), 0, false, false),
+            ),
+        )
+    };
+    let proof_type = |value| app(c("ProofIndex"), [app(c("mkString"), [value])]);
+    let string_type = |value| app(c("StringIndex"), [value]);
+    let env = environment_of(vec![
+        entry("P", Expr::sort(Level::zero())),
+        entry("String", Expr::sort(Level::one())),
+        entry("Char", Expr::sort(Level::one())),
+        ConstantEntry::new(
+            checker_name("List"),
+            header(
+                vec![checker_name("u")],
+                decoded(&pi(type_u.clone(), type_u.clone())),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["List", "nil"]),
+            header(
+                vec![checker_name("u")],
+                decoded(&pi(
+                    type_u,
+                    list(u, Expr::bvar(0).expect("list element type")),
+                )),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["String", "ofList"]),
+            header(
+                Vec::new(),
+                decoded(&pi(list(Level::zero(), c("Char")), c("String"))),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+        ),
+        entry("mkString", pi(c("String"), c("P"))),
+        indexed("ProofIndex", c("P")),
+        indexed("StringIndex", c("String")),
+        entry("proof_witness", proof_type(literal.clone())),
+        entry("string_witness", string_type(literal)),
+    ]);
+    accepted(
+        &env,
+        &candidate(
+            "string_proofs",
+            proof_type(empty.clone()),
+            c("proof_witness"),
+        ),
+    );
+    let different_data = admit(
+        &env,
+        &candidate("string_values", string_type(empty), c("string_witness")),
+        AdmissionBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            &different_data,
+            Verdict::Rejected(AdmissionRejection::BodyTypeMismatch { mismatch, .. })
+                if matches!(**mismatch, fln_checker::defeq::DefEqMismatch::StringExpansion { .. })
+        ),
+        "{different_data:?}"
+    );
+}
+
+#[test]
 fn proof_arguments_cannot_hide_invalid_unused_annotations() {
     let env = environment();
     let bad = Expr::let_e(primary_name("ignored"), c("Q"), c("p"), c("w"), false);
