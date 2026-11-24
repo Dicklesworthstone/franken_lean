@@ -13664,22 +13664,18 @@ fn source_terminal(
 }
 
 fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static str, bool, u8) {
-    match error {
-        fln::EngineExecutionError::BatchCommand { error, .. } => execution_error_disposition(error),
-        fln::EngineExecutionError::Frontend(fln::DefinitionFrontendError::Elaborate(
-            fln_elab::NatDefinitionElabError::Inference(
-                fln_elab::source::SourceInferenceError::EliminatorTags(error),
-            ),
-        )) => match error {
-            fln_elab::eliminator_tags::EliminatorTagError::UnsupportedEliminator(_) => {
+    if let Some(kind) = error.eliminator_tag_error_kind() {
+        return match kind {
+            fln::EliminatorTagErrorKind::UnsupportedEliminator => {
                 ("capability", false, CAPABILITY_NOT_IMPLEMENTED_EXIT)
             }
-            fln_elab::eliminator_tags::EliminatorTagError::Limit => ("resource", false, 3),
-            fln_elab::eliminator_tags::EliminatorTagError::Malformed => {
-                ("internal-fault", false, 4)
-            }
-            _ => ("execution", true, 1),
-        },
+            fln::EliminatorTagErrorKind::Limit => ("resource", false, 3),
+            fln::EliminatorTagErrorKind::Malformed => ("internal-fault", false, 4),
+            fln::EliminatorTagErrorKind::Execution => ("execution", true, 1),
+        };
+    }
+    match error {
+        fln::EngineExecutionError::BatchCommand { error, .. } => execution_error_disposition(error),
         fln::EngineExecutionError::AllocationFailure { .. }
         | fln::EngineExecutionError::SourceScopeLimit { .. }
         | fln::EngineExecutionError::SourceModuleLimit { .. }

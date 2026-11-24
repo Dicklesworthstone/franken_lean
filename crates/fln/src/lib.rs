@@ -10055,7 +10055,41 @@ pub enum EngineExecutionError {
     Codec(CodecError),
 }
 
+/// Disposition-relevant category of an elaborator eliminator-tag failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EliminatorTagErrorKind {
+    UnsupportedEliminator,
+    Limit,
+    Malformed,
+    Execution,
+}
+
 impl EngineExecutionError {
+    /// Classification of a frontend eliminator-tag elaboration error, if any,
+    /// without requiring downstream CLI crates to depend directly on `fln-elab`.
+    pub fn eliminator_tag_error_kind(&self) -> Option<EliminatorTagErrorKind> {
+        match self {
+            Self::BatchCommand { error, .. } => error.eliminator_tag_error_kind(),
+            Self::Frontend(NatDefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::EliminatorTags(error),
+                ),
+            )) => Some(match error {
+                fln_elab::eliminator_tags::EliminatorTagError::UnsupportedEliminator(_) => {
+                    EliminatorTagErrorKind::UnsupportedEliminator
+                }
+                fln_elab::eliminator_tags::EliminatorTagError::Limit => {
+                    EliminatorTagErrorKind::Limit
+                }
+                fln_elab::eliminator_tags::EliminatorTagError::Malformed => {
+                    EliminatorTagErrorKind::Malformed
+                }
+                _ => EliminatorTagErrorKind::Execution,
+            }),
+            _ => None,
+        }
+    }
+
     /// The primary source byte offset this failure points at, or `None`.
     ///
     /// A frontend refusal delegates to [`NatDefinitionFrontendError::primary_offset`]

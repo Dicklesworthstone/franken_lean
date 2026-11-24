@@ -75,6 +75,56 @@ impl Preparation<'_> {
         }))
     }
 
+    fn has_staged_callback_argument(
+        &mut self,
+        definition_type: &Expr,
+        arguments: &[Expr],
+    ) -> Result<bool, IngressError> {
+        let mut computed_candidate = false;
+        for argument in arguments {
+            if self.inert_callable(argument)?.is_some() {
+                return Ok(true);
+            }
+            computed_candidate |= matches!(
+                argument.node(),
+                ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::MData { .. }
+            );
+        }
+        if !computed_candidate {
+            return Ok(false);
+        }
+        let mut parameter_type = definition_type.clone();
+        for argument in arguments {
+            self.tick()?;
+            let normal = self.type_head(&parameter_type)?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = normal.node()
+            else {
+                break;
+            };
+            // The entry below requires this same nondependent
+            // telescope. Do not substitute runtime operands into
+            // types merely to discover an ineligible callback.
+            if binder_type.has_loose_bvars() || body.has_loose_bvars() {
+                break;
+            }
+            if matches!(
+                argument.node(),
+                ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::MData { .. }
+            ) && matches!(
+                self.type_head(binder_type)?.node(),
+                ExprNode::ForallE { .. }
+            ) && !self.type_parameter(binder_type)?
+                && self.computed_callback_is_staged(argument, binder_type)?
+            {
+                return Ok(true);
+            }
+            parameter_type = body.clone();
+        }
+        Ok(false)
+    }
+
     fn partial_stage(
         &mut self,
         name: &Name,
@@ -133,60 +183,14 @@ impl Preparation<'_> {
             body = next.clone();
         }
         let producer = matches!(self.type_head(&type_)?.node(), ExprNode::ForallE { .. });
-        if !producer {
+        if !producer && !self.has_staged_callback_argument(&definition.base.type_, arguments)? {
             // Ordinary fully lambda-bound globals keep their flat ABI. Only a
             // known callback can justify building a different recursive entry.
             // A strict producer can expose the same checked staged callback as
             // a literal: recognize its interface without copying or evaluating
             // its prefix. PartialCallPlan retains the operand's strict binding;
             // neither runtime values nor captures enter the specialization key.
-            let mut known_callback = false;
-            let mut computed_candidate = false;
-            for argument in arguments {
-                if self.inert_callable(argument)?.is_some() {
-                    known_callback = true;
-                    break;
-                }
-                computed_candidate |= matches!(
-                    argument.node(),
-                    ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::MData { .. }
-                );
-            }
-            if !known_callback && computed_candidate {
-                let mut parameter_type = definition.base.type_.clone();
-                for argument in arguments {
-                    self.tick()?;
-                    let normal = self.type_head(&parameter_type)?;
-                    let ExprNode::ForallE {
-                        binder_type, body, ..
-                    } = normal.node()
-                    else {
-                        break;
-                    };
-                    // The entry below requires this same nondependent
-                    // telescope. Do not substitute runtime operands into
-                    // types merely to discover an ineligible callback.
-                    if binder_type.has_loose_bvars() || body.has_loose_bvars() {
-                        break;
-                    }
-                    if matches!(
-                        argument.node(),
-                        ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::MData { .. }
-                    ) && matches!(
-                        self.type_head(binder_type)?.node(),
-                        ExprNode::ForallE { .. }
-                    ) && !self.type_parameter(binder_type)?
-                        && self.computed_callback_is_staged(argument, binder_type)?
-                    {
-                        known_callback = true;
-                        break;
-                    }
-                    parameter_type = body.clone();
-                }
-            }
-            if !known_callback {
-                return Ok(None);
-            }
+            return Ok(None);
         }
         let mut definition = self.normalize_definition_signature(&definition)?;
         if !specialize::closed(&definition.base.type_) {
@@ -231,7 +235,18 @@ impl Preparation<'_> {
             type_ = result.clone();
             body = next.clone();
         }
-        if producer != matches!(type_.node(), ExprNode::ForallE { .. }) {
+        // Proof erasure and dead-let elimination inside
+        // `normalize_definition_signature` can erase an unused let prefix that
+        // previously stood before a trailing lambda, turning a raw `producer`
+        // into a fully lambda-bound function. Still allow callback-stage
+        // specialization on that normalized body when the call passes a staged
+        // callback; otherwise keep the flat ABI.
+        let normalized_producer = matches!(type_.node(), ExprNode::ForallE { .. });
+        if normalized_producer && !producer {
+            return Ok(None);
+        }
+        let producer = normalized_producer;
+        if !producer && !self.has_staged_callback_argument(&definition.base.type_, arguments)? {
             return Ok(None);
         }
         let Some(result) = self.value_type(&type_)? else {

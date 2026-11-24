@@ -167,41 +167,60 @@ fn recursive_partial_globals_return_reusable_closures_and_replay() {
 #[test]
 fn nonreturning_prefix_is_evaluated_when_live_and_eliminated_when_unused() {
     let callback_type = arrow(nat_type());
-    let value = lambda(Expr::let_e(
+    // An unused pure let inside `spin` is erased by LCNF dead-let elimination
+    // (pinned Lean 4 v4.32.0 prints `42` for both `let ignored := spin 0; 42`
+    // and `spin 0 5`), whereas a live recursive prefix (`spinLive`) diverges
+    // when invoked and is still eliminated when bound to an unused outer let.
+    let dead_value = lambda(Expr::let_e(
         name("never"),
         callback_type.clone(),
         call("spin._unsafe_rec", [b(0)]),
         lambda(nat::literal(42)),
         false,
     ));
-    let engine = admit(pair(
-        "spin",
-        arrow(callback_type),
-        lambda(lambda(nat::literal(0))),
-        value,
+    let live_value = lambda(Expr::let_e(
+        name("never"),
+        callback_type.clone(),
+        call("spinLive._unsafe_rec", [b(0)]),
+        lambda(Expr::app(b(1), b(0))),
+        false,
     ));
+    let engine = extend(
+        admit(pair(
+            "spin",
+            arrow(callback_type.clone()),
+            lambda(lambda(nat::literal(0))),
+            dead_value,
+        )),
+        pair(
+            "spinLive",
+            arrow(callback_type),
+            lambda(lambda(nat::literal(0))),
+            live_value,
+        ),
+    );
     let root = engine.logical_root(&KVMap::new());
     let mut bounded = limits();
     bounded.vm.max_steps = 200;
-    // Matches pinned Lean 4 LCNF dead-let elimination: an unused pure let binding
-    // is dropped rather than evaluated, while invoking the call still runs strictly.
-    let discarded = engine
-        .execute_source_definitions(
-            &[b"#eval let ignored : Nat -> Nat := spin 0; 42"],
-            &KVMap::new(),
-            bounded,
-        )
-        .unwrap()
-        .into_complete()
-        .unwrap();
-    assert_eq!(
-        crate::closed_vm_value(&discarded.executions.last().unwrap().exit).unwrap(),
-        Some(crate::ClosedVmValue::Scalar(42))
-    );
-    assert_eq!(engine.logical_root(&KVMap::new()), root);
+    for source in [
+        b"#eval let ignored : Nat -> Nat := spin 0; 42".as_slice(),
+        b"#eval spin 0 5".as_slice(),
+        b"#eval let ignored : Nat -> Nat := spinLive 0; 42".as_slice(),
+    ] {
+        let completed = engine
+            .execute_source_definitions(&[source], &KVMap::new(), bounded)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(
+            crate::closed_vm_value(&completed.executions.last().unwrap().exit).unwrap(),
+            Some(crate::ClosedVmValue::Scalar(42))
+        );
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
     assert!(matches!(
         engine
-            .execute_source_definitions(&[b"#eval spin 0 5"], &KVMap::new(), bounded)
+            .execute_source_definitions(&[b"#eval spinLive 0 5"], &KVMap::new(), bounded)
             .unwrap(),
         Outcome::Inconclusive(_)
     ));
@@ -235,39 +254,56 @@ fn zero_argument_partial_prefix_executes_before_returning_its_callback() {
 #[test]
 fn a_diverging_zero_argument_prefix_runs_when_live_and_is_eliminated_when_unused() {
     let callback_type = arrow(nat_type());
-    let value = Expr::let_e(
+    let dead_value = Expr::let_e(
         name("never"),
         callback_type.clone(),
         call("spinZero._unsafe_rec", []),
         lambda(nat::literal(42)),
         false,
     );
-    let engine = admit(pair(
-        "spinZero",
-        callback_type,
-        lambda(nat::literal(0)),
-        value,
-    ));
+    let live_value = Expr::let_e(
+        name("never"),
+        callback_type.clone(),
+        call("spinZeroLive._unsafe_rec", []),
+        lambda(Expr::app(b(1), b(0))),
+        false,
+    );
+    let engine = extend(
+        admit(pair(
+            "spinZero",
+            callback_type.clone(),
+            lambda(nat::literal(0)),
+            dead_value,
+        )),
+        pair(
+            "spinZeroLive",
+            callback_type,
+            lambda(nat::literal(0)),
+            live_value,
+        ),
+    );
     let root = engine.logical_root(&KVMap::new());
     let mut bounded = limits();
     bounded.vm.max_steps = 200;
-    let discarded = engine
-        .execute_source_definitions(
-            &[b"#eval let ignored : Nat -> Nat := spinZero; 42"],
-            &KVMap::new(),
-            bounded,
-        )
-        .unwrap()
-        .into_complete()
-        .unwrap();
-    assert_eq!(
-        crate::closed_vm_value(&discarded.executions.last().unwrap().exit).unwrap(),
-        Some(crate::ClosedVmValue::Scalar(42))
-    );
-    assert_eq!(engine.logical_root(&KVMap::new()), root);
+    for source in [
+        b"#eval let ignored : Nat -> Nat := spinZero; 42".as_slice(),
+        b"#eval spinZero 5".as_slice(),
+        b"#eval let ignored : Nat -> Nat := spinZeroLive; 42".as_slice(),
+    ] {
+        let completed = engine
+            .execute_source_definitions(&[source], &KVMap::new(), bounded)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(
+            crate::closed_vm_value(&completed.executions.last().unwrap().exit).unwrap(),
+            Some(crate::ClosedVmValue::Scalar(42))
+        );
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
     assert!(matches!(
         engine
-            .execute_source_definitions(&[b"#eval spinZero 5"], &KVMap::new(), bounded)
+            .execute_source_definitions(&[b"#eval spinZeroLive 5"], &KVMap::new(), bounded)
             .unwrap(),
         Outcome::Inconclusive(_)
     ));

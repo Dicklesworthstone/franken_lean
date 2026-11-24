@@ -122,27 +122,46 @@ fn a_callback_prefix_executes_when_live_and_is_eliminated_when_unused() {
             ))),
         ),
     );
+    let engine = extend(
+        engine,
+        pair(
+            "stageUse",
+            consumer_type(),
+            callback_parameter(lambda(lambda(nat::literal(0)))),
+            callback_parameter(lambda(Expr::let_e(
+                name("action"),
+                arrow(nat_type()),
+                Expr::app(b(1), b(0)),
+                lambda(Expr::app(b(1), b(0))),
+                false,
+            ))),
+        ),
+    );
     let root = engine.logical_root(&KVMap::new());
     let mut bounded = limits();
     bounded.vm.max_steps = 500;
-    let discarded = engine
-        .execute_source_definitions(
-            &[b"#eval let ignored : Nat -> Nat := stageIgnore (fun n => let paid := stageSpin n; fun state => Nat.add paid state) 3; 42"],
-            &KVMap::new(),
-            bounded,
-        )
-        .unwrap()
-        .into_complete()
-        .unwrap();
-    assert_eq!(
-        crate::closed_vm_value(&discarded.executions.last().unwrap().exit).unwrap(),
-        Some(crate::ClosedVmValue::Scalar(42))
-    );
-    assert_eq!(engine.logical_root(&KVMap::new()), root);
+    // Matches pinned Lean 4 v4.32.0: dead `let action := f n` inside `stageIgnore`
+    // is erased while callback-stage specialization still accepts staged callbacks.
+    for source in [
+        b"#eval let ignored : Nat -> Nat := stageIgnore (fun n => let paid := stageSpin n; fun state => Nat.add paid state) 3; 42".as_slice(),
+        b"#eval stageIgnore (fun n => let paid := stageSpin n; fun state => Nat.add paid state) 3 5".as_slice(),
+        b"#eval let ignored : Nat -> Nat := stageUse (fun n => let paid := stageSpin n; fun state => Nat.add paid state) 3; 42".as_slice(),
+    ] {
+        let completed = engine
+            .execute_source_definitions(&[source], &KVMap::new(), bounded)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(
+            crate::closed_vm_value(&completed.executions.last().unwrap().exit).unwrap(),
+            Some(crate::ClosedVmValue::Scalar(42))
+        );
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
     assert!(matches!(
         engine
             .execute_source_definitions(
-                &[b"#eval stageIgnore (fun n => let paid := stageSpin n; fun state => Nat.add paid state) 3 5"],
+                &[b"#eval stageUse (fun n => let paid := stageSpin n; fun state => Nat.add paid state) 3 5"],
                 &KVMap::new(),
                 bounded,
             )
@@ -152,8 +171,8 @@ fn a_callback_prefix_executes_when_live_and_is_eliminated_when_unused() {
     assert_eq!(engine.logical_root(&KVMap::new()), root);
     returned(
         &engine,
-        b"#eval stageIgnore (fun n => let paid := Nat.add n 1; fun state => Nat.add paid state) 3 5",
-        &["42"],
+        b"#eval stageIgnore (fun n => let paid := Nat.add n 1; fun state => Nat.add paid state) 3 5\n#eval stageUse (fun n => let paid := Nat.add n 1; fun state => Nat.add paid state) 3 5",
+        &["42", "9"],
     );
 }
 
