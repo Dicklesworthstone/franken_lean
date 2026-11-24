@@ -1335,10 +1335,20 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
             continue;
         }
         if let TokenKind::Symbol(symbol) = &token.kind {
-            let command_line = (index == 0
+            let begins_line = index == 0
                 || source_view.line_of(token.extent.start())
-                    > source_view.line_of(tokens[index - 1].extent.end()))
-                && declaration_column.is_none_or(|base| column(token) <= base);
+                    > source_view.line_of(tokens[index - 1].extent.end());
+            // A declaration doc may be indented farther than its declaration
+            // (as in Init.Prelude's Macro.resolveNamespace). The following
+            // declaration exits the previous layout block and owns the doc.
+            let command_line = begins_line
+                && declaration_column.is_none_or(|base| {
+                    column(token) <= base
+                        || (symbol == "/--"
+                            && tokens.get(index + 1).is_some_and(|next| {
+                                carries_doc_comment(next) && column(next) <= base
+                            }))
+                });
             if depth == 0 && custom_command && !command_line {
                 match bracket(symbol) {
                     Some(true) => depth = depth.saturating_add(1),
@@ -2604,6 +2614,19 @@ def after : Nat := 3
         let commands = partition(source.as_bytes()).unwrap();
         assert_eq!(commands.len(), 2, "{commands:?}");
         assert!(commands[1].1.starts_with(b"def x"));
+    }
+
+    #[test]
+    fn indented_doc_before_an_outdented_declaration_belongs_to_that_declaration() {
+        let source = b"structure S where\r\n  /-- Field. -/\r\n  n : Nat\r\n  /-- Next declaration. -/\r\ndef laterDecl : Nat := 0\r\n";
+        let commands = partition(source).unwrap();
+        assert_eq!(commands.len(), 2);
+        let split = source.windows(8).position(|w| w == b"  /-- Ne").unwrap();
+        assert_eq!(commands[0], (BytePos(0), &source[..split]));
+        assert_eq!(commands[1], (BytePos(split), &source[split..]));
+        for (_, command) in commands {
+            parse_definition(command).unwrap();
+        }
     }
 
     /// A module doc is a command of its own wherever a command may start; a declaration's doc
