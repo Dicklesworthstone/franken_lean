@@ -990,10 +990,12 @@ jobs:
             scripts/tribunal/bemc_mutant_generator.lean \
             Init.Data.List.Basic 7 4 100 "$bemc_root"
           rc=0
+          FLN_BEMC_MIN_CHECKER_REJECTS=92 \
           FLN_BEMC_ROOT="$bemc_root" FLN_BEMC_MODULE=Bemc.Init.Data.Nat.Basic \
             cargo test --locked -p fln-conformance --test kernel_replay \
             bemc_synthetic_module_pin_and_kernel_verdicts_join \
             -- --ignored --exact --nocapture || rc=1
+          FLN_BEMC_MIN_CHECKER_REJECTS=167 \
           FLN_BEMC_ROOT="$bemc_root" FLN_BEMC_MODULE=Bemc.Init.Data.List.Basic \
             cargo test --locked -p fln-conformance --test kernel_replay \
             bemc_synthetic_module_pin_and_kernel_verdicts_join \

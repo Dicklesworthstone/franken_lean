@@ -31,6 +31,13 @@ pub(super) fn judge(
         Ok("1") => true,
         _ => panic!("FLN_BEMC_REQUIRE_COMPLETE_CHECKER must be 0 or 1"),
     };
+    let min_checker_rejects = std::env::var_os("FLN_BEMC_MIN_CHECKER_REJECTS").map(|value| {
+        value
+            .to_str()
+            .and_then(|s| s.parse::<std::num::NonZeroU64>().ok())
+            .expect("FLN_BEMC_MIN_CHECKER_REJECTS must be a positive integer")
+            .get()
+    });
     let limits = fln::CheckerExecutionLimits::default();
     let mut context = ReferenceFixtureContext::new();
     let mut checker = ConstantEnvironment::empty();
@@ -148,6 +155,16 @@ pub(super) fn judge(
         // The scheduled lane requires an actual rejection when there are
         // negative controls. A checker that defers every one cannot pass.
         if !cells.deferred_rejects.is_empty() && (require_complete || cells.agree_reject == 0) {
+            clean = false;
+        }
+        if engine == "fln-checker"
+            && let Some(minimum) = min_checker_rejects
+            && cells.agree_reject < minimum
+        {
+            eprintln!(
+                "bemc-coverage module={chosen} engine={engine} observed_rejects={} required_rejects={minimum}",
+                cells.agree_reject
+            );
             clean = false;
         }
         for row in cells.deferred_rejects {

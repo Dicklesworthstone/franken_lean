@@ -295,6 +295,11 @@ pub struct DefEqDeferred {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefEqMismatch {
+    /// A universe and a fully applied, registered inductive family.
+    SortInductive {
+        left: DefEqLocation,
+        right: DefEqLocation,
+    },
     /// A universe and a dependent function type have distinct rigid heads.
     SortForall {
         left: DefEqLocation,
@@ -3261,6 +3266,48 @@ fn unit_like_inductive_for_binder(
     Ok(None)
 }
 
+/// A fully applied inductive type is a rigid type constructor. Check metadata
+/// from the independent environment, counting its parameters and indices on
+/// the actual spine. Never infer rigidity from the constant's spelling.
+fn is_saturated_inductive(
+    mut head: DefEqTerm,
+    sources: TermSources<'_>,
+    context: &WhnfContext,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<bool, SlowHalt> {
+    let mut arguments = 0_u64;
+    loop {
+        control.comparison(cancelled)?;
+        let arena = sources.source(head)?;
+        let node = arena
+            .node(head.root)
+            .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+                location: head.location(),
+            }))?;
+        match node {
+            ExprNode::Apply { function, .. } => {
+                arguments += 1;
+                head = child(head, *function)?;
+            }
+            ExprNode::Metadata { expression, .. } => {
+                head = child(head, *expression)?;
+            }
+            ExprNode::Constant { name, levels } => {
+                let Some(declaration) = context.constants().find(name) else {
+                    return Ok(false);
+                };
+                return Ok(declaration.level_parameters().len() == levels.len()
+                    && declaration.inductive_metadata().is_some_and(|family| {
+                        arguments
+                            == u64::from(family.num_parameters()) + u64::from(family.num_indices())
+                    }));
+            }
+            _ => return Ok(false),
+        }
+    }
+}
+
 fn collect_constructor_spine(
     term: DefEqTerm,
     sources: TermSources<'_>,
@@ -4321,6 +4368,37 @@ fn run_slow(
                                 ));
                             }
                             continue;
+                        }
+                        // A negative answer from a child compared by congruence does
+                        // not decide its parents: their function might erase it.
+                        let inductive_side = match (need.left_class, need.right_class) {
+                            (
+                                ExpressionClass::Sort,
+                                ExpressionClass::Apply | ExpressionClass::Constant,
+                            ) => Some(right_reference),
+                            (
+                                ExpressionClass::Apply | ExpressionClass::Constant,
+                                ExpressionClass::Sort,
+                            ) => Some(left_reference),
+                            _ => None,
+                        };
+                        if !decomposed
+                            && let Some(side) = inductive_side
+                            && is_saturated_inductive(
+                                side,
+                                TermSources::new(left, right, &generated),
+                                context,
+                                &mut control,
+                                cancelled,
+                            )?
+                        {
+                            return Ok(DefEqOutcome::NotEqual {
+                                mismatch: DefEqMismatch::SortInductive {
+                                    left: left_reference.location(),
+                                    right: right_reference.location(),
+                                },
+                                progress: control.progress,
+                            });
                         }
                         trace_unresolved(
                             &need,

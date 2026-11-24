@@ -336,6 +336,100 @@ fn sort_and_forall_clash_only_at_a_decisive_comparison() {
 }
 
 #[test]
+fn sort_clashes_only_with_a_saturated_rigid_inductive() {
+    let sort = Expr::sort(Level::zero());
+    let type_ = Expr::sort(Level::one());
+    let family_type = Expr::forall_e(name("p"), sort.clone(), type_.clone(), BinderInfo::Default);
+    let entry = |label: &str, ty: &Expr, parameters, indices| {
+        let id = checker_name(label);
+        ConstantEntry::new(
+            id.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(ty),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    parameters,
+                    indices,
+                    vec![id],
+                    Vec::new(),
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        )
+    };
+    let context = definition_context(vec![
+        entry("Ground", &type_, 0, 0),
+        entry("Family", &family_type, 1, 0),
+        entry("Indexed", &family_type, 0, 1),
+        definition_entry(
+            "SortAlias",
+            decoded(&sort),
+            ReducibilityHint::Abbrev,
+            DefinitionSafety::Safe,
+        ),
+    ]);
+    let compare = |left: &Expr, right: &Expr| {
+        def_eq(
+            &decoded(left),
+            &decoded(right),
+            &context,
+            DefEqBudget::unlimited(),
+        )
+    };
+    let prop = constant("P");
+    let applied = |f: &str| Expr::app(constant(f), prop.clone());
+    for family in [constant("Ground"), applied("Family"), applied("Indexed")] {
+        for (a, b) in [(&family, &sort), (&sort, &family)] {
+            assert!(matches!(
+                compare(a, b),
+                DefEqOutcome::NotEqual {
+                    mismatch: DefEqMismatch::SortInductive { .. },
+                    ..
+                }
+            ));
+            assert!(matches!(
+                compare(
+                    &Expr::app(constant("f"), a.clone()),
+                    &Expr::app(constant("f"), b.clone())
+                ),
+                DefEqOutcome::Deferred { .. }
+            ));
+            let erase = Expr::lam(
+                name("T"),
+                type_.clone(),
+                nat_literal(7),
+                BinderInfo::Default,
+            );
+            assert!(matches!(
+                compare(
+                    &Expr::app(erase.clone(), a.clone()),
+                    &Expr::app(erase, b.clone())
+                ),
+                DefEqOutcome::Equal(_)
+            ));
+        }
+    }
+    for candidate in [
+        constant("Family"),
+        applied("Missing"),
+        Expr::app(applied("Family"), prop),
+        constant("Missing"),
+    ] {
+        assert!(matches!(
+            compare(&candidate, &sort),
+            DefEqOutcome::Deferred { .. }
+        ));
+    }
+    assert!(matches!(
+        compare(&constant("SortAlias"), &sort),
+        DefEqOutcome::Equal(_)
+    ));
+}
+
+#[test]
 fn slow_or_environment_sensitive_cases_defer_instead_of_rejecting() {
     let left = decoded(&Expr::const_(name("C"), vec![Level::zero()]));
     let right = decoded(&Expr::const_(name("C"), vec![Level::one()]));
