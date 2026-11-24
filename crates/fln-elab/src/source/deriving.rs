@@ -262,12 +262,19 @@ pub fn prepare(syntax: &Syntax) -> Result<Option<DerivingRequest>, NatDefinition
         2,
         "derived declaration",
     )?;
-    let parts = expect_node(
-        &root[1],
-        &parser_kind(&["Command", if is_record { "structure" } else { "inductive" }]),
-        if is_record { 6 } else { 7 },
-        "derived family",
-    )?;
+    let (is_class_inductive, parts) = if is_record {
+        (
+            false,
+            expect_node(
+                &root[1],
+                &parser_kind(&["Command", "structure"]),
+                6,
+                "derived family",
+            )?,
+        )
+    } else {
+        super::inductive::command_parts(&root[1])?
+    };
     let id = expect_node(
         &parts[1],
         &parser_kind(&["Command", "declId"]),
@@ -285,7 +292,15 @@ pub fn prepare(syntax: &Syntax) -> Result<Option<DerivingRequest>, NatDefinition
         "deriving suffix",
     )?;
     let mut handlers = Vec::new();
-    match expect_null_args(&suffix[0], "deriving clause")? {
+    // Lean v4.32.0 parses this suffix on class inductives but ignores it:
+    // Inductive.inductiveSyntaxToView reads slot 6, absent from that grammar.
+    // Preserve the measured behavior instead of introducing extra instances.
+    let deriving = if is_class_inductive {
+        &[][..]
+    } else {
+        expect_null_args(&suffix[0], "deriving clause")?
+    };
+    match deriving {
         [] => {}
         [keyword, classes] => {
             expect_atom(keyword, "deriving", "deriving keyword")?;

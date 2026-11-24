@@ -8749,7 +8749,7 @@ pub fn protected_registration(syntax: &Syntax) -> Result<Option<Name>, NatDefini
     }
 }
 
-pub use inductive::{elaborate_inductive, is_inductive};
+pub use inductive::{class_inductive_registration, elaborate_inductive, is_inductive};
 /// A source record/class expands to a block and projections, not one definition.
 /// These are untrusted candidates. The caller must admit the whole sequence
 /// before registering the class or exposing any successor.

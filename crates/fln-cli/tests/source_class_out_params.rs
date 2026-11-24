@@ -1,10 +1,9 @@
 //! A class parameter that is neither an `outParam` nor instance-implicit may not mention an earlier
 //! `outParam`: the pin's `checkOutParam` (vendored `src/Lean/Class.lean`), which `addClass` runs on
 //! every new class. Through the installed drop-in `lean`, over `prelude` + `import Init.Core`.
-//! Every program here was run through the pinned `lean` v4.32.0 with the same header first
-//! (2026-10-11), with the same verdict, and is compared with the pinned binary again when it is
-//! present. The refused ones are the pin's `tests/elab_fail/classBadOutParam.lean` in both class
-//! syntaxes, and a parameter typed by an earlier `outParam`.
+//! The same programs run through the pinned binary when it is present. The refused ones
+//! exercise the pin's `tests/elab_fail/classBadOutParam.lean` in both structure-class syntaxes,
+//! the class-inductive syntax, and a parameter typed by an earlier `outParam`.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,6 +35,22 @@ const ACCEPTED: &[(&str, &str)] = &[
         "structure",
         "structure S (x : outParam Nat) (y : { n : Nat // n > x }) where\n  val : Nat\n",
     ),
+    (
+        "class_inductive_witness",
+        "universe u\nclass inductive NativeWitness (α : Sort u) : Prop where\n  | intro (value : α) : NativeWitness α\nexample {α : Sort u} [NativeWitness α] : NativeWitness α := inferInstance\ninstance : NativeWitness Nat := .intro 7\nexample : NativeWitness Nat := inferInstance\n",
+    ),
+    (
+        "class_inductive_decision",
+        "class inductive NativeDecision (p : Prop) : Type where\n  | no (proof : Not p) : NativeDecision p\n  | yes (proof : p) : NativeDecision p\ninstance : NativeDecision True := .yes True.intro\nexample : NativeDecision True := inferInstance\nnoncomputable def decisionValue {p : Prop} [answer : NativeDecision p] : Bool :=\n  match answer with\n  | .no _ => false\n  | .yes _ => true\n",
+    ),
+    (
+        "class_inductive_out",
+        "class inductive NativeOutput (α : Type) (β : outParam Type) where\n  | mk (value : β) : NativeOutput α β\ninstance : NativeOutput Nat Bool := .mk true\nexample : NativeOutput Nat Bool := inferInstance\n",
+    ),
+    (
+        "class_inductive_typed_by_out",
+        "class inductive NativeIndexedOutput (β : outParam Type) (b : outParam β) where\n  | mk : NativeIndexedOutput β b\n",
+    ),
 ];
 
 const REFUSED: &[(&str, &str)] = &[
@@ -50,6 +65,10 @@ const REFUSED: &[(&str, &str)] = &[
     (
         "typed_by_regular",
         "class F (β : outParam Type) (b : β) where\n  val : Nat\n",
+    ),
+    (
+        "class_inductive_dependent_regular",
+        "class inductive NativeInvalidOutput (β : outParam Type) (b : β) where\n  | mk : NativeInvalidOutput β b\n",
     ),
 ];
 

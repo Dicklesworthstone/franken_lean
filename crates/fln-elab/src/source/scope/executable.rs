@@ -208,7 +208,7 @@ pub fn registrations(syntax: &Syntax) -> Result<Vec<Attribute>, NatDefinitionEla
         .iter()
         .any(|kind| declaration.kind() == Some(&parser_kind(&["Command", kind])))
         && !(rows.iter().all(Attribute::is_tag)
-            && ["structure", "inductive"]
+            && ["structure", "inductive", "classInductive"]
                 .iter()
                 .any(|kind| declaration.kind() == Some(&parser_kind(&["Command", kind]))))
     {
@@ -234,17 +234,16 @@ pub fn data_registration(
         2,
         "data declaration",
     )?;
-    let (kind, arity) = if root[1].kind() == Some(&parser_kind(&["Command", "structure"])) {
-        ("structure", 6)
+    let parts = if root[1].kind() == Some(&parser_kind(&["Command", "structure"])) {
+        expect_node(
+            &root[1],
+            &parser_kind(&["Command", "structure"]),
+            6,
+            "data declaration",
+        )?
     } else {
-        ("inductive", 7)
+        super::super::inductive::command_parts(&root[1])?.1
     };
-    let parts = expect_node(
-        &root[1],
-        &parser_kind(&["Command", kind]),
-        arity,
-        "data declaration",
-    )?;
     let id = expect_node(
         &parts[1],
         &parser_kind(&["Command", "declId"]),

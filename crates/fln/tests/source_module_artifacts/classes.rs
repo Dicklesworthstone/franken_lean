@@ -96,6 +96,139 @@ def use (A : Type) (x : A) : A := Mapper.apply x
 }
 
 #[test]
+fn class_inductive_dictionaries_survive_artifacts_cache_and_checked_import() {
+    const SOURCE: &str = "prelude\nclass inductive Selection where | first | second\ninstance selection : Selection := Selection.second\ndef chosen [value : Selection] : Selection := value";
+    let mut session = SourceModuleSession::new(
+        Engine::builder().build_empty(),
+        KVMap::new(),
+        limits(),
+        SourceModuleCacheLimits::default(),
+    );
+    let module = name("Main");
+    let inputs = [SourceModuleInput {
+        name: &module,
+        source: SOURCE.as_bytes(),
+    }];
+    let cold = session
+        .compile(&inputs, &module, OleanWriteBudget::default())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let warm = session
+        .compile(&inputs, &module, OleanWriteBudget::default())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!((warm.reused_modules, warm.elaborated_modules), (1, 0));
+    assert_eq!(cold.artifacts[0].bytes, warm.artifacts[0].bytes);
+    let rows = metadata(&warm.artifacts[0].bytes);
+    assert_eq!(
+        rows.classes,
+        [ClassEntry {
+            name: name("Selection"),
+            out_params: vec![],
+            out_level_params: vec![],
+        }]
+    );
+    assert_eq!(rows.instances.len(), 1);
+    assert_eq!(rows.instances[0].declaration, name("selection"));
+    let receipt = imported(&warm);
+    assert_eq!(receipt.modules[0].classes, 1);
+    receipt
+        .engine
+        .check_source_files(
+            &[b"def importedChoice : Selection := chosen\ndef passSelection [s : Selection] : Selection := s"],
+            &KVMap::new(),
+            limits().source,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+}
+
+#[test]
+fn class_inductive_output_parameters_and_universes_survive_serialization() {
+    let built = compiled(&[(
+        "Main",
+        r#"prelude
+def outParam.{u} (A : Sort u) : Sort u := A
+class inductive Convert.{u,v} (A : Type u) (B : outParam (Type v)) where
+  | mk (convert : A -> B) : Convert A B
+"#,
+    )]);
+    assert_eq!(
+        metadata(&built.artifacts[0].bytes).classes,
+        [ClassEntry {
+            name: name("Convert"),
+            out_params: vec![1],
+            out_level_params: vec![1],
+        }]
+    );
+    let receipt = imported(&built);
+    let registry =
+        fln_elab::instances::InstanceRegistry::read(receipt.engine.environment()).unwrap();
+    let parameters = registry
+        .imported_class_parameters(&name("Convert"))
+        .unwrap();
+    assert_eq!(parameters.out_params, [1]);
+    assert_eq!(parameters.out_level_params, [1]);
+    receipt
+        .engine
+        .check_source_files(
+            &[b"instance convertIdentity (A : Type) : Convert A A := Convert.mk (fun x => x)\ndef useConvert (A : Type) [c : Convert A A] : Convert A A := c\ndef inferConvert (A : Type) : Convert A A := useConvert A"],
+            &KVMap::new(),
+            limits().source,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+}
+
+#[test]
+fn public_class_inductives_export_only_their_visible_class_metadata() {
+    let built = compiled(&[(
+        "Main",
+        "module\nprelude\nnamespace API\nclass inductive Hidden where | mk\npublic class inductive Visible where | mk\nend API",
+    )]);
+    assert_eq!(
+        metadata(&built.artifacts[0].bytes).classes,
+        [ClassEntry {
+            name: name("API.Visible"),
+            out_params: vec![],
+            out_level_params: vec![],
+        }]
+    );
+    let registry =
+        fln_elab::instances::InstanceRegistry::read(built.checked.checked.engine.environment())
+            .unwrap();
+    let hidden = Name::num(name("_private.Main"), 0).append_core(&name("API.Hidden"));
+    assert!(registry.is_class(&hidden));
+    assert!(registry.is_class(&name("API.Visible")));
+    assert!(!registry.is_class(&name("API.Hidden")));
+    let receipt = imported(&built);
+    receipt
+        .engine
+        .check_source_files(
+            &[b"def useVisible [v : API.Visible] : API.Visible := v"],
+            &KVMap::new(),
+            limits().source,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(
+        receipt
+            .engine
+            .check_source_files(
+                &[b"def exposeHidden : API.Hidden := API.Hidden.mk"],
+                &KVMap::new(),
+                limits().source,
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn structures_and_explicit_reducibility_survive_a_compiled_module_boundary() {
     use fln_elab::reducibility::{Reducibility, ReducibilityTable};
     let built = compiled(&[(

@@ -11,7 +11,68 @@ pub(super) use mutual::elaborate_mutual;
 
 pub fn is_inductive(syntax: &Syntax) -> bool {
     matches!(syntax,Syntax::Node { kind,args,.. } if kind == &parser_kind(&["Command","declaration"])
-        && matches!(args.as_slice(),[_,Syntax::Node { kind,.. }] if kind == &parser_kind(&["Command","inductive"])))
+        && matches!(args.as_slice(),[_,Syntax::Node { kind,.. }]
+            if kind == &parser_kind(&["Command","inductive"])
+                || kind == &parser_kind(&["Command","classInductive"])))
+}
+
+fn is_class_inductive(syntax: &Syntax) -> bool {
+    matches!(syntax,Syntax::Node { kind,args,.. } if kind == &parser_kind(&["Command","declaration"])
+        && matches!(args.as_slice(),[_,Syntax::Node { kind,.. }]
+            if kind == &parser_kind(&["Command","classInductive"])))
+}
+
+/// The pinned class-inductive grammar has no computed-fields slot: its
+/// deriving suffix follows the constructors directly. Keep its actual parser
+/// shape when sharing the ordinary inductive elaborator and attribute readers.
+pub(super) fn command_parts(syntax: &Syntax) -> Result<(bool, &[Syntax]), NatDefinitionElabError> {
+    let is_class = syntax.kind() == Some(&parser_kind(&["Command", "classInductive"]));
+    let parts = expect_node(
+        syntax,
+        &parser_kind(&[
+            "Command",
+            if is_class {
+                "classInductive"
+            } else {
+                "inductive"
+            },
+        ]),
+        if is_class { 6 } else { 7 },
+        "inductive command",
+    )?;
+    Ok((is_class, parts))
+}
+
+/// Resolve the class tag requested by a source inductive. The caller must
+/// register it only after the whole inductive bundle has passed admission.
+pub fn class_inductive_registration(
+    syntax: &Syntax,
+    scope: &SourceScope,
+) -> Result<Option<Name>, NatDefinitionElabError> {
+    if !is_class_inductive(syntax) {
+        return Ok(None);
+    }
+    let root = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "class inductive declaration",
+    )?;
+    let (_, parts) = command_parts(&root[1])?;
+    let id = expect_node(
+        &parts[1],
+        &parser_kind(&["Command", "declId"]),
+        2,
+        "class inductive name",
+    )?;
+    let Syntax::Ident { val, .. } = &id[0] else {
+        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    };
+    scope
+        .for_declaration(syntax)?
+        .declaration_name(val)
+        .map(Some)
+        .map_err(|error| failure(SourceInferenceError::NameScope(error)))
 }
 fn invalid() -> NatDefinitionElabError {
     failure(SourceInferenceError::Inductive(
@@ -448,13 +509,16 @@ fn header<'a>(
     )?;
     scope::visibility::data_modifiers(&root[0])?;
     let scope = scope.for_declaration(syntax)?;
-    let parts = expect_node(
-        &root[1],
-        &parser_kind(&["Command", "inductive"]),
-        7,
-        "inductive command",
-    )?;
-    expect_atom(&parts[0], "inductive", "inductive keyword")?;
+    let (is_class, parts) = command_parts(&root[1])?;
+    if is_class {
+        let [class, inductive] = expect_null_args(&parts[0], "class inductive keywords")? else {
+            return Err(invalid());
+        };
+        expect_atom(class, "class", "class keyword")?;
+        expect_atom(inductive, "inductive", "inductive keyword")?;
+    } else {
+        expect_atom(&parts[0], "inductive", "inductive keyword")?;
+    }
     let id = expect_node(
         &parts[1],
         &parser_kind(&["Command", "declId"]),
@@ -479,14 +543,21 @@ fn header<'a>(
         [Syntax::Atom { val, .. }] if val == "where" || val == ":=" => {}
         _ => return Err(invalid()),
     }
-    expect_empty_null(&parts[5], "unsupported computed inductive fields")?;
+    if !is_class {
+        expect_empty_null(&parts[5], "unsupported computed inductive fields")?;
+    }
     let deriving = expect_node(
-        &parts[6],
+        &parts[parts.len() - 1],
         &parser_kind(&["Command", "optDeriving"]),
         1,
         "inductive deriving",
     )?;
-    expect_empty_null(&deriving[0], "unsupported deriving")?;
+    // The pin ignores class-inductive deriving suffixes (its shared view
+    // reader looks at slot 6, while the class parser places it at slot 5).
+    // In particular, this must not synthesize an instance absent at the pin.
+    if !is_class {
+        expect_empty_null(&deriving[0], "unsupported deriving")?;
+    }
     let ctors = expect_null_args(&parts[4], "constructors")?;
     if ctors.len() > budget.max_binders {
         return Err(failure(SourceInferenceError::ResourceLimit));

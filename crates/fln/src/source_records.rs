@@ -828,6 +828,20 @@ impl Engine {
             return Ok(result);
         };
         for syntax in members {
+            let class = fln_elab::source::class_inductive_registration(syntax, scope)
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?;
+            if let Some(class) = class {
+                batch.engine.environment =
+                    fln_elab::instances::register_class(batch.engine.environment(), &class)
+                        .map_err(|error| {
+                            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                fln_elab::NatDefinitionElabError::Inference(
+                                    fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                                ),
+                            ))
+                        })?;
+            }
             let registration =
                 fln_elab::source::scope::executable::data_registration(syntax, scope)
                     .map_err(DefinitionFrontendError::Elaborate)

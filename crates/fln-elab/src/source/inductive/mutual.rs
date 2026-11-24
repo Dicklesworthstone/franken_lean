@@ -62,6 +62,13 @@ pub(in crate::source) fn elaborate_mutual(
     if !(2..=8).contains(&syntax.len()) {
         return Err(invalid());
     }
+    // The pin's checkClass rejects classes in every multi-family block,
+    // independently of whether the kernel could admit the mutual inductives.
+    if syntax.iter().any(is_class_inductive) {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "mutual inductive blocks without classes",
+        });
+    }
     let mut headers = syntax
         .iter()
         .map(|s| header(s, env, kernel, budget, scope))

@@ -21,6 +21,172 @@ fn check(text: &str) -> fln::SourceFileCheck {
         .into_complete()
         .unwrap()
 }
+
+#[test]
+fn prelude_class_inductives_bootstrap_without_seeded_declarations() {
+    let initial = Engine::builder().build_empty();
+    let result = initial
+        .check_source_files(
+            &[br#"prelude
+universe u
+class inductive Nonempty (A : Sort u) : Prop where
+  | intro (value : A) : Nonempty A
+inductive False : Prop
+def Not (p : Prop) : Prop := p -> False
+class inductive Decidable (p : Prop) where
+  | isFalse (proof : Not p) : Decidable p
+  | isTrue (proof : p) : Decidable p
+def passNonempty {A : Sort u} [witness : Nonempty A] : Nonempty A := witness
+def passDecidable {p : Prop} [decision : Decidable p] : Decidable p := decision
+"#],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(initial.environment().is_empty());
+    let registry =
+        fln_elab::instances::InstanceRegistry::read(result.engine.environment()).unwrap();
+    for family in ["Nonempty", "Decidable"] {
+        let name = Name::from_components([family]);
+        assert!(registry.is_class(&name));
+        assert!(registry.candidates(&name).is_empty());
+        assert!(
+            result
+                .engine
+                .environment()
+                .contains(&Name::str(name, "recOn"))
+        );
+    }
+}
+
+#[test]
+fn class_inductives_register_namespaced_dictionaries_and_compute_eliminators() {
+    let result = check(
+        r#"universe u
+namespace Native
+class inductive Witness (A : Sort u) : Prop where
+  | intro (value : A) : Witness A
+instance natWitness : Witness Nat := Witness.intro 7
+theorem foundWitness : Witness Nat := inferInstance
+class inductive Choice where | off | on
+instance choice : Choice := Choice.on
+def selected [value : Choice] : Nat :=
+  match value with
+  | .off => 0
+  | .on => 1
+theorem selected_on : selected = 1 := by rfl
+end Native
+"#,
+    );
+    let registry =
+        fln_elab::instances::InstanceRegistry::read(result.engine.environment()).unwrap();
+    assert!(registry.is_class(&Name::from_components(["Native", "Witness"])));
+    assert!(registry.is_class(&Name::from_components(["Native", "Choice"])));
+    assert!(!registry.is_class(&Name::from_components(["Witness"])));
+    assert!(registry.is_instance(&Name::from_components(["Native", "natWitness"])));
+    assert!(registry.is_instance(&Name::from_components(["Native", "choice"])));
+    assert!(!registry.is_instance(&Name::from_components(["Native", "Choice", "on"])));
+    assert_eq!(result.theorems, 2);
+}
+
+#[test]
+fn class_inductive_deriving_keeps_the_pins_ignored_suffix() {
+    // At the pin both suffixes parse and the class is admitted, but neither
+    // invokes a handler: the shared upstream view reads the ordinary slot 6.
+    for suffix in ["Inhabited", "UnknownClass"] {
+        let prefix = format!("class inductive Flag where | off | on deriving {suffix}\n");
+        let result = check(&prefix);
+        let registry =
+            fln_elab::instances::InstanceRegistry::read(result.engine.environment()).unwrap();
+        assert!(registry.is_class(&Name::from_components(["Flag"])));
+        assert!(
+            registry
+                .candidates(&Name::from_components(["Flag"]))
+                .is_empty()
+        );
+        assert!(
+            result
+                .engine
+                .check_source_files(
+                    &[b"def missing : Inhabited Flag := inferInstance"],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits()),
+                )
+                .is_err(),
+            "an ignored class-inductive suffix cannot supply an instance"
+        );
+    }
+}
+
+#[test]
+fn invalid_class_inductives_and_mutual_classes_never_publish() {
+    let initial = engine();
+    let root = initial.logical_root(&KVMap::new());
+    for source in [
+        "class inductive Bad where | mk : Nat",
+        "class inductive Bad where | mk (negative : Bad -> Nat)",
+        "class inductive Bad where | same | same",
+        "class inductive Bad : Type where | mk (large : Type)",
+        "mutual\nclass inductive Bad where | mk\ninductive Other where | mk\nend",
+        "mutual\ninductive Other where | mk\nclass inductive Bad where | mk\nend",
+        "class inductive Bad where | mk\ntheorem falseResult : 1 = 2 := by rfl",
+    ] {
+        assert!(
+            initial
+                .check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits()),
+                )
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(initial.logical_root(&KVMap::new()), root);
+        assert!(
+            !initial
+                .environment()
+                .contains(&Name::from_components(["Bad"]))
+        );
+        assert!(
+            !fln_elab::instances::InstanceRegistry::read(initial.environment())
+                .unwrap()
+                .is_class(&Name::from_components(["Bad"]))
+        );
+    }
+    check("mutual\nclass inductive Only where | mk\nend\ndef useOnly [x : Only] : Only := x");
+}
+
+#[test]
+fn class_registration_failures_and_resource_stops_are_atomic() {
+    let initial = Engine::builder().build_empty();
+    let root = initial.logical_root(&KVMap::new());
+    let error = initial
+        .check_source_files(
+            &[br#"prelude
+def outParam.{u} (A : Sort u) : Sort u := A
+class inductive Bad (A : outParam Type) (value : A) where
+  | mk : Bad A value
+"#],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("depends on `outParam`"));
+    assert_eq!(initial.logical_root(&KVMap::new()), root);
+    let mut bounded = limits();
+    bounded.kernel = bounded.kernel.narrowed(0, bounded.kernel.depth);
+    let result = initial.check_source_files(
+        &[b"prelude\nclass inductive Flag : Type where | off | on"],
+        &KVMap::new(),
+        SourceCheckLimits::new(bounded),
+    );
+    assert!(matches!(result, Ok(Outcome::Inconclusive(_))));
+    assert_eq!(initial.logical_root(&KVMap::new()), root);
+    assert!(initial.environment().is_empty());
+}
+
 #[test]
 fn source_enumerations_and_payload_variants_are_usable_by_later_commands() {
     let result = check(

@@ -211,6 +211,7 @@ impl SourceScope {
                     ));
                 }
             } else if kind == Some(&parser_kind(&["Command", "inductive"]))
+                || kind == Some(&parser_kind(&["Command", "classInductive"]))
                 || kind == Some(&parser_kind(&["Command", "structure"]))
             {
                 if no_expose {
@@ -241,7 +242,8 @@ impl SourceScope {
                 2,
                 "mutual declaration",
             )?;
-            inductive &= declaration[1].kind() == Some(&parser_kind(&["Command", "inductive"]));
+            inductive &= declaration[1].kind() == Some(&parser_kind(&["Command", "inductive"]))
+                || declaration[1].kind() == Some(&parser_kind(&["Command", "classInductive"]));
         }
         if exported != 0 && (exported != members.len() || !inductive) {
             return Err(refused(
