@@ -6,6 +6,7 @@ pub(super) struct Scopes<'a> {
     indices: BTreeMap<&'a Name, usize>,
     owners: BTreeMap<Name, Vec<(usize, &'a ConstantInfo)>>,
     work_left: u64,
+    coercion: bool,
 }
 
 impl<'a> Scopes<'a> {
@@ -14,17 +15,45 @@ impl<'a> Scopes<'a> {
         rows: &[metadata::ReducibilityExtraEntry],
         work_left: u64,
     ) -> Result<Self> {
+        Self::from_names(
+            checked,
+            rows.iter().map(|row| &row.declaration),
+            work_left,
+            false,
+        )
+    }
+
+    pub(super) fn coercions(
+        checked: &'a CheckedOleanSet,
+        rows: &[metadata::CoeEntry],
+        work_left: u64,
+    ) -> Result<Self> {
+        Self::from_names(
+            checked,
+            rows.iter().map(|row| &row.declaration),
+            work_left,
+            true,
+        )
+    }
+
+    fn from_names<'n>(
+        checked: &'a CheckedOleanSet,
+        names: impl IntoIterator<Item = &'n Name>,
+        work_left: u64,
+        coercion: bool,
+    ) -> Result<Self> {
         let mut result = Self {
             indices: BTreeMap::new(),
             owners: BTreeMap::new(),
             work_left,
+            coercion,
         };
-        if rows.is_empty() {
-            return Ok(result);
-        }
-        for row in rows {
+        for name in names {
             result.tick()?;
-            result.owners.entry(row.declaration.clone()).or_default();
+            result.owners.entry(name.clone()).or_default();
+        }
+        if result.owners.is_empty() {
+            return Ok(result);
         }
         for (index, module) in checked.modules.iter().enumerate() {
             result.tick()?;
@@ -66,9 +95,13 @@ impl<'a> Scopes<'a> {
             declaration: declaration.clone(),
             reason,
         };
-        let target = active
-            .find(declaration)
-            .ok_or_else(|| error("a reducibility override names no admitted declaration"))?;
+        let target = active.find(declaration).ok_or_else(|| {
+            error(if self.coercion {
+                "a coercion registration names no admitted declaration"
+            } else {
+                "a reducibility override names no admitted declaration"
+            })
+        })?;
         if origin.find(declaration) == Some(target) {
             return Ok(());
         }
@@ -102,9 +135,11 @@ impl<'a> Scopes<'a> {
                 pending.push(dependency);
             }
         }
-        Err(error(
-            "a reducibility override is outside this module's checked import closure",
-        ))
+        Err(error(if self.coercion {
+            "a coercion registration is outside this module's checked import closure"
+        } else {
+            "a reducibility override is outside this module's checked import closure"
+        }))
     }
 }
 

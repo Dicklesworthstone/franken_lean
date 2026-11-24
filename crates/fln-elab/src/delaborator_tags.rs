@@ -19,6 +19,9 @@ use fln_env::extensions::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod coercions;
+pub use coercions::{CoeFnInfo, CoeFnKind};
+
 const MAGIC: &[u8] = b"FLNDLBT\x01";
 const MAX_ROWS: usize = 65_536;
 const MAX_TAGS: usize = 1 << 20;
@@ -49,6 +52,8 @@ pub enum DelaboratorTagError {
     Limit,
     UnknownDeclaration(Name),
     Duplicate(Name),
+    NoExplicitArgument(Name),
+    UnsupportedTelescope(Name),
 }
 
 impl std::fmt::Display for DelaboratorTagError {
@@ -64,6 +69,14 @@ impl std::fmt::Display for DelaboratorTagError {
             Self::Duplicate(name) => write!(
                 f,
                 "{} carries the same delaborator tag twice",
+                name.to_display_string()
+            ),
+            Self::NoExplicitArgument(name) => {
+                write!(f, "{} has no explicit arguments", name.to_display_string())
+            }
+            Self::UnsupportedTelescope(name) => write!(
+                f,
+                "unsupported coercion telescope for {}",
                 name.to_display_string()
             ),
         }
@@ -125,7 +138,7 @@ fn source_descriptor() -> ExtensionDescriptor {
 }
 
 pub fn supports_source(candidate: &ExtensionDescriptor) -> bool {
-    *candidate == source_descriptor()
+    *candidate == source_descriptor() || coercions::supports(candidate)
 }
 
 /// Source admission checks global scope and module ownership before calling this.
@@ -298,15 +311,18 @@ pub struct DelaboratorTags {
     /// Each constant's `@[app_unexpander]` registrations: `None` for a global one, and the
     /// namespace of a `scoped` one.
     unexpanded: BTreeMap<Name, BTreeSet<Option<Name>>>,
+    coercions: BTreeMap<Name, CoeFnInfo>,
 }
 
 impl DelaboratorTags {
     /// Validate and read every recorded tag, keeping each unexpander's scope.
     pub fn read(env: &Environment) -> Result<Self, DelaboratorTagError> {
         let source = source_anonymous_constructors(env)?;
+        let coercions = coercions::read(env)?.into_iter().collect();
         let Some(extension) = env.extension(&journal_name()) else {
             return Ok(Self {
                 anonymous_constructor: source,
+                coercions,
                 ..Self::default()
             });
         };
@@ -316,7 +332,10 @@ impl DelaboratorTags {
         if extension.len() > MAX_ROWS {
             return Err(DelaboratorTagError::Limit);
         }
-        let mut tags = Self::default();
+        let mut tags = Self {
+            coercions,
+            ..Self::default()
+        };
         let mut total = source.len();
         for (entry, validation) in env.metadata_validation_entries(&journal_name()) {
             if entry.payload.len() > MAX_ENTRY_BYTES {
@@ -377,6 +396,12 @@ impl DelaboratorTags {
     /// Whether `declaration` is tagged `@[pp_using_anonymous_constructor]`.
     pub fn anonymous_constructor(&self, declaration: &Name) -> bool {
         self.anonymous_constructor.contains(declaration)
+    }
+
+    /// The last global coercion registration for this function, including
+    /// imported and source rows. This is printer metadata, not a Coe instance.
+    pub fn coercion(&self, declaration: &Name) -> Option<&CoeFnInfo> {
+        self.coercions.get(declaration)
     }
 
     /// Whether `function` is tagged `@[pp_nodot]`.

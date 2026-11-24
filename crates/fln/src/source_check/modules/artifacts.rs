@@ -901,6 +901,50 @@ impl ArtifactData {
                 metadata.pp_anonymous_constructor.push(tagged);
             }
         }
+        let coercions = |env: &Environment, meter: &mut Meter| {
+            use fln_elab::delaborator_tags::{DelaboratorTagError, coercions};
+            if let Some(journal) = env.extension(&coercions::journal_name()) {
+                for entry in journal.entries() {
+                    meter.work(1)?;
+                    meter.bytes(entry.payload.len())?;
+                }
+            }
+            coercions::read(env).map_err(|error| match error {
+                DelaboratorTagError::Limit => SourceModuleCheckError::Limit {
+                    resource: "native coercion registrations",
+                    limit: coercions::MAX_ROWS,
+                },
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: coercions::journal_name(),
+                    reason: "invalid coercion journal",
+                },
+            })
+        };
+        let inherited = coercions(base, meter)?;
+        let current = coercions(checked, meter)?;
+        if !current.starts_with(&inherited) {
+            return Err(SourceModuleCheckError::Extension {
+                module: name.clone(),
+                extension: fln_elab::delaborator_tags::coercions::journal_name(),
+                reason: "coercion registrations do not extend the checked predecessor journal",
+            });
+        }
+        for (declaration, info) in current.into_iter().skip(inherited.len()) {
+            meter.work(1)?;
+            use fln_elab::delaborator_tags::CoeFnKind;
+            use fln_olean::source_extensions as metadata_types;
+            metadata.coercions.push(metadata_types::CoeEntry {
+                declaration,
+                num_args: info.num_args,
+                coercee: info.coercee,
+                kind: match info.kind {
+                    CoeFnKind::Coe => metadata_types::CoeFnKind::Coe,
+                    CoeFnKind::CoeFun => metadata_types::CoeFnKind::CoeFun,
+                    CoeFnKind::CoeSort => metadata_types::CoeFnKind::CoeSort,
+                },
+            });
+        }
         // Reflexivity tags are selection metadata owned by the module that
         // declared the theorem. The codec already emits both pinned tag sets;
         // export the journal delta rather than silently losing it at this edge.

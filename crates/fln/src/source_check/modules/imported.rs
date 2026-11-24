@@ -196,6 +196,8 @@ pub struct SourceMetadataReport {
     pub pp_anonymous_constructor: usize,
     pub pp_nodot: usize,
     pub app_unexpanders: usize,
+    /// Global coercion notation registrations, including updates to dependencies.
+    pub coercions: usize,
     /// `@[deprecated]` entries on this module's own declarations (the pin's `deprecatedAttr`),
     /// which name resolution reports from.
     pub deprecations: usize,
@@ -1098,6 +1100,7 @@ fn prepare_source_metadata_view(
             Name::from_components(metadata::SYMM_EXTENSION.split('.')),
             Name::from_components(metadata::ELAB_AS_ELIM_EXTENSION.split('.')),
             metadata::sparse_cases_on_extension_name(),
+            Name::from_components(metadata::COE_EXTENSION.split('.')),
         ])
         .collect();
     let mut blocks: Vec<_> = selected
@@ -1186,6 +1189,7 @@ fn prepare_source_metadata_view(
             pp_anonymous_constructor: 0,
             pp_nodot: 0,
             app_unexpanders: 0,
+            coercions: 0,
             deprecations: 0,
             uninterpreted: Vec::new(),
         };
@@ -1271,6 +1275,7 @@ fn prepare_source_metadata_view(
                     25 => report.symms = entries.len(),
                     26 => report.elab_as_elim = entries.len(),
                     27 => report.sparse_cases_on = entries.len(),
+                    28 => report.coercions = entries.len(),
                     _ => {
                         return Err(SourceOleanImportError::Internal(
                             "unknown selected metadata kind",
@@ -1452,6 +1457,12 @@ impl Engine {
         let mut pp_anonymous_constructor = decoded.pp_anonymous_constructor.into_iter();
         let mut pp_nodot = decoded.pp_nodot.into_iter();
         let mut app_unexpanders = decoded.app_unexpanders.into_iter();
+        let mut coercion_scopes = reducibility::Scopes::coercions(
+            &checked,
+            &decoded.coercions,
+            limits.metadata.max_objects,
+        )?;
+        let mut coercions = decoded.coercions.into_iter();
         let mut deprecations = decoded.deprecations.into_iter();
         let mut reducibility_scopes = reducibility::Scopes::new(
             &checked,
@@ -1746,6 +1757,41 @@ impl Engine {
                                 reason: "a delaborator tag cannot be recorded",
                             }
                         })?;
+            }
+            for _ in 0..report.coercions {
+                cancelled!("source-olean/coercions");
+                let row = coercions.next().ok_or(SourceOleanImportError::Internal(
+                    "coercion count changed during decode",
+                ))?;
+                coercion_scopes.validate(
+                    &checked,
+                    &self.environment,
+                    activation.environment(),
+                    index,
+                    &row.declaration,
+                )?;
+                use fln_elab::delaborator_tags::{CoeFnInfo, CoeFnKind};
+                let info = CoeFnInfo {
+                    num_args: row.num_args,
+                    coercee: row.coercee,
+                    kind: match row.kind {
+                        metadata::CoeFnKind::Coe => CoeFnKind::Coe,
+                        metadata::CoeFnKind::CoeFun => CoeFnKind::CoeFun,
+                        metadata::CoeFnKind::CoeSort => CoeFnKind::CoeSort,
+                    },
+                };
+                activation = activation
+                    .register_coercions(&[(row.declaration.clone(), info)])
+                    .map_err(|error| match error {
+                        fln_elab::delaborator_tags::DelaboratorTagError::Limit => {
+                            SourceOleanImportError::Limit("coercion delaborator journal")
+                        }
+                        _ => SourceOleanImportError::Metadata {
+                            module: report.module.clone(),
+                            declaration: row.declaration,
+                            reason: "a coercion registration cannot be recorded",
+                        },
+                    })?;
             }
             if report.deprecations != 0 {
                 cancelled!("source-olean/deprecations");
@@ -2237,6 +2283,7 @@ impl Engine {
             || pp_anonymous_constructor.next().is_some()
             || pp_nodot.next().is_some()
             || app_unexpanders.next().is_some()
+            || coercions.next().is_some()
             || deprecations.next().is_some()
             || reducibility.next().is_some()
             || reducibility_extra.next().is_some()
@@ -2518,6 +2565,10 @@ trait Registrar: Sized {
         self,
         tags: &[fln_elab::delaborator_tags::DelaboratorTag],
     ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError>;
+    fn register_coercions(
+        self,
+        rows: &[(Name, fln_elab::delaborator_tags::CoeFnInfo)],
+    ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError>;
     fn register_deprecations(
         self,
         entries: &[fln_elab::deprecations::Deprecation],
@@ -2635,6 +2686,12 @@ impl Registrar for instances::imported::ImportActivation {
         tags: &[fln_elab::delaborator_tags::DelaboratorTag],
     ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError> {
         self.register_delaborator_tags(tags)
+    }
+    fn register_coercions(
+        self,
+        rows: &[(Name, fln_elab::delaborator_tags::CoeFnInfo)],
+    ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError> {
+        self.register_coercions(rows)
     }
     fn register_deprecations(
         self,
@@ -3266,6 +3323,115 @@ pub(super) mod tests {
         )
         .unwrap()
         .bytes
+    }
+
+    #[test]
+    fn coercion_registrations_require_the_recording_modules_actual_import_closure() {
+        use fln_olean::source_extensions::{CoeEntry, CoeFnKind};
+        use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
+
+        on_import_stack(|| {
+            let base = n("Base");
+            let registration = n("Registration");
+            let base_bytes = namespace_fixture(&[], &[], true);
+            let encode = |dependency: bool| {
+                let imports: Vec<_> = dependency
+                    .then(|| OleanModuleImport {
+                        module: base.clone(),
+                        import_all: false,
+                        is_exported: false,
+                        is_meta: false,
+                    })
+                    .into_iter()
+                    .collect();
+                encode_module_with_source_metadata(
+                    OleanModuleWriteInput {
+                        is_module: false,
+                        imports: &imports,
+                        constants: &[],
+                        extra_const_names: &[],
+                    },
+                    &SourceMetadata {
+                        // Explicit registerCoercion info need not be inferred
+                        // from the target's telescope at the pin.
+                        coercions: vec![CoeEntry {
+                            declaration: n("sortAlias"),
+                            num_args: 1,
+                            coercee: 0,
+                            kind: CoeFnKind::Coe,
+                        }],
+                        ..SourceMetadata::default()
+                    },
+                    OleanWriteHeader {
+                        version: OLEAN_ACCEPTED_VERSIONS[0],
+                        flags: 1,
+                        lean_version: OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
+                        githash: OLEAN_PIN_COMMIT,
+                        base_addr: (OLEAN_REGION_ALIGN as u64) * 2,
+                    },
+                    OleanWriteBudget::default(),
+                )
+                .unwrap()
+                .bytes
+            };
+            let initial = Engine::from_environment(Environment::new());
+            let initial_root = initial.logical_root(&KVMap::new());
+            for dependency in [true, false] {
+                let bytes = encode(dependency);
+                let result = initial.import_olean_modules_for_source(
+                    &[
+                        OleanModuleInput {
+                            name: &base,
+                            artifact: &base_bytes,
+                            server_artifact: None,
+                            private_artifact: None,
+                        },
+                        OleanModuleInput {
+                            name: &registration,
+                            artifact: &bytes,
+                            server_artifact: None,
+                            private_artifact: None,
+                        },
+                    ],
+                    &[base.clone(), registration.clone()],
+                    &KVMap::new(),
+                    limits(1),
+                );
+                if dependency {
+                    let imported = result.unwrap().into_complete().unwrap();
+                    assert!(
+                        fln_elab::delaborator_tags::DelaboratorTags::read(
+                            imported.engine.environment()
+                        )
+                        .unwrap()
+                        .coercion(&n("sortAlias"))
+                        .is_some()
+                    );
+                } else {
+                    match result.unwrap_err() {
+                        SourceOleanImportError::Metadata {
+                            module,
+                            declaration,
+                            reason,
+                        } => {
+                            assert_eq!(module, registration);
+                            assert_eq!(declaration, n("sortAlias"));
+                            assert_eq!(
+                                reason,
+                                "a coercion registration is outside this module's checked import closure"
+                            );
+                        }
+                        error => panic!("unexpected coercion import error: {error:?}"),
+                    }
+                }
+                assert_eq!(initial.logical_root(&KVMap::new()), initial_root);
+                assert!(
+                    fln_elab::delaborator_tags::coercions::read(initial.environment())
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        });
     }
 
     #[test]
@@ -4500,6 +4666,12 @@ pub(super) mod tests {
             tags: &[fln_elab::delaborator_tags::DelaboratorTag],
         ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError> {
             fln_elab::delaborator_tags::register_module(&self.0, tags).map(Sequential)
+        }
+        fn register_coercions(
+            self,
+            rows: &[(Name, fln_elab::delaborator_tags::CoeFnInfo)],
+        ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError> {
+            fln_elab::delaborator_tags::coercions::register(&self.0, rows).map(Sequential)
         }
         fn register_deprecations(
             self,

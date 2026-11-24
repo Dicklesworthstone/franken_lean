@@ -693,6 +693,15 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Preserve coercion printer registrations without changing instance search.
+    pub fn register_coercions(
+        mut self,
+        rows: &[(Name, crate::delaborator_tags::CoeFnInfo)],
+    ) -> Result<Self, crate::delaborator_tags::DelaboratorTagError> {
+        self.env = crate::delaborator_tags::coercions::register(&self.env, rows)?;
+        Ok(self)
+    }
+
     /// Record one imported module's `@[deprecated]` entries. This journal, which name
     /// resolution reports from, does not affect the kept class or instance state.
     pub fn register_deprecations(

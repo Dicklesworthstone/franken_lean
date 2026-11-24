@@ -480,6 +480,7 @@ impl SourceModuleRecord {
                 fln_elab::eliminator_tags::TagKind::SparseCasesOn,
             ),
             fln_elab::delaborator_tags::source_journal_name(),
+            fln_elab::delaborator_tags::coercions::journal_name(),
             fln_elab::source::scope::simp::export::journal_name(),
             fln_elab::source::scope::simp::defeq::journal_name(),
             fln_elab::source::scope::simp::equations::journal_name(),

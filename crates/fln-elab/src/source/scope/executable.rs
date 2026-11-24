@@ -13,6 +13,7 @@ pub enum Attribute {
     Extern(Vec<ExternEntry>),
     Unbox,
     AnonymousConstructor,
+    Coe,
     MatchPattern,
 }
 
@@ -21,8 +22,14 @@ impl Attribute {
     pub fn is_tag(&self) -> bool {
         matches!(
             self,
-            Self::Unbox | Self::AnonymousConstructor | Self::MatchPattern
+            Self::Unbox | Self::AnonymousConstructor | Self::Coe | Self::MatchPattern
         )
+    }
+
+    /// Unlike declaration-owned tags, the pin's coercion map permits registering
+    /// an already imported function. The registration belongs to this module.
+    pub fn permits_imported_target(&self) -> bool {
+        matches!(self, Self::Coe)
     }
 }
 
@@ -97,6 +104,15 @@ pub(in crate::source) fn attribute(
             } else {
                 return Ok(None);
             }
+        }
+        Syntax::Node { kind, args, .. }
+            if kind == &Name::from_components(["Lean", "Attr", "coe"]) =>
+        {
+            let [keyword] = args.as_slice() else {
+                return Err(refused("coe without arguments"));
+            };
+            expect_atom(keyword, "coe", "coe attribute keyword")?;
+            Attribute::Coe
         }
         Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Attr", "extern"]) => {
             let [keyword, entries] = args.as_slice() else {
@@ -411,6 +427,25 @@ pub fn apply(
                         }
                         _ => refused("a valid delaborator tag journal"),
                     })?
+            }
+            Attribute::Coe => {
+                crate::delaborator_tags::coercions::register_source(&result, declaration).map_err(
+                    |error| match error {
+                        crate::delaborator_tags::DelaboratorTagError::Limit => {
+                            failure(SourceInferenceError::ResourceLimit)
+                        }
+                        crate::delaborator_tags::DelaboratorTagError::UnknownDeclaration(_) => {
+                            refused("coe on an admitted declaration")
+                        }
+                        crate::delaborator_tags::DelaboratorTagError::NoExplicitArgument(_) => {
+                            refused("coe on a declaration with an explicit argument")
+                        }
+                        crate::delaborator_tags::DelaboratorTagError::UnsupportedTelescope(_) => {
+                            refused("a supported coercion function telescope")
+                        }
+                        _ => refused("a valid coercion delaborator journal"),
+                    },
+                )?
             }
         };
     }

@@ -450,7 +450,9 @@ pub(crate) fn apply_control_command(
                                 requested.to_display_string()
                             ),
                         })?;
-                if file_base.contains(&name) {
+                if file_base.contains(&name)
+                    && rows.iter().any(|row| !row.permits_imported_target())
+                {
                     return Err(SourceCheckError::Scope {
                         file,
                         command,
@@ -897,7 +899,9 @@ pub(crate) fn apply_module_control_command(
                             requested.to_display_string()
                         ),
                     })?;
-                if file_base.contains(&name) {
+                if file_base.contains(&name)
+                    && rows.iter().any(|row| !row.permits_imported_target())
+                {
                     return Err(SourceCheckError::Scope {
                         file,
                         command,

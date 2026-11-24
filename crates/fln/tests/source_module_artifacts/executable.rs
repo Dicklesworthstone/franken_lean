@@ -60,6 +60,115 @@ end Tagging
 "#;
 
 #[test]
+fn coercion_functions_survive_metadata_only_modules_and_diamond_imports() {
+    use fln_elab::delaborator_tags::{CoeFnInfo, CoeFnKind, DelaboratorTags};
+
+    let built = compiled(&[
+        ("Main", "prelude\nimport Left\nimport Right"),
+        (
+            "Left",
+            "prelude\nimport Base\nattribute [coe] Coercion.later",
+        ),
+        (
+            "Right",
+            "prelude\nimport Base\nattribute [coe] Coercion.later",
+        ),
+        (
+            "Base",
+            r#"prelude
+namespace Coercion
+inductive A where | mk
+def a : A := A.mk
+@[coe] def custom (x : A) : A := x
+@[coe] def generic {X : Type} (x : X) : X := x
+@[coe] def toFunction (x : A) : A -> A := fun y => y
+def later (x : A) : A := x
+def ordinary (x : A) : A := x
+end Coercion
+"#,
+        ),
+    ]);
+    let before = DelaboratorTags::read(built.checked.checked.engine.environment()).unwrap();
+    for (target, num_args, coercee) in [
+        ("Coercion.custom", 1, 0),
+        ("Coercion.generic", 2, 1),
+        ("Coercion.toFunction", 1, 0),
+        ("Coercion.later", 1, 0),
+    ] {
+        assert_eq!(
+            before.coercion(&name(target)),
+            Some(&CoeFnInfo {
+                num_args,
+                coercee,
+                kind: CoeFnKind::Coe,
+            })
+        );
+    }
+    assert!(before.coercion(&name("Coercion.ordinary")).is_none());
+    let receipt = imported(&built);
+    assert_eq!(
+        before,
+        DelaboratorTags::read(receipt.engine.environment()).unwrap()
+    );
+    let constant = |text| fln::Expr::const_(name(text), Vec::new());
+    let value = constant("Coercion.a");
+    for environment in [
+        built.checked.checked.engine.environment(),
+        receipt.engine.environment(),
+    ] {
+        let mut printer = fln::pretty::Printer::new(environment);
+        for (function, args, expected) in [
+            ("Coercion.custom", vec![value.clone()], "↑Coercion.a"),
+            ("Coercion.later", vec![value.clone()], "↑Coercion.a"),
+            (
+                "Coercion.generic",
+                vec![constant("Coercion.A"), value.clone()],
+                "↑Coercion.a",
+            ),
+            (
+                "Coercion.toFunction",
+                vec![value.clone(), value.clone()],
+                "↑Coercion.a Coercion.a",
+            ),
+            (
+                "Coercion.ordinary",
+                vec![value.clone()],
+                "Coercion.ordinary Coercion.a",
+            ),
+        ] {
+            let application = args.into_iter().fold(constant(function), fln::Expr::app);
+            assert_eq!(printer.expr(&application, 0).unwrap(), expected);
+        }
+    }
+    aliases::reference_import_stdout(
+        &built,
+        r#"prelude
+import Lean
+import Main
+run_cmd do
+  for decl in [`Coercion.custom, `Coercion.toFunction, `Coercion.later] do
+    let some info ← Lean.Meta.getCoeFnInfo? decl
+      | throwError "missing coercion registration: {decl}"
+    unless info.numArgs == 1 && info.coercee == 0 && info.type == .coe do
+      throwError "incorrect coercion registration: {decl}"
+  let some info ← Lean.Meta.getCoeFnInfo? `Coercion.generic
+    | throwError "missing generic coercion registration"
+  unless info.numArgs == 2 && info.coercee == 1 && info.type == .coe do
+    throwError "incorrect generic coercion registration"
+#check Coercion.custom Coercion.a
+#check Coercion.later Coercion.a
+#check Coercion.generic Coercion.a
+#check Coercion.toFunction Coercion.a Coercion.a
+#check Coercion.ordinary Coercion.a
+"#,
+        true,
+        Some(
+            "↑Coercion.a : Coercion.A\n↑Coercion.a : Coercion.A\n↑Coercion.a : Coercion.A\n↑Coercion.a Coercion.a : Coercion.A\nCoercion.ordinary Coercion.a : Coercion.A\n",
+        ),
+    );
+}
+
+#[test]
 fn anonymous_constructor_tags_survive_owned_artifacts_and_diamond_imports() {
     let built = compiled(&[
         ("Main", "prelude\nimport Left\nimport Right"),

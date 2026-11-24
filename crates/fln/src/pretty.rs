@@ -684,7 +684,7 @@ pub struct Printer<'a> {
     /// How a dependent `let` prints ([`LetMode`]).
     lets: LetMode,
     /// The source/imported delaborator tags (`pp_using_anonymous_constructor`, `pp_nodot`,
-    /// `app_unexpander` keys), or `None` when the journal cannot be read.
+    /// `app_unexpander` keys and coercion functions), or `None` when the journal cannot be read.
     tags: Option<fln_elab::delaborator_tags::DelaboratorTags>,
     /// Whether the environment records imported delaborator tags at all: importing any `Init`
     /// module does (`Init.Prelude` tags `Subtype`). Without them, as in the native source
@@ -1973,6 +1973,216 @@ impl<'a> Printer<'a> {
         Some(self.ascribed(shown, &args[0]))
     }
 
+    /// Coercion applications can expose further parameters only after reducing a
+    /// type alias or substituting the supplied arguments (`CoeFun.coe`'s result).
+    /// Read that telescope with the native reducer instead of guessing explicit
+    /// arguments past the syntactic binders of the declaration.
+    fn coercion_param_kinds(
+        &mut self,
+        name: &Name,
+        levels: &[Level],
+        args: &[Expr],
+    ) -> Result<Vec<ParamKind>, Unsupported> {
+        use fln_core::expr::FVarId;
+        use fln_elab::constraint::unify::{UnificationBudget, UnificationTransparency};
+        use fln_elab::{ElabTxn, LocalContext};
+
+        let unavailable = Unsupported("a coercion with an unavailable argument telescope");
+        let declaration = self.env.find(name).ok_or(unavailable.clone())?;
+        let base = declaration.constant_val();
+        let mut current = fln_elab::universe::parameters::instantiate(
+            || Ok(()),
+            || (),
+            &base.type_,
+            &base.level_params,
+            levels,
+        )
+        .map_err(|_| unavailable.clone())?;
+        let mut locals = LocalContext::new();
+        let mut context = Vec::new();
+        for (index, type_) in self.types.iter().enumerate() {
+            let id = FVarId(Name::num(Name::anonymous(), index as u64));
+            let type_ = type_
+                .subst_loose(0, &context)
+                .map_err(|_| unavailable.clone())?;
+            locals.add_param(id.clone(), Name::anonymous(), type_, BinderInfo::Default);
+            context.push(Expr::fvar(id));
+        }
+        let scoped_args: Vec<_> = args
+            .iter()
+            .map(|arg| {
+                if arg.has_fvar() {
+                    return Err(unavailable.clone());
+                }
+                let arg = arg
+                    .subst_loose(0, &context)
+                    .map_err(|_| unavailable.clone())?;
+                if arg.has_loose_bvars() {
+                    return Err(unavailable.clone());
+                }
+                Ok(arg)
+            })
+            .collect::<Result<_, _>>()?;
+        let mut txn = ElabTxn::new(self.env.clone(), KVMap::new(), 0);
+        let mut budget = UnificationBudget::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+        budget.transparency = UnificationTransparency::Default;
+        let mut kinds = Vec::new();
+        loop {
+            self.tick()?;
+            budget.transparency = if kinds.len() < args.len() {
+                UnificationTransparency::SafeDefinitions
+            } else {
+                UnificationTransparency::Default
+            };
+            current = txn
+                .whnf_with(&current, &locals, budget)
+                .map_err(|_| unavailable.clone())?;
+            let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } = current.node()
+            else {
+                break;
+            };
+            let index = kinds.len();
+            // Equality is tested in the temporary local context, then retained
+            // in the original expression's context for the printer's consumer.
+            let default = annotation(binder_type, "optParam").and_then(|(_, value)| {
+                (scoped_args.get(index) == Some(value)).then(|| args[index].clone())
+            });
+            kinds.push(ParamKind {
+                info: *binder_info,
+                optional: annotation(binder_type, "optParam").is_some(),
+                default,
+                auto: annotation(binder_type, "autoParam").is_some(),
+            });
+            let argument = if let Some(argument) = scoped_args.get(index) {
+                argument.clone()
+            } else {
+                let id = FVarId(Name::num(Name::anonymous(), (context.len() + index) as u64));
+                locals.add_param(
+                    id.clone(),
+                    binder_name.clone(),
+                    binder_type.clone(),
+                    *binder_info,
+                );
+                Expr::fvar(id)
+            };
+            current = body
+                .subst_loose(0, &[argument])
+                .map_err(|_| unavailable.clone())?;
+        }
+        if kinds.len() < args.len() {
+            return Err(unavailable);
+        }
+        Ok(kinds)
+    }
+
+    /// `coeDelaborator` (vendored `PrettyPrinter/Delaborator/Builtins.lean`): use the
+    /// registered coercion's argument and kind, including applications of its result.
+    /// The remaining telescope decides whether implicit/defaulted arguments are shown;
+    /// when that requires `@`, the pin falls back to the ordinary application printer.
+    fn coercion_application(
+        &mut self,
+        name: &Name,
+        levels: &[Level],
+        args: &[Expr],
+        outer: u32,
+    ) -> Result<Option<Format>, Unsupported> {
+        use fln_elab::delaborator_tags::CoeFnKind;
+
+        if !self.pp.coercions {
+            return Ok(None);
+        }
+        let tags = self
+            .tags
+            .as_ref()
+            .ok_or(Unsupported("a malformed delaborator tag journal"))?;
+        let Some(info) = tags.coercion(name).copied() else {
+            return Ok(None);
+        };
+        let num_args = info.num_args as usize;
+        let coercee = info.coercee as usize;
+        if args.len() < num_args || (self.pp.explicit && coercee != 0) {
+            return Ok(None);
+        }
+        let value = args
+            .get(coercee)
+            .ok_or(Unsupported("a coercion with an invalid argument index"))?;
+        let rest = &args[num_args..];
+        let kinds = if rest.is_empty() {
+            Vec::new()
+        } else {
+            self.coercion_param_kinds(name, levels, args)?
+        };
+        let kinds = if rest.is_empty() {
+            &[][..]
+        } else {
+            &kinds[num_args..]
+        };
+        let explicit = self.pp.explicit || app_explicit(rest.len(), kinds);
+        if !rest.is_empty() && explicit && needs_explicit(rest.len(), kinds) {
+            return Ok(None);
+        }
+        let mut shown: Vec<Shown> = rest
+            .iter()
+            .zip(kinds)
+            .map(|(arg, kind)| {
+                if explicit {
+                    Shown::Regular
+                } else if kind.default.as_ref() == Some(arg) {
+                    Shown::Optional
+                } else if kind.info == BinderInfo::Default {
+                    Shown::Regular
+                } else {
+                    Shown::Skip
+                }
+            })
+            .collect();
+        while shown.last() == Some(&Shown::Optional) {
+            shown.pop();
+        }
+        let shown_args: Vec<_> = rest
+            .iter()
+            .zip(shown)
+            .filter_map(|(arg, shown)| (shown != Shown::Skip).then_some(arg))
+            .collect();
+        let mut head = if info.kind == CoeFnKind::CoeFun && !rest.is_empty() {
+            // An applied function coercion displays the original function itself.
+            let precedence = if self.pp.coercions_types {
+                0
+            } else if shown_args.is_empty() {
+                outer
+            } else {
+                MAX_PREC
+            };
+            self.doc(value, precedence)?
+        } else {
+            let arrow = match info.kind {
+                CoeFnKind::Coe => "↑",
+                CoeFnKind::CoeFun => "⇑",
+                CoeFnKind::CoeSort => "↥",
+            };
+            node(Format::text(arrow).then(self.doc(value, MAX_PREC)?))
+        };
+        if self.pp.coercions_types {
+            let type_ = self.application_type(name, levels, &args[..num_args])?;
+            head = self.ascribed(head, &type_)?;
+        }
+        if shown_args.is_empty() {
+            return Ok(Some(head));
+        }
+        let mut open = false;
+        for (index, arg) in shown_args.iter().enumerate() {
+            let (argument, bare) = self.argument(arg, index + 1 == shown_args.len())?;
+            head = head.then(Format::Line).then(argument);
+            open = bare;
+        }
+        Ok(Some(self.applied(node(head), open, outer)))
+    }
+
     fn application(&mut self, e: &Expr, outer: u32) -> Doc {
         let (head, args) = spine(e);
         if let ExprNode::Const { name, levels } = head.node() {
@@ -2014,6 +2224,9 @@ impl<'a> Printer<'a> {
                 && let Some(printed) = self.numeric_literal(&text, &args, outer)
             {
                 return printed;
+            }
+            if let Some(printed) = self.coercion_application(name, levels, &args, outer)? {
+                return Ok(printed);
             }
             // The source's own notations: their unexpanders are the newest.
             if unexpanding && let Some(printed) = self.notation(name, &args, outer) {
@@ -2263,38 +2476,6 @@ impl<'a> Printer<'a> {
                     paren_doc(doc, infix.precedence, outer)
                 });
             }
-            // `coeDelaborator` (vendored `PrettyPrinter/Delaborator/Builtins.lean:1230-1260`): a
-            // function the `coe` attribute registers is `↑x` of its first explicit argument
-            // when applied to exactly that many arguments. The pinned `Init` registers four:
-            // `Nat.cast` (`Init/Data/Cast.lean:69`), `Int.cast` (`Init/Data/Int/Basic.lean:453`),
-            // `Fin.val` (`Init/Prelude.lean:2321`), `Subarray.copy`
-            // (`Init/Data/Slice/Array/Iterator.lean:88`).
-            if matches!(
-                text.as_str(),
-                "Nat.cast" | "Int.cast" | "Fin.val" | "Subarray.copy"
-            ) && let Some(coercee) = self
-                .binder_infos(name)
-                .iter()
-                .position(|info| *info == BinderInfo::Default)
-                // `whenPPOption getPPCoercions`; under `pp.explicit` a coercion whose coercee is not
-                // its first argument is not one (each of the four's is not).
-                && self.pp.coercions
-                && !(self.pp.explicit && coercee != 0)
-            {
-                if args.len() == coercee + 1 {
-                    let shown = self.doc(&args[coercee], MAX_PREC)?;
-                    let coercion = node(Format::text("↑").then(shown));
-                    // `withTypeAscription (cond := ← getPPOption getPPCoercionsTypes)`.
-                    if self.pp.coercions_types {
-                        let type_ = self.application_type(name, levels, &args)?;
-                        return self.ascribed(coercion, &type_);
-                    }
-                    return Ok(coercion);
-                }
-                if args.len() > coercee + 1 {
-                    return Err(Unsupported("an applied coercion"));
-                }
-            }
             // `delabSorry` (vendored `PrettyPrinter/Delaborator/Builtins.lean:1515-1542`): a
             // labeled sorry, `sorryAx (Lean.Name → α) synthetic tag`, and a plain one,
             // `sorryAx α synthetic`, both print `sorry`; arguments beyond are applied after it.
@@ -2332,7 +2513,15 @@ impl<'a> Printer<'a> {
             {
                 return Err(Unsupported("an application an `@[app_unexpander]` prints"));
             }
-            let kinds = self.param_kinds(name, levels, &args);
+            let kinds = if self
+                .tags
+                .as_ref()
+                .is_some_and(|tags| tags.coercion(name).is_some())
+            {
+                self.coercion_param_kinds(name, levels, &args)?
+            } else {
+                self.param_kinds(name, levels, &args)
+            };
             // `delabAppExplicitCore`: every argument, implicit and instance ones included, after
             // `@c` (`needsExplicit`). The pin takes explicit mode under `pp.explicit`, and
             // otherwise when the next parameter is implicit (`@List.map Nat`) or a later explicit
