@@ -331,6 +331,154 @@ fn string_expansion_refutes_data_without_refuting_equal_proofs() {
 }
 
 #[test]
+fn expanded_character_proofs_reach_typed_admission_without_equating_data() {
+    let qualified =
+        |parts: &[&str]| Expr::const_(Name::from_components(parts.iter().copied()), Vec::new());
+    let nat = |n| Expr::lit(Literal::Nat(NatLit::from_u64(n)));
+    let chars = app(
+        Expr::const_(primary_name("List"), vec![Level::zero()]),
+        [c("Char")],
+    );
+    let char_mk = qualified(&["Char", "mk"]);
+    let string_mk = qualified(&["String", "mk"]);
+    let structure = |label: &str, constructor_type: Expr, fields| {
+        let family = checker_name(label);
+        let constructor = checker_qualified(&[label, "mk"]);
+        [
+            ConstantEntry::new(
+                family.clone(),
+                ConstantDeclaration::inductive(
+                    Vec::new(),
+                    decoded(&Expr::sort(Level::one())),
+                    ConstantSafety::Safe,
+                    InductiveDeclaration::new(
+                        0,
+                        0,
+                        vec![family.clone()],
+                        vec![constructor.clone()],
+                        0,
+                        false,
+                        false,
+                    ),
+                ),
+            ),
+            ConstantEntry::new(
+                constructor,
+                ConstantDeclaration::constructor(
+                    Vec::new(),
+                    decoded(&constructor_type),
+                    ConstantSafety::Safe,
+                    ConstructorDeclaration::new(family, 0, 0, fields),
+                ),
+            ),
+        ]
+    };
+    let reducing = |parts: &[&str], ty: Expr, value: Expr| {
+        ConstantEntry::new(
+            checker_qualified(parts),
+            ConstantDeclaration::definition(
+                Vec::new(),
+                decoded(&ty),
+                ConstantSafety::Safe,
+                DefinitionBody::new(
+                    decoded(&value),
+                    ReducibilityHint::Regular(1),
+                    DefinitionSafety::Safe,
+                    Vec::new(),
+                ),
+            ),
+        )
+    };
+    let explicit = |n| {
+        let character = app(char_mk.clone(), [nat(n), c("q")]);
+        let tail = app(
+            Expr::const_(Name::from_components(["List", "nil"]), vec![Level::zero()]),
+            [c("Char")],
+        );
+        let list = app(
+            Expr::const_(Name::from_components(["List", "cons"]), vec![Level::zero()]),
+            [c("Char"), character, tail],
+        );
+        app(qualified(&["String", "ofList"]), [list])
+    };
+    let literal = Expr::lit(Literal::Str("a".to_owned()));
+    let indexed = |s| app(c("StringIndex"), [s]);
+    let mut rows = init_list_entries();
+    rows.extend([
+        entry("Nat", Expr::sort(Level::one())),
+        entry("P", Expr::sort(Level::zero())),
+        entry("p", c("P")),
+        entry("q", c("P")),
+    ]);
+    // A small well-typed representation with both data and a proof field,
+    // isolating the same Char.ofNat/Char.mk boundary as the pin's Char.
+    rows.extend(structure("Char", pi(c("Nat"), pi(c("P"), c("Char"))), 2));
+    rows.extend(structure("String", pi(chars.clone(), c("String")), 1));
+    rows.extend([
+        reducing(
+            &["Char", "ofNat"],
+            pi(c("Nat"), c("Char")),
+            lam(
+                c("Nat"),
+                app(
+                    char_mk.clone(),
+                    [Expr::bvar(0).expect("character value"), c("p")],
+                ),
+            ),
+        ),
+        reducing(
+            &["String", "ofList"],
+            pi(chars.clone(), c("String")),
+            lam(chars, app(string_mk, [Expr::bvar(0).expect("string data")])),
+        ),
+        ConstantEntry::new(
+            checker_name("StringIndex"),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&pi(c("String"), Expr::sort(Level::one()))),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    1,
+                    vec![checker_name("StringIndex")],
+                    Vec::new(),
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        entry("literal_witness", indexed(literal.clone())),
+        entry("expanded_witness", indexed(explicit(97))),
+    ]);
+    let env = environment_of(rows);
+    accepted(
+        &env,
+        &candidate(
+            "expanded_proofs",
+            indexed(explicit(97)),
+            c("literal_witness"),
+        ),
+    );
+    accepted(
+        &env,
+        &candidate("literal_proofs", indexed(literal), c("expanded_witness")),
+    );
+    let different_data = admit(
+        &env,
+        &candidate("expanded_data", indexed(explicit(98)), c("literal_witness")),
+        AdmissionBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            different_data,
+            Verdict::Deferred(AdmissionDeferred::BodyConversion { .. })
+        ),
+        "typed proof conversion must not equate differing data: {different_data:?}"
+    );
+}
+
+#[test]
 fn proof_arguments_cannot_hide_invalid_unused_annotations() {
     let env = environment();
     let bad = Expr::let_e(primary_name("ignored"), c("Q"), c("p"), c("w"), false);

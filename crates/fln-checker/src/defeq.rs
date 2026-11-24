@@ -2271,7 +2271,7 @@ fn lazy_delta_heights(
     (left_reference, right_reference): (DefEqTerm, DefEqTerm),
     (left, right): (&WireExpr, &WireExpr),
     generated: &mut GeneratedPool,
-    (pending, offset_context, string_context, decomposed): (
+    (pending, offset_context, _string_context, decomposed): (
         &mut Vec<PendingPair>,
         NatOffsetContext,
         StringComparisonContext,
@@ -2376,7 +2376,7 @@ fn lazy_delta_heights(
         next_left,
         next_right,
         offset_context,
-        string_context,
+        StringComparisonContext::Ordinary,
         decomposed,
     ));
     Ok(None)
@@ -4059,8 +4059,9 @@ fn run_slow(
     // so its mismatch defers to conversion that has types. Pi types and
     // registered inductive type formers preserve decisive mismatches through
     // their children; they cannot turn an already speculative pair decisive. A
-    // matched string expansion is the exception: its pairs are `String`,
-    // `List Char`, `Char` and `Nat` data, never proofs, and stay decisive.
+    // matched string expansion initially compares a canonical data spine.
+    // Normalization or structure eta can expose proof fields (Char validity,
+    // for example), so those steps discard the string-specific exception.
     loop {
         generated.sweep_unreachable(&pending);
         let Some((left_reference, right_reference, offset_context, string_context, decomposed)) =
@@ -4229,7 +4230,7 @@ fn run_slow(
                         next_left,
                         next_right,
                         offset_context,
-                        string_context,
+                        StringComparisonContext::Ordinary,
                         decomposed,
                     ));
                     continue;
@@ -4428,7 +4429,7 @@ fn run_slow(
                                     next_left,
                                     next_right,
                                     offset_context,
-                                    string_context,
+                                    StringComparisonContext::Ordinary,
                                     true,
                                 ));
                             }
@@ -4610,7 +4611,7 @@ fn run_slow(
                     next_left,
                     next_right,
                     offset_context,
-                    string_context,
+                    StringComparisonContext::Ordinary,
                     decomposed,
                 ));
             }

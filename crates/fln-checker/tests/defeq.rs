@@ -320,6 +320,96 @@ fn string_expansion_retains_uncertainty_from_an_enclosing_function() {
 }
 
 #[test]
+fn string_expansion_cannot_refute_proof_fields_exposed_by_delta() {
+    let of_nat_name = qualified("Char", "ofNat");
+    let of_nat_wire_name =
+        match decode_name(&of_nat_name.to_canonical_bytes(), DecodeBudget::unlimited()) {
+            DecodeOutcome::Complete(Ok(value)) => value,
+            other => panic!("qualified Char name did not decode: {other:?}"),
+        };
+    let char_mk = Expr::const_(qualified("Char", "mk"), Vec::new());
+    let uint32_of_nat = Expr::const_(qualified("UInt32", "ofNat"), Vec::new());
+    let body = Expr::lam(
+        name("n"),
+        constant("Nat"),
+        Expr::app(
+            Expr::app(
+                char_mk.clone(),
+                Expr::app(
+                    uint32_of_nat.clone(),
+                    Expr::bvar(0).expect("character value"),
+                ),
+            ),
+            Expr::app(
+                constant("canonicalValid"),
+                Expr::bvar(0).expect("proof index"),
+            ),
+        ),
+        BinderInfo::Default,
+    );
+    // This isolates the pin's Char.ofNat -> Char.mk value/proof boundary.
+    // Char.mk's validity field is a proof; distinct proof heads are not a
+    // String mismatch. The pin accepts an opaque alternative validity proof.
+    let context = definition_context(vec![ConstantEntry::new(
+        of_nat_wire_name,
+        ConstantDeclaration::definition(
+            Vec::new(),
+            decoded(&Expr::forall_e(
+                name("n"),
+                constant("Nat"),
+                constant("Char"),
+                BinderInfo::Default,
+            )),
+            ConstantSafety::Safe,
+            DefinitionBody::new(
+                decoded(&body),
+                ReducibilityHint::Regular(1),
+                DefinitionSafety::Safe,
+                Vec::new(),
+            ),
+        ),
+    )]);
+    let literal = decoded(&Expr::lit(Literal::Str("a".to_owned())));
+    for proof in ["canonicalValid", "alternativeValid"] {
+        let character = Expr::app(
+            Expr::app(
+                char_mk.clone(),
+                Expr::app(uint32_of_nat.clone(), nat_literal(97)),
+            ),
+            Expr::app(constant(proof), nat_literal(97)),
+        );
+        let chars = Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::const_(qualified("List", "cons"), vec![Level::zero()]),
+                    constant("Char"),
+                ),
+                character,
+            ),
+            Expr::app(
+                Expr::const_(qualified("List", "nil"), vec![Level::zero()]),
+                constant("Char"),
+            ),
+        );
+        let explicit = decoded(&Expr::app(
+            Expr::const_(qualified("String", "ofList"), Vec::new()),
+            chars,
+        ));
+        for (left, right) in [(&literal, &explicit), (&explicit, &literal)] {
+            let outcome = def_eq(left, right, &context, DefEqBudget::unlimited());
+            assert!(
+                if proof == "canonicalValid" {
+                    matches!(outcome, DefEqOutcome::Equal(_))
+                } else {
+                    matches!(outcome, DefEqOutcome::Deferred { .. })
+                },
+                "the character proof field needs typed conversion: {outcome:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_mismatch_below_the_root_defers_instead_of_rejecting() {
     // Untyped conversion cannot see types, so a literal mismatch it reaches by
     // congruence says nothing about the terms enclosing it: `g 0` and `g 1`
