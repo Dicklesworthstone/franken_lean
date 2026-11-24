@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 
 pub use format::{
     ALIAS_EXTENSION, APP_UNEXPANDER_EXTENSION, AUX_RECURSOR_EXTENSION, BACKWARD_DEFEQ_EXTENSION,
-    CLASS_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION, DEPRECATED_EXTENSION,
+    CLASS_EXTENSION, COE_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION, DEPRECATED_EXTENSION,
     ELAB_AS_ELIM_EXTENSION, EXTERN_EXTENSION, IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION,
     INSTANCE_EXTENSION, MATCH_PATTERN_EXTENSION, NONCOMPUTABLE_EXTENSION,
     PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION, PROTECTED_EXTENSION,
@@ -139,6 +139,24 @@ pub struct AppUnexpanderEntry {
     pub scope: Option<Name>,
 }
 
+/// The pin's `CoeFnType`, used only by coercion delaboration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoeFnKind {
+    Coe,
+    CoeFun,
+    CoeSort,
+}
+
+/// A global `coeExt` registration. The source attribute and `registerCoercion`
+/// both add global rows; each row can refer to an imported declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoeEntry {
+    pub declaration: Name,
+    pub num_args: u32,
+    pub coercee: u32,
+    pub kind: CoeFnKind,
+}
+
 /// The pin's `implementedByAttr`: an explicit executable replacement. Both
 /// names still need checked ownership/type validation before source activation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,6 +271,8 @@ pub struct SourceExtensions {
     pub pp_nodot: Vec<Name>,
     /// `@[app_unexpander]` registrations, in journal order.
     pub app_unexpanders: Vec<AppUnexpanderEntry>,
+    /// Chronological coercion printing metadata, retaining repeated updates.
+    pub coercions: Vec<CoeEntry>,
     /// `@[deprecated]` registrations (the pin's `deprecatedAttr`), in journal order.
     pub deprecations: Vec<DeprecationEntry>,
     /// Nonempty foreign extensions whose semantics this decoder does not serve.
@@ -618,6 +638,35 @@ impl Reader {
             declaration: self.name(&field(obj, format::PROD_SND)?)?,
         })
     }
+
+    fn coercion(&mut self, obj: &Obj) -> Result<CoeEntry, DecodeError> {
+        constructor(obj, format::SCOPE_GLOBAL, 1)?;
+        let entry = field(obj, 0)?;
+        constructor(&entry, 0, format::PROD_POINTERS)?;
+        let declaration = self.name(&field(&entry, format::PROD_FST)?)?;
+        let info = field(&entry, format::PROD_SND)?;
+        constructor(&info, 0, format::COE_FN_POINTERS)?;
+        let num_args = natural(&field(&info, format::COE_FN_NUM_ARGS)?)?;
+        let coercee = natural(&field(&info, format::COE_FN_COERCEE)?)?;
+        if coercee >= num_args {
+            return Err(shape("coercion argument index is outside its application"));
+        }
+        let kind = info
+            .try_ctor_scalar_u64(format::COE_FN_POINTERS * 8 + format::COE_FN_TYPE_SCALAR)
+            .ok_or_else(|| shape("missing coercion function type"))? as u8;
+        let kind = match kind {
+            format::COE_FN_COE => CoeFnKind::Coe,
+            format::COE_FN_COE_FUN => CoeFnKind::CoeFun,
+            format::COE_FN_COE_SORT => CoeFnKind::CoeSort,
+            _ => return Err(shape("unknown coercion function type")),
+        };
+        Ok(CoeEntry {
+            declaration,
+            num_args,
+            coercee,
+            kind,
+        })
+    }
     fn default_instance(&mut self, obj: &Obj) -> Result<DefaultEntry, DecodeError> {
         constructor(obj, 0, format::DEFAULT_POINTERS)?;
         Ok(DefaultEntry {
@@ -733,6 +782,7 @@ fn decode_batch(
         name(format::SYMM_EXTENSION),
         name(format::ELAB_AS_ELIM_EXTENSION),
         sparse_cases_on_extension_name(),
+        name(format::COE_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -924,7 +974,8 @@ fn decode_batch(
                     }
                     names.push(declaration);
                 }
-                _ => unreachable!("twenty-eight selected extension families"),
+                28 => out.coercions.push(reader.coercion(&obj)?),
+                _ => unreachable!("twenty-nine selected extension families"),
             }
         }
     }

@@ -127,6 +127,7 @@ pub(super) fn encode(
             && metadata.unbox.is_empty()
             && metadata.match_patterns.is_empty()
             && metadata.symms.is_empty()
+            && metadata.coercions.is_empty()
             && metadata.pp_anonymous_constructor.is_empty()
             && metadata.defeq.is_empty()
             && metadata.backward_defeq.is_empty()

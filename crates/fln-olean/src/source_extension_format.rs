@@ -35,6 +35,7 @@
 //! src/Lean/Meta/Tactic/Symm.lean: sha256 30128dc01015c517702073afcc6fa10054120e2f15b8e3acf10aaeb2e89eb244
 //! src/Lean/Elab/App.lean: sha256 3010f5f1fdb8b95701b7e201ff6af7184f9b2e762aeef1ab2261eac11a478569
 //! stage0/stdlib/Lean/AuxRecursor.c: sha256 9323e0f5dc1e4ee134c383c3970ae90f39a1a8701eabc7436e7fbb01f4386ff7
+//! src/Lean/Meta/CoeAttr.lean: sha256 b71fe94a3fe4dc0430dda77c5f77c97a5b8fde6f7a9fef5fafaca0b5aaedd0b9
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -97,6 +98,12 @@ pub const DEPRECATION_SINCE_OPTION: usize = 2;
 pub const DEPRECATION_POINTERS: usize = 3;
 pub const DEPRECATION_SCALAR_BYTES: usize = 0;
 
+pub const COE_FN_NUM_ARGS: usize = 0;
+pub const COE_FN_COERCEE: usize = 1;
+pub const COE_FN_TYPE_SCALAR: usize = 0;
+pub const COE_FN_POINTERS: usize = 2;
+pub const COE_FN_SCALAR_BYTES: usize = 1;
+
 pub const SCOPE_GLOBAL: u8 = 0;
 pub const SCOPE_SCOPED: u8 = 1;
 pub const ATTRIBUTE_GLOBAL: u8 = 0;
@@ -130,6 +137,10 @@ pub const BACKWARD_DEFEQ_EXTENSION: &str = "Lean.backwardDefeqAttr";
 pub const UNBOX_EXTENSION: &str = "Lean.IR.UnboxResult.unboxAttr";
 pub const MATCH_PATTERN_EXTENSION: &str = "Lean.matchPatternAttr";
 pub const SYMM_EXTENSION: &str = "Lean.Meta.Symm.symmExt";
+pub const COE_FN_COE: u8 = 0;
+pub const COE_FN_COE_FUN: u8 = 1;
+pub const COE_FN_COE_SORT: u8 = 2;
+pub const COE_EXTENSION: &str = "Lean.Meta.coeExt";
 pub const ELAB_AS_ELIM_EXTENSION: &str = "Lean.Elab.Term.elabAsElim";
 pub const PP_ANONYMOUS_CONSTRUCTOR_EXTENSION: &str = "Lean.ppUsingAnonymousConstructorAttr";
 pub const PP_NODOT_EXTENSION: &str = "Lean.ppNoDotAttr";
