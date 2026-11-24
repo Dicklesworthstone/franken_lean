@@ -18,6 +18,7 @@ mod guard_messages;
 mod guard_spec_tests;
 mod imported_ir;
 mod lake_build;
+mod lean_deps;
 mod output;
 pub mod runtime_plane;
 mod source_check;
@@ -437,6 +438,7 @@ const LEAN_USAGE: &str = concat!(
     "  lean [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N] PATH\n",
     "  lean --stdin [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N]\n",
     "  lean --src-deps [--max-bytes BYTES] PATH\n",
+    "  lean --deps-json [--max-bytes BYTES] [PATH ... | --stdin]\n",
     "  lean [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N] --run PATH [ARG...]\n",
     "  lean --help\n",
     "  lean -v | --version\n",
@@ -686,6 +688,11 @@ enum LeanCommand {
     },
     SourceDependencies {
         path: PathBuf,
+        max_bytes: usize,
+    },
+    ImportHeaders {
+        paths: Vec<PathBuf>,
+        stdin: bool,
         max_bytes: usize,
     },
     Source {
@@ -2164,11 +2171,12 @@ fn parse_lean_command(
         };
     }
 
-    let mut path = None;
+    let mut paths = Vec::new();
     let mut max_bytes = SOURCE_RUN_DEFAULT_MAX_BYTES;
     let mut max_bytes_seen = false;
     let mut stdin_source = false;
     let mut source_dependencies = false;
+    let mut import_headers = false;
     // Every ordinary Lean input imports Init. Keep the default admission
     // footprint to one council worker; -j/--threads opts into parallelism.
     let mut import_jobs = std::num::NonZeroUsize::MIN;
@@ -2181,7 +2189,7 @@ fn parse_lean_command(
             continue;
         }
         if options && (argument == "--run" || argument == "-r") {
-            if stdin_source || source_dependencies || path.is_some() {
+            if stdin_source || source_dependencies || import_headers || !paths.is_empty() {
                 return Err(UsageError(
                     "--run requires its own source path and cannot be combined with --stdin or --src-deps"
                         .to_owned(),
@@ -2263,6 +2271,10 @@ fn parse_lean_command(
             source_dependencies = true;
             continue;
         }
+        if options && argument == "--deps-json" {
+            import_headers = true;
+            continue;
+        }
         if options && argument == "--stdin" {
             if stdin_source {
                 return Err(UsageError(
@@ -2319,13 +2331,30 @@ fn parse_lean_command(
         if argument.is_empty() {
             return Err(UsageError("source path must not be empty".to_owned()));
         }
-        if path.replace(PathBuf::from(argument)).is_some() {
-            return Err(UsageError(
-                "lean accepts exactly one source path".to_owned(),
-            ));
+        if paths.len() >= lean_deps::MAX_FILES {
+            return Err(UsageError("too many input paths".to_owned()));
         }
+        paths.push(PathBuf::from(argument));
     }
 
+    if import_headers {
+        if vm_options.supplied() {
+            return Err(UsageError(
+                "execution limits cannot be combined with --deps-json".to_owned(),
+            ));
+        }
+        return Ok(LeanCommand::ImportHeaders {
+            paths,
+            stdin: stdin_source,
+            max_bytes,
+        });
+    }
+    if paths.len() > 1 {
+        return Err(UsageError(
+            "lean accepts exactly one source path".to_owned(),
+        ));
+    }
+    let path = paths.pop();
     if stdin_source {
         if source_dependencies {
             return Err(UsageError(
@@ -15830,6 +15859,11 @@ fn run_lean_with_optional_input(
         Ok(LeanCommand::PrintPrefix) => lean_installation_path_output(|paths| paths.prefix),
         Ok(LeanCommand::PrintLibdir) => lean_installation_path_output(|paths| paths.libdir),
         Ok(LeanCommand::Server) => serve_lsp(),
+        Ok(LeanCommand::ImportHeaders {
+            paths,
+            stdin,
+            max_bytes,
+        }) => lean_deps::run(paths, stdin, input, max_bytes),
         Ok(LeanCommand::Stdin {
             max_bytes,
             import_jobs,
