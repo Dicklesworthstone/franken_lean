@@ -5932,26 +5932,21 @@ fn kr700_restricted_elimination_and_kr317_k_flags_are_regenerated() {
     );
 }
 
-#[test]
-fn kr317_a_k_target_block_admits_with_k_true() {
-    // `MyTrue : Prop` with one nullary constructor is a K-target that still
-    // eliminates LARGE (empty to_check ⇒ KR-701 passes): the generated
-    // recursor carries k=true and the elim level parameter. An
-    // always-false K-targeting mutant rejects this acceptance.
+fn mytrue_block(ctor: &str) -> Declaration {
     let mytrue = || Expr::const_(n("MyTrue"), vec![]);
     let ind = InductiveVal {
         base: cval(n("MyTrue"), vec![], prop()),
         num_params: 0,
         num_indices: 0,
         all: vec![n("MyTrue")],
-        ctors: vec![nn("MyTrue", "intro")],
+        ctors: vec![nn("MyTrue", ctor)],
         num_nested: 0,
         is_rec: false,
         is_unsafe: false,
         is_reflexive: false,
     };
     let intro = ConstructorVal {
-        base: cval(nn("MyTrue", "intro"), vec![], mytrue()),
+        base: cval(nn("MyTrue", ctor), vec![], mytrue()),
         induct: n("MyTrue"),
         cidx: 0,
         num_params: 0,
@@ -5965,8 +5960,8 @@ fn kr317_a_k_target_block_admits_with_k_true() {
         n("motive"),
         motive_ty.clone(),
         Expr::forall_e(
-            n("intro"),
-            Expr::app(bv(0), Expr::const_(nn("MyTrue", "intro"), vec![])),
+            n(ctor),
+            Expr::app(bv(0), Expr::const_(nn("MyTrue", ctor), vec![])),
             Expr::forall_e(
                 n("t"),
                 mytrue(),
@@ -5981,8 +5976,8 @@ fn kr317_a_k_target_block_admits_with_k_true() {
         n("motive"),
         motive_ty,
         Expr::lam(
-            n("intro"),
-            Expr::app(bv(0), Expr::const_(nn("MyTrue", "intro"), vec![])),
+            n(ctor),
+            Expr::app(bv(0), Expr::const_(nn("MyTrue", ctor), vec![])),
             bv(0),
             BinderInfo::Default,
         ),
@@ -5996,22 +5991,40 @@ fn kr317_a_k_target_block_admits_with_k_true() {
         num_motives: 1,
         num_minors: 1,
         rules: vec![RecursorRule {
-            ctor: nn("MyTrue", "intro"),
+            ctor: nn("MyTrue", ctor),
             nfields: 0,
             rhs,
         }],
         k: true,
         is_unsafe: false,
     };
-    let verdict = check(
-        &Environment::new(),
-        &block_decl(vec![ind], vec![intro], vec![rec]),
-        Budget::DEFAULT,
-    );
+    block_decl(vec![ind], vec![intro], vec![rec])
+}
+
+#[test]
+fn kr317_a_k_target_block_admits_with_k_true() {
+    // `MyTrue : Prop` with one nullary constructor is a K-target that still
+    // eliminates LARGE (empty to_check ⇒ KR-701 passes): the generated
+    // recursor carries k=true and the elim level parameter. An
+    // always-false K-targeting mutant rejects this acceptance.
+    let verdict = check(&Environment::new(), &mytrue_block("intro"), Budget::DEFAULT);
     assert!(
         verdict.is_accepted(),
         "MyTrue is a K-target with large elimination; got {verdict:?}"
     );
+}
+
+#[test]
+fn recursor_name_collision_with_a_constructor_is_rejected() {
+    // Both the constructor and its faithfully regenerated recursor have the
+    // name MyTrue.rec. Even a byte-exact decoded recursor cannot occupy it.
+    let verdict = check(&Environment::new(), &mytrue_block("rec"), Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::AlreadyDeclared),
+        "{verdict:?}"
+    );
+    assert!(reject_message(&verdict).contains("MyTrue.rec"));
 }
 
 #[test]
@@ -7471,6 +7484,25 @@ fn kr608_nested_block_admits_with_byte_exact_translated_regeneration() {
         verdict.is_accepted(),
         "nested MyTree block must admit under the FULL ruleset; got {verdict:?}"
     );
+}
+
+#[test]
+fn recursor_name_collision_after_nested_restoration_is_rejected() {
+    let occupied = nn("MyTree", "rec_1");
+    let env = mylist_env()
+        .add_decl(ConstantInfo::Axiom(AxiomVal {
+            base: cval(occupied, vec![], sort1()),
+            is_unsafe: false,
+        }))
+        .expect("publish existing axiom");
+    let (types, ctors, recursors) = mytree_block();
+    let verdict = check(&env, &block_decl(types, ctors, recursors), Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::AlreadyDeclared),
+        "{verdict:?}"
+    );
+    assert!(reject_message(&verdict).contains("MyTree.rec_1"));
 }
 
 #[test]

@@ -542,6 +542,19 @@ impl<'a> Engine<'a> {
 
     // ---- KR-600..602: the types ------------------------------------------------------
 
+    fn check_fresh_recursor_name(&self, name: &Name) -> KResult<()> {
+        if self.env.contains(name) {
+            return reject(
+                RejectClass::AlreadyDeclared,
+                format!(
+                    "recursor name `{}` is already declared",
+                    name.to_display_string()
+                ),
+            );
+        }
+        Ok(())
+    }
+
     fn check_inductive_types(&mut self) -> KResult<()> {
         let types = self.block.types.to_vec();
         let mut first = true;
@@ -555,15 +568,7 @@ impl<'a> Engine<'a> {
                     format!("`{}` is already declared", name.to_display_string()),
                 );
             }
-            if self.env.contains(&mk_rec_name(name)) {
-                return reject(
-                    RejectClass::AlreadyDeclared,
-                    format!(
-                        "recursor name `{}` is already declared",
-                        mk_rec_name(name).to_display_string()
-                    ),
-                );
-            }
+            self.check_fresh_recursor_name(&mk_rec_name(name))?;
             if ind.base.level_params != self.lparams {
                 return reject(
                     RejectClass::BlockMismatch,
@@ -1340,6 +1345,9 @@ impl<'a> Engine<'a> {
             rec_ty = infer_implicit_strict(&rec_ty, 0)?;
             let rules = self.mk_rec_rules(&infos, &cs, &minors, d_idx, &mut minor_idx)?;
             let rec_name = mk_rec_name(&self.block.types[d_idx].base.name);
+            // At this point every type and constructor of this block is in
+            // the scratch environment, including on the synthesized path.
+            self.check_fresh_recursor_name(&rec_name)?;
             generated.push(RecursorVal {
                 base: fln_env::constants::ConstantVal {
                     name: rec_name.clone(),
@@ -1597,6 +1605,9 @@ impl<'a> Engine<'a> {
             } else {
                 rec_rename[i - main_count].1.clone()
             };
+            // Translation checked the internal auxiliary name. The public
+            // name (e.g. MyTree.rec_1) must be fresh in the original block.
+            self.check_fresh_recursor_name(&restored_name)?;
             let restored_ty = self.restore_expr(&g.base.type_, &st, &rec_rename, 0)?;
             let mut restored_rules = Vec::with_capacity(g.rules.len());
             for rule in &g.rules {
