@@ -1351,13 +1351,73 @@ struct Generated {
     copied: bool,
 }
 
+/// Live-node threshold above which `GeneratedPool::sweep_unreachable` drops
+/// intermediate arenas no longer referenced by `run_slow`'s `pending` stack.
+const COMPACT_GENERATED_NODES: usize = 1 << 19;
+
+/// Monotonically-indexed arena pool for `run_slow`: indices never recycle (so
+/// `seen` and `DefEqLocation` stay unique and deterministic), while unreachable
+/// generations are dropped in place to keep peak memory proportional to the
+/// live `pending` frontier rather than total normalizations.
+#[derive(Default)]
+struct GeneratedPool {
+    entries: Vec<Option<Generated>>,
+    live_nodes: usize,
+}
+
+impl GeneratedPool {
+    fn push(&mut self, term: WireExpr, copied: bool) -> usize {
+        let index = self.entries.len();
+        self.live_nodes = self.live_nodes.saturating_add(term.nodes().len());
+        self.entries.push(Some(Generated {
+            term: Arc::new(term),
+            copied,
+        }));
+        index
+    }
+
+    fn sweep_unreachable(&mut self, pending: &[PendingPair]) {
+        if self.live_nodes <= COMPACT_GENERATED_NODES {
+            return;
+        }
+        let mut live = vec![false; self.entries.len()];
+        for &(left_ref, right_ref, ..) in pending {
+            for term_ref in [left_ref, right_ref] {
+                if let DefEqSource::Generated { index, .. } = term_ref.source
+                    && let Some(slot) = live.get_mut(index)
+                {
+                    *slot = true;
+                }
+            }
+        }
+        let mut remaining_nodes = 0_usize;
+        for (slot, &keep) in self.entries.iter_mut().zip(&live) {
+            if !keep {
+                *slot = None;
+            } else if let Some(entry) = slot.as_ref() {
+                remaining_nodes = remaining_nodes.saturating_add(entry.term.nodes().len());
+            }
+        }
+        self.live_nodes = remaining_nodes;
+    }
+}
+
+impl std::ops::Deref for GeneratedPool {
+    type Target = [Option<Generated>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
 fn generated_entry(
-    generated: &[Generated],
+    generated: &[Option<Generated>],
     index: usize,
     side: DefEqSide,
 ) -> Result<&Generated, SlowHalt> {
     generated
         .get(index)
+        .and_then(Option::as_ref)
         .ok_or(SlowHalt::Fault(DefEqFault::MissingGeneratedArena {
             side,
             generation: usize_units(index).saturating_add(1),
@@ -1368,7 +1428,7 @@ fn source_term<'a>(
     reference: DefEqTerm,
     left: &'a WireExpr,
     right: &'a WireExpr,
-    generated: &'a [Generated],
+    generated: &'a [Option<Generated>],
 ) -> Result<&'a WireExpr, SlowHalt> {
     match reference.source {
         DefEqSource::Original(DefEqSide::Left) => Ok(left),
@@ -1383,11 +1443,15 @@ fn source_term<'a>(
 struct TermSources<'a> {
     left: &'a WireExpr,
     right: &'a WireExpr,
-    generated: &'a [Generated],
+    generated: &'a [Option<Generated>],
 }
 
 impl<'a> TermSources<'a> {
-    fn new(left: &'a WireExpr, right: &'a WireExpr, generated: &'a [Generated]) -> TermSources<'a> {
+    fn new(
+        left: &'a WireExpr,
+        right: &'a WireExpr,
+        generated: &'a [Option<Generated>],
+    ) -> TermSources<'a> {
         TermSources {
             left,
             right,
@@ -1416,7 +1480,7 @@ fn slow_node<'a>(
     reference: DefEqTerm,
     left: &'a WireExpr,
     right: &'a WireExpr,
-    generated: &'a [Generated],
+    generated: &'a [Option<Generated>],
 ) -> Result<(&'a WireExpr, &'a ExprNode), SlowHalt> {
     let term = source_term(reference, left, right, generated)?;
     let node = term
@@ -1476,7 +1540,7 @@ fn trace_unresolved(
     right_reference: DefEqTerm,
     left: &WireExpr,
     right: &WireExpr,
-    generated: &[Generated],
+    generated: &[Option<Generated>],
 ) {
     if std::env::var_os("FLN_CHECKER_TRACE").is_none() {
         return;
@@ -1970,7 +2034,7 @@ fn resolve_nat_predecessor(
     side: DefEqSide,
     left: &WireExpr,
     right: &WireExpr,
-    generated: &mut Vec<Generated>,
+    generated: &mut GeneratedPool,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<DefEqTerm, SlowHalt> {
@@ -1992,7 +2056,7 @@ fn nat_offset_action(
     references: (DefEqTerm, DefEqTerm),
     left: &WireExpr,
     right: &WireExpr,
-    generated: &mut Vec<Generated>,
+    generated: &mut GeneratedPool,
     offset_context: NatOffsetContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
@@ -2145,7 +2209,7 @@ type HeightPair = (Option<u32>, Option<u32>);
 fn lazy_delta_heights(
     (left_reference, right_reference): (DefEqTerm, DefEqTerm),
     (left, right): (&WireExpr, &WireExpr),
-    generated: &mut Vec<Generated>,
+    generated: &mut GeneratedPool,
     (pending, offset_context, string_context, decomposed): (
         &mut Vec<PendingPair>,
         NatOffsetContext,
@@ -2850,7 +2914,7 @@ fn eta_candidate(
     (mut lambda, mut body): (DefEqTerm, ExprId),
     outside: DefEqTerm,
     (left, right): (&WireExpr, &WireExpr),
-    generated: &mut Vec<Generated>,
+    generated: &mut GeneratedPool,
     context: &WhnfContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
@@ -3052,7 +3116,7 @@ fn exact_function_eta(
     left_reference: DefEqTerm,
     right_reference: DefEqTerm,
     (left, right): (&WireExpr, &WireExpr),
-    generated: &mut Vec<Generated>,
+    generated: &mut GeneratedPool,
     context: &WhnfContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
@@ -3393,23 +3457,19 @@ fn exact_structure_eta(
     )
 }
 
-fn retain_generated(generated: &mut Vec<Generated>, side: DefEqSide, term: WireExpr) -> DefEqTerm {
+fn retain_generated(generated: &mut GeneratedPool, side: DefEqSide, term: WireExpr) -> DefEqTerm {
     retain_normalized(generated, side, term, false)
 }
 
 /// A normalization's result, with the copy flag it reported (`Generated`).
 fn retain_normalized(
-    generated: &mut Vec<Generated>,
+    generated: &mut GeneratedPool,
     side: DefEqSide,
     term: WireExpr,
     copied: bool,
 ) -> DefEqTerm {
     let root = term.root();
-    let index = generated.len();
-    generated.push(Generated {
-        term: Arc::new(term),
-        copied,
-    });
+    let index = generated.push(term, copied);
     DefEqTerm {
         source: DefEqSource::Generated { index, side },
         root,
@@ -3682,7 +3742,7 @@ fn regular_same_head_apps_def_eq(
     right_reference: DefEqTerm,
     left: &WireExpr,
     right: &WireExpr,
-    generated: &[Generated],
+    generated: &[Option<Generated>],
     context: &WhnfContext,
     scope: ConversionScope,
     control: &mut SlowControl,
@@ -3892,7 +3952,7 @@ fn run_slow(
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<DefEqOutcome, SlowHalt> {
     let mut control = SlowControl::new(budget, quick_comparisons);
-    let mut generated = Vec::new();
+    let mut generated = GeneratedPool::default();
     let mut pending = vec![(
         DefEqTerm::original(DefEqSide::Left, left.root()),
         DefEqTerm::original(DefEqSide::Right, right.root()),
@@ -3911,9 +3971,13 @@ fn run_slow(
     // verdict, and below the root it defers to conversion that has types. A
     // matched string expansion is the exception: its pairs are `String`,
     // `List Char`, `Char` and `Nat` data, never proofs, and stay decisive.
-    while let Some((left_reference, right_reference, offset_context, string_context, decomposed)) =
-        pending.pop()
-    {
+    loop {
+        generated.sweep_unreachable(&pending);
+        let Some((left_reference, right_reference, offset_context, string_context, decomposed)) =
+            pending.pop()
+        else {
+            break;
+        };
         if !seen.insert((
             left_reference,
             right_reference,
@@ -4719,6 +4783,51 @@ mod tests {
                     index: 0,
                 },
             })
+        );
+    }
+
+    #[test]
+    fn generated_pool_sweeps_unreachable_generations_without_recycling_indices() {
+        let root = ExprId::from_index(0).expect("zero expression index");
+        let small = WireExpr::from_parts(
+            vec![ExprNode::NatLiteral { limbs_le: vec![1] }],
+            Vec::new(),
+            root,
+        );
+        let mut pool = GeneratedPool::default();
+        let dead_idx = pool.push(small.clone(), false);
+        let live_idx = pool.push(small.clone(), true);
+        // Simulate exceeding the compaction threshold while only `live_idx`
+        // remains referenced on `pending`.
+        pool.live_nodes = COMPACT_GENERATED_NODES + 1;
+        let pending = vec![(
+            DefEqTerm {
+                source: DefEqSource::Generated {
+                    index: live_idx,
+                    side: DefEqSide::Left,
+                },
+                root,
+            },
+            DefEqTerm::original(DefEqSide::Right, root),
+            NatOffsetContext::Fresh,
+            StringComparisonContext::Ordinary,
+            false,
+        )];
+        pool.sweep_unreachable(&pending);
+        assert!(
+            pool[dead_idx].is_none(),
+            "unreachable generation must be dropped"
+        );
+        assert!(
+            pool[live_idx].is_some(),
+            "reachable generation must survive compaction"
+        );
+        assert_eq!(pool.live_nodes, 1);
+        let next_idx = pool.push(small, false);
+        assert_eq!(
+            next_idx,
+            live_idx + 1,
+            "generation indices must stay strictly monotonic"
         );
     }
 }

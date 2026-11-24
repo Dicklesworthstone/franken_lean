@@ -1694,7 +1694,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         )
         .with_string(self.remaining_string_budget());
         // Its caller compares the result, as the pin's `to_cnstr_when_K`
-        // compares types with `is_def_eq`: see `whnf_comparand_with`.
+        // compares types with `is_def_eq`: see `whnf_comparand_delta_step_with`.
         match whnf_at_mode_with(
             &cursor.arena,
             cursor.root,
@@ -3512,8 +3512,10 @@ impl<'a, 'c> Reducer<'a, 'c> {
         };
         self.entry = Some(Arc::clone(&current.arena));
         let (memo, bindings) = self.context.source.whnf_memo();
-        let (delta_mode, budget) = (self.delta_mode, self.control.budget);
-        if let Some(remembered) = memo.recall(&current.arena, delta_mode, &budget, bindings) {
+        let (delta_mode, head_nat, budget) = (self.delta_mode, self.head_nat, self.control.budget);
+        if let Some(remembered) =
+            memo.recall(&current.arena, delta_mode, head_nat, &budget, bindings)
+        {
             return Ok(remembered);
         }
         let input = Arc::clone(&current.arena);
@@ -3521,6 +3523,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         memo.remember(
             input,
             delta_mode,
+            head_nat,
             budget.materialization,
             bindings,
             memo::RememberedWhnf {
@@ -3558,8 +3561,10 @@ impl<'a, 'c> Reducer<'a, 'c> {
         };
         self.entry = Some(Arc::clone(&current.arena));
         let (memo, bindings) = self.context.source.whnf_memo();
-        let (delta_mode, budget) = (self.delta_mode, self.control.budget);
-        if let Some((result, copied)) = memo.recall(&current.arena, delta_mode, &budget, bindings) {
+        let (delta_mode, head_nat, budget) = (self.delta_mode, self.head_nat, self.control.budget);
+        if let Some((result, copied)) =
+            memo.recall(&current.arena, delta_mode, head_nat, &budget, bindings)
+        {
             if skipped_initial_copy && result.reductions == 0 && !result.has_auxiliary_work {
                 return Ok(WhnfCoreOutcome::Unchanged {
                     steps: self.control.steps.saturating_add(result.steps),
@@ -3598,6 +3603,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         memo.remember(
             input,
             delta_mode,
+            head_nat,
             budget.materialization,
             bindings,
             memo::RememberedWhnf {
@@ -3631,10 +3637,11 @@ impl<'a, 'c> Reducer<'a, 'c> {
         };
         self.entry = Some(Arc::clone(&current.arena));
         let (memo, bindings) = self.context.source.whnf_memo();
-        let (delta_mode, budget) = (self.delta_mode, self.control.budget);
+        let (delta_mode, head_nat, budget) = (self.delta_mode, self.head_nat, self.control.budget);
         if let Some((result, nat_progress, _)) = memo.recall_eager_nat(
             &current.arena,
             delta_mode,
+            head_nat,
             &budget,
             numeric_budget,
             bindings,
@@ -3666,6 +3673,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         memo.remember(
             input,
             delta_mode,
+            head_nat,
             budget.materialization,
             bindings,
             memo::RememberedWhnf {
@@ -5272,24 +5280,45 @@ pub(crate) fn whnf_at_with(
     )
 }
 
-/// WHNF of a term being compared, as opposed to a type or a recursor major.
-/// The pin's conversion never takes the WHNF of a comparand: it reduces a Nat
-/// operation only in lazy delta, and only when neither side has a free
-/// variable (`type_checker.cpp:1007` of the vendored source). A caller that
-/// normalizes comparands to widen conversion must therefore not reduce an
-/// open operation, whatever its free variables are bound to.
-pub(crate) fn whnf_comparand_with(
-    term: &WireExpr,
+/// Core normalization (`DeltaMode::Disabled`) for a comparand in typed
+/// conversion, keeping `NatReductionScope::ClosedPair` (the pin's conversion
+/// reduces a Nat operation only in lazy delta when neither side has a free
+/// variable, `type_checker.cpp:1007`) and using the zero-copy
+/// `is_already_whnf_core` and `WhnfInput::Copied` fast paths.
+pub(crate) fn whnf_comparand_core_of_with(
+    input: WhnfInput<'_>,
+    root: ExprId,
     context: &WhnfContext,
     budget: WhnfBudget,
     cancelled: &mut dyn FnMut() -> bool,
-) -> WhnfOutcome {
-    whnf_at_mode_with(
-        term,
-        term.root(),
+) -> WhnfCoreOutcome {
+    whnf_core_step_scoped_with(
+        input,
+        root,
         context,
         budget,
-        DeltaMode::Eager,
+        NatReductionScope::ClosedPair,
+        cancelled,
+    )
+}
+
+/// One lazy delta step (`DeltaMode::Once`) for a comparand in typed conversion,
+/// keeping `NatReductionScope::ClosedPair` so open Nat applications are never
+/// reduced by comparand normalization, and returning whether the output arena
+/// is this module's own copy (`WhnfInput::Copied`).
+pub(crate) fn whnf_comparand_delta_step_of_with(
+    input: WhnfInput<'_>,
+    root: ExprId,
+    context: &WhnfContext,
+    budget: WhnfBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> (WhnfOutcome, bool) {
+    whnf_input_at_mode_with(
+        input,
+        root,
+        context,
+        budget,
+        DeltaMode::Once,
         NatReductionScope::ClosedPair,
         cancelled,
     )
@@ -5588,6 +5617,24 @@ pub(crate) fn whnf_core_step_of_with(
     budget: WhnfBudget,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> WhnfCoreOutcome {
+    whnf_core_step_scoped_with(
+        input,
+        root,
+        context,
+        budget,
+        NatReductionScope::WhnfHead,
+        cancelled,
+    )
+}
+
+fn whnf_core_step_scoped_with(
+    input: WhnfInput<'_>,
+    root: ExprId,
+    context: &WhnfContext,
+    budget: WhnfBudget,
+    head_nat: NatReductionScope,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> WhnfCoreOutcome {
     let mut control = Control::new(budget);
     let prepared = match PreparedContext::prepare(context, &mut control, cancelled) {
         Ok(prepared) => prepared,
@@ -5621,7 +5668,7 @@ pub(crate) fn whnf_core_step_of_with(
         unfolded_bindings: BTreeSet::new(),
         acyclic_bindings: BTreeSet::new(),
         delta_mode: DeltaMode::Disabled,
-        head_nat: NatReductionScope::WhnfHead,
+        head_nat,
         numeric_budget: None,
         nat_progress: WhnfNatProgress::default(),
         nat_pow_cap: None,

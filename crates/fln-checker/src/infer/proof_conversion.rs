@@ -27,6 +27,47 @@ pub(crate) enum ProofConversionOutcome {
     Halted(Box<InferenceOutcome>),
 }
 
+/// A comparand expression in `Probe::run`, shared via `Arc` for O(1) clones
+/// across worklist/memo entries and tagged with `copied` so WHNF skips
+/// redundant input materialization (`WhnfInput::Copied`) across lazy-delta steps.
+#[derive(Clone)]
+struct Term {
+    expr: Arc<WireExpr>,
+    copied: bool,
+}
+
+impl Term {
+    fn new(expr: WireExpr) -> Self {
+        Self {
+            expr: Arc::new(expr),
+            copied: false,
+        }
+    }
+
+    fn from_whnf(expr: WireExpr, copied: bool) -> Self {
+        Self {
+            expr: Arc::new(expr),
+            copied,
+        }
+    }
+
+    fn as_whnf_input(&self) -> crate::whnf::WhnfInput<'_> {
+        if self.copied {
+            crate::whnf::WhnfInput::Copied(&self.expr)
+        } else {
+            crate::whnf::WhnfInput::Borrowed(&self.expr)
+        }
+    }
+}
+
+impl std::ops::Deref for Term {
+    type Target = WireExpr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.expr
+    }
+}
+
 struct Probe<'a> {
     budget: InferenceBudget,
     steps: u64,
@@ -43,6 +84,13 @@ struct Probe<'a> {
     /// it only stops the attempt being repeated; the pair itself takes the
     /// other rules.
     incongruent: PairSet,
+    /// Pairs unconditionally proven convertible in this run (`m_eqv_manager` in
+    /// `type_checker.cpp`), retained even when an enclosing congruence attempt
+    /// fails on a sibling argument.
+    proven: PairSet,
+    /// Pairs that exhausted all rules of this lane in this run (`m_failure` in
+    /// `type_checker.cpp`), preventing exponential re-exploration.
+    disproven: PairSet,
     /// The untyped converter's answers in this run (`PairAnswers`).
     answers: PairAnswers,
     /// Types already inferred in this run (`InferredTypes`).
@@ -176,13 +224,30 @@ fn all_free_locals_in_context(term: &WireExpr, context: &InferenceContext) -> bo
         _ => true,
     })
 }
-/// A set of term pairs, looked up without copying the terms.
+/// A bounded two-generation set of term pairs, looked up without copying the terms.
 #[derive(Default)]
-struct PairSet {
-    buckets: crate::whnf::memo::PrehashedMap<Vec<(WireExpr, WireExpr)>>,
+pub(super) struct PairSet {
+    current: PairSetTable,
+    previous: PairSetTable,
+}
+#[derive(Default)]
+struct PairSetTable {
+    buckets: crate::whnf::memo::PrehashedMap<Vec<(Arc<WireExpr>, Arc<WireExpr>)>>,
+    nodes: usize,
+}
+impl PairSetTable {
+    fn contains(&self, fingerprint: u64, left: &WireExpr, right: &WireExpr) -> bool {
+        !self.buckets.is_empty()
+            && self
+                .buckets
+                .get(&fingerprint)
+                .is_some_and(|pairs| pairs.iter().any(|(l, r)| **l == *left && **r == *right))
+    }
 }
 impl PairSet {
-    fn fingerprint(left: &WireExpr, right: &WireExpr) -> u64 {
+    const MAX_GENERATION_NODES: usize = 1 << 20;
+    const MAX_BUCKET: usize = 8;
+    pub(super) fn fingerprint(left: &WireExpr, right: &WireExpr) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = crate::whnf::memo::Fingerprinter::default();
         left.hash(&mut hasher);
@@ -190,18 +255,89 @@ impl PairSet {
         hasher.finish()
     }
     fn contains(&self, left: &WireExpr, right: &WireExpr) -> bool {
-        !self.buckets.is_empty()
-            && self
-                .buckets
-                .get(&Self::fingerprint(left, right))
-                .is_some_and(|pairs| pairs.iter().any(|(l, r)| l == left && r == right))
+        let fingerprint = Self::fingerprint(left, right);
+        self.current.contains(fingerprint, left, right)
+            || self.previous.contains(fingerprint, left, right)
     }
-    fn insert(&mut self, left: WireExpr, right: WireExpr) {
-        if !self.contains(&left, &right) {
-            self.buckets
-                .entry(Self::fingerprint(&left, &right))
-                .or_default()
-                .push((left, right));
+    fn insert(&mut self, left: Arc<WireExpr>, right: Arc<WireExpr>) {
+        let fingerprint = Self::fingerprint(&left, &right);
+        if self.current.contains(fingerprint, &left, &right)
+            || self.previous.contains(fingerprint, &left, &right)
+        {
+            return;
+        }
+        let nodes = left.nodes().len().saturating_add(right.nodes().len());
+        if nodes > Self::MAX_GENERATION_NODES {
+            return;
+        }
+        if self.current.nodes.saturating_add(nodes) > Self::MAX_GENERATION_NODES {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        let bucket = self.current.buckets.entry(fingerprint).or_default();
+        if bucket.len() < Self::MAX_BUCKET {
+            bucket.push((left, right));
+            self.current.nodes += nodes;
+        }
+    }
+}
+
+/// Cross-call positive conversion memo for one `InferenceEngine` run.
+///
+/// Records only proven `ConversionMode::Ordinary` equalities together with the
+/// inference step count they required. Every local name in an `InferenceEngine`
+/// run is either an immutable caller local or a monotonically fresh
+/// `_fln_checker_local.<N>` that is never rebound to another value, so a pair
+/// proven convertible once remains convertible throughout that run. Refusals,
+/// deferrals, stops, and faults are never cached, and a hit is taken only when
+/// the remaining inference step budget covers `steps_needed`.
+#[derive(Default)]
+pub(super) struct DomainEqualityCache {
+    current: DomainEqualityTable,
+    previous: DomainEqualityTable,
+}
+#[derive(Default)]
+struct DomainEqualityTable {
+    buckets: crate::whnf::memo::PrehashedMap<Vec<(WireExpr, WireExpr, u64)>>,
+    nodes: usize,
+}
+impl DomainEqualityTable {
+    fn get(&self, fingerprint: u64, left: &WireExpr, right: &WireExpr) -> Option<u64> {
+        self.buckets
+            .get(&fingerprint)?
+            .iter()
+            .find(|(l, r, _)| l == left && r == right)
+            .map(|(_, _, steps)| *steps)
+    }
+}
+impl DomainEqualityCache {
+    const MAX_GENERATION_NODES: usize = 1 << 20;
+    const MAX_BUCKET: usize = 8;
+    pub(super) fn get(&self, fingerprint: u64, left: &WireExpr, right: &WireExpr) -> Option<u64> {
+        self.current
+            .get(fingerprint, left, right)
+            .or_else(|| self.previous.get(fingerprint, left, right))
+    }
+    pub(super) fn insert(
+        &mut self,
+        fingerprint: u64,
+        left: &WireExpr,
+        right: &WireExpr,
+        steps_needed: u64,
+    ) {
+        if self.get(fingerprint, left, right).is_some() {
+            return;
+        }
+        let nodes = left.nodes().len().saturating_add(right.nodes().len());
+        if nodes > Self::MAX_GENERATION_NODES {
+            return;
+        }
+        if self.current.nodes.saturating_add(nodes) > Self::MAX_GENERATION_NODES {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        let bucket = self.current.buckets.entry(fingerprint).or_default();
+        if bucket.len() < Self::MAX_BUCKET {
+            bucket.push((left.clone(), right.clone(), steps_needed));
+            self.current.nodes += nodes;
         }
     }
 }
@@ -520,18 +656,94 @@ impl Probe<'_> {
         let result = whnf_with(term, context.reduction(), budget, &mut || self.poll());
         self.whnf_result(result)
     }
-    /// See [`crate::whnf::whnf_comparand_with`].
-    fn whnf_comparand(
+    /// Core normalization (`DeltaMode::Disabled`, `ClosedPair`) for comparands
+    /// in typed lazy delta. Returns `Ok(Some(None))` when already in `whnf_core`
+    /// (zero allocation), `Ok(Some(Some(term)))` when reduced, and `Ok(None)`
+    /// when WHNF refused the term.
+    fn whnf_comparand_core(
+        &mut self,
+        term: &Term,
+        context: &InferenceContext,
+    ) -> Result<Option<Option<Term>>> {
+        let budget = self.budget.whnf;
+        let result = crate::whnf::whnf_comparand_core_of_with(
+            term.as_whnf_input(),
+            term.root(),
+            context.reduction(),
+            budget,
+            &mut || self.poll(),
+        );
+        self.check_stop()?;
+        match result {
+            crate::whnf::WhnfCoreOutcome::Unchanged { .. } => Ok(Some(None)),
+            crate::whnf::WhnfCoreOutcome::Complete { result, copied } => {
+                Ok(Some(Some(Term::from_whnf(result.term, copied))))
+            }
+            crate::whnf::WhnfCoreOutcome::Refused(_) => Ok(None),
+            crate::whnf::WhnfCoreOutcome::Inconclusive(stop) => Err(Box::new(
+                InferenceOutcome::Inconclusive(InferenceStop::Whnf {
+                    argument: 0,
+                    stop: Box::new(stop),
+                    progress: self.progress(),
+                }),
+            )),
+            crate::whnf::WhnfCoreOutcome::InternalFault(fault) => {
+                Err(self.fault(InferenceFault::Whnf { argument: 0, fault }))
+            }
+        }
+    }
+    /// One lazy delta step (`DeltaMode::Once`, `ClosedPair`) for comparands in
+    /// typed conversion, matching the pin's `lazy_delta_reduction_step` and
+    /// preserving `WhnfInput::Copied` so consecutive steps skip input recopying.
+    fn whnf_comparand_delta_step(
+        &mut self,
+        term: &Term,
+        context: &InferenceContext,
+    ) -> Result<Option<Term>> {
+        let budget = self.budget.whnf;
+        let (result, copied) = crate::whnf::whnf_comparand_delta_step_of_with(
+            term.as_whnf_input(),
+            term.root(),
+            context.reduction(),
+            budget,
+            &mut || self.poll(),
+        );
+        Ok(self
+            .whnf_result(result)?
+            .map(|reduced| Term::from_whnf(reduced, copied)))
+    }
+    /// Reducibility height of `term`'s spine head (stepping through
+    /// applications, metadata, and projections), and whether a projection was
+    /// crossed (matching `defeq::definition_height_through` and the pin's
+    /// `try_unfold_proj_app`).
+    fn definition_height_through(
         &mut self,
         term: &WireExpr,
         context: &InferenceContext,
-    ) -> Result<Option<WireExpr>> {
-        let budget = self.budget.whnf;
-        let result =
-            crate::whnf::whnf_comparand_with(term, context.reduction(), budget, &mut || {
-                self.poll()
-            });
-        self.whnf_result(result)
+    ) -> Result<(Option<u32>, bool)> {
+        let reduction = context.reduction();
+        let mut id = term.root();
+        let mut through_projection = false;
+        loop {
+            self.tick()?;
+            match term.node(id) {
+                Some(ExprNode::Apply { function, .. }) => id = *function,
+                Some(ExprNode::Metadata { expression, .. }) => id = *expression,
+                Some(ExprNode::Projection { expression, .. }) => {
+                    through_projection = true;
+                    id = *expression;
+                }
+                Some(ExprNode::Constant { name, .. }) => {
+                    let height = reduction
+                        .constants()
+                        .find(name)
+                        .and_then(|constant| reduction.delta_body(constant))
+                        .map(|definition| definition.hint().delta_height());
+                    return Ok((height, through_projection));
+                }
+                _ => return Ok((None, through_projection)),
+            }
+        }
     }
     fn whnf_result(&mut self, result: WhnfOutcome) -> Result<Option<WireExpr>> {
         self.check_stop()?;
@@ -560,27 +772,73 @@ impl Probe<'_> {
         if let Some(answer) = self.answers.get(fingerprint, left, right) {
             return Ok(answer);
         }
-        let budget = self.budget.defeq;
-        let result =
-            def_eq_before_typed_with(left, right, context.reduction(), budget, &mut || {
-                self.poll()
-            });
-        self.check_stop()?;
-        let answer = match result {
-            DefEqOutcome::Equal(_) => Some(true),
-            DefEqOutcome::NotEqual { .. } | DefEqOutcome::Refused { .. } => Some(false),
-            DefEqOutcome::Deferred { .. } => None,
-            DefEqOutcome::Inconclusive(stop) => {
-                return Err(Box::new(InferenceOutcome::Inconclusive(
-                    InferenceStop::DefEq {
-                        argument: 0,
-                        stop: Box::new(stop),
-                        progress: self.progress(),
-                    },
-                )));
+        let answer = if has_nat_or_string_head(left) || has_nat_or_string_head(right) {
+            let budget = self.budget.defeq;
+            let result =
+                def_eq_before_typed_with(left, right, context.reduction(), budget, &mut || {
+                    self.poll()
+                });
+            self.check_stop()?;
+            match result {
+                DefEqOutcome::Equal(_) => Some(true),
+                DefEqOutcome::NotEqual { .. } | DefEqOutcome::Refused { .. } => Some(false),
+                DefEqOutcome::Deferred { .. } => None,
+                DefEqOutcome::Inconclusive(stop) => {
+                    return Err(Box::new(InferenceOutcome::Inconclusive(
+                        InferenceStop::DefEq {
+                            argument: 0,
+                            stop: Box::new(stop),
+                            progress: self.progress(),
+                        },
+                    )));
+                }
+                DefEqOutcome::InternalFault(fault) => {
+                    return Err(self.fault(InferenceFault::DefEq { argument: 0, fault }));
+                }
             }
-            DefEqOutcome::InternalFault(fault) => {
-                return Err(self.fault(InferenceFault::DefEq { argument: 0, fault }));
+        } else {
+            // `Probe::run` owns typed lazy delta, congruence, eta, and K-reduction.
+            // Running untyped `run_slow` at every intermediate lazy-delta step
+            // would re-walk the remaining delta chain O(N^2) times without proof
+            // irrelevance. Use quick alpha/metadata/universe equality only; a
+            // literal/sort mismatch is final only at the undecomposed root pair.
+            let result =
+                crate::defeq::quick_def_eq_with(left, right, self.budget.defeq.quick, &mut || {
+                    self.poll()
+                });
+            self.check_stop()?;
+            match result {
+                crate::defeq::QuickDefEqOutcome::Equal(_) => Some(true),
+                crate::defeq::QuickDefEqOutcome::NotEqual { mismatch, .. } => {
+                    let (ml, mr) = match mismatch {
+                        crate::defeq::QuickDefEqMismatch::SortLevels { left, right }
+                        | crate::defeq::QuickDefEqMismatch::NatLiterals { left, right }
+                        | crate::defeq::QuickDefEqMismatch::StringLiterals { left, right } => {
+                            (left, right)
+                        }
+                    };
+                    if ml == left.root().index() && mr == right.root().index() {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                crate::defeq::QuickDefEqOutcome::Deferred { .. } => None,
+                crate::defeq::QuickDefEqOutcome::Inconclusive(stop) => {
+                    return Err(Box::new(InferenceOutcome::Inconclusive(
+                        InferenceStop::DefEq {
+                            argument: 0,
+                            stop: Box::new(DefEqStop::Quick(stop)),
+                            progress: self.progress(),
+                        },
+                    )));
+                }
+                crate::defeq::QuickDefEqOutcome::InternalFault(fault) => {
+                    return Err(self.fault(InferenceFault::DefEq {
+                        argument: 0,
+                        fault: crate::defeq::DefEqFault::Quick(fault),
+                    }));
+                }
             }
         };
         self.answers.insert(fingerprint, left, right, answer);
@@ -1263,34 +1521,32 @@ impl Probe<'_> {
         root_deferred: bool,
     ) -> Result<bool> {
         enum Work {
-            Pair(WireExpr, WireExpr, InferenceContext),
+            Pair(Term, Term, InferenceContext),
             /// A pair whose congruence attempt failed, taking the other rules;
             /// the flag is the root's `root_deferred`.
-            Rules(WireExpr, WireExpr, InferenceContext, bool),
+            Rules(Term, Term, InferenceContext, bool),
+            /// Marker sitting below a pair's sub-obligations (and below any
+            /// `Work::Attempt` for that pair): reaching it records the pair in
+            /// `self.proven` if no unproven `taken` skip occurred beneath it;
+            /// unwinding past it on `fail!()` records it in `self.disproven`.
+            Established(Arc<WireExpr>, Arc<WireExpr>, u64),
             /// Every task above this one is an argument obligation of a
             /// congruence attempt on the pair, so reaching it means they all
             /// held. `trail` is the length of the taken-trail at the attempt.
             Attempt {
-                left: WireExpr,
-                right: WireExpr,
+                left: Term,
+                right: Term,
                 context: InferenceContext,
                 skip_untyped: bool,
                 trail: usize,
             },
-            Binders(
-                WireExpr,
-                WireExpr,
-                ExprId,
-                ExprId,
-                WireExpr,
-                InferenceContext,
-            ),
+            Binders(Term, Term, ExprId, ExprId, WireExpr, InferenceContext),
             /// KR-312: open `lambda`'s body at a fresh local `x : domain` and
             /// compare it with `other x`, keeping the original sides.
             Eta {
-                lambda: WireExpr,
+                lambda: Term,
                 body: ExprId,
-                other: WireExpr,
+                other: Term,
                 domain: WireExpr,
                 lambda_on_left: bool,
                 context: InferenceContext,
@@ -1304,7 +1560,11 @@ impl Probe<'_> {
                 self.unreserved_nested.push((left.clone(), right.clone()));
             }
         }
-        let mut work = vec![Work::Pair(left.clone(), right.clone(), context.clone())];
+        let mut work = vec![Work::Pair(
+            Term::new(left.clone()),
+            Term::new(right.clone()),
+            context.clone(),
+        )];
         let mut skip_untyped = root_deferred;
         // Every task is an obligation of one conjunction: the run succeeds only
         // if each holds, and returns false at the first that does not. A task
@@ -1315,13 +1575,16 @@ impl Probe<'_> {
         // terms means the same thing in every context of one run. Binder and
         // eta tasks are keyed before they open a fresh local, since the pairs
         // they produce then differ in that local's name.
-        let mut taken: crate::whnf::memo::FastHashSet<(Taken, WireExpr, WireExpr)> =
+        let mut taken: crate::whnf::memo::FastHashSet<(Taken, Arc<WireExpr>, Arc<WireExpr>)> =
             crate::whnf::memo::FastHashSet::default();
+        const MAX_TAKEN_NODES: usize = 1 << 21;
+        let mut taken_nodes: usize = 0;
+        let mut taken_skips: u64 = 0;
         // A congruence attempt only proposes obligations: when one fails, the
         // attempt is abandoned and the tasks it took on are not established.
         // `trail` records what was taken while an attempt is open, so that
         // abandoning it can give those tasks back.
-        let mut trail: Vec<(Taken, WireExpr, WireExpr)> = Vec::new();
+        let mut trail: Vec<(Taken, Arc<WireExpr>, Arc<WireExpr>)> = Vec::new();
         let mut attempts = 0_usize;
         'work: while let Some(task) = work.pop() {
             // A task that does not hold fails the innermost open congruence
@@ -1335,7 +1598,11 @@ impl Probe<'_> {
                     else {
                         return Ok(false);
                     };
-                    work.truncate(marker + 1);
+                    for abandoned in work.drain(marker + 1..) {
+                        if let Work::Established(a, b, _) = abandoned {
+                            self.disproven.insert(a, b);
+                        }
+                    }
                     if let Some(Work::Attempt {
                         left,
                         right,
@@ -1346,45 +1613,84 @@ impl Probe<'_> {
                     {
                         attempts -= 1;
                         for entry in trail.drain(mark..) {
-                            taken.remove(&entry);
+                            let entry_nodes =
+                                entry.1.nodes().len().saturating_add(entry.2.nodes().len());
+                            if taken.remove(&entry) {
+                                taken_nodes = taken_nodes.saturating_sub(entry_nodes);
+                            }
                         }
-                        self.incongruent.insert(left.clone(), right.clone());
+                        self.incongruent
+                            .insert(Arc::clone(&left.expr), Arc::clone(&right.expr));
                         work.push(Work::Rules(left, right, context, skip_untyped));
                     }
                     continue 'work;
                 }};
             }
             self.tick()?;
+            if let Work::Pair(ref left, ref right, _) = task {
+                if left.expr == right.expr || self.proven.contains(left, right) {
+                    continue;
+                }
+                if self.disproven.contains(left, right) {
+                    fail!();
+                }
+            }
             let key = match &task {
-                Work::Pair(left, right, _) => Some((Taken::Pair, left, right)),
-                Work::Binders(left, right, ..) => Some((Taken::Binders, left, right)),
+                Work::Pair(left, right, _) => Some((Taken::Pair, &left.expr, &right.expr)),
+                Work::Binders(left, right, ..) => Some((Taken::Binders, &left.expr, &right.expr)),
                 Work::Eta {
                     lambda,
                     other,
                     lambda_on_left,
                     ..
-                } => Some((Taken::Eta(*lambda_on_left), lambda, other)),
-                Work::Rules(..) | Work::Attempt { .. } => None,
+                } => Some((Taken::Eta(*lambda_on_left), &lambda.expr, &other.expr)),
+                Work::Rules(..) | Work::Attempt { .. } | Work::Established(..) => None,
             };
             if let Some((kind, a, b)) = key {
-                let entry = (kind, a.clone(), b.clone());
+                let entry_nodes = a.nodes().len().saturating_add(b.nodes().len());
+                let entry = (kind, Arc::clone(a), Arc::clone(b));
                 if taken.contains(&entry) {
+                    taken_skips = taken_skips.saturating_add(1);
                     continue;
                 }
-                if attempts > 0 {
-                    trail.push(entry.clone());
+                if taken_nodes.saturating_add(entry_nodes) > MAX_TAKEN_NODES && attempts == 0 {
+                    taken.clear();
+                    taken_nodes = 0;
                 }
-                taken.insert(entry);
+                if taken_nodes.saturating_add(entry_nodes) <= MAX_TAKEN_NODES {
+                    if attempts > 0 {
+                        trail.push(entry.clone());
+                    }
+                    taken.insert(entry);
+                    taken_nodes = taken_nodes.saturating_add(entry_nodes);
+                }
             }
             let (left, right, context, try_congruence, skip) = match task {
-                Work::Pair(left, right, context) => (
-                    left,
-                    right,
-                    context,
-                    true,
-                    std::mem::take(&mut skip_untyped),
-                ),
+                Work::Pair(left, right, context) => {
+                    // Record an establishment marker BELOW any `Work::Attempt`
+                    // or sub-obligations for this pair so proven sub-pairs
+                    // survive sibling attempt rollbacks and fully failed pairs
+                    // enter `self.disproven`.
+                    work.push(Work::Established(
+                        Arc::clone(&left.expr),
+                        Arc::clone(&right.expr),
+                        taken_skips,
+                    ));
+                    (
+                        left,
+                        right,
+                        context,
+                        true,
+                        std::mem::take(&mut skip_untyped),
+                    )
+                }
                 Work::Rules(left, right, context, skip) => (left, right, context, false, skip),
+                Work::Established(a, b, start_skips) => {
+                    if taken_skips == start_skips {
+                        self.proven.insert(a, b);
+                    }
+                    continue;
+                }
                 Work::Attempt { .. } => {
                     attempts -= 1;
                     if attempts == 0 {
@@ -1395,8 +1701,8 @@ impl Probe<'_> {
                 Work::Binders(left, right, lb, rb, domain, context) => {
                     let (_, local, context) =
                         self.open_local(Taken::Binders, &left, &right, domain, &context)?;
-                    let left = self.open(&left, lb, &local)?;
-                    let right = self.open(&right, rb, &local)?;
+                    let left = Term::new(self.open(&left, lb, &local)?);
+                    let right = Term::new(self.open(&right, rb, &local)?);
                     work.push(Work::Pair(left, right, context));
                     continue;
                 }
@@ -1415,8 +1721,8 @@ impl Probe<'_> {
                         domain,
                         &context,
                     )?;
-                    let opened = self.open(&lambda, body, &local)?;
-                    let applied = self.apply_to_free(&other, name)?;
+                    let opened = Term::new(self.open(&lambda, body, &local)?);
+                    let applied = Term::new(self.apply_to_free(&other, name)?);
                     let (left, right) = if lambda_on_left {
                         (opened, applied)
                     } else {
@@ -1426,7 +1732,7 @@ impl Probe<'_> {
                     continue;
                 }
             };
-            if left == right {
+            if left.expr == right.expr {
                 continue;
             }
             // KR-301/KR-302: the pin's `quick_is_def_eq` sends matching
@@ -1472,7 +1778,7 @@ impl Probe<'_> {
                     domain.clone(),
                     context.clone(),
                 ));
-                work.push(Work::Pair(domain, other, context));
+                work.push(Work::Pair(Term::new(domain), Term::new(other), context));
                 continue;
             }
             // Congruence first, with each argument pair decided by this lane.
@@ -1493,8 +1799,8 @@ impl Probe<'_> {
                 let mut obligations = Vec::with_capacity(arguments.len());
                 for (left_argument, right_argument) in arguments {
                     obligations.push(Work::Pair(
-                        self.piece(&left, left_argument)?,
-                        self.piece(&right, right_argument)?,
+                        Term::new(self.piece(&left, left_argument)?),
+                        Term::new(self.piece(&right, right_argument)?),
                         context.clone(),
                     ));
                 }
@@ -1524,7 +1830,7 @@ impl Probe<'_> {
             if let Some(lt) = self.proof_type(&left, &context)?
                 && let Some(rt) = self.proof_type(&right, &context)?
             {
-                work.push(Work::Pair(lt, rt, context));
+                work.push(Work::Pair(Term::new(lt), Term::new(rt), context));
                 continue;
             }
             if !skip {
@@ -1535,43 +1841,41 @@ impl Probe<'_> {
                 }
             }
             if let Some((lt, rt)) = self.unit_like_obligation(&left, &right, &context)? {
-                work.push(Work::Pair(lt, rt, context));
+                work.push(Work::Pair(Term::new(lt), Term::new(rt), context));
                 continue;
             }
-            let Some(l) = self.whnf_comparand(&left, &context)? else {
+            let Some(l_core) = self.whnf_comparand_core(&left, &context)? else {
                 fail!()
             };
-            let Some(r) = self.whnf_comparand(&right, &context)? else {
+            let Some(r_core) = self.whnf_comparand_core(&right, &context)? else {
                 fail!()
             };
-            // A changed head may expose ordinary conversion or proof evidence.
-            if l != left || r != right {
-                work.push(Work::Pair(l, r, context));
+            // Core beta/zeta/iota/projection reduction may expose matching
+            // binders, matching heads for typed congruence, or proofs without
+            // eagerly unfolding any regular definition.
+            let l_changed = l_core
+                .as_ref()
+                .is_some_and(|reduced| reduced.expr != left.expr);
+            let r_changed = r_core
+                .as_ref()
+                .is_some_and(|reduced| reduced.expr != right.expr);
+            if l_changed || r_changed {
+                let next_l = l_core.unwrap_or(left);
+                let next_r = r_core.unwrap_or(right);
+                work.push(Work::Pair(next_l, next_r, context));
                 continue;
             }
-            // KR-312 structure eta runs before congruence: after whnf the other
-            // side's head is stuck, so `mk a b ≟ f x` could only fail on heads.
-            for (s, t, s_on_left) in [(&l, &r, true), (&r, &l, false)] {
-                if let Some(obligations) = self.structure_eta(s, t, &context)? {
-                    for (s_part, t_part) in obligations.into_iter().rev() {
-                        let (a, b) = if s_on_left {
-                            (s_part, t_part)
-                        } else {
-                            (t_part, s_part)
-                        };
-                        work.push(Work::Pair(a, b, context.clone()));
-                    }
-                    continue 'work;
-                }
-            }
+            let (l, r) = (left, right);
             // KR-317: a K recursor stuck on a non-constructor major. Like the pin,
             // reduce only once the gate is established, so an unmet gate leaves
-            // the pair to congruence and the other rules instead of failing it.
+            // the pair to lazy delta, structure eta, and congruence instead of
+            // failing it.
             for (s, t, s_on_left) in [(&l, &r, true), (&r, &l, false)] {
                 if let Some(((major_type, constructor_type), reduced)) =
                     self.k_reduction(s, &context)?
                     && self.run(&major_type, &constructor_type, &context, false)?
                 {
+                    let reduced = Term::new(reduced);
                     let (a, b) = if s_on_left {
                         (reduced, t.clone())
                     } else {
@@ -1588,6 +1892,7 @@ impl Probe<'_> {
                     self.nested_k_reduction(s, &context, Reach::Majors)?
                     && self.run(&major_type, &constructor_type, &context, false)?
                 {
+                    let reduced = Term::new(reduced);
                     let (a, b) = if s_on_left {
                         (reduced, t.clone())
                     } else {
@@ -1598,9 +1903,9 @@ impl Probe<'_> {
                 }
             }
             // KR-317 through a projection (see `Reach`): reduce a K recursor
-            // stuck beneath a projection before structural projection congruence,
-            // as the pin's `reduce_proj` normalizes the projected structure with
-            // `to_cnstr_when_K` before comparing projections.
+            // stuck beneath a projection before lazy delta or projection
+            // congruence, as the pin's `reduce_proj` normalizes the projected
+            // structure with `to_cnstr_when_K`.
             for (s, t, s_on_left) in [(&l, &r, true), (&r, &l, false)] {
                 if self.projected_structure(s)?.is_none()
                     || !self.reaches_k_recursor(s, &context)?
@@ -1611,6 +1916,7 @@ impl Probe<'_> {
                     self.nested_k_reduction(s, &context, Reach::MajorsAndProjections)?
                     && self.run(&major_type, &constructor_type, &context, false)?
                 {
+                    let reduced = Term::new(reduced);
                     let (a, b) = if s_on_left {
                         (reduced, t.clone())
                     } else {
@@ -1620,23 +1926,126 @@ impl Probe<'_> {
                     continue 'work;
                 }
             }
+            // Pin-aligned height-ordered lazy delta (`type_checker.cpp:903-1055`):
+            // unfold ONE step at the higher reducibility height (preferring a
+            // projection side over a constant side, as `try_unfold_proj_app`),
+            // returning immediately to the worklist so typed congruence and
+            // proof irrelevance fire at every intermediate combinator layer
+            // instead of eagerly blowing both sides to full delta WHNF.
+            let (mut left_height, left_proj) = self.definition_height_through(&l, &context)?;
+            let (mut right_height, right_proj) = self.definition_height_through(&r, &context)?;
+            let left_delta = left_height.is_some() && !left_proj;
+            let right_delta = right_height.is_some() && !right_proj;
+            if left_delta && !right_delta && right_proj && right_height.is_some() {
+                let Some(reduced) = self.whnf_comparand_delta_step(&r, &context)? else {
+                    fail!()
+                };
+                if reduced.expr != r.expr {
+                    work.push(Work::Pair(l, reduced, context));
+                    continue 'work;
+                }
+                right_height = None;
+            } else if !left_delta && right_delta && left_proj && left_height.is_some() {
+                let Some(reduced) = self.whnf_comparand_delta_step(&l, &context)? else {
+                    fail!()
+                };
+                if reduced.expr != l.expr {
+                    work.push(Work::Pair(reduced, r, context));
+                    continue 'work;
+                }
+                left_height = None;
+            }
+            let (unfold_left, unfold_right) = match (left_height, right_height) {
+                (Some(lh), Some(rh)) => (lh >= rh, rh >= lh),
+                (Some(_), None) => (true, false),
+                (None, Some(_)) => (false, true),
+                (None, None) => (false, false),
+            };
+            if unfold_left || unfold_right {
+                let mut next_l = if unfold_left {
+                    let Some(reduced) = self.whnf_comparand_delta_step(&l, &context)? else {
+                        fail!()
+                    };
+                    reduced
+                } else {
+                    l.clone()
+                };
+                let mut next_r = if unfold_right {
+                    let Some(reduced) = self.whnf_comparand_delta_step(&r, &context)? else {
+                        fail!()
+                    };
+                    reduced
+                } else {
+                    r.clone()
+                };
+                if next_l.expr == l.expr && !unfold_right && right_height.is_some() {
+                    let Some(reduced) = self.whnf_comparand_delta_step(&r, &context)? else {
+                        fail!()
+                    };
+                    next_r = reduced;
+                } else if next_r.expr == r.expr && !unfold_left && left_height.is_some() {
+                    let Some(reduced) = self.whnf_comparand_delta_step(&l, &context)? else {
+                        fail!()
+                    };
+                    next_l = reduced;
+                }
+                if next_l.expr != l.expr || next_r.expr != r.expr {
+                    work.push(Work::Pair(next_l, next_r, context));
+                    continue 'work;
+                }
+            }
+            // KR-312 structure eta runs once neither side can delta-unfold
+            // further (pin `type_checker.cpp:1049`): a constructor application
+            // against a stuck term compares types and fields against projections.
+            for (s, t, s_on_left) in [(&l, &r, true), (&r, &l, false)] {
+                if let Some(obligations) = self.structure_eta(s, t, &context)? {
+                    for (s_part, t_part) in obligations.into_iter().rev() {
+                        let (a, b) = if s_on_left {
+                            (Term::new(s_part), Term::new(t_part))
+                        } else {
+                            (Term::new(t_part), Term::new(s_part))
+                        };
+                        work.push(Work::Pair(a, b, context.clone()));
+                    }
+                    continue 'work;
+                }
+            }
             match (l.node(l.root()), r.node(r.root())) {
-                (
-                    Some(ExprNode::Apply {
-                        function: lf,
-                        argument: la,
-                    }),
-                    Some(ExprNode::Apply {
-                        function: rf,
-                        argument: ra,
-                    }),
-                ) => {
-                    let lf = self.piece(&l, *lf)?;
-                    let rf = self.piece(&r, *rf)?;
-                    let la = self.piece(&l, *la)?;
-                    let ra = self.piece(&r, *ra)?;
-                    work.push(Work::Pair(la, ra, context.clone()));
-                    work.push(Work::Pair(lf, rf, context));
+                (Some(ExprNode::Apply { .. }), Some(ExprNode::Apply { .. })) => {
+                    // Peel all matching outer Apply layers in one shot to avoid
+                    // O(n^2) prefix WireExpr materializations and `taken` clones.
+                    let mut l_cursor = l.root();
+                    let mut r_cursor = r.root();
+                    let mut arg_pairs = Vec::new();
+                    while let (
+                        Some(ExprNode::Apply {
+                            function: lf,
+                            argument: la,
+                        }),
+                        Some(ExprNode::Apply {
+                            function: rf,
+                            argument: ra,
+                        }),
+                    ) = (l.node(l_cursor), r.node(r_cursor))
+                    {
+                        self.tick()?;
+                        arg_pairs.push((*la, *ra));
+                        l_cursor = *lf;
+                        r_cursor = *rf;
+                    }
+                    // `arg_pairs` was collected outermost-first; reverse so we
+                    // push arguments in forward order (0..m), causing the LIFO
+                    // stack to check the heads first, then trailing arguments
+                    // before leading typeclass instances.
+                    arg_pairs.reverse();
+                    let l_head = Term::new(self.piece(&l, l_cursor)?);
+                    let r_head = Term::new(self.piece(&r, r_cursor)?);
+                    for (la, ra) in arg_pairs {
+                        let la = Term::new(self.piece(&l, la)?);
+                        let ra = Term::new(self.piece(&r, ra)?);
+                        work.push(Work::Pair(la, ra, context.clone()));
+                    }
+                    work.push(Work::Pair(l_head, r_head, context));
                 }
                 (
                     Some(ExprNode::Projection {
@@ -1650,16 +2059,16 @@ impl Probe<'_> {
                         expression: re,
                     }),
                 ) if ls == rs && li == ri => {
-                    let le = self.piece(&l, *le)?;
-                    let re = self.piece(&r, *re)?;
+                    let le = Term::new(self.piece(&l, *le)?);
+                    let re = Term::new(self.piece(&r, *re)?);
                     work.push(Work::Pair(le, re, context));
                 }
                 (Some(ExprNode::Metadata { expression: le, .. }), _) => {
-                    let le = self.piece(&l, *le)?;
+                    let le = Term::new(self.piece(&l, *le)?);
                     work.push(Work::Pair(le, r, context));
                 }
                 (_, Some(ExprNode::Metadata { expression: re, .. })) => {
-                    let re = self.piece(&r, *re)?;
+                    let re = Term::new(self.piece(&r, *re)?);
                     work.push(Work::Pair(l, re, context));
                 }
                 // KR-312, the pin's `try_eta_expansion_core` (type_checker.cpp:797):
@@ -1684,7 +2093,11 @@ impl Probe<'_> {
                         lambda_on_left: true,
                         context: context.clone(),
                     });
-                    work.push(Work::Pair(domain, other_domain, context));
+                    work.push(Work::Pair(
+                        Term::new(domain),
+                        Term::new(other_domain),
+                        context,
+                    ));
                 }
                 (
                     _,
@@ -1705,7 +2118,11 @@ impl Probe<'_> {
                         lambda_on_left: false,
                         context: context.clone(),
                     });
-                    work.push(Work::Pair(other_domain, domain, context));
+                    work.push(Work::Pair(
+                        Term::new(other_domain),
+                        Term::new(domain),
+                        context,
+                    ));
                 }
                 _ => fail!(),
             }
@@ -1823,6 +2240,23 @@ fn head_constant(term: &WireExpr) -> Option<&WireName> {
     }
 }
 
+/// Whether `term` has a Nat/String literal or `Nat.*` head where untyped
+/// `defeq`'s specialized numeric/string rules should run with the full budget.
+fn has_nat_or_string_head(term: &WireExpr) -> bool {
+    let mut id = term.root();
+    loop {
+        match term.node(id) {
+            Some(ExprNode::Apply { function, .. }) => id = *function,
+            Some(ExprNode::Metadata { expression, .. }) => id = *expression,
+            Some(ExprNode::NatLiteral { .. } | ExprNode::StringLiteral(_)) => return true,
+            Some(ExprNode::Constant { name, .. }) => {
+                return matches!(name.parts().first(), Some(NamePart::Text(root)) if root == "Nat");
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// The typed lane for a pair untyped conversion has just DEFERRED, under an
 /// equivalent context: both callers reach it only on that outcome, so the root's
 /// untyped query is not repeated.
@@ -1847,6 +2281,8 @@ pub(crate) fn proof_conversion_with(
         unreserved_nested: Vec::new(),
         next: 0,
         incongruent: PairSet::default(),
+        proven: PairSet::default(),
+        disproven: PairSet::default(),
         answers: PairAnswers::default(),
         inferred: InferredTypes::default(),
         opened: OpenedLocals::default(),
@@ -2041,6 +2477,361 @@ mod tests {
                 ProofConversionOutcome::Complete { equal: false, .. }
             ),
             "let-value free-name collision would capture the binder local after zeta: {via_let:?}"
+        );
+    }
+
+    #[test]
+    fn domain_equality_cache_separates_pairs_and_records_steps_needed() {
+        let mut cache = DomainEqualityCache::default();
+        let (a, b, c) = (constant("a"), constant("b"), constant("c"));
+        let fp = PairSet::fingerprint(&a, &b);
+        assert_eq!(cache.get(fp, &a, &b), None);
+        cache.insert(fp, &a, &b, 42);
+        assert_eq!(cache.get(fp, &a, &b), Some(42));
+        assert_eq!(cache.get(PairSet::fingerprint(&b, &a), &b, &a), None);
+        assert_eq!(cache.get(fp, &a, &c), None);
+    }
+
+    #[test]
+    fn quick_subterm_literal_mismatch_does_not_reject_reducible_application() {
+        use crate::environment::{
+            ConstantDeclaration, ConstantEntry, ConstantKind, ConstantSafety, DefinitionBody,
+            DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
+        };
+        let name = |s: &str| WireName::from_parts(vec![NamePart::Text(s.into())]);
+        let sort_type = WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: crate::wire::LevelId::from_index(1).expect("level 1"),
+            }],
+            vec![
+                crate::wire::LevelNode::Zero,
+                crate::wire::LevelNode::Succ(crate::wire::LevelId::ZERO),
+            ],
+            ExprId::ZERO,
+        );
+        let nat_to_nat = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("Nat"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Forall {
+                    binder_name: name("n"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::ZERO,
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(1).expect("forall"),
+        );
+        let ignore_body = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("Nat"),
+                    levels: Vec::new(),
+                },
+                ExprNode::NatLiteral {
+                    limbs_le: Vec::new(),
+                },
+                ExprNode::Lambda {
+                    binder_name: name("n"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(1).expect("zero"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(2).expect("lambda"),
+        );
+        let entries = vec![
+            ConstantEntry::new(
+                name("Nat"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    sort_type,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("ignore"),
+                ConstantDeclaration::definition(
+                    Vec::new(),
+                    nat_to_nat,
+                    ConstantSafety::Safe,
+                    DefinitionBody::new(
+                        ignore_body,
+                        ReducibilityHint::Regular(1),
+                        DefinitionSafety::Safe,
+                        Vec::new(),
+                    ),
+                ),
+            ),
+        ];
+        let constants = match crate::environment::ConstantEnvironment::build(
+            entries,
+            EnvironmentBudget::unlimited(),
+        ) {
+            EnvironmentOutcome::Complete { environment, .. } => environment,
+            other => panic!("environment must build: {other:?}"),
+        };
+        let context = InferenceContext::empty(constants);
+        let app_lit = |v: u64| {
+            WireExpr::from_parts(
+                vec![
+                    ExprNode::Constant {
+                        name: name("ignore"),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::NatLiteral { limbs_le: vec![v] },
+                    ExprNode::Apply {
+                        function: ExprId::ZERO,
+                        argument: ExprId::from_index(1).expect("lit"),
+                    },
+                ],
+                Vec::new(),
+                ExprId::from_index(2).expect("apply"),
+            )
+        };
+        // `ignore 1 ≟ ignore 2`: quick conversion sees a subterm NatLiteral
+        // mismatch beneath `ignore`, which must defer (not falsely reject) so
+        // lazy delta unfolds `ignore` to `0 ≟ 0`.
+        let outcome = proof_conversion_with(
+            &app_lit(1),
+            &app_lit(2),
+            &context,
+            InferenceMode::InferOnly,
+            InferenceBudget::unlimited(),
+            &mut || false,
+        );
+        assert!(
+            matches!(
+                outcome,
+                ProofConversionOutcome::Complete { equal: true, .. }
+            ),
+            "subterm literal mismatch under reducible head must not falsely reject: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn typed_lazy_delta_matches_shared_head_before_unfolding_it() {
+        use crate::environment::{
+            ConstantDeclaration, ConstantEntry, ConstantKind, ConstantSafety, DefinitionBody,
+            DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
+        };
+        let name = |s: &str| WireName::from_parts(vec![NamePart::Text(s.into())]);
+        let sort_prop = WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: crate::wire::LevelId::ZERO,
+            }],
+            vec![crate::wire::LevelNode::Zero],
+            ExprId::ZERO,
+        );
+        let sort_type = WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: crate::wire::LevelId::from_index(1).expect("level 1"),
+            }],
+            vec![
+                crate::wire::LevelNode::Zero,
+                crate::wire::LevelNode::Succ(crate::wire::LevelId::ZERO),
+            ],
+            ExprId::ZERO,
+        );
+        // `P : Prop`, `p1 p2 : P`, `T : Type`, `t0 : T`.
+        // `shared : P -> T := fun _ => t0` (Regular height 1).
+        // `wrap : P -> T := fun h => shared h` (Regular height 2).
+        // Comparing `wrap p1` vs `shared p2`: lazy delta unfolds `wrap` (height 2)
+        // to `shared p1`, matches shared head `shared` (height 1), and settles
+        // `p1 ≟ p2` by proof irrelevance without unfolding `shared`.
+        let p_const = constant("P");
+        let t_const = constant("T");
+        let p_to_t = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("P"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("T"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Forall {
+                    binder_name: name("h"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(1).expect("body"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(2).expect("root"),
+        );
+        let shared_body = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("P"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("T"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("t0"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Lambda {
+                    binder_name: name("h"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(2).expect("t0"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(3).expect("root"),
+        );
+        let wrap_body = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("P"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("shared"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Bound { index: 0 },
+                ExprNode::Apply {
+                    function: ExprId::from_index(1).expect("shared"),
+                    argument: ExprId::from_index(2).expect("bvar"),
+                },
+                ExprNode::Lambda {
+                    binder_name: name("h"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(3).expect("apply"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(4).expect("root"),
+        );
+        let entries = vec![
+            ConstantEntry::new(
+                name("P"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    sort_prop,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("p1"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    p_const.clone(),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("p2"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    p_const,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("T"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    sort_type,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("t0"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    t_const,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("shared"),
+                ConstantDeclaration::definition(
+                    Vec::new(),
+                    p_to_t.clone(),
+                    ConstantSafety::Safe,
+                    DefinitionBody::new(
+                        shared_body,
+                        ReducibilityHint::Regular(1),
+                        DefinitionSafety::Safe,
+                        Vec::new(),
+                    ),
+                ),
+            ),
+            ConstantEntry::new(
+                name("wrap"),
+                ConstantDeclaration::definition(
+                    Vec::new(),
+                    p_to_t,
+                    ConstantSafety::Safe,
+                    DefinitionBody::new(
+                        wrap_body,
+                        ReducibilityHint::Regular(2),
+                        DefinitionSafety::Safe,
+                        Vec::new(),
+                    ),
+                ),
+            ),
+        ];
+        let constants = match crate::environment::ConstantEnvironment::build(
+            entries,
+            EnvironmentBudget::unlimited(),
+        ) {
+            EnvironmentOutcome::Complete { environment, .. } => environment,
+            other => panic!("environment must build: {other:?}"),
+        };
+        let context = InferenceContext::empty(constants);
+        let apply = |f: &str, a: &str| {
+            WireExpr::from_parts(
+                vec![
+                    ExprNode::Constant {
+                        name: name(f),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Constant {
+                        name: name(a),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Apply {
+                        function: ExprId::ZERO,
+                        argument: ExprId::from_index(1).expect("arg"),
+                    },
+                ],
+                Vec::new(),
+                ExprId::from_index(2).expect("apply"),
+            )
+        };
+        let outcome = proof_conversion_with(
+            &apply("wrap", "p1"),
+            &apply("shared", "p2"),
+            &context,
+            InferenceMode::InferOnly,
+            InferenceBudget::unlimited(),
+            &mut || false,
+        );
+        assert!(
+            matches!(
+                outcome,
+                ProofConversionOutcome::Complete { equal: true, .. }
+            ),
+            "height-ordered lazy delta must unfold wrap to shared and prove p1 ≟ p2: {outcome:?}"
         );
     }
 }

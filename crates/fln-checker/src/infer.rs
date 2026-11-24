@@ -2394,6 +2394,10 @@ struct InferenceEngine<'a> {
     /// run, and it is dispatched only inside the scope of the locals it names:
     /// a subterm shared in the input is inferred once, not once per occurrence.
     inferred_types: crate::whnf::memo::FastHashMap<TermReference, WireExpr>,
+    /// Bounded positive conversion memo across `compare_domain` / `compare_let_value`
+    /// queries of this run (eliminates repeated proof-conversion work on shared
+    /// instance diamonds).
+    domain_conversions: proof_conversion::DomainEqualityCache,
 }
 
 enum TelescopeSchedule {
@@ -2968,6 +2972,19 @@ impl<'a> InferenceEngine<'a> {
             .step(self.cancelled, InferencePhase::LetValueComparison, binder)
             .map_err(LeafHalt::stop)?;
         self.control.progress.defeq_queries = self.control.progress.defeq_queries.saturating_add(1);
+        let cache_fp = proof_conversion::PairSet::fingerprint(actual, declared);
+        let remaining_steps = self
+            .control
+            .budget
+            .max_steps
+            .saturating_sub(self.control.progress.steps);
+        if self
+            .domain_conversions
+            .get(cache_fp, actual, declared)
+            .is_some_and(|needed| remaining_steps >= needed)
+        {
+            return Ok(());
+        }
         match def_eq_before_typed_with(
             actual,
             declared,
@@ -2975,7 +2992,11 @@ impl<'a> InferenceEngine<'a> {
             self.control.budget.defeq,
             &mut *self.cancelled,
         ) {
-            DefEqOutcome::Equal(_) => Ok(()),
+            DefEqOutcome::Equal(_) => {
+                self.domain_conversions
+                    .insert(cache_fp, actual, declared, 0);
+                Ok(())
+            }
             DefEqOutcome::NotEqual { mismatch, .. } => {
                 Err(LeafHalt::Refused(InferenceRefusal::LetValueTypeMismatch {
                     binder,
@@ -2983,7 +3004,11 @@ impl<'a> InferenceEngine<'a> {
                 }))
             }
             DefEqOutcome::Deferred { need, .. } => {
+                let steps_before = self.control.progress.steps;
                 if self.proof_conversion(actual, declared)? {
+                    let steps_needed = self.control.progress.steps.saturating_sub(steps_before);
+                    self.domain_conversions
+                        .insert(cache_fp, actual, declared, steps_needed);
                     return Ok(());
                 }
                 Err(LeafHalt::Deferred(InferenceDeferred::LetValueConversion {
@@ -4117,6 +4142,24 @@ impl<'a> InferenceEngine<'a> {
             .step(self.cancelled, InferencePhase::DomainComparison, argument)
             .map_err(LeafHalt::stop)?;
         self.control.progress.defeq_queries = self.control.progress.defeq_queries.saturating_add(1);
+        let cache_fp = if conversion == ConversionMode::Ordinary {
+            let fp = proof_conversion::PairSet::fingerprint(actual, expected);
+            let remaining_steps = self
+                .control
+                .budget
+                .max_steps
+                .saturating_sub(self.control.progress.steps);
+            if self
+                .domain_conversions
+                .get(fp, actual, expected)
+                .is_some_and(|needed| remaining_steps >= needed)
+            {
+                return Ok(());
+            }
+            Some(fp)
+        } else {
+            None
+        };
         let outcome = match conversion {
             ConversionMode::Ordinary => def_eq_before_typed_with(
                 actual,
@@ -4134,7 +4177,12 @@ impl<'a> InferenceEngine<'a> {
             ),
         };
         match outcome {
-            DefEqOutcome::Equal(_) => Ok(()),
+            DefEqOutcome::Equal(_) => {
+                if let Some(fp) = cache_fp {
+                    self.domain_conversions.insert(fp, actual, expected, 0);
+                }
+                Ok(())
+            }
             DefEqOutcome::NotEqual { mismatch, .. } => Err(LeafHalt::Refused(
                 InferenceRefusal::ApplicationTypeMismatch { argument, mismatch },
             )),
@@ -4146,10 +4194,17 @@ impl<'a> InferenceEngine<'a> {
                         expected.nodes()
                     );
                 }
-                if conversion == ConversionMode::Ordinary
-                    && self.proof_conversion(actual, expected)?
-                {
-                    return Ok(());
+                if conversion == ConversionMode::Ordinary {
+                    let steps_before = self.control.progress.steps;
+                    if self.proof_conversion(actual, expected)? {
+                        if let Some(fp) = cache_fp {
+                            let steps_needed =
+                                self.control.progress.steps.saturating_sub(steps_before);
+                            self.domain_conversions
+                                .insert(fp, actual, expected, steps_needed);
+                        }
+                        return Ok(());
+                    }
                 }
                 Err(LeafHalt::Deferred(
                     InferenceDeferred::ApplicationConversion { argument, need },
@@ -4440,6 +4495,7 @@ fn infer_policy(
         continuations: Vec::new(),
         arena_facts: crate::whnf::memo::FastHashMap::default(),
         inferred_types: crate::whnf::memo::FastHashMap::default(),
+        domain_conversions: proof_conversion::DomainEqualityCache::default(),
     }
     .run();
     finish(result, control.progress)

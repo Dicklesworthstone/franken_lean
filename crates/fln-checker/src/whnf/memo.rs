@@ -70,6 +70,7 @@ pub(crate) type FastHashSet<K> = HashSet<K, BuildHasherDefault<Fingerprinter>>;
 struct Entry {
     input: Arc<WireExpr>,
     delta_mode: DeltaMode,
+    head_nat: NatReductionScope,
     materialization: TermBudget,
     /// The let-bound locals in scope when `result` was computed.
     bindings: Vec<FreeBinding>,
@@ -84,10 +85,12 @@ impl Entry {
         &self,
         input: &WireExpr,
         delta_mode: DeltaMode,
+        head_nat: NatReductionScope,
         materialization: TermBudget,
         bindings: &[FreeBinding],
     ) -> bool {
         self.delta_mode == delta_mode
+            && self.head_nat == head_nat
             && self.materialization == materialization
             && same_bindings(&self.bindings, bindings)
             && *self.input == *input
@@ -109,17 +112,19 @@ fn admits(
     bucket: &[Entry],
     input: &WireExpr,
     delta_mode: DeltaMode,
+    head_nat: NatReductionScope,
     materialization: TermBudget,
     bindings: &[FreeBinding],
 ) -> bool {
     bucket.len() < MAX_BUCKET_ENTRIES
         && !bucket
             .iter()
-            .any(|entry| entry.matches(input, delta_mode, materialization, bindings))
+            .any(|entry| entry.matches(input, delta_mode, head_nat, materialization, bindings))
 }
 
-/// Past either bound the memo stops growing; lookups continue. A memo lives as
-/// long as its context, one declaration's check, so both bound its memory.
+/// Per-generation bounds: when the current generation reaches either bound it
+/// rotates into `previous` and the old `previous` is dropped, keeping memory
+/// bounded while keeping the active working set hot on large declarations.
 const MAX_ENTRIES: usize = 1 << 16;
 const MAX_STORED_NODES: usize = 1 << 20;
 /// A full bucket takes no more entries, so no input, however it collides, makes
@@ -146,11 +151,80 @@ struct Table {
     stored_nodes: usize,
 }
 
+#[derive(Default)]
+struct MemoTables {
+    current: Table,
+    previous: Table,
+}
+
+#[derive(Clone, Copy)]
+struct LookupKey<'a> {
+    fp: u64,
+    input: &'a WireExpr,
+    delta_mode: DeltaMode,
+    head_nat: NatReductionScope,
+    bindings: &'a [FreeBinding],
+}
+
+impl Table {
+    fn recall(&self, key: LookupKey<'_>, budget: &WhnfBudget) -> Option<(WhnfResult, bool)> {
+        self.buckets
+            .get(&key.fp)?
+            .iter()
+            .find(|entry| {
+                entry.matches(
+                    key.input,
+                    key.delta_mode,
+                    key.head_nat,
+                    budget.materialization,
+                    key.bindings,
+                )
+            })
+            .filter(|entry| covers(budget, &entry.result))
+            .map(|entry| (entry.result.clone(), entry.copied))
+    }
+
+    fn recall_eager_nat(
+        &self,
+        key: LookupKey<'_>,
+        budget: &WhnfBudget,
+        numeric_budget: NatBudget,
+    ) -> Option<(WhnfResult, WhnfNatProgress, bool)> {
+        self.buckets
+            .get(&key.fp)?
+            .iter()
+            .find(|entry| {
+                entry.matches(
+                    key.input,
+                    key.delta_mode,
+                    key.head_nat,
+                    budget.materialization,
+                    key.bindings,
+                )
+            })
+            .filter(|entry| {
+                covers(budget, &entry.result)
+                    && entry.nat_progress.steps <= numeric_budget.max_steps
+                    && entry.nat_progress.materialized_limbs
+                        <= numeric_budget.max_materialized_limbs
+            })
+            .map(|entry| (entry.result.clone(), entry.nat_progress, entry.copied))
+    }
+
+    fn recall_k_gate(&self, fp: u64, domain: &WireExpr, result: &WireExpr) -> Option<bool> {
+        self.k_gate
+            .get(&fp)?
+            .iter()
+            .find(|entry| *entry.domain == *domain && *entry.result == *result)
+            .map(|entry| entry.equal)
+    }
+}
+
 /// Shared by a context and its clones. It carries no meaning of its own: two
 /// contexts that are otherwise equal reduce alike whatever their memos hold, so
 /// every memo compares equal.
 #[derive(Clone, Default)]
-pub(super) struct WhnfMemo(Arc<Mutex<Table>>);
+pub(super) struct WhnfMemo(Arc<Mutex<MemoTables>>);
 
 impl PartialEq for WhnfMemo {
     fn eq(&self, _: &WhnfMemo) -> bool {
@@ -222,12 +296,14 @@ impl Hasher for Fingerprinter {
 fn fingerprint(
     input: &WireExpr,
     delta_mode: DeltaMode,
+    head_nat: NatReductionScope,
     materialization: TermBudget,
     bindings: &[FreeBinding],
 ) -> u64 {
     let mut hasher = Fingerprinter::default();
     input.hash(&mut hasher);
     delta_mode.hash(&mut hasher);
+    head_nat.hash(&mut hasher);
     materialization.hash(&mut hasher);
     for binding in bindings {
         binding.name.hash(&mut hasher);
@@ -258,50 +334,61 @@ impl WhnfMemo {
         &self,
         input: &WireExpr,
         delta_mode: DeltaMode,
+        head_nat: NatReductionScope,
         budget: &WhnfBudget,
         bindings: &[FreeBinding],
     ) -> Option<(WhnfResult, bool)> {
-        let table = self.0.lock().ok()?;
-        table
-            .buckets
-            .get(&fingerprint(
+        let tables = self.0.lock().ok()?;
+        let key = LookupKey {
+            fp: fingerprint(
                 input,
                 delta_mode,
+                head_nat,
                 budget.materialization,
                 bindings,
-            ))?
-            .iter()
-            .find(|entry| entry.matches(input, delta_mode, budget.materialization, bindings))
-            .filter(|entry| covers(budget, &entry.result))
-            .map(|entry| (entry.result.clone(), entry.copied))
+            ),
+            input,
+            delta_mode,
+            head_nat,
+            bindings,
+        };
+        tables
+            .current
+            .recall(key, budget)
+            .or_else(|| tables.previous.recall(key, budget))
     }
 
     pub(super) fn recall_eager_nat(
         &self,
         input: &WireExpr,
         delta_mode: DeltaMode,
+        head_nat: NatReductionScope,
         budget: &WhnfBudget,
         numeric_budget: NatBudget,
         bindings: &[FreeBinding],
     ) -> Option<(WhnfResult, WhnfNatProgress, bool)> {
-        let table = self.0.lock().ok()?;
-        table
-            .buckets
-            .get(&fingerprint(
+        let tables = self.0.lock().ok()?;
+        let key = LookupKey {
+            fp: fingerprint(
                 input,
                 delta_mode,
+                head_nat,
                 budget.materialization,
                 bindings,
-            ))?
-            .iter()
-            .find(|entry| entry.matches(input, delta_mode, budget.materialization, bindings))
-            .filter(|entry| {
-                covers(budget, &entry.result)
-                    && entry.nat_progress.steps <= numeric_budget.max_steps
-                    && entry.nat_progress.materialized_limbs
-                        <= numeric_budget.max_materialized_limbs
+            ),
+            input,
+            delta_mode,
+            head_nat,
+            bindings,
+        };
+        tables
+            .current
+            .recall_eager_nat(key, budget, numeric_budget)
+            .or_else(|| {
+                tables
+                    .previous
+                    .recall_eager_nat(key, budget, numeric_budget)
             })
-            .map(|entry| (entry.result.clone(), entry.nat_progress, entry.copied))
     }
 
     /// Record a complete result. Results that reduced nothing are not worth a
@@ -310,6 +397,7 @@ impl WhnfMemo {
         &self,
         input: Arc<WireExpr>,
         delta_mode: DeltaMode,
+        head_nat: NatReductionScope,
         materialization: TermBudget,
         bindings: &[FreeBinding],
         value: RememberedWhnf<'_>,
@@ -317,36 +405,45 @@ impl WhnfMemo {
         if value.result.reductions == 0 && value.result.delta_reductions == 0 {
             return;
         }
-        let Ok(mut table) = self.0.lock() else {
-            return;
-        };
         let nodes = input
             .nodes()
             .len()
             .saturating_add(value.result.term.nodes().len());
-        if table.entries >= MAX_ENTRIES
-            || table.stored_nodes.saturating_add(nodes) > MAX_STORED_NODES
-        {
+        if nodes > MAX_STORED_NODES {
             return;
         }
-        let bucket = table
-            .buckets
-            .entry(fingerprint(&input, delta_mode, materialization, bindings))
-            .or_default();
-        if !admits(bucket, &input, delta_mode, materialization, bindings) {
+        let Ok(mut tables) = self.0.lock() else {
+            return;
+        };
+        if tables.current.entries >= MAX_ENTRIES
+            || tables.current.stored_nodes.saturating_add(nodes) > MAX_STORED_NODES
+        {
+            tables.previous = std::mem::take(&mut tables.current);
+        }
+        let fp = fingerprint(&input, delta_mode, head_nat, materialization, bindings);
+        let bucket = tables.current.buckets.entry(fp).or_default();
+        if !admits(
+            bucket,
+            &input,
+            delta_mode,
+            head_nat,
+            materialization,
+            bindings,
+        ) {
             return;
         }
         bucket.push(Entry {
             input,
             delta_mode,
+            head_nat,
             materialization,
             bindings: bindings.to_vec(),
             result: value.result.clone(),
             nat_progress: value.nat_progress,
             copied: value.copied,
         });
-        table.entries += 1;
-        table.stored_nodes = table.stored_nodes.saturating_add(nodes);
+        tables.current.entries += 1;
+        tables.current.stored_nodes = tables.current.stored_nodes.saturating_add(nodes);
     }
 }
 
@@ -357,13 +454,12 @@ impl WhnfMemo {
     /// the context: recording it changes no answer and saves the conversion. In
     /// Cpop, 240 gate misses were 32 distinct pairs.
     pub(super) fn recall_k_gate(&self, domain: &WireExpr, result: &WireExpr) -> Option<bool> {
-        let table = self.0.lock().ok()?;
-        table
-            .k_gate
-            .get(&pair_fingerprint(domain, result))?
-            .iter()
-            .find(|entry| *entry.domain == *domain && *entry.result == *result)
-            .map(|entry| entry.equal)
+        let tables = self.0.lock().ok()?;
+        let fp = pair_fingerprint(domain, result);
+        tables
+            .current
+            .recall_k_gate(fp, domain, result)
+            .or_else(|| tables.previous.recall_k_gate(fp, domain, result))
     }
 
     /// Record a gate outcome. Never called for a cancelled or faulted
@@ -374,16 +470,20 @@ impl WhnfMemo {
         result: Arc<WireExpr>,
         equal: bool,
     ) {
-        let Ok(mut table) = self.0.lock() else {
-            return;
-        };
         let nodes = domain.nodes().len().saturating_add(result.nodes().len());
-        if table.entries >= MAX_ENTRIES
-            || table.stored_nodes.saturating_add(nodes) > MAX_STORED_NODES
-        {
+        if nodes > MAX_STORED_NODES {
             return;
         }
-        let bucket = table
+        let Ok(mut tables) = self.0.lock() else {
+            return;
+        };
+        if tables.current.entries >= MAX_ENTRIES
+            || tables.current.stored_nodes.saturating_add(nodes) > MAX_STORED_NODES
+        {
+            tables.previous = std::mem::take(&mut tables.current);
+        }
+        let bucket = tables
+            .current
             .k_gate
             .entry(pair_fingerprint(&domain, &result))
             .or_default();
@@ -399,8 +499,8 @@ impl WhnfMemo {
             result,
             equal,
         });
-        table.entries += 1;
-        table.stored_nodes = table.stored_nodes.saturating_add(nodes);
+        tables.current.entries += 1;
+        tables.current.stored_nodes = tables.current.stored_nodes.saturating_add(nodes);
     }
 }
 
@@ -529,6 +629,7 @@ mod tests {
         let entry = |index: usize| Entry {
             input: Arc::new(constant(&format!("c{index}"))),
             delta_mode: DeltaMode::Eager,
+            head_nat: NatReductionScope::WhnfHead,
             materialization: TermBudget::unlimited(),
             bindings: Vec::new(),
             result: WhnfResult {
@@ -547,6 +648,7 @@ mod tests {
                 bucket,
                 &constant("fresh"),
                 DeltaMode::Eager,
+                NatReductionScope::WhnfHead,
                 TermBudget::unlimited(),
                 &[],
             )
@@ -561,6 +663,7 @@ mod tests {
                 &bucket,
                 &constant("c1"),
                 DeltaMode::Eager,
+                NatReductionScope::WhnfHead,
                 TermBudget::unlimited(),
                 &[],
             ),
@@ -596,7 +699,8 @@ mod tests {
     }
 
     fn remembered(context: &WhnfContext) -> usize {
-        context.memo.0.lock().expect("the memo lock").entries
+        let tables = context.memo.0.lock().expect("the memo lock");
+        tables.current.entries + tables.previous.entries
     }
 
     /// Under a let-bound local the memo is used: the result is recorded with
