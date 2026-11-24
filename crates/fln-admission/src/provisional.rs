@@ -292,64 +292,60 @@ pub fn compute_root_dominators(
     first_blocker: &[Option<usize>],
 ) -> (BTreeMap<usize, usize>, BTreeMap<usize, usize>) {
     let count = order.len();
-    let mut dom: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); count];
-    let mut is_root = vec![false; count];
+    let mut sole_root = vec![None; count];
+    let mut unlock_value = BTreeMap::new();
+    let mut first_blocker_count = BTreeMap::new();
     for &index in order {
         if is_accepted[index] {
             continue;
         }
         if !is_blocked[index] {
-            is_root[index] = true;
-            dom[index].insert(index);
+            sole_root[index] = Some(index);
+            unlock_value.insert(index, 0);
+            first_blocker_count.insert(index, 0);
             continue;
         }
-        let mut non_accepted_preds = dependencies[index]
-            .iter()
-            .copied()
-            .filter(|&dep| !is_accepted[dep]);
-        let mut intersection = match non_accepted_preds.next() {
-            Some(first) => dom[first].clone(),
-            None => BTreeSet::new(),
-        };
-        for pred in non_accepted_preds {
-            intersection.retain(|node| dom[pred].contains(node));
+
+        // A non-accepted path starts at exactly one root. A root dominates
+        // this module iff *every* non-accepted predecessor has that same root.
+        let mut predecessors = dependencies[index].iter().filter(|&&dep| !is_accepted[dep]);
+        if let Some(root) = predecessors.next().and_then(|&dep| sole_root[dep])
+            && predecessors.all(|&dep| sole_root[dep] == Some(root))
+        {
+            sole_root[index] = Some(root);
+            *unlock_value.get_mut(&root).expect("dominator root") += 1;
         }
-        intersection.insert(index);
-        dom[index] = intersection;
     }
 
-    let mut unlock_value: BTreeMap<usize, usize> = BTreeMap::new();
-    let mut first_blocker_count: BTreeMap<usize, usize> = BTreeMap::new();
-    for &index in order {
-        if is_root[index] {
-            unlock_value.entry(index).or_insert(0);
-            first_blocker_count.entry(index).or_insert(0);
-        }
-    }
+    // Memoize each first-blocker chain, including chains that end without a
+    // root. Marking a node on entry preserves the cycle cut-off without
+    // retracing an arbitrarily long prefix for each descendant.
+    let mut visited: Vec<bool> = is_blocked.iter().map(|blocked| !blocked).collect();
+    let mut first_root: Vec<_> = (0..count)
+        .map(|i| (!is_accepted[i] && !is_blocked[i]).then_some(i))
+        .collect();
+    let mut path = Vec::new();
     for &index in order {
         if !is_blocked[index] {
             continue;
         }
-        for &dominator in &dom[index] {
-            if is_root[dominator] {
-                *unlock_value.entry(dominator).or_insert(0) += 1;
-            }
-        }
-        // Trace the first-blocker pointer chain to its non-blocked root.
-        let mut cursor = first_blocker[index];
-        let mut hops = 0_usize;
+        let mut cursor = Some(index);
         while let Some(node) = cursor {
-            if hops >= count {
+            if visited[node] {
                 break;
             }
-            hops += 1;
-            if !is_blocked[node] {
-                if is_root[node] {
-                    *first_blocker_count.entry(node).or_insert(0) += 1;
-                }
-                break;
-            }
+            visited[node] = true;
+            path.push(node);
             cursor = first_blocker[node];
+        }
+        let root = cursor.and_then(|node| first_root[node]);
+        for node in path.drain(..) {
+            first_root[node] = root;
+        }
+        if let Some(root) = root {
+            *first_blocker_count
+                .get_mut(&root)
+                .expect("first-blocker root") += 1;
         }
     }
     (unlock_value, first_blocker_count)
@@ -2457,5 +2453,82 @@ impl Admitted {
         };
         result.counts().assert_conservation();
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod dominator_tests {
+    use super::*;
+
+    #[test]
+    fn root_counts_match_explicit_paths_in_all_four_module_dags() {
+        let order = [2, 0, 3, 1]; // module IDs differ from traversal order
+        for edges in 0..64_u32 {
+            let mut deps = vec![BTreeSet::new(); 4];
+            let mut bit = 1;
+            for (position, &module) in order.iter().enumerate() {
+                for &dep in &order[..position] {
+                    if edges & bit != 0 {
+                        deps[module].insert(dep);
+                    }
+                    bit <<= 1;
+                }
+            }
+            for failures in 0..16 {
+                let mut accepted = [false; 4];
+                let mut blocked = [false; 4];
+                let mut first = [None; 4];
+                // Explicitly enumerate the path origins. Their multiplicity
+                // matters here: a diamond can reach one root by two paths.
+                let mut origins: [Vec<usize>; 4] = Default::default();
+                let mut unlock = BTreeMap::new();
+                let mut first_counts = BTreeMap::new();
+                for &module in &order {
+                    let paths: Vec<_> = deps[module]
+                        .iter()
+                        .flat_map(|&dep| origins[dep].iter().copied())
+                        .collect();
+                    if let Some(&root) = paths.first() {
+                        blocked[module] = true;
+                        first[module] = deps[module].iter().copied().find(|&dep| !accepted[dep]);
+                        if paths.iter().all(|origin| *origin == root) {
+                            *unlock.get_mut(&root).unwrap() += 1;
+                        }
+                        *first_counts.get_mut(&root).unwrap() += 1;
+                        origins[module] = paths;
+                    } else if failures & (1 << module) != 0 {
+                        origins[module].push(module);
+                        unlock.insert(module, 0);
+                        first_counts.insert(module, 0);
+                    } else {
+                        accepted[module] = true;
+                    }
+                }
+                assert_eq!(
+                    compute_root_dominators(&order, &deps, &accepted, &blocked, &first),
+                    (unlock, first_counts),
+                    "edges {edges}, failures {failures}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_blocker_cycle_never_credits_a_root() {
+        let deps = [
+            BTreeSet::new(),
+            BTreeSet::from([0]),
+            BTreeSet::from([1]),
+            BTreeSet::from([2]),
+        ];
+        let (unlock, first) = compute_root_dominators(
+            &[0, 1, 2, 3],
+            &deps,
+            &[false; 4],
+            &[false, true, true, true],
+            &[None, Some(2), Some(1), Some(2)],
+        );
+        assert_eq!(unlock, BTreeMap::from([(0, 3)]));
+        assert_eq!(first, BTreeMap::from([(0, 0)]));
     }
 }
