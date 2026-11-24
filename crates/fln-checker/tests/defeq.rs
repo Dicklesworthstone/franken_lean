@@ -301,6 +301,41 @@ fn a_mismatch_below_the_root_defers_instead_of_rejecting() {
 }
 
 #[test]
+fn sort_and_forall_clash_only_at_a_decisive_comparison() {
+    let context = WhnfContext::default();
+    // Both Prop and (Prop → Prop) inhabit Type. Their heads cannot reduce
+    // to one another, but a function of Type need not distinguish them.
+    let sort = Expr::sort(Level::zero());
+    let forall = Expr::forall_e(name("p"), sort.clone(), sort.clone(), BinderInfo::Default);
+    let compare =
+        |a: &Expr, b: &Expr| def_eq(&decoded(a), &decoded(b), &context, DefEqBudget::unlimited());
+    for (a, b) in [(&sort, &forall), (&forall, &sort)] {
+        assert!(matches!(
+            compare(a, b),
+            DefEqOutcome::NotEqual {
+                mismatch: DefEqMismatch::SortForall { .. },
+                ..
+            }
+        ));
+        let apply = |f: Expr, x: &Expr| Expr::app(f, x.clone());
+        assert!(matches!(
+            compare(&apply(constant("f"), a), &apply(constant("f"), b)),
+            DefEqOutcome::Deferred { .. }
+        ));
+        let erase = Expr::lam(
+            name("T"),
+            Expr::sort(Level::one()),
+            nat_literal(7),
+            BinderInfo::Default,
+        );
+        assert!(matches!(
+            compare(&apply(erase.clone(), a), &apply(erase, b)),
+            DefEqOutcome::Equal(_)
+        ));
+    }
+}
+
+#[test]
 fn slow_or_environment_sensitive_cases_defer_instead_of_rejecting() {
     let left = decoded(&Expr::const_(name("C"), vec![Level::zero()]));
     let right = decoded(&Expr::const_(name("C"), vec![Level::one()]));

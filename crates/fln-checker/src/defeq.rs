@@ -295,6 +295,11 @@ pub struct DefEqDeferred {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefEqMismatch {
+    /// A universe and a dependent function type have distinct rigid heads.
+    SortForall {
+        left: DefEqLocation,
+        right: DefEqLocation,
+    },
     SortLevels {
         left: DefEqLocation,
         right: DefEqLocation,
@@ -1640,6 +1645,15 @@ fn compare_pair(
         }
         (ExprNode::Meta { name: left }, ExprNode::Meta { name: right }) if left == right => {
             Ok(PairAction::Done)
+        }
+        (ExprNode::Sort { .. }, ExprNode::Forall { .. })
+        | (ExprNode::Forall { .. }, ExprNode::Sort { .. }) => {
+            // Neither head reduces, and a universe cannot be a proof. The
+            // caller still defers a mismatch found by speculative congruence.
+            Ok(PairAction::NotEqual(DefEqMismatch::SortForall {
+                left: left_reference.location(),
+                right: right_reference.location(),
+            }))
         }
         (ExprNode::Sort { level: left_level }, ExprNode::Sort { level: right_level }) => {
             let equal = level_roots_equal(
