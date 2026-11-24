@@ -4,6 +4,11 @@
 use super::*;
 use crate::grind_patterns::{self as registry, GrindPattern, GrindPatternError};
 use fln_env::constants::ConstantInfo;
+mod capture;
+mod import;
+pub use import::import_captured;
+#[cfg(test)]
+mod tests;
 
 pub struct Request<'a> {
     declaration: &'a Syntax,
@@ -201,7 +206,7 @@ pub fn compile(
         }
         let term = context.term(syntax, None)?;
         let term = context.finish(term)?;
-        context.check_grind_pattern_term(&term, &checking_levels)?;
+        context.check_grind_pattern_term(&term, &checking_levels, true)?;
         let mut expression = context.prepare_grind_pattern(&term.value)?;
         for (index, id) in locals.iter().enumerate() {
             context.tick()?;
@@ -211,11 +216,13 @@ pub fn compile(
         }
         patterns.push(expression);
     }
+    let captured = context.capture_grind_patterns(&patterns)?;
     let row = GrindPattern {
         declaration,
         num_params,
         data_params,
         patterns,
+        captured: Some(captured),
     };
     registry::validate(env, &row).map_err(registry_error)?;
     Ok(row)
@@ -463,6 +470,7 @@ impl Context {
         &mut self,
         term: &Typed,
         level_params: &[Name],
+        use_source_reducibility: bool,
     ) -> Result<(), NatDefinitionElabError> {
         let mut value = term.value.clone();
         let mut expected = term.type_.clone();
@@ -502,11 +510,19 @@ impl Context {
                     Expr::forall_e(local.user_name.clone(), domain, expected, local.binder_info);
             }
         }
-        let reducibility = crate::reducibility::table(&self.txn.env).map_err(|error| {
-            failure(SourceInferenceError::Unification(Box::new(
-                UnificationError::Reducibility(error),
-            )))
-        })?;
+        // Source elaboration respects its current transparency policy.
+        // Rechecking a stored witness uses ordinary kernel conversion, so a
+        // later irreducibility attribute cannot invalidate existing metadata.
+        let reducibility = if use_source_reducibility {
+            Some(crate::reducibility::table(&self.txn.env).map_err(|error| {
+                failure(SourceInferenceError::Unification(Box::new(
+                    UnificationError::Reducibility(error),
+                )))
+            })?)
+        } else {
+            None
+        };
+        let no_opaque_definitions = std::collections::BTreeSet::new();
         let remaining = if self.txn.budget.max_heartbeats == 0 {
             u64::MAX
         } else {
@@ -523,7 +539,9 @@ impl Context {
             self.kernel
                 .narrowed(self.kernel.steps.min(remaining), self.kernel.depth),
             fln_kernel::DefEqUnfolding {
-                opaque_definitions: reducibility.opaque_definitions(),
+                opaque_definitions: reducibility
+                    .as_ref()
+                    .map_or(&no_opaque_definitions, |table| table.opaque_definitions()),
                 unfold_theorems: false,
             },
         );

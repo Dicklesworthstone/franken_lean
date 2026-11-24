@@ -475,6 +475,7 @@ impl SourceModuleRecord {
             fln_elab::unbox::journal_name(),
             fln_elab::match_pattern::journal_name(),
             fln_elab::symm::journal_name(),
+            fln_elab::grind_patterns::journal_name(),
             fln_elab::eliminator_tags::journal_name(fln_elab::eliminator_tags::TagKind::ElabAsElim),
             fln_elab::eliminator_tags::journal_name(
                 fln_elab::eliminator_tags::TagKind::SparseCasesOn,

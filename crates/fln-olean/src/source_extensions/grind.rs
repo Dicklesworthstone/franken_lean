@@ -99,11 +99,19 @@ impl Reader {
         }
         let entry = match obj.obj_tag() as u8 {
             format::SCOPE_GLOBAL => {
-                constructor(obj, format::SCOPE_GLOBAL, format::PARSER_SCOPE_GLOBAL_POINTERS)?;
+                constructor(
+                    obj,
+                    format::SCOPE_GLOBAL,
+                    format::PARSER_SCOPE_GLOBAL_POINTERS,
+                )?;
                 field(obj, format::PARSER_SCOPE_GLOBAL_ENTRY)?
             }
             format::SCOPE_SCOPED => {
-                constructor(obj, format::SCOPE_SCOPED, format::PARSER_SCOPE_SCOPED_POINTERS)?;
+                constructor(
+                    obj,
+                    format::SCOPE_SCOPED,
+                    format::PARSER_SCOPE_SCOPED_POINTERS,
+                )?;
                 // The opaque payload remains attached to its module. A future
                 // scope-aware consumer may activate it; this reader does not.
                 return Ok(None);
@@ -173,7 +181,10 @@ impl Reader {
         let mut symbols = Vec::new();
         let mut rest = field(&theorem, format::GRIND_THM_SYMBOLS)?;
         while let Some((symbol, tail)) = list_next(&rest, entries_left)? {
-            self.keys_left = self.keys_left.checked_sub(1).ok_or_else(|| limit("grind symbols"))?;
+            self.keys_left = self
+                .keys_left
+                .checked_sub(1)
+                .ok_or_else(|| limit("grind symbols"))?;
             if symbol.is_scalar() || symbol.obj_tag() != usize::from(format::GRIND_HEAD_CONST) {
                 return Ok(None);
             }

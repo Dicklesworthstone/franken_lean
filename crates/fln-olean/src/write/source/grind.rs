@@ -7,7 +7,8 @@ impl Encoder {
     fn grind_theorem(&mut self, row: &GrindPatternEntry) -> WResult<Obj> {
         self.source_array_bound(row.patterns.len())?;
         self.source_array_bound(row.symbols.len())?;
-        row.validate().map_err(|what| WriteError::Contract { what })?;
+        row.validate()
+            .map_err(|what| WriteError::Contract { what })?;
         let mut patterns = Vec::with_capacity(row.patterns.len());
         for pattern in &row.patterns {
             patterns.push(self.expression(pattern)?);

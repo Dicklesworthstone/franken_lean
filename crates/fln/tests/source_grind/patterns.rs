@@ -120,6 +120,97 @@ const GOALS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
+fn artifacts_preserve_explicit_pattern_consumption(engine: &Engine) {
+    use fln::source_check::modules::SourceModuleCheckLimits;
+    use fln::{OleanWriteBudget, SourceModuleInput};
+    let module = name("GrindPatternsLibrary");
+    let declarations = "prelude\nnamespace ArtifactGrind\naxiom A : Type\naxiom P : A -> Prop\naxiom Q : A -> Prop\naxiom step (x : A) : P x -> Q x\n";
+    let compile = |registered: bool| {
+        let source = format!(
+            "{declarations}{}end ArtifactGrind\n",
+            if registered {
+                "grind_pattern step => P x\n"
+            } else {
+                ""
+            }
+        );
+        Engine::builder()
+            .build_empty()
+            .compile_source_modules(
+                &[SourceModuleInput {
+                    name: &module,
+                    source: source.as_bytes(),
+                }],
+                &module,
+                &KVMap::new(),
+                SourceModuleCheckLimits::new(limits()),
+                OleanWriteBudget::default(),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+    };
+    let import = |built: &fln::source_check::modules::SourceModuleBuild| {
+        let artifact = &built.artifacts[0];
+        engine
+            .import_olean_modules_for_source(
+                &[OleanModuleInput {
+                    name: &module,
+                    artifact: &artifact.bytes,
+                    server_artifact: None,
+                    private_artifact: None,
+                }],
+                std::slice::from_ref(&module),
+                &KVMap::new(),
+                SourceOleanImportLimits::new(OleanCheckLimits::new(
+                    4 << 20,
+                    limits().admission.kernel,
+                )),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+    };
+    let before = engine.logical_root(&KVMap::new());
+    let registered = import(&compile(true));
+    assert_eq!(registered.modules[0].grind_patterns, 1);
+    // The real admitted Init.Grind.Tactics module supplies the tactic marker;
+    // the independently built library needs only the primitive type theory.
+    let consumer = b"theorem artifactUse (x : ArtifactGrind.A) (h : ArtifactGrind.P x) : ArtifactGrind.Q x := by grind only [usr ArtifactGrind.step]";
+    let checked = registered
+        .engine
+        .check_source_files(&[consumer], &KVMap::new(), limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(matches!(
+        checked.engine.environment().find(&name("artifactUse")),
+        Some(fln::ConstantInfo::Thm(_))
+    ));
+    let unregistered = import(&compile(false));
+    assert_eq!(unregistered.modules[0].grind_patterns, 0);
+    assert!(!matches!(
+        unregistered
+            .engine
+            .check_source_files(&[consumer], &KVMap::new(), limits()),
+        Ok(Outcome::Complete(_)),
+    ));
+    let missing_premise = b"theorem missingPremise (x : ArtifactGrind.A) : ArtifactGrind.Q x := by grind only [usr ArtifactGrind.step]";
+    assert!(!matches!(
+        registered
+            .engine
+            .check_source_files(&[missing_premise], &KVMap::new(), limits()),
+        Ok(Outcome::Complete(_)),
+    ));
+    assert!(
+        !registered
+            .engine
+            .environment()
+            .contains(&name("artifactUse"))
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+}
+
 #[test]
 fn registered_patterns_match_the_live_pin() {
     std::thread::Builder::new()
@@ -181,6 +272,7 @@ fn registered_patterns_match_the_live_pin() {
                 );
             }
             let engine = base_with_roots(&library, LOGICAL_ROOTS, 1);
+            artifacts_preserve_explicit_pattern_consumption(&engine);
             let options = KVMap::new();
             let before = engine.logical_root(&options);
             let mut failures = Vec::new();

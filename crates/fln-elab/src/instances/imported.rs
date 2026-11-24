@@ -759,6 +759,17 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Append validated explicit E-matching groups without admitting any proof.
+    /// The importer checks every referenced declaration in its recording
+    /// module's dependency closure before invoking this metadata-only bridge.
+    pub fn register_grind_patterns(
+        mut self,
+        rows: &[crate::grind_patterns::GrindPattern],
+    ) -> Result<Self, crate::grind_patterns::GrindPatternError> {
+        self.env = crate::grind_patterns::register(&self.env, rows)?;
+        Ok(self)
+    }
+
     /// Record an imported `@[defeq]` tag
     /// ([`crate::source::scope::simp::defeq::register_imported`]). The tag journal is
     /// not one this activation keeps or reads.

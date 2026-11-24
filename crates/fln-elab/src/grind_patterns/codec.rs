@@ -91,8 +91,12 @@ fn write_expr(root: &Expr, bytes: &mut Vec<u8>) -> Result<(), Error> {
         }
         if !ready {
             stack.push((term, true));
-            if let ExprNode::App { f, a } = term.node() {
-                stack.extend([(a, false), (f, false)]);
+            match term.node() {
+                ExprNode::App { f, a } => stack.extend([(a, false), (f, false)]),
+                ExprNode::MData { expr, .. } if ground_pattern(term).is_some() => {
+                    stack.push((expr, false));
+                }
+                _ => {}
             }
             continue;
         }
@@ -150,6 +154,15 @@ fn write_expr(root: &Expr, bytes: &mut Vec<u8>) -> Result<(), Error> {
                 bytes.push(5);
                 put_u32(value.len(), bytes)?;
                 bytes.extend(value.as_bytes());
+            }
+            ExprNode::MData { expr, .. } if ground_pattern(node).is_some() => {
+                bytes.push(6);
+                put_u32(
+                    *indices
+                        .get(&expr.allocation_identity())
+                        .ok_or(Error::Malformed)?,
+                    bytes,
+                )?;
             }
             _ => return Err(Error::Malformed),
         }
@@ -216,6 +229,13 @@ fn read_expr(bytes: &mut &[u8]) -> Result<Expr, Error> {
                     std::str::from_utf8(take(bytes, length)?).map_err(|_| Error::Malformed)?;
                 Expr::lit(Literal::Str(value.to_owned()))
             }
+            6 => {
+                let inner = nodes
+                    .get(u32_(bytes)? as usize)
+                    .cloned()
+                    .ok_or(Error::Malformed)?;
+                mark_ground(inner)
+            }
             _ => return Err(Error::Malformed),
         };
         nodes.push(term);
@@ -224,13 +244,27 @@ fn read_expr(bytes: &mut &[u8]) -> Result<Expr, Error> {
 }
 
 pub(super) fn encode(row: &GrindPattern) -> Result<Vec<u8>, Error> {
-    let mut bytes = MAGIC.to_vec();
+    let mut bytes = if row.captured.is_some() {
+        CAPTURED_MAGIC.to_vec()
+    } else {
+        MAGIC.to_vec()
+    };
     write_name(&row.declaration, &mut bytes).map_err(codec_error)?;
     bytes.extend(row.num_params.to_le_bytes());
     bytes.extend(row.data_params.to_le_bytes());
     put_u32(row.patterns.len(), &mut bytes)?;
     for pattern in &row.patterns {
         write_expr(pattern, &mut bytes)?;
+    }
+    if let Some(capture) = &row.captured {
+        put_u32(capture.patterns.len(), &mut bytes)?;
+        for pattern in &capture.patterns {
+            write_expr(pattern, &mut bytes)?;
+        }
+        put_u32(capture.symbols.len(), &mut bytes)?;
+        for symbol in &capture.symbols {
+            write_name(symbol, &mut bytes).map_err(codec_error)?;
+        }
     }
     if bytes.len() > MAX_ENTRY_BYTES {
         return Err(Error::Limit);
@@ -241,7 +275,11 @@ pub(super) fn decode(payload: &[u8]) -> Result<GrindPattern, Error> {
     if payload.len() > MAX_ENTRY_BYTES {
         return Err(Error::Limit);
     }
-    let mut bytes = payload.strip_prefix(MAGIC).ok_or(Error::Malformed)?;
+    let (mut bytes, has_capture) = if let Some(bytes) = payload.strip_prefix(CAPTURED_MAGIC) {
+        (bytes, true)
+    } else {
+        (payload.strip_prefix(MAGIC).ok_or(Error::Malformed)?, false)
+    };
     let declaration = read_name(&mut bytes).map_err(codec_error)?;
     let num_params = u32_(&mut bytes)?;
     let data_params = u32_(&mut bytes)?;
@@ -253,6 +291,30 @@ pub(super) fn decode(payload: &[u8]) -> Result<GrindPattern, Error> {
     for _ in 0..count {
         patterns.push(read_expr(&mut bytes)?);
     }
+    let captured = if has_capture {
+        let count = u32_(&mut bytes)? as usize;
+        if count > MAX_PATTERNS {
+            return Err(Error::Limit);
+        }
+        let mut captured_patterns = Vec::with_capacity(count);
+        for _ in 0..count {
+            captured_patterns.push(read_expr(&mut bytes)?);
+        }
+        let count = u32_(&mut bytes)? as usize;
+        if count > MAX_SYMBOLS {
+            return Err(Error::Limit);
+        }
+        let mut symbols = Vec::with_capacity(count);
+        for _ in 0..count {
+            symbols.push(read_name(&mut bytes).map_err(codec_error)?);
+        }
+        Some(CapturedPatterns {
+            patterns: captured_patterns,
+            symbols,
+        })
+    } else {
+        None
+    };
     if !bytes.is_empty() {
         return Err(Error::Malformed);
     }
@@ -261,6 +323,7 @@ pub(super) fn decode(payload: &[u8]) -> Result<GrindPattern, Error> {
         num_params,
         data_params,
         patterns,
+        captured,
     };
     // Reject disconnected nodes and alternate encodings instead of discarding
     // unvalidated fields from a supposedly understood extension.

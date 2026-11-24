@@ -4,7 +4,9 @@
 //! authority. Patterns are captured when registered, before later namespace or
 //! reducibility changes. One row is one simultaneous multipattern, and repeated
 //! registrations for the same declaration remain distinct and ordered.
+mod captured;
 mod codec;
+pub(crate) use captured::{ground_pattern, is_wildcard, mark_ground, wildcard};
 #[cfg(test)]
 mod tests;
 
@@ -21,11 +23,21 @@ use std::collections::HashSet;
 
 pub const MAX_PARAMETERS: u32 = 16;
 pub const MAX_PATTERNS: usize = 32;
-const MAX_ROWS: usize = 4096;
+pub const MAX_ROWS: usize = 4096;
+pub(crate) const MAX_SYMBOLS: usize = 4096;
 const MAX_ENTRY_BYTES: usize = 256 * 1024;
 const MAX_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STEPS: usize = 1_000_000;
 const MAGIC: &[u8] = b"FLNGRIND\x01";
+const CAPTURED_MAGIC: &[u8] = b"FLNGRIND\x02";
+
+/// The pin's normalized user multipattern and activation symbols, captured in
+/// registration order. This is selection metadata, never a proof or declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedPatterns {
+    pub patterns: Vec<Expr>,
+    pub symbols: Vec<Name>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrindPattern {
@@ -39,6 +51,9 @@ pub struct GrindPattern {
     /// Open using subst_loose(num_params - data_params, data_locals), with locals
     /// in their original telescope order. No trailing proof variable may occur.
     pub patterns: Vec<Expr>,
+    /// Legacy rows have no pinned snapshot and cannot be exported as .olean
+    /// user patterns. New rows match this immutable normalized representation.
+    pub captured: Option<CapturedPatterns>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +132,13 @@ pub(crate) fn supported_head(name: &Name) -> bool {
         "HMod.hMod",
         "LT.lt",
         "LE.le",
+        "[grind_dontcare]",
+        "Lean.Grind.offset",
+        "Lean.Grind.genPattern",
+        "Lean.Grind.genHEqPattern",
+        "Lean.Grind.eqBwdPattern",
+        "Lean.Grind.nestedProof",
+        "Lean.Grind.nestedDecidable",
     ]
     .iter()
     .any(|head| *name == Name::from_components(head.split('.')))
@@ -237,6 +259,10 @@ fn validate_with(
             "a data parameter not determined by the patterns",
         ));
     }
+    if let Some(capture) = &row.captured {
+        captured::validate_with(env, row, capture, remaining)?;
+        captured::compatible(&row.patterns, &capture.patterns, remaining)?;
+    }
     Ok(())
 }
 
@@ -246,6 +272,22 @@ fn validate_with(
 pub fn validate(env: &Environment, row: &GrindPattern) -> Result<(), Error> {
     let mut remaining = MAX_STEPS;
     validate_with(env, row, &mut remaining)
+}
+
+/// Check a normalized foreign snapshot before opening any of its indices.
+pub(crate) fn validate_capture(
+    env: &Environment,
+    row: &GrindPattern,
+    capture: &CapturedPatterns,
+) -> Result<(), Error> {
+    if row.num_params > MAX_PARAMETERS {
+        return Err(Error::Limit);
+    }
+    if row.data_params > row.num_params {
+        return Err(Error::Malformed);
+    }
+    let mut remaining = MAX_STEPS;
+    captured::validate_with(env, row, capture, &mut remaining)
 }
 
 /// Append completely compiled rows as one transaction. Neither a failed

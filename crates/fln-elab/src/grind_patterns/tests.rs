@@ -43,6 +43,7 @@ fn fixture() -> (Environment, GrindPattern) {
         declaration: n("rule"),
         num_params: 3,
         data_params: 2,
+        captured: None,
         patterns: vec![Expr::app(
             Expr::app(c("f"), Expr::bvar(2).unwrap()),
             Expr::bvar(1).unwrap(),
@@ -266,5 +267,72 @@ fn cumulative_registration_never_publishes_an_unreadable_journal() {
         register(&env, &vec![dense; MAX_ROWS / 2]).err(),
         Some(Error::Limit)
     );
+    assert!(read(&env).unwrap().is_empty());
+}
+
+#[test]
+fn captured_journals_preserve_legacy_rows_and_wire_selection_metadata() {
+    let (env, legacy) = fixture();
+    let mut captured = legacy.clone();
+    captured.captured = Some(CapturedPatterns {
+        patterns: captured.patterns.clone(),
+        symbols: vec![n("f")],
+    });
+    let first = codec::encode(&legacy).unwrap();
+    let second = codec::encode(&captured).unwrap();
+    assert!(first.starts_with(MAGIC));
+    assert!(second.starts_with(CAPTURED_MAGIC));
+    assert_eq!(codec::decode(&first).unwrap().captured, None);
+    assert_eq!(codec::decode(&second).unwrap(), captured);
+    let registered = register(&env, &[legacy.clone(), captured.clone(), legacy.clone()]).unwrap();
+    assert_eq!(
+        read(&registered).unwrap(),
+        [legacy.clone(), captured, legacy]
+    );
+
+    // Wire gadgets are metadata, never declarations supplied to the kernel.
+    let mut wire = read(&registered).unwrap().remove(1);
+    let raw = Expr::app(Expr::app(c("g"), c("P")), Expr::bvar(1).unwrap());
+    wire.patterns.push(raw);
+    wire.captured.as_mut().unwrap().patterns.push(Expr::app(
+        Expr::app(c("g"), mark_ground(c("P"))),
+        wildcard(),
+    ));
+    wire.captured.as_mut().unwrap().symbols.push(n("g"));
+    let bytes = codec::encode(&wire).unwrap();
+    assert_eq!(codec::decode(&bytes).unwrap(), wire);
+    assert!(!env.contains(&n("[grind_dontcare]")));
+}
+
+#[test]
+fn captured_journals_reject_forged_annotations_symbols_and_witnesses() {
+    let (env, row) = fixture();
+    let valid = GrindPattern {
+        captured: Some(CapturedPatterns {
+            patterns: row.patterns.clone(),
+            symbols: vec![n("f")],
+        }),
+        ..row
+    };
+    register(&env, std::slice::from_ref(&valid)).unwrap();
+    let mut invalid = valid.clone();
+    invalid.captured.as_mut().unwrap().symbols.clear();
+    assert_eq!(register(&env, &[invalid]).err(), Some(Error::Malformed));
+    let mut invalid = valid.clone();
+    invalid.captured.as_mut().unwrap().symbols.push(n("f"));
+    assert_eq!(register(&env, &[invalid]).err(), Some(Error::Malformed));
+    let mut invalid = valid.clone();
+    invalid.captured.as_mut().unwrap().patterns[0] = Expr::app(
+        Expr::app(c("g"), Expr::bvar(2).unwrap()),
+        Expr::bvar(1).unwrap(),
+    );
+    invalid.captured.as_mut().unwrap().symbols = vec![n("g")];
+    assert_eq!(register(&env, &[invalid]).err(), Some(Error::Malformed));
+    let mut invalid = valid.clone();
+    invalid.captured.as_mut().unwrap().patterns[0] = Expr::app(
+        Expr::app(c("f"), mark_ground(Expr::bvar(2).unwrap())),
+        Expr::bvar(1).unwrap(),
+    );
+    assert_eq!(register(&env, &[invalid]).err(), Some(Error::Malformed));
     assert!(read(&env).unwrap().is_empty());
 }

@@ -3707,6 +3707,7 @@ impl Engine {
                         | ScopeCommand::Omit(_)
                         | ScopeCommand::Simp(_)
                         | ScopeCommand::Symm(_)
+                        | ScopeCommand::GrindPattern(_)
                         | ScopeCommand::ConstructorElims(_)
                         | ScopeCommand::Executable(_)
                         | ScopeCommand::Instance(_)

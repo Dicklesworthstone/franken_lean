@@ -232,6 +232,9 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
             | SourceInferenceError::EliminatorTags(
                 fln_elab::eliminator_tags::EliminatorTagError::UnsupportedEliminator(_),
             )
+            | SourceInferenceError::GrindPattern(
+                fln_elab::grind_patterns::GrindPatternError::Unsupported(_),
+            )
             | SourceInferenceError::PreresolvedReference { .. } => ("capability", false, 5),
             SourceInferenceError::SimpSet(
                 fln_elab::source::scope::simp::SimpSetError::Malformed,
@@ -249,6 +252,9 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
                 fln_elab::eliminator_tags::EliminatorTagError::Malformed,
             ) => ("internal-fault", false, 4),
             SourceInferenceError::ResourceLimit
+            | SourceInferenceError::GrindPattern(
+                fln_elab::grind_patterns::GrindPatternError::Limit,
+            )
             | SourceInferenceError::SimpSet(fln_elab::source::scope::simp::SimpSetError::Limit)
             | SourceInferenceError::ProtectedJournal(
                 fln_elab::protected_names::ProtectedError::Limit,

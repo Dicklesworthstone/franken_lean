@@ -54,6 +54,8 @@ struct Theorem {
     level_params: Vec<Name>,
     parameters: Vec<Parameter>,
     patterns: Vec<Vec<Expr>>,
+    captured: bool,
+    symbols: Vec<Name>,
 }
 
 #[derive(Clone, Default)]
@@ -450,6 +452,8 @@ impl Theorem {
                 level_params: level_params.to_vec(),
                 parameters,
                 patterns,
+                captured: false,
+                symbols: Vec::new(),
             }))
         })();
         // A cutoff while opening the telescope must not leave its pattern
@@ -473,6 +477,12 @@ impl Theorem {
         if row.data_params > row.num_params || row.patterns.is_empty() {
             return Err(unsupported());
         }
+        crate::grind_patterns::validate(&context.txn.env, row)
+            .map_err(crate::source::grind_patterns::registry_error)?;
+        let capture = row.captured.as_ref();
+        let source_patterns = capture.map_or(row.patterns.as_slice(), |capture| {
+            capture.patterns.as_slice()
+        });
         let declaration_levels = context
             .txn
             .env
@@ -487,7 +497,11 @@ impl Theorem {
         let levels: Vec<_> = level_params.iter().cloned().map(Level::param).collect();
         let saved = context.txn.lctx.clone();
         let result = (|| {
-            let mut type_ = normalize(context, &evidence.type_)?;
+            let mut type_ = if capture.is_some() {
+                evidence.type_.clone()
+            } else {
+                normalize(context, &evidence.type_)?
+            };
             let mut parameters = Vec::new();
             let mut locals = Vec::new();
             for _ in 0..row.data_params {
@@ -517,7 +531,11 @@ impl Theorem {
                 let value = Expr::fvar(local.id);
                 let opened = context.substitute(body, &value)?;
                 locals.push(value);
-                type_ = normalize(context, &opened)?;
+                type_ = if capture.is_some() {
+                    opened
+                } else {
+                    normalize(context, &opened)?
+                };
             }
             let mut conclusion = type_;
             for _ in row.data_params..row.num_params {
@@ -531,7 +549,11 @@ impl Theorem {
                 if body.has_loose_bvars() || !is_prop(context, binder_type)? {
                     return Err(unsupported());
                 }
-                conclusion = normalize(context, body)?;
+                conclusion = if capture.is_some() {
+                    body.clone()
+                } else {
+                    normalize(context, body)?
+                };
             }
             if matches!(conclusion.node(), ExprNode::ForallE { .. })
                 || !is_prop(context, &conclusion)?
@@ -540,7 +562,7 @@ impl Theorem {
             }
             let mut group = Vec::new();
             let mut covered = vec![false; parameters.len()];
-            for pattern in &row.patterns {
+            for pattern in source_patterns {
                 context.tick()?;
                 let pattern = context.instantiate_params(pattern, &declaration_levels, &levels)?;
                 // subst_loose expects the original outer-to-inner order. The
@@ -548,8 +570,14 @@ impl Theorem {
                 let pattern = pattern
                     .subst_loose(row.num_params - row.data_params, &locals)
                     .map_err(|_| resource())?;
-                let pattern = normalize(context, &pattern)?;
-                let pattern = folded_projection(context, &pattern)?;
+                let pattern = if capture.is_some() {
+                    // The registration already selected and normalized this
+                    // trigger. A later reducibility change must not rewrite it.
+                    pattern
+                } else {
+                    let pattern = normalize(context, &pattern)?;
+                    folded_projection(context, &pattern)?
+                };
                 if !matches!(
                     pattern.node(),
                     ExprNode::App { .. } | ExprNode::Const { .. }
@@ -573,6 +601,8 @@ impl Theorem {
                 level_params: level_params.to_vec(),
                 parameters,
                 patterns: vec![group],
+                captured: capture.is_some(),
+                symbols: capture.map_or_else(Vec::new, |capture| capture.symbols.clone()),
             })
         })();
         context.txn.lctx = saved;
@@ -698,6 +728,40 @@ impl Quantifiers {
         Ok(true)
     }
 
+    /// Ground annotations use equality or reducible-and-instance conversion.
+    /// As in the pin's withoutModifyingMCtx branch, polymorphic ground patterns
+    /// get private universe holes whose assignments cannot choose theorem levels.
+    fn match_captured_ground(
+        &mut self,
+        context: &mut Context,
+        graph: &Equalities,
+        theorem: &Theorem,
+        pattern: &Expr,
+        ground: &Expr,
+    ) -> Result<bool, Error> {
+        self.tick(context)?;
+        context.flush(false)?;
+        let saved = context.txn.clone();
+        let result = (|| {
+            let mut levels = Vec::with_capacity(theorem.level_params.len());
+            for _ in &theorem.level_params {
+                levels.push(context.level()?);
+            }
+            let pattern = context.instantiate_params(pattern, &theorem.level_params, &levels)?;
+            if !pattern.has_level_mvar() && graph.equivalent(context, &pattern, ground)? {
+                return Ok(true);
+            }
+            let mut budget = UnificationBudget::new(context.kernel);
+            budget.transparency = UnificationTransparency::Instances;
+            budget.zeta_delta = true;
+            context.proof_types_match_at(&pattern, ground, budget)
+        })();
+        let spent = context.txn.budget.clone();
+        context.txn = saved;
+        context.txn.budget = spent;
+        result
+    }
+
     fn match_term(
         &mut self,
         context: &mut Context,
@@ -712,9 +776,24 @@ impl Quantifiers {
         if depth >= MAX_MATCH_DEPTH {
             return Err(resource());
         }
-        while let ExprNode::MData { expr, .. } = pattern.node() {
-            self.tick(context)?;
-            pattern = expr;
+        if theorem.captured {
+            if crate::grind_patterns::is_wildcard(pattern) {
+                return Ok(vec![substitution]);
+            }
+            if let Some(value) = crate::grind_patterns::ground_pattern(pattern) {
+                return Ok(
+                    if self.match_captured_ground(context, graph, theorem, value, ground)? {
+                        vec![substitution]
+                    } else {
+                        Vec::new()
+                    },
+                );
+            }
+        } else {
+            while let ExprNode::MData { expr, .. } = pattern.node() {
+                self.tick(context)?;
+                pattern = expr;
+            }
         }
         // Keep the ground spelling for theorem application: reducing a
         // dictionary projection can hide arithmetic from the theory hook.
@@ -739,7 +818,8 @@ impl Quantifiers {
         let Some(found) = variables(context, &theorem.parameters, pattern)? else {
             return Ok(Vec::new());
         };
-        if !found.iter().any(|found| *found) && theorem.level_params.is_empty() {
+        if !theorem.captured && !found.iter().any(|found| *found) && theorem.level_params.is_empty()
+        {
             if graph.equivalent(context, pattern, ground)? {
                 return Ok(vec![substitution]);
             }
@@ -836,10 +916,14 @@ impl Quantifiers {
         let mut instances = Vec::new();
         // Snapshot before matching: no theorem in this round can see terms
         // manufactured by an earlier theorem in the same round.
-        let ground_patterns = self
-            .theorems
-            .iter()
-            .any(|theorem| theorem.parameters.is_empty());
+        let ground_patterns = self.theorems.iter().any(|theorem| {
+            theorem.parameters.is_empty()
+                || theorem
+                    .patterns
+                    .iter()
+                    .flatten()
+                    .any(|pattern| matches!(pattern.node(), ExprNode::Const { .. }))
+        });
         let terms: Vec<_> = graph
             .nodes
             .iter()
@@ -850,7 +934,40 @@ impl Quantifiers {
             })
             .map(|node| node.term.clone())
             .collect();
+        let mut symbols = HashSet::new();
+        if self.theorems.iter().any(|theorem| theorem.captured) {
+            // Graph nodes share expression DAGs. Retain visited expressions
+            // across the whole snapshot, including temporary projection views,
+            // so repeated children neither multiply work nor reuse saved IDs.
+            let mut symbol_terms = HashSet::new();
+            for node in &graph.nodes {
+                let view = folded_projection(context, &node.term)?;
+                let mut pending = vec![&view];
+                while let Some(term) = pending.pop() {
+                    self.tick(context)?;
+                    if !symbol_terms.insert(term.clone()) {
+                        continue;
+                    }
+                    match term.node() {
+                        ExprNode::Const { name, .. } => {
+                            symbols.insert(name.clone());
+                        }
+                        ExprNode::App { f, a } => pending.extend([f, a]),
+                        ExprNode::MData { expr, .. } => pending.push(expr),
+                        _ => {}
+                    }
+                }
+            }
+        }
         for (index, theorem) in self.theorems.clone().into_iter().enumerate() {
+            if theorem.captured
+                && !theorem
+                    .symbols
+                    .iter()
+                    .all(|symbol| symbols.contains(symbol))
+            {
+                continue;
+            }
             for patterns in &theorem.patterns {
                 let mut substitutions = vec![Substitution {
                     terms: vec![None; theorem.parameters.len()],

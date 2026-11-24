@@ -12,6 +12,8 @@ use fln_olean::region::{OleanView, OpaqueExtensionBlock, SelectedExtensionBlock}
 use fln_olean::source_extensions::{self as metadata, DecodeLimits};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[path = "imported/grind.rs"]
+mod grind;
 #[path = "imported/implemented_by.rs"]
 mod implemented_by;
 #[path = "imported/reducibility.rs"]
@@ -160,6 +162,12 @@ pub struct SourceMetadataReport {
     pub match_patterns: usize,
     /// Ordered symmetry registrations, including dormant scoped rows.
     pub symms: usize,
+    /// Physical rows in the pin's grind extension, in module journal order.
+    pub grind_entries: usize,
+    /// Global explicit multipattern registrations activated natively.
+    pub grind_patterns: usize,
+    /// Other grind entries retained as unsupported, without activating them.
+    pub deferred_grind: usize,
     /// `@[defeq]` tags (the pin's `Lean.defeqAttr`), which select `dsimp`'s rfl lemmas.
     pub defeq: usize,
     /// Backward-definitional tags, retained independently so an imported
@@ -513,6 +521,12 @@ pub enum SourceOleanImportError {
         module: Name,
         error: fln_elab::symm::SymmRegistryError,
     },
+    /// Preserve pattern-validation failures, including native coverage and
+    /// resource boundaries, separately from declaration admission.
+    Grind {
+        module: Name,
+        error: fln_elab::NatDefinitionElabError,
+    },
     /// Preserve unsupported eliminator header normalization as native coverage.
     EliminatorTags {
         module: Name,
@@ -565,6 +579,11 @@ impl std::fmt::Display for SourceOleanImportError {
                 "module {} symmetry metadata: {error}",
                 module.to_display_string(),
             ),
+            Self::Grind { module, error } => write!(
+                f,
+                "module {} grind-pattern metadata: {error}",
+                module.to_display_string(),
+            ),
             Self::EliminatorTags { module, error } => write!(
                 f,
                 "module {} eliminator metadata: {error}",
@@ -600,6 +619,12 @@ impl SourceOleanImportError {
                 ..
             } => true,
             Self::Decode(error) => error.is_resource(),
+            Self::Grind { error, .. } => {
+                let wrapped = EngineExecutionError::Frontend(
+                    fln_elab::NatDefinitionFrontendError::Elaborate(error.clone()),
+                );
+                crate::source_check::classify(&wrapped).2 == 3
+            }
             _ => false,
         }
     }
@@ -1101,6 +1126,7 @@ fn prepare_source_metadata_view(
             Name::from_components(metadata::ELAB_AS_ELIM_EXTENSION.split('.')),
             metadata::sparse_cases_on_extension_name(),
             Name::from_components(metadata::COE_EXTENSION.split('.')),
+            Name::from_components(metadata::GRIND_EXTENSION.split('.')),
         ])
         .collect();
     let mut blocks: Vec<_> = selected
@@ -1173,6 +1199,9 @@ fn prepare_source_metadata_view(
             unbox: 0,
             match_patterns: 0,
             symms: 0,
+            grind_entries: 0,
+            grind_patterns: 0,
+            deferred_grind: 0,
             defeq: 0,
             backward_defeq: 0,
             structures: 0,
@@ -1276,6 +1305,7 @@ fn prepare_source_metadata_view(
                     26 => report.elab_as_elim = entries.len(),
                     27 => report.sparse_cases_on = entries.len(),
                     28 => report.coercions = entries.len(),
+                    29 => report.grind_entries = entries.len(),
                     _ => {
                         return Err(SourceOleanImportError::Internal(
                             "unknown selected metadata kind",
@@ -1310,6 +1340,32 @@ fn prepare_source_metadata_view(
         .map_err(SourceOleanImportError::Decode)?;
     decoded.defeq = defeq_tags.declarations;
     decoded.backward_defeq = backward_defeq_tags.declarations;
+    // One decoded slot corresponds to each physical row, even when that row's
+    // kind or scope is unsupported. Otherwise a deferred entry in one module
+    // could shift a later module's registration into the wrong import closure.
+    let mut grind_rows = decoded.grind_patterns.iter();
+    for report in &mut reports {
+        for _ in 0..report.grind_entries {
+            let row = grind_rows.next().ok_or(SourceOleanImportError::Internal(
+                "grind entry count changed during decode",
+            ))?;
+            if row.is_some() {
+                report.grind_patterns += 1;
+            } else {
+                report.deferred_grind += 1;
+            }
+        }
+        if report.deferred_grind != 0 {
+            report
+                .uninterpreted
+                .push(Name::from_components(metadata::GRIND_EXTENSION.split('.')));
+        }
+    }
+    if grind_rows.next().is_some() {
+        return Err(SourceOleanImportError::Internal(
+            "grind decode produced rows outside the module journals",
+        ));
+    }
     cancelled!("source-olean/after-metadata-preflight");
     Ok(Outcome::Complete(PreparedMetadata {
         reports,
@@ -1452,6 +1508,12 @@ impl Engine {
         let mut symm_scopes =
             symm::Scopes::new(&checked, &decoded.symms, limits.metadata.max_objects)?;
         let mut symms = decoded.symms.into_iter();
+        let mut grind_scopes = grind::Scopes::new(
+            &checked,
+            &decoded.grind_patterns,
+            limits.metadata.max_objects,
+        )?;
+        let mut grind_patterns = decoded.grind_patterns.into_iter();
         let mut defeq = decoded.defeq.into_iter();
         let mut backward_defeq = decoded.backward_defeq.into_iter();
         let mut pp_anonymous_constructor = decoded.pp_anonymous_constructor.into_iter();
@@ -2020,6 +2082,70 @@ impl Engine {
                         namespace: row.scope,
                     })
                     .map_err(|error| symm::error(&report.module, error))?;
+            }
+            // Validate captured patterns only after this module's class,
+            // structure and reducibility metadata is available. Retain the
+            // stored normalized patterns and symbol order; importing is not a
+            // new source registration under a later environment.
+            let mut native_grind = Vec::new();
+            for _ in 0..report.grind_entries {
+                cancelled!("source-olean/grind-pattern");
+                let row = grind_patterns
+                    .next()
+                    .ok_or(SourceOleanImportError::Internal(
+                        "grind entry count changed during activation",
+                    ))?;
+                let Some(row) = row else { continue };
+                grind_scopes.validate_row(
+                    &checked,
+                    &self.environment,
+                    activation.environment(),
+                    index,
+                    &row,
+                )?;
+                let native = match fln_elab::source::grind_patterns::import_captured(
+                    activation.environment(),
+                    limits.check.admission.kernel,
+                    &row.declaration,
+                    &row.proof,
+                    row.num_params,
+                    &row.patterns,
+                    &row.symbols,
+                ) {
+                    Ok(native) => native,
+                    Err(fln_elab::NatDefinitionElabError::Inference(
+                        fln_elab::source::SourceInferenceError::GrindPattern(
+                            fln_elab::grind_patterns::GrindPatternError::Unsupported(_),
+                        ),
+                    )) => {
+                        // A valid foreign user rule can exceed native matching
+                        // coverage. Keep the import usable and disclose the
+                        // dormant row; explicit usr selection cannot find it.
+                        report.grind_patterns -= 1;
+                        report.deferred_grind += 1;
+                        let name = Name::from_components(metadata::GRIND_EXTENSION.split('.'));
+                        if !report.uninterpreted.contains(&name) {
+                            report.uninterpreted.push(name);
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(grind::error(&report.module, error)),
+                };
+                native_grind.try_reserve(1).map_err(|_| {
+                    SourceOleanImportError::Limit("native grind-pattern activation allocation")
+                })?;
+                native_grind.push(native);
+            }
+            if !native_grind.is_empty() {
+                activation =
+                    activation
+                        .register_grind_patterns(&native_grind)
+                        .map_err(|error| {
+                            grind::error(
+                                &report.module,
+                                fln_elab::source::grind_patterns::registry_error(error),
+                            )
+                        })?;
             }
             // Like symmetry headers, eliminator headers observe this module's
             // reducibility policies. The two tag identities stay independent.
@@ -2594,6 +2720,10 @@ trait Registrar: Sized {
         self,
         entry: fln_elab::symm::SymmEntry,
     ) -> std::result::Result<Self, fln_elab::symm::SymmRegistryError>;
+    fn register_grind_patterns(
+        self,
+        rows: &[fln_elab::grind_patterns::GrindPattern],
+    ) -> std::result::Result<Self, fln_elab::grind_patterns::GrindPatternError>;
     fn register_defeq(
         self,
         declaration: &Name,
@@ -2729,6 +2859,12 @@ impl Registrar for instances::imported::ImportActivation {
         entry: fln_elab::symm::SymmEntry,
     ) -> std::result::Result<Self, fln_elab::symm::SymmRegistryError> {
         self.register_symm(entry)
+    }
+    fn register_grind_patterns(
+        self,
+        rows: &[fln_elab::grind_patterns::GrindPattern],
+    ) -> std::result::Result<Self, fln_elab::grind_patterns::GrindPatternError> {
+        self.register_grind_patterns(rows)
     }
     fn register_defeq(
         self,
@@ -4709,6 +4845,12 @@ pub(super) mod tests {
             entry: fln_elab::symm::SymmEntry,
         ) -> std::result::Result<Self, fln_elab::symm::SymmRegistryError> {
             fln_elab::symm::register(&self.0, entry).map(Sequential)
+        }
+        fn register_grind_patterns(
+            self,
+            rows: &[fln_elab::grind_patterns::GrindPattern],
+        ) -> std::result::Result<Self, fln_elab::grind_patterns::GrindPatternError> {
+            fln_elab::grind_patterns::register(&self.0, rows).map(Sequential)
         }
         fn register_defeq(
             self,

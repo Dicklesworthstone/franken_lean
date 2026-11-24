@@ -7,9 +7,9 @@ use super::*;
 use crate::source_extension_format as layout;
 use crate::source_extensions::{
     AliasEntry, ClassEntry, CoeEntry, DefaultEntry, DeprecationEntry, DiscrTreeKey,
-    ExternAttribute, ExternEntry, GrindPatternEntry, ImplementedByEntry, InlineEntry, InstanceEntry,
-    ReducibilityEntry, ReducibilityExtraEntry, SimpEntry, SimpKind, SimpTheorem, StructureEntry,
-    StructureField, StructureParent, SymmEntry,
+    ExternAttribute, ExternEntry, GrindPatternEntry, ImplementedByEntry, InlineEntry,
+    InstanceEntry, ReducibilityEntry, ReducibilityExtraEntry, SimpEntry, SimpKind, SimpTheorem,
+    StructureEntry, StructureField, StructureParent, SymmEntry,
 };
 use std::collections::HashSet;
 

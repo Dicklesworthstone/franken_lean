@@ -37,6 +37,7 @@ pub(super) fn supports_artifact_extension(descriptor: &ExtensionDescriptor) -> b
         || fln_elab::unbox::supports(descriptor)
         || fln_elab::match_pattern::supports(descriptor)
         || fln_elab::symm::supports(descriptor)
+        || fln_elab::grind_patterns::supports(descriptor)
         || fln_elab::eliminator_tags::supports(
             fln_elab::eliminator_tags::TagKind::ElabAsElim,
             descriptor,

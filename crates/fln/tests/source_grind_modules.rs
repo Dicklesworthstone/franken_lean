@@ -1,14 +1,15 @@
 //! Explicit grind registrations survive native imports without leaking private symbols.
 #![forbid(unsafe_code)]
 
+use fln::source_check::modules::imported::{SourceOleanImport, SourceOleanImportLimits};
 use fln::source_check::modules::{
-    SourceModuleBuildError, SourceModuleCheck, SourceModuleCheckError, SourceModuleCheckLimits,
+    SourceModuleBuild, SourceModuleCheck, SourceModuleCheckError, SourceModuleCheckLimits,
 };
 use fln::{
-    Budget, Engine, EngineAdmissionLimits, Expr, KVMap, Name, OleanWriteBudget, Outcome,
-    SourceCheckLimits, SourceModuleInput,
+    Budget, Engine, EngineAdmissionLimits, Expr, KVMap, Name, OleanCheckLimits, OleanModuleInput,
+    OleanWriteBudget, Outcome, SourceCheckLimits, SourceModuleInput,
 };
-use fln_elab::grind_patterns::{self, GrindPattern};
+use fln_elab::grind_patterns::{self, CapturedPatterns, GrindPattern};
 
 fn n(text: &str) -> Name {
     Name::from_components(text.split('.'))
@@ -44,16 +45,71 @@ fn complete(base: &Engine, files: &[(&str, &str)]) -> SourceModuleCheck {
 }
 
 fn row(declaration: Name, trigger: &str) -> GrindPattern {
+    let pattern = Expr::app(Expr::const_(n(trigger), vec![]), Expr::bvar(1).unwrap());
     GrindPattern {
         declaration,
         num_params: 2,
         data_params: 1,
         // The trailing proof occupies index zero in the full theorem telescope.
-        patterns: vec![Expr::app(
-            Expr::const_(n(trigger), vec![]),
-            Expr::bvar(1).unwrap(),
-        )],
+        patterns: vec![pattern.clone()],
+        captured: Some(CapturedPatterns {
+            patterns: vec![pattern],
+            symbols: vec![n(trigger)],
+        }),
     }
+}
+
+fn build(base: &Engine, files: &[(&str, &str)]) -> SourceModuleBuild {
+    let names: Vec<_> = files.iter().map(|(name, _)| n(name)).collect();
+    let inputs: Vec<_> = files
+        .iter()
+        .zip(&names)
+        .map(|((_, source), name)| SourceModuleInput {
+            name,
+            source: source.as_bytes(),
+        })
+        .collect();
+    base.compile_source_modules(
+        &inputs,
+        &n("Main"),
+        &KVMap::new(),
+        limits(),
+        OleanWriteBudget::default(),
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap()
+}
+
+fn import(base: &Engine, built: &SourceModuleBuild) -> SourceOleanImport {
+    let inputs: Vec<_> = built
+        .artifacts
+        .iter()
+        .map(|artifact| OleanModuleInput {
+            name: &artifact.name,
+            artifact: &artifact.bytes,
+            server_artifact: artifact
+                .companions
+                .as_ref()
+                .map(|parts| parts.server.as_slice()),
+            private_artifact: artifact
+                .companions
+                .as_ref()
+                .map(|parts| parts.private.as_slice()),
+        })
+        .collect();
+    base.import_olean_modules_for_source(
+        &inputs,
+        &[n("Main")],
+        &KVMap::new(),
+        SourceOleanImportLimits::new(OleanCheckLimits::new(
+            4 << 20,
+            limits().source.admission.kernel,
+        )),
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap()
 }
 
 const CORE: &str = "prelude\naxiom A : Type\naxiom p : A -> Prop\naxiom trigger : A -> A\naxiom other : A -> A\ntheorem rule (x : A) (h : p x) : p x := h\n";
@@ -131,43 +187,33 @@ fn a_private_trigger_on_a_public_rule_refuses_the_module_atomically() {
 }
 
 #[test]
-fn artifact_export_refuses_an_unencoded_grind_journal_without_losing_it() {
+fn artifact_export_reimports_ordered_groups_without_mutating_the_source_base() {
     let base = Engine::builder().build_empty();
     let before = base.logical_root(&KVMap::new());
-    let main = n("Main");
-    let build = |source: &str| {
-        base.compile_source_modules(
-            &[SourceModuleInput {
-                name: &main,
-                source: source.as_bytes(),
-            }],
-            &main,
-            &KVMap::new(),
-            limits(),
-            OleanWriteBudget::default(),
-        )
-    };
-    let plain = build(CORE).unwrap().into_complete().unwrap();
-    assert_eq!(plain.artifacts.len(), 1);
-    assert_eq!(plain.artifacts[0].name, main);
-    let registered = format!("{CORE}grind_pattern rule => trigger x\n");
-    let in_memory = complete(&base, &[("Main", &registered)]);
+    let registered = format!(
+        "{CORE}grind_pattern rule => trigger x\ngrind_pattern rule => other x\ngrind_pattern rule => trigger x\n"
+    );
+    let built = build(&base, &[("Main", &registered)]);
+    assert_eq!(built.artifacts.len(), 1);
+    let imported = import(&base, &built);
+    let expected = [
+        row(n("rule"), "trigger"),
+        row(n("rule"), "other"),
+        row(n("rule"), "trigger"),
+    ];
     assert_eq!(
-        grind_patterns::read(in_memory.checked.engine.environment()).unwrap(),
-        [row(n("rule"), "trigger")]
+        grind_patterns::read(built.checked.checked.engine.environment()).unwrap(),
+        expected
     );
-    let error = build(&registered).unwrap_err();
-    assert!(
-        matches!(
-            &error,
-            SourceModuleBuildError::Check(SourceModuleCheckError::Extension {
-                module, extension, ..
-            }) if *module == main && *extension == grind_patterns::journal_name()
-        ),
-        "{error:?}"
+    assert_eq!(
+        grind_patterns::read(imported.engine.environment()).unwrap(),
+        expected
     );
+    assert_eq!(imported.modules[0].grind_entries, 3);
+    assert_eq!(imported.modules[0].grind_patterns, 3);
+    assert_eq!(imported.modules[0].deferred_grind, 0);
     assert_eq!(base.logical_root(&KVMap::new()), before);
-    assert!(grind_patterns::read(base.environment()).unwrap().is_empty());
+    assert!(base.environment().is_empty());
 }
 
 #[test]
@@ -247,6 +293,10 @@ fn prelude_subtype_property_uses_its_checked_polymorphic_value_projection() {
             num_params: 3,
             data_params: 3,
             patterns: vec![trigger.clone()],
+            captured: Some(CapturedPatterns {
+                patterns: vec![trigger.clone()],
+                symbols: vec![n("Subtype.val")],
+            }),
         }]
     );
     // The registered proof is the structure's original second projection,
@@ -273,3 +323,6 @@ fn prelude_subtype_property_uses_its_checked_polymorphic_value_projection() {
     assert_eq!(*body, Expr::proj(n("Subtype"), 1, Expr::bvar(0).unwrap()));
     assert!(base.environment().is_empty());
 }
+
+#[path = "source_grind_modules/artifacts.rs"]
+mod artifacts;

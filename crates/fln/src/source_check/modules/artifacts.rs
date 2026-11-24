@@ -820,6 +820,66 @@ impl ArtifactData {
                     scope: entry.namespace,
                 });
         }
+        let grind_patterns = |env: &Environment, meter: &mut Meter| {
+            use fln_elab::grind_patterns::{self, GrindPatternError};
+            if let Some(journal) = env.extension(&grind_patterns::journal_name()) {
+                for entry in journal.entries() {
+                    meter.work(1)?;
+                    meter.bytes(entry.payload.len())?;
+                }
+            }
+            grind_patterns::read(env).map_err(|error| match error {
+                GrindPatternError::Limit => SourceModuleCheckError::Limit {
+                    resource: "native grind-pattern registrations",
+                    limit: grind_patterns::MAX_ROWS,
+                },
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: grind_patterns::journal_name(),
+                    reason: "invalid grind-pattern journal",
+                },
+            })
+        };
+        let inherited = grind_patterns(base, meter)?;
+        let current = grind_patterns(checked, meter)?;
+        if !current.starts_with(&inherited) {
+            return Err(SourceModuleCheckError::Extension {
+                module: name.clone(),
+                extension: fln_elab::grind_patterns::journal_name(),
+                reason: "grind patterns do not extend the checked predecessor journal",
+            });
+        }
+        for entry in current.into_iter().skip(inherited.len()) {
+            meter.work(1)?;
+            let captured = entry.captured.ok_or_else(|| SourceModuleCheckError::Extension {
+                module: name.clone(),
+                extension: fln_elab::grind_patterns::journal_name(),
+                reason: "a legacy grind pattern has no registration-time normalization snapshot",
+            })?;
+            let declaration = checked.find(&entry.declaration).ok_or_else(|| {
+                SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::grind_patterns::journal_name(),
+                    reason: "a grind-pattern registration names a hidden declaration",
+                }
+            })?;
+            let levels = declaration
+                .constant_val()
+                .level_params
+                .iter()
+                .cloned()
+                .map(fln_core::level::Level::param)
+                .collect();
+            metadata
+                .grind_patterns
+                .push(fln_olean::source_extensions::GrindPatternEntry {
+                    proof: Expr::const_(entry.declaration.clone(), levels),
+                    declaration: entry.declaration,
+                    num_params: entry.num_params,
+                    patterns: captured.patterns,
+                    symbols: captured.symbols,
+                });
+        }
         let eliminator_tags = |env: &Environment, kind, meter: &mut Meter| {
             let extension = fln_elab::eliminator_tags::journal_name(kind);
             if let Some(journal) = env.extension(&extension) {
