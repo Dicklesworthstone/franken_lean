@@ -7,7 +7,7 @@ use super::*;
 use crate::source_extension_format as layout;
 use crate::source_extensions::{
     AliasEntry, ClassEntry, CoeEntry, DefaultEntry, DeprecationEntry, DiscrTreeKey,
-    ExternAttribute, ExternEntry, ImplementedByEntry, InlineEntry, InstanceEntry,
+    ExternAttribute, ExternEntry, GrindPatternEntry, ImplementedByEntry, InlineEntry, InstanceEntry,
     ReducibilityEntry, ReducibilityExtraEntry, SimpEntry, SimpKind, SimpTheorem, StructureEntry,
     StructureField, StructureParent, SymmEntry,
 };
@@ -19,6 +19,7 @@ mod compiler;
 mod defaults;
 mod deprecations;
 mod executable;
+mod grind;
 mod inlining;
 mod instances;
 mod namespaces;
@@ -66,6 +67,9 @@ pub struct SourceMetadata {
     /// Chronological global/scoped symmetry registrations with their original paths.
     /// Targets may be dependency declarations and repeated entries remain ordered.
     pub symms: Vec<SymmEntry>,
+    /// Chronological global user patterns in the pin's normalized wire form.
+    /// Each row is one simultaneous group; repeated rows are not deduplicated.
+    pub grind_patterns: Vec<GrindPatternEntry>,
     /// Chronological coercion printing metadata, including updates to imported declarations.
     /// Repeated registrations stay ordered so the final row supplies the active metadata.
     pub coercions: Vec<CoeEntry>,
@@ -180,6 +184,9 @@ impl Encoder {
         }
         if !metadata.symms.is_empty() {
             blocks.push(self.symm_block(&metadata.symms)?);
+        }
+        if !metadata.grind_patterns.is_empty() {
+            blocks.push(self.grind_block(&metadata.grind_patterns)?);
         }
         if !metadata.coercions.is_empty() {
             blocks.push(self.coercion_block(&metadata.coercions)?);

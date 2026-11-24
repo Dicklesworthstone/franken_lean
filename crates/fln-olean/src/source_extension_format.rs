@@ -36,6 +36,15 @@
 //! src/Lean/Elab/App.lean: sha256 3010f5f1fdb8b95701b7e201ff6af7184f9b2e762aeef1ab2261eac11a478569
 //! stage0/stdlib/Lean/AuxRecursor.c: sha256 9323e0f5dc1e4ee134c383c3970ae90f39a1a8701eabc7436e7fbb01f4386ff7
 //! src/Lean/Meta/CoeAttr.lean: sha256 b71fe94a3fe4dc0430dda77c5f77c97a5b8fde6f7a9fef5fafaca0b5aaedd0b9
+//! src/Lean/Meta/Tactic/Grind/Extension.lean: sha256 02cd16588433b14d16f1bde225ce0495f6cb7d860b7529cb0ab45226aac0dad0
+//! src/Lean/Meta/Tactic/Grind/Attr.lean: sha256 90d78e6b402c4e42ba72b4245ec10c361e11275c75ad9bdc4b97b686668cdb46
+//! src/Lean/Meta/Tactic/Grind/Theorems.lean: sha256 77d0b30585f35e5328456c099a02d6b53aeef5e7614c8da5a69c237e13d3a69a
+//! src/Lean/Meta/Tactic/Grind/EMatchTheorem.lean: sha256 8fa4f2553434362e6406daaeefbc94fd7ee98379d475849d1e7d3fa0bd99d887
+//! src/Lean/HeadIndex.lean: sha256 5ba5955d35fc80848c0de5213bc85196d4853a97a81d52628cd027d82c4009d0
+//! stage0/stdlib/Lean/Meta/Tactic/Grind/Extension.c: sha256 bfb0a1813783a1ade91e8de2c093553c97d4ea1917d95fe0d2eea10d8b774858
+//! stage0/stdlib/Lean/Meta/Tactic/Grind/Attr.c: sha256 767512344301c18e3b41c780beb3374b87f8f8d55eee6312da72b119a911ced5
+//! stage0/stdlib/Lean/Meta/Tactic/Grind/EMatchTheorem.c: sha256 11d5046ed8607eac5c77fe3a655bc038370a40e395f8265bea30acd2bad58636
+//! stage0/stdlib/Lean/HeadIndex.c: sha256 357a938edda3ae067fb3d6d541a99e1c87467892a67b1de1e9d3f94aaf547524
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -300,3 +309,121 @@ pub const PARSER_NAME_LITERAL_FORMS: &[(&str, usize)] = &[
 ];
 pub const PARSER_NAT_LITERAL_INSTANCE: &str = "instOfNatNat";
 pub const PARSER_NAT_LITERAL_PROJECTION: &str = "OfNat.ofNat";
+
+pub const GRIND_EXTENSION: &str = "Lean.Meta.Grind.grindExt";
+pub const GRIND_THM_LEVEL_PARAMS: usize = 0;
+pub const GRIND_THM_PROOF: usize = 1;
+pub const GRIND_THM_NUM_PARAMS: usize = 2;
+pub const GRIND_THM_PATTERNS: usize = 3;
+pub const GRIND_THM_SYMBOLS: usize = 4;
+pub const GRIND_THM_ORIGIN: usize = 5;
+pub const GRIND_THM_KIND: usize = 6;
+pub const GRIND_THM_MIN_INDEXABLE_SCALAR: usize = 0;
+pub const GRIND_THM_CNSTRS: usize = 7;
+pub const GRIND_THM_POINTERS: usize = 8;
+pub const GRIND_THM_SCALAR_BYTES: usize = 1;
+pub const GRIND_ENTRY_EXT: u8 = 0;
+pub const GRIND_ENTRY_EXT_DECL_NAME: usize = 0;
+pub const GRIND_ENTRY_EXT_POINTERS: usize = 1;
+pub const GRIND_ENTRY_EXT_SCALAR_BYTES: usize = 0;
+pub const GRIND_ENTRY_FUN_CC: u8 = 1;
+pub const GRIND_ENTRY_FUN_CC_DECL_NAME: usize = 0;
+pub const GRIND_ENTRY_FUN_CC_POINTERS: usize = 1;
+pub const GRIND_ENTRY_FUN_CC_SCALAR_BYTES: usize = 0;
+pub const GRIND_ENTRY_CASES: u8 = 2;
+pub const GRIND_ENTRY_CASES_DECL_NAME: usize = 0;
+pub const GRIND_ENTRY_CASES_EAGER_SCALAR: usize = 0;
+pub const GRIND_ENTRY_CASES_POINTERS: usize = 1;
+pub const GRIND_ENTRY_CASES_SCALAR_BYTES: usize = 1;
+pub const GRIND_ENTRY_EMATCH: u8 = 3;
+pub const GRIND_ENTRY_EMATCH_THM: usize = 0;
+pub const GRIND_ENTRY_EMATCH_POINTERS: usize = 1;
+pub const GRIND_ENTRY_EMATCH_SCALAR_BYTES: usize = 0;
+pub const GRIND_ENTRY_INJ: u8 = 4;
+pub const GRIND_ENTRY_INJ_THM: usize = 0;
+pub const GRIND_ENTRY_INJ_POINTERS: usize = 1;
+pub const GRIND_ENTRY_INJ_SCALAR_BYTES: usize = 0;
+pub const GRIND_KIND_EQ_LHS: u8 = 0;
+pub const GRIND_KIND_EQ_LHS_GEN_SCALAR: usize = 0;
+pub const GRIND_KIND_EQ_LHS_POINTERS: usize = 0;
+pub const GRIND_KIND_EQ_LHS_SCALAR_BYTES: usize = 1;
+pub const GRIND_KIND_EQ_RHS: u8 = 1;
+pub const GRIND_KIND_EQ_RHS_GEN_SCALAR: usize = 0;
+pub const GRIND_KIND_EQ_RHS_POINTERS: usize = 0;
+pub const GRIND_KIND_EQ_RHS_SCALAR_BYTES: usize = 1;
+pub const GRIND_KIND_EQ_BOTH: u8 = 2;
+pub const GRIND_KIND_EQ_BOTH_GEN_SCALAR: usize = 0;
+pub const GRIND_KIND_EQ_BOTH_POINTERS: usize = 0;
+pub const GRIND_KIND_EQ_BOTH_SCALAR_BYTES: usize = 1;
+pub const GRIND_KIND_EQ_BWD: u8 = 3;
+pub const GRIND_KIND_EQ_BWD_POINTERS: usize = 0;
+pub const GRIND_KIND_EQ_BWD_SCALAR_BYTES: usize = 0;
+pub const GRIND_KIND_FWD: u8 = 4;
+pub const GRIND_KIND_FWD_POINTERS: usize = 0;
+pub const GRIND_KIND_FWD_SCALAR_BYTES: usize = 0;
+pub const GRIND_KIND_BWD: u8 = 5;
+pub const GRIND_KIND_BWD_GEN_SCALAR: usize = 0;
+pub const GRIND_KIND_BWD_POINTERS: usize = 0;
+pub const GRIND_KIND_BWD_SCALAR_BYTES: usize = 1;
+pub const GRIND_KIND_LEFT_RIGHT: u8 = 6;
+pub const GRIND_KIND_LEFT_RIGHT_POINTERS: usize = 0;
+pub const GRIND_KIND_LEFT_RIGHT_SCALAR_BYTES: usize = 0;
+pub const GRIND_KIND_RIGHT_LEFT: u8 = 7;
+pub const GRIND_KIND_RIGHT_LEFT_POINTERS: usize = 0;
+pub const GRIND_KIND_RIGHT_LEFT_SCALAR_BYTES: usize = 0;
+pub const GRIND_KIND_DEFAULT: u8 = 8;
+pub const GRIND_KIND_DEFAULT_GEN_SCALAR: usize = 0;
+pub const GRIND_KIND_DEFAULT_POINTERS: usize = 0;
+pub const GRIND_KIND_DEFAULT_SCALAR_BYTES: usize = 1;
+pub const GRIND_KIND_USER: u8 = 9;
+pub const GRIND_KIND_USER_POINTERS: usize = 0;
+pub const GRIND_KIND_USER_SCALAR_BYTES: usize = 0;
+pub const GRIND_ORIGIN_DECL: u8 = 0;
+pub const GRIND_ORIGIN_DECL_DECL_NAME: usize = 0;
+pub const GRIND_ORIGIN_DECL_POINTERS: usize = 1;
+pub const GRIND_ORIGIN_DECL_SCALAR_BYTES: usize = 0;
+pub const GRIND_ORIGIN_FVAR: u8 = 1;
+pub const GRIND_ORIGIN_FVAR_FVAR_ID: usize = 0;
+pub const GRIND_ORIGIN_FVAR_POINTERS: usize = 1;
+pub const GRIND_ORIGIN_FVAR_SCALAR_BYTES: usize = 0;
+pub const GRIND_ORIGIN_STX: u8 = 2;
+pub const GRIND_ORIGIN_STX_ID: usize = 0;
+pub const GRIND_ORIGIN_STX_REF: usize = 1;
+pub const GRIND_ORIGIN_STX_POINTERS: usize = 2;
+pub const GRIND_ORIGIN_STX_SCALAR_BYTES: usize = 0;
+pub const GRIND_ORIGIN_LOCAL: u8 = 3;
+pub const GRIND_ORIGIN_LOCAL_ID: usize = 0;
+pub const GRIND_ORIGIN_LOCAL_POINTERS: usize = 1;
+pub const GRIND_ORIGIN_LOCAL_SCALAR_BYTES: usize = 0;
+pub const GRIND_HEAD_FVAR: u8 = 0;
+pub const GRIND_HEAD_FVAR_FVAR_ID: usize = 0;
+pub const GRIND_HEAD_FVAR_POINTERS: usize = 1;
+pub const GRIND_HEAD_FVAR_SCALAR_BYTES: usize = 0;
+pub const GRIND_HEAD_MVAR: u8 = 1;
+pub const GRIND_HEAD_MVAR_MVAR_ID: usize = 0;
+pub const GRIND_HEAD_MVAR_POINTERS: usize = 1;
+pub const GRIND_HEAD_MVAR_SCALAR_BYTES: usize = 0;
+pub const GRIND_HEAD_CONST: u8 = 2;
+pub const GRIND_HEAD_CONST_CONST_NAME: usize = 0;
+pub const GRIND_HEAD_CONST_POINTERS: usize = 1;
+pub const GRIND_HEAD_CONST_SCALAR_BYTES: usize = 0;
+pub const GRIND_HEAD_PROJ: u8 = 3;
+pub const GRIND_HEAD_PROJ_STRUCT_NAME: usize = 0;
+pub const GRIND_HEAD_PROJ_IDX: usize = 1;
+pub const GRIND_HEAD_PROJ_POINTERS: usize = 2;
+pub const GRIND_HEAD_PROJ_SCALAR_BYTES: usize = 0;
+pub const GRIND_HEAD_LIT: u8 = 4;
+pub const GRIND_HEAD_LIT_LIT_VAL: usize = 0;
+pub const GRIND_HEAD_LIT_POINTERS: usize = 1;
+pub const GRIND_HEAD_LIT_SCALAR_BYTES: usize = 0;
+pub const GRIND_HEAD_SORT: u8 = 5;
+pub const GRIND_HEAD_SORT_POINTERS: usize = 0;
+pub const GRIND_HEAD_SORT_SCALAR_BYTES: usize = 0;
+pub const GRIND_HEAD_LAM: u8 = 6;
+pub const GRIND_HEAD_LAM_POINTERS: usize = 0;
+pub const GRIND_HEAD_LAM_SCALAR_BYTES: usize = 0;
+pub const GRIND_HEAD_FORALL_E: u8 = 7;
+pub const GRIND_HEAD_FORALL_E_POINTERS: usize = 0;
+pub const GRIND_HEAD_FORALL_E_SCALAR_BYTES: usize = 0;
+pub const GRIND_DONT_CARE: &str = "[grind_dontcare]";
+pub const GRIND_GROUND_PATTERN_ANNOTATION: &str = "grind.ground_pat";

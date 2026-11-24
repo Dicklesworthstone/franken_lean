@@ -234,6 +234,162 @@ def parser_contract(text):
     return lines
 
 
+
+def grind_contract(text, sources):
+    """Extract global user-pattern rows and verify their pinned C layout."""
+    extension = text["src/Lean/Meta/Tactic/Grind/Extension.lean"]
+    attr = text["src/Lean/Meta/Tactic/Grind/Attr.lean"]
+    theorems = text["src/Lean/Meta/Tactic/Grind/Theorems.lean"]
+    heads = text["src/Lean/HeadIndex.lean"]
+    patterns = text["src/Lean/Meta/Tactic/Grind/EMatchTheorem.lean"]
+    namespace = re.search(r"^namespace (Lean\.Meta\.Grind)\s*$", attr, re.M)
+    registration = re.search(
+        r"^builtin_initialize (\w+) : Extension ← registerAttr " + chr(96) + r"grind\s*$",
+        attr, re.M)
+    if namespace is None or registration is None:
+        raise ValueError("grind extension identity drift")
+    for fragment in [
+        "abbrev Extension := SimpleScopedEnvExtension Entry ExtensionState",
+        "name     := name", "addEntry := ExtensionState.addEntry",
+    ]:
+        if fragment not in extension:
+            raise ValueError("grind extension registration drift: " + fragment)
+    register = declaration(attr, "def", "registerAttr")
+    if "let ext ← mkExtension ref" not in register or not re.search(
+        r"^def registerAttr \(attrName : Name\) \(ref : Name := by exact decl_name%\)", attr, re.M
+    ):
+        raise ValueError("grind extension registration reference drift")
+    lines = ["", f'pub const GRIND_EXTENSION: &str = "{namespace[1]}.{registration[1]}";']
+    pointer_types = {
+        "Name", "Expr", "Nat", "Array Name", "List Expr", "List HeadIndex",
+        "Origin", "EMatchTheoremKind", "List EMatchTheoremConstraint",
+        "EMatchTheorem", "InjectiveTheorem", "FVarId", "MVarId", "Syntax", "Literal",
+    }
+
+    def constant(name):
+        return re.sub(r"([a-z])([A-Z])", r"\1_\2", name).upper()
+
+    def layout(prefix, fields):
+        pointers, scalars = {}, {}
+        for field, ty in fields:
+            if ty == "Bool":
+                scalars[field] = len(scalars)
+                lines.append(f"pub const {prefix}_{constant(field)}_SCALAR: usize = {scalars[field]};")
+            elif ty in pointer_types:
+                pointers[field] = len(pointers)
+                lines.append(f"pub const {prefix}_{constant(field)}: usize = {pointers[field]};")
+            else:
+                raise ValueError(f"unsupported {prefix} field type {ty!r}")
+        lines.extend([
+            f"pub const {prefix}_POINTERS: usize = {len(pointers)};",
+            f"pub const {prefix}_SCALAR_BYTES: usize = {len(scalars)};",
+        ])
+        return pointers, scalars
+
+    fields = re.findall(
+        r"^\s+(\w+)\s*:\s*(.+?)(?:\s*:=.*)?$",
+        declaration(extension, "structure", "EMatchTheorem"), re.M)
+    fields = [(name, ty.strip()) for name, ty in fields]
+    if fields != [
+        ("levelParams", "Array Name"), ("proof", "Expr"), ("numParams", "Nat"),
+        ("patterns", "List Expr"), ("symbols", "List HeadIndex"), ("origin", "Origin"),
+        ("kind", "EMatchTheoremKind"), ("minIndexable", "Bool"),
+        ("cnstrs", "List EMatchTheoremConstraint"),
+    ]:
+        raise ValueError(f"grind theorem field drift: {fields}")
+    theorem_pointers, theorem_scalars = layout("GRIND_THM", fields)
+    enums = [
+        ("GRIND_ENTRY", extension, "Entry", [
+            ("ext", [("declName", "Name")]), ("funCC", [("declName", "Name")]),
+            ("cases", [("declName", "Name"), ("eager", "Bool")]),
+            ("ematch", [("thm", "EMatchTheorem")]), ("inj", [("thm", "InjectiveTheorem")]),
+        ]),
+        ("GRIND_KIND", extension, "EMatchTheoremKind", [
+            ("eqLhs", [("gen", "Bool")]), ("eqRhs", [("gen", "Bool")]),
+            ("eqBoth", [("gen", "Bool")]), ("eqBwd", []), ("fwd", []),
+            ("bwd", [("gen", "Bool")]), ("leftRight", []), ("rightLeft", []),
+            ("default", [("gen", "Bool")]), ("user", []),
+        ]),
+        ("GRIND_ORIGIN", theorems, "Origin", [
+            ("decl", [("declName", "Name")]), ("fvar", [("fvarId", "FVarId")]),
+            ("stx", [("id", "Name"), ("ref", "Syntax")]), ("local", [("id", "Name")]),
+        ]),
+        ("GRIND_HEAD", heads, "HeadIndex", [
+            ("fvar", [("fvarId", "FVarId")]), ("mvar", [("mvarId", "MVarId")]),
+            ("const", [("constName", "Name")]), ("proj", [("structName", "Name"), ("idx", "Nat")]),
+            ("lit", [("litVal", "Literal")]), ("sort", []), ("lam", []), ("forallE", []),
+        ]),
+    ]
+    tags = {}
+    for prefix, source, name, expected in enums:
+        actual = constructor_fields(declaration(source, "inductive", name))
+        if actual != expected:
+            raise ValueError(f"{name} grind constructor drift: {actual}")
+        for index, (name, fields) in enumerate(actual):
+            key = f"{prefix}_{constant(name)}"
+            tags[key] = index
+            lines.append(f"pub const {key}: u8 = {index};")
+            layout(key, fields)
+    dont_care = re.search(r'^private def dontCare := mkConst \(Name\.mkSimple "([^"]+)"\)\s*$', patterns, re.M)
+    ground = re.search(
+        r"^def mkGroundPattern \(e : Expr\) : Expr :=\s*\n\s*mkAnnotation "
+        + chr(96) + r"([\w.]+) e\s*$", patterns, re.M)
+    if dont_care is None or ground is None:
+        raise ValueError("grind normalized-pattern gadget drift")
+    lines.extend([
+        f'pub const GRIND_DONT_CARE: &str = "{dont_care[1]}";',
+        f'pub const GRIND_GROUND_PATTERN_ANNOTATION: &str = "{ground[1]}";',
+    ])
+
+    def c_function(path, name):
+        source = sources[path]
+        found = re.search(r"^LEAN_EXPORT [^\n]*\b" + re.escape(name) + r"\([^;\n]*\)\{", source, re.M)
+        if found is None:
+            raise ValueError(f"missing pinned C function: {name}")
+        end, depth = found.end(), 1
+        while end < len(source) and depth:
+            depth += (source[end] == "{") - (source[end] == "}")
+            end += 1
+        if depth:
+            raise ValueError(f"unclosed pinned C function: {name}")
+        return source[found.start():end]
+
+    c_root = "stage0/stdlib/Lean/Meta/Tactic/Grind/"
+    update = c_function(c_root + "Extension.c", "l_Lean_Meta_Grind_instTheoremLikeEMatchTheorem___lam__1")
+    pointer_count, scalar_count = len(theorem_pointers), len(theorem_scalars)
+    if f"lean_alloc_ctor(0, {pointer_count}, {scalar_count})" not in update:
+        raise ValueError("compiled grind theorem allocation layout drift")
+    for field, index in theorem_pointers.items():
+        if not re.search(rf"lean_ctor_set\(\w+, {index}, v_{field}_\d+_\);", update):
+            raise ValueError(f"compiled grind theorem pointer drift: {field}")
+    for field, index in theorem_scalars.items():
+        offset = rf"sizeof\(void\*\)\*{pointer_count}" + (rf" \+ {index}" if index else "")
+        if not re.search(rf"lean_ctor_set_uint8\(\w+, {offset}, v_{field}_\d+_\);", update):
+            raise ValueError(f"compiled grind theorem scalar drift: {field}")
+    add = c_function(c_root + "EMatchTheorem.c", "l_Lean_Meta_Grind_Extension_addEMatchTheorem")
+    if f"lean_alloc_ctor({tags['GRIND_ENTRY_EMATCH']}, 1, 0)" not in add:
+        raise ValueError("compiled grind ematch wrapper drift")
+    make = c_function(c_root + "EMatchTheorem.c", "l_Lean_Meta_Grind_mkEMatchTheorem")
+    if not re.search(
+        rf"(\w+) = lean_alloc_ctor\({tags['GRIND_ORIGIN_DECL']}, 1, 0\);\s*"
+        rf"lean_ctor_set\(\1, 0, v_declName_\d+_\);", make
+    ):
+        raise ValueError("compiled grind declaration origin drift")
+    attr_c = c_function(c_root + "Attr.c", "l_Lean_Meta_Grind_getAttrKindCore")
+    if f"lean_box({tags['GRIND_KIND_USER']})" not in attr_c:
+        raise ValueError("compiled grind user-kind scalar drift")
+    head_c = c_function(
+        "stage0/stdlib/Lean/HeadIndex.c",
+        "l___private_Lean_HeadIndex_0__Lean_Expr_toHeadIndexQuick_x3f",
+    )
+    if not re.search(
+        rf"(\w+) = lean_alloc_ctor\({tags['GRIND_HEAD_CONST']}, 1, 0\);\s*"
+        rf"lean_ctor_set\(\1, 0, v_declName_\d+_\);", head_c
+    ):
+        raise ValueError("compiled constant HeadIndex layout drift")
+    return lines
+
+
 def render():
     reference = [line for line in (ROOT / "SUITE.lock").read_text().splitlines() if line.startswith("reference ")]
     if len(reference) != 1:
@@ -256,6 +412,17 @@ def render():
     files.append("src/Lean/Elab/App.lean")
     files.append("stage0/stdlib/Lean/AuxRecursor.c")
     files.append("src/Lean/Meta/CoeAttr.lean")
+    files.extend([
+        "src/Lean/Meta/Tactic/Grind/Extension.lean",
+        "src/Lean/Meta/Tactic/Grind/Attr.lean",
+        "src/Lean/Meta/Tactic/Grind/Theorems.lean",
+        "src/Lean/Meta/Tactic/Grind/EMatchTheorem.lean",
+        "src/Lean/HeadIndex.lean",
+        "stage0/stdlib/Lean/Meta/Tactic/Grind/Extension.c",
+        "stage0/stdlib/Lean/Meta/Tactic/Grind/Attr.c",
+        "stage0/stdlib/Lean/Meta/Tactic/Grind/EMatchTheorem.c",
+        "stage0/stdlib/Lean/HeadIndex.c",
+    ])
     sources = {path: (VENDOR / path).read_text(encoding="utf-8") for path in files}
     text = {path: strip_comments(value) for path, value in sources.items()}
     lines = ["//! Generated by scripts/extract/gen_source_extension_contract.py; do not edit.",
@@ -740,6 +907,7 @@ def render():
     lines += ["pub const LIST_CONS_HEAD: usize = 0;", "pub const LIST_CONS_TAIL: usize = 1;",
               "pub const LIST_CONS_POINTERS: usize = 2;"]
     lines.extend(parser_contract(text))
+    lines.extend(grind_contract(text, sources))
     return "\n".join(lines) + "\n"
 
 

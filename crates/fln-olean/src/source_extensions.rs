@@ -20,6 +20,7 @@ pub use format::{
     ALIAS_EXTENSION, APP_UNEXPANDER_EXTENSION, AUX_RECURSOR_EXTENSION, BACKWARD_DEFEQ_EXTENSION,
     CLASS_EXTENSION, COE_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION, DEPRECATED_EXTENSION,
     ELAB_AS_ELIM_EXTENSION, EXTERN_EXTENSION, IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION,
+    GRIND_EXTENSION, GRIND_DONT_CARE, GRIND_GROUND_PATTERN_ANNOTATION,
     INSTANCE_EXTENSION, MATCH_PATTERN_EXTENSION, NONCOMPUTABLE_EXTENSION,
     PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION, PROTECTED_EXTENSION,
     REDUCIBILITY_EXTENSION, REDUCIBILITY_EXTRA_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
@@ -29,6 +30,8 @@ mod deprecations;
 pub use deprecations::DeprecationEntry;
 mod externs;
 pub use externs::{ExternAttribute, ExternEntry};
+mod grind;
+pub use grind::GrindPatternEntry;
 pub mod macros;
 pub mod parsers;
 mod simp;
@@ -242,6 +245,12 @@ pub struct SourceExtensions {
     pub match_patterns: Vec<Name>,
     /// Global/scoped symmetry registrations, including repeated rows, in source order.
     pub symms: Vec<SymmEntry>,
+    /// One slot per physical grind journal row, in module order. Unsupported
+    /// variants, inferred patterns, scopes and constraints remain `None` so
+    /// callers can retain exact module windows without activating those effects.
+    pub grind_patterns: Vec<Option<GrindPatternEntry>>,
+    /// Number of deferred grind rows. Their extension also stays uninterpreted.
+    pub grind_deferred: usize,
     /// The pin's defeq attribute tags, not evidence that an equation is true.
     /// Source activation must bind names to their checked owning module; each
     /// use still requires conversion and ordinary proof checking.
@@ -283,10 +292,10 @@ pub struct SourceExtensions {
 pub struct DecodeLimits {
     pub max_bytes: usize,
     pub max_objects: u64,
-    /// Cumulative journal rows, extern list cells, and structure array cells.
+    /// Cumulative journal rows, extern/grind list cells, and structure array cells.
     pub max_entries: usize,
     pub max_indices: usize,
-    /// Cumulative instance and simp `DiscrTree` keys across the batch.
+    /// Cumulative instance/simp `DiscrTree` keys and grind symbols across the batch.
     pub max_keys: usize,
 }
 impl Default for DecodeLimits {
@@ -783,6 +792,7 @@ fn decode_batch(
         name(format::ELAB_AS_ELIM_EXTENSION),
         sparse_cases_on_extension_name(),
         name(format::COE_EXTENSION),
+        name(format::GRIND_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -816,6 +826,7 @@ fn decode_batch(
         entries_left = entries_left
             .checked_sub(block.entries.len())
             .ok_or_else(|| limit("entries"))?;
+        let mut grind_deferred = false;
         for payload in &block.entries {
             bytes_left = bytes_left
                 .checked_sub(payload.len())
@@ -975,8 +986,19 @@ fn decode_batch(
                     names.push(declaration);
                 }
                 28 => out.coercions.push(reader.coercion(&obj)?),
-                _ => unreachable!("twenty-nine selected extension families"),
+                29 => {
+                    let row = reader.grind(&obj, &mut entries_left)?;
+                    if row.is_none() {
+                        out.grind_deferred += 1;
+                        grind_deferred = true;
+                    }
+                    out.grind_patterns.push(row);
+                }
+                _ => unreachable!("thirty selected extension families"),
             }
+        }
+        if grind_deferred {
+            out.uninterpreted.push(block.name.clone());
         }
     }
     Ok((
