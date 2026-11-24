@@ -295,6 +295,11 @@ pub struct DefEqDeferred {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefEqMismatch {
+    /// A dependent function type and a fully applied registered inductive type.
+    ForallInductive {
+        left: DefEqLocation,
+        right: DefEqLocation,
+    },
     /// Fully applied inductive types with distinct registered heads.
     InductiveHeads {
         left: DefEqLocation,
@@ -4448,6 +4453,24 @@ fn run_slow(
                                 )
                             };
                             let mismatch = match (need.left_class, need.right_class) {
+                                (
+                                    ExpressionClass::Forall,
+                                    ExpressionClass::Apply | ExpressionClass::Constant,
+                                ) if head(right_reference)?.is_some() => {
+                                    Some(DefEqMismatch::ForallInductive {
+                                        left: left_reference.location(),
+                                        right: right_reference.location(),
+                                    })
+                                }
+                                (
+                                    ExpressionClass::Apply | ExpressionClass::Constant,
+                                    ExpressionClass::Forall,
+                                ) if head(left_reference)?.is_some() => {
+                                    Some(DefEqMismatch::ForallInductive {
+                                        left: left_reference.location(),
+                                        right: right_reference.location(),
+                                    })
+                                }
                                 (
                                     ExpressionClass::Sort,
                                     ExpressionClass::Apply | ExpressionClass::Constant,

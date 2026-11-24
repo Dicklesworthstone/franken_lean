@@ -565,6 +565,113 @@ fn sort_clashes_only_with_a_saturated_rigid_inductive() {
 }
 
 #[test]
+fn inductive_types_and_function_types_have_distinct_rigid_heads() {
+    let type_ = Expr::sort(Level::one());
+    let arrow = Expr::forall_e(
+        name("x"),
+        constant("Nat"),
+        constant("Nat"),
+        BinderInfo::Default,
+    );
+    let family_type = Expr::forall_e(
+        name("n"),
+        constant("Nat"),
+        type_.clone(),
+        BinderInfo::Default,
+    );
+    let entry = |label: &str, ty: &Expr, indices| {
+        let id = checker_name(label);
+        ConstantEntry::new(
+            id.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(ty),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(0, indices, vec![id], Vec::new(), 0, false, false),
+            ),
+        )
+    };
+    let context = definition_context(vec![
+        entry("Nat", &type_, 0),
+        entry("Family", &family_type, 1),
+        definition_entry(
+            "TypeAlias",
+            decoded(&constant("Nat")),
+            ReducibilityHint::Abbrev,
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "FunctionAlias",
+            decoded(&arrow),
+            ReducibilityHint::Abbrev,
+            DefinitionSafety::Safe,
+        ),
+    ]);
+    let applied = Expr::app(constant("Family"), nat_literal(0));
+    let compare =
+        |a: &Expr, b: &Expr| def_eq(&decoded(a), &decoded(b), &context, DefEqBudget::unlimited());
+    let wrap = |body| Expr::forall_e(name("n"), constant("Nat"), body, BinderInfo::Default);
+    for family in [constant("Nat"), applied.clone(), constant("TypeAlias")] {
+        for (a, b) in [(&family, &arrow), (&arrow, &family)] {
+            for (left, right) in [(a.clone(), b.clone()), (wrap(a.clone()), wrap(b.clone()))] {
+                assert!(matches!(
+                    compare(&left, &right),
+                    DefEqOutcome::NotEqual {
+                        mismatch: DefEqMismatch::ForallInductive { .. },
+                        ..
+                    }
+                ));
+            }
+            assert!(matches!(
+                compare(
+                    &Expr::app(constant("f"), a.clone()),
+                    &Expr::app(constant("f"), b.clone())
+                ),
+                DefEqOutcome::Deferred { .. }
+            ));
+            let erase = Expr::lam(
+                name("ignored"),
+                type_.clone(),
+                nat_literal(7),
+                BinderInfo::Default,
+            );
+            assert!(matches!(
+                compare(
+                    &Expr::app(erase.clone(), a.clone()),
+                    &Expr::app(erase, b.clone())
+                ),
+                DefEqOutcome::Equal(_)
+            ));
+        }
+    }
+    for candidate in [
+        constant("Family"),
+        constant("Missing"),
+        Expr::const_(name("Nat"), vec![Level::zero()]),
+        Expr::app(constant("Nat"), nat_literal(0)),
+        Expr::app(applied, nat_literal(1)),
+    ] {
+        for (a, b) in [(&candidate, &arrow), (&arrow, &candidate)] {
+            assert!(matches!(compare(a, b), DefEqOutcome::Deferred { .. }));
+        }
+    }
+    assert!(matches!(
+        compare(&constant("FunctionAlias"), &arrow),
+        DefEqOutcome::Equal(_)
+    ));
+    assert!(matches!(
+        def_eq_with(
+            &decoded(&constant("Nat")),
+            &decoded(&arrow),
+            &context,
+            DefEqBudget::unlimited(),
+            || true
+        ),
+        DefEqOutcome::Inconclusive(_)
+    ));
+}
+
+#[test]
 fn pi_and_inductive_type_injectivity_preserve_nested_mismatches() {
     let prop = Expr::sort(Level::zero());
     let type_ = Expr::sort(Level::one());

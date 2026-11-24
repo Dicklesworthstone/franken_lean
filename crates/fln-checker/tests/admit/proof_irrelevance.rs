@@ -479,6 +479,61 @@ fn expanded_character_proofs_reach_typed_admission_without_equating_data() {
 }
 
 #[test]
+fn inductive_and_function_type_mismatches_remain_irrelevant_inside_proofs() {
+    let type_ = Expr::sort(Level::one());
+    let arrow = pi(c("Nat"), c("Nat"));
+    let inductive = |label: &str, ty: Expr, indices| {
+        let id = checker_name(label);
+        ConstantEntry::new(
+            id.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&ty),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(0, indices, vec![id], Vec::new(), 0, false, false),
+            ),
+        )
+    };
+    let proof_type = |t| app(c("ProofIndex"), [app(c("mkType"), [t])]);
+    let env = environment_of(vec![
+        inductive("Nat", type_.clone(), 0),
+        inductive("Family", pi(c("Nat"), type_.clone()), 1),
+        entry("n", c("Nat")),
+        entry("f", arrow.clone()),
+        entry(
+            "family0",
+            app(c("Family"), [Expr::lit(Literal::Nat(NatLit::from_u64(0)))]),
+        ),
+        definition("FunctionAlias", decoded(&type_), decoded(&arrow)),
+        entry("P", Expr::sort(Level::zero())),
+        entry("mkType", pi(type_, c("P"))),
+        inductive("ProofIndex", pi(c("P"), Expr::sort(Level::one())), 1),
+        entry("proof_witness", proof_type(c("Nat"))),
+    ]);
+    for decl in [
+        candidate("nat_as_function", arrow.clone(), c("n")),
+        candidate("function_as_nat", c("Nat"), c("f")),
+        candidate("family_as_function", arrow.clone(), c("family0")),
+    ] {
+        let result = admit(&env, &decl, AdmissionBudget::unlimited());
+        assert!(
+            matches!(&result,
+            Verdict::Rejected(AdmissionRejection::BodyTypeMismatch { mismatch, .. })
+                if matches!(**mismatch, fln_checker::defeq::DefEqMismatch::ForallInductive { .. })),
+            "{result:?}"
+        );
+    }
+    accepted(
+        &env,
+        &candidate("function_alias", c("FunctionAlias"), c("f")),
+    );
+    accepted(
+        &env,
+        &candidate("type_proofs", proof_type(arrow), c("proof_witness")),
+    );
+}
+
+#[test]
 fn proof_arguments_cannot_hide_invalid_unused_annotations() {
     let env = environment();
     let bad = Expr::let_e(primary_name("ignored"), c("Q"), c("p"), c("w"), false);
