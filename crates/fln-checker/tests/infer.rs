@@ -2235,15 +2235,20 @@ fn application_outcomes_separate_function_mismatch_conversion_and_nested_rules()
         mode,
         InferenceBudget::unlimited(),
     );
+    // A lambda of type (Prop → Prop) cannot inhabit the Prop domain of f.
+    // Its Pi head is now a decisive mismatch with that domain's Sort head.
     assert!(
         matches!(
             nested_outcome,
-            InferenceOutcome::Deferred {
-                requirement: InferenceDeferred::ApplicationConversion { argument: 0, .. },
+            InferenceOutcome::Refused {
+                refusal: InferenceRefusal::ApplicationTypeMismatch {
+                    argument: 0,
+                    mismatch: fln_checker::defeq::DefEqMismatch::SortForall { .. },
+                },
                 ..
             }
         ),
-        "nested lambda outcome drifted: {nested_outcome:?}"
+        "a lambda supplied where a proposition is expected: {nested_outcome:?}"
     );
 }
 
