@@ -1411,7 +1411,7 @@ impl Context {
             )?;
             let work_start = proof.work.len();
             let (branch, substitutions) = if let Some(equations) = equations {
-                self.refine_index_branch(proof, branch, &equations.names)?
+                self.refine_index_branch(proof, branch, equations)?
             } else {
                 (Some(branch), Vec::new())
             };

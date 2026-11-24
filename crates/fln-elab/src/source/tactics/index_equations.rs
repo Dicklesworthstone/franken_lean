@@ -14,6 +14,9 @@ use std::collections::{HashSet, VecDeque};
 /// an arbitrary value at the constrained type, never to the original input.
 pub(super) struct IndexEquations {
     pub names: Vec<Name>,
+    /// The following final equation transports the major value. It is an
+    /// implementation premise, not a source index to which `unifyEq?` applies.
+    index_count: usize,
     pub induction_major: Option<FVarId>,
 }
 
@@ -311,6 +314,7 @@ impl Context {
         self.txn.lctx = expanded;
         let equations = IndexEquations {
             names: equations,
+            index_count: indices.len(),
             induction_major: induction.then(|| major.id.clone()),
         };
         self.eliminate_proof_goal_with_substitutions(
@@ -331,18 +335,47 @@ impl Context {
         *self = saved;
     }
 
+    /// `unifyEq?` chooses a raw variable before reducing either endpoint. When
+    /// both are variables it chooses the later declaration, so a constructor
+    /// field can be substituted even when the other endpoint is an older let.
+    /// Keep this dispatch separate from the general proof-producing `subst`
+    /// helper, whose reduction of endpoint aliases remains useful elsewhere.
+    fn index_equation_selects_let(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let left = self.instantiate(left)?;
+        let right = self.instantiate(right)?;
+        let local = |value: &Expr| match value.node() {
+            ExprNode::FVar { id } => self.txn.lctx.find(id),
+            _ => None,
+        };
+        let selected = match (local(&left), local(&right)) {
+            (Some(left), Some(right)) if left.index < right.index => Some(right),
+            (Some(left), _) => Some(left),
+            (None, right) => right,
+        };
+        Ok(selected.is_some_and(LocalDecl::is_let))
+    }
+
     pub(super) fn refine_index_branch(
         &mut self,
         proof: &mut ProofState<'_>,
         mut goal: ProofGoal,
-        equations: &[Name],
+        equations: &IndexEquations,
     ) -> Result<(Option<ProofGoal>, Vec<eliminate::CaseSubstitution>), NatDefinitionElabError> {
-        let mut pending: VecDeque<_> = equations.iter().cloned().collect();
+        let mut pending: VecDeque<_> = equations
+            .names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), index < equations.index_count))
+            .collect();
         let mut substitutions = Vec::new();
         loop {
             let mut progress = false;
             let mut deferred = VecDeque::new();
-            while let Some(name) = pending.pop_front() {
+            while let Some((name, source_index)) = pending.pop_front() {
                 self.tick()?;
                 self.txn.lctx = goal.lctx.clone();
                 let Some(local) = goal.lctx.find_by_user_name(&name).cloned() else {
@@ -353,15 +386,21 @@ impl Context {
                     value: Expr::fvar(local.id),
                     type_: type_.clone(),
                 };
+                let mut selected_let = false;
                 if let Some(homogeneous) = self.homogeneous_equality_evidence(&evidence)? {
                     let (_, _, left, right) = equality_target(&homogeneous.type_)
                         .ok_or_else(|| error(TacticError::ExpectedEquality))?;
+                    selected_let =
+                        source_index && self.index_equation_selects_let(&left, &right)?;
                     let left = self.whnf(&left)?;
                     let right = self.whnf(&right)?;
                     if self.proof_types_match(&left, &right)? {
                         continue;
                     }
-                    if let Some(term) = self.refute_index_evidence(&homogeneous, &goal.target)? {
+                    if !selected_let
+                        && let Some(term) =
+                            self.refute_index_evidence(&homogeneous, &goal.target)?
+                    {
                         self.close_proof_goal(goal, term)?;
                         return Ok((None, substitutions));
                     }
@@ -391,6 +430,13 @@ impl Context {
                     }
                     Err(error) => return Err(error),
                 }
+                // A selected local definition which was neither reflexive nor
+                // substitutable is a dependent-elimination refusal. Unfolding
+                // it and then refuting/injecting constructors would admit a
+                // source match that the pin's raw-variable dispatch rejects.
+                if selected_let {
+                    return Err(error(TacticError::SubstitutionLocal));
+                }
                 let before: HashSet<_> = goal
                     .lctx
                     .decls()
@@ -409,7 +455,7 @@ impl Context {
                         };
                         for local in child.lctx.decls().iter().rev() {
                             if !before.contains(&local.id) && !local.user_name.is_anonymous() {
-                                pending.push_front(local.user_name.clone());
+                                pending.push_front((local.user_name.clone(), source_index));
                             }
                         }
                         goal = child;
@@ -420,7 +466,7 @@ impl Context {
                     ))) => {
                         proof.work.truncate(work);
                         self.restore_refinement_attempt(saved);
-                        deferred.push_back(name);
+                        deferred.push_back((name, source_index));
                     }
                     Err(error) => return Err(error),
                 }
