@@ -167,6 +167,40 @@ impl Scopes {
                         .push((position, opened_id, declaration));
                 }
             }
+            ScopeCommand::OpenRenaming { namespace, renames } => {
+                self.observe_namespaces(env)
+                    .map_err(TransitionError::Registry)?;
+                let namespaces = self
+                    .resolve_open_in(&self.current, &namespace)
+                    .map_err(TransitionError::Scope)?;
+                let [ns] = namespaces.as_slice() else {
+                    return Err(TransitionError::Scope(format!(
+                        "ambiguous namespace `{}`",
+                        namespace.to_display_string()
+                    )));
+                };
+                let aliases = fln_elab::aliases::AliasTable::read(env)
+                    .map_err(|error| TransitionError::Scope(error.to_string()))?;
+                let protected = fln_elab::protected_names::ProtectedNames::read(env)
+                    .map_err(|error| TransitionError::Scope(error.to_string()))?;
+                // Lean.Elab.OpenDecl.elabOpenDecl resolves successive pairs against
+                // the preceding aliases. Publish the lexical state only on success.
+                let mut next = self.current.clone();
+                for (from, to) in renames {
+                    let declaration =
+                        Self::resolve_member(&next, env, ns, &from, &aliases, &protected)
+                            .map_err(TransitionError::Scope)?
+                            .ok_or_else(|| {
+                                TransitionError::Scope(format!(
+                                    "unknown declaration `{}`",
+                                    from.to_display_string()
+                                ))
+                            })?;
+                    next.explicit_opens
+                        .push((next.opened.len(), to, declaration));
+                }
+                self.current = next;
+            }
             ScopeCommand::OpenScoped(names) => {
                 return self.transition_open(names, true, env, public_env);
             }
@@ -368,20 +402,10 @@ impl Scopes {
             let mut candidates = Vec::new();
             let mut last_error = None;
             for ns in namespaces {
-                let qualified = ns.append_core(name);
-                if env.contains(&qualified) {
-                    candidates.push(qualified);
-                    continue;
-                }
-                match self.current.resolve_with_aliases(
-                    &qualified,
-                    |candidate| env.contains(candidate),
-                    &table,
-                    &protected,
-                ) {
+                match Self::resolve_member(&self.current, env, ns, name, &table, &protected) {
                     Ok(Some(declaration)) => candidates.push(declaration),
                     Ok(None) => {}
-                    Err(error) => last_error = Some(error.to_string()),
+                    Err(error) => last_error = Some(error),
                 }
             }
             let [declaration] = candidates.as_slice() else {
@@ -396,6 +420,28 @@ impl Scopes {
             aliases.push((name.clone(), declaration.clone()));
         }
         Ok(aliases)
+    }
+
+    fn resolve_member(
+        scope: &SourceScope,
+        env: &Environment,
+        namespace: &Name,
+        name: &Name,
+        aliases: &fln_elab::aliases::AliasTable,
+        protected: &fln_elab::protected_names::ProtectedNames,
+    ) -> Result<Option<Name>, String> {
+        let qualified = namespace.append_core(name);
+        if env.contains(&qualified) {
+            return Ok(Some(qualified));
+        }
+        scope
+            .resolve_with_aliases(
+                &qualified,
+                |candidate| env.contains(candidate),
+                aliases,
+                protected,
+            )
+            .map_err(|error| error.to_string())
     }
 
     /// Namespace lookup is not global-constant lookup. The Reference's
@@ -656,6 +702,9 @@ impl Scopes {
         }
         let (old, new) = match command {
             ScopeCommand::Open(names) => (self.current.opened.len(), names.len()),
+            ScopeCommand::OpenRenaming { renames, .. } => {
+                (self.current.explicit_opens.len(), renames.len())
+            }
             ScopeCommand::OpenScoped(names) => (0, names.len()),
             ScopeCommand::Universe(names) => (self.current.universes.len(), names.len()),
             ScopeCommand::Include(names) | ScopeCommand::Omit(names) => (0, names.len()),
@@ -681,7 +730,7 @@ impl Scopes {
             ScopeCommand::Export { .. } => {
                 return Err("export requires an environment transition".into());
             }
-            ScopeCommand::OpenExplicit { .. } => {
+            ScopeCommand::OpenExplicit { .. } | ScopeCommand::OpenRenaming { .. } => {
                 return Err("explicit opening requires an environment transition".into());
             }
             ScopeCommand::Reducibility(_) => {

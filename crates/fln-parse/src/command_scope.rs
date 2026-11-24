@@ -7,6 +7,7 @@ pub mod imports;
 pub mod instances;
 pub mod modifiers;
 pub mod mutual;
+mod opening;
 pub mod reducibility;
 pub(crate) mod syntax_decls;
 pub mod trees;
@@ -103,6 +104,11 @@ pub enum ScopeCommand {
     OpenExplicit {
         namespace: Name,
         names: Vec<Name>,
+    },
+    /// `open Ns renaming x → y` opens the selected declarations under new names.
+    OpenRenaming {
+        namespace: Name,
+        renames: Vec<(Name, Name)>,
     },
     Trivia,
     /// `#exit` (`Lean.Parser.Command.exit`): the pin warns "using 'exit' to interrupt Lean"
@@ -960,6 +966,11 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     if keyword == "export" {
         return export(&view, &tokens, source.len()).map(Some);
     }
+    if keyword == "open"
+        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "renaming")
+    {
+        return opening::parse(source);
+    }
     // `open Ns (a b …)`: the same shape as `export`'s.
     if keyword == "open"
         && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "(")
@@ -1037,7 +1048,7 @@ fn generic_in(
     end: usize,
 ) -> Option<ScopeCommand> {
     let explicit_open = keyword == "open"
-        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "(");
+        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "(" || s == "renaming");
     // A global `attribute [a] x in …` is not one: the pin refuses it ("Despite the `in`, the
     // attribute … is added globally"). A `local` one scopes to the body. Instance
     // erasure is state-only as well: the pin applies eraseAttr without adding a
@@ -1102,6 +1113,7 @@ pub fn wrapper_body(source: &[u8]) -> Result<Option<usize>, DefinitionParseError
         Some(
             ScopeCommand::OpenIn { body, .. }
             | ScopeCommand::SetOptionIn { body, .. }
+            | ScopeCommand::In { body, .. }
             | ScopeCommand::GuardMsgs { body, .. },
         ) => Some(body),
         _ => None,
@@ -2194,7 +2206,7 @@ def after : Nat := 3
             "open scoped",
             "open scoped A in",
             "open A hiding x",
-            "open A renaming x -> y",
+            "open A renaming x ->",
             "universe A.u",
             "universe u, v",
             "end := 3",

@@ -4,8 +4,8 @@
 //! - `OpenDecl.explicit a Ns.a` then answers `a` (and `a.b` when `Ns.a.b` exists) without the
 //!   protection test, until the end of the section.
 //!
-//! Every program here was run through the pinned `lean` v4.32.0 first (2026-10-11), over
-//! `prelude` + `import Init.Core`; a refusal quotes the pin's message.
+//! The explicit-open and renaming programs were checked against pinned Lean v4.32.0
+//! over `prelude` + `import Init.Core`.
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
 
@@ -72,5 +72,39 @@ fn explicit_open_refusals_match_the_pin() {
             check(&source).is_err(),
             "accepted {source} (the pin: {pin})"
         );
+    }
+}
+
+#[test]
+fn renamed_opens_resolve_protected_exported_and_preceding_names() {
+    for source in [
+        format!(
+            "{FOO}open Foo renaming x → leftValue, y -> rightValue\ntheorem t : leftValue + rightValue = 3 := rfl\n"
+        ),
+        format!("{FOO}open Foo renaming x → Foo.w, w → twice\ntheorem t : twice = 1 := rfl\n"),
+        format!(
+            "{FOO}namespace N\nexport Foo (x)\nend N\nopen N renaming x → chosen\ntheorem t : chosen = 1 := rfl\n"
+        ),
+        format!(
+            "{FOO}def Foo.x.next : Nat := 3\nopen Foo renaming x → a\ntheorem t : a.next = 3 := rfl\n"
+        ),
+        format!("{FOO}open Foo renaming x → aliasValue in\ntheorem t : aliasValue = 1 := rfl\n"),
+        "open Nat renaming add → total\ntheorem t : total 1 2 = 3 := rfl\n".to_owned(),
+    ] {
+        check(&source).unwrap_or_else(|error| panic!("{source}: {error}"));
+    }
+}
+
+#[test]
+fn renamed_opens_require_a_unique_namespace_and_stay_lexical() {
+    for source in [
+        format!("{FOO}section\nopen Foo renaming x → aliasValue\nend\n#check aliasValue\n"),
+        format!("{FOO}open Foo renaming x → aliasValue in\ntheorem t : aliasValue = 1 := rfl\n#check aliasValue\n"),
+        format!("{FOO}open Foo renaming x → aliasValue\n#check x\n"),
+        format!("{FOO}open Foo renaming x → aliasValue, z → missingValue\n"),
+        format!("{FOO}open Foo renaming x →\ny\n"),
+        "namespace A.N\ndef x : Nat := 1\nend A.N\nnamespace B.N\ndef y : Nat := 2\nend B.N\nopen A B\nopen N renaming x → chosen\n".to_owned(),
+    ] {
+        assert!(check(&source).is_err(), "{source}");
     }
 }

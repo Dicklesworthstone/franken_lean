@@ -581,7 +581,8 @@ impl<'a> FileSession<'a> {
             ScopeCommand::End(_) => "end",
             ScopeCommand::Open(_)
             | ScopeCommand::OpenScoped(_)
-            | ScopeCommand::OpenExplicit { .. } => "open",
+            | ScopeCommand::OpenExplicit { .. }
+            | ScopeCommand::OpenRenaming { .. } => "open",
             ScopeCommand::Universe(_) => "universe",
             ScopeCommand::Include(_) => "include",
             ScopeCommand::Omit(_) => "omit",
@@ -607,6 +608,7 @@ impl<'a> FileSession<'a> {
             ScopeCommand::Open(_) => &["openSimple"],
             ScopeCommand::OpenScoped(_) => &["openScoped"],
             ScopeCommand::OpenExplicit { .. } => &["openOnly"],
+            ScopeCommand::OpenRenaming { .. } => &["openRenaming", "openRenamingItem"],
             ScopeCommand::OpenIn { scoped: true, .. } => &["open", "openScoped"],
             ScopeCommand::OpenIn { scoped: false, .. } => &["open", "openSimple"],
             ScopeCommand::SetOptionIn { .. } => &["set_option"],

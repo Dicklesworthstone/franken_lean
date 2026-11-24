@@ -1,50 +1,63 @@
-//! Typed selective opens over the same lexer used by the source command driver.
+//! Lower the generated `openRenaming` tree to its lexical scope transition.
 use super::*;
 
-pub(super) fn parse(
-    view: &SourceView,
-    tokens: &[LexedToken],
-    source_len: usize,
-) -> Result<Option<ScopeCommand>, DefinitionParseError> {
-    let symbol = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
-    if !symbol(0, "open") || !symbol(2, "renaming") {
+pub(super) fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError> {
+    let parsed = crate::parse_source_command(source)?;
+    let syntax = parsed.syntax();
+    if crate::extensions::is_active_command_macro(syntax) {
         return Ok(None);
     }
-    let bad = |at: usize| NatDefinitionParseError::OutsideSeedGrammar {
-        at: tokens.get(at).map_or(BytePos(source_len), |token| {
-            view.to_original(token.extent.start())
-        }),
-        expected: NatDefinitionExpectation::EndOfCommand,
+    Ok(renaming_targets(syntax)
+        .map(|(namespace, renames)| ScopeCommand::OpenRenaming { namespace, renames }))
+}
+
+fn renaming_targets(syntax: &Syntax) -> Option<(Name, Vec<(Name, Name)>)> {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return None;
     };
-    let ident = |at: usize| match tokens.get(at).map(|t| &t.kind) {
-        Some(TokenKind::Ident(name)) => Ok(name.clone()),
-        _ => Err(bad(at)),
+    let [
+        _,
+        Syntax::Node {
+            kind: form,
+            args: fields,
+            ..
+        },
+    ] = args.as_slice()
+    else {
+        return None;
     };
-    let namespace = ident(1)?;
-    let mut at = 3;
-    let mut renames = Vec::new();
-    loop {
-        if renames.len() >= 4096 {
-            return Err(bad(at));
-        }
-        let from = ident(at)?;
-        at += 1;
-        if !symbol(at, "->") && !symbol(at, "→") {
-            return Err(bad(at));
-        }
-        at += 1;
-        let to = ident(at)?;
-        renames.push((from, to));
-        at += 1;
-        if at == tokens.len() {
-            break;
-        }
-        if !symbol(at, ",") {
-            return Err(bad(at));
-        }
-        at += 1;
+    if kind != &parser_kind(&["Command", "open"])
+        || form != &parser_kind(&["Command", "openRenaming"])
+    {
+        return None;
     }
-    Ok(Some(ScopeCommand::OpenRenaming { namespace, renames }))
+    let [
+        Syntax::Ident { val: namespace, .. },
+        _,
+        Syntax::Node { args: items, .. },
+    ] = fields.as_slice()
+    else {
+        return None;
+    };
+    let mut renames = Vec::new();
+    for item in items.iter().step_by(2) {
+        let Syntax::Node { kind, args, .. } = item else {
+            return None;
+        };
+        let [
+            Syntax::Ident { val: from, .. },
+            _,
+            Syntax::Ident { val: to, .. },
+        ] = args.as_slice()
+        else {
+            return None;
+        };
+        if kind != &parser_kind(&["Command", "openRenamingItem"]) {
+            return None;
+        }
+        renames.push((from.clone(), to.clone()));
+    }
+    Some((namespace.clone(), renames))
 }
 
 #[cfg(test)]

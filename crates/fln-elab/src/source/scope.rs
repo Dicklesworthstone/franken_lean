@@ -459,7 +459,8 @@ impl SourceScope {
     /// An explicit open (`open X (y)`, `OpenDecl.explicit y X.y`) answers `y` with `X.y`, and
     /// `y.z` with `X.y.z` when that exists, without the protection test.
     ///
-    /// Not modelled: `open X hiding y` and `open X renaming`, and the projection fallback
+    /// A renaming adds the same explicit entry under its destination name.
+    /// Not modelled: `open X hiding y`, and the projection fallback
     /// (`loop p (s::projs)`), which field notation handles.
     pub fn resolve_with_aliases(
         &self,

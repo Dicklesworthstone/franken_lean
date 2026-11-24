@@ -3697,6 +3697,7 @@ impl Engine {
                         | ScopeCommand::End(_)
                         | ScopeCommand::Open(_)
                         | ScopeCommand::OpenExplicit { .. }
+                        | ScopeCommand::OpenRenaming { .. }
                         | ScopeCommand::OpenScoped(_)
                         | ScopeCommand::SetOption { .. }
                         | ScopeCommand::Universe(_)
