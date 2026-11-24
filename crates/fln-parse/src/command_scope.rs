@@ -17,6 +17,10 @@ pub enum ScopeCommand {
     /// The kernel quotient initialization command. It declares one checked
     /// primitive quartet, with root names independent of the lexical scope.
     InitQuot,
+    /// The generated `addDocString` command names an existing declaration.
+    /// Documentation has the same validation-only policy as declaration docs;
+    /// the source driver must still check resolution and current-file ownership.
+    AddDeclDoc(Name),
     Namespace(Name),
     Section(Option<Name>),
     /// The pin's `sectionHeader` public and exposure defaults. These are lexical
@@ -867,6 +871,37 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     let TokenKind::Symbol(keyword) = &first.kind else {
         return Ok(None);
     };
+    if keyword == "/--"
+        && tokens
+            .get(1)
+            .is_some_and(|token| view.normalized().span_str(token.extent) == Some("add_decl_doc"))
+    {
+        // Use the active generated production, including its complete doc and
+        // identifier syntax. A macro replacing this command must remain on the
+        // ordinary expansion path, not acquire builtin control semantics.
+        let parsed = crate::parse_source_command(source)?;
+        if crate::extensions::is_active_command_macro(parsed.syntax()) {
+            return Ok(None);
+        }
+        if let Syntax::Node { kind, args, .. } = parsed.syntax()
+            && kind == &parser_kind(&["Command", "addDocString"])
+            && let [
+                doc,
+                Syntax::Atom { val: keyword, .. },
+                Syntax::Ident { val, .. },
+            ] = args.as_slice()
+            && doc.kind() == Some(&parser_kind(&["Command", "docComment"]))
+            && keyword == "add_decl_doc"
+        {
+            // `partition` checks this too; direct scope-parser callers retain
+            // the same invalid-reference-link refusal as ordinary docstrings.
+            if let Some(refusal) = unvalidated_manual_link(&view, first) {
+                return Err(refusal);
+            }
+            return Ok(Some(ScopeCommand::AddDeclDoc(val.clone())));
+        }
+        return Ok(None);
+    }
     if keyword == "#exit" && tokens.len() == 1 {
         return Ok(Some(ScopeCommand::Exit));
     }
@@ -1509,6 +1544,48 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_decl_doc_uses_the_generated_command_and_preserves_original_bytes() {
+        let source =
+            "/-- Existing declaration documentation. -/\r\nadd_decl_doc Ns.«odd target»\r\n";
+        let parsed = crate::parse_source_command(source.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.syntax().kind(),
+            Some(&parser_kind(&["Command", "addDocString"]))
+        );
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        assert_eq!(
+            parse(source.as_bytes()).unwrap(),
+            Some(ScopeCommand::AddDeclDoc(Name::from_components([
+                "Ns",
+                "odd target"
+            ])))
+        );
+        let commands = partition(source.as_bytes()).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].1, source.as_bytes());
+    }
+
+    #[test]
+    fn add_decl_doc_does_not_admit_malformed_commands_or_invalid_doc_links() {
+        for source in [
+            "add_decl_doc Quot",
+            "/-- Doc. -/ add_decl_doc",
+            "/-- Doc. -/ add_decl_doc Quot extra",
+            "/-- Doc. -/ add_decl_doc Quot := Quot",
+            "/-- Doc. -/ add_decl_doc _",
+            "/-- see [](lean-manual://f) -/ add_decl_doc Quot",
+        ] {
+            assert!(
+                !matches!(
+                    parse(source.as_bytes()),
+                    Ok(Some(ScopeCommand::AddDeclDoc(_)))
+                ),
+                "{source}"
+            );
+        }
+    }
 
     #[test]
     fn source_command_headers_partition_their_later_invocations() {

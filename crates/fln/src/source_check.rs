@@ -337,6 +337,37 @@ pub(crate) fn apply_control_command(
     use fln_parse::command_scope::ScopeCommand;
 
     match control {
+        ScopeCommand::AddDeclDoc(requested) => {
+            // `elabAddDeclDoc` resolves one global constant and refuses an
+            // imported owner. As with inline declaration docs, this source
+            // door validates documentation without publishing a doc journal.
+            let name = fln_elab::source::scope::executable::resolve(
+                engine.environment(),
+                scope,
+                &requested,
+            )
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)
+            .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?
+            .filter(|name| engine.environment().contains(name))
+            .ok_or_else(|| SourceCheckError::Scope {
+                file,
+                command,
+                offset,
+                message: format!(
+                    "unknown add_decl_doc declaration `{}`",
+                    requested.to_display_string()
+                ),
+            })?;
+            if file_base.contains(&name) {
+                return Err(SourceCheckError::Scope {
+                    file,
+                    command,
+                    offset,
+                    message: "invalid 'add_decl_doc', declaration is in an imported module".into(),
+                });
+            }
+        }
         ScopeCommand::InitQuot => {
             // BuiltinCommand.elabInitQuot submits Declaration.quotDecl. Reuse
             // the canonical candidate builder, then require both admission
@@ -515,6 +546,20 @@ pub(crate) fn apply_module_control_command(
 ) -> Result<Outcome<Vec<DeclarationAdmission>>, SourceCheckError> {
     use fln_parse::command_scope::ScopeCommand;
 
+    // Documentation resolves in the actual lexical world, even in a public
+    // section that documents an earlier private declaration. It exports no
+    // declaration or metadata suffix under the existing doc-validation policy.
+    if matches!(control, ScopeCommand::AddDeclDoc(_)) {
+        return apply_control_command(
+            engine,
+            &mut scopes.current,
+            file_base,
+            control,
+            limits,
+            position,
+            options,
+        );
+    }
     if let ScopeCommand::Export { namespace, names } = &control {
         let (file, command, offset) = position;
         let refuse = |message: String| SourceCheckError::Scope {

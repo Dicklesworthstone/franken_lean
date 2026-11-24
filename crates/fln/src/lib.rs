@@ -3691,6 +3691,7 @@ impl Engine {
                         }
                         ScopeCommand::Namespace(_)
                         | ScopeCommand::InitQuot
+                        | ScopeCommand::AddDeclDoc(_)
                         | ScopeCommand::Section(_)
                         | ScopeCommand::SectionWithModifiers { .. }
                         | ScopeCommand::End(_)

@@ -576,6 +576,7 @@ impl<'a> FileSession<'a> {
             }
             ScopeCommand::Namespace(_) => "namespace",
             ScopeCommand::InitQuot => "init_quot",
+            ScopeCommand::AddDeclDoc(_) => "addDocString",
             ScopeCommand::Section(_) | ScopeCommand::SectionWithModifiers { .. } => "section",
             ScopeCommand::End(_) => "end",
             ScopeCommand::Open(_)

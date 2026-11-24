@@ -178,6 +178,7 @@ fn scope_name(command: &ScopeCommand) -> &'static str {
         | ScopeCommand::Executable(_) => "attribute",
         ScopeCommand::Trivia => "trivia",
         ScopeCommand::InitQuot => "init_quot",
+        ScopeCommand::AddDeclDoc(_) => "add_decl_doc",
         ScopeCommand::Exit => "exit",
     }
 }

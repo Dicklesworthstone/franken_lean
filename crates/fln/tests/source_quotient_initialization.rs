@@ -1,4 +1,6 @@
 //! `init_quot` creates the native checked primitives from source, without a seed.
+//! Its `add_decl_doc` commands validate owned targets under the same policy as
+//! ordinary declaration docs; these tests do not claim serialized doc metadata.
 #![forbid(unsafe_code)]
 
 use fln::source_check::modules::imported::SourceOleanImport;
@@ -299,12 +301,12 @@ fn source_initialized_quotient_lift_executes_on_the_native_vm_without_a_seed() {
 }
 
 #[test]
-fn untouched_prelude_bootstraps_through_quotient_initialization_from_empty() {
+fn untouched_prelude_bootstraps_through_quotient_documentation_from_empty() {
     let prelude = include_str!("../../../vendor/lean4-src/src/Init/Prelude.lean");
     let end = prelude
-        .find("\ninit_quot\n")
-        .expect("pinned initialization command")
-        + "\ninit_quot\n".len();
+        .find("\nadd_decl_doc Quot.lift\n")
+        .expect("pinned quotient documentation commands")
+        + "\nadd_decl_doc Quot.lift\n".len();
     let source = format!("{}\n{BETA}", &prelude[..end]);
     let initial = Engine::builder().build_empty();
     let main = name("Init.Prelude");
@@ -329,4 +331,177 @@ fn untouched_prelude_bootstraps_through_quotient_initialization_from_empty() {
             .engine,
     );
     assert!(initial.environment().is_empty());
+}
+
+#[test]
+fn add_decl_doc_resolves_owned_quotient_primitives_and_aliases_without_changing_logic() {
+    let initial = Engine::builder().build_empty();
+    let plain =
+        format!("{EQ}init_quot\nnamespace QuotDocs\nexport Quot (mk)\nend QuotDocs\n{BETA}");
+    let documented = format!(
+        "{EQ}init_quot\n\
+         /-- The quotient type. -/\nadd_decl_doc Quot\n\
+         /-- Replacing an earlier doc is allowed. -/\nadd_decl_doc Quot\n\
+         /-- Quotient induction. -/\nadd_decl_doc Quot.ind\n\
+         /-- Quotient elimination. -/\nadd_decl_doc _root_.Quot.lift\n\
+         namespace QuotDocs\nexport Quot (mk)\n\
+         /-- An alias resolves to its actual owned declaration. -/\nadd_decl_doc mk\n\
+         end QuotDocs\n{BETA}"
+    );
+    let expected = checked(&initial, &plain);
+    let actual = checked(&initial, &documented);
+    quartet(&actual.engine);
+    assert_eq!(actual.theorems, expected.theorems);
+    assert_eq!(
+        actual.engine.logical_root(&KVMap::new()),
+        expected.engine.logical_root(&KVMap::new())
+    );
+    let executed = initial
+        .execute_source_commands_with_checks(
+            documented.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(admission().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        executed.batch.engine.logical_root(&KVMap::new()),
+        actual.result_logical_root
+    );
+    assert!(initial.environment().is_empty());
+}
+
+#[test]
+fn add_decl_doc_refuses_missing_ambiguous_imported_and_malformed_targets_atomically() {
+    let initial = Engine::builder().build_empty();
+    let root = initial.logical_root(&KVMap::new());
+    for source in [
+        "axiom owned : Prop\n/-- Doc. -/\nadd_decl_doc missing",
+        "axiom owned : Prop\nadd_decl_doc owned",
+        "axiom owned : Prop\n/-- Doc. -/\nadd_decl_doc owned extra",
+        "axiom owned : Prop\n/-- see [](lean-manual://f) -/\nadd_decl_doc owned",
+        "section\nvariable (localOnly : Prop)\n/-- Doc. -/\nadd_decl_doc localOnly\nend",
+        "namespace A\naxiom target : Prop\nend A\nnamespace B\naxiom target : Prop\nend B\nopen A B\n/-- Doc. -/\nadd_decl_doc target",
+        "axiom owned : Prop\n/-- First succeeds. -/\nadd_decl_doc owned\n/-- Second fails. -/\nadd_decl_doc missing",
+    ] {
+        let error = initial
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(admission()),
+            )
+            .unwrap_err();
+        assert_eq!(error.disposition().2, 1, "{source}: {error:?}");
+        assert_eq!(initial.logical_root(&KVMap::new()), root);
+    }
+    // A new file cannot rewrite a declaration's docs merely because an earlier
+    // file in the same check batch admitted it.
+    let error = initial
+        .check_source_files(
+            &[b"axiom owned : Prop", b"/-- Doc. -/\nadd_decl_doc owned"],
+            &KVMap::new(),
+            SourceCheckLimits::new(admission()),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("declaration is in an imported module")
+    );
+    assert_eq!(initial.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn add_decl_doc_checks_module_ownership_in_the_actual_private_scope() {
+    let initial = Engine::builder().build_empty();
+    let main = name("Main");
+    let base = name("Base");
+    let limits = SourceModuleCheckLimits::new(SourceCheckLimits::new(admission()));
+    let plain = "module\nprelude\nnamespace Docs\npublic axiom visible : Prop\naxiom hidden : Prop\npublic section\nend\nend Docs\n";
+    let documented = "module\nprelude\nnamespace Docs\npublic axiom visible : Prop\naxiom hidden : Prop\npublic section\n/-- A public section may document this module's private name. -/\nadd_decl_doc hidden\n/-- The same resolution admits its public name. -/\nadd_decl_doc visible\nend\nend Docs\n";
+    let check = |source: &str| {
+        initial
+            .check_source_modules(
+                &[SourceModuleInput {
+                    name: &main,
+                    source: source.as_bytes(),
+                }],
+                &main,
+                &KVMap::new(),
+                limits,
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+    };
+    let expected = check(plain);
+    let actual = check(documented);
+    assert_eq!(
+        actual.checked.result_logical_root,
+        expected.checked.result_logical_root
+    );
+    assert!(
+        actual
+            .checked
+            .engine
+            .environment()
+            .contains(&name("Docs.visible"))
+    );
+    assert!(
+        actual
+            .checked
+            .engine
+            .environment()
+            .contains(&Name::num(name("_private.Main"), 0).append_core(&name("Docs.hidden")))
+    );
+
+    for target in ["Imported.target", "target"] {
+        let source = format!(
+            "module\nprelude\npublic import Base\nopen Imported\naxiom owned : Prop\n/-- Owned. -/\nadd_decl_doc owned\n/-- Borrowed. -/\nadd_decl_doc {target}\n"
+        );
+        let error = initial
+            .check_source_modules(
+                &[
+                    SourceModuleInput { name: &main, source: source.as_bytes() },
+                    SourceModuleInput {
+                        name: &base,
+                        source: b"module\nprelude\nnamespace Imported\npublic axiom target : Prop\nend Imported\n",
+                    },
+                ],
+                &main,
+                &KVMap::new(),
+                limits,
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("declaration is in an imported module"),
+            "{error:?}"
+        );
+    }
+    assert!(initial.environment().is_empty());
+}
+
+#[test]
+fn add_decl_doc_obeys_file_byte_and_command_limits() {
+    let initial = Engine::builder().build_empty();
+    let source = b"axiom owned : Prop\n/-- Doc. -/\nadd_decl_doc owned";
+    for limited in [
+        SourceCheckLimits {
+            max_bytes: source.len() - 1,
+            ..SourceCheckLimits::new(admission())
+        },
+        SourceCheckLimits {
+            max_commands: 1,
+            ..SourceCheckLimits::new(admission())
+        },
+    ] {
+        let error = initial
+            .check_source_files(&[source], &KVMap::new(), limited)
+            .unwrap_err();
+        assert_eq!(error.disposition(), ("resource", false, 3));
+        assert!(initial.environment().is_empty());
+    }
 }

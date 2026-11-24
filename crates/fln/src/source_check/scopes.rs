@@ -669,6 +669,9 @@ impl Scopes {
     pub fn apply(&mut self, command: ScopeCommand) -> Result<(), String> {
         let namespace = matches!(command, ScopeCommand::Namespace(_));
         match command {
+            ScopeCommand::AddDeclDoc(_) => {
+                return Err("declaration documentation requires checked target ownership".into());
+            }
             ScopeCommand::InitQuot => {
                 return Err("quotient initialization requires checked block admission".into());
             }
