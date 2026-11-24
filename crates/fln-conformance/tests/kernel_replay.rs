@@ -2244,6 +2244,16 @@ fn corpus_module_parts_hash(name: &str, parts: &[(&str, &[u8])]) -> String {
 /// bodies. Reading only the public file silently postulated exported
 /// definitions as axioms and omitted the equation compiler's private family.
 fn decode_corpus_module(path: &Path, name: &str) -> Result<DecodedCorpusModule, String> {
+    decode_corpus_module_with(path, name, |_| Ok(())).map(|(decoded, ())| decoded)
+}
+
+/// Share the exact bounded byte buffers with an independent reader when a
+/// differential requires two interpretations of the same artifact.
+fn decode_corpus_module_with<T>(
+    path: &Path,
+    name: &str,
+    read: impl FnOnce(&[&[u8]]) -> Result<T, String>,
+) -> Result<(DecodedCorpusModule, T), String> {
     let public = read_corpus_module_part(path)?;
     let public_view =
         OleanView::parse(&public).map_err(|error| format!("parse {}: {error}", path.display()))?;
@@ -2261,11 +2271,14 @@ fn decode_corpus_module(path: &Path, name: &str) -> Result<DecodedCorpusModule, 
             .decode_module_constants()
             .map_err(|error| format!("decode {}: {error}", path.display()))?;
         let olean_hash = corpus_module_parts_hash(name, &[("exported", &public)]);
-        return Ok(DecodedCorpusModule {
-            infos,
-            imports,
-            olean_hash,
-        });
+        return Ok((
+            DecodedCorpusModule {
+                infos,
+                imports,
+                olean_hash,
+            },
+            read(&[&public])?,
+        ));
     }
 
     let server_path = path.with_extension("olean.server");
@@ -2301,11 +2314,14 @@ fn decode_corpus_module(path: &Path, name: &str) -> Result<DecodedCorpusModule, 
             ("private", &private),
         ],
     );
-    Ok(DecodedCorpusModule {
-        infos,
-        imports,
-        olean_hash,
-    })
+    Ok((
+        DecodedCorpusModule {
+            infos,
+            imports,
+            olean_hash,
+        },
+        read(&[&public, &server, &private])?,
+    ))
 }
 
 fn corpus_module_from_decode(
@@ -21650,14 +21666,14 @@ struct BemcJudgedRow {
 /// (bead `fln-kernel-reject-side-at-scale-bemc`, the "mutants of the rig"
 /// list). The join is BY NAME, never by position; an unjoined name is an
 /// error, not a skip; inconclusive is its own cell, never agreement and never
-/// a rejection; and the caller must separately require `joined` to equal the
-/// table's size (conservation), because a dropped mutant is missing coverage.
+/// a rejection. Every distinct pin name must appear exactly once.
 struct BemcJoinCells {
     joined: u64,
     agree_reject: u64,
     agree_accept: u64,
     fatal: Vec<String>,
     inconclusive: Vec<String>,
+    deferred_rejects: Vec<String>,
     other: Vec<String>,
 }
 
@@ -21671,9 +21687,14 @@ fn join_bemc_rows(
         agree_accept: 0,
         fatal: Vec::new(),
         inconclusive: Vec::new(),
+        deferred_rejects: Vec::new(),
         other: Vec::new(),
     };
+    let mut seen = HashSet::new();
     for row in judged {
+        if !seen.insert(&row.lead) {
+            return Err(format!("{}: duplicate judged declaration", row.lead));
+        }
         let Some((pin_verdict, pin_class)) = pin_verdicts.get(&row.lead) else {
             return Err(format!(
                 "{}: judged unit has no row in the pin verdict table; the join is by name \
@@ -21690,9 +21711,18 @@ fn join_bemc_rows(
             ("reject", fln) if fln.starts_with("rejected") => cells.agree_reject += 1,
             ("accept", "accepted") => cells.agree_accept += 1,
             ("reject", "accepted") => cells.fatal.push(rendered),
+            ("reject", "deferred") => cells.deferred_rejects.push(rendered),
+            (_, "deferred") | ("inconclusive", _) => cells.inconclusive.push(rendered),
             (_, fln) if fln.starts_with("inconclusive") => cells.inconclusive.push(rendered),
             _ => cells.other.push(rendered),
         }
+    }
+    if seen.len() != pin_verdicts.len() {
+        return Err(format!(
+            "judged {} distinct declarations for {} pin rows",
+            seen.len(),
+            pin_verdicts.len()
+        ));
     }
     Ok(cells)
 }
@@ -21766,6 +21796,34 @@ fn bemc_join_cells_classify_and_conserve() {
     );
     assert!(cells.other[0].starts_with("unit=d "));
 
+    assert!(join_bemc_rows(&judged[..4], &table).is_err());
+    let mut duplicated = judged;
+    duplicated[4].lead = duplicated[0].lead.clone();
+    assert!(
+        join_bemc_rows(&duplicated, &table).is_err(),
+        "a duplicate cannot substitute for a missing name even at the expected count"
+    );
+    let unknown_pin =
+        HashMap::from([("a".into(), ("inconclusive".into(), "deepRecursion".into()))]);
+    let cells = join_bemc_rows(&duplicated[1..2], &unknown_pin).unwrap();
+    assert_eq!((cells.agree_reject, cells.inconclusive.len()), (0, 1));
+
+    let deferred = [BemcJudgedRow {
+        lead: "a".into(),
+        outcome: "deferred".into(),
+        message: "no independent conversion rule".into(),
+    }];
+    for (verdict, expected_deferred, expected_inconclusive) in [("reject", 1, 0), ("accept", 0, 1)]
+    {
+        let oracle = HashMap::from([("a".into(), (verdict.into(), String::new()))]);
+        let cells = join_bemc_rows(&deferred, &oracle).unwrap();
+        assert_eq!((cells.agree_reject, cells.agree_accept), (0, 0));
+        assert_eq!(
+            (cells.deferred_rejects.len(), cells.inconclusive.len()),
+            (expected_deferred, expected_inconclusive)
+        );
+    }
+
     let missing = vec![BemcJudgedRow {
         lead: "zz".into(),
         outcome: "accepted".into(),
@@ -21777,16 +21835,16 @@ fn bemc_join_cells_classify_and_conserve() {
     );
 }
 
-/// The reject-side join (bead `fln-kernel-reject-side-at-scale-bemc`): every
-/// mutant of a synthetic `Bemc.*` module is judged by K1 PER DECLARATION —
-/// each admission unit carries its own prepared environment, so no mutant's
-/// fate can affect the next and no rejection stops the walk — and the verdict
-/// is joined by FRESH NAME against the pin's verdict table written beside the
-/// olean by the generator. The one fatal cell is pin=reject joined with
-/// FrankenLean=accepted: a soundness-side divergence, reported with the full
-/// row before the assertion fires (plan R7 stop-ship). An
-/// inconclusive is never counted as a rejection: it lands in its own cell and
-/// fails the run as unattributed coverage, not as agreement.
+#[path = "kernel_replay/bemc.rs"]
+mod bemc;
+
+/// The reject-side join (bead `fln-kernel-reject-side-at-scale-bemc`).
+/// Each engine reads the synthetic module, judges each declaration in the
+/// original import environment, and joins its answers to the pin by name.
+/// K1 must decide all cases. A definite divergence, fault, resource stop or
+/// missing row from either engine fails. For pin-rejected inputs the checker's
+/// explicit Deferred verdict is reported as uncovered. Set
+/// `FLN_BEMC_REQUIRE_COMPLETE_CHECKER=1` to require a decision there too.
 ///
 /// Run with:
 ///   FLN_BEMC_ROOT=<dir holding Bemc/...> \
@@ -21810,9 +21868,6 @@ fn bemc_synthetic_module_pin_and_kernel_verdicts_join() {
         "{chosen}: closure has unresolved imports: {:?}",
         inventory.missing_imports
     );
-    let PreparedChosenModule { prep, .. } = prepare_chosen_module(&inventory, &chosen)
-        .unwrap_or_else(|error| panic!("{chosen}: replay preparation failed: {error}"));
-
     let tsv_path = PathBuf::from(&bemc_root)
         .join(chosen.replace('.', "/"))
         .with_extension("tsv");
@@ -21827,9 +21882,18 @@ fn bemc_synthetic_module_pin_and_kernel_verdicts_join() {
             "verdict table row must have five fields, got {}: {line:?}",
             fields.len()
         );
-        pin_verdicts.insert(
-            fields[1].to_string(),
-            (fields[3].to_string(), fields[4].to_string()),
+        assert!(
+            matches!(fields[3], "accept" | "reject" | "inconclusive"),
+            "unknown pin verdict: {line:?}"
+        );
+        assert!(
+            pin_verdicts
+                .insert(
+                    fields[1].to_string(),
+                    (fields[3].to_string(), fields[4].to_string()),
+                )
+                .is_none(),
+            "duplicate pin verdict: {line:?}"
         );
     }
     assert!(
@@ -21837,71 +21901,15 @@ fn bemc_synthetic_module_pin_and_kernel_verdicts_join() {
         "an empty verdict table is a broken generator run, not a clean join"
     );
 
-    let mut judged: Vec<BemcJudgedRow> = Vec::new();
-    for item in &prep.items {
-        let lead = item.lead.to_display_string();
-        if !lead.contains("_bemc_") {
-            continue;
-        }
-        let verdict =
-            check_work_item_with_stack(item, Budget::DEFAULT, KERNEL_REPLAY_WORKER_STACK_BYTES);
-        let outcome = unit_outcome(item, &verdict);
-        judged.push(BemcJudgedRow {
-            lead,
-            outcome: outcome.outcome,
-            message: outcome.message,
-        });
-    }
-    let BemcJoinCells {
-        joined,
-        agree_reject,
-        agree_accept,
-        fatal: fatal_rows,
-        inconclusive: inconclusive_rows,
-        other: pin_accept_fln_other,
-    } = join_bemc_rows(&judged, &pin_verdicts).unwrap_or_else(|unjoined| panic!("{unjoined}"));
-    assert!(
-        joined == pin_verdicts.len() as u64,
-        "the synthetic module judged {joined} mutant units against {} table rows; a mutant \
-         the transport dropped or the decode lost is missing coverage, not agreement",
-        pin_verdicts.len()
-    );
-    eprintln!(
-        "bemc-join module={chosen} joined={joined} agree_reject={agree_reject} \
-         agree_accept={agree_accept} pin_accept_fln_other={} inconclusive={} fatal={}",
-        pin_accept_fln_other.len(),
-        inconclusive_rows.len(),
-        fatal_rows.len()
-    );
-    for row in &pin_accept_fln_other {
-        eprintln!("bemc-row false-rejection-or-divergence {row}");
-    }
-    for row in &inconclusive_rows {
-        eprintln!("bemc-row inconclusive {row}");
-    }
-    for row in &fatal_rows {
-        eprintln!("bemc-row FATAL {row}");
-    }
-    assert!(
-        fatal_rows.is_empty(),
-        "pin-rejected mutants ACCEPTED by FrankenLean — a soundness-side divergence, \
-         stop-ship (plan R7): {} row(s), first: {}",
-        fatal_rows.len(),
-        fatal_rows[0]
-    );
-    assert!(
-        inconclusive_rows.is_empty(),
-        "{} mutant unit(s) inconclusive: unattributed coverage, not agreement; first: {}",
-        inconclusive_rows.len(),
-        inconclusive_rows[0]
-    );
-    assert!(
-        pin_accept_fln_other.is_empty(),
-        "{} unit(s) where the engines disagree without a soundness fatal (false rejection \
-         or class drift); first: {}",
-        pin_accept_fln_other.len(),
-        pin_accept_fln_other[0]
-    );
+    // Use the same explicit kernel stack floor as the positive replay lane.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(KERNEL_REPLAY_WORKER_STACK_BYTES)
+            .spawn_scoped(scope, || bemc::judge(&inventory, &chosen, &pin_verdicts))
+            .expect("spawn reject-side worker")
+            .join()
+            .expect("reject-side worker must complete");
+    });
 }
 
 fn validate_leanchecker_authority_contract(script: &str, findings: &str) -> Result<(), String> {

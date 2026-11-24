@@ -25,3 +25,6 @@ fln-syntax = { path = "../fln-syntax" }
 # three of which are fln-verdict's wire formats. §21 puts fln-conformance last in the
 # crate map, so this edge points downward like every other one here.
 fln-verdict = { path = "../fln-verdict" }
+
+[dev-dependencies]
+fln-checker = { path = "../fln-checker" }

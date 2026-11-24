@@ -565,6 +565,7 @@ name = "fln-conformance"
 version = "0.0.0"
 dependencies = [
  "fln",
+ "fln-checker",
  "fln-cli",
  "fln-core",
  "fln-env",

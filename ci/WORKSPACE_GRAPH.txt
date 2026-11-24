@@ -142,6 +142,7 @@ edge fln-admission -> fln-hash     # logical roots and reading digests of admitt
 edge fln-admission -> fln-kernel   # every admitted declaration crosses the sole kernel authority (fln-import-reuse-composes-4ngt)
 edge fln-admission -> fln-olean    # the pinned .olean read path the council decodes (fln-import-reuse-composes-4ngt)
 edge fln-conformance -> fln-env    # kernel replay builds environments from decoded modules (franken_lean-z6c)
+edge fln-conformance -> fln-checker # reject-side differential separately decodes and judges each mutant (fln-kernel-reject-side-at-scale-bemc)
 edge fln-conformance -> fln-kernel # kernel replay drives the one authority (franken_lean-z6c)
 edge fln-conformance -> fln-olean  # kernel replay decodes real Reference oleans (franken_lean-z6c)
 edge fln-conformance -> fln-hash   # kernel-replay evidence hashes fixture inputs canonically (evidence-runner lane)
