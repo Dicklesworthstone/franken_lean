@@ -1100,6 +1100,10 @@ enum DeltaMode {
     EagerNat(NatReductionScope),
     Disabled,
     Once,
+    /// Unfold at least once, and keep unfolding top-level definitions whose
+    /// `delta_priority` stays strictly greater than `floor` without
+    /// materializing intermediate arenas.
+    AbovePriority((u8, u32)),
 }
 
 impl DeltaMode {
@@ -1114,7 +1118,10 @@ impl DeltaMode {
     const fn eager_child(self) -> DeltaMode {
         match self {
             DeltaMode::EagerNat(scope) => DeltaMode::EagerNat(scope),
-            DeltaMode::Eager | DeltaMode::Disabled | DeltaMode::Once => DeltaMode::Eager,
+            DeltaMode::Eager
+            | DeltaMode::Disabled
+            | DeltaMode::Once
+            | DeltaMode::AbovePriority(_) => DeltaMode::Eager,
         }
     }
 }
@@ -1496,6 +1503,18 @@ impl<'a, 'c> Reducer<'a, 'c> {
             })
         })?;
         Ok(arguments.get(target).cloned())
+    }
+
+    fn current_constant_priority(&self, current: &Cursor) -> Option<(u8, u32)> {
+        let ExprNode::Constant { name, .. } = self.node(current).ok()? else {
+            return None;
+        };
+        self.context
+            .source
+            .constants()
+            .find(name)
+            .and_then(|constant| self.context.source.delta_body(constant))
+            .map(|definition| definition.hint().delta_priority())
     }
 
     fn unfold_definition(&mut self, current: &Cursor) -> Result<Option<Cursor>, Halt> {
@@ -3795,6 +3814,13 @@ impl<'a, 'c> Reducer<'a, 'c> {
                             DeltaMode::Eager | DeltaMode::EagerNat(_) => true,
                             DeltaMode::Disabled => false,
                             DeltaMode::Once => self.delta_reductions == 0,
+                            DeltaMode::AbovePriority(floor) => {
+                                self.delta_reductions == 0
+                                    || (frames.is_empty()
+                                        && self
+                                            .current_constant_priority(&current)
+                                            .is_some_and(|priority| priority > floor))
+                            }
                         };
                     if self.delta_mode.is_eager()
                         && !std::mem::take(&mut self.skip_nat)
@@ -5319,6 +5345,30 @@ pub(crate) fn whnf_comparand_delta_step_of_with(
         context,
         budget,
         DeltaMode::Once,
+        NatReductionScope::ClosedPair,
+        cancelled,
+    )
+}
+
+/// Multi-step lazy delta catch-up (`DeltaMode::AbovePriority(floor)`) for a
+/// comparand whose head priority strictly exceeds the peer's priority `floor`:
+/// unfolds in-place on zero-copy `Cursor`s while top-level priority remains
+/// strictly above `floor`, materializing only once when priority reaches
+/// `<= floor` or a non-delta head.
+pub(crate) fn whnf_comparand_delta_above_of_with(
+    input: WhnfInput<'_>,
+    root: ExprId,
+    floor: (u8, u32),
+    context: &WhnfContext,
+    budget: WhnfBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> (WhnfOutcome, bool) {
+    whnf_input_at_mode_with(
+        input,
+        root,
+        context,
+        budget,
+        DeltaMode::AbovePriority(floor),
         NatReductionScope::ClosedPair,
         cancelled,
     )

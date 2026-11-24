@@ -728,6 +728,28 @@ impl Probe<'_> {
             .whnf_result(result)?
             .map(|reduced| Term::from_whnf(reduced, copied)))
     }
+    /// Multi-step lazy delta catch-up (`DeltaMode::AbovePriority(floor)`):
+    /// unfolds zero-copy `Cursor`s while top-level priority stays strictly
+    /// above `floor`, materializing only once at the catch-up boundary.
+    fn whnf_comparand_delta_above(
+        &mut self,
+        term: &Term,
+        floor: (u8, u32),
+        context: &InferenceContext,
+    ) -> Result<Option<Term>> {
+        let budget = self.budget.whnf;
+        let (result, copied) = crate::whnf::whnf_comparand_delta_above_of_with(
+            term.as_whnf_input(),
+            term.root(),
+            floor,
+            context.reduction(),
+            budget,
+            &mut || self.poll(),
+        );
+        Ok(self
+            .whnf_result(result)?
+            .map(|reduced| Term::from_whnf(reduced, copied)))
+    }
     /// Reducibility priority of `term`'s spine head (stepping through
     /// applications, metadata, and projections), and whether a projection was
     /// crossed (matching `defeq::definition_height_through` and the pin's
@@ -868,17 +890,24 @@ impl Probe<'_> {
         }
         Ok(answer)
     }
-    /// The argument pairs of two applications of one head: the same local, or
-    /// the same constant at equal universe levels, applied to equally many
-    /// arguments.
+    /// The argument pairs of two applications (possibly wrapped in identical
+    /// projection spines) of one non-`Abbrev` head: the same local, or the same
+    /// constant at equal universe levels, applied to equally many arguments.
+    ///
+    /// Matches pinned `type_checker.cpp:936` (`d_t->get_hints().is_regular()`)
+    /// and `defeq::collect_matching_regular_spine_args`: `Abbrev` heads (such
+    /// as `DFunLike.coe` / `LinearMap.instFunLike`) and projections over
+    /// differing heads never trigger speculative `Work::Attempt` congruence and
+    /// instead unfold directly via lazy delta.
     fn same_head_arguments(
         &mut self,
         left: &WireExpr,
         right: &WireExpr,
+        context: &InferenceContext,
     ) -> Result<Option<Vec<(ExprId, ExprId)>>> {
-        let spine = |term: &WireExpr| {
+        let spine = |term: &WireExpr, start: ExprId| {
             let mut arguments = Vec::new();
-            let mut id = term.root();
+            let mut id = start;
             while let Some(ExprNode::Apply { function, argument }) = term.node(id) {
                 arguments.push(*argument);
                 id = *function;
@@ -886,56 +915,84 @@ impl Probe<'_> {
             arguments.reverse();
             (id, arguments)
         };
-        let (left_head, left_arguments) = spine(left);
-        let (right_head, right_arguments) = spine(right);
-        if left_arguments.len() != right_arguments.len() {
-            return Ok(None);
-        }
-        self.tick()?;
-        if let (
-            Some(ExprNode::Projection {
-                structure_name: left_structure,
-                index: left_index,
-                expression: left_expr,
-            }),
-            Some(ExprNode::Projection {
-                structure_name: right_structure,
-                index: right_index,
-                expression: right_expr,
-            }),
-        ) = (left.node(left_head), right.node(right_head))
-            && left_structure == right_structure
-            && left_index == right_index
-        {
-            let mut pairs = Vec::with_capacity(1 + left_arguments.len());
-            pairs.push((*left_expr, *right_expr));
-            pairs.extend(left_arguments.into_iter().zip(right_arguments));
-            return Ok(Some(pairs));
-        }
-        if left_arguments.is_empty() {
-            return Ok(None);
-        }
-        let same_head = match (left.node(left_head), right.node(right_head)) {
-            (
-                Some(ExprNode::Constant {
-                    name: left_name,
-                    levels: left_levels,
-                }),
-                Some(ExprNode::Constant {
-                    name: right_name,
-                    levels: right_levels,
-                }),
-            ) => {
-                left_name == right_name
-                    && left_levels.len() == right_levels.len()
-                    && left_levels.iter().zip(right_levels).all(|(l, r)| {
-                        level_roots_equal(left.levels(), *l, right.levels(), *r).unwrap_or(false)
-                    })
+        let mut left_cursor = left.root();
+        let mut right_cursor = right.root();
+        let mut peeled_projection = false;
+        let mut batches: Vec<Vec<(ExprId, ExprId)>> = Vec::new();
+        loop {
+            self.tick()?;
+            let (left_head, left_arguments) = spine(left, left_cursor);
+            let (right_head, right_arguments) = spine(right, right_cursor);
+            if left_arguments.len() != right_arguments.len() {
+                return Ok(None);
             }
-            (Some(ExprNode::Free { name: l }), Some(ExprNode::Free { name: r })) => l == r,
-            _ => false,
-        };
-        Ok(same_head.then(|| left_arguments.into_iter().zip(right_arguments).collect()))
+            if !left_arguments.is_empty() {
+                batches.push(left_arguments.into_iter().zip(right_arguments).collect());
+            }
+            match (left.node(left_head), right.node(right_head)) {
+                (
+                    Some(ExprNode::Projection {
+                        structure_name: left_structure,
+                        index: left_index,
+                        expression: left_expr,
+                    }),
+                    Some(ExprNode::Projection {
+                        structure_name: right_structure,
+                        index: right_index,
+                        expression: right_expr,
+                    }),
+                ) if left_structure == right_structure && left_index == right_index => {
+                    peeled_projection = true;
+                    left_cursor = *left_expr;
+                    right_cursor = *right_expr;
+                }
+                (
+                    Some(ExprNode::Constant {
+                        name: left_name,
+                        levels: left_levels,
+                    }),
+                    Some(ExprNode::Constant {
+                        name: right_name,
+                        levels: right_levels,
+                    }),
+                ) => {
+                    if batches.is_empty() && !peeled_projection {
+                        return Ok(None);
+                    }
+                    let reduction = context.reduction();
+                    let is_abbrev = reduction
+                        .constants()
+                        .find(left_name)
+                        .and_then(|constant| reduction.delta_body(constant))
+                        .is_some_and(|definition| {
+                            definition.hint() == crate::environment::ReducibilityHint::Abbrev
+                        });
+                    if is_abbrev
+                        || left_name != right_name
+                        || left_levels.len() != right_levels.len()
+                        || !left_levels.iter().zip(right_levels).all(|(l, r)| {
+                            level_roots_equal(left.levels(), *l, right.levels(), *r)
+                                .unwrap_or(false)
+                        })
+                    {
+                        return Ok(None);
+                    }
+                    let mut pairs = Vec::new();
+                    for batch in batches.into_iter().rev() {
+                        pairs.extend(batch);
+                    }
+                    return Ok((!pairs.is_empty()).then_some(pairs));
+                }
+                (Some(ExprNode::Free { name: l }), Some(ExprNode::Free { name: r })) if l == r => {
+                    let mut pairs = Vec::new();
+                    for batch in batches.into_iter().rev() {
+                        pairs.extend(batch);
+                    }
+                    return Ok((!pairs.is_empty()).then_some(pairs));
+                }
+                _ => return Ok(None),
+            }
+        }
     }
     fn proof_status(&mut self, term: &WireExpr, context: &InferenceContext) -> Result<ProofStatus> {
         // A type constructor cannot itself be a proof. Avoid expensive failed
@@ -1901,7 +1958,7 @@ impl Probe<'_> {
             // sufficient, so a pair it cannot establish goes on to the rules
             // below unchanged.
             if try_congruence
-                && let Some(arguments) = self.same_head_arguments(&left, &right)?
+                && let Some(arguments) = self.same_head_arguments(&left, &right, &context)?
                 && !self.incongruent.contains(&left, &right)
             {
                 let mut obligations = Vec::with_capacity(arguments.len());
@@ -2068,17 +2125,29 @@ impl Probe<'_> {
             };
             if unfold_left || unfold_right {
                 let mut next_l = if unfold_left {
-                    let Some(reduced) = self.whnf_comparand_delta_step(&l, &context)? else {
-                        fail!()
+                    let reduced = if !unfold_right
+                        && left_delta
+                        && let Some(floor) = right_height
+                    {
+                        self.whnf_comparand_delta_above(&l, floor, &context)?
+                    } else {
+                        self.whnf_comparand_delta_step(&l, &context)?
                     };
+                    let Some(reduced) = reduced else { fail!() };
                     reduced
                 } else {
                     l.clone()
                 };
                 let mut next_r = if unfold_right {
-                    let Some(reduced) = self.whnf_comparand_delta_step(&r, &context)? else {
-                        fail!()
+                    let reduced = if !unfold_left
+                        && right_delta
+                        && let Some(floor) = left_height
+                    {
+                        self.whnf_comparand_delta_above(&r, floor, &context)?
+                    } else {
+                        self.whnf_comparand_delta_step(&r, &context)?
                     };
+                    let Some(reduced) = reduced else { fail!() };
                     reduced
                 } else {
                     r.clone()
@@ -3067,6 +3136,203 @@ mod tests {
             probe.answers.current.buckets.len(),
             0,
             "intermediate lazy-delta steps must not populate PairAnswers"
+        );
+    }
+
+    #[test]
+    fn abbrev_and_mismatched_projection_heads_skip_speculative_congruence() {
+        use crate::environment::{
+            ConstantDeclaration, ConstantEntry, ConstantKind, ConstantSafety, DefinitionBody,
+            DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
+        };
+        let name = |s: &str| WireName::from_parts(vec![NamePart::Text(s.into())]);
+        let sort_type = WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: crate::wire::LevelId::from_index(1).expect("level 1"),
+            }],
+            vec![
+                crate::wire::LevelNode::Zero,
+                crate::wire::LevelNode::Succ(crate::wire::LevelId::ZERO),
+            ],
+            ExprId::ZERO,
+        );
+        let t_const = constant("T");
+        let t_to_t = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("T"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Forall {
+                    binder_name: name("x"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::ZERO,
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(1).expect("forall"),
+        );
+        // `coe : T -> T := fun _ => t0` with `ReducibilityHint::Abbrev`.
+        // Comparing `coe a ≟ coe b` (with distinct axioms `a`, `b : T`) must
+        // unfold `coe` directly without pushing a speculative `Work::Attempt`
+        // congruence (so `probe.incongruent` stays empty).
+        let coe_body = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("T"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("t0"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Lambda {
+                    binder_name: name("x"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(1).expect("t0"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(2).expect("lambda"),
+        );
+        let entries = vec![
+            ConstantEntry::new(
+                name("T"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    sort_type,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("t0"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    t_const.clone(),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("a"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    t_const.clone(),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("b"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    t_const,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("coe"),
+                ConstantDeclaration::definition(
+                    Vec::new(),
+                    t_to_t,
+                    ConstantSafety::Safe,
+                    DefinitionBody::new(
+                        coe_body,
+                        ReducibilityHint::Abbrev,
+                        DefinitionSafety::Safe,
+                        Vec::new(),
+                    ),
+                ),
+            ),
+        ];
+        let constants = match crate::environment::ConstantEnvironment::build(
+            entries,
+            EnvironmentBudget::unlimited(),
+        ) {
+            EnvironmentOutcome::Complete { environment, .. } => environment,
+            other => panic!("environment must build: {other:?}"),
+        };
+        let context = InferenceContext::empty(constants);
+        let apply = |f: &str, arg: &str| {
+            WireExpr::from_parts(
+                vec![
+                    ExprNode::Constant {
+                        name: name(f),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Constant {
+                        name: name(arg),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Apply {
+                        function: ExprId::ZERO,
+                        argument: ExprId::from_index(1).expect("arg"),
+                    },
+                ],
+                Vec::new(),
+                ExprId::from_index(2).expect("apply"),
+            )
+        };
+        let left = apply("coe", "a");
+        let right = apply("coe", "b");
+        let mut cancelled = || false;
+        let mut probe = Probe {
+            budget: InferenceBudget::unlimited(),
+            steps: 0,
+            polls: 0,
+            cancelled: &mut cancelled,
+            stop: None,
+            root_left: &left,
+            root_right: &right,
+            root_context: &context,
+            reserved: None,
+            unreserved_nested: Vec::new(),
+            next: 0,
+            incongruent: PairSet::default(),
+            proven: PairSet::default(),
+            disproven: PairSet::default(),
+            answers: PairAnswers::default(),
+            inferred: InferredTypes::default(),
+            opened: OpenedLocals::default(),
+        };
+        assert!(
+            probe
+                .run(&left, &right, &context, true)
+                .expect("abbrev delta must succeed")
+        );
+        assert!(
+            probe.incongruent.current.buckets.is_empty(),
+            "Abbrev head must unfold directly without speculative congruence attempts"
+        );
+        // Distinct heads beneath matching projections must also skip speculative
+        // congruence (`a.0` vs `b.0` has `same_head_arguments == None`).
+        let proj = |target: &str| {
+            WireExpr::from_parts(
+                vec![
+                    ExprNode::Constant {
+                        name: name(target),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Projection {
+                        structure_name: name("S"),
+                        index: 0,
+                        expression: ExprId::ZERO,
+                    },
+                ],
+                Vec::new(),
+                ExprId::from_index(1).expect("proj"),
+            )
+        };
+        assert_eq!(
+            probe
+                .same_head_arguments(&proj("a"), &proj("b"), &context)
+                .expect("same_head_arguments"),
+            None,
+            "projections over distinct heads must not trigger speculative congruence"
         );
     }
 }
