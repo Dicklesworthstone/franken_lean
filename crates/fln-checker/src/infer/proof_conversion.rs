@@ -433,6 +433,22 @@ enum Reach {
     MajorsAndProjections,
 }
 
+/// Whether a comparand's type is known to inhabit `Prop`, known not to, or
+/// could not be inferred without further reduction.
+enum ProofStatus {
+    Proof(WireExpr),
+    NotProof,
+    Unknown,
+}
+
+/// Whether `term`'s spine head is a `Theorem` constant (always proof-valued
+/// when fully applied, so proof irrelevance should run before congruence).
+fn is_theorem_head(term: &WireExpr, context: &InferenceContext) -> bool {
+    head_constant(term)
+        .and_then(|name| context.constants().find(name))
+        .is_some_and(|decl| decl.kind() == crate::environment::ConstantKind::Theorem)
+}
+
 /// How `nested_k_reduction` reached the next term down from the current one.
 enum Descent {
     /// The recursor's major premise, at this spine position.
@@ -712,7 +728,7 @@ impl Probe<'_> {
             .whnf_result(result)?
             .map(|reduced| Term::from_whnf(reduced, copied)))
     }
-    /// Reducibility height of `term`'s spine head (stepping through
+    /// Reducibility priority of `term`'s spine head (stepping through
     /// applications, metadata, and projections), and whether a projection was
     /// crossed (matching `defeq::definition_height_through` and the pin's
     /// `try_unfold_proj_app`).
@@ -720,7 +736,7 @@ impl Probe<'_> {
         &mut self,
         term: &WireExpr,
         context: &InferenceContext,
-    ) -> Result<(Option<u32>, bool)> {
+    ) -> Result<(Option<(u8, u32)>, bool)> {
         let reduction = context.reduction();
         let mut id = term.root();
         let mut through_projection = false;
@@ -738,7 +754,7 @@ impl Probe<'_> {
                         .constants()
                         .find(name)
                         .and_then(|constant| reduction.delta_body(constant))
-                        .map(|definition| definition.hint().delta_height());
+                        .map(|definition| definition.hint().delta_priority());
                     return Ok((height, through_projection));
                 }
                 _ => return Ok((None, through_projection)),
@@ -767,11 +783,17 @@ impl Probe<'_> {
         left: &WireExpr,
         right: &WireExpr,
         context: &InferenceContext,
+        record_cache: bool,
     ) -> Result<Option<bool>> {
-        let fingerprint = PairSet::fingerprint(left, right);
-        if let Some(answer) = self.answers.get(fingerprint, left, right) {
-            return Ok(answer);
-        }
+        let fingerprint = if record_cache {
+            let fp = PairSet::fingerprint(left, right);
+            if let Some(answer) = self.answers.get(fp, left, right) {
+                return Ok(answer);
+            }
+            Some(fp)
+        } else {
+            None
+        };
         let answer = if has_nat_or_string_head(left) || has_nat_or_string_head(right) {
             let budget = self.budget.defeq;
             let result =
@@ -841,7 +863,9 @@ impl Probe<'_> {
                 }
             }
         };
-        self.answers.insert(fingerprint, left, right, answer);
+        if let Some(fingerprint) = fingerprint {
+            self.answers.insert(fingerprint, left, right, answer);
+        }
         Ok(answer)
     }
     /// The argument pairs of two applications of one head: the same local, or
@@ -913,37 +937,65 @@ impl Probe<'_> {
         };
         Ok(same_head.then(|| left_arguments.into_iter().zip(right_arguments).collect()))
     }
-    fn proof_type(
-        &mut self,
-        term: &WireExpr,
-        context: &InferenceContext,
-    ) -> Result<Option<WireExpr>> {
+    fn proof_status(&mut self, term: &WireExpr, context: &InferenceContext) -> Result<ProofStatus> {
         // A type constructor cannot itself be a proof. Avoid expensive failed
         // queries while descending the declaration's outer function telescope.
         if matches!(
             term.node(term.root()),
             Some(ExprNode::Sort { .. } | ExprNode::Forall { .. })
         ) {
-            return Ok(None);
+            return Ok(ProofStatus::NotProof);
         }
         let Some(type_) = self.infer(term, context)? else {
-            return Ok(None);
+            return Ok(ProofStatus::Unknown);
         };
         let Some(sort) = self.infer(&type_, context)? else {
-            return Ok(None);
+            return Ok(ProofStatus::Unknown);
         };
         let Some(sort) = self.whnf(&sort, context)? else {
-            return Ok(None);
+            return Ok(ProofStatus::Unknown);
         };
         let Some(ExprNode::Sort { level }) = sort.node(sort.root()) else {
-            return Ok(None);
+            return Ok(ProofStatus::Unknown);
         };
         self.tick()?;
-        let normalized = normalize(&WireLevel::from_parts(sort.levels().to_vec(), *level));
-        Ok(normalized
-            .ok()
-            .filter(|n| matches!(n.nodes().get(n.root().index()), Some(NormalNode::Zero)))
-            .map(|_| type_))
+        match normalize(&WireLevel::from_parts(sort.levels().to_vec(), *level)) {
+            Ok(n) if matches!(n.nodes().get(n.root().index()), Some(NormalNode::Zero)) => {
+                Ok(ProofStatus::Proof(type_))
+            }
+            Ok(_) => Ok(ProofStatus::NotProof),
+            Err(_) => Ok(ProofStatus::Unknown),
+        }
+    }
+    /// Try KR-311 proof irrelevance (`type_checker.cpp:1117`). When either side
+    /// is definitively non-`Prop` (`ProofStatus::NotProof`), clear
+    /// `*check_proof`: by subject reduction, subsequent core/K/delta steps on
+    /// this pair cannot turn a non-proof into a proof.
+    fn try_proof_irrelevance(
+        &mut self,
+        left: &WireExpr,
+        right: &WireExpr,
+        context: &InferenceContext,
+        check_proof: &mut bool,
+    ) -> Result<Option<(WireExpr, WireExpr)>> {
+        if !*check_proof {
+            return Ok(None);
+        }
+        match self.proof_status(left, context)? {
+            ProofStatus::Proof(lt) => match self.proof_status(right, context)? {
+                ProofStatus::Proof(rt) => Ok(Some((lt, rt))),
+                ProofStatus::NotProof => {
+                    *check_proof = false;
+                    Ok(None)
+                }
+                ProofStatus::Unknown => Ok(None),
+            },
+            ProofStatus::NotProof => {
+                *check_proof = false;
+                Ok(None)
+            }
+            ProofStatus::Unknown => Ok(None),
+        }
     }
     /// KR-315, the pin's `is_def_eq_unit_like` (type_checker.cpp:1073): when
     /// `left`'s type normalizes to a non-recursive, index-free, one-constructor
@@ -956,6 +1008,12 @@ impl Probe<'_> {
         right: &WireExpr,
         context: &InferenceContext,
     ) -> Result<Option<(WireExpr, WireExpr)>> {
+        if matches!(
+            left.node(left.root()),
+            Some(ExprNode::Sort { .. } | ExprNode::Forall { .. })
+        ) {
+            return Ok(None);
+        }
         let Some(left_type) = self.infer(left, context)? else {
             return Ok(None);
         };
@@ -1520,11 +1578,36 @@ impl Probe<'_> {
         context: &InferenceContext,
         root_deferred: bool,
     ) -> Result<bool> {
+        #[derive(Clone, Copy)]
+        struct PairState {
+            /// True until either side is inferred to have a non-Prop type.
+            check_proof: bool,
+            /// True for logical subgoals (`Work::Pair`), false for intermediate
+            /// core/K/delta steps inside one pair's lazy-delta chain (matching
+            /// `type_checker.cpp:1117-1157`: intermediate delta states do not
+            /// populate `taken`, `proven`/`disproven`, or `PairAnswers`).
+            record_pair: bool,
+        }
+        impl PairState {
+            const FRESH: Self = Self {
+                check_proof: true,
+                record_pair: true,
+            };
+            const fn after_step(self) -> Self {
+                Self {
+                    check_proof: self.check_proof,
+                    record_pair: false,
+                }
+            }
+        }
         enum Work {
             Pair(Term, Term, InferenceContext),
+            /// Intermediate core, K-reduction, or single-step lazy-delta state
+            /// of an already-entered pair.
+            DeltaStep(Term, Term, InferenceContext, PairState),
             /// A pair whose congruence attempt failed, taking the other rules;
             /// the flag is the root's `root_deferred`.
-            Rules(Term, Term, InferenceContext, bool),
+            Rules(Term, Term, InferenceContext, bool, PairState),
             /// Marker sitting below a pair's sub-obligations (and below any
             /// `Work::Attempt` for that pair): reaching it records the pair in
             /// `self.proven` if no unproven `taken` skip occurred beneath it;
@@ -1538,6 +1621,7 @@ impl Probe<'_> {
                 right: Term,
                 context: InferenceContext,
                 skip_untyped: bool,
+                state: PairState,
                 trail: usize,
             },
             Binders(Term, Term, ExprId, ExprId, WireExpr, InferenceContext),
@@ -1608,6 +1692,7 @@ impl Probe<'_> {
                         right,
                         context,
                         skip_untyped,
+                        state,
                         trail: mark,
                     }) = work.pop()
                     {
@@ -1621,13 +1706,15 @@ impl Probe<'_> {
                         }
                         self.incongruent
                             .insert(Arc::clone(&left.expr), Arc::clone(&right.expr));
-                        work.push(Work::Rules(left, right, context, skip_untyped));
+                        work.push(Work::Rules(left, right, context, skip_untyped, state));
                     }
                     continue 'work;
                 }};
             }
             self.tick()?;
-            if let Work::Pair(ref left, ref right, _) = task {
+            if let Work::Pair(ref left, ref right, _) | Work::DeltaStep(ref left, ref right, ..) =
+                task
+            {
                 if left.expr == right.expr || self.proven.contains(left, right) {
                     continue;
                 }
@@ -1644,7 +1731,10 @@ impl Probe<'_> {
                     lambda_on_left,
                     ..
                 } => Some((Taken::Eta(*lambda_on_left), &lambda.expr, &other.expr)),
-                Work::Rules(..) | Work::Attempt { .. } | Work::Established(..) => None,
+                Work::DeltaStep(..)
+                | Work::Rules(..)
+                | Work::Attempt { .. }
+                | Work::Established(..) => None,
             };
             if let Some((kind, a, b)) = key {
                 let entry_nodes = a.nodes().len().saturating_add(b.nodes().len());
@@ -1665,7 +1755,7 @@ impl Probe<'_> {
                     taken_nodes = taken_nodes.saturating_add(entry_nodes);
                 }
             }
-            let (left, right, context, try_congruence, skip) = match task {
+            let (left, right, context, try_congruence, skip, mut state) = match task {
                 Work::Pair(left, right, context) => {
                     // Record an establishment marker BELOW any `Work::Attempt`
                     // or sub-obligations for this pair so proven sub-pairs
@@ -1682,9 +1772,15 @@ impl Probe<'_> {
                         context,
                         true,
                         std::mem::take(&mut skip_untyped),
+                        PairState::FRESH,
                     )
                 }
-                Work::Rules(left, right, context, skip) => (left, right, context, false, skip),
+                Work::DeltaStep(left, right, context, state) => {
+                    (left, right, context, true, false, state)
+                }
+                Work::Rules(left, right, context, skip, state) => {
+                    (left, right, context, false, skip, state)
+                }
                 Work::Established(a, b, start_skips) => {
                     if taken_skips == start_skips {
                         self.proven.insert(a, b);
@@ -1781,6 +1877,18 @@ impl Probe<'_> {
                 work.push(Work::Pair(Term::new(domain), Term::new(other), context));
                 continue;
             }
+            // If `left` is headed by a theorem constant, try proof irrelevance
+            // before congruence so differing proof combinators (`Eq.trans`,
+            // `congrArg`, etc.) equate their proposition types immediately
+            // without comparing proof subterms.
+            if state.check_proof
+                && is_theorem_head(&left, &context)
+                && let Some((lt, rt)) =
+                    self.try_proof_irrelevance(&left, &right, &context, &mut state.check_proof)?
+            {
+                work.push(Work::Pair(Term::new(lt), Term::new(rt), context));
+                continue;
+            }
             // Congruence first, with each argument pair decided by this lane.
             // The pin tries congruence before unfolding two applications of one
             // regular definition (`lazy_delta_reduction_step`), comparing the
@@ -1809,6 +1917,7 @@ impl Probe<'_> {
                     right,
                     context,
                     skip_untyped: skip,
+                    state,
                     trail: trail.len(),
                 });
                 attempts += 1;
@@ -1822,27 +1931,23 @@ impl Probe<'_> {
             // Both witnesses must independently type-check as proofs. The two
             // proposition types become a further conversion obligation; merely
             // inhabiting Prop never equates distinct propositions. This runs
-            // before the untyped conversion, as the pin's `is_def_eq_core` runs
-            // `is_def_eq_proof_irrel` before `lazy_delta_reduction` (vendored
-            // type_checker.cpp:1117, 1121): untyped, two proofs can only be
-            // compared by reducing them, and a transport along an `omega`
-            // equation cost `PartialMatch.isLongestMatchAt` its whole budget.
-            if let Some(lt) = self.proof_type(&left, &context)?
-                && let Some(rt) = self.proof_type(&right, &context)?
+            // once per logical pair before lazy delta, as the pin's
+            // `is_def_eq_core` runs `is_def_eq_proof_irrel` before
+            // `lazy_delta_reduction` (vendored type_checker.cpp:1117, 1121),
+            // and is skipped on intermediate delta steps once either side is
+            // known to have a non-Prop type.
+            if let Some((lt, rt)) =
+                self.try_proof_irrelevance(&left, &right, &context, &mut state.check_proof)?
             {
                 work.push(Work::Pair(Term::new(lt), Term::new(rt), context));
                 continue;
             }
             if !skip {
-                match self.equal(&left, &right, &context)? {
+                match self.equal(&left, &right, &context, state.record_pair)? {
                     Some(true) => continue,
                     Some(false) => fail!(),
                     None => {}
                 }
-            }
-            if let Some((lt, rt)) = self.unit_like_obligation(&left, &right, &context)? {
-                work.push(Work::Pair(Term::new(lt), Term::new(rt), context));
-                continue;
             }
             let Some(l_core) = self.whnf_comparand_core(&left, &context)? else {
                 fail!()
@@ -1862,7 +1967,7 @@ impl Probe<'_> {
             if l_changed || r_changed {
                 let next_l = l_core.unwrap_or(left);
                 let next_r = r_core.unwrap_or(right);
-                work.push(Work::Pair(next_l, next_r, context));
+                work.push(Work::DeltaStep(next_l, next_r, context, state.after_step()));
                 continue;
             }
             let (l, r) = (left, right);
@@ -1881,7 +1986,7 @@ impl Probe<'_> {
                     } else {
                         (t.clone(), reduced)
                     };
-                    work.push(Work::Pair(a, b, context.clone()));
+                    work.push(Work::DeltaStep(a, b, context.clone(), state.after_step()));
                     continue 'work;
                 }
             }
@@ -1898,7 +2003,7 @@ impl Probe<'_> {
                     } else {
                         (t.clone(), reduced)
                     };
-                    work.push(Work::Pair(a, b, context.clone()));
+                    work.push(Work::DeltaStep(a, b, context.clone(), state.after_step()));
                     continue 'work;
                 }
             }
@@ -1922,16 +2027,16 @@ impl Probe<'_> {
                     } else {
                         (t.clone(), reduced)
                     };
-                    work.push(Work::Pair(a, b, context.clone()));
+                    work.push(Work::DeltaStep(a, b, context.clone(), state.after_step()));
                     continue 'work;
                 }
             }
             // Pin-aligned height-ordered lazy delta (`type_checker.cpp:903-1055`):
-            // unfold ONE step at the higher reducibility height (preferring a
+            // unfold ONE step at the higher reducibility priority (preferring a
             // projection side over a constant side, as `try_unfold_proj_app`),
-            // returning immediately to the worklist so typed congruence and
-            // proof irrelevance fire at every intermediate combinator layer
-            // instead of eagerly blowing both sides to full delta WHNF.
+            // returning immediately via `Work::DeltaStep` so typed congruence
+            // fires at every intermediate combinator layer without re-running
+            // `proof_type` or polluting `taken`/`PairSet`/`PairAnswers`.
             let (mut left_height, left_proj) = self.definition_height_through(&l, &context)?;
             let (mut right_height, right_proj) = self.definition_height_through(&r, &context)?;
             let left_delta = left_height.is_some() && !left_proj;
@@ -1941,7 +2046,7 @@ impl Probe<'_> {
                     fail!()
                 };
                 if reduced.expr != r.expr {
-                    work.push(Work::Pair(l, reduced, context));
+                    work.push(Work::DeltaStep(l, reduced, context, state.after_step()));
                     continue 'work;
                 }
                 right_height = None;
@@ -1950,7 +2055,7 @@ impl Probe<'_> {
                     fail!()
                 };
                 if reduced.expr != l.expr {
-                    work.push(Work::Pair(reduced, r, context));
+                    work.push(Work::DeltaStep(reduced, r, context, state.after_step()));
                     continue 'work;
                 }
                 left_height = None;
@@ -1990,9 +2095,17 @@ impl Probe<'_> {
                     next_l = reduced;
                 }
                 if next_l.expr != l.expr || next_r.expr != r.expr {
-                    work.push(Work::Pair(next_l, next_r, context));
+                    work.push(Work::DeltaStep(next_l, next_r, context, state.after_step()));
                     continue 'work;
                 }
+            }
+            // KR-315 unit-like conversion (`type_checker.cpp:1157`) runs once
+            // lazy delta stops (and before non-backtracking structural
+            // decomposition), avoiding `whnf(infer_type(left))` on pairs
+            // settled by quick equality, congruence, or lazy delta.
+            if let Some((lt, rt)) = self.unit_like_obligation(&l, &r, &context)? {
+                work.push(Work::Pair(Term::new(lt), Term::new(rt), context));
+                continue;
             }
             // KR-312 structure eta runs once neither side can delta-unfold
             // further (pin `type_checker.cpp:1049`): a constructor application
@@ -2832,6 +2945,128 @@ mod tests {
                 ProofConversionOutcome::Complete { equal: true, .. }
             ),
             "height-ordered lazy delta must unfold wrap to shared and prove p1 ≟ p2: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn typed_lazy_delta_skips_proof_type_and_pair_set_on_intermediate_steps() {
+        use crate::environment::{
+            ConstantDeclaration, ConstantEntry, ConstantKind, ConstantSafety, DefinitionBody,
+            DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
+        };
+        assert!(
+            ReducibilityHint::Regular(0).delta_priority()
+                > ReducibilityHint::Opaque.delta_priority()
+        );
+        assert!(
+            ReducibilityHint::Abbrev.delta_priority()
+                > ReducibilityHint::Regular(u32::MAX).delta_priority()
+        );
+        let name = |s: &str| WireName::from_parts(vec![NamePart::Text(s.into())]);
+        let sort_type = WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: crate::wire::LevelId::from_index(1).expect("level 1"),
+            }],
+            vec![
+                crate::wire::LevelNode::Zero,
+                crate::wire::LevelNode::Succ(crate::wire::LevelId::ZERO),
+            ],
+            ExprId::ZERO,
+        );
+        let t_const = constant("T");
+        let mut entries = vec![
+            ConstantEntry::new(
+                name("T"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    sort_type,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("d0"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    t_const.clone(),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+        ];
+        // Build a 12-step regular delta chain `d12 -> d11 -> ... -> d0 : T`
+        // over a non-Prop carrier `T : Type`.
+        for i in 1_u32..=12 {
+            let prev = format!("d{}", i - 1);
+            let cur = format!("d{i}");
+            entries.push(ConstantEntry::new(
+                name(&cur),
+                ConstantDeclaration::definition(
+                    Vec::new(),
+                    t_const.clone(),
+                    ConstantSafety::Safe,
+                    DefinitionBody::new(
+                        constant(&prev),
+                        ReducibilityHint::Regular(i),
+                        DefinitionSafety::Safe,
+                        Vec::new(),
+                    ),
+                ),
+            ));
+        }
+        let constants = match crate::environment::ConstantEnvironment::build(
+            entries,
+            EnvironmentBudget::unlimited(),
+        ) {
+            EnvironmentOutcome::Complete { environment, .. } => environment,
+            other => panic!("environment must build: {other:?}"),
+        };
+        let context = InferenceContext::empty(constants);
+        let left = constant("d12");
+        let right = constant("d0");
+        let mut cancelled = || false;
+        let mut probe = Probe {
+            budget: InferenceBudget::unlimited(),
+            steps: 0,
+            polls: 0,
+            cancelled: &mut cancelled,
+            stop: None,
+            root_left: &left,
+            root_right: &right,
+            root_context: &context,
+            reserved: None,
+            unreserved_nested: Vec::new(),
+            next: 0,
+            incongruent: PairSet::default(),
+            proven: PairSet::default(),
+            disproven: PairSet::default(),
+            answers: PairAnswers::default(),
+            inferred: InferredTypes::default(),
+            opened: OpenedLocals::default(),
+        };
+        let equal = probe
+            .run(&left, &right, &context, true)
+            .expect("delta chain must succeed");
+        assert!(equal);
+        // Only the entry term `d12` and its type `T` should have been inferred;
+        // intermediate delta states `d11..d1` must not re-run `proof_status`.
+        assert!(
+            probe.inferred.current.buckets.len() <= 3,
+            "intermediate lazy-delta steps must not re-run proof_type inference: inferred_buckets={}",
+            probe.inferred.current.buckets.len()
+        );
+        // Only the logical root pair `(d12, d0)` enters `proven`; intermediate
+        // delta pairs `(d11, d0) .. (d1, d0)` must not thrash `PairSet`.
+        assert!(
+            probe.proven.current.buckets.len() <= 1,
+            "intermediate lazy-delta steps must not populate PairSet: proven_buckets={}",
+            probe.proven.current.buckets.len()
+        );
+        // Intermediate delta steps must not clone into `PairAnswers`.
+        assert_eq!(
+            probe.answers.current.buckets.len(),
+            0,
+            "intermediate lazy-delta steps must not populate PairAnswers"
         );
     }
 }

@@ -2120,7 +2120,7 @@ fn definition_height(
     context: &WhnfContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
-) -> Result<Option<u32>, SlowHalt> {
+) -> Result<Option<(u8, u32)>, SlowHalt> {
     Ok(definition_height_through(reference, sources, context, control, cancelled)?.0)
 }
 
@@ -2132,7 +2132,7 @@ fn definition_height_through(
     context: &WhnfContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
-) -> Result<(Option<u32>, bool), SlowHalt> {
+) -> Result<(Option<(u8, u32)>, bool), SlowHalt> {
     let term = sources.source(reference)?;
     let mut current = reference;
     let mut through_projection = false;
@@ -2164,7 +2164,7 @@ fn definition_height_through(
                         .constants()
                         .find(name)
                         .and_then(|constant| context.delta_body(constant))
-                        .map(|definition| definition.hint().delta_height()),
+                        .map(|definition| definition.hint().delta_priority()),
                     through_projection,
                 ));
             }
@@ -2189,8 +2189,8 @@ type PendingPair = (
     bool,
 );
 
-/// Each side's definition height, `None` when it does not unfold.
-type HeightPair = (Option<u32>, Option<u32>);
+/// Each side's definition priority, `None` when it does not unfold.
+type HeightPair = (Option<(u8, u32)>, Option<(u8, u32)>);
 
 /// The heights for one lazy delta step, applying first the pin's rule for a
 /// projection side (vendored `type_checker.cpp:903-928`): when exactly one side

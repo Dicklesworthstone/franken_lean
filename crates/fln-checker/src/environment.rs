@@ -35,6 +35,16 @@ impl ReducibilityHint {
             ReducibilityHint::Regular(height) => height,
         }
     }
+
+    /// Pin-aligned reducibility priority (`declaration.cpp:compare`):
+    /// `Opaque < Regular(0) < Regular(1) < ... < Abbrev`.
+    pub const fn delta_priority(self) -> (u8, u32) {
+        match self {
+            ReducibilityHint::Opaque => (0, 0),
+            ReducibilityHint::Regular(height) => (1, height),
+            ReducibilityHint::Abbrev => (2, 0),
+        }
+    }
 }
 
 /// The declaration family carried by one constant header.
