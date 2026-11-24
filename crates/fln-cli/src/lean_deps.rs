@@ -35,6 +35,9 @@ impl<'a> Header<'a> {
             } else if rest.starts_with("/-") && !rest.starts_with("/--") && !rest.starts_with("/-!")
             {
                 self.offset += 2;
+                // ParseImportsFast consumes the first non-doc character before
+                // entering finishCommentBlock, including a multibyte character.
+                self.offset += self.rest().chars().next().map_or(0, char::len_utf8);
                 let mut depth = 1;
                 while depth > 0 {
                     let rest = self.rest();
@@ -50,7 +53,16 @@ impl<'a> Header<'a> {
                         self.offset += 2;
                         depth += 1;
                     } else {
+                        // A dash consumes its lookahead even when it is not a
+                        // slash. A slash leaves a non-dash lookahead unconsumed.
+                        let marker = self.rest().as_bytes()[0];
+                        let Some(next) = self.rest()[1..].chars().next() else {
+                            return Err("unterminated comment");
+                        };
                         self.offset += 1;
+                        if marker == b'-' {
+                            self.offset += next.len_utf8();
+                        }
                     }
                 }
             } else {
@@ -261,6 +273,21 @@ mod tests {
             Err("cannot use 'public', 'meta', or 'all' without 'module'")
         );
         assert_eq!(scan("import «oops"), Err("unterminated identifier escape"));
+    }
+
+    #[test]
+    fn batch_dependency_headers_follow_the_fast_comment_cursor() {
+        let right = format!(
+            r#"{{"imports":[{}],"isModule":false}}"#,
+            import("Right", false, true, false)
+        );
+        for source in [
+            "prelude /- --/ import Wrong -/ import Right",
+            "prelude /-/- import Wrong -/ import Right",
+            "prelude /-🐾 -λ /-γ --/ import Hidden -/ -/ import Right",
+        ] {
+            assert_eq!(scan(source).unwrap(), right, "{source}");
+        }
     }
 
     #[test]
