@@ -19,9 +19,10 @@
 //! from a literal), or `.cons k x .nil` against `Vec Nat n` (a nested `Vec.nil` against
 //! `Vec Nat k`). This module replays the pin's decision on a model whose definitional equality
 //! answers yes, no or unknown, and refuses a match only when every step of that decision was
-//! decided. A form it does not model (a literal of another type, an anonymous constructor, a
-//! definition to unfold, a let-bound local) leaves the match to the lowering as before, so a match
-//! the pin admits is never refused here; universe levels are not compared, which can only admit.
+//! decided. Aliases and let-bound indices use metered source head reduction at the pin's
+//! transparency. A form it does not model (a literal of another type, an anonymous constructor)
+//! leaves the match to the lowering as before; universe levels are not compared, which can only
+//! admit. The original discriminant types remain intact for refinement and abstraction.
 use super::*;
 use fln_env::constants::ConstantInfo;
 use std::collections::{HashMap, HashSet};
@@ -633,6 +634,89 @@ fn with_offset(base: Option<Expr>, offset: u64) -> Expr {
 }
 
 impl Model<'_> {
+    /// Expose aliases without publishing assignments made by speculative reduction. Model
+    /// variables remain neutral; spent work is retained even when the reducer refuses. Nat
+    /// offsets keep the representation read by `shape`: ordinary native WHNF need not preserve
+    /// the pin's `Nat.add` argument beneath a successor.
+    fn reduce_head_at(
+        &mut self,
+        expression: &Expr,
+        transparency: UnificationTransparency,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        if nat_view(expression, 0).is_some() {
+            return Ok(expression.clone());
+        }
+        let (head, arguments) = spine(expression);
+        let may_reduce = match head.node() {
+            ExprNode::LetE { .. } | ExprNode::MData { .. } | ExprNode::Proj { .. } => true,
+            ExprNode::Lam { .. } => !arguments.is_empty(),
+            ExprNode::FVar { id } => self
+                .cx
+                .txn
+                .lctx
+                .find(id)
+                .is_some_and(|local| local.value.is_some()),
+            ExprNode::Const { name, .. } => matches!(
+                self.cx.txn.env.find(name),
+                Some(ConstantInfo::Defn(_) | ConstantInfo::Rec(_) | ConstantInfo::Quot(_))
+            ),
+            _ => false,
+        };
+        if !may_reduce {
+            return Ok(expression.clone());
+        }
+        let mut trial = self.cx.clone();
+        let result: Result<Expr, NatDefinitionElabError> = (|| {
+            let mut current = expression.clone();
+            loop {
+                let reduced = trial.whnf_with_transparency(&current, transparency, true)?;
+                // A stored let value may still contain already assigned source metavariables.
+                // Expose them before treating its head as stuck; newly revealed beta/iota
+                // redexes use the same metered reducer and the same isolated assignments.
+                let instantiated = trial.instantiate(&reduced)?;
+                if instantiated == reduced {
+                    return Ok(reduced);
+                }
+                current = instantiated;
+            }
+        })();
+        self.cx.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        result
+    }
+
+    fn reduce_head(&mut self, expression: &Expr) -> Result<Expr, NatDefinitionElabError> {
+        let transparency = self
+            .cx
+            .ambient_transparency(UnificationTransparency::Default);
+        self.reduce_head_at(expression, transparency)
+    }
+
+    fn reduce_head_default(&mut self, expression: &Expr) -> Result<Expr, NatDefinitionElabError> {
+        self.reduce_head_at(expression, UnificationTransparency::Default)
+    }
+
+    /// `whnfD` folds a closed Nat offset even if its base needs delta or zeta reduction.
+    /// An open offset must retain its original constructor argument for refinement paths.
+    fn closed_nat(&mut self, expression: &Expr) -> Result<Option<u64>, NatDefinitionElabError> {
+        let mut current = expression.clone();
+        let mut total = 0u64;
+        loop {
+            self.cx.tick()?;
+            current = self.reduce_head_default(&current)?;
+            let Some((base, offset)) = nat_view(&current, 0) else {
+                return Ok(None);
+            };
+            let Some(next) = total.checked_add(offset) else {
+                return Ok(None);
+            };
+            total = next;
+            match base {
+                None => return Ok(Some(total)),
+                Some(base) => current = base,
+            }
+        }
+    }
+
     /// Absolute constructor applications collect their fields in telescope order. Relative
     /// heads are still unresolved at collection time: the pin visits their named values in
     /// written order, then positional values (`PatternVar.lean:processCtorApp`). This matters
@@ -1308,6 +1392,15 @@ impl Model<'_> {
         {
             return Ok(answer);
         }
+        // The pattern replay follows source transparency before deciding that two rigid
+        // indices cannot unify. R1's separately measured application model stays unchanged.
+        if !self.applications {
+            let reduced_left = self.reduce_head(&left)?;
+            let reduced_right = self.reduce_head(&right)?;
+            if reduced_left != left || reduced_right != right {
+                return self.compare(&reduced_left, &reduced_right, depth + 1);
+            }
+        }
         // `isDefEqOffsetNat`: two offset terms compare by their bases once the common offset
         // is cancelled; a smaller literal than the offset is never equal.
         if let (Some((left_base, left_offset)), Some((right_base, right_offset))) =
@@ -1467,12 +1560,8 @@ impl Model<'_> {
             let Some(expected) = self.inst(expected, 0)? else {
                 return Ok(Err(Stop::Unknown));
             };
-            // A record alias must not hide a written-order scope error. Reduce in a
-            // snapshot: retain spent work, but never speculative assignments.
-            let mut reduction = self.cx.clone();
-            let reduced = reduction.whnf(&expected);
-            self.cx.txn.budget.heartbeats_consumed = reduction.txn.budget.heartbeats_consumed;
-            let expected = reduced?;
+            // A record alias must not hide a written-order scope error.
+            let expected = self.reduce_head(&expected)?;
             let (head, _) = spine(&expected);
             let Some(family) = const_name(head) else {
                 return Ok(Err(Stop::Unknown));
@@ -1516,6 +1605,7 @@ impl Model<'_> {
             let Some(expected) = self.inst(expected, 0)? else {
                 return Ok(Err(Stop::Unknown));
             };
+            let expected = self.reduce_head(&expected)?;
             if const_name(&expected) != Some(&nat()) {
                 return Ok(Err(Stop::Unknown));
             }
@@ -1534,6 +1624,7 @@ impl Model<'_> {
                 let Some(expected) = self.inst(expected, 0)? else {
                     return Ok(Err(Stop::Unknown));
                 };
+                let expected = self.reduce_head(&expected)?;
                 let (family, _) = spine(&expected);
                 match const_name(family).filter(|name| self.inductive(name).is_some()) {
                     Some(family) => family.clone().append_core(val),
@@ -2302,7 +2393,8 @@ impl Model<'_> {
         if depth > DEPTH {
             return Ok(None);
         }
-        let (head, args) = spine(type_);
+        let reduced = self.reduce_head_default(type_)?;
+        let (head, args) = spine(&reduced);
         let Some(info) = const_name(head).and_then(|name| self.inductive(name)) else {
             return Ok(Some(type_.clone()));
         };
@@ -2340,6 +2432,8 @@ impl Model<'_> {
         else {
             return Ok(Path::Unknown);
         };
+        let pattern = self.reduce_head(&pattern)?;
+        let expected = self.reduce_head(&expected)?;
         let (pattern_head, pattern_args) = spine(&pattern);
         let (expected_head, expected_args) = spine(&expected);
         let (Some(name), Some(other)) = (const_name(pattern_head), const_name(expected_head))
@@ -2428,16 +2522,20 @@ impl Model<'_> {
     }
 
     /// The pin's `whnfD` of an index term, as far as the refinement reads it: closed Nat
-    /// arithmetic is a literal, `e + k` is `Nat.succ (e + (k - 1))`, `e + 0` is `e`. `None` where
-    /// the model does not know (a definition to unfold, a let-bound local).
+    /// arithmetic is a literal, `e + k` is `Nat.succ (e + (k - 1))`, `e + 0` is `e`. Aliases
+    /// and local definitions reduce at default transparency; an opaque head remains unknown.
     fn shape(&mut self, expr: &Expr) -> Result<Option<Shape>, NatDefinitionElabError> {
         let Some(expr) = self.inst(expr, 0)? else {
             return Ok(None);
         };
+        let expr = self.reduce_head_default(&expr)?;
         if self.model_mvar(&expr).is_some() {
             return Ok(Some(Shape::Atomic));
         }
         if let Some((base, offset)) = nat_view(&expr, 0) {
+            if base.is_some() && self.closed_nat(&expr)?.is_some() {
+                return Ok(Some(Shape::Atomic));
+            }
             return Ok(match base {
                 None => Some(Shape::Atomic),
                 Some(base) if offset == 0 => return self.shape(&base),
@@ -2482,6 +2580,7 @@ impl Model<'_> {
         let mut current = type_.clone();
         for (step, position) in path.iter().enumerate() {
             self.cx.tick()?;
+            current = self.reduce_head_default(&current)?;
             let args: Vec<Expr> = if step == 0 {
                 let (head, args) = spine(&current);
                 if !const_name(head).is_some_and(|name| self.inductive(name).is_some()) {
@@ -2783,4 +2882,106 @@ fn replace_fvar(expr: &Expr, id: &FVarId, value: &Expr) -> Result<Expr, NatDefin
     expr.abstract_fvar(id, 0)
         .and_then(|abstracted| abstracted.subst_loose(0, std::slice::from_ref(value)))
         .map_err(|_| failure(SourceInferenceError::Scope))
+}
+
+#[cfg(test)]
+mod reduction_tests {
+    use super::*;
+
+    fn model(context: &mut Context) -> Model<'_> {
+        Model {
+            cx: context,
+            assigned: HashMap::new(),
+            next: 0,
+            names: HashMap::new(),
+            placeholders: HashSet::new(),
+            applications: false,
+            definition_obligations: Vec::new(),
+            source_holes: HashMap::new(),
+            verify_definitions: false,
+        }
+    }
+
+    fn unchanged(context: &Context, before: &ElabTxn) {
+        assert_eq!(context.txn.env, before.env);
+        assert_eq!(context.txn.lctx, before.lctx);
+        assert_eq!(context.txn.mvars, before.mvars);
+        assert_eq!(context.txn.universes, before.universes);
+        assert_eq!(context.txn.constraints, before.constraints);
+        assert_eq!(context.bound_metavars.len(), 1);
+    }
+
+    #[test]
+    fn reduction_charges_success_and_refusal_without_publishing_pending_assignments() {
+        let environment = crate::seed::bootstrap_nat_environment(Budget::DEFAULT).unwrap();
+        let mut context = Context::new(&environment, Budget::DEFAULT);
+        let outer = context.txn.lctx.clone();
+        let local = FVarId(Name::from_components(["n"]));
+        context.txn.lctx.add_param(
+            local.clone(),
+            local.0.clone(),
+            nat_const(),
+            BinderInfo::Default,
+        );
+        let goal = MVarId(Name::from_components(["captured"]));
+        context.txn.mvars.declare(
+            goal.clone(),
+            goal.0.clone(),
+            nat_const(),
+            context.txn.lctx.clone(),
+            MetavarKind::SyntheticOpaque,
+            0,
+            None,
+        );
+        context.instance_goals.push(goal.clone());
+        let mut body = Typed {
+            value: Expr::mvar(goal.clone()),
+            type_: nat_const(),
+        };
+        let captured = context.txn.lctx.find(&local).unwrap().clone();
+        context
+            .capture_bound_metavars(&[captured], &outer, &mut body)
+            .unwrap();
+        assert_eq!(context.bound_metavars.len(), 1);
+        context
+            .txn
+            .assign_mvar(goal, nat_literal(7), AssignmentJustification::SyntheticHole)
+            .unwrap();
+        let alias = FVarId(Name::from_components(["alias"]));
+        context
+            .txn
+            .lctx
+            .add_let(alias.clone(), alias.0.clone(), nat_const(), body.value);
+        let input = Expr::fvar(alias);
+        let before = context.txn.clone();
+        // Ordinary WHNF really settles the captured outer metavariable. The
+        // stored local value still contains it, and needs another instantiation
+        // before its head reduces. Neither assignment may reach the caller.
+        let mut direct = context.clone();
+        let pending = direct.whnf(&input).unwrap();
+        assert!(pending.has_expr_mvar());
+        assert_eq!(direct.whnf(&pending).unwrap(), nat_literal(7));
+        assert_ne!(direct.txn.mvars, before.mvars);
+        assert!(direct.bound_metavars.is_empty());
+
+        let mut limited = context.clone();
+        assert_eq!(
+            model(&mut context).reduce_head_default(&input).unwrap(),
+            nat_literal(7)
+        );
+        unchanged(&context, &before);
+        let charged = context.txn.budget.heartbeats_consumed - before.budget.heartbeats_consumed;
+        let ordinary = direct.txn.budget.heartbeats_consumed - before.budget.heartbeats_consumed;
+        assert!(ordinary > 1 && charged >= ordinary);
+
+        limited.txn.budget.max_heartbeats = before.budget.heartbeats_consumed + charged - 1;
+        assert!(matches!(
+            model(&mut limited).reduce_head_default(&input),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
+        unchanged(&limited, &before);
+        assert!(limited.txn.budget.heartbeats_consumed > before.budget.heartbeats_consumed);
+    }
 }

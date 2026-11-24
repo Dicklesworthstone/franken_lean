@@ -3,8 +3,9 @@
 //! not, a top-level pattern whose type does not unify is refined only along a path to a free
 //! variable, and a nested pattern is never refined. For applications (R1): see the last two tests.
 //!
-//! Every program's verdict was taken from the pinned `lean` (v4.32.0) on 2026-10-10 first, each
-//! on its own file; `set_option trace.Elab.match true` showed the refinement steps cited.
+//! The original program verdicts were taken from pinned `lean` (v4.32.0) on 2026-10-10;
+//! the alias and local-index regressions were checked individually on 2026-11-24 against
+//! the same pin. `set_option trace.Elab.match true` showed the refinement steps cited.
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckError, SourceCheckLimits};
 
@@ -59,6 +60,103 @@ fn a_named_field_against_a_literal_index_is_a_mismatch() {
     // As equations too (the pin elaborates them as a match on the parameters).
     mismatched(&format!(
         "{VEC}def f : Vec Nat 2 → Nat\n  | .cons k x _ => x\n"
+    ));
+}
+
+/// Naming a fixed index does not make it a free variable: the pin unfolds
+/// reducible definitions before searching for a refinement path. The named
+/// constructor field remains rigid, whereas a wildcard can be assigned.
+#[test]
+fn reducible_index_aliases_preserve_rigid_pattern_typing() {
+    for alias in ["abbrev two : Nat := 2", "def two : Nat := 2"] {
+        mismatched(&format!(
+            "{VEC}{alias}\ndef f (xs : Vec Nat two) : Nat := match xs with | .cons k x _ => x\n"
+        ));
+        accepted(&format!(
+            "{VEC}{alias}\ndef f (xs : Vec Nat two) : Nat := match xs with | .cons _ x _ => x\n"
+        ));
+    }
+    // A constructor's closed argument may itself need unfolding before whnfD
+    // recognizes the whole index as a literal.
+    mismatched(&format!(
+        "{VEC}abbrev one : Nat := 1\ndef f (xs : Vec Nat (Nat.succ one)) : Nat := match xs with | .cons k x _ => x\n"
+    ));
+    accepted(&format!(
+        "{VEC}abbrev one : Nat := 1\ndef f (xs : Vec Nat (Nat.succ one)) : Nat := match xs with | .cons _ x _ => x\n"
+    ));
+}
+
+/// Default transparency unfolds the ordinary definition above but preserves
+/// an irreducible one. Even a wildcard cannot solve the pin's opaque index.
+#[test]
+fn irreducible_index_aliases_stay_opaque_during_pattern_replay() {
+    let source = format!(
+        "{VEC}@[irreducible] def two : Nat := 2\ndef f (xs : Vec Nat two) : Nat := match xs with | .cons _ x _ => x\n"
+    );
+    // Native elaboration already refuses at coverage checking; retain that
+    // semantic refusal without requiring the pin's earlier pattern diagnostic.
+    let error = check(&source).expect_err("the pin refuses the irreducible index");
+    assert!(
+        format!("{error:?}").contains("EliminationCoverage"),
+        "{source}\n{error:?}"
+    );
+}
+
+/// The same decision applies through a type alias or a local let. Reducing
+/// these wrappers must retain the original discriminant for valid variable
+/// refinement, rather than treating every aliased index as a fixed literal.
+#[test]
+fn aliased_families_and_local_indices_keep_their_refinement_boundary() {
+    mismatched(&format!(
+        "{VEC}abbrev PairVec := Vec Nat 2\ndef f (xs : PairVec) : Nat := match xs with | .cons k x _ => x\n"
+    ));
+    accepted(&format!(
+        "{VEC}abbrev PairVec := Vec Nat 2\ndef f (xs : PairVec) : Nat := match xs with | .cons _ x _ => x\n"
+    ));
+    mismatched(&format!(
+        "{VEC}def f (xs : Vec Nat 2) : Nat := let two := 2; let ys : Vec Nat two := xs; match ys with | .cons k x _ => x\n"
+    ));
+    mismatched(&format!(
+        "{VEC}def f (xs : Vec Nat (let two := 2; two)) : Nat := match xs with | .cons k x _ => x\n"
+    ));
+    accepted(&format!(
+        "{VEC}def f (xs : Vec Nat (let two := 2; two)) : Nat := match xs with | .cons _ x _ => x\n"
+    ));
+}
+
+/// Unfolding an alias can still expose a path to an actual free variable. Both
+/// the family's head and the original index along that path matter.
+#[test]
+fn aliased_open_indices_still_refine() {
+    accepted(&format!(
+        "{VEC}abbrev next (n : Nat) := Nat.succ n\ndef f (n : Nat) (xs : Vec Nat (next n)) : Nat := match xs with | .cons k x _ => x\n"
+    ));
+    accepted(&format!(
+        "{VEC}abbrev SV (n : Nat) := Vec Nat (Nat.succ n)\ndef f (n : Nat) (xs : SV n) : Nat := match xs with | .cons k x _ => x\n"
+    ));
+    accepted(&format!(
+        "{VEC}abbrev idn (n : Nat) := n\ndef f (n : Nat) (xs : Vec Nat (idn n)) : Nat := match xs with | .nil => 0 | .cons k x _ => x\n"
+    ));
+    accepted(&format!(
+        "{VEC}abbrev ident (n : Nat) := n\ndef f (n : Nat) (xs : Vec Nat (Nat.succ (ident n))) : Nat := match xs with | .cons k x _ => x\n"
+    ));
+}
+
+/// A closed non-Nat constructor index has a refinement path, unlike a Nat
+/// literal. Hiding it behind an alias preserves the original discriminant type:
+/// the pin retries the same index and refuses instead of abstracting through
+/// the definition. Its trace includes `index to include: Index.zero.succ` twice.
+#[test]
+fn alias_refinement_preserves_the_original_discriminant_type() {
+    let family = "inductive Index where\n  | zero\n  | succ (i : Index)\ninductive Box : Index → Type where\n  | mk (i : Index) : Box (.succ i)\n";
+    accepted(&format!(
+        "{family}def f (x : Box (Index.succ (Index.succ Index.zero))) : Index := match x with | .mk i => i\n"
+    ));
+    mismatched(&format!(
+        "{family}abbrev two := Index.succ (Index.succ Index.zero)\ndef f (x : Box two) : Index := match x with | .mk i => i\n"
+    ));
+    mismatched(&format!(
+        "{family}abbrev Box2 := Box (Index.succ (Index.succ Index.zero))\ndef f (x : Box2) : Index := match x with | .mk i => i\n"
     ));
 }
 
