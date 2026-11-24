@@ -286,13 +286,8 @@ fn member_kind(syntax: &Syntax) -> Option<MemberKind> {
     {
         return None;
     }
-    if args[1].kind()
-        == Some(&Name::from_components([
-            "Lean",
-            "Parser",
-            "Command",
-            "inductive",
-        ]))
+    if args[1].kind() == Some(&parser_kind(&["Command", "inductive"]))
+        || args[1].kind() == Some(&parser_kind(&["Command", "classInductive"]))
     {
         return Some(MemberKind::Inductive);
     }
@@ -453,6 +448,43 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn class_inductive_members_preserve_the_generated_keyword_group() {
+        let members = parse(b"mutual\nclass inductive C where | mk\nend")
+            .unwrap()
+            .unwrap();
+        let [
+            Syntax::Node {
+                args: declaration, ..
+            },
+        ] = members.as_slice()
+        else {
+            panic!("one canonical declaration");
+        };
+        let Syntax::Node { kind, args, .. } = &declaration[1] else {
+            panic!("a canonical class inductive command");
+        };
+        assert_eq!(kind, &parser_kind(&["Command", "classInductive"]));
+        assert_eq!(args.len(), 6);
+        let Syntax::Node { kind, args, .. } = &args[0] else {
+            panic!("grouped class inductive keywords");
+        };
+        assert_eq!(kind, &Name::from_components(["group"]));
+        assert!(
+            matches!(args.as_slice(), [Syntax::Atom { val: first, .. }, Syntax::Atom { val: second, .. }]
+            if first == "class" && second == "inductive")
+        );
+        // Semantic rejection of multi-member class blocks belongs to the
+        // inductive elaborator, which receives every original member.
+        assert_eq!(
+            parse(b"mutual\nclass inductive C where | mk\ninductive D where | mk\nend")
+                .unwrap()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

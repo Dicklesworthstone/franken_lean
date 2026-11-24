@@ -27,8 +27,7 @@ fn prelude_class_inductives_bootstrap_without_seeded_declarations() {
     let initial = Engine::builder().build_empty();
     let result = initial
         .check_source_files(
-            &[br#"prelude
-universe u
+            &[br#"universe u
 class inductive Nonempty (A : Sort u) : Prop where
   | intro (value : A) : Nonempty A
 inductive False : Prop
@@ -88,7 +87,15 @@ end Native
     assert!(registry.is_instance(&Name::from_components(["Native", "natWitness"])));
     assert!(registry.is_instance(&Name::from_components(["Native", "choice"])));
     assert!(!registry.is_instance(&Name::from_components(["Native", "Choice", "on"])));
-    assert_eq!(result.theorems, 2);
+    // The Prop-valued natWitness instance is admitted as a theorem too.
+    assert!(matches!(
+        result
+            .engine
+            .environment()
+            .find(&Name::from_components(["Native", "natWitness"])),
+        Some(fln_env::constants::ConstantInfo::Thm(_))
+    ));
+    assert_eq!(result.theorems, 3);
 }
 
 #[test]
@@ -164,8 +171,7 @@ fn class_registration_failures_and_resource_stops_are_atomic() {
     let root = initial.logical_root(&KVMap::new());
     let error = initial
         .check_source_files(
-            &[br#"prelude
-def outParam.{u} (A : Sort u) : Sort u := A
+            &[br#"def outParam.{u} (A : Sort u) : Sort u := A
 class inductive Bad (A : outParam Type) (value : A) where
   | mk : Bad A value
 "#],
@@ -178,7 +184,7 @@ class inductive Bad (A : outParam Type) (value : A) where
     let mut bounded = limits();
     bounded.kernel = bounded.kernel.narrowed(0, bounded.kernel.depth);
     let result = initial.check_source_files(
-        &[b"prelude\nclass inductive Flag : Type where | off | on"],
+        &[b"class inductive Flag : Type where | off | on"],
         &KVMap::new(),
         SourceCheckLimits::new(bounded),
     );

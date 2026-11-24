@@ -511,11 +511,14 @@ fn header<'a>(
     let scope = scope.for_declaration(syntax)?;
     let (is_class, parts) = command_parts(&root[1])?;
     if is_class {
-        let [class, inductive] = expect_null_args(&parts[0], "class inductive keywords")? else {
-            return Err(invalid());
-        };
-        expect_atom(class, "class", "class keyword")?;
-        expect_atom(inductive, "inductive", "inductive keyword")?;
+        let keywords = expect_node(
+            &parts[0],
+            &Name::from_components(["group"]),
+            2,
+            "class inductive keywords",
+        )?;
+        expect_atom(&keywords[0], "class", "class keyword")?;
+        expect_atom(&keywords[1], "inductive", "inductive keyword")?;
     } else {
         expect_atom(&parts[0], "inductive", "inductive keyword")?;
     }
