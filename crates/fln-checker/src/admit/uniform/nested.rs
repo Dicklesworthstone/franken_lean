@@ -1156,7 +1156,18 @@ fn check(
     if p > MAX_NONRECURSIVE_FIELDS {
         return Err(field_limit(p));
     }
+    // Translation gives auxiliary recursors private names. Check the original
+    // public names in the environment in which they would be published.
+    let mut names = BTreeSet::new();
     for entry in declarations {
+        audit.tick()?;
+        if !names.insert(entry.name()) || environment.find(entry.name()).is_some() {
+            return Err(InductiveVerdict::Rejected(
+                InductiveRejection::NameAlreadyDeclared {
+                    name: entry.name().clone(),
+                },
+            ));
+        }
         let declaration = entry.declaration();
         let mut terms = vec![declaration.type_()];
         if let Some(recursor) = declaration.recursor_metadata() {

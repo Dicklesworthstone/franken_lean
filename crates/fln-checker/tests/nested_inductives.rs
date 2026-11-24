@@ -811,6 +811,27 @@ fn a_nested_family_with_parameters_is_admitted_as_its_auxiliary_mutual_block() {
 }
 
 #[test]
+fn original_nested_recursor_name_must_be_fresh() {
+    let (_, rows) = f1("");
+    let mut base = box_entries();
+    base.push(inductive(
+        "T.rec_1",
+        &[],
+        ty(Level::zero()),
+        0,
+        &["T.rec_1"],
+        &[],
+        0,
+        false,
+    ));
+    let result = verdict(&environment(base), &rows);
+    assert!(
+        matches!(&result, InductiveVerdict::Rejected(InductiveRejection::NameAlreadyDeclared { name }) if name == &wn("T.rec_1")),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn nested_levels_are_instantiated_as_the_pins_mk_max_writes_them() {
     let (env, rows) = f2();
     let verdict = verdict(&env, &rows);
