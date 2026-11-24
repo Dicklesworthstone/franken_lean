@@ -1,0 +1,50 @@
+{
+ "bead": "fln-frontier-rows-depend-on-jobs-2g96",
+ "companion_to": "v4.32.0.receipt.json and v4.32.0.decl-content-dag.receipt.json (both unchanged)",
+ "why": "retains the full 2,433-module pinned stdlib frontier produced after streaming .olean decode, transitive-consumer eviction, admission control, solo retry of concurrent host-memory refusals, and per-component top-20 peak memory attribution (`topMemoryRows`), paired with the identical --jobs 1 vs --jobs 24 digest comparison",
+ "command_jobs_24": "fln check-olean --continue --jobs 24 --progress --json --max-bytes 17179869184 /home/ubuntu/.elan/toolchains/leanprover--lean4---v4.32.0/lib/lean",
+ "command_jobs_1": "fln check-olean --continue --jobs 1 --progress --json --max-bytes 17179869184 /home/ubuntu/.elan/toolchains/leanprover--lean4---v4.32.0/lib/lean",
+ "source_commits": [
+  "25efcb66a (solo retry of concurrent host-memory refusals)",
+  "f12084c85 (admission control, per-component attribution, topMemoryRows, installed-binary --jobs 8 prlimit e2e)",
+  "28121e89d (streaming .olean decode, settled-closure eviction, idle checker shedding; produced both --jobs 1 and --jobs 24 runs)",
+  "c89b1f9e5 (high-pressure Phase-1 shedding, FL-INV-01 subsumed-repeat digest fix, --provisional topMemoryRows)",
+  "f3c2ff7f2 (fln-checker K2-R3 bounded conversion arenas, typed lazy delta, 2-gen WhnfMemo/PairSet)"
+ ],
+ "reference": {
+  "tag": "v4.32.0",
+  "commit": "8c9756b28d64dab099da31a4c09229a9e6a2ef35"
+ },
+ "jobs_comparison": {
+  "jobs_1": {
+   "verdict_rows_canonical_sha256": "a997337397a9c34625bfeefd8293a7f3233c3d13650b8bf9af7b721ce5f91644",
+   "selectionDigest": "2bfeb73dd6cd8e1c388acda0338b081ec6e5b5f42f3ec326613da5cad1fbb8ae",
+   "file_sha256": "58022129b7c9bb29f4f1dd8be0dec9b3df10e802fab652c4ddfa133299d9cf2d",
+   "peak_rss_gib": 5.73,
+   "modules": 2433,
+   "accepted": 2433,
+   "acceptedDeclarations": 215136,
+   "topMemoryRows": 20
+  },
+  "jobs_24": {
+   "verdict_rows_canonical_sha256": "a997337397a9c34625bfeefd8293a7f3233c3d13650b8bf9af7b721ce5f91644",
+   "selectionDigest": "2bfeb73dd6cd8e1c388acda0338b081ec6e5b5f42f3ec326613da5cad1fbb8ae",
+   "file_sha256": "7bbe89151039388cdc1c4a1d73b76337dc8514f04b5a433ffaf645a4c50b933a",
+   "peak_rss_gib": 9.93,
+   "modules": 2433,
+   "accepted": 2433,
+   "acceptedDeclarations": 215136,
+   "topMemoryRows": 20
+  },
+  "verdict_rows_identical": true,
+  "selection_digest_identical": true
+ },
+ "s25_memory_roots": {
+  "Mathlib.Algebra.Category.Ring.Limits": "Phase-1 ACCEPTED (380/380) in crates/fln-conformance/evidence/combined_frontier/S27.json",
+  "Mathlib.Algebra.Category.CoalgCat.ComonEquivalence": "Phase-1 ACCEPTED (56/56) in crates/fln-conformance/evidence/combined_frontier/S27.json; K2-R3 (f3c2ff7f2) additionally holds comul_tensorObj_tensorObj_left flat at 3.47 GiB MaxRSS vs 12+ GiB climbing",
+  "Mathlib.RingTheory.Coalgebra.Convolution": "Phase-1 ACCEPTED (67/67) in crates/fln-conformance/evidence/combined_frontier/S27.json",
+  "Mathlib.RingTheory.TensorProduct.Maps": "Phase-1 ACCEPTED (283/283) in crates/fln-conformance/evidence/combined_frontier/S27.json",
+  "Mathlib.LinearAlgebra.CliffordAlgebra.Contraction": "S27 attempt=2 solo host-memory refusal root-caused to fln-checker (Probe::run eager whnf_comparand_with, append-only defeq::run_slow::generated, unbounded PairSet/taken) and fixed in f3c2ff7f2 (MaxRSS now flat 3.98 GiB over 300 s); remaining typed-conversion CPU time tracked in bead fln-8xw0"
+ },
+ "result_file": "v4.32.0.streaming-attribution.json (the --jobs 24 run's --json, verbatim, carrying 20 topMemoryRows)"
+}
