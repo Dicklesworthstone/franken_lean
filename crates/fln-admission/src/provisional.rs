@@ -428,8 +428,8 @@ fn check_unit_against_environment(
     declaration: Declaration,
     limits: EngineAdmissionLimits,
     reading: ReadingCheck<'_>,
-    retained_checker_bytes: &mut u64,
-    transient_checker_bytes: &mut u64,
+    content_override: Option<CheckerContentDigest>,
+    checker_bytes: &mut (u64, u64),
 ) -> UnitCheckOutcome {
     if !matches!(
         declaration,
@@ -476,7 +476,8 @@ fn check_unit_against_environment(
     let (selected, sampled_decision, k1_step_floor) = match limits.policy {
         VerificationPolicy::Release | VerificationPolicy::Paranoid => (true, None, false),
         VerificationPolicy::Standard | VerificationPolicy::CompatBench => {
-            let content = declaration_content_digest(&declaration);
+            let content =
+                content_override.unwrap_or_else(|| declaration_content_digest(&declaration));
             let risks = classify_declaration_risks(&declaration);
             let mut decision = CheckerPolicyV1.decide(limits.policy, content, risks);
             let k1_step_floor = k1_steps_used > limits.high_risk_k1_steps;
@@ -496,9 +497,10 @@ fn check_unit_against_environment(
             limits.checker,
             reading,
         );
-        *retained_checker_bytes =
-            retained_checker_bytes.saturating_add(checker_review.retained_delta_bytes);
-        *transient_checker_bytes = (*transient_checker_bytes).max(checker_review.candidate_bytes);
+        checker_bytes.0 = checker_bytes
+            .0
+            .saturating_add(checker_review.retained_delta_bytes);
+        checker_bytes.1 = checker_bytes.1.max(checker_review.candidate_bytes);
         let council = if limits.policy == VerificationPolicy::Paranoid {
             let mut seats = checker_review.council.seats().to_vec();
             seats.push(Seat::new(
@@ -604,7 +606,9 @@ fn check_unit_against_environment(
         Some(decision) => decision,
         None => CheckerPolicyV1.decide(
             limits.policy,
-            published_declaration_content_digest(&next_environment, &declaration),
+            content_override.unwrap_or_else(|| {
+                published_declaration_content_digest(&next_environment, &declaration)
+            }),
             CheckerRiskProfile::none(),
         ),
     };
@@ -747,15 +751,19 @@ pub fn check_decoded_olean_per_declaration(
                 detail: "planned declaration unit is outside the unit table",
             });
         };
-        match check_unit_against_environment(
+        let mut unit_bytes = (retained_checker_bytes, transient_checker_bytes);
+        let outcome = check_unit_against_environment(
             env.as_check_environment(),
             checker_env.as_ref(),
             unit.declaration.clone(),
             limits.admission,
             reading,
-            &mut retained_checker_bytes,
-            &mut transient_checker_bytes,
-        ) {
+            None,
+            &mut unit_bytes,
+        );
+        retained_checker_bytes = unit_bytes.0;
+        transient_checker_bytes = unit_bytes.1;
+        match outcome {
             UnitCheckOutcome::Accepted {
                 environment: next_env,
                 checker_environment: next_checker,
@@ -903,6 +911,8 @@ pub fn check_decoded_olean_per_declaration(
         let objection = readings.objection(&repeat, limits.admission.checker.decode);
         match repeat {
             ConstantInfo::Thm(mut theorem) => {
+                let original_content =
+                    declaration_content_digest(&Declaration::Thm(theorem.clone()));
                 let mut scratch = Name::str(name.clone(), "_fln_subsumed_repeat");
                 let mut suffix = 0_u64;
                 while env.contains(&scratch) {
@@ -916,16 +926,15 @@ pub fn check_decoded_olean_per_declaration(
                     }
                 }
                 let repeat_reading = ReadingCheck::Settled(objection.as_ref());
-                let mut repeat_retained = 0_u64;
-                let mut repeat_transient = 0_u64;
+                let mut repeat_bytes = (0_u64, 0_u64);
                 match check_unit_against_environment(
                     env.as_check_environment(),
                     checker_env.as_ref(),
                     Declaration::Thm(theorem),
                     limits.admission,
                     repeat_reading,
-                    &mut repeat_retained,
-                    &mut repeat_transient,
+                    Some(original_content),
+                    &mut repeat_bytes,
                 ) {
                     UnitCheckOutcome::Accepted {
                         checker,

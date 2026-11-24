@@ -100,7 +100,7 @@ fn recursive_consumers_keep_application_tail_callback_stages() {
 }
 
 #[test]
-fn a_callback_prefix_cannot_be_delayed_when_its_returned_action_is_ignored() {
+fn a_callback_prefix_executes_when_live_and_is_eliminated_when_unused() {
     let engine = admit(pair(
         "stageSpin",
         arrow(nat_type()),
@@ -125,16 +125,31 @@ fn a_callback_prefix_cannot_be_delayed_when_its_returned_action_is_ignored() {
     let root = engine.logical_root(&KVMap::new());
     let mut bounded = limits();
     bounded.vm.max_steps = 500;
-    for source in [
-        b"#eval let ignored : Nat -> Nat := stageIgnore (fun n => let paid := stageSpin n; fun state => Nat.add paid state) 3; 42".as_slice(),
-        b"#eval stageIgnore (fun n => let paid := stageSpin n; fun state => Nat.add paid state) 3 5".as_slice(),
-    ] {
-        assert!(matches!(
-            engine.execute_source_definitions(&[source], &KVMap::new(), bounded).unwrap(),
-            Outcome::Inconclusive(_)
-        ));
-        assert_eq!(engine.logical_root(&KVMap::new()), root);
-    }
+    let discarded = engine
+        .execute_source_definitions(
+            &[b"#eval let ignored : Nat -> Nat := stageIgnore (fun n => let paid := stageSpin n; fun state => Nat.add paid state) 3; 42"],
+            &KVMap::new(),
+            bounded,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        crate::closed_vm_value(&discarded.executions.last().unwrap().exit).unwrap(),
+        Some(crate::ClosedVmValue::Scalar(42))
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+    assert!(matches!(
+        engine
+            .execute_source_definitions(
+                &[b"#eval stageIgnore (fun n => let paid := stageSpin n; fun state => Nat.add paid state) 3 5"],
+                &KVMap::new(),
+                bounded,
+            )
+            .unwrap(),
+        Outcome::Inconclusive(_)
+    ));
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
     returned(
         &engine,
         b"#eval stageIgnore (fun n => let paid := Nat.add n 1; fun state => Nat.add paid state) 3 5",
@@ -198,7 +213,7 @@ fn changed_or_missing_recursive_callback_forwarding_refuses_without_a_variant() 
         name("saved"),
         consumer_type(),
         call("bareStage._unsafe_rec", []),
-        lambda(nat::literal(0)),
+        lambda(Expr::app(Expr::app(Expr::app(b(1), b(3)), b(2)), b(0))),
         false,
     )));
     for (label, value) in [("changedStage", changed), ("bareStage", bare)] {

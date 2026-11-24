@@ -4508,7 +4508,12 @@ impl Admitted {
                         break;
                     }
                     let sample = memory.sample();
-                    if let Some(limit_bytes) = sample.limit_bytes
+                    let high_pressure = sample.limit_bytes.is_some_and(|limit_bytes| {
+                        sample.rss_bytes >= (limit_bytes / 10).saturating_mul(7)
+                    });
+                    if high_pressure {
+                        engines.shed_idle_checker_environments(None);
+                    } else if let Some(limit_bytes) = sample.limit_bytes
                         && sample.rss_bytes >= limit_bytes / 2
                     {
                         engines.shed_idle_checker_environments(engines.base_of(index));
@@ -4534,7 +4539,15 @@ impl Admitted {
                             });
                         }
                     };
-                    let base = engines.release(index, &closures, true)?;
+                    let mut base = engines.release(index, &closures, true)?;
+                    if high_pressure
+                        && let Some(base) = &mut base
+                        && base.engine.checker_environment.is_some()
+                    {
+                        let mut trimmed = (*base.engine).clone();
+                        trimmed.checker_environment = None;
+                        base.engine = std::sync::Arc::new(trimmed);
+                    }
                     let mut closure: Vec<_> = closures[index]
                         .iter()
                         .filter(|member| {
@@ -5804,6 +5817,11 @@ impl Admitted {
             };
             let (checker, policy_decision, k1_step_floor) = match repeat {
                 ConstantInfo::Thm(mut theorem) => {
+                    // Hash the original unrenamed theorem so policy selection and
+                    // `CheckerSelectionDecision` stay invariant across serial vs.
+                    // scheduled import orders (FL-INV-01).
+                    let original_content =
+                        declaration_content_digest(&Declaration::Thm(theorem.clone()));
                     let mut scratch = Name::str(name.clone(), "_fln_subsumed_repeat");
                     let mut suffix = 0_u64;
                     while self.environment.contains(&scratch) {
@@ -5821,22 +5839,21 @@ impl Admitted {
                         ReadingCheck::Artifact(_) => ReadingCheck::Settled(objection.as_ref()),
                         other => other,
                     };
-                    let mut repeat_retained = 0_u64;
-                    let mut repeat_transient = 0_u64;
+                    let mut repeat_bytes = (0_u64, 0_u64);
                     match self
                         .admit_declaration_unrooted_measured(
                             Declaration::Thm(theorem),
                             options,
                             limits,
                             reading,
-                            &mut repeat_retained,
-                            &mut repeat_transient,
+                            Some(original_content),
+                            &mut repeat_bytes,
                         )
                         .map_err(OleanCheckError::Admission)?
                     {
                         Outcome::Complete(admission) => {
-                            *checker_bytes = (*checker_bytes)
-                                .max(repeat_retained.saturating_add(repeat_transient));
+                            *checker_bytes =
+                                (*checker_bytes).max(repeat_bytes.0.saturating_add(repeat_bytes.1));
                             (
                                 admission.checker,
                                 Some(admission.policy_decision),
@@ -5844,13 +5861,13 @@ impl Admitted {
                             )
                         }
                         Outcome::Inconclusive(reason) => {
-                            *checker_bytes = (*checker_bytes)
-                                .max(repeat_retained.saturating_add(repeat_transient));
+                            *checker_bytes =
+                                (*checker_bytes).max(repeat_bytes.0.saturating_add(repeat_bytes.1));
                             return Ok(Outcome::Inconclusive(reason));
                         }
                         Outcome::InternalFault(fault) => {
-                            *checker_bytes = (*checker_bytes)
-                                .max(repeat_retained.saturating_add(repeat_transient));
+                            *checker_bytes =
+                                (*checker_bytes).max(repeat_bytes.0.saturating_add(repeat_bytes.1));
                             return Ok(Outcome::InternalFault(fault));
                         }
                     }
@@ -5951,15 +5968,14 @@ impl Admitted {
         limits: EngineAdmissionLimits,
         reading: ReadingCheck<'_>,
     ) -> Result<Outcome<UnrootedAdmission>, EngineAdmissionError> {
-        let mut retained = 0_u64;
-        let mut transient = 0_u64;
+        let mut checker_bytes = (0_u64, 0_u64);
         self.admit_declaration_unrooted_measured(
             declaration,
             options,
             limits,
             reading,
-            &mut retained,
-            &mut transient,
+            None,
+            &mut checker_bytes,
         )
     }
 
@@ -5969,8 +5985,8 @@ impl Admitted {
         options: &KVMap,
         limits: EngineAdmissionLimits,
         reading: ReadingCheck<'_>,
-        retained_checker_bytes: &mut u64,
-        transient_checker_bytes: &mut u64,
+        content_override: Option<CheckerContentDigest>,
+        checker_bytes: &mut (u64, u64),
     ) -> Result<Outcome<UnrootedAdmission>, EngineAdmissionError> {
         if !matches!(
             declaration,
@@ -6014,7 +6030,8 @@ impl Admitted {
         let (selected, sampled_decision, k1_step_floor) = match limits.policy {
             VerificationPolicy::Release | VerificationPolicy::Paranoid => (true, None, false),
             VerificationPolicy::Standard | VerificationPolicy::CompatBench => {
-                let content = declaration_content_digest(&declaration);
+                let content =
+                    content_override.unwrap_or_else(|| declaration_content_digest(&declaration));
                 let risks = classify_declaration_risks(&declaration);
                 let mut decision = CheckerPolicyV1.decide(limits.policy, content, risks);
                 let k1_step_floor = k1_steps_used > limits.high_risk_k1_steps;
@@ -6034,10 +6051,10 @@ impl Admitted {
                 limits.checker,
                 reading,
             );
-            *retained_checker_bytes =
-                retained_checker_bytes.saturating_add(checker_review.retained_delta_bytes);
-            *transient_checker_bytes =
-                (*transient_checker_bytes).max(checker_review.candidate_bytes);
+            checker_bytes.0 = checker_bytes
+                .0
+                .saturating_add(checker_review.retained_delta_bytes);
+            checker_bytes.1 = checker_bytes.1.max(checker_review.candidate_bytes);
             let council = if limits.policy == VerificationPolicy::Paranoid {
                 let mut seats = checker_review.council.seats().to_vec();
                 seats.push(Seat::new(
@@ -6143,7 +6160,9 @@ impl Admitted {
             Some(decision) => decision,
             None => CheckerPolicyV1.decide(
                 limits.policy,
-                published_declaration_content_digest(&environment, &declaration),
+                content_override.unwrap_or_else(|| {
+                    published_declaration_content_digest(&environment, &declaration)
+                }),
                 CheckerRiskProfile::none(),
             ),
         };
@@ -6208,28 +6227,30 @@ impl Admitted {
                 requested: declarations.len(),
             })?;
         let mut engine = self.clone();
-        let mut retained = 0_u64;
-        let mut transient = 0_u64;
+        let mut batch_bytes = (0_u64, 0_u64);
         for (index, declaration) in declarations.iter().cloned().enumerate() {
             let admitted = match engine.admit_declaration_unrooted_measured(
                 declaration,
                 options,
                 limits,
                 reading,
-                &mut retained,
-                &mut transient,
+                None,
+                &mut batch_bytes,
             ) {
                 Ok(Outcome::Complete(admitted)) => admitted,
                 Ok(Outcome::Inconclusive(reason)) => {
-                    *checker_bytes = (*checker_bytes).max(retained.saturating_add(transient));
+                    *checker_bytes =
+                        (*checker_bytes).max(batch_bytes.0.saturating_add(batch_bytes.1));
                     return Ok(Outcome::Inconclusive(reason));
                 }
                 Ok(Outcome::InternalFault(fault)) => {
-                    *checker_bytes = (*checker_bytes).max(retained.saturating_add(transient));
+                    *checker_bytes =
+                        (*checker_bytes).max(batch_bytes.0.saturating_add(batch_bytes.1));
                     return Ok(Outcome::InternalFault(fault));
                 }
                 Err(error) => {
-                    *checker_bytes = (*checker_bytes).max(retained.saturating_add(transient));
+                    *checker_bytes =
+                        (*checker_bytes).max(batch_bytes.0.saturating_add(batch_bytes.1));
                     return Err(EngineAdmissionError::BatchDeclaration {
                         index,
                         error: Box::new(error),
@@ -6243,7 +6264,7 @@ impl Admitted {
                 k1_step_floor: admitted.k1_step_floor,
             });
         }
-        *checker_bytes = (*checker_bytes).max(retained.saturating_add(transient));
+        *checker_bytes = (*checker_bytes).max(batch_bytes.0.saturating_add(batch_bytes.1));
         Ok(Outcome::Complete((engine, checkers)))
     }
 }

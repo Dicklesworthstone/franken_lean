@@ -422,14 +422,24 @@ fn nonreturning_partial_prefix_is_not_delayed_until_its_callback_is_used() {
     let root = engine.logical_root(&options);
     let mut bounded = limits;
     bounded.vm.max_steps = 200;
-    let execution = engine
+    let discarded = engine
         .execute_source_definitions(
             &[b"#eval let ignored : Nat -> Nat := makeStrict 0; 42"],
             &options,
             bounded,
         )
+        .unwrap()
+        .into_complete()
         .unwrap();
-    assert!(matches!(execution, Outcome::Inconclusive(_)));
+    assert_eq!(
+        crate::closed_vm_value(&discarded.executions.last().unwrap().exit).unwrap(),
+        Some(crate::ClosedVmValue::Scalar(42))
+    );
+    assert_eq!(engine.logical_root(&options), root);
+    let live = engine
+        .execute_source_definitions(&[b"#eval makeStrict 0 5"], &options, bounded)
+        .unwrap();
+    assert!(matches!(live, Outcome::Inconclusive(_)));
     assert_eq!(engine.logical_root(&options), root);
     let retry = engine
         .execute_source_definitions(&[b"#eval 42"], &options, limits)

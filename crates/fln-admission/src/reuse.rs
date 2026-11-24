@@ -605,6 +605,14 @@ impl RecordedModule {
                     "a policy-skipped declaration cannot be recorded for import reuse",
                 ));
             };
+            if row
+                .policy_decision
+                .is_some_and(|decision| decision.policy != VerificationPolicy::Release)
+            {
+                return Err(ImportReuseRefusal::Unrecordable(
+                    "only release-policy admissions can be recorded for import reuse",
+                ));
+            }
             if schema_code(agreement.schema).is_none() {
                 return Err(ImportReuseRefusal::Unrecordable(
                     "a checker row carries an unknown schema",
@@ -634,6 +642,49 @@ impl RecordedModule {
             rows,
         })
     }
+}
+
+fn release_policy_decisions(
+    before: &Environment,
+    after: &Environment,
+    decoded: &DecodedOlean,
+) -> Option<BTreeMap<Name, Option<CheckerSelectionDecision>>> {
+    let mut decisions = BTreeMap::new();
+    let mut new_constants = Vec::new();
+    let mut owners = BTreeMap::new();
+    for info in &decoded.constants {
+        if let Some(existing) = before.find(info.name()) {
+            let decision = if *existing == *info {
+                None
+            } else {
+                match info {
+                    ConstantInfo::Thm(theorem) => Some(CheckerPolicyV1.decide(
+                        VerificationPolicy::Release,
+                        declaration_content_digest(&Declaration::Thm(theorem.clone())),
+                        CheckerRiskProfile::none(),
+                    )),
+                    ConstantInfo::Axiom(_) => None,
+                    _ => return None,
+                }
+            };
+            decisions.insert(info.name().clone(), decision);
+            continue;
+        }
+        owners.insert(info.name().clone(), new_constants.len());
+        new_constants.push(info.clone());
+    }
+    let (units, _) = build_olean_declaration_units(&new_constants, &owners).ok()?;
+    for unit in units {
+        let decision = CheckerPolicyV1.decide(
+            VerificationPolicy::Release,
+            published_declaration_content_digest(after, &unit.declaration),
+            CheckerRiskProfile::none(),
+        );
+        for name in unit.names {
+            decisions.insert(name, Some(decision));
+        }
+    }
+    Some(decisions)
 }
 
 fn module_content_root(
@@ -1548,12 +1599,16 @@ impl Admitted {
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
                 let key = keys[index];
-                let record = reuse
-                    .store
-                    .load(key)
-                    .ok()
-                    .flatten()
-                    .and_then(|bytes| ModuleReuseRecord::parse(&bytes).ok());
+                let record = if limits.check.admission.policy == VerificationPolicy::Release {
+                    reuse
+                        .store
+                        .load(key)
+                        .ok()
+                        .flatten()
+                        .and_then(|bytes| ModuleReuseRecord::parse(&bytes).ok())
+                } else {
+                    None
+                };
                 if cancellation.is_some_and(CancellationProbe::is_cancelled) {
                     return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
                         "import-reuse/module-lookup",
@@ -1757,8 +1812,7 @@ impl Admitted {
             });
         }
         let mut covered = vec![false; decoded.constants.len()];
-        let mut declarations = Vec::with_capacity(module.rows.len());
-        for &(at, checker) in &module.rows {
+        for &(at, _) in &module.rows {
             if cancellation.is_some_and(CancellationProbe::is_cancelled) {
                 return Outcome::Inconclusive(Inconclusive::cancelled("import-reuse/module-rows"));
             }
@@ -1766,12 +1820,6 @@ impl Admitted {
                 Some(slot) if !*slot => *slot = true,
                 _ => return refuse(ImportReuseRefusal::Rows),
             }
-            declarations.push(OleanCheckedDeclaration {
-                name: decoded.constants[at].name().clone(),
-                checker: Some(checker),
-                policy_decision: None,
-                k1_step_floor: false,
-            });
         }
         if covered.iter().any(|covered| !covered) {
             return refuse(ImportReuseRefusal::Rows);
@@ -1829,6 +1877,21 @@ impl Admitted {
             return refuse(ImportReuseRefusal::Root {
                 at: "module-result",
                 module: Some(name.clone()),
+            });
+        }
+        let Some(policy_decisions) =
+            release_policy_decisions(&self.environment, &environment, decoded)
+        else {
+            return refuse(ImportReuseRefusal::Rows);
+        };
+        let mut declarations = Vec::with_capacity(module.rows.len());
+        for &(at, checker) in &module.rows {
+            let decl_name = decoded.constants[at].name();
+            declarations.push(OleanCheckedDeclaration {
+                name: decl_name.clone(),
+                checker: Some(checker),
+                policy_decision: policy_decisions.get(decl_name).copied().flatten(),
+                k1_step_floor: false,
             });
         }
         let mut engine = self.clone();
@@ -2008,6 +2071,13 @@ impl Admitted {
         record: &ImportReuseRecord,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> ImportResult<Outcome<ImportReuse<H::Import>>, H::Error> {
+        if limits.check.admission.policy != VerificationPolicy::Release {
+            return Ok(Outcome::Complete(ImportReuse::Refused(
+                ImportReuseRefusal::Unrecordable(
+                    "import reuse requires release verification policy",
+                ),
+            )));
+        }
         // Identity before key: a record planted under this key by another binary is
         // named as what it is.
         if record.checker != checker.0 {
@@ -2139,6 +2209,7 @@ impl Admitted {
                     "a decoded module has no measurements",
                 ));
             };
+            let before_env = environment.clone();
             let mut delta = Vec::new();
             for info in &decoded.constants {
                 let Some(measurement) = module_measured.next() else {
@@ -2184,9 +2255,14 @@ impl Admitted {
                     Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
                 };
             }
+            let Some(policy_decisions) =
+                release_policy_decisions(&before_env, &environment, &decoded)
+            else {
+                return refuse(ImportReuseRefusal::Rows);
+            };
             admitted_any |= !delta.is_empty();
             deltas.push(delta);
-            pending.push((name, decoded));
+            pending.push((name, decoded, policy_decisions));
         }
         let roots = match module_roots(base_logical_root, &deltas, options, jobs, cancellation) {
             Outcome::Complete(roots) => roots,
@@ -2195,7 +2271,7 @@ impl Admitted {
         };
         let mut checked_modules = Vec::with_capacity(pending.len());
         let mut module_base_root = base_logical_root;
-        for (((name, decoded), recorded), root) in
+        for (((name, decoded, policy_decisions), recorded), root) in
             pending.into_iter().zip(&record.modules).zip(roots)
         {
             if module_base_root.0 != recorded.base_root {
@@ -2217,10 +2293,11 @@ impl Admitted {
                     Some(slot) if !*slot => *slot = true,
                     _ => return refuse(ImportReuseRefusal::Rows),
                 }
+                let decl_name = decoded.constants[at].name();
                 declarations.push(OleanCheckedDeclaration {
-                    name: decoded.constants[at].name().clone(),
+                    name: decl_name.clone(),
                     checker: Some(checker),
-                    policy_decision: None,
+                    policy_decision: policy_decisions.get(decl_name).copied().flatten(),
                     k1_step_floor: false,
                 });
             }

@@ -10302,6 +10302,7 @@ fn render_check_olean_provisional_frontier<E>(
     let policy_summary = &frontier.policy_summary;
 
     let mut rows_json = Vec::with_capacity(frontier.rows.len());
+    let mut ranked_rows = Vec::with_capacity(frontier.rows.len());
     let mut lines = Vec::new();
     for row in &frontier.rows {
         let module = row.name.to_display_string();
@@ -10424,6 +10425,14 @@ fn render_check_olean_provisional_frontier<E>(
             memory_json,
             checker_policy_summary_json(&row.policy_summary),
         ));
+        ranked_rows.push((
+            module.clone(),
+            verdict,
+            attempt,
+            elapsed_ms,
+            row.memory,
+            memory_json,
+        ));
 
         let assumes_str = if row.assumes.is_empty() {
             "[]".to_owned()
@@ -10511,6 +10520,50 @@ fn render_check_olean_provisional_frontier<E>(
         }
     }
 
+    let mut ranked: Vec<usize> = (0..ranked_rows.len()).collect();
+    ranked.sort_by(|left, right| {
+        ranked_rows[*right]
+            .4
+            .peak_bytes
+            .cmp(&ranked_rows[*left].4.peak_bytes)
+            .then_with(|| left.cmp(right))
+    });
+    ranked.truncate(20);
+    let top_memory_json: Vec<String> = ranked
+        .iter()
+        .map(|&index| {
+            let (module, verdict, attempt, elapsed_ms, _, memory_json) = &ranked_rows[index];
+            format!(
+                "{{\"module\":{},\"verdict\":{},\"attempt\":{},\"elapsedMs\":{},\"memory\":{}}}",
+                json_string(module),
+                json_string(verdict),
+                attempt,
+                elapsed_ms,
+                memory_json,
+            )
+        })
+        .collect();
+    if !ranked.is_empty() {
+        lines.push("top memory rows (up to 20 by peak bytes):".to_owned());
+        for (rank, &index) in ranked.iter().enumerate() {
+            let (module, verdict, attempt, elapsed_ms, memory, _) = &ranked_rows[index];
+            lines.push(format!(
+                "  {:>2}. {} ({}, attempt {}, {} ms): peak={} B estimate={} B (k1Delta={} B, checker={} B, decodedOlean={} B, admittedEntries={} B)",
+                rank + 1,
+                module,
+                verdict,
+                attempt,
+                elapsed_ms,
+                memory.peak_bytes,
+                memory.estimated_bytes,
+                memory.k1_environment_delta_bytes,
+                memory.checker_bytes,
+                memory.decoded_olean_bytes,
+                memory.admitted_entries_bytes,
+            ));
+        }
+    }
+
     let summary = format!(
         "provisional modules: {}/{} accepted, {} accepted-under-assumptions, {} failed, {} inconclusive, {} internal-fault, {} blocked (eligibleBlocked={}, ineligibleBlocked={}, authority={})",
         counts.accepted,
@@ -10533,7 +10586,7 @@ fn render_check_olean_provisional_frontier<E>(
                 "\"inconclusive\":{},\"internalFault\":{},\"blocked\":{},",
                 "\"acceptedDeclarations\":{},\"acceptedUnderAssumptionsDeclarations\":{},",
                 "\"eligibleBlocked\":{},\"ineligibleBlocked\":{},\"eligibleModules\":{},\"ineligibleModules\":{},",
-                "\"roots\":[{}],\"rows\":[{}]}}\n"
+                "\"topMemoryRows\":[{}],\"roots\":[{}],\"rows\":[{}]}}\n"
             ),
             json_string(CHECK_OLEAN_FRONTIER_SCHEMA),
             json_string(if exit_code == 0 {
@@ -10560,6 +10613,7 @@ fn render_check_olean_provisional_frontier<E>(
             frontier.ineligible_blocked.len(),
             json_name_array(&frontier.eligible_blocked),
             json_name_array(&frontier.ineligible_blocked),
+            top_memory_json.join(","),
             roots_json.join(","),
             rows_json.join(","),
         )

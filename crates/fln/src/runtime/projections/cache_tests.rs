@@ -292,12 +292,25 @@ fn reused_single_field_code_keeps_a_nonreturning_runtime_computation() {
     );
     let mut bounded = limits;
     bounded.vm.max_steps = 200;
-    let outcome = engine.execute_source_definitions(
+    let discarded = engine
+        .execute_source_definitions(
             &[b"#eval let ignored : Nat := cachedStrictBox.value; let alsoIgnored : Nat := cachedStrictBox.value; 42"],
-            &options, bounded,
-        ).unwrap();
+            &options,
+            bounded,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        crate::closed_vm_value(&discarded.executions.last().unwrap().exit).unwrap(),
+        Some(crate::ClosedVmValue::Scalar(42))
+    );
+    assert_eq!(engine.logical_root(&options), root);
+    let outcome = engine
+        .execute_source_definitions(&[b"#eval cachedStrictBox.value"], &options, bounded)
+        .unwrap();
     let Outcome::Inconclusive(stopped) = outcome else {
-        panic!("the selected runtime field must execute before the unused binding is discarded")
+        panic!("the selected live runtime field must still execute strictly")
     };
     assert!(matches!(
         stopped.cause,

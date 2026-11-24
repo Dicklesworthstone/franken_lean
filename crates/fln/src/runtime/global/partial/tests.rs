@@ -165,7 +165,7 @@ fn recursive_partial_globals_return_reusable_closures_and_replay() {
 }
 
 #[test]
-fn nonreturning_prefix_is_evaluated_even_when_the_returned_function_is_unused() {
+fn nonreturning_prefix_is_evaluated_when_live_and_eliminated_when_unused() {
     let callback_type = arrow(nat_type());
     let value = lambda(Expr::let_e(
         name("never"),
@@ -183,18 +183,29 @@ fn nonreturning_prefix_is_evaluated_even_when_the_returned_function_is_unused() 
     let root = engine.logical_root(&KVMap::new());
     let mut bounded = limits();
     bounded.vm.max_steps = 200;
-    for source in [
-        b"#eval let ignored : Nat -> Nat := spin 0; 42".as_slice(),
-        b"#eval spin 0 5".as_slice(),
-    ] {
-        assert!(matches!(
-            engine
-                .execute_source_definitions(&[source], &KVMap::new(), bounded)
-                .unwrap(),
-            Outcome::Inconclusive(_)
-        ));
-        assert_eq!(engine.logical_root(&KVMap::new()), root);
-    }
+    // Matches pinned Lean 4 LCNF dead-let elimination: an unused pure let binding
+    // is dropped rather than evaluated, while invoking the call still runs strictly.
+    let discarded = engine
+        .execute_source_definitions(
+            &[b"#eval let ignored : Nat -> Nat := spin 0; 42"],
+            &KVMap::new(),
+            bounded,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        crate::closed_vm_value(&discarded.executions.last().unwrap().exit).unwrap(),
+        Some(crate::ClosedVmValue::Scalar(42))
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+    assert!(matches!(
+        engine
+            .execute_source_definitions(&[b"#eval spin 0 5"], &KVMap::new(), bounded)
+            .unwrap(),
+        Outcome::Inconclusive(_)
+    ));
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
     returned(&engine, b"#eval 42", &["42"]);
 }
 
@@ -222,7 +233,7 @@ fn zero_argument_partial_prefix_executes_before_returning_its_callback() {
 }
 
 #[test]
-fn a_diverging_zero_argument_prefix_cannot_be_delayed_by_an_unused_function_binding() {
+fn a_diverging_zero_argument_prefix_runs_when_live_and_is_eliminated_when_unused() {
     let callback_type = arrow(nat_type());
     let value = Expr::let_e(
         name("never"),
@@ -240,13 +251,23 @@ fn a_diverging_zero_argument_prefix_cannot_be_delayed_by_an_unused_function_bind
     let root = engine.logical_root(&KVMap::new());
     let mut bounded = limits();
     bounded.vm.max_steps = 200;
+    let discarded = engine
+        .execute_source_definitions(
+            &[b"#eval let ignored : Nat -> Nat := spinZero; 42"],
+            &KVMap::new(),
+            bounded,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        crate::closed_vm_value(&discarded.executions.last().unwrap().exit).unwrap(),
+        Some(crate::ClosedVmValue::Scalar(42))
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
     assert!(matches!(
         engine
-            .execute_source_definitions(
-                &[b"#eval let ignored : Nat -> Nat := spinZero; 42"],
-                &KVMap::new(),
-                bounded,
-            )
+            .execute_source_definitions(&[b"#eval spinZero 5"], &KVMap::new(), bounded)
             .unwrap(),
         Outcome::Inconclusive(_)
     ));

@@ -258,6 +258,10 @@ fn cli_provisional_chain_failed_control_and_schedule_independence() {
             stdout.contains("\"firstBlockerCount\":2"),
             "jobs={jobs}: {stdout}"
         );
+        assert!(
+            stdout.contains("\"topMemoryRows\":["),
+            "jobs={jobs} missing topMemoryRows: {stdout}"
+        );
         eprintln!("[e2e chain jobs={jobs}] exit={code} json={}", stdout.trim());
         normalized.push(strip_elapsed(&stdout));
     }
