@@ -1875,11 +1875,11 @@ impl Admitted {
             if let Some(dep) = best_dep {
                 base_env_consumers[dep] += 1;
             }
-            for &member in closures[idx].iter() {
+            for member in closures[idx].iter() {
                 if member == idx {
                     continue;
                 }
-                if best_dep.is_some_and(|dep| closures[dep].contains(&member)) {
+                if best_dep.is_some_and(|dep| closures[dep].contains(member)) {
                     continue;
                 }
                 remaining_delta_consumers[member] += 1;
@@ -1968,14 +1968,14 @@ impl Admitted {
                 let mut assumes_set: BTreeSet<Name> = BTreeSet::new();
                 let mut p1_closure = Vec::new();
                 let mut p2_closure = Vec::new();
-                for &member in closures[index].iter() {
+                for member in closures[index].iter() {
                     if member == index {
                         continue;
                     }
                     if phase2_contributes_assumptions[member] {
                         assumes_set.insert(modules[member].name.clone());
                     }
-                    if base_dep.is_some_and(|dep| closures[dep].contains(&member)) {
+                    if base_dep.is_some_and(|dep| closures[dep].contains(member)) {
                         continue;
                     }
                     if let Some(acc) = &phase1_accepted[member] {
@@ -2031,11 +2031,11 @@ impl Admitted {
                         phase2_envs[dep] = None;
                     }
                 }
-                for &member in closures[idx].iter() {
+                for member in closures[idx].iter() {
                     if member == idx {
                         continue;
                     }
-                    if base_dep.is_some_and(|dep| closures[dep].contains(&member)) {
+                    if base_dep.is_some_and(|dep| closures[dep].contains(member)) {
                         continue;
                     }
                     remaining_delta_consumers[member] =

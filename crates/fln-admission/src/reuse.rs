@@ -1496,7 +1496,7 @@ impl Admitted {
             .map(|(index, (name, _))| (name.clone(), index))
             .collect();
         let mut dependencies = Vec::with_capacity(count);
-        let mut closures: Vec<std::sync::Arc<BTreeSet<usize>>> = Vec::with_capacity(count);
+        let mut closures = Vec::with_capacity(count);
         let mut keys = Vec::with_capacity(count);
         for (index, (name, decoded)) in ordered.iter().enumerate() {
             if cancellation.is_some_and(CancellationProbe::is_cancelled) {
@@ -1505,7 +1505,6 @@ impl Admitted {
                 )));
             }
             let mut imports = BTreeSet::new();
-            let mut closure = BTreeSet::new();
             let mut dependency_keys = Vec::new();
             for import in &decoded.module.imports {
                 let Some(&dependency) = positions.get(&import.module).filter(|i| **i < index)
@@ -1515,10 +1514,9 @@ impl Admitted {
                     });
                 };
                 imports.insert(dependency);
-                closure.extend(closures[dependency].iter().copied());
                 dependency_keys.push(keys[dependency]);
             }
-            closure.insert(index);
+            closures.push(ImportClosure::new(index, &imports, &closures));
             let Some(input) = inputs.get(name) else {
                 return Err(OleanCheckError::InternalInvariant {
                     detail: "a decoded reuse module has no artifact input",
@@ -1531,11 +1529,12 @@ impl Admitted {
                 reuse.checker,
             ));
             dependencies.push(imports);
-            closures.push(std::sync::Arc::new(closure));
         }
         let mut engines = FrontierEngines::new(
             (0..count)
-                .map(|index| frontier_base_of(&dependencies, &closures, |i| i, index))
+                .map(|index| {
+                    frontier_base_by_size(&dependencies, |i| closures[i].len(), |i| i, index)
+                })
                 .collect(),
         );
         let mut accepted: Vec<Option<std::sync::Arc<FrontierAccepted>>> = vec![None; count];
@@ -1576,11 +1575,11 @@ impl Admitted {
                         detail: "a ready reuse module has no decoded artifact",
                     });
                 };
-                let base = engines.release(index, &closures, true)?;
+                let base = engines.release_indexed(index, &closures, true)?;
                 let closure = closures[index]
                     .iter()
-                    .filter(|member| **member != index)
-                    .filter_map(|member| accepted[*member].clone())
+                    .filter(|member| *member != index)
+                    .filter_map(|member| accepted[member].clone())
                     .collect();
                 let job = FrontierJob {
                     index,

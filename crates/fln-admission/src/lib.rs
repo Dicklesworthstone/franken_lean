@@ -31,6 +31,9 @@
 // Allocation failure unwinds to the import frontier's per-module guard.
 #![feature(alloc_error_hook)]
 
+mod import_closure;
+use import_closure::ImportClosure;
+
 pub mod olean_imports;
 pub mod provisional;
 pub mod reuse;
@@ -1856,16 +1859,20 @@ pub fn frontier_base_of(
     position: impl Fn(usize) -> usize,
     index: usize,
 ) -> Option<usize> {
+    frontier_base_by_size(dependencies, |i| closures[i].len(), position, index)
+}
+
+fn frontier_base_by_size(
+    dependencies: &[BTreeSet<usize>],
+    closure_size: impl Fn(usize) -> usize,
+    position: impl Fn(usize) -> usize,
+    index: usize,
+) -> Option<usize> {
     dependencies[index]
         .iter()
         .copied()
         .filter(|dependency| *dependency != index)
-        .max_by(|left, right| {
-            closures[*left]
-                .len()
-                .cmp(&closures[*right].len())
-                .then(position(*right).cmp(&position(*left)))
-        })
+        .max_by_key(|&dep| (closure_size(dep), std::cmp::Reverse(position(dep))))
 }
 
 /// Each admitted constant's checker entry in `engine`'s retained projection,
@@ -1980,6 +1987,28 @@ impl FrontierEngines {
         closures: &[std::sync::Arc<BTreeSet<usize>>],
         take: bool,
     ) -> Result<Option<FrontierBase>, OleanCheckError> {
+        self.release_with(index, take, |base| std::sync::Arc::clone(&closures[base]))
+    }
+
+    fn release_indexed(
+        &mut self,
+        index: usize,
+        closures: &[ImportClosure],
+        take: bool,
+    ) -> Result<Option<FrontierBase>, OleanCheckError> {
+        // FrontierJob exposes an ordered set to public check hooks. Only a
+        // dispatched base needs this view; the planning index stays packed.
+        self.release_with(index, take, |base| {
+            std::sync::Arc::new(closures[base].iter().collect())
+        })
+    }
+
+    fn release_with(
+        &mut self,
+        index: usize,
+        take: bool,
+        closure: impl FnOnce(usize) -> std::sync::Arc<BTreeSet<usize>>,
+    ) -> Result<Option<FrontierBase>, OleanCheckError> {
         let Some(base) = self.base_of[index] else {
             return Ok(None);
         };
@@ -2005,7 +2034,7 @@ impl FrontierEngines {
         }
         Ok(engine.map(|engine| FrontierBase {
             engine,
-            closure: std::sync::Arc::clone(&closures[base]),
+            closure: closure(base),
         }))
     }
 }
@@ -3575,7 +3604,7 @@ pub(crate) struct Phase1FrontierOutput<E = Admitted> {
     pub order: Vec<usize>,
     pub position: Vec<usize>,
     pub dependencies: Vec<BTreeSet<usize>>,
-    pub closures: Vec<std::sync::Arc<BTreeSet<usize>>>,
+    pub closures: Vec<ImportClosure>,
     pub accepted: Vec<Option<std::sync::Arc<FrontierAccepted>>>,
 }
 
@@ -4110,30 +4139,24 @@ impl Admitted {
         }
         // Each module's transitive import closure, itself included. Frontier order
         // is topological, so every import's closure exists before its importer's.
-        let mut closures: Vec<std::sync::Arc<BTreeSet<usize>>> =
-            vec![std::sync::Arc::default(); count];
-        for index in &order {
-            let mut closure = BTreeSet::new();
-            for dependency in &dependencies[*index] {
-                if dependency != index {
-                    closure.extend(closures[*dependency].iter().copied());
-                }
-            }
-            closure.insert(*index);
-            closures[*index] = std::sync::Arc::new(closure);
+        let mut closures: Vec<_> = (0..count).map(|_| ImportClosure::default()).collect();
+        for &index in &order {
+            closures[index] = ImportClosure::new(index, &dependencies[index], &closures);
         }
         let estimated_bytes: Vec<u64> = (0..count)
             .map(|index| {
                 let closure_decoded = closures[index]
                     .iter()
-                    .map(|member| module_decoded_bytes[*member])
+                    .map(|member| module_decoded_bytes[member])
                     .fold(0_u64, u64::saturating_add);
                 memory.estimate_bytes(index, closure_decoded)
             })
             .collect();
 
         let base_of: Vec<Option<usize>> = (0..count)
-            .map(|index| frontier_base_of(&dependencies, &closures, |i| position[i], index))
+            .map(|index| {
+                frontier_base_by_size(&dependencies, |i| closures[i].len(), |i| position[i], index)
+            })
             .collect();
         // Track remaining consumers of each `accepted[member]` payload so streaming
         // runs can evict accepted module payloads as soon as no later module can
@@ -4143,12 +4166,12 @@ impl Admitted {
         if !exec_options.retain_union_engine {
             for index in 0..count {
                 let base_dep = base_of[index];
-                for &member in closures[index].iter() {
+                for member in closures[index].iter() {
                     if member == index {
                         continue;
                     }
                     if !exec_options.retain_accepted_for_phase2
-                        && base_dep.is_some_and(|base| closures[base].contains(&member))
+                        && base_dep.is_some_and(|base| closures[base].contains(member))
                     {
                         continue;
                     }
@@ -4168,12 +4191,12 @@ impl Admitted {
                 if exec_options.retain_accepted_for_phase2 && !settled_accepted {
                     return;
                 }
-                for &member in closures[settled_index].iter() {
+                for member in closures[settled_index].iter() {
                     if member == settled_index {
                         continue;
                     }
                     if !exec_options.retain_accepted_for_phase2
-                        && base_dep.is_some_and(|base| closures[base].contains(&member))
+                        && base_dep.is_some_and(|base| closures[base].contains(member))
                     {
                         continue;
                     }
@@ -4377,7 +4400,7 @@ impl Admitted {
                     // Release them before any isolated retry has to allocate.
                     decoded[index] = None;
                     decided[index] = true;
-                    engines.release(index, &closures, false)?;
+                    engines.release_indexed(index, &closures, false)?;
                     release_accepted_consumers(
                         index,
                         false,
@@ -4539,7 +4562,7 @@ impl Admitted {
                             });
                         }
                     };
-                    let mut base = engines.release(index, &closures, true)?;
+                    let mut base = engines.release_indexed(index, &closures, true)?;
                     if high_pressure
                         && let Some(base) = &mut base
                         && base.engine.checker_environment.is_some()
@@ -4551,12 +4574,12 @@ impl Admitted {
                     let mut closure: Vec<_> = closures[index]
                         .iter()
                         .filter(|member| {
-                            **member != index
+                            *member != index
                                 && !base
                                     .as_ref()
                                     .is_some_and(|base| base.closure.contains(member))
                         })
-                        .filter_map(|member| accepted[*member].clone())
+                        .filter_map(|member| accepted[member].clone())
                         .collect();
                     closure.sort_by_key(|module| module.position);
                     on_event(OleanFrontierEvent::Started {
@@ -4815,10 +4838,9 @@ impl Admitted {
         let mut artifacts = Vec::with_capacity(count);
         let mut dependencies: Vec<BTreeSet<usize>> = Vec::with_capacity(count);
         // Each module's transitive import closure, itself included.
-        let mut closures: Vec<std::sync::Arc<BTreeSet<usize>>> = Vec::with_capacity(count);
+        let mut closures = Vec::with_capacity(count);
         for (position, (name, artifact)) in ordered.into_iter().enumerate() {
             let mut imports = BTreeSet::new();
-            let mut closure = BTreeSet::new();
             for import in &artifact.module.imports {
                 let Some(&dependency) = positions
                     .get(&import.module)
@@ -4829,20 +4851,20 @@ impl Admitted {
                     });
                 };
                 imports.insert(dependency);
-                closure.extend(closures[dependency].iter().copied());
             }
-            closure.insert(position);
+            closures.push(ImportClosure::new(position, &imports, &closures));
             names.push(name);
             artifacts.push(Some(artifact));
             dependencies.push(imports);
-            closures.push(std::sync::Arc::new(closure));
         }
 
         let threads = jobs.threads.get();
         let mut accepted: Vec<Option<std::sync::Arc<FrontierAccepted>>> = vec![None; count];
         let mut engines = FrontierEngines::new(
             (0..count)
-                .map(|index| frontier_base_of(&dependencies, &closures, |i| i, index))
+                .map(|index| {
+                    frontier_base_by_size(&dependencies, |i| closures[i].len(), |i| i, index)
+                })
                 .collect(),
         );
         let mut retained: Vec<Option<FrontierRetained>> = (0..count).map(|_| None).collect();
@@ -4906,11 +4928,11 @@ impl Admitted {
                                 detail: "a ready module-set member has no decoded artifact",
                             });
                         };
-                        let base = engines.release(index, &closures, true)?;
+                        let base = engines.release_indexed(index, &closures, true)?;
                         let mut closure: Vec<_> = closures[index]
                             .iter()
-                            .filter(|member| **member != index)
-                            .filter_map(|member| accepted[*member].clone())
+                            .filter(|member| *member != index)
+                            .filter_map(|member| accepted[member].clone())
                             .collect();
                         closure.sort_by_key(|module| module.position);
                         running[index] = true;
