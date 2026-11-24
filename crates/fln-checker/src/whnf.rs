@@ -1085,9 +1085,20 @@ enum RecursorStep {
     },
 }
 
+struct ProjCoreState {
+    delta_mode: DeltaMode,
+    unfolded_bindings: BTreeSet<usize>,
+    force_string_delta: bool,
+    progress: ProgressMark,
+}
+
 struct ProjectionFrame {
     projection: Cursor,
     outer_arguments: VecDeque<Cursor>,
+    /// Saved state when `DeltaMode::ProjCore` switches to eager reduction of a
+    /// projection's scrutinee (`whnf_core(e, false, false)` in `type_checker.cpp`),
+    /// restoring the original projection unchanged if reduction stays stuck.
+    proj_core: Option<Box<ProjCoreState>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1099,6 +1110,11 @@ enum DeltaMode {
     /// `Nat.pow` over the exponent.
     EagerNat(NatReductionScope),
     Disabled,
+    /// Core reduction with eager projection scrutinees (`whnf_core(e, false, false)`
+    /// / `try_unfold_proj_app` in `type_checker.cpp:420, 887, 1139`): never unfolds
+    /// top-level constants, but eagerly normalizes projected structures in-place
+    /// on zero-copy cursors and restores the original projection if stuck.
+    ProjCore,
     Once,
     /// Unfold at least once, and keep unfolding top-level definitions whose
     /// `delta_priority` stays strictly greater than `floor` without
@@ -1120,6 +1136,7 @@ impl DeltaMode {
             DeltaMode::EagerNat(scope) => DeltaMode::EagerNat(scope),
             DeltaMode::Eager
             | DeltaMode::Disabled
+            | DeltaMode::ProjCore
             | DeltaMode::Once
             | DeltaMode::AbovePriority(_) => DeltaMode::Eager,
         }
@@ -1515,6 +1532,69 @@ impl<'a, 'c> Reducer<'a, 'c> {
             .find(name)
             .and_then(|constant| self.context.source.delta_body(constant))
             .map(|definition| definition.hint().delta_priority())
+    }
+
+    fn is_nat_operation_head(&self, current: &Cursor, pending_args: usize) -> bool {
+        let Ok(ExprNode::Constant { name, levels }) = self.node(current) else {
+            return false;
+        };
+        levels.is_empty()
+            && crate::nat_reduce::operation_for_name(name)
+                .is_some_and(|op| pending_args >= usize::from(op.arity()))
+    }
+
+    /// Whether a stuck projection scrutinee `spine` has a K-like recursor
+    /// (such as `Eq.rec`) at its head or beneath a short chain of projections
+    /// and recursor majors. When `DeltaMode::ProjCore` exposes such a stuck
+    /// K-recursor inside a projection (e.g. `(eqToHom h).hom.right` in
+    /// `OpensLeCover`), preserving the unfolded scrutinee lets the typed
+    /// conversion lane discharge the KR-317 gate with proof irrelevance.
+    fn stuck_reaches_k_recursor(&mut self, spine: &Spine) -> Result<bool, Halt> {
+        let mut head = spine.head.clone();
+        let mut args = spine.args.clone();
+        for _ in 0..8 {
+            match self.node(&head)? {
+                ExprNode::Projection { expression, .. } => {
+                    let inner = head.child(*expression);
+                    let (next_head, next_args) = self.peel_application(&inner)?;
+                    head = next_head;
+                    args = next_args;
+                }
+                ExprNode::Constant { name, .. } => {
+                    let Some(recursor) = self
+                        .context
+                        .source
+                        .constants()
+                        .find(name)
+                        .and_then(|d| d.recursor_metadata())
+                    else {
+                        return Ok(false);
+                    };
+                    if recursor.k() {
+                        return Ok(true);
+                    }
+                    let major = usize::try_from(recursor.num_parameters())
+                        .unwrap_or(usize::MAX)
+                        .saturating_add(
+                            usize::try_from(recursor.num_motives()).unwrap_or(usize::MAX),
+                        )
+                        .saturating_add(
+                            usize::try_from(recursor.num_minors()).unwrap_or(usize::MAX),
+                        )
+                        .saturating_add(
+                            usize::try_from(recursor.num_indices()).unwrap_or(usize::MAX),
+                        );
+                    let Some(next) = args.get(major).cloned() else {
+                        return Ok(false);
+                    };
+                    let (next_head, next_args) = self.peel_application(&next)?;
+                    head = next_head;
+                    args = next_args;
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
     }
 
     fn unfold_definition(&mut self, current: &Cursor) -> Result<Option<Cursor>, Halt> {
@@ -3519,6 +3599,10 @@ impl<'a, 'c> Reducer<'a, 'c> {
             // and could not stop on its budget, so it is taken as is (bead
             // `fln-checker-associator-time-y8wc`, comment 3170). The step the
             // copy charges first is still charged.
+            WhnfInput::CopiedWithinBudget(arena) if root == arena.root() => {
+                self.control.step(root.index(), self.cancelled)?;
+                Cursor::closed(Arc::clone(arena), root)
+            }
             WhnfInput::Copied(arena)
                 if root == arena.root()
                     && copy_cannot_stop(arena, self.control.budget.materialization) =>
@@ -3526,7 +3610,9 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 self.control.step(root.index(), self.cancelled)?;
                 Cursor::closed(Arc::clone(arena), root)
             }
-            WhnfInput::Copied(arena) => self.materialize_term(arena, root, WhnfPhase::Initial)?,
+            WhnfInput::CopiedWithinBudget(arena) | WhnfInput::Copied(arena) => {
+                self.materialize_term(arena, root, WhnfPhase::Initial)?
+            }
             WhnfInput::Borrowed(term) => self.materialize_term(term, root, WhnfPhase::Initial)?,
         };
         self.entry = Some(Arc::clone(&current.arena));
@@ -3562,6 +3648,10 @@ impl<'a, 'c> Reducer<'a, 'c> {
         root: ExprId,
     ) -> Result<WhnfCoreOutcome, Halt> {
         let (current, skipped_initial_copy) = match input {
+            WhnfInput::CopiedWithinBudget(arena) if root == arena.root() => {
+                self.control.step(root.index(), self.cancelled)?;
+                (Cursor::closed(Arc::clone(arena), root), true)
+            }
             WhnfInput::Copied(arena)
                 if root == arena.root()
                     && copy_cannot_stop(arena, self.control.budget.materialization) =>
@@ -3569,7 +3659,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 self.control.step(root.index(), self.cancelled)?;
                 (Cursor::closed(Arc::clone(arena), root), true)
             }
-            WhnfInput::Copied(arena) => (
+            WhnfInput::CopiedWithinBudget(arena) | WhnfInput::Copied(arena) => (
                 self.materialize_term(arena, root, WhnfPhase::Initial)?,
                 false,
             ),
@@ -3644,6 +3734,10 @@ impl<'a, 'c> Reducer<'a, 'c> {
         numeric_budget: NatBudget,
     ) -> Result<WhnfEagerNatOutcome, Halt> {
         let current = match input {
+            WhnfInput::CopiedWithinBudget(arena) if root == arena.root() => {
+                self.control.step(root.index(), self.cancelled)?;
+                Cursor::closed(Arc::clone(arena), root)
+            }
             WhnfInput::Copied(arena)
                 if root == arena.root()
                     && copy_cannot_stop(arena, self.control.budget.materialization) =>
@@ -3651,7 +3745,9 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 self.control.step(root.index(), self.cancelled)?;
                 Cursor::closed(Arc::clone(arena), root)
             }
-            WhnfInput::Copied(arena) => self.materialize_term(arena, root, WhnfPhase::Initial)?,
+            WhnfInput::CopiedWithinBudget(arena) | WhnfInput::Copied(arena) => {
+                self.materialize_term(arena, root, WhnfPhase::Initial)?
+            }
             WhnfInput::Borrowed(term) => self.materialize_term(term, root, WhnfPhase::Initial)?,
         };
         self.entry = Some(Arc::clone(&current.arena));
@@ -3812,11 +3908,15 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     let may_unfold = forced
                         || match self.delta_mode {
                             DeltaMode::Eager | DeltaMode::EagerNat(_) => true,
-                            DeltaMode::Disabled => false,
+                            DeltaMode::Disabled | DeltaMode::ProjCore => false,
                             DeltaMode::Once => self.delta_reductions == 0,
                             DeltaMode::AbovePriority(floor) => {
                                 self.delta_reductions == 0
                                     || (frames.is_empty()
+                                        && !self.is_nat_operation_head(
+                                            &current,
+                                            pending_arguments.len(),
+                                        )
                                         && self
                                             .current_constant_priority(&current)
                                             .is_some_and(|priority| priority > floor))
@@ -3885,9 +3985,28 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     continue;
                 }
                 HeadAction::Projection { expression } => {
+                    let proj_core = if self.delta_mode == DeltaMode::ProjCore {
+                        let saved = Box::new(ProjCoreState {
+                            delta_mode: self.delta_mode,
+                            unfolded_bindings: self.unfolded_bindings.clone(),
+                            force_string_delta: self.force_string_delta,
+                            progress: ProgressMark {
+                                reductions: self.control.reductions,
+                                delta_reductions: self.delta_reductions,
+                                discarded_reductions: self.discarded_reductions,
+                                discarded_delta_reductions: self.discarded_delta_reductions,
+                            },
+                        });
+                        self.delta_mode = DeltaMode::Eager;
+                        self.force_string_delta = false;
+                        Some(saved)
+                    } else {
+                        None
+                    };
                     frames.push(ReductionFrame::Projection(ProjectionFrame {
                         projection: current.clone(),
                         outer_arguments: std::mem::take(&mut pending_arguments),
+                        proj_core,
                     }));
                     current = current.child(expression).shared();
                     continue;
@@ -3966,7 +4085,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         frames: &mut Vec<ReductionFrame>,
     ) -> Result<Resumed, Halt> {
         while let Some(frame) = frames.pop() {
-            let frame = match frame {
+            let mut frame = match frame {
                 ReductionFrame::Update { thunk, keyed } => {
                     let _ = thunk.result.set(stuck.clone());
                     if let Some(keyed) = keyed {
@@ -4184,6 +4303,12 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     continue;
                 }
             };
+            let proj_core = frame.proj_core.take();
+            if let Some(ref saved) = proj_core {
+                self.delta_mode = saved.delta_mode;
+                self.unfolded_bindings = saved.unfolded_bindings.clone();
+                self.force_string_delta = saved.force_string_delta;
+            }
             if let Some(field) = self.projection_field(&frame, &stuck)? {
                 self.control
                     .reduction(frame.projection.root.index(), self.cancelled)?;
@@ -4191,6 +4316,28 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     head: field,
                     args: frame.outer_arguments,
                 }));
+            }
+            if let Some(saved) = proj_core
+                && !self.stuck_reaches_k_recursor(&stuck)?
+            {
+                // Pin `whnf_core(e, false, false)` (`type_checker.cpp:459`):
+                // a projection whose eagerly normalized scrutinee did not
+                // reach a constructor returns the original projection
+                // unchanged and discards the fruitless reductions from progress
+                // (except when it exposed a stuck K-recursor whose KR-317 gate
+                // requires typed proof irrelevance in `Probe::run`).
+                let mark = saved.progress;
+                self.discarded_reductions = mark
+                    .discarded_reductions
+                    .saturating_add(self.control.reductions.saturating_sub(mark.reductions));
+                self.discarded_delta_reductions = mark
+                    .discarded_delta_reductions
+                    .saturating_add(self.delta_reductions.saturating_sub(mark.delta_reductions));
+                stuck = Spine {
+                    head: frame.projection,
+                    args: frame.outer_arguments,
+                };
+                continue;
             }
             // A projection whose structure stayed exactly as written is that
             // projection: reuse its node instead of rebuilding it, charging the
@@ -5328,6 +5475,77 @@ pub(crate) fn whnf_comparand_core_of_with(
     )
 }
 
+/// Core normalization with eager projection scrutinees (`DeltaMode::ProjCore`,
+/// matching pinned `whnf_core(e, false, false)` / `try_unfold_proj_app` in
+/// `type_checker.cpp:420, 887, 1139`): never unfolds top-level constants, but
+/// normalizes projected structures eagerly in-place on zero-copy cursors and
+/// returns `Unchanged` when the projection stays stuck.
+pub(crate) fn whnf_comparand_proj_core_of_with(
+    input: WhnfInput<'_>,
+    root: ExprId,
+    context: &WhnfContext,
+    budget: WhnfBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> WhnfCoreOutcome {
+    let mut control = Control::new(budget);
+    let prepared = match PreparedContext::prepare(context, &mut control, cancelled) {
+        Ok(prepared) => prepared,
+        Err(Halt::Refusal(refusal)) => return WhnfCoreOutcome::Refused(refusal),
+        Err(Halt::Stop(stop)) => return WhnfCoreOutcome::Inconclusive(*stop),
+        Err(Halt::Fault(fault)) => return WhnfCoreOutcome::InternalFault(fault),
+    };
+    let arena: &WireExpr = match input {
+        WhnfInput::Borrowed(term) => term,
+        WhnfInput::Copied(term) | WhnfInput::CopiedWithinBudget(term) => term,
+    };
+    match projection_may_reduce(arena, root, &prepared, &mut control, cancelled) {
+        Ok(false) => {
+            return WhnfCoreOutcome::Unchanged {
+                steps: control.steps,
+                reductions: 0,
+                delta_reductions: 0,
+                has_auxiliary_work: false,
+                string_progress: StringExpansionProgress::default(),
+            };
+        }
+        Ok(true) => {}
+        Err(Halt::Refusal(refusal)) => return WhnfCoreOutcome::Refused(refusal),
+        Err(Halt::Stop(stop)) => return WhnfCoreOutcome::Inconclusive(*stop),
+        Err(Halt::Fault(fault)) => return WhnfCoreOutcome::InternalFault(fault),
+    }
+    let reducer = Reducer {
+        context: prepared,
+        control,
+        cancelled,
+        unfolded_bindings: BTreeSet::new(),
+        acyclic_bindings: BTreeSet::new(),
+        delta_mode: DeltaMode::ProjCore,
+        head_nat: NatReductionScope::ClosedPair,
+        numeric_budget: None,
+        nat_progress: WhnfNatProgress::default(),
+        nat_pow_cap: None,
+        delta_reductions: 0,
+        discarded_reductions: 0,
+        discarded_delta_reductions: 0,
+        has_auxiliary_work: false,
+        string_progress: StringExpansionProgress::default(),
+        force_string_delta: false,
+        skip_nat: false,
+        facts: FastHashMap::default(),
+        string_expansions: FastHashMap::default(),
+        bodies: FastHashMap::default(),
+        keyed_thunks: FastHashMap::default(),
+        entry: None,
+        copied_result: false,
+    };
+    match reducer.run_core_step(input, root) {
+        Ok(outcome) => outcome,
+        Err(Halt::Refusal(refusal)) => WhnfCoreOutcome::Refused(refusal),
+        Err(Halt::Stop(stop)) => WhnfCoreOutcome::Inconclusive(*stop),
+        Err(Halt::Fault(fault)) => WhnfCoreOutcome::InternalFault(fault),
+    }
+}
+
 /// One lazy delta step (`DeltaMode::Once`) for a comparand in typed conversion,
 /// keeping `NatReductionScope::ClosedPair` so open Nat applications are never
 /// reduced by comparand normalization, and returning whether the output arena
@@ -5480,12 +5698,15 @@ fn whnf_at_mode_with(
 /// A term to reduce. `Copied` is this module's own copy of a term: the input
 /// copy's output or the final copy's, as a result flagged copied reports. Copying
 /// such an arena from its root reproduces it node for node, so `Reducer::run`
-/// takes it as is when the copy could not have stopped. Only a flag this module
-/// returned may mark a term copied.
+/// takes it as is when the copy could not have stopped. `CopiedWithinBudget`
+/// additionally asserts that the arena was produced under the caller's exact
+/// `TermBudget`, skipping the O(N) `copy_cannot_stop` unit rescan. Only a flag
+/// this module returned may mark a term copied.
 #[derive(Clone, Copy)]
 pub(crate) enum WhnfInput<'a> {
     Borrowed(&'a WireExpr),
     Copied(&'a Arc<WireExpr>),
+    CopiedWithinBudget(&'a Arc<WireExpr>),
 }
 
 /// Whether copying `arena` from its root is sure to complete under `budget`.
@@ -5657,6 +5878,85 @@ fn is_already_whnf_core(
     }
 }
 
+/// Conservative O(spine) check for whether a projection-headed term can
+/// possibly reduce under `DeltaMode::ProjCore`. Returns `Ok(false)` only when
+/// the innermost projected scrutinee head is definitively stuck (non-let Free,
+/// Bound, Meta, Sort, Forall, NatLiteral, or a non-delta/non-constructor/
+/// non-recursor/non-quotient Constant with no external projection rules).
+fn projection_may_reduce(
+    arena: &WireExpr,
+    root: ExprId,
+    prepared: &PreparedContext<'_>,
+    control: &mut Control,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<bool, Halt> {
+    let mut head = root;
+    let mut arg_count = 0_usize;
+    let mut inside_projection = false;
+    loop {
+        control.step(head.index(), cancelled)?;
+        let node = arena
+            .node(head)
+            .ok_or(Halt::Fault(WhnfFault::MissingExpression {
+                input: 0,
+                index: head.index(),
+            }))?;
+        match node {
+            ExprNode::Apply { function, .. } => {
+                if function.index() >= head.index() {
+                    return Err(Halt::Fault(WhnfFault::NonBackwardExpressionReference {
+                        input: 0,
+                        parent: head.index(),
+                        child: function.index(),
+                    }));
+                }
+                arg_count = arg_count.saturating_add(1);
+                head = *function;
+            }
+            ExprNode::Projection { expression, .. } => {
+                if expression.index() >= head.index() {
+                    return Err(Halt::Fault(WhnfFault::NonBackwardExpressionReference {
+                        input: 0,
+                        parent: head.index(),
+                        child: expression.index(),
+                    }));
+                }
+                inside_projection = true;
+                arg_count = 0;
+                head = *expression;
+            }
+            ExprNode::Bound { .. }
+            | ExprNode::Meta { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Forall { .. }
+            | ExprNode::NatLiteral { .. } => return Ok(false),
+            ExprNode::StringLiteral(_) => return Ok(inside_projection),
+            ExprNode::Lambda { .. } => return Ok(arg_count > 0),
+            ExprNode::Free { name } => return Ok(prepared.free_bindings.contains_key(name)),
+            ExprNode::Metadata { .. } | ExprNode::Let { .. } => return Ok(true),
+            ExprNode::Constant { name, .. } => {
+                if !inside_projection {
+                    return Ok(false);
+                }
+                if !prepared.projection_rules.is_empty() {
+                    return Ok(true);
+                }
+                let Some(entry) = prepared.source.constants().find(name) else {
+                    return Ok(true);
+                };
+                if entry.kind() == crate::environment::ConstantKind::Constructor
+                    || prepared.source.delta_body(entry).is_some()
+                    || (arg_count > 0
+                        && (entry.quotient_kind().is_some() || entry.recursor_metadata().is_some()))
+                {
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+        }
+    }
+}
+
 /// Core normalization (`DeltaMode::Disabled`) that skips copying and
 /// materialization when the term is already in `whnf_core` or when a copied
 /// input remained unchanged.
@@ -5694,7 +5994,7 @@ fn whnf_core_step_scoped_with(
     };
     let arena: &WireExpr = match input {
         WhnfInput::Borrowed(term) => term,
-        WhnfInput::Copied(term) => term,
+        WhnfInput::Copied(term) | WhnfInput::CopiedWithinBudget(term) => term,
     };
     match is_already_whnf_core(arena, root, &prepared, &mut control, cancelled) {
         Ok(true) => {

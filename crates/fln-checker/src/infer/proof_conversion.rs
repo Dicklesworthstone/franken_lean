@@ -53,7 +53,10 @@ impl Term {
 
     fn as_whnf_input(&self) -> crate::whnf::WhnfInput<'_> {
         if self.copied {
-            crate::whnf::WhnfInput::Copied(&self.expr)
+            // Every `copied` `Term` in `Probe` was produced by `whnf` under
+            // `self.budget.whnf.materialization` (which is immutable within a
+            // `Probe` run), so `copy_cannot_stop` holds by construction.
+            crate::whnf::WhnfInput::CopiedWithinBudget(&self.expr)
         } else {
             crate::whnf::WhnfInput::Borrowed(&self.expr)
         }
@@ -224,7 +227,9 @@ fn all_free_locals_in_context(term: &WireExpr, context: &InferenceContext) -> bo
         _ => true,
     })
 }
-/// A bounded two-generation set of term pairs, looked up without copying the terms.
+/// A bounded two-generation symmetric set of term pairs (`m_eqv_manager` /
+/// `m_failure` canonicalization in `type_checker.cpp:864-881`), looked up
+/// without copying the terms.
 #[derive(Default)]
 pub(super) struct PairSet {
     current: PairSetTable,
@@ -238,10 +243,11 @@ struct PairSetTable {
 impl PairSetTable {
     fn contains(&self, fingerprint: u64, left: &WireExpr, right: &WireExpr) -> bool {
         !self.buckets.is_empty()
-            && self
-                .buckets
-                .get(&fingerprint)
-                .is_some_and(|pairs| pairs.iter().any(|(l, r)| **l == *left && **r == *right))
+            && self.buckets.get(&fingerprint).is_some_and(|pairs| {
+                pairs.iter().any(|(l, r)| {
+                    (**l == *left && **r == *right) || (**l == *right && **r == *left)
+                })
+            })
     }
 }
 impl PairSet {
@@ -254,13 +260,27 @@ impl PairSet {
         right.hash(&mut hasher);
         hasher.finish()
     }
+    fn symmetric_fingerprint(left: &WireExpr, right: &WireExpr) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hl = crate::whnf::memo::Fingerprinter::default();
+        left.hash(&mut hl);
+        let a = hl.finish();
+        let mut hr = crate::whnf::memo::Fingerprinter::default();
+        right.hash(&mut hr);
+        let b = hr.finish();
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let mut combined = crate::whnf::memo::Fingerprinter::default();
+        combined.write_u64(lo);
+        combined.write_u64(hi);
+        combined.finish()
+    }
     fn contains(&self, left: &WireExpr, right: &WireExpr) -> bool {
-        let fingerprint = Self::fingerprint(left, right);
+        let fingerprint = Self::symmetric_fingerprint(left, right);
         self.current.contains(fingerprint, left, right)
             || self.previous.contains(fingerprint, left, right)
     }
     fn insert(&mut self, left: Arc<WireExpr>, right: Arc<WireExpr>) {
-        let fingerprint = Self::fingerprint(&left, &right);
+        let fingerprint = Self::symmetric_fingerprint(&left, &right);
         if self.current.contains(fingerprint, &left, &right)
             || self.previous.contains(fingerprint, &left, &right)
         {
@@ -708,6 +728,43 @@ impl Probe<'_> {
             }
         }
     }
+    /// Core normalization with eager projection scrutinees (`DeltaMode::ProjCore`,
+    /// `ClosedPair`), matching pinned `whnf_core(e, false, false)` and
+    /// `try_unfold_proj_app` (`type_checker.cpp:420, 887, 1139`). Returns
+    /// `Ok(Some(None))` when stuck/unchanged (zero allocation), `Ok(Some(Some(term)))`
+    /// when reduced, and `Ok(None)` when WHNF refused the term.
+    fn whnf_comparand_proj_core(
+        &mut self,
+        term: &Term,
+        context: &InferenceContext,
+    ) -> Result<Option<Option<Term>>> {
+        let budget = self.budget.whnf;
+        let result = crate::whnf::whnf_comparand_proj_core_of_with(
+            term.as_whnf_input(),
+            term.root(),
+            context.reduction(),
+            budget,
+            &mut || self.poll(),
+        );
+        self.check_stop()?;
+        match result {
+            crate::whnf::WhnfCoreOutcome::Unchanged { .. } => Ok(Some(None)),
+            crate::whnf::WhnfCoreOutcome::Complete { result, copied } => {
+                Ok(Some(Some(Term::from_whnf(result.term, copied))))
+            }
+            crate::whnf::WhnfCoreOutcome::Refused(_) => Ok(None),
+            crate::whnf::WhnfCoreOutcome::Inconclusive(stop) => Err(Box::new(
+                InferenceOutcome::Inconclusive(InferenceStop::Whnf {
+                    argument: 0,
+                    stop: Box::new(stop),
+                    progress: self.progress(),
+                }),
+            )),
+            crate::whnf::WhnfCoreOutcome::InternalFault(fault) => {
+                Err(self.fault(InferenceFault::Whnf { argument: 0, fault }))
+            }
+        }
+    }
     /// One lazy delta step (`DeltaMode::Once`, `ClosedPair`) for comparands in
     /// typed conversion, matching the pin's `lazy_delta_reduction_step` and
     /// preserving `WhnfInput::Copied` so consecutive steps skip input recopying.
@@ -750,36 +807,33 @@ impl Probe<'_> {
             .whnf_result(result)?
             .map(|reduced| Term::from_whnf(reduced, copied)))
     }
-    /// Reducibility priority of `term`'s spine head (stepping through
-    /// applications, metadata, and projections), and whether a projection was
-    /// crossed (matching `defeq::definition_height_through` and the pin's
-    /// `try_unfold_proj_app`).
-    fn definition_height_through(
+    /// Direct spine-head classification matching pinned `is_delta`
+    /// (`type_checker.cpp:506`) and `try_unfold_proj_app` (`type_checker.cpp:887`):
+    /// steps only through `Apply` and `Metadata`, returning `(Some(priority), false)`
+    /// for a delta-reducible constant head, `(None, true)` for a projection head
+    /// (applied or bare), and `(None, false)` otherwise.
+    fn direct_delta_priority(
         &mut self,
         term: &WireExpr,
         context: &InferenceContext,
     ) -> Result<(Option<(u8, u32)>, bool)> {
         let reduction = context.reduction();
         let mut id = term.root();
-        let mut through_projection = false;
         loop {
             self.tick()?;
             match term.node(id) {
                 Some(ExprNode::Apply { function, .. }) => id = *function,
                 Some(ExprNode::Metadata { expression, .. }) => id = *expression,
-                Some(ExprNode::Projection { expression, .. }) => {
-                    through_projection = true;
-                    id = *expression;
-                }
+                Some(ExprNode::Projection { .. }) => return Ok((None, true)),
                 Some(ExprNode::Constant { name, .. }) => {
                     let height = reduction
                         .constants()
                         .find(name)
                         .and_then(|constant| reduction.delta_body(constant))
                         .map(|definition| definition.hint().delta_priority());
-                    return Ok((height, through_projection));
+                    return Ok((height, false));
                 }
-                _ => return Ok((None, through_projection)),
+                _ => return Ok((None, false)),
             }
         }
     }
@@ -941,7 +995,16 @@ impl Probe<'_> {
                         index: right_index,
                         expression: right_expr,
                     }),
-                ) if left_structure == right_structure && left_index == right_index => {
+                ) if batches.is_empty()
+                    && left_structure == right_structure
+                    && left_index == right_index =>
+                {
+                    // Only peel bare projections (`(f p1).i ≟ (f p2).i`,
+                    // matching `type_checker.cpp:1131`). Applied projections
+                    // (`(EquivLike.toFunLike ...).0 e1 x`) must NEVER run
+                    // speculative congruence on outer arguments `e1 ≟ e2`
+                    // before `whnf_comparand_proj_core` reduces the projection
+                    // (`type_checker.cpp:936, 1139`).
                     peeled_projection = true;
                     left_cursor = *left_expr;
                     right_cursor = *right_expr;
@@ -1934,12 +1997,12 @@ impl Probe<'_> {
                 work.push(Work::Pair(Term::new(domain), Term::new(other), context));
                 continue;
             }
-            // If `left` is headed by a theorem constant, try proof irrelevance
-            // before congruence so differing proof combinators (`Eq.trans`,
-            // `congrArg`, etc.) equate their proposition types immediately
-            // without comparing proof subterms.
+            // If either side is headed by a theorem constant, try proof
+            // irrelevance before congruence so differing proof combinators
+            // (`Eq.trans`, `congrArg`, etc.) equate their proposition types
+            // immediately without comparing proof subterms.
             if state.check_proof
-                && is_theorem_head(&left, &context)
+                && (is_theorem_head(&left, &context) || is_theorem_head(&right, &context))
                 && let Some((lt, rt)) =
                     self.try_proof_irrelevance(&left, &right, &context, &mut state.check_proof)?
             {
@@ -2088,84 +2151,118 @@ impl Probe<'_> {
                     continue 'work;
                 }
             }
-            // Pin-aligned height-ordered lazy delta (`type_checker.cpp:903-1055`):
-            // unfold ONE step at the higher reducibility priority (preferring a
-            // projection side over a constant side, as `try_unfold_proj_app`),
-            // returning immediately via `Work::DeltaStep` so typed congruence
-            // fires at every intermediate combinator layer without re-running
-            // `proof_type` or polluting `taken`/`PairSet`/`PairAnswers`.
-            let (mut left_height, left_proj) = self.definition_height_through(&l, &context)?;
-            let (mut right_height, right_proj) = self.definition_height_through(&r, &context)?;
-            let left_delta = left_height.is_some() && !left_proj;
-            let right_delta = right_height.is_some() && !right_proj;
-            if left_delta && !right_delta && right_proj && right_height.is_some() {
-                let Some(reduced) = self.whnf_comparand_delta_step(&r, &context)? else {
-                    fail!()
-                };
-                if reduced.expr != r.expr {
-                    work.push(Work::DeltaStep(l, reduced, context, state.after_step()));
-                    continue 'work;
-                }
-                right_height = None;
-            } else if !left_delta && right_delta && left_proj && left_height.is_some() {
-                let Some(reduced) = self.whnf_comparand_delta_step(&l, &context)? else {
-                    fail!()
-                };
-                if reduced.expr != l.expr {
-                    work.push(Work::DeltaStep(reduced, r, context, state.after_step()));
-                    continue 'work;
-                }
-                left_height = None;
-            }
-            let (unfold_left, unfold_right) = match (left_height, right_height) {
-                (Some(lh), Some(rh)) => (lh >= rh, rh >= lh),
-                (Some(_), None) => (true, false),
-                (None, Some(_)) => (false, true),
-                (None, None) => (false, false),
-            };
-            if unfold_left || unfold_right {
-                let mut next_l = if unfold_left {
-                    let reduced = if !unfold_right
-                        && left_delta
-                        && let Some(floor) = right_height
-                    {
-                        self.whnf_comparand_delta_above(&l, floor, &context)?
+            // Pin-aligned height-ordered lazy delta (`type_checker.cpp:903-953`)
+            // followed by eager-projection `whnf_core` (`type_checker.cpp:1139`):
+            // - Only direct constant heads participate in delta height ordering
+            //   (`is_delta`, `type_checker.cpp:506`).
+            // - When one side has a delta head and the other has a projection
+            //   head, reduce the projection first (`try_unfold_proj_app`,
+            //   `type_checker.cpp:917, 924`) in-place via `DeltaMode::ProjCore`.
+            // - When one delta side strictly outranks the peer (or the peer has
+            //   no delta head), catch up in one zero-copy `Cursor` pass via
+            //   `DeltaMode::AbovePriority`.
+            // - When neither side has a direct delta head (`DefUnknown`), reduce
+            //   any projection head via `DeltaMode::ProjCore` (`whnf_core(e, false, false)`,
+            //   `type_checker.cpp:1139`) before structural decomposition.
+            let (left_height, left_is_proj) = self.direct_delta_priority(&l, &context)?;
+            let (right_height, right_is_proj) = self.direct_delta_priority(&r, &context)?;
+            match (left_height, right_height) {
+                (Some(lh), Some(rh)) => {
+                    let (next_l, next_r) = if lh > rh {
+                        let Some(reduced) = self.whnf_comparand_delta_above(&l, rh, &context)?
+                        else {
+                            fail!()
+                        };
+                        (reduced, r.clone())
+                    } else if rh > lh {
+                        let Some(reduced) = self.whnf_comparand_delta_above(&r, lh, &context)?
+                        else {
+                            fail!()
+                        };
+                        (l.clone(), reduced)
                     } else {
-                        self.whnf_comparand_delta_step(&l, &context)?
+                        let Some(reduced_l) = self.whnf_comparand_delta_step(&l, &context)? else {
+                            fail!()
+                        };
+                        let Some(reduced_r) = self.whnf_comparand_delta_step(&r, &context)? else {
+                            fail!()
+                        };
+                        (reduced_l, reduced_r)
                     };
-                    let Some(reduced) = reduced else { fail!() };
-                    reduced
-                } else {
-                    l.clone()
-                };
-                let mut next_r = if unfold_right {
-                    let reduced = if !unfold_left
-                        && right_delta
-                        && let Some(floor) = left_height
-                    {
-                        self.whnf_comparand_delta_above(&r, floor, &context)?
-                    } else {
-                        self.whnf_comparand_delta_step(&r, &context)?
-                    };
-                    let Some(reduced) = reduced else { fail!() };
-                    reduced
-                } else {
-                    r.clone()
-                };
-                if next_l.expr == l.expr && !unfold_right && right_height.is_some() {
-                    let Some(reduced) = self.whnf_comparand_delta_step(&r, &context)? else {
+                    if next_l.expr != l.expr || next_r.expr != r.expr {
+                        work.push(Work::DeltaStep(next_l, next_r, context, state.after_step()));
+                        continue 'work;
+                    }
+                }
+                (Some(_), None) => {
+                    if right_is_proj {
+                        let Some(r_proj) = self.whnf_comparand_proj_core(&r, &context)? else {
+                            fail!()
+                        };
+                        if let Some(reduced) = r_proj
+                            && reduced.expr != r.expr
+                        {
+                            work.push(Work::DeltaStep(l, reduced, context, state.after_step()));
+                            continue 'work;
+                        }
+                    }
+                    let Some(reduced) = self.whnf_comparand_delta_above(&l, (0, 0), &context)?
+                    else {
                         fail!()
                     };
-                    next_r = reduced;
-                } else if next_r.expr == r.expr && !unfold_left && left_height.is_some() {
-                    let Some(reduced) = self.whnf_comparand_delta_step(&l, &context)? else {
+                    if reduced.expr != l.expr {
+                        work.push(Work::DeltaStep(reduced, r, context, state.after_step()));
+                        continue 'work;
+                    }
+                }
+                (None, Some(_)) => {
+                    if left_is_proj {
+                        let Some(l_proj) = self.whnf_comparand_proj_core(&l, &context)? else {
+                            fail!()
+                        };
+                        if let Some(reduced) = l_proj
+                            && reduced.expr != l.expr
+                        {
+                            work.push(Work::DeltaStep(reduced, r, context, state.after_step()));
+                            continue 'work;
+                        }
+                    }
+                    let Some(reduced) = self.whnf_comparand_delta_above(&r, (0, 0), &context)?
+                    else {
                         fail!()
                     };
-                    next_l = reduced;
+                    if reduced.expr != r.expr {
+                        work.push(Work::DeltaStep(l, reduced, context, state.after_step()));
+                        continue 'work;
+                    }
                 }
-                if next_l.expr != l.expr || next_r.expr != r.expr {
-                    work.push(Work::DeltaStep(next_l, next_r, context, state.after_step()));
-                    continue 'work;
+                (None, None) => {
+                    if left_is_proj || right_is_proj {
+                        let l_proj = if left_is_proj {
+                            let Some(reduced) = self.whnf_comparand_proj_core(&l, &context)? else {
+                                fail!()
+                            };
+                            reduced
+                        } else {
+                            None
+                        };
+                        let r_proj = if right_is_proj {
+                            let Some(reduced) = self.whnf_comparand_proj_core(&r, &context)? else {
+                                fail!()
+                            };
+                            reduced
+                        } else {
+                            None
+                        };
+                        let l_changed = l_proj.as_ref().is_some_and(|t| t.expr != l.expr);
+                        let r_changed = r_proj.as_ref().is_some_and(|t| t.expr != r.expr);
+                        if l_changed || r_changed {
+                            let next_l = l_proj.unwrap_or(l);
+                            let next_r = r_proj.unwrap_or(r);
+                            work.push(Work::DeltaStep(next_l, next_r, context, state.after_step()));
+                            continue 'work;
+                        }
+                    }
                 }
             }
             // KR-315 unit-like conversion (`type_checker.cpp:1157`) runs once
@@ -3333,6 +3430,972 @@ mod tests {
                 .expect("same_head_arguments"),
             None,
             "projections over distinct heads must not trigger speculative congruence"
+        );
+    }
+
+    #[test]
+    fn applied_projection_reduces_without_speculative_congruence_and_pair_set_is_symmetric() {
+        use crate::environment::{
+            ConstantDeclaration, ConstantEntry, ConstantKind, ConstantSafety,
+            ConstructorDeclaration, DefinitionBody, DefinitionSafety, EnvironmentBudget,
+            EnvironmentOutcome, InductiveDeclaration, ReducibilityHint,
+        };
+        let mut set = PairSet::default();
+        let (x, y) = (Arc::new(constant("x")), Arc::new(constant("y")));
+        set.insert(Arc::clone(&x), Arc::clone(&y));
+        assert!(set.contains(&x, &y));
+        assert!(set.contains(&y, &x), "PairSet must be symmetric");
+
+        // Model `(EquivLike.toFunLike ...).0 e1 x ≟ (EquivLike.toFunLike ...).0 e2 x`
+        // where `e1 = Box.mk f u1` and `e2 = Box.mk f u2` share field 0 (`f`)
+        // but differ in field 1 (`u1 != u2`). Applied projection must NOT push
+        // a speculative `Work::Attempt` comparing `e1 ≟ e2`, and `ProjCore`
+        // reduces `(inst).0 e1 x` directly to `f x`.
+        let name = |s: &str| WireName::from_parts(vec![NamePart::Text(s.into())]);
+        let sort_type = WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: crate::wire::LevelId::from_index(1).expect("level 1"),
+            }],
+            vec![
+                crate::wire::LevelNode::Zero,
+                crate::wire::LevelNode::Succ(crate::wire::LevelId::ZERO),
+            ],
+            ExprId::ZERO,
+        );
+        let t_const = constant("T");
+        let box_const = constant("Box");
+        let fl_const = constant("FL");
+        let t_to_t = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("T"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Forall {
+                    binder_name: name("x"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::ZERO,
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(1).expect("t_to_t"),
+        );
+        // `Box.mk : (T -> T) -> T -> Box`
+        let box_mk_ty = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("T"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Forall {
+                    binder_name: name("x"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::ZERO,
+                    style: crate::wire::BinderStyle::Default,
+                },
+                ExprNode::Constant {
+                    name: name("Box"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Forall {
+                    binder_name: name("u"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(2).expect("box"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                ExprNode::Forall {
+                    binder_name: name("f"),
+                    binder_type: ExprId::from_index(1).expect("t_to_t"),
+                    body: ExprId::from_index(3).expect("inner"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(4).expect("box_mk_ty"),
+        );
+        // `FL.mk : (Box -> T -> T) -> FL`
+        let fl_mk_ty = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("Box"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("T"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Forall {
+                    binder_name: name("x"),
+                    binder_type: ExprId::from_index(1).expect("T"),
+                    body: ExprId::from_index(1).expect("T"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                ExprNode::Forall {
+                    binder_name: name("b"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(2).expect("t_to_t"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                ExprNode::Constant {
+                    name: name("FL"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Forall {
+                    binder_name: name("coe"),
+                    binder_type: ExprId::from_index(3).expect("box_to_t_to_t"),
+                    body: ExprId::from_index(4).expect("FL"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(5).expect("fl_mk_ty"),
+        );
+        // `fl_inst_inner : FL := FL.mk (fun b : Box => b.0)`
+        let fl_inst_inner_body = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("FL.mk"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("Box"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Bound { index: 0 },
+                ExprNode::Projection {
+                    structure_name: name("Box"),
+                    index: 0,
+                    expression: ExprId::from_index(2).expect("b"),
+                },
+                ExprNode::Lambda {
+                    binder_name: name("b"),
+                    binder_type: ExprId::from_index(1).expect("Box"),
+                    body: ExprId::from_index(3).expect("proj"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                ExprNode::Apply {
+                    function: ExprId::ZERO,
+                    argument: ExprId::from_index(4).expect("lam"),
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(5).expect("apply"),
+        );
+        // `fl_inst : FL := fl_inst_inner` (2-layer Regular chain inside Projection!)
+        let mk_box = |unused: &str| {
+            WireExpr::from_parts(
+                vec![
+                    ExprNode::Constant {
+                        name: name("Box.mk"),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Constant {
+                        name: name("f"),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Apply {
+                        function: ExprId::ZERO,
+                        argument: ExprId::from_index(1).expect("f"),
+                    },
+                    ExprNode::Constant {
+                        name: name(unused),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Apply {
+                        function: ExprId::from_index(2).expect("app1"),
+                        argument: ExprId::from_index(3).expect("u"),
+                    },
+                ],
+                Vec::new(),
+                ExprId::from_index(4).expect("box"),
+            )
+        };
+        let entries = vec![
+            ConstantEntry::new(
+                name("T"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    sort_type.clone(),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("f"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    t_to_t,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("u1"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    t_const.clone(),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("u2"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    t_const.clone(),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("x"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    t_const,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("Box"),
+                ConstantDeclaration::inductive(
+                    Vec::new(),
+                    sort_type.clone(),
+                    ConstantSafety::Safe,
+                    InductiveDeclaration::new(
+                        0,
+                        0,
+                        vec![name("Box")],
+                        vec![name("Box.mk")],
+                        0,
+                        false,
+                        false,
+                    ),
+                ),
+            ),
+            ConstantEntry::new(
+                name("Box.mk"),
+                ConstantDeclaration::constructor(
+                    Vec::new(),
+                    box_mk_ty,
+                    ConstantSafety::Safe,
+                    ConstructorDeclaration::new(name("Box"), 0, 0, 2),
+                ),
+            ),
+            ConstantEntry::new(
+                name("FL"),
+                ConstantDeclaration::inductive(
+                    Vec::new(),
+                    sort_type,
+                    ConstantSafety::Safe,
+                    InductiveDeclaration::new(
+                        0,
+                        0,
+                        vec![name("FL")],
+                        vec![name("FL.mk")],
+                        0,
+                        false,
+                        false,
+                    ),
+                ),
+            ),
+            ConstantEntry::new(
+                name("FL.mk"),
+                ConstantDeclaration::constructor(
+                    Vec::new(),
+                    fl_mk_ty,
+                    ConstantSafety::Safe,
+                    ConstructorDeclaration::new(name("FL"), 0, 0, 1),
+                ),
+            ),
+            ConstantEntry::new(
+                name("fl_inst_inner"),
+                ConstantDeclaration::definition(
+                    Vec::new(),
+                    fl_const.clone(),
+                    ConstantSafety::Safe,
+                    DefinitionBody::new(
+                        fl_inst_inner_body,
+                        ReducibilityHint::Regular(1),
+                        DefinitionSafety::Safe,
+                        Vec::new(),
+                    ),
+                ),
+            ),
+            ConstantEntry::new(
+                name("fl_inst"),
+                ConstantDeclaration::definition(
+                    Vec::new(),
+                    fl_const,
+                    ConstantSafety::Safe,
+                    DefinitionBody::new(
+                        constant("fl_inst_inner"),
+                        ReducibilityHint::Regular(2),
+                        DefinitionSafety::Safe,
+                        Vec::new(),
+                    ),
+                ),
+            ),
+            ConstantEntry::new(
+                name("e1"),
+                ConstantDeclaration::definition(
+                    Vec::new(),
+                    box_const.clone(),
+                    ConstantSafety::Safe,
+                    DefinitionBody::new(
+                        mk_box("u1"),
+                        ReducibilityHint::Regular(3),
+                        DefinitionSafety::Safe,
+                        Vec::new(),
+                    ),
+                ),
+            ),
+            ConstantEntry::new(
+                name("e2"),
+                ConstantDeclaration::definition(
+                    Vec::new(),
+                    box_const,
+                    ConstantSafety::Safe,
+                    DefinitionBody::new(
+                        mk_box("u2"),
+                        ReducibilityHint::Regular(3),
+                        DefinitionSafety::Safe,
+                        Vec::new(),
+                    ),
+                ),
+            ),
+        ];
+        let constants = match crate::environment::ConstantEnvironment::build(
+            entries,
+            EnvironmentBudget::unlimited(),
+        ) {
+            EnvironmentOutcome::Complete { environment, .. } => environment,
+            other => panic!("environment must build: {other:?}"),
+        };
+        let context = InferenceContext::empty(constants);
+        let applied_proj = |e_name: &str| {
+            WireExpr::from_parts(
+                vec![
+                    ExprNode::Constant {
+                        name: name("fl_inst"),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Projection {
+                        structure_name: name("FL"),
+                        index: 0,
+                        expression: ExprId::ZERO,
+                    },
+                    ExprNode::Constant {
+                        name: name(e_name),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Apply {
+                        function: ExprId::from_index(1).expect("proj"),
+                        argument: ExprId::from_index(2).expect("e"),
+                    },
+                    ExprNode::Constant {
+                        name: name("x"),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Apply {
+                        function: ExprId::from_index(3).expect("app1"),
+                        argument: ExprId::from_index(4).expect("x"),
+                    },
+                ],
+                Vec::new(),
+                ExprId::from_index(5).expect("app2"),
+            )
+        };
+        let left = applied_proj("e1");
+        let right = applied_proj("e2");
+        let mut cancelled = || false;
+        let mut probe = Probe {
+            budget: InferenceBudget::unlimited(),
+            steps: 0,
+            polls: 0,
+            cancelled: &mut cancelled,
+            stop: None,
+            root_left: &left,
+            root_right: &right,
+            root_context: &context,
+            reserved: None,
+            unreserved_nested: Vec::new(),
+            next: 0,
+            incongruent: PairSet::default(),
+            proven: PairSet::default(),
+            disproven: PairSet::default(),
+            answers: PairAnswers::default(),
+            inferred: InferredTypes::default(),
+            opened: OpenedLocals::default(),
+        };
+        assert!(
+            probe
+                .run(&left, &right, &context, true)
+                .expect("applied projection reduction must succeed")
+        );
+        assert!(
+            probe.incongruent.current.buckets.is_empty(),
+            "applied projection must not push speculative congruence comparing e1 ≟ e2"
+        );
+    }
+
+    #[test]
+    fn proj_core_preserves_exposed_k_recursor_beneath_projection() {
+        use crate::environment::{
+            ConstantDeclaration, ConstantEntry, ConstantKind, ConstantSafety,
+            ConstructorDeclaration, DefinitionBody, DefinitionSafety, EnvironmentBudget,
+            EnvironmentOutcome, InductiveDeclaration, RecursorDeclaration, RecursorRule,
+            ReducibilityHint,
+        };
+        let name = |s: &str| WireName::from_parts(vec![NamePart::Text(s.into())]);
+        let sort_prop = WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: crate::wire::LevelId::ZERO,
+            }],
+            vec![crate::wire::LevelNode::Zero],
+            ExprId::ZERO,
+        );
+        let sort_type = WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: crate::wire::LevelId::from_index(1).expect("level 1"),
+            }],
+            vec![
+                crate::wire::LevelNode::Zero,
+                crate::wire::LevelNode::Succ(crate::wire::LevelId::ZERO),
+            ],
+            ExprId::ZERO,
+        );
+        // `A : Type`, `a : A`, `P : Prop`, `p1 p2 : P`.
+        // `Wrap : Type` with constructor `Wrap.mk : A -> Wrap`.
+        // `EqA : A -> A -> Prop` (K-like inductive with 1 param, 1 index, ctor `EqA.refl : EqA a a`),
+        // with K-recursor `EqA.rec : (x : A) -> (m : A -> Type) -> m x -> (y : A) -> EqA x y -> m y`.
+        // `id_def : A -> A := fun z => z` so `EqA a (id_def a)` requires conversion (or proof-differing
+        // `f p1` vs `f p2` where `f : P -> A := fun _ => a`, so `EqA (f p1) (f p2)` only passes the
+        // KR-317 gate via typed proof irrelevance, NEVER via untyped `whnf`!).
+        // `castWrap : EqA (f p1) (f p2) -> Wrap := fun h => EqA.rec (f p1) (fun _ => Wrap) (Wrap.mk a) (f p2) h`.
+        // Compare `(castWrap h).0 ≟ a` where `h : EqA (f p1) (f p2)` is a free axiom:
+        // `DeltaMode::ProjCore` unfolds `castWrap h` to the stuck K-recursor `EqA.rec ... h`
+        // beneath `.0` and MUST preserve it so `nested_k_reduction` fires on the next step!
+        let p_const = constant("P");
+        let a_const = constant("A");
+        let wrap_const = constant("Wrap");
+        let f_ty = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("P"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("A"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Forall {
+                    binder_name: name("p"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(1).expect("A"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(2).expect("f_ty"),
+        );
+        let wrap_mk_ty = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("A"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("Wrap"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Forall {
+                    binder_name: name("x"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(1).expect("Wrap"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(2).expect("wrap_mk_ty"),
+        );
+        // `EqA : A -> A -> Prop`
+        let eqa_ty = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("A"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Sort {
+                    level: crate::wire::LevelId::ZERO,
+                },
+                ExprNode::Forall {
+                    binder_name: name("y"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(1).expect("Prop"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                ExprNode::Forall {
+                    binder_name: name("x"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(2).expect("inner"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            vec![crate::wire::LevelNode::Zero],
+            ExprId::from_index(3).expect("eqa_ty"),
+        );
+        // `EqA.refl : (x : A) -> EqA x x`
+        let eqa_refl_ty = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("A"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("EqA"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Bound { index: 0 },
+                ExprNode::Apply {
+                    function: ExprId::from_index(1).expect("EqA"),
+                    argument: ExprId::from_index(2).expect("x"),
+                },
+                ExprNode::Apply {
+                    function: ExprId::from_index(3).expect("EqA x"),
+                    argument: ExprId::from_index(2).expect("x"),
+                },
+                ExprNode::Forall {
+                    binder_name: name("x"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(4).expect("EqA x x"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(5).expect("refl_ty"),
+        );
+        // `EqA.rec : (x : A) -> (m : A -> Type) -> m x -> (y : A) -> EqA x y -> m y`
+        let eqa_rec_ty = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("A"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Sort {
+                    level: crate::wire::LevelId::from_index(1).expect("1"),
+                },
+                // 2: A -> Type
+                ExprNode::Forall {
+                    binder_name: name("_"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(1).expect("Type"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                // 3: m x (under x=bvar1, m=bvar0)
+                ExprNode::Bound { index: 0 },
+                ExprNode::Bound { index: 1 },
+                ExprNode::Apply {
+                    function: ExprId::from_index(3).expect("m"),
+                    argument: ExprId::from_index(4).expect("x"),
+                },
+                // 6: EqA x y (under x=bvar3, m=bvar2, minor=bvar1, y=bvar0)
+                ExprNode::Constant {
+                    name: name("EqA"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Bound { index: 3 },
+                ExprNode::Apply {
+                    function: ExprId::from_index(6).expect("EqA"),
+                    argument: ExprId::from_index(7).expect("x"),
+                },
+                ExprNode::Apply {
+                    function: ExprId::from_index(8).expect("EqA x"),
+                    argument: ExprId::from_index(3).expect("y=bvar0"),
+                },
+                // 10: m y (under x=bvar4, m=bvar3, minor=bvar2, y=bvar1, h=bvar0)
+                ExprNode::Apply {
+                    function: ExprId::from_index(7).expect("m=bvar3"),
+                    argument: ExprId::from_index(4).expect("y=bvar1"),
+                },
+                // 11: EqA x y -> m y
+                ExprNode::Forall {
+                    binder_name: name("h"),
+                    binder_type: ExprId::from_index(9).expect("EqA x y"),
+                    body: ExprId::from_index(10).expect("m y"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                // 12: (y : A) -> EqA x y -> m y
+                ExprNode::Forall {
+                    binder_name: name("y"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(11).expect("for_h"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                // 13: m x -> (y : A) -> EqA x y -> m y
+                ExprNode::Forall {
+                    binder_name: name("minor"),
+                    binder_type: ExprId::from_index(5).expect("m x"),
+                    body: ExprId::from_index(12).expect("for_y"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                // 14: (m : A -> Type) -> ...
+                ExprNode::Forall {
+                    binder_name: name("m"),
+                    binder_type: ExprId::from_index(2).expect("A->Type"),
+                    body: ExprId::from_index(13).expect("for_minor"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                // 15: (x : A) -> ...
+                ExprNode::Forall {
+                    binder_name: name("x"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(14).expect("for_m"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            vec![
+                crate::wire::LevelNode::Zero,
+                crate::wire::LevelNode::Succ(crate::wire::LevelId::ZERO),
+            ],
+            ExprId::from_index(15).expect("rec_ty"),
+        );
+        // Rule rhs for `EqA.refl`: `fun x m minor => minor` (0 fields, params=1, motives=1, minors=1)
+        let eqa_rec_rule_rhs = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("A"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Bound { index: 0 },
+                ExprNode::Lambda {
+                    binder_name: name("minor"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(1).expect("minor"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                ExprNode::Lambda {
+                    binder_name: name("m"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(2).expect("lam_minor"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                ExprNode::Lambda {
+                    binder_name: name("x"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(3).expect("lam_m"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(4).expect("rhs"),
+        );
+        // `h : EqA (f p1) (f p2)`
+        let h_ty = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("EqA"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("f"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("p1"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Apply {
+                    function: ExprId::from_index(1).expect("f"),
+                    argument: ExprId::from_index(2).expect("p1"),
+                },
+                ExprNode::Constant {
+                    name: name("p2"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Apply {
+                    function: ExprId::from_index(1).expect("f"),
+                    argument: ExprId::from_index(4).expect("p2"),
+                },
+                ExprNode::Apply {
+                    function: ExprId::ZERO,
+                    argument: ExprId::from_index(3).expect("f p1"),
+                },
+                ExprNode::Apply {
+                    function: ExprId::from_index(6).expect("EqA (f p1)"),
+                    argument: ExprId::from_index(5).expect("f p2"),
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(7).expect("h_ty"),
+        );
+        // `castWrap : Wrap := EqA.rec (f p1) (fun _ : A => Wrap) (Wrap.mk a) (f p2) h`
+        let cast_wrap_body = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("EqA.rec"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("f"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("p1"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Apply {
+                    function: ExprId::from_index(1).expect("f"),
+                    argument: ExprId::from_index(2).expect("p1"),
+                },
+                ExprNode::Apply {
+                    function: ExprId::ZERO,
+                    argument: ExprId::from_index(3).expect("f p1"),
+                },
+                ExprNode::Constant {
+                    name: name("A"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("Wrap"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Lambda {
+                    binder_name: name("_"),
+                    binder_type: ExprId::from_index(5).expect("A"),
+                    body: ExprId::from_index(6).expect("Wrap"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+                ExprNode::Apply {
+                    function: ExprId::from_index(4).expect("app1"),
+                    argument: ExprId::from_index(7).expect("motive"),
+                },
+                ExprNode::Constant {
+                    name: name("Wrap.mk"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("a"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Apply {
+                    function: ExprId::from_index(9).expect("Wrap.mk"),
+                    argument: ExprId::from_index(10).expect("a"),
+                },
+                ExprNode::Apply {
+                    function: ExprId::from_index(8).expect("app2"),
+                    argument: ExprId::from_index(11).expect("minor"),
+                },
+                ExprNode::Constant {
+                    name: name("p2"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Apply {
+                    function: ExprId::from_index(1).expect("f"),
+                    argument: ExprId::from_index(13).expect("p2"),
+                },
+                ExprNode::Apply {
+                    function: ExprId::from_index(12).expect("app3"),
+                    argument: ExprId::from_index(14).expect("f p2"),
+                },
+                ExprNode::Constant {
+                    name: name("h"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Apply {
+                    function: ExprId::from_index(15).expect("app4"),
+                    argument: ExprId::from_index(16).expect("h"),
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(17).expect("cast_wrap_body"),
+        );
+        let entries = vec![
+            ConstantEntry::new(
+                name("P"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    sort_prop,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("p1"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    p_const.clone(),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("p2"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    p_const,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("A"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    sort_type.clone(),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("a"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    a_const,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("f"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    f_ty,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("Wrap"),
+                ConstantDeclaration::inductive(
+                    Vec::new(),
+                    sort_type,
+                    ConstantSafety::Safe,
+                    InductiveDeclaration::new(
+                        0,
+                        0,
+                        vec![name("Wrap")],
+                        vec![name("Wrap.mk")],
+                        0,
+                        false,
+                        false,
+                    ),
+                ),
+            ),
+            ConstantEntry::new(
+                name("Wrap.mk"),
+                ConstantDeclaration::constructor(
+                    Vec::new(),
+                    wrap_mk_ty,
+                    ConstantSafety::Safe,
+                    ConstructorDeclaration::new(name("Wrap"), 0, 0, 1),
+                ),
+            ),
+            ConstantEntry::new(
+                name("EqA"),
+                ConstantDeclaration::inductive(
+                    Vec::new(),
+                    eqa_ty,
+                    ConstantSafety::Safe,
+                    InductiveDeclaration::new(
+                        1,
+                        1,
+                        vec![name("EqA")],
+                        vec![name("EqA.refl")],
+                        0,
+                        false,
+                        false,
+                    ),
+                ),
+            ),
+            ConstantEntry::new(
+                name("EqA.refl"),
+                ConstantDeclaration::constructor(
+                    Vec::new(),
+                    eqa_refl_ty,
+                    ConstantSafety::Safe,
+                    ConstructorDeclaration::new(name("EqA"), 0, 1, 0),
+                ),
+            ),
+            ConstantEntry::new(
+                name("EqA.rec"),
+                ConstantDeclaration::recursor(
+                    Vec::new(),
+                    eqa_rec_ty,
+                    ConstantSafety::Safe,
+                    RecursorDeclaration::new(
+                        vec![name("EqA")],
+                        1,
+                        1,
+                        1,
+                        1,
+                        vec![RecursorRule::new(name("EqA.refl"), 0, eqa_rec_rule_rhs)],
+                        true,
+                    ),
+                ),
+            ),
+            ConstantEntry::new(
+                name("h"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    h_ty,
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("castWrap"),
+                ConstantDeclaration::definition(
+                    Vec::new(),
+                    wrap_const,
+                    ConstantSafety::Safe,
+                    DefinitionBody::new(
+                        cast_wrap_body,
+                        ReducibilityHint::Regular(1),
+                        DefinitionSafety::Safe,
+                        Vec::new(),
+                    ),
+                ),
+            ),
+        ];
+        let constants = match crate::environment::ConstantEnvironment::build(
+            entries,
+            EnvironmentBudget::unlimited(),
+        ) {
+            EnvironmentOutcome::Complete { environment, .. } => environment,
+            other => panic!("environment must build: {other:?}"),
+        };
+        let context = InferenceContext::empty(constants);
+        let proj_cast = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("castWrap"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Projection {
+                    structure_name: name("Wrap"),
+                    index: 0,
+                    expression: ExprId::ZERO,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(1).expect("proj"),
+        );
+        let outcome = proof_conversion_with(
+            &proj_cast,
+            &constant("a"),
+            &context,
+            InferenceMode::InferOnly,
+            InferenceBudget::unlimited(),
+            &mut || false,
+        );
+        assert!(
+            matches!(
+                outcome,
+                ProofConversionOutcome::Complete { equal: true, .. }
+            ),
+            "ProjCore must preserve exposed K-recursor beneath projection for typed KR-317: {outcome:?}"
         );
     }
 }
