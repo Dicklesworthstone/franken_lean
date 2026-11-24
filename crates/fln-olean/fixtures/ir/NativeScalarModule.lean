@@ -5,6 +5,9 @@ public import Init
 
 public section
 
+-- Exercise the pin's retained extern aliases as well as the current API.
+set_option linter.deprecated false
+
 -- These consumers retain native PAP/AP pairs instead of specializing them.
 -- Each captured function is reused so its borrowed/consuming ABI matters.
 @[noinline, nospecialize] def useNatTransform (f : Nat → Nat) (n : Nat) : Nat :=
@@ -64,6 +67,55 @@ public section
 @[noinline] def stringBoxedBytes (s : String) : Nat := useStringMeasure String.utf8ByteSize s
 @[noinline] def stringBoxedHash (s : String) : Nat := useStringHash String.hash s
 @[noinline] def stringBoxedEq (a b : String) : Nat := useStringDecision (String.decEq a) b
+
+@[noinline, nospecialize] def useStringCursorGet
+    (f : String.Pos.Raw → Char) (n : Nat) : Nat :=
+  (f ⟨n⟩).toNat + (f ⟨n + 1⟩).toNat
+
+@[noinline, nospecialize] def useStringCursorMove
+    (f : String.Pos.Raw → String.Pos.Raw) (n : Nat) : Nat :=
+  (f ⟨n⟩).byteIdx + (f ⟨n + 1⟩).byteIdx
+
+@[noinline, nospecialize] def useStringCursorAtEnd
+    (f : String.Pos.Raw → Bool) (n : Nat) : Nat :=
+  (if f ⟨n⟩ then 1 else 0) + (if f ⟨n + 1⟩ then 2 else 0)
+
+@[noinline, nospecialize] def useStringCursorExtract
+    (f : String.Pos.Raw → String) (n : Nat) : Nat :=
+  (f ⟨n⟩).length + (f ⟨n + 1⟩).utf8ByteSize
+
+@[noinline, nospecialize] def useStringPosExtract {s : String}
+    (f : s.Pos → String) : Nat :=
+  (f s.startPos).utf8ByteSize + (f s.endPos).utf8ByteSize
+
+@[noinline] def stringBoxedInternalGet (s : String) (n : Nat) : Nat :=
+  useStringCursorGet (String.Internal.get s) n + s.utf8ByteSize
+@[noinline] def stringBoxedRawGet (s : String) (n : Nat) : Nat :=
+  useStringCursorGet (String.Pos.Raw.get s) n + s.utf8ByteSize
+@[noinline] def stringBoxedGet (s : String) (n : Nat) : Nat :=
+  useStringCursorGet (String.get s) n + s.utf8ByteSize
+@[noinline] def stringBoxedInternalNext (s : String) (n : Nat) : Nat :=
+  useStringCursorMove (String.Internal.next s) n + s.utf8ByteSize
+@[noinline] def stringBoxedRawNext (s : String) (n : Nat) : Nat :=
+  useStringCursorMove (String.Pos.Raw.next s) n + s.utf8ByteSize
+@[noinline] def stringBoxedNext (s : String) (n : Nat) : Nat :=
+  useStringCursorMove (String.next s) n + s.utf8ByteSize
+@[noinline] def stringBoxedRawPrev (s : String) (n : Nat) : Nat :=
+  useStringCursorMove (String.Pos.Raw.prev s) n + s.utf8ByteSize
+@[noinline] def stringBoxedPrev (s : String) (n : Nat) : Nat :=
+  useStringCursorMove (String.prev s) n + s.utf8ByteSize
+@[noinline] def stringBoxedInternalAtEnd (s : String) (n : Nat) : Nat :=
+  useStringCursorAtEnd (String.Internal.atEnd s) n + s.utf8ByteSize
+@[noinline] def stringBoxedRawAtEnd (s : String) (n : Nat) : Nat :=
+  useStringCursorAtEnd (String.Pos.Raw.atEnd s) n + s.utf8ByteSize
+@[noinline] def stringBoxedAtEnd (s : String) (n : Nat) : Nat :=
+  useStringCursorAtEnd (String.atEnd s) n + s.utf8ByteSize
+@[noinline] def stringBoxedInternalExtract (s : String) (b e : Nat) : Nat :=
+  useStringCursorExtract (String.Internal.extract s ⟨b⟩) e + s.utf8ByteSize
+@[noinline] def stringBoxedRawExtract (s : String) (b e : Nat) : Nat :=
+  useStringCursorExtract (String.Pos.Raw.extract s ⟨b⟩) e + s.utf8ByteSize
+@[noinline] def stringBoxedExtract (s : String) : Nat :=
+  useStringPosExtract (@String.extract s s.startPos) + s.utf8ByteSize
 
 @[noinline, nospecialize] def useUInt8Transform (f : UInt8 → UInt8) (n : UInt8) : Nat :=
   (f n).toNat + (f (n + 1)).toNat

@@ -1,6 +1,6 @@
 //! Actual higher-order primitive IR with every reviewed native prototype.
 use super::arrays_reference::assert_nat_replay;
-use super::boxed_primitives::{STRING_PREDICATES, WORD_FAMILIES, names};
+use super::boxed_primitives::{STRING_CURSORS, STRING_PREDICATES, WORD_FAMILIES, names};
 use super::*;
 use crate::imported_ir::EntryArgument;
 use std::path::{Path, PathBuf};
@@ -86,7 +86,10 @@ fn live_pinned_boxed_primitives_preserve_values_captures_and_canonical_replay() 
                 })
         })
         .collect();
-    for target in names() {
+    for target in names()
+        .into_iter()
+        .chain(STRING_CURSORS.into_iter().map(str::to_owned))
+    {
         assert!(
             boxed_partials.contains(&Name::str(name(&target), "_boxed")),
             "{target} partial application optimized away; {dir:?}"
@@ -118,7 +121,7 @@ fn live_pinned_boxed_primitives_preserve_values_captures_and_canonical_replay() 
     // These are the new fixture's own public families and their compiler
     // helpers. Native primitive names are separately reserved by selection;
     // no blanket namespace grant is used for the imported toolchain modules.
-    let word_prefixes: Vec<_> = WORD_FAMILIES
+    let mut fixture_prefixes: Vec<_> = WORD_FAMILIES
         .into_iter()
         .flat_map(|family| {
             std::iter::once(name(&format!("{}Boxed", family.to_ascii_lowercase()))).chain(
@@ -128,9 +131,33 @@ fn live_pinned_boxed_primitives_preserve_values_captures_and_canonical_replay() 
             )
         })
         .collect();
+    fixture_prefixes.extend(
+        [
+            "useStringCursorGet",
+            "useStringCursorMove",
+            "useStringCursorAtEnd",
+            "useStringCursorExtract",
+            "useStringPosExtract",
+            "stringBoxedInternalGet",
+            "stringBoxedRawGet",
+            "stringBoxedGet",
+            "stringBoxedInternalNext",
+            "stringBoxedRawNext",
+            "stringBoxedNext",
+            "stringBoxedRawPrev",
+            "stringBoxedPrev",
+            "stringBoxedInternalAtEnd",
+            "stringBoxedRawAtEnd",
+            "stringBoxedAtEnd",
+            "stringBoxedInternalExtract",
+            "stringBoxedRawExtract",
+            "stringBoxedExtract",
+        ]
+        .map(name),
+    );
     users.extend(module.decls.iter().filter_map(|declaration| {
         let declaration = declaration.name();
-        word_prefixes
+        fixture_prefixes
             .iter()
             .any(|prefix| {
                 declaration == prefix
@@ -242,7 +269,10 @@ fn live_pinned_boxed_primitives_preserve_values_captures_and_canonical_replay() 
         observed.extend(compiled.native_externs().iter().cloned());
         eprintln!("live Reference and Golem: {entry} {arguments:?} = {expected}");
     }
-    for target in names() {
+    for target in names()
+        .into_iter()
+        .chain(STRING_CURSORS.into_iter().map(str::to_owned))
+    {
         assert!(
             observed.contains(&format!("extern:{target}")),
             "{target} not linked"
@@ -303,6 +333,48 @@ fn cases() -> Vec<(&'static str, Vec<EntryArgument>)> {
         cases.push(("stringBoxedEq", vec![string(a), string(b)]));
     }
     for entry in [
+        "stringBoxedInternalGet",
+        "stringBoxedRawGet",
+        "stringBoxedGet",
+        "stringBoxedInternalNext",
+        "stringBoxedRawNext",
+        "stringBoxedNext",
+        "stringBoxedRawPrev",
+        "stringBoxedPrev",
+        "stringBoxedInternalAtEnd",
+        "stringBoxedRawAtEnd",
+        "stringBoxedAtEnd",
+    ] {
+        for (text, position) in [
+            ("", 0),
+            ("aλ🦀z", 0),
+            ("aλ🦀z", 1),
+            ("aλ🦀z", 2),
+            ("aλ🦀z", 3),
+            ("aλ🦀z", 7),
+            ("aλ🦀z", 8),
+            ("aλ🦀z", 99),
+        ] {
+            cases.push((entry, vec![string(text), nat(position)]));
+        }
+    }
+    for entry in ["stringBoxedInternalExtract", "stringBoxedRawExtract"] {
+        for (text, begin, end) in [
+            ("", 0, 0),
+            ("aλ🦀z", 1, 3),
+            ("aλ🦀z", 3, 7),
+            ("aλ🦀z", 1, 2),
+            ("aλ🦀z", 1, 99),
+            ("aλ🦀z", 3, 1),
+            ("aλ🦀z", 99, 100),
+        ] {
+            cases.push((entry, vec![string(text), nat(begin), nat(end)]));
+        }
+    }
+    for text in ["", "ascii", "aλ🦀z", "e\u{301}"] {
+        cases.push(("stringBoxedExtract", vec![string(text)]));
+    }
+    for entry in [
         "uint8Boxed",
         "uint16Boxed",
         "uint32Boxed",
@@ -349,6 +421,7 @@ fn native_prototypes_from_library(library: &Path) -> IrModule {
     let wanted: BTreeSet<_> = names()
         .into_iter()
         .chain(STRING_PREDICATES.into_iter().map(str::to_owned))
+        .chain(STRING_CURSORS.into_iter().map(str::to_owned))
         .chain(
             super::array_operations::BYTE_ARRAY_NAMES
                 .into_iter()

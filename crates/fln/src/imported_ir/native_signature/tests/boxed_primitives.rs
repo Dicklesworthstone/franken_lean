@@ -25,6 +25,23 @@ pub(super) const NAMES: [&str; 18] = [
 pub(super) const STRING_PREDICATES: [&str; 2] =
     ["String.Internal.isEmpty", "String.Internal.isPrefixOf"];
 
+pub(super) const STRING_CURSORS: [&str; 14] = [
+    "String.Internal.get",
+    "String.Pos.Raw.get",
+    "String.get",
+    "String.Internal.next",
+    "String.Pos.Raw.next",
+    "String.next",
+    "String.Pos.Raw.prev",
+    "String.prev",
+    "String.Internal.extract",
+    "String.Pos.Raw.extract",
+    "String.extract",
+    "String.Internal.atEnd",
+    "String.Pos.Raw.atEnd",
+    "String.atEnd",
+];
+
 pub(super) const WORD_FAMILIES: [&str; 5] = ["UInt8", "UInt16", "UInt32", "UInt64", "USize"];
 pub(super) const WORD_OPERATIONS: [&str; 18] = [
     "add",
@@ -68,6 +85,7 @@ fn reviewed_boxed_primitives_bind_the_generated_row_before_admitting_a_wrapper()
     for target in names()
         .into_iter()
         .chain(STRING_PREDICATES.into_iter().map(str::to_owned))
+        .chain(STRING_CURSORS.into_iter().map(str::to_owned))
     {
         let original = row(&target);
         assert!(BoxedNative::from_row(original).unwrap().is_some());
@@ -134,7 +152,12 @@ fn reviewed_boxed_primitives_bind_the_generated_row_before_admitting_a_wrapper()
             );
         }
     }
-    for target in ["Nat.divExact", "Nat.gcd", "String.extract", "Int.divExact"] {
+    for target in [
+        "Nat.divExact",
+        "Nat.gcd",
+        "String.Internal.foldl",
+        "Int.divExact",
+    ] {
         assert!(BoxedNative::from_row(row(target)).unwrap().is_none());
     }
 }
@@ -205,7 +228,24 @@ fn primitive_prototypes_distinguish_borrowing_and_boxed_scalar_representations()
             vec![IrType::TObject],
             IrType::TObject,
         ),
-    ] {
+    ]
+    .into_iter()
+    .chain(STRING_CURSORS.into_iter().map(|target| {
+        let mut parameters = vec![(IrType::Object, true), (IrType::TObject, true)];
+        let mut boxed_parameters = vec![IrType::Object, IrType::TObject];
+        let (result, boxed_result) = match target.rsplit('.').next().unwrap() {
+            "get" => (IrType::UInt32, IrType::TObject),
+            "next" | "prev" => (IrType::TObject, IrType::TObject),
+            "atEnd" => (IrType::UInt8, IrType::Tagged),
+            "extract" => {
+                parameters.push((IrType::TObject, true));
+                boxed_parameters.push(IrType::TObject);
+                (IrType::Object, IrType::Object)
+            }
+            _ => unreachable!(),
+        };
+        (target, parameters, result, boxed_parameters, boxed_result)
+    })) {
         let native = row(target);
         let bridge = BoxedNative::from_row(native).unwrap().unwrap();
         let params: Vec<_> = parameters
@@ -236,6 +276,16 @@ fn primitive_prototypes_distinguish_borrowing_and_boxed_scalar_representations()
             validate_extern_signature(native, &params, &IrType::Void),
             Err(IrExecutionError::NativeContract { .. })
         ));
+        assert!(matches!(
+            validated_ir_arity(native, params.len() - 1),
+            Err(IrExecutionError::NativeContract { .. })
+        ));
+        if result != boxed_result {
+            assert!(matches!(
+                validate_extern_signature(native, &params, &boxed_result),
+                Err(IrExecutionError::NativeContract { .. })
+            ));
+        }
         let prototype = IrDecl::Extern {
             name: Name::str(name(target), "_boxed"),
             params: boxed_parameters
@@ -247,10 +297,34 @@ fn primitive_prototypes_distinguish_borrowing_and_boxed_scalar_representations()
                     borrow: false,
                 })
                 .collect(),
-            result: boxed_result,
+            result: boxed_result.clone(),
             entries: vec![],
         };
         bridge.validate_declaration(&prototype).unwrap();
+        if result != boxed_result {
+            let mut wrong = prototype.clone();
+            let IrDecl::Extern { result: output, .. } = &mut wrong else {
+                unreachable!()
+            };
+            *output = result;
+            assert!(matches!(
+                bridge.validate_declaration(&wrong),
+                Err(IrExecutionError::NativeContract { .. })
+            ));
+        }
+        let mut wrong = prototype.clone();
+        let IrDecl::Extern {
+            params: malformed_params,
+            ..
+        } = &mut wrong
+        else {
+            unreachable!()
+        };
+        malformed_params.pop();
+        assert!(matches!(
+            bridge.validate_declaration(&wrong),
+            Err(IrExecutionError::NativeContract { .. })
+        ));
         for index in 0..params.len() {
             for change_type in [false, true] {
                 let mut wrong = prototype.clone();
@@ -278,6 +352,205 @@ fn primitive_prototypes_distinguish_borrowing_and_boxed_scalar_representations()
             Err(IrExecutionError::NativeContract { .. })
         ));
     }
+}
+
+#[test]
+fn boxed_string_cursors_execute_unicode_boundaries_and_reuse_captures() {
+    for target in STRING_CURSORS {
+        let cases: &[(&[u64], &str, u64)] = match target.rsplit('.').next().unwrap() {
+            "get" => &[
+                (&[0], "", 97),
+                (&[1], "", 955),
+                (&[2], "", 65),
+                (&[3], "", 129408),
+                (&[7], "", 122),
+                (&[8], "", 65),
+                (&[99], "", 65),
+            ],
+            "next" => &[
+                (&[0], "", 1),
+                (&[1], "", 3),
+                (&[2], "", 3),
+                (&[3], "", 7),
+                (&[7], "", 8),
+                (&[8], "", 9),
+                (&[99], "", 100),
+            ],
+            "prev" => &[
+                (&[0], "", 0),
+                (&[1], "", 0),
+                (&[2], "", 1),
+                (&[3], "", 1),
+                (&[7], "", 3),
+                (&[8], "", 7),
+                (&[99], "", 98),
+            ],
+            "atEnd" => &[(&[0], "", 0), (&[7], "", 0), (&[8], "", 1), (&[99], "", 1)],
+            "extract" => &[
+                (&[1, 3], "λ", 1),
+                (&[3, 7], "🦀", 1),
+                (&[1, 99], "λ🦀z", 1),
+                // The pin extends a non-boundary end to the string's end.
+                (&[1, 2], "λ🦀z", 1),
+                (&[3, 1], "", 1),
+                (&[99, 100], "", 1),
+            ],
+            _ => unreachable!(),
+        };
+        for &(positions, expected_string, expected) in cases {
+            // Exercise both a first-class function and every proper PAP.
+            // Each closure is called twice, then its original String is read.
+            for captured in 0..=positions.len() {
+                let declaration =
+                    boxed_string_cursor_program(target, positions, expected_string, captured);
+                let compiled = compile_declarations(vec![declaration])
+                    .unwrap_or_else(|error| panic!("{target} {positions:?}: {error}"));
+                assert_nat(&compiled, &(2 * expected + 8).to_string());
+                assert!(
+                    compiled
+                        .native_externs()
+                        .contains(&format!("extern:{target}"))
+                );
+                assert_eq!(compiled.reference_functions()[0].name, name("Arity.main"));
+            }
+        }
+    }
+}
+
+fn boxed_string_cursor_program(
+    target: &str,
+    positions: &[u64],
+    expected_string: &str,
+    captured: usize,
+) -> IrDecl {
+    let typed = |x, ty, expr| IrStmt::VDecl { x, ty, expr };
+    let mut statements = vec![typed(
+        1,
+        IrType::Object,
+        IrExpr::Lit(IrLit::Str("aλ🦀z".to_owned())),
+    )];
+    let mut arguments = vec![var(1)];
+    for (index, &position) in positions.iter().enumerate() {
+        let x = index as u64 + 2;
+        statements.push(num(x, position));
+        arguments.push(var(x));
+    }
+    statements.push(typed(
+        5,
+        IrType::Object,
+        IrExpr::Pap {
+            function: name(&format!("{target}._boxed")),
+            args: arguments[..captured].to_vec(),
+        },
+    ));
+    let operation = target.rsplit('.').next().unwrap();
+    let boxed_result = match operation {
+        "atEnd" => IrType::Tagged,
+        "extract" => IrType::Object,
+        _ => IrType::TObject,
+    };
+    for x in [6, 7] {
+        statements.push(typed(
+            x,
+            boxed_result.clone(),
+            IrExpr::Ap {
+                x: 5,
+                args: arguments[captured..].to_vec(),
+            },
+        ));
+    }
+    let results = if matches!(operation, "next" | "prev") {
+        [6, 7]
+    } else {
+        if operation == "extract" {
+            statements.push(typed(
+                8,
+                IrType::Object,
+                IrExpr::Lit(IrLit::Str(expected_string.to_owned())),
+            ));
+        }
+        for index in [0, 1] {
+            let (ty, expr, conversion) = if operation == "extract" {
+                (
+                    IrType::UInt8,
+                    IrExpr::Fap {
+                        function: name("String.decEq"),
+                        args: vec![var(6 + index), var(8)],
+                    },
+                    "UInt8.toNat",
+                )
+            } else if operation == "get" {
+                (
+                    IrType::UInt32,
+                    IrExpr::Unbox { x: 6 + index },
+                    "UInt32.toNat",
+                )
+            } else {
+                (IrType::UInt8, IrExpr::Unbox { x: 6 + index }, "UInt8.toNat")
+            };
+            statements.push(typed(10 + index, ty, expr));
+            statements.push(call(12 + index, conversion, &[10 + index]));
+        }
+        [12, 13]
+    };
+    statements.push(call(14, "Nat.add", &results));
+    statements.push(call(15, "String.utf8ByteSize", &[1]));
+    statements.push(call(16, "Nat.add", &[14, 15]));
+    entry(statements, 16)
+}
+
+#[test]
+fn boxed_string_cursor_bodies_and_bad_values_cannot_replace_native_semantics() {
+    let caller = || boxed_string_cursor_program("String.Pos.Raw.get", &[1], "", 1);
+    let forged = IrDecl::Function {
+        name: name("String.Pos.Raw.get._boxed"),
+        params: vec![
+            IrParam {
+                x: 1,
+                borrow: false,
+                ty: IrType::Object,
+            },
+            IrParam {
+                x: 2,
+                borrow: false,
+                ty: IrType::TObject,
+            },
+        ],
+        result: IrType::TObject,
+        body: IrBody {
+            stmts: vec![num(3, 999)],
+            terminal: Box::new(IrTerminal::Ret(var(3))),
+        },
+        sorry_dep: None,
+    };
+    assert_nat(
+        &compile_declarations(vec![caller(), forged.clone()]).unwrap(),
+        "1918",
+    );
+    let mut malformed = forged;
+    let IrDecl::Function { result, .. } = &mut malformed else {
+        unreachable!()
+    };
+    *result = IrType::Tagged;
+    assert!(matches!(
+        compile_declarations(vec![caller(), malformed]),
+        Err(IrExecutionError::NativeContract { .. })
+    ));
+
+    let mut bad_value = caller();
+    let IrDecl::Function { body, .. } = &mut bad_value else {
+        unreachable!()
+    };
+    body.stmts[0] = num(1, 42);
+    let compiled = compile_declarations(vec![bad_value]).unwrap();
+    assert!(matches!(
+        compiled.execute(ExecutionLimits::default(), None).outcome,
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch { .. },
+            ..
+        })
+    ));
+    assert_nat(&compile_declarations(vec![caller()]).unwrap(), "1918");
 }
 
 #[test]
