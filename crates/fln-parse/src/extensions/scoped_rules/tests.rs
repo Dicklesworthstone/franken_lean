@@ -197,6 +197,34 @@ fn grammar_namespace_lookup_compares_structural_names_not_printed_prefixes() {
 }
 
 #[test]
+fn hiding_keeps_scoped_rules_active_and_filters_grammar_namespace_lookup() {
+    let mut file = scoped();
+    declare(&mut file, "namespace Choice.Child");
+    declare(&mut file, "scoped macro_rules | `(picked! 0) => `(99)");
+    declare(&mut file, "end Choice.Child");
+    declare(&mut file, "section");
+    declare(&mut file, "open Choice hiding Child");
+    assert_eq!(count(&file.grammar()), 2);
+    let child = Name::from_components(["Child"]);
+    assert!(file.resolve_in(file.top(), &child).is_empty());
+    assert!(
+        file.resolve_name_in(file.top(), &child, |name| {
+            name == &Name::from_components(["Choice", "Child"])
+        })
+        .is_none()
+    );
+    declare(&mut file, "open Choice");
+    assert_eq!(
+        file.resolve_in(file.top(), &child),
+        vec![Name::from_components(["Choice", "Child"])]
+    );
+    declare(&mut file, "open Child");
+    assert_eq!(count(&file.grammar()), 3);
+    declare(&mut file, "end");
+    assert_eq!(count(&file.grammar()), 1);
+}
+
+#[test]
 fn registration_groups_survive_scope_sorting_local_expiry_and_native_replay() {
     let markers = |rules: &BTreeMap<Name, Arc<NotationRule>>| {
         rules[&key()]

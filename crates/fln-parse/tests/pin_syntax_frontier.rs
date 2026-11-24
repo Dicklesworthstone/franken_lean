@@ -163,6 +163,7 @@ fn scope_name(command: &ScopeCommand) -> &'static str {
         | ScopeCommand::OpenScoped(_)
         | ScopeCommand::OpenIn { .. }
         | ScopeCommand::OpenExplicit { .. }
+        | ScopeCommand::OpenHiding { .. }
         | ScopeCommand::OpenRenaming { .. } => "open",
         ScopeCommand::Export { .. } => "export",
         ScopeCommand::Universe(_) => "universe",

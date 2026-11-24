@@ -112,6 +112,11 @@ pub enum ScopeCommand {
         namespace: Name,
         renames: Vec<(Name, Name)>,
     },
+    /// `open Ns hiding x y` opens the namespace with exact name exclusions.
+    OpenHiding {
+        namespace: Name,
+        names: Vec<Name>,
+    },
     Trivia,
     /// `#exit` (`Lean.Parser.Command.exit`): the pin warns "using 'exit' to interrupt Lean"
     /// (`elabExit`) and stops there, a terminal command (`Parser.isTerminalCommand`); the
@@ -985,7 +990,7 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         return export(&view, &tokens, source.len()).map(Some);
     }
     if keyword == "open"
-        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "renaming")
+        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if matches!(s.as_str(), "renaming" | "hiding"))
     {
         return opening::parse(source);
     }
@@ -2223,7 +2228,7 @@ def after : Nat := 3
             "open A in",
             "open scoped",
             "open scoped A in",
-            "open A hiding x",
+            "open A hiding",
             "open A renaming x ->",
             "universe A.u",
             "universe u, v",

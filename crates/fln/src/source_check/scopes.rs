@@ -152,7 +152,10 @@ impl Scopes {
                 }
             }
             ScopeCommand::Open(names) => {
-                return self.transition_open(names, false, env, public_env);
+                return self.transition_open(names, false, None, env, public_env);
+            }
+            ScopeCommand::OpenHiding { namespace, names } => {
+                return self.transition_open(vec![namespace], false, Some(names), env, public_env);
             }
             ScopeCommand::OpenExplicit { namespace, names } => {
                 self.observe_namespaces(env)
@@ -202,7 +205,7 @@ impl Scopes {
                 self.current = next;
             }
             ScopeCommand::OpenScoped(names) => {
-                return self.transition_open(names, true, env, public_env);
+                return self.transition_open(names, true, None, env, public_env);
             }
             other => self.apply(other).map_err(TransitionError::Scope)?,
         }
@@ -213,6 +216,7 @@ impl Scopes {
         &mut self,
         names: Vec<Name>,
         scoped_only: bool,
+        exclusions: Option<Vec<Name>>,
         env: &Environment,
         public_env: Option<&Environment>,
     ) -> Result<(), TransitionError> {
@@ -240,6 +244,28 @@ impl Scopes {
             let resolved = self
                 .resolve_open_in(&next, &name)
                 .map_err(TransitionError::Scope)?;
+            if let Some(excluded) = &exclusions {
+                let [namespace] = resolved.as_slice() else {
+                    return Err(TransitionError::Scope(format!(
+                        "ambiguous namespace `{}`",
+                        name.to_display_string()
+                    )));
+                };
+                let aliases = fln_elab::aliases::AliasTable::read(env)
+                    .map_err(|error| TransitionError::Scope(error.to_string()))?;
+                let protected = fln_elab::protected_names::ProtectedNames::read(env)
+                    .map_err(|error| TransitionError::Scope(error.to_string()))?;
+                for hidden in excluded {
+                    Self::resolve_member(&next, env, namespace, hidden, &aliases, &protected)
+                        .map_err(TransitionError::Scope)?
+                        .ok_or_else(|| {
+                            TransitionError::Scope(format!(
+                                "unknown declaration `{}`",
+                                hidden.to_display_string()
+                            ))
+                        })?;
+                }
+            }
             for namespace in resolved {
                 next.instance_scopes
                     .activate(env, &namespace)
@@ -263,7 +289,12 @@ impl Scopes {
                     );
                 }
                 if !scoped_only {
-                    Self::add_open(&mut next, namespace).map_err(TransitionError::Scope)?;
+                    Self::add_open(
+                        &mut next,
+                        namespace,
+                        exclusions.as_deref().unwrap_or_default(),
+                    )
+                    .map_err(TransitionError::Scope)?;
                 }
             }
         }
@@ -475,9 +506,16 @@ impl Scopes {
             }
             enclosing = enclosing.parent();
         }
-        for opened in scope.opened.iter().rev() {
+        for (position, opened) in scope.opened.iter().enumerate().rev() {
+            if scope
+                .open_exclusions
+                .get(&position)
+                .is_some_and(|names| names.contains(name))
+            {
+                continue;
+            }
             let candidate = opened.append_core(name);
-            if self.namespaces.contains(&candidate) && !resolved.contains(&candidate) {
+            if self.namespaces.contains(&candidate) {
                 resolved.push(candidate);
             }
         }
@@ -487,15 +525,19 @@ impl Scopes {
         Ok(resolved)
     }
 
-    fn add_open(scope: &mut SourceScope, namespace: Name) -> Result<(), String> {
-        if !scope.opened.contains(&namespace) {
-            // One short namespace can expand to many matches. Bound the
-            // resulting state, not only the number of source identifiers.
-            if scope.opened.len() >= 4096 {
-                return Err("scope items limit exceeded".into());
-            }
-            scope.opened.push(namespace);
+    fn add_open(scope: &mut SourceScope, namespace: Name, excluded: &[Name]) -> Result<(), String> {
+        // The pin retains repeated opens. A later selective open may require
+        // one namespace interpretation, so equal matches still count twice.
+        // One short namespace can expand to many matches; bound the result.
+        if scope.opened.len() >= 4096 {
+            return Err("scope items limit exceeded".into());
         }
+        if !excluded.is_empty() {
+            scope
+                .open_exclusions
+                .insert(scope.opened.len(), excluded.iter().cloned().collect());
+        }
+        scope.opened.push(namespace);
         Ok(())
     }
 
@@ -702,6 +744,16 @@ impl Scopes {
         }
         let (old, new) = match command {
             ScopeCommand::Open(names) => (self.current.opened.len(), names.len()),
+            ScopeCommand::OpenHiding { names, .. } => (
+                self.current.opened.len().saturating_add(
+                    self.current
+                        .open_exclusions
+                        .values()
+                        .map(BTreeSet::len)
+                        .sum(),
+                ),
+                names.len().saturating_add(1),
+            ),
             ScopeCommand::OpenRenaming { renames, .. } => {
                 (self.current.explicit_opens.len(), renames.len())
             }
@@ -730,7 +782,9 @@ impl Scopes {
             ScopeCommand::Export { .. } => {
                 return Err("export requires an environment transition".into());
             }
-            ScopeCommand::OpenExplicit { .. } | ScopeCommand::OpenRenaming { .. } => {
+            ScopeCommand::OpenExplicit { .. }
+            | ScopeCommand::OpenRenaming { .. }
+            | ScopeCommand::OpenHiding { .. } => {
                 return Err("explicit opening requires an environment transition".into());
             }
             ScopeCommand::Reducibility(_) => {
@@ -861,7 +915,7 @@ impl Scopes {
                 let mut next = self.current.clone();
                 for name in names {
                     for namespace in self.resolve_open_in(&next, &name)? {
-                        Self::add_open(&mut next, namespace)?;
+                        Self::add_open(&mut next, namespace, &[])?;
                     }
                 }
                 self.current = next;
@@ -978,6 +1032,58 @@ mod tests {
                 .is_err()
         );
         assert_eq!(scopes.current, before);
+    }
+
+    #[test]
+    fn invalid_hidden_member_does_not_publish_open_or_scoped_activation() {
+        let mut scopes = scopes(&["Library"]);
+        let env = Environment::new()
+            .add_decl(fln_env::constants::ConstantInfo::Axiom(
+                fln_env::constants::AxiomVal {
+                    base: fln_env::constants::ConstantVal {
+                        name: n("Library.value"),
+                        level_params: Vec::new(),
+                        type_: fln_core::expr::Expr::sort(fln_core::level::Level::one()),
+                    },
+                    is_unsafe: false,
+                },
+            ))
+            .unwrap();
+        let before = scopes.current.clone();
+        assert!(
+            scopes
+                .transition(
+                    ScopeCommand::OpenHiding {
+                        namespace: n("Library"),
+                        names: vec![n("value"), n("missing")],
+                    },
+                    &env,
+                )
+                .is_err()
+        );
+        assert_eq!(scopes.current, before);
+        scopes
+            .transition(
+                ScopeCommand::OpenHiding {
+                    namespace: n("Library"),
+                    names: vec![n("value")],
+                },
+                &env,
+            )
+            .unwrap_or_else(|error| panic!("{}", error.message()));
+        assert_eq!(
+            scopes
+                .current
+                .resolve(&n("value"), |name| env.contains(name)),
+            Ok(None)
+        );
+        open(&mut scopes, &["Library"]);
+        assert_eq!(
+            scopes
+                .current
+                .resolve(&n("value"), |name| env.contains(name)),
+            Ok(Some(n("Library.value")))
+        );
     }
 
     #[test]

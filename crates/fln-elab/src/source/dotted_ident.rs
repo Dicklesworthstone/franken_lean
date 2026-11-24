@@ -196,6 +196,8 @@ impl Context {
             .map_err(|_| failure(SourceInferenceError::Scope))?;
         let root = SourceScope {
             opened: self.source_scope.opened.clone(),
+            open_exclusions: self.source_scope.open_exclusions.clone(),
+            explicit_opens: self.source_scope.explicit_opens.clone(),
             ..SourceScope::default()
         };
         for _ in 0..root.opened.len().saturating_add(1) {

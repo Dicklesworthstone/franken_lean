@@ -11,7 +11,7 @@ use fln_core::name::{LeafView, Name};
 use fln_elab::aliases::AliasTable;
 use fln_elab::protected_names::ProtectedNames;
 use fln_vm::macro_native::{MacroLookup, MacroLookupError, ResolvedGlobals};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 const MAX_NAMESPACE_WORK: usize = 1 << 20;
@@ -37,6 +37,7 @@ pub struct EnvironmentMacroLookup<'a> {
     current_namespace: &'a Name,
     /// Simple opens in source order; explicit opens never resolve namespaces.
     opened_namespaces: &'a [Name],
+    open_exclusions: Option<&'a BTreeMap<usize, BTreeSet<Name>>>,
     /// Explicit opens with the number of earlier simple opens, in source order.
     explicit_opens: &'a [(usize, Name, Name)],
     private_prefix: Name,
@@ -56,6 +57,7 @@ impl<'a> EnvironmentMacroLookup<'a> {
             full_environment,
             current_namespace,
             opened_namespaces,
+            open_exclusions: None,
             explicit_opens,
             private_prefix: Name::num(
                 Name::from_components(["_private"]).append_core(main_module),
@@ -64,6 +66,36 @@ impl<'a> EnvironmentMacroLookup<'a> {
             namespaces: OnceLock::new(),
             globals: OnceLock::new(),
         }
+    }
+
+    /// Retain `OpenDecl.simple` exclusions from this invocation's lexical scope.
+    pub fn with_open_exclusions(mut self, exclusions: &'a BTreeMap<usize, BTreeSet<Name>>) -> Self {
+        self.open_exclusions = Some(exclusions);
+        self
+    }
+
+    fn excluded(&self, position: usize, name: &Name) -> bool {
+        self.open_exclusions
+            .and_then(|rows| rows.get(&position))
+            .is_some_and(|names| names.contains(name))
+    }
+
+    fn validate_open_exclusions(&self, work: &mut usize) -> Result<(), MacroLookupError> {
+        if let Some(rows) = self.open_exclusions {
+            for (position, names) in rows {
+                global_work(work, 1)?;
+                if *position >= self.opened_namespaces.len() {
+                    return Err(MacroLookupError::Invalid("malformed excluded open"));
+                }
+                for name in names {
+                    if name.is_anonymous() {
+                        return Err(MacroLookupError::Invalid("anonymous excluded name"));
+                    }
+                    global_name_work(work, name)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn namespaces(&self) -> Result<&BTreeSet<Name>, MacroLookupError> {
@@ -242,7 +274,9 @@ impl<'a> EnvironmentMacroLookup<'a> {
                     opened.push(candidate);
                 }
             }
-            if let Some(namespace) = self.opened_namespaces.get(position) {
+            if let Some(namespace) = self.opened_namespaces.get(position)
+                && !self.excluded(position, id)
+            {
                 opened.extend(self.qualified_globals(namespace, id, tables, work)?);
             }
         }
@@ -269,8 +303,9 @@ impl MacroLookup for EnvironmentMacroLookup<'_> {
     }
 
     fn resolve_namespace(&self, requested: &Name) -> Result<Vec<Name>, MacroLookupError> {
-        let namespaces = self.namespaces()?;
         let mut work = 0;
+        self.validate_open_exclusions(&mut work)?;
+        let namespaces = self.namespaces()?;
         let mut parts = Vec::new();
         let mut cursor = requested.clone();
         while !cursor.is_anonymous() {
@@ -325,8 +360,11 @@ impl MacroLookup for EnvironmentMacroLookup<'_> {
         }
         // The pin keeps this list's order and duplicates, including a match
         // already returned by the enclosing-namespace search.
-        for opened in self.opened_namespaces.iter().rev() {
+        for (position, opened) in self.opened_namespaces.iter().enumerate().rev() {
             namespace_work(&mut work, requested_work)?;
+            if self.excluded(position, requested) {
+                continue;
+            }
             let candidate = opened.append_core(requested);
             if namespaces.contains(&candidate) {
                 candidates.push(candidate);
@@ -340,6 +378,7 @@ impl MacroLookup for EnvironmentMacroLookup<'_> {
         global_name_work(&mut work, requested)?;
         global_name_work(&mut work, self.current_namespace)?;
         global_name_work(&mut work, &self.private_prefix)?;
+        self.validate_open_exclusions(&mut work)?;
         for opened in self.opened_namespaces {
             global_name_work(&mut work, opened)?;
         }
@@ -961,6 +1000,56 @@ mod tests {
                 (name("Second.value"), vec!["missing".into(), "tail".into()]),
             ]
         );
+    }
+
+    #[test]
+    fn hiding_applies_to_each_open_for_macro_names_and_namespaces() {
+        let env = environment([
+            name("First.value"),
+            name("Second.value"),
+            name("First.value.child"),
+        ]);
+        let env = fln_elab::namespaces::register_module(
+            &env,
+            &[name("First.value"), name("Second.value")],
+        )
+        .unwrap();
+        let module = name("Module");
+        let root = Name::anonymous();
+        let opened = [name("First"), name("Second"), name("First")];
+        let exclusions = BTreeMap::from([(0, BTreeSet::from([name("value")]))]);
+        let lookup = EnvironmentMacroLookup::new(&env, &module, &root, &opened[..2], &[])
+            .with_open_exclusions(&exclusions);
+        assert_eq!(
+            lookup.resolve_global_name(&name("value")).unwrap(),
+            [(name("Second.value"), vec![])]
+        );
+        assert_eq!(
+            lookup.resolve_global_name(&name("value.child")).unwrap(),
+            [(name("First.value.child"), vec![])]
+        );
+        assert_eq!(
+            lookup.resolve_namespace(&name("value")).unwrap(),
+            [name("Second.value")]
+        );
+        let reopened = EnvironmentMacroLookup::new(&env, &module, &root, &opened, &[])
+            .with_open_exclusions(&exclusions);
+        assert_eq!(
+            reopened.resolve_global_name(&name("value")).unwrap(),
+            [
+                (name("Second.value"), vec![]),
+                (name("First.value"), vec![])
+            ]
+        );
+        assert_eq!(
+            reopened.resolve_namespace(&name("value")).unwrap(),
+            [name("First.value"), name("Second.value")]
+        );
+        let invalid = BTreeMap::from([(3, BTreeSet::from([name("value")]))]);
+        let invalid = EnvironmentMacroLookup::new(&env, &module, &root, &opened, &[])
+            .with_open_exclusions(&invalid);
+        assert!(invalid.resolve_global_name(&name("value")).is_err());
+        assert!(invalid.resolve_namespace(&name("value")).is_err());
     }
 
     #[test]

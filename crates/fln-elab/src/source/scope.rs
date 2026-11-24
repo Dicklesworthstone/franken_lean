@@ -17,6 +17,7 @@ use crate::protected_names::ProtectedNames;
 use fln_core::name::LeafView;
 use fln_syntax::source::{BytePos, SourceText};
 use fln_syntax::view::SourceView;
+use std::collections::{BTreeMap, BTreeSet};
 pub use visibility::command_scope;
 
 /// The source file and the original byte offset of the command being elaborated.
@@ -83,6 +84,9 @@ pub struct SourceScope {
     /// require executable code, and successful definitions are not blanket-tagged.
     pub noncomputable_section: bool,
     pub opened: Vec<Name>,
+    /// Exact identifiers hidden by a particular simple open, keyed by its
+    /// position in `opened`. A separate open can still expose the same name.
+    pub open_exclusions: BTreeMap<usize, BTreeSet<Name>>,
     /// `open X (a b)`'s `OpenDecl.explicit a X.a`, each with `opened.len()` when it was added,
     /// so resolution reads simple and explicit open declarations in one order, as the pin's
     /// single `openDecls` list.
@@ -138,6 +142,7 @@ impl PartialEq for SourceScope {
             expose_definitions,
             noncomputable_section,
             opened,
+            open_exclusions,
             explicit_opens,
             universes,
             variables,
@@ -161,6 +166,7 @@ impl PartialEq for SourceScope {
             && expose_definitions == &other.expose_definitions
             && noncomputable_section == &other.noncomputable_section
             && opened == &other.opened
+            && open_exclusions == &other.open_exclusions
             && explicit_opens == &other.explicit_opens
             && universes == &other.universes
             && variables == &other.variables
@@ -460,8 +466,8 @@ impl SourceScope {
     /// `y.z` with `X.y.z` when that exists, without the protection test.
     ///
     /// A renaming adds the same explicit entry under its destination name.
-    /// Not modelled: `open X hiding y`, and the projection fallback
-    /// (`loop p (s::projs)`), which field notation handles.
+    /// A hiding clause excludes the complete identifier from that simple open
+    /// only. Field notation handles the projection fallback (`loop p (s::projs)`).
     pub fn resolve_with_aliases(
         &self,
         name: &Name,
@@ -538,7 +544,12 @@ impl SourceScope {
                     decls.push(Err((opened_id, resolved)));
                 }
             }
-            if let Some(opened) = self.opened.get(position) {
+            if let Some(opened) = self.opened.get(position)
+                && !self
+                    .open_exclusions
+                    .get(&position)
+                    .is_some_and(|names| names.contains(name))
+            {
                 decls.push(Ok(opened));
             }
         }
@@ -1300,6 +1311,7 @@ mod tests {
             expose_definitions: false,
             noncomputable_section: false,
             opened: vec![n("O")],
+            open_exclusions: BTreeMap::new(),
             explicit_opens: Vec::new(),
             universes: vec![],
             variables: variables::SectionVariables::default(),
@@ -1414,6 +1426,7 @@ mod tests {
                 n(namespace)
             },
             opened: opened.iter().map(|name| n(name)).collect(),
+            open_exclusions: BTreeMap::new(),
             ..SourceScope::default()
         };
         let resolve =
@@ -1500,6 +1513,7 @@ mod tests {
             noncomputable_section: false,
             namespace: n(namespace),
             opened: opened.iter().map(|o| n(o)).collect(),
+            open_exclusions: BTreeMap::new(),
             explicit_opens: Vec::new(),
             universes: vec![],
             variables: variables::SectionVariables::default(),
@@ -1583,6 +1597,7 @@ mod tests {
             noncomputable_section: false,
             namespace: n("Outer.Inner"),
             opened: vec![n("A"), n("B"), n("A")],
+            open_exclusions: BTreeMap::new(),
             explicit_opens: Vec::new(),
             universes: vec![],
             variables: variables::SectionVariables::default(),

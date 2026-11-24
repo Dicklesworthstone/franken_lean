@@ -108,3 +108,53 @@ fn renamed_opens_require_a_unique_namespace_and_stay_lexical() {
         assert!(check(&source).is_err(), "{source}");
     }
 }
+
+#[test]
+fn hiding_excludes_only_the_exact_name_in_that_open() {
+    for source in [
+        format!("{FOO}open Foo hiding x\ntheorem t : y = 2 := rfl\ntheorem u : Foo.x = 1 := rfl\n"),
+        format!("{FOO}open Foo\nopen Foo hiding x\ntheorem t : x = 1 := rfl\n"),
+        format!("{FOO}open Foo hiding x\nopen Foo\ntheorem t : x = 1 := rfl\n"),
+        format!("{FOO}open Foo hiding x\nopen Foo hiding y\ntheorem t : x + y = 3 := rfl\n"),
+        format!("{FOO}def Foo.x.next : Nat := 3\nopen Foo hiding x\ntheorem t : x.next = 3 := rfl\n"),
+        format!("{FOO}namespace N\nexport Foo (x y)\nend N\nopen N hiding x\ntheorem t : y = 2 := rfl\n"),
+        "open Nat hiding add\ntheorem t : succ 1 = 2 := rfl\n".to_owned(),
+        "namespace Foo\ndef «a.b» : Nat := 1\ndef a.b : Nat := 2\nend Foo\nopen Foo hiding «a.b»\ntheorem t : a.b = 2 := rfl\n".to_owned(),
+        "def Foo.Child : Nat := 1\ndef Foo.Child.x : Nat := 2\nopen Foo hiding Child\ntheorem t : Child.x = 2 := rfl\n".to_owned(),
+    ] {
+        check(&source).unwrap_or_else(|error| panic!("{source}: {error}"));
+    }
+}
+
+#[test]
+fn hiding_validates_the_namespace_and_members_and_stays_lexical() {
+    for source in [
+        format!("{FOO}open Foo hiding x\n#check x\n"),
+        format!("{FOO}open Foo hiding absent\n"),
+        format!("{FOO}open Foo hiding x in\ntheorem t : y = 2 := rfl\n#check y\n"),
+        format!("{FOO}section\nopen Foo hiding x\nend\n#check y\n"),
+        "namespace A.N\ndef x : Nat := 1\nend A.N\nnamespace B.N\ndef x : Nat := 2\nend B.N\nopen A B\nopen N hiding x\n".to_owned(),
+        "namespace A.N\ndef x : Nat := 1\nend A.N\nopen A\nopen A\nopen N hiding x\n".to_owned(),
+        "def Foo.Child : Nat := 1\ndef Foo.Child.x : Nat := 2\nopen Foo hiding Child\nopen Child\n".to_owned(),
+    ] {
+        assert!(check(&source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn hiding_still_activates_scoped_instances() {
+    check(
+        "class Pick where\n  value : Nat\n\
+         def fallback : Pick := Pick.mk 1\n\
+         attribute [instance] fallback\n\
+         def chosen [p : Pick] : Nat := Pick.value\n\
+         namespace Chosen\n\
+         def hidden : Nat := 7\n\
+         def override : Pick := Pick.mk 2\n\
+         attribute [scoped instance] override\n\
+         end Chosen\n\
+         open Chosen hiding hidden\n\
+         theorem selected : chosen = 2 := rfl\n",
+    )
+    .unwrap();
+}

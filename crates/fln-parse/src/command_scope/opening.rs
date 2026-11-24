@@ -1,4 +1,4 @@
-//! Lower the generated `openRenaming` tree to its lexical scope transition.
+//! Lower generated selective-open trees to their lexical scope transitions.
 use super::*;
 
 pub(super) fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError> {
@@ -7,11 +7,10 @@ pub(super) fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionPar
     if crate::extensions::is_active_command_macro(syntax) {
         return Ok(None);
     }
-    Ok(renaming_targets(syntax)
-        .map(|(namespace, renames)| ScopeCommand::OpenRenaming { namespace, renames }))
+    Ok(selective_open(syntax))
 }
 
-fn renaming_targets(syntax: &Syntax) -> Option<(Name, Vec<(Name, Name)>)> {
+fn selective_open(syntax: &Syntax) -> Option<ScopeCommand> {
     let Syntax::Node { kind, args, .. } = syntax else {
         return None;
     };
@@ -26,9 +25,7 @@ fn renaming_targets(syntax: &Syntax) -> Option<(Name, Vec<(Name, Name)>)> {
     else {
         return None;
     };
-    if kind != &parser_kind(&["Command", "open"])
-        || form != &parser_kind(&["Command", "openRenaming"])
-    {
+    if kind != &parser_kind(&["Command", "open"]) {
         return None;
     }
     let [
@@ -39,6 +36,22 @@ fn renaming_targets(syntax: &Syntax) -> Option<(Name, Vec<(Name, Name)>)> {
     else {
         return None;
     };
+    if form == &parser_kind(&["Command", "openHiding"]) {
+        let names = items
+            .iter()
+            .map(|item| match item {
+                Syntax::Ident { val, .. } => Some(val.clone()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return Some(ScopeCommand::OpenHiding {
+            namespace: namespace.clone(),
+            names,
+        });
+    }
+    if form != &parser_kind(&["Command", "openRenaming"]) {
+        return None;
+    }
     let mut renames = Vec::new();
     for item in items.iter().step_by(2) {
         let Syntax::Node { kind, args, .. } = item else {
@@ -57,7 +70,10 @@ fn renaming_targets(syntax: &Syntax) -> Option<(Name, Vec<(Name, Name)>)> {
         }
         renames.push((from.clone(), to.clone()));
     }
-    Some((namespace.clone(), renames))
+    Some(ScopeCommand::OpenRenaming {
+        namespace: namespace.clone(),
+        renames,
+    })
 }
 
 #[cfg(test)]
@@ -126,5 +142,37 @@ mod tests {
         ));
         assert_eq!(body, source.find("theorem").unwrap());
         assert_eq!(wrapper_body(parts[0].1).unwrap(), Some(body));
+    }
+
+    #[test]
+    fn hiding_keeps_exact_names_and_command_local_scope() {
+        let source = "/- 🦀 -/\r\nopen Library hiding «a.b» x.y in\r\ntheorem yes : kept = 7 := by rfl\r\ndef after : Nat := 8";
+        let parts = partition(source.as_bytes()).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!([parts[0].1, parts[1].1].concat(), source.as_bytes());
+        let Some(ScopeCommand::In { head, body }) = super::super::parse(parts[0].1).unwrap() else {
+            panic!("temporary scope expected");
+        };
+        assert_eq!(
+            super::super::parse(&parts[0].1[..head]).unwrap(),
+            Some(ScopeCommand::OpenHiding {
+                namespace: Name::from_components(["Library"]),
+                names: vec![
+                    Name::from_components(["a.b"]),
+                    Name::from_components(["x", "y"]),
+                ],
+            })
+        );
+        assert_eq!(body, source.find("theorem").unwrap());
+        assert_eq!(wrapper_body(parts[0].1).unwrap(), Some(body));
+        for bad in [
+            "open Library hiding",
+            "open Library hiding (x)",
+            "open Library hiding x, y",
+            "open Library hiding x -> y",
+            "open Library hiding\nx",
+        ] {
+            assert!(super::super::parse(bad.as_bytes()).is_err(), "{bad}");
+        }
     }
 }

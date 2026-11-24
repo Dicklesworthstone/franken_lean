@@ -186,7 +186,8 @@ impl ImportedTactics {
             &scope.namespace,
             &scope.opened,
             &scope.explicit_opens,
-        );
+        )
+        .with_open_exclusions(&scope.open_exclusions);
         let (report, tree) = self.registry.expand_runtime_root(
             syntax,
             MacroDispatchInvocation {

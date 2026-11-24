@@ -583,6 +583,7 @@ impl<'a> FileSession<'a> {
             ScopeCommand::Open(_)
             | ScopeCommand::OpenScoped(_)
             | ScopeCommand::OpenExplicit { .. }
+            | ScopeCommand::OpenHiding { .. }
             | ScopeCommand::OpenRenaming { .. } => "open",
             ScopeCommand::Universe(_) => "universe",
             ScopeCommand::Include(_) => "include",
@@ -609,6 +610,7 @@ impl<'a> FileSession<'a> {
             ScopeCommand::Open(_) => &["openSimple"],
             ScopeCommand::OpenScoped(_) => &["openScoped"],
             ScopeCommand::OpenExplicit { .. } => &["openOnly"],
+            ScopeCommand::OpenHiding { .. } => &["openHiding"],
             ScopeCommand::OpenRenaming { .. } => &["openRenaming", "openRenamingItem"],
             ScopeCommand::OpenIn { scoped: true, .. } => &["open", "openScoped"],
             ScopeCommand::OpenIn { scoped: false, .. } => &["open", "openSimple"],
@@ -1811,7 +1813,8 @@ fn expand_syntax_in_scope(
         &scope.namespace,
         &scope.opened,
         &scope.explicit_opens,
-    );
+    )
+    .with_open_exclusions(&scope.open_exclusions);
     let lookup = lookup.or(Some(&engine_lookup as &dyn MacroLookup));
     let dispatch = MacroDispatchInvocation {
         source,

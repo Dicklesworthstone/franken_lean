@@ -1486,10 +1486,17 @@ pub(crate) struct FileScope {
     namespace: Name,
     trail: Vec<Trail>,
     opens: Vec<Name>,
+    open_exclusions: BTreeMap<usize, BTreeSet<Name>>,
     docs: DocOptions,
 }
 
 impl FileScope {
+    fn excludes(&self, position: usize, name: &Name) -> bool {
+        self.open_exclusions
+            .get(&position)
+            .is_some_and(|names| names.contains(name))
+    }
+
     fn is_active(&self, namespace: &Name) -> bool {
         self.trail
             .iter()
@@ -1666,6 +1673,7 @@ impl FileGrammar {
                 namespace: Name::anonymous(),
                 trail: Vec::new(),
                 opens: Vec::new(),
+                open_exclusions: BTreeMap::new(),
                 docs: DocOptions::default(),
             }],
             cache: RefCell::new(BTreeMap::new()),
@@ -1767,9 +1775,12 @@ impl FileGrammar {
             }
             prefix = prefix.parent();
         }
-        for open in top.opens.iter().rev() {
+        for (position, open) in top.opens.iter().enumerate().rev() {
+            if top.excludes(position, name) {
+                continue;
+            }
             let candidate = open.append_core(name);
-            if self.has_grammar_namespace(&candidate) && !out.contains(&candidate) {
+            if self.has_grammar_namespace(&candidate) {
                 out.push(candidate);
             }
         }
@@ -1791,9 +1802,9 @@ impl FileGrammar {
         for name in names {
             for namespace in self.resolve_in(scope, name) {
                 self.activate_in(scope, namespace.clone());
-                if simple && !scope.opens.contains(&namespace) {
-                    // Keep the resolved structural name. The original short name
-                    // loses its prefix for later opens and syntax abbreviations.
+                if simple {
+                    // Keep structural names and repeated opens. Selective
+                    // opens require exactly one namespace interpretation.
                     scope.opens.push(namespace);
                 }
             }
@@ -1845,6 +1856,16 @@ impl FileGrammar {
             }
             ScopeCommand::Open(names) => self.activate(names, true),
             ScopeCommand::OpenScoped(names) => self.activate(names, false),
+            ScopeCommand::OpenHiding { namespace, names } => {
+                let mut top = self.top().clone();
+                if let [namespace] = self.resolve_in(&top, namespace).as_slice() {
+                    self.activate_in(&mut top, namespace.clone());
+                    top.open_exclusions
+                        .insert(top.opens.len(), names.iter().cloned().collect());
+                    top.opens.push(namespace.clone());
+                }
+                *self.top_mut() = top;
+            }
             ScopeCommand::SetOption {
                 name,
                 value: DataValue::OfBool(value),
@@ -1909,8 +1930,10 @@ impl FileGrammar {
         snapshot
             .opens
             .iter()
+            .enumerate()
             .rev()
-            .find_map(|open| self.abbreviations.get(&open.append_core(name)))
+            .filter(|(position, _)| !snapshot.excludes(*position, name))
+            .find_map(|(_, open)| self.abbreviations.get(&open.append_core(name)))
     }
 
     pub(crate) fn resolve_name_in(
@@ -1930,10 +1953,18 @@ impl FileGrammar {
             }
             prefix = prefix.parent();
         }
-        snapshot.opens.iter().rev().find_map(|open| {
-            let candidate = open.append_core(name);
-            exists(&candidate).then_some(candidate)
-        })
+        snapshot
+            .opens
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(position, open)| {
+                if snapshot.excludes(position, name) {
+                    return None;
+                }
+                let candidate = open.append_core(name);
+                exists(&candidate).then_some(candidate)
+            })
     }
 
     /// Advance scope and doc-option state directly from a parsed command `Syntax` tree
@@ -1996,8 +2027,11 @@ impl FileGrammar {
                         }
                     }
                     ["Lean", "Parser", "Command", "openHiding"] => {
-                        if let Some(name) = decl_args.first().and_then(ident_name) {
-                            self.apply(&ScopeCommand::Open(vec![name]));
+                        if let Some(namespace) = decl_args.first().and_then(ident_name)
+                            && let Some(items) = decl_args.get(2).and_then(null_args)
+                            && let Some(names) = items.iter().map(ident_name).collect()
+                        {
+                            self.apply(&ScopeCommand::OpenHiding { namespace, names });
                         }
                     }
                     _ => {}
@@ -2975,21 +3009,7 @@ impl FileGrammar {
 
     /// A syntax abbreviation `name` resolves to from the current namespace and `open`s.
     fn abbreviation(&self, name: &Name) -> Option<&Descr> {
-        let top = self.top();
-        let mut prefix = top.namespace.clone();
-        loop {
-            if let Some(descr) = self.abbreviations.get(&prefix.append_core(name)) {
-                return Some(descr);
-            }
-            if prefix.is_anonymous() {
-                break;
-            }
-            prefix = prefix.parent();
-        }
-        top.opens
-            .iter()
-            .rev()
-            .find_map(|open| self.abbreviations.get(&open.append_core(name)))
+        self.resolve_abbreviation_in(self.top(), name)
     }
 
     /// `processAlias`.
