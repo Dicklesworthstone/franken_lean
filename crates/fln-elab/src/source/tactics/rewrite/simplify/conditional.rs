@@ -207,7 +207,7 @@ impl Context {
                     let Some(definition) = selections.definitions.get(name) else {
                         return Ok((None, changed));
                     };
-                    self.unfold_selected_definition(&term, definition)?
+                    self.unfold_simp_definition(&term, definition, self.simp_unfold_partial_app)?
                 }
                 ExprNode::FVar { id } => {
                     let Some(value) = selections.locals.get(id) else {

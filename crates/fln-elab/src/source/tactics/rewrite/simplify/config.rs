@@ -6,7 +6,7 @@
 //! instance's fields.
 //!
 //! A field set to its declared default changes nothing and is accepted. `arith`, `decide`,
-//! `autoUnfold` and `failIfUnchanged` are honoured. Every other field set away from its default, a field the
+//! `autoUnfold`, `unfoldPartialApp` and `failIfUnchanged` are honoured. Every other field set away from its default, a field the
 //! structure does not declare, a value other than a Boolean literal, and any other configuration
 //! term (`Lean.Meta.Simp.neutralConfig`, `{ c with … }`) remain this slot's typed refusal.
 use super::*;
@@ -22,6 +22,8 @@ pub(in crate::source) struct SimpConfig {
     pub(super) decide: bool,
     /// `autoUnfold`: reduce matched definitions when their discriminants select a branch.
     pub(super) auto_unfold: bool,
+    /// Expand a selected ordinary definition with fewer arguments than its head lambdas.
+    pub(super) unfold_partial_app: bool,
     /// `failIfUnchanged`: a call that changes nothing fails, rather than leaving its goal.
     pub(super) fail_if_unchanged: bool,
 }
@@ -32,6 +34,7 @@ impl Default for SimpConfig {
             arith: false,
             decide: false,
             auto_unfold: false,
+            unfold_partial_app: false,
             fail_if_unchanged: true,
         }
     }
@@ -191,6 +194,7 @@ fn set_field(
         "arith" => config.arith = value,
         "decide" => config.decide = value,
         "autoUnfold" => config.auto_unfold = value,
+        "unfoldPartialApp" => config.unfold_partial_app = value,
         "failIfUnchanged" => config.fail_if_unchanged = value,
         _ if value == default => {}
         _ => return Err(unsupported()),

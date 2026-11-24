@@ -28,6 +28,7 @@ struct DsimpSet<'a> {
     procedures: super::NatSimprocs,
     /// `failIfUnchanged`: a call that changes nothing fails, rather than leaving its goal.
     fail_if_unchanged: bool,
+    unfold_partial_app: bool,
 }
 
 impl Default for DsimpSet<'_> {
@@ -39,6 +40,7 @@ impl Default for DsimpSet<'_> {
             tagged: std::collections::BTreeSet::new(),
             procedures: super::NatSimprocs::default(),
             fail_if_unchanged: true,
+            unfold_partial_app: false,
         }
     }
 }

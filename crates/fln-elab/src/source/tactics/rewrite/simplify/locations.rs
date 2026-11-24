@@ -178,12 +178,15 @@ impl Context {
             target: true,
             all: true,
         };
-        if config.fail_if_unchanged {
-            return self.simplify_location_rules(proof, &initial, locations, rules, true);
-        }
         let start = proof.work.len();
-        let result = self.simplify_location_rules(proof, &initial, locations, rules, true);
-        simp_unchanged(proof, initial, start, result)
+        let result = self.with_simp_config(config, |ctx| {
+            ctx.simplify_location_rules(proof, &initial, locations, rules, true)
+        });
+        if config.fail_if_unchanged {
+            result
+        } else {
+            simp_unchanged(proof, initial, start, result)
+        }
     }
 
     pub(super) fn simplify_at_locations(
@@ -201,7 +204,9 @@ impl Context {
         };
         let (rules, config) = self.simp_selection(args)?;
         let start = proof.work.len();
-        let result = self.simplify_location_rules(proof, initial, locations, rules, false);
+        let result = self.with_simp_config(config, |ctx| {
+            ctx.simplify_location_rules(proof, initial, locations, rules, false)
+        });
         if config.fail_if_unchanged {
             result?;
         } else {

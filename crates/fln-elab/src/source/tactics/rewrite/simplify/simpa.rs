@@ -15,9 +15,21 @@ impl Context {
         // acquire a synthetic assumption or use it as its own rewrite rule.
         // `failIfUnchanged` changes nothing here: simp's no-progress refusal below is already
         // `simpa`'s fallback to an assumption, as the pin's `simpa` makes no progress silently.
-        let rules = self.simp_rules(args)?;
+        let (rules, config) = self.simp_selection(args)?;
+        self.with_simp_config(config, |ctx| {
+            ctx.simpa_with_rules(proof, goal, &rules, using)
+        })
+    }
+
+    fn simpa_with_rules(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        rules: &[SimpRule<'_>],
+        using: Option<Typed>,
+    ) -> Result<(), NatDefinitionElabError> {
         if let Some(term) = using {
-            return self.simpa_candidate(proof, goal, &rules, term);
+            return self.simpa_candidate(proof, goal, rules, term);
         }
         // The pin's bare `simpa` simplifies the GOAL and then closes with a
         // plain `assumption` against the UNSIMPLIFIED hypotheses — measured at
@@ -27,7 +39,7 @@ impl Context {
         // the pin rejects (reference_differential.tsv, native_simpa Reference
         // 16). A goal simp closes outright still succeeds.
         let start = proof.work.len();
-        match self.simplify_goal_with_rules(proof, goal.clone(), &rules, 0, None) {
+        match self.simplify_goal_with_rules(proof, goal.clone(), rules, 0, None) {
             Ok(()) => {}
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
                 TacticError::SimplificationNoProgress,

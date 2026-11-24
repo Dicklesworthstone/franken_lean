@@ -98,8 +98,30 @@
    exact h
 -- CASE preserve_partial_application accept
  def wrap (n : Nat) : Nat := n
+ def choose (x _y : Nat) : Nat := x
+ structure Boxed where
+   val : Nat
+ theorem bareField (P : (Boxed -> Nat) -> Prop) (h : P Boxed.val) : P Boxed.val := by
+   fail_if_success simp only [Boxed.val]
+   fail_if_success dsimp only [Boxed.val]
+   fail_if_success simp +unfoldPartialApp only [Boxed.val]
+   fail_if_success dsimp +unfoldPartialApp only [Boxed.val]
+   exact h
+ theorem partiallyApplied (P : (Nat -> Nat) -> Prop) (x : Nat) (h : P (choose x)) : P (choose x) := by
+   fail_if_success simp only [choose] at h
+   simp +unfoldPartialApp only [choose] at h
+   guard_hyp h :ₛ P (fun _ => x)
+   fail_if_success dsimp only [choose]
+   dsimp (config := { unfoldPartialApp := true }) only [choose]
+   guard_target =ₛ P (fun _ => x)
+   exact h
  theorem t (P : (Nat -> Nat) -> Prop) (h : P wrap) : P wrap := by
    fail_if_success dsimp only [wrap]
+   fail_if_success simp only [wrap]
+   dsimp +unfoldPartialApp only [wrap] at h
+   guard_hyp h :ₛ P (fun n => n)
+   simp (config := { unfoldPartialApp := true }) only [wrap]
+   guard_target =ₛ P (fun n => n)
    exact h
 -- CASE dependent_hypothesis_replacement accept
  def Carrier (A : Type) : Type := A

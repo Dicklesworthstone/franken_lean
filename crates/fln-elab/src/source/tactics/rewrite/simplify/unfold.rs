@@ -388,8 +388,11 @@ impl Context {
                 _ => term.clone(),
             };
             let rebuilt = match selection {
-                Some(Selection::Global(definition)) => {
+                Some(Selection::Global(definition)) if self.unfold_tactic => {
                     self.unfold_selected_definition(&rebuilt, definition)?
+                }
+                Some(Selection::Global(definition)) => {
+                    self.unfold_simp_definition(&rebuilt, definition, self.simp_unfold_partial_app)?
                 }
                 Some(Selection::Automatic(policy)) => {
                     self.simp_auto_unfold_head(&rebuilt, policy)?

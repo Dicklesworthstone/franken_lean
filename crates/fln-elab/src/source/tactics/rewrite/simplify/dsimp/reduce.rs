@@ -383,20 +383,10 @@ impl Context {
                     // `Simp.unfold?` chooses the auto branch instead of `toUnfold`, including
                     // explicit definitions. Reflexive theorem rules above remain available.
                     if set.automatic.is_none() && self.dsimp_unfoldable(definition)? {
-                        let mut body = &definition.value;
-                        let mut arity = 0usize;
-                        while let ExprNode::Lam { body: next, .. } = body.node() {
-                            self.tick()?;
-                            arity = arity
-                                .checked_add(1)
-                                .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
-                            body = next;
-                        }
-                        if arguments.len() >= arity {
-                            let next = self.unfold_selected_definition(term, definition)?;
-                            if !self.rewrite_same(term, &next)? {
-                                return Ok(next);
-                            }
+                        let next =
+                            self.unfold_simp_definition(term, definition, set.unfold_partial_app)?;
+                        if !self.rewrite_same(term, &next)? {
+                            return Ok(next);
                         }
                     }
                 }

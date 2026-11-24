@@ -896,6 +896,8 @@ struct Context {
     // unfold equation, so an occurrence whose match is stuck becomes a `match`, which a
     // compiled recursor application does not print as.
     unfold_tactic: bool,
+    // Per-invocation simp settings, restored after nested simplifier and discharger calls.
+    simp_unfold_partial_app: bool,
     // The ambient transparency `with_reducible`, `with_reducible_and_instances` and
     // `with_unfolding_none` set for the tactics they run (`withReducible` &c., vendored
     // src/Lean/Elab/Tactic/BuiltinTactic.lean). `None` is the elaborator's own default.
@@ -1063,6 +1065,7 @@ impl Context {
             partial: None,
             noncomputable_definition: false,
             unfold_tactic: false,
+            simp_unfold_partial_app: false,
             tactic_transparency: None,
             enclosing_recursions: Vec::new(),
             postponed_eliminators: Vec::new(),

@@ -16,6 +16,7 @@ impl Context {
             tagged,
             procedures: NatSimprocs::default(),
             fail_if_unchanged: config.fail_if_unchanged,
+            unfold_partial_app: config.unfold_partial_app,
         };
         for rule in rules {
             if let SimpRule::AutoUnfold(policy) = rule {

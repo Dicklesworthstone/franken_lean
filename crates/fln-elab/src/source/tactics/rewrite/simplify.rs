@@ -885,11 +885,16 @@ impl Context {
         Ok(None)
     }
 
-    fn simp_rules<'a>(
+    fn with_simp_config<T>(
         &mut self,
-        args: &'a [Syntax],
-    ) -> Result<Vec<SimpRule<'a>>, NatDefinitionElabError> {
-        Ok(self.simp_selection(args)?.0)
+        config: SimpConfig,
+        run: impl FnOnce(&mut Self) -> Result<T, NatDefinitionElabError>,
+    ) -> Result<T, NatDefinitionElabError> {
+        let previous =
+            std::mem::replace(&mut self.simp_unfold_partial_app, config.unfold_partial_app);
+        let result = run(self);
+        self.simp_unfold_partial_app = previous;
+        result
     }
 
     /// The rules a `simp`, `simpa` or `dsimp` call's slots `args` select, with its configuration.
@@ -1814,8 +1819,8 @@ impl Context {
         args: &[Syntax],
         expr: &Expr,
     ) -> Result<(Expr, Option<Expr>), NatDefinitionElabError> {
-        let rules = self.simp_rules(args)?;
-        self.simp_expression_with_rules(&rules, expr)
+        let (rules, config) = self.simp_selection(args)?;
+        self.with_simp_config(config, |ctx| ctx.simp_expression_with_rules(&rules, expr))
     }
 
     /// The same proof-producing expression simplifier, with an already frozen
@@ -1941,12 +1946,14 @@ impl Context {
             return Ok(());
         }
         let (rules, config) = self.simp_selection(args)?;
-        if config.fail_if_unchanged {
-            return self.simplify_goal_with_rules(proof, goal, &rules, 0, None);
-        }
-        let start = proof.work.len();
-        let result = self.simplify_goal_with_rules(proof, goal.clone(), &rules, 0, None);
-        simp_unchanged(proof, goal, start, result)
+        self.with_simp_config(config, |ctx| {
+            if config.fail_if_unchanged {
+                return ctx.simplify_goal_with_rules(proof, goal, &rules, 0, None);
+            }
+            let start = proof.work.len();
+            let result = ctx.simplify_goal_with_rules(proof, goal.clone(), &rules, 0, None);
+            simp_unchanged(proof, goal, start, result)
+        })
     }
 
     // Hypothesis and goal simplification share one productive-step limit. A

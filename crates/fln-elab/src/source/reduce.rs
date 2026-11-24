@@ -70,6 +70,11 @@ fn recursor_major(recursor: &RecursorVal) -> Result<usize, NatDefinitionElabErro
         .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))
 }
 
+enum SelectedUnfolding {
+    Explicit,
+    Simp { unfold_partial: bool },
+}
+
 impl Context {
     pub(super) fn reduce_source_head(
         &mut self,
@@ -398,6 +403,28 @@ impl Context {
         term: &Expr,
         definition: &DefinitionVal,
     ) -> Result<Expr, NatDefinitionElabError> {
+        self.unfold_definition_at_spine(term, definition, SelectedUnfolding::Explicit)
+    }
+
+    pub(in crate::source) fn unfold_simp_definition(
+        &mut self,
+        term: &Expr,
+        definition: &DefinitionVal,
+        unfold_partial: bool,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        self.unfold_definition_at_spine(
+            term,
+            definition,
+            SelectedUnfolding::Simp { unfold_partial },
+        )
+    }
+
+    fn unfold_definition_at_spine(
+        &mut self,
+        term: &Expr,
+        definition: &DefinitionVal,
+        mode: SelectedUnfolding,
+    ) -> Result<Expr, NatDefinitionElabError> {
         let mut head = term.clone();
         let mut arguments = Vec::new();
         while let ExprNode::App { f, a } = head.node() {
@@ -441,6 +468,34 @@ impl Context {
             }
             SmartUnfolding::Folded => return Ok(term.clone()),
             SmartUnfolding::Plain => {
+                // Simp.unfold? counts head lambdas of the value (not arrows of its type).
+                // Stop at the first missing argument, including when the constant is bare.
+                if let SelectedUnfolding::Simp { unfold_partial } = mode {
+                    let mut body = &definition.value;
+                    let mut supplied = arguments.iter();
+                    while let ExprNode::Lam { body: inner, .. } = body.node() {
+                        self.tick()?;
+                        if supplied.next().is_none() {
+                            if !unfold_partial {
+                                return Ok(term.clone());
+                            }
+                            // Simp.unfold? excludes projections: reduceProjFn? handles them
+                            // separately. This switch cannot supply a missing receiver.
+                            let env = self.txn.env.clone();
+                            if crate::records::projection::generated_projection(
+                                &env,
+                                definition,
+                                || self.tick(),
+                            )?
+                            .is_some()
+                            {
+                                return Ok(term.clone());
+                            }
+                            break;
+                        }
+                        body = inner;
+                    }
+                }
                 self.instantiate_params(&definition.value, &definition.base.level_params, levels)?
             }
             SmartUnfolding::Alternative { value, consumed } => {
