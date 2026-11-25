@@ -197,7 +197,7 @@ const MERGE_SORT_COMPANION_ONLY_UNSAFE_REC_RESIDUALS: [&str; 3] = [
 
 const USAGE: &str = concat!(
     "Usage:\n",
-    "  fln check-olean [--json] [--policy standard|release|paranoid|compat-bench] [--receipts PATH | --continue [--provisional] [--progress] [--jobs N]] [--max-bytes BYTES] [--max-steps N] PATH [ROOT...]\n",
+    "  fln check-olean [--json] [--policy standard|release|paranoid|compat-bench] [--receipts PATH | --continue [--provisional [--provisional-jobs N]] [--progress] [--jobs N]] [--max-bytes BYTES] [--max-steps N] PATH [ROOT...]\n",
     "  fln check-source [--json] [--max-bytes BYTES] [--jobs N] [--import-posture P] [--imported-macros PARTITION.tsv [--macro-max-bytes BYTES] [--imported-syntax MODULE]...] PATH...\n",
     "    Check definitions and theorems without executing code. An import with no\n",
     "    source file under the entry's directory is read as an .olean from\n",
@@ -572,7 +572,7 @@ enum MultiplexerCommand {
         policy: fln::VerificationPolicy,
         receipts: Option<PathBuf>,
         continue_on_failure: bool,
-        provisional: bool,
+        provisional: Option<std::num::NonZeroUsize>,
         progress: bool,
         jobs: std::num::NonZeroUsize,
     },
@@ -1222,6 +1222,7 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
     let mut policy: Option<fln::VerificationPolicy> = None;
     let mut continue_on_failure = false;
     let mut provisional = false;
+    let mut provisional_jobs = None;
     let mut progress = false;
     let mut jobs: Option<std::num::NonZeroUsize> = None;
     let mut max_steps: Option<u64> = None;
@@ -1315,25 +1316,31 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
             policy = Some(parse_verification_policy(&value)?);
             continue;
         }
-        let jobs_value =
-            if options && argument == "--jobs" {
-                Some(arguments.next().ok_or_else(|| {
-                    UsageError("--jobs requires a following thread count".to_owned())
-                })?)
-            } else if options {
-                argument
-                    .to_str()
-                    .and_then(|value| value.strip_prefix("--jobs="))
-                    .map(OsString::from)
-            } else {
-                None
+        if options && let Some(text) = argument.to_str() {
+            let (key, inline) = text
+                .split_once('=')
+                .map_or((text, None), |(k, v)| (k, Some(v)));
+            let slot = match key {
+                "--jobs" => Some(&mut jobs),
+                "--provisional-jobs" => Some(&mut provisional_jobs),
+                _ => None,
             };
-        if let Some(value) = jobs_value {
-            if jobs.is_some() {
-                return Err(UsageError("--jobs may be supplied at most once".to_owned()));
+            if let Some(slot) = slot {
+                if slot.is_some() {
+                    return Err(UsageError(format!("{key} may be supplied at most once")));
+                }
+                let value = inline
+                    .map(OsString::from)
+                    .or_else(|| arguments.next())
+                    .ok_or_else(|| {
+                        UsageError(format!("{key} requires a following thread count"))
+                    })?;
+                *slot = Some(
+                    parse_jobs_count(&value)
+                        .map_err(|_| UsageError(format!("{key} takes a positive thread count")))?,
+                );
+                continue;
             }
-            jobs = Some(parse_jobs_count(&value)?);
-            continue;
         }
         let selected = if options && argument == "--receipts" {
             Some(arguments.next().ok_or_else(|| {
@@ -1374,6 +1381,11 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
             ));
         }
     }
+    if provisional_jobs.is_some() && !provisional {
+        return Err(UsageError(
+            "--provisional-jobs requires --provisional".to_owned(),
+        ));
+    }
     if provisional && !continue_on_failure {
         return Err(UsageError(
             "--provisional explores past inconclusive imports, so it requires --continue"
@@ -1396,6 +1408,7 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
                 .to_owned(),
         ));
     }
+    let jobs = jobs.unwrap_or(std::num::NonZeroUsize::MIN);
     Ok(MultiplexerCommand::CheckOlean {
         roots: paths,
         max_bytes,
@@ -1404,9 +1417,9 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
         policy: policy.unwrap_or(fln::VerificationPolicy::Release),
         receipts,
         continue_on_failure,
-        provisional,
+        provisional: provisional.then_some(provisional_jobs.unwrap_or(jobs)),
         progress,
-        jobs: jobs.unwrap_or(std::num::NonZeroUsize::MIN),
+        jobs,
     })
 }
 
@@ -9775,7 +9788,7 @@ fn check_olean_module_frontier(
     max_steps: Option<u64>,
     policy: fln::VerificationPolicy,
     json: bool,
-    provisional: bool,
+    provisional: Option<std::num::NonZeroUsize>,
     progress: bool,
     jobs: std::num::NonZeroUsize,
 ) -> MultiplexerOutput {
@@ -9862,7 +9875,7 @@ fn check_olean_module_frontier(
                 threads: jobs,
                 worker_stack_bytes: OLEAN_CHECK_KERNEL_STACK_BYTES,
             };
-            if provisional {
+            if let Some(cap) = provisional {
                 let mut phase2_stream = |completed: usize,
                                          total: usize,
                                          row: &fln::ProvisionalFrontierRow| {
@@ -9896,7 +9909,7 @@ fn check_olean_module_frontier(
                     &inputs,
                     &fln::KVMap::new(),
                     limits,
-                    frontier_jobs,
+                    frontier_jobs.with_provisional_cap(cap),
                     None,
                     &mut stream,
                     Some(&mut phase2_stream),
@@ -10793,7 +10806,7 @@ fn check_olean(
     json: bool,
     receipts: Option<&Path>,
     continue_on_failure: bool,
-    provisional: bool,
+    provisional: Option<std::num::NonZeroUsize>,
     progress: bool,
     jobs: std::num::NonZeroUsize,
 ) -> MultiplexerOutput {

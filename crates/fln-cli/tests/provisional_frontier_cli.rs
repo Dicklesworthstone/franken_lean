@@ -194,7 +194,12 @@ fn cli_provisional_chain_failed_control_and_schedule_independence() {
 
     // 2. With --provisional at --jobs 1, 8, 32: identical rows (modulo elapsedMs).
     let mut normalized = Vec::new();
-    for jobs in ["1", "8", "32"] {
+    for (jobs, cap) in [
+        ("1", None),
+        ("8", None),
+        ("32", None),
+        ("8", Some("--provisional-jobs=1")),
+    ] {
         let out = Command::new(fln_bin())
             .args([
                 "check-olean",
@@ -206,6 +211,7 @@ fn cli_provisional_chain_failed_control_and_schedule_independence() {
                 "--jobs",
                 jobs,
             ])
+            .args(cap)
             .arg(&dir)
             .output()
             .expect("run fln check-olean --continue --provisional");
@@ -273,6 +279,8 @@ fn cli_provisional_chain_failed_control_and_schedule_independence() {
         normalized[0], normalized[2],
         "--jobs 1 vs --jobs 32 mismatch"
     );
+
+    assert_eq!(normalized[0], normalized[3], "independent provisional cap");
 
     // Human-readable log check: logs phase, verdict, assumes, decl counts, k1_steps, ms.
     let human = Command::new(fln_bin())
@@ -349,6 +357,25 @@ fn cli_provisional_chain_failed_control_and_schedule_independence() {
         .output()
         .expect("run bad usage");
     assert_eq!(bad_usage.status.code(), Some(2));
+
+    for flags in [
+        &["--continue", "--provisional-jobs", "1"][..],
+        &["--continue", "--provisional", "--provisional-jobs=0"],
+        &[
+            "--continue",
+            "--provisional",
+            "--provisional-jobs=1",
+            "--provisional-jobs=2",
+        ],
+    ] {
+        let output = Command::new(fln_bin())
+            .arg("check-olean")
+            .args(flags)
+            .arg(&dir)
+            .output()
+            .expect("run invalid provisional worker option");
+        assert_eq!(output.status.code(), Some(2), "{flags:?}");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&fail_dir);

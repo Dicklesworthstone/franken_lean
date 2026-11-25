@@ -1104,7 +1104,7 @@ fn phase2_memory_admission_accounts_for_retained_rss_and_inflight_estimates() {
         runtime_initializers: Default::default(),
         options: KVMap::new(),
     };
-    let run = |threads, limit| {
+    let run = |threads, limit, cap| {
         let memory = RetainedMemory {
             phase2: AtomicBool::new(false),
             limit,
@@ -1114,7 +1114,7 @@ fn phase2_memory_admission_accounts_for_retained_rss_and_inflight_estimates() {
             .check_olean_frontier_provisional_using_with_progress(
                 &inputs,
                 limits,
-                jobs(threads),
+                jobs(threads).with_provisional_cap(NonZeroUsize::new(cap).unwrap()),
                 None,
                 &mut |event| {
                     if matches!(
@@ -1168,8 +1168,8 @@ fn phase2_memory_admission_accounts_for_retained_rss_and_inflight_estimates() {
         frontier
     };
 
-    let serial = run(1, Some(100));
-    let bounded = run(4, Some(100));
+    let serial = run(1, Some(100), 1);
+    let bounded = run(4, Some(100), 4);
     assert_eq!(row_signature(&serial), row_signature(&bounded));
     assert!(
         bounded
@@ -1179,14 +1179,25 @@ fn phase2_memory_admission_accounts_for_retained_rss_and_inflight_estimates() {
         "80 retained + 15 reserved + 15 next exceeds 100, although live RSS alone does not"
     );
 
+    // With the same ceiling and four authoritative workers, the explicit
+    // one-worker follow-up never reserves two closures concurrently.
+    let capped = run(4, Some(100), 1);
+    assert_eq!(row_signature(&serial), row_signature(&capped));
+    assert!(
+        capped
+            .rows
+            .iter()
+            .all(|row| row.memory.admission_deferrals == 0)
+    );
+
     // An idle worker must still try when its estimate alone exceeds the cap:
     // only the actual decoder/checkers can produce a resource non-answer.
-    let below_retained = run(4, Some(10));
+    let below_retained = run(4, Some(10), 4);
     assert_eq!(row_signature(&serial), row_signature(&below_retained));
 
     // Without a ceiling, --jobs keeps its ordinary parallel scheduling; there
     // is no arbitrary Phase-2 cap masquerading as memory admission control.
-    let unbounded = run(4, None);
+    let unbounded = run(4, None, 4);
     assert_eq!(row_signature(&serial), row_signature(&unbounded));
     assert!(
         unbounded

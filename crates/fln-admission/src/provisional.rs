@@ -18,6 +18,34 @@ use super::*;
 use fln_core::outcome::InconclusiveCause;
 pub use fln_env::environment::ProvisionalEnvironment;
 
+/// Worker limits for the authoritative pass and its provisional follow-up.
+/// Both passes use the same kernel budget and configured worker stack size.
+#[derive(Debug, Clone, Copy)]
+pub struct ProvisionalFrontierJobs {
+    authoritative: OleanFrontierJobs,
+    provisional: OleanFrontierJobs,
+}
+
+impl OleanFrontierJobs {
+    /// Limit concurrent provisional checks while keeping all workers available
+    /// for authoritative checks. A cap of one uses the caller's kernel-sized stack.
+    pub fn with_provisional_cap(self, cap: std::num::NonZeroUsize) -> ProvisionalFrontierJobs {
+        ProvisionalFrontierJobs {
+            authoritative: self,
+            provisional: Self {
+                threads: self.threads.min(cap),
+                ..self
+            },
+        }
+    }
+}
+
+impl From<OleanFrontierJobs> for ProvisionalFrontierJobs {
+    fn from(jobs: OleanFrontierJobs) -> Self {
+        jobs.with_provisional_cap(jobs.threads)
+    }
+}
+
 /// Outcome of checking one atomic declaration unit (a single declaration, or an
 /// entire mutual/inductive/quotient block) in declaration-by-declaration mode.
 #[derive(Debug)]
@@ -1697,11 +1725,12 @@ impl Admitted {
         modules: &[OleanModuleInput<'_>],
         options: &KVMap,
         limits: OleanCheckLimits,
-        jobs: OleanFrontierJobs,
+        jobs: impl Into<ProvisionalFrontierJobs>,
         cancellation: Option<&dyn CancellationProbe>,
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
         on_phase2: Option<Phase2ProgressCallback<'_>>,
     ) -> Result<ProvisionalFrontier<()>, OleanCheckError> {
+        let jobs = jobs.into();
         let hooks = FrontierRunHooks {
             check: &|job| self.frontier_check_module(job, options, limits),
             decode: &|index| {
@@ -1712,7 +1741,7 @@ impl Admitted {
         let phase1 = self.check_olean_frontier_phase1_core_with_options(
             modules,
             limits,
-            jobs,
+            jobs.authoritative,
             on_event,
             hooks,
             FrontierExecutionOptions::STREAMING_PROVISIONAL_ROWS,
@@ -1721,7 +1750,7 @@ impl Admitted {
             phase1,
             modules,
             limits,
-            jobs,
+            jobs.provisional,
             cancellation,
             on_phase2,
             hooks,
@@ -1756,19 +1785,25 @@ impl Admitted {
         &self,
         modules: &[OleanModuleInput<'_>],
         limits: OleanCheckLimits,
-        jobs: OleanFrontierJobs,
+        jobs: impl Into<ProvisionalFrontierJobs>,
         cancellation: Option<&dyn CancellationProbe>,
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
         on_phase2: Option<Phase2ProgressCallback<'_>>,
         hooks: FrontierRunHooks<'_>,
     ) -> Result<ProvisionalFrontier, OleanCheckError> {
-        let phase1 =
-            self.check_olean_frontier_phase1_core(modules, limits, jobs, on_event, hooks)?;
+        let jobs = jobs.into();
+        let phase1 = self.check_olean_frontier_phase1_core(
+            modules,
+            limits,
+            jobs.authoritative,
+            on_event,
+            hooks,
+        )?;
         self.check_olean_frontier_provisional_after_phase1(
             phase1,
             modules,
             limits,
-            jobs,
+            jobs.provisional,
             cancellation,
             on_phase2,
             hooks,

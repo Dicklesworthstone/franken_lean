@@ -2202,7 +2202,7 @@ impl Engine {
         modules: &[OleanModuleInput<'_>],
         options: &KVMap,
         limits: OleanCheckLimits,
-        jobs: OleanFrontierJobs,
+        jobs: impl Into<fln_admission::provisional::ProvisionalFrontierJobs>,
         cancellation: Option<&dyn CancellationProbe>,
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
         on_phase2: Option<fln_admission::provisional::Phase2ProgressCallback<'_>>,
