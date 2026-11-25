@@ -7479,19 +7479,12 @@ fn definition_elaboration(
         }
     }
     let (proof_instance, hidden_instance) = if is_instance {
-        context.validate_instance_binder(
-            expected
-                .as_ref()
-                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
-        )?;
-        instance_command::prepare_header(
-            context,
-            &parameters,
-            expected
-                .as_ref()
-                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
-            &modifiers[1],
-        )?
+        let result = expected
+            .as_mut()
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        *result = instance_command::cleanup_of_nat(context, result)?;
+        context.validate_instance_binder(result)?;
+        instance_command::prepare_header(context, &parameters, result, &modifiers[1])?
     } else {
         (false, false)
     };
