@@ -13,7 +13,9 @@ use std::path::{Component, Path, PathBuf};
 type ReadFile<'a> = dyn FnMut(&Path) -> Option<String> + 'a;
 
 pub(super) fn sample(override_limit: Option<u64>) -> FrontierMemorySample {
-    sample_with(override_limit, &mut |path| std::fs::read_to_string(path).ok())
+    sample_with(override_limit, &mut |path| {
+        std::fs::read_to_string(path).ok()
+    })
 }
 
 fn sample_with(override_limit: Option<u64>, read: &mut ReadFile<'_>) -> FrontierMemorySample {
@@ -25,8 +27,8 @@ fn sample_with(override_limit: Option<u64>, read: &mut ReadFile<'_>) -> Frontier
     let physical = read(Path::new("/proc/meminfo")).and_then(|meminfo| {
         // MemAvailable includes reclaimable memory. MemFree alone would
         // unnecessarily serialize the frontier whenever the page cache grew.
-        let available = proc_kb_value(&meminfo, "MemAvailable:")
-            .map(|bytes| rss_bytes.saturating_add(bytes));
+        let available =
+            proc_kb_value(&meminfo, "MemAvailable:").map(|bytes| rss_bytes.saturating_add(bytes));
         available
             .into_iter()
             .chain(proc_kb_value(&meminfo, "MemTotal:"))
@@ -90,7 +92,10 @@ fn cgroup_ceiling(
         };
         let version = if hierarchy == "0" && controllers.is_empty() {
             CgroupVersion::V2
-        } else if controllers.split(',').any(|controller| controller == "memory") {
+        } else if controllers
+            .split(',')
+            .any(|controller| controller == "memory")
+        {
             CgroupVersion::V1
         } else {
             continue;
@@ -209,14 +214,19 @@ mod tests {
             .iter()
             .map(|(path, text)| (Path::new(path), *text))
             .collect();
-        sample_with(cap, &mut |path| files.get(path).map(|text| (*text).to_owned()))
+        sample_with(cap, &mut |path| {
+            files.get(path).map(|text| (*text).to_owned())
+        })
     }
 
     #[test]
     fn host_available_memory_and_address_space_bound_an_explicit_cap() {
         let files = [
             ("/proc/self/status", "VmRSS: 100 kB\nVmSize: 300 kB\n"),
-            ("/proc/self/limits", "Max address space 512000 512000 bytes\n"),
+            (
+                "/proc/self/limits",
+                "Max address space 512000 512000 bytes\n",
+            ),
             ("/proc/meminfo", "MemTotal: 1000 kB\nMemAvailable: 150 kB\n"),
         ];
         // Available physical memory permits 250 KiB process RSS; RLIMIT_AS
@@ -352,7 +362,10 @@ mod tests {
     fn malformed_or_hidden_cgroups_preserve_other_observed_bounds() {
         let files = [
             ("/proc/self/status", "VmRSS: 1 kB\n"),
-            ("/proc/self/cgroup", "malformed\n0::/outside/../worker\n0::/valid\n"),
+            (
+                "/proc/self/cgroup",
+                "malformed\n0::/outside/../worker\n0::/valid\n",
+            ),
             (
                 "/proc/self/mountinfo",
                 "invalid\n7 1 0:1 /other /wrong rw - cgroup2 cgroup rw\n8 1 0:2 / /bad\\999 rw - cgroup2 cgroup rw\n9 1 0:3 / /cg rw - cgroup2 cgroup rw\n",
@@ -362,10 +375,7 @@ mod tests {
             ("/cg/memory.max", "max"),
             ("/proc/meminfo", "MemTotal: 100 kB\n"),
         ];
-        assert_eq!(
-            fixture_sample(&files, None).limit_bytes,
-            Some(100 * 1024)
-        );
+        assert_eq!(fixture_sample(&files, None).limit_bytes, Some(100 * 1024));
         assert_eq!(fixture_sample(&[], Some(42)).limit_bytes, Some(42));
         assert_eq!(fixture_sample(&[], None).limit_bytes, None);
     }
@@ -405,10 +415,7 @@ mod tests {
                 "MemTotal: 100 kB\nMemAvailable: 18446744073709551615 kB\n",
             ),
         ];
-        assert_eq!(
-            fixture_sample(&files, None).limit_bytes,
-            Some(100 * 1024)
-        );
+        assert_eq!(fixture_sample(&files, None).limit_bytes, Some(100 * 1024));
         assert_eq!(fixture_sample(&files, None).rss_bytes, 0);
         assert!(mount_path("relative").is_none());
         assert!(mount_path("/cg/../outside").is_none());

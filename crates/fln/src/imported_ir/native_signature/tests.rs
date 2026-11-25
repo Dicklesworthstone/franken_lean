@@ -40,6 +40,9 @@ mod integers;
 #[path = "tests/signed_words.rs"]
 mod signed_words;
 
+#[path = "tests/signed_words_reference.rs"]
+mod signed_words_reference;
+
 #[path = "tests/levels_reference.rs"]
 mod levels_reference;
 

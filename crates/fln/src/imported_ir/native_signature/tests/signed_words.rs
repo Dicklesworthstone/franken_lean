@@ -129,9 +129,12 @@ fn signed_word_closures_authenticate_every_reviewed_native_row() {
         }
     }
     for family in FAMILIES {
-        // Floating conversions have a separate native signature and module.
-        let row = crate::imported_ir::native_row(&name(&format!("{family}.toFloat"))).unwrap();
-        assert!(BoxedNative::from_row(row).unwrap().is_none());
+        // Floating conversions have separate native signatures and modules.
+        for operation in ["toFloat", "toFloat32"] {
+            let row =
+                crate::imported_ir::native_row(&name(&format!("{family}.{operation}"))).unwrap();
+            assert!(BoxedNative::from_row(row).unwrap().is_some());
+        }
     }
 }
 
