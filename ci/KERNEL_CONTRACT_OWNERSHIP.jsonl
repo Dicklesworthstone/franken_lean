@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":753,"projection_hash":"794f4c0fab8ae63f756e82a4c358c798b7adc59484279c7b99ac28942d2e99f8"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":754,"projection_hash":"7379e378deffb4f70e6f0d7d61eed7fbc7d707cafb675e11ce7b307b04b416e5"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -241,6 +241,7 @@
 {"id":"fln-iron-target-profile-contract-ba9"}
 {"id":"fln-it70"}
 {"id":"fln-ivm"}
+{"id":"fln-j0hb"}
 {"id":"fln-jde"}
 {"id":"fln-jjun"}
 {"id":"fln-judgement-row-not-bound-to-its-closure-iumd"}
