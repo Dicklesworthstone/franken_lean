@@ -17,6 +17,27 @@ fn tick(remaining: &mut u64) -> Result<()> {
     Ok(())
 }
 
+fn is_pattern_gadget(name: &Name, levels: &[fln_core::level::Level]) -> bool {
+    let wildcard = Name::from_components(["[grind_dontcare]"]);
+    if *name == wildcard {
+        return levels.is_empty();
+    }
+    // Lean 4's `NormalizePattern` synthesizes these syntactic pattern gadgets
+    // directly by name (e.g. `Init.Prelude`'s `Nat.ctorIdx_succ` uses
+    // `Lean.Grind.offset`, which is declared later in `Init.Grind.Util`).
+    // `import_captured` refuses all of them as `Unsupported` via `supported_head`.
+    [
+        "Lean.Grind.offset",
+        "Lean.Grind.genPattern",
+        "Lean.Grind.genHEqPattern",
+        "Lean.Grind.eqBwdPattern",
+        "Lean.Grind.nestedProof",
+        "Lean.Grind.nestedDecidable",
+    ]
+    .iter()
+    .any(|gadget| *name == Name::from_components(gadget.split('.')))
+}
+
 fn names(row: &metadata::GrindPatternEntry, remaining: &mut u64) -> Result<BTreeSet<Name>> {
     let mut result = BTreeSet::new();
     tick(remaining)?;
@@ -25,7 +46,6 @@ fn names(row: &metadata::GrindPatternEntry, remaining: &mut u64) -> Result<BTree
         tick(remaining)?;
         result.insert(symbol.clone());
     }
-    let wildcard = Name::from_components(["[grind_dontcare]"]);
     let mut seen = HashSet::new();
     let mut pending = vec![(&row.proof, false)];
     for pattern in &row.patterns {
@@ -47,9 +67,10 @@ fn names(row: &metadata::GrindPatternEntry, remaining: &mut u64) -> Result<BTree
             .map_err(|_| SourceOleanImportError::Limit("grind-pattern dependency allocation"))?;
         match expression.node() {
             ExprNode::Const { name, levels } => {
-                // This reserved symbol is metadata syntax, never a declaration
-                // or proof. Its position and type are checked by import_captured.
-                if !(pattern && *name == wildcard && levels.is_empty()) {
+                // Pattern gadgets are metadata syntax, never a declaration or
+                // proof. `import_captured` checks wildcards and defers all
+                // other gadgets via `supported_head`.
+                if !(pattern && is_pattern_gadget(name, levels)) {
                     result.insert(name.clone());
                 }
             }

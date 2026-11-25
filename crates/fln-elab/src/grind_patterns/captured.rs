@@ -33,6 +33,24 @@ pub(crate) fn ground_pattern(expression: &Expr) -> Option<&Expr> {
     }
 }
 
+fn contains_wildcard(root: &Expr, remaining: &mut usize) -> Result<bool, Error> {
+    let mut stack = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(node) = stack.pop() {
+        spend(remaining)?;
+        if !seen.insert(node.allocation_identity()) {
+            continue;
+        }
+        if is_wildcard(node) {
+            return Ok(true);
+        }
+        if let ExprNode::App { f, a } = node.node() {
+            stack.extend([f, a]);
+        }
+    }
+    Ok(false)
+}
+
 fn constant(
     env: &Environment,
     expression: &Expr,
@@ -114,14 +132,22 @@ pub(super) fn validate_with(
             continue;
         }
         if argument && let ExprNode::BVar { idx } = expression.node() {
-            if *idx >= row.num_params || *idx < row.num_params - row.data_params {
+            if *idx >= row.num_params {
                 return Err(Error::Malformed);
+            }
+            if *idx < row.num_params - row.data_params {
+                return Err(Error::Unsupported(
+                    "a captured pattern binding a proof parameter",
+                ));
             }
             covered[(row.num_params - idx - 1) as usize] = true;
             continue;
         }
-        // All closed children are explicitly marked by NormalizePattern.goArg.
-        if argument && !expression.has_loose_bvars() {
+        // Closed children without wildcards are explicitly marked by
+        // NormalizePattern.goArg; nested non-ground applications whose bound
+        // variables were replaced by `[grind_dontcare]` (e.g. `List [grind_dontcare]`
+        // in `Init.GetElem`) have no loose bvars left and stay ordinary applications.
+        if argument && !expression.has_loose_bvars() && !contains_wildcard(expression, remaining)? {
             return Err(Error::Malformed);
         }
         let mut head = expression;

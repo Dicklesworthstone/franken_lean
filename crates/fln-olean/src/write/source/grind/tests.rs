@@ -251,6 +251,16 @@ fn mixed_grind_blocks_preserve_physical_row_windows_and_deferred_accounting() {
             1,
             expression(&Expr::app(row().proof, Expr::const_(n("a"), vec![]))),
         ),
+        replace_field(
+            3,
+            list(vec![expression(&Expr::app(
+                Expr::const_(
+                    n("List.Sublist"),
+                    vec![Level::mvar(fln_core::level::LMVarId(n("_uniq.6061")))],
+                ),
+                Expr::const_(n(source_extensions::GRIND_DONT_CARE), vec![]),
+            ))]),
+        ),
     ];
     deferred.push(wire(fields(&row()), &[1]));
     let expected_deferred = deferred.len();

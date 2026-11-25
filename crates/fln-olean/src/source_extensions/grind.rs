@@ -202,6 +202,13 @@ impl Reader {
             patterns.push(self.grind_expr(&pattern)?);
             rest = tail;
         }
+        // Pinned `Init` modules (e.g. `Init.Data.List.Sublist` / `Init.Data.List.Erase`)
+        // persist valid global `grind_pattern` rows whose wildcard support patterns carry
+        // an unassigned universe-level metavariable (`List.Sublist.{?_uniq.N} [grind_dontcare]`).
+        // Keep those rows explicitly deferred rather than rejecting the module as malformed.
+        if patterns.iter().any(Expr::has_level_mvar) {
+            return Ok(None);
+        }
         let row = GrindPatternEntry {
             declaration,
             proof,

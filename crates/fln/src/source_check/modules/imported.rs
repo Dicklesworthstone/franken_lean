@@ -114,11 +114,15 @@ impl SourceOleanImportLimits {
     pub fn new(check: OleanCheckLimits) -> Self {
         Self {
             check,
-            // The pinned Std closure has 965 modules and charges 72,157 metadata
-            // entries, including extern list and structure array cells. Keep a
-            // finite ceiling with headroom above that measured requirement.
-            // Bytes, objects, indices and instance keys remain independently bound.
+            // The pinned Std closure has 965 modules and charges 72,157+ metadata
+            // entries, and decoding the pin's `Lean.Meta.Grind.grindExt` journal
+            // (3,385 rows in Init, 7,447 rows in Init+Std) pushes cumulative
+            // materialized extension objects past DecodeLimits::default()'s 1M
+            // ceiling. Keep finite ceilings with headroom above the measured
+            // Init/Std requirements; bytes, objects, entries, indices and keys
+            // remain independently bound.
             metadata: DecodeLimits {
+                max_objects: 1 << 23,
                 max_entries: 1 << 17,
                 // Preserve the separately bounded allowance for simp index cells.
                 max_indices: 1 << 17,
@@ -3884,6 +3888,24 @@ pub(super) mod tests {
                 SourceOleanImportError::Limit("metadata entries")
                     | SourceOleanImportError::Decode(metadata::DecodeError::Limit {
                         resource: "entries"
+                    })
+            ));
+
+            let mut former_objects_limit = source_limits;
+            former_objects_limit.metadata.max_objects = 1_000_000;
+            let obj_failure =
+                match prepare_source_metadata(&modules, &roots, former_objects_limit, None) {
+                    Err(failure) => failure,
+                    Ok(_) => {
+                        panic!("the former 1M object cap must still refuse the same real metadata")
+                    }
+                };
+            assert!(obj_failure.metadata_resource_exhausted(), "{obj_failure}");
+            assert!(matches!(
+                obj_failure,
+                SourceOleanImportError::Limit(_)
+                    | SourceOleanImportError::Decode(metadata::DecodeError::Limit {
+                        resource: "objects"
                     })
             ));
         });

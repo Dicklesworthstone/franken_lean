@@ -281,3 +281,110 @@ fn malformed_counts_cannot_hide_behind_unsupported_proof_telescope_shapes() {
         )),
     ));
 }
+
+#[test]
+fn pinned_init_wildcard_subapps_import_and_proof_param_bvars_defer_cleanly() {
+    let env = fixture();
+    let u = Level::param(n("u"));
+    let u_sort = Expr::sort(u.clone().succ().unwrap());
+    let env = axiom(
+        &env,
+        "Wrap",
+        vec![n("u")],
+        pi("α", u_sort.clone(), u_sort.clone()),
+    );
+    let env = axiom(
+        &env,
+        "pairRule",
+        vec![n("u")],
+        pi(
+            "α",
+            u_sort.clone(),
+            pi(
+                "x",
+                Expr::app(Expr::const_(n("Wrap"), vec![u.clone()]), b(0)),
+                pi("h", c("P"), c("P")),
+            ),
+        ),
+    );
+
+    // Nested support application whose bound variable was replaced by `[grind_dontcare]`
+    // (`Wrap [grind_dontcare]` has no loose bvars left, matching `Init.GetElem`).
+    let wrap_wc = Expr::app(
+        Expr::const_(n("Wrap"), vec![u.clone()]),
+        registry::wildcard(),
+    );
+    let env = axiom(
+        &env,
+        "outerTag",
+        vec![n("u")],
+        pi(
+            "α",
+            u_sort.clone(),
+            pi(
+                "wTy",
+                u_sort,
+                pi(
+                    "x",
+                    Expr::app(Expr::const_(n("Wrap"), vec![u.clone()]), b(1)),
+                    Expr::sort(Level::zero()),
+                ),
+            ),
+        ),
+    );
+    let pat = Expr::app(
+        Expr::app(
+            Expr::app(Expr::const_(n("outerTag"), vec![u.clone()]), b(2)),
+            wrap_wc,
+        ),
+        b(1),
+    );
+    let proof = Expr::const_(n("pairRule"), vec![u.clone()]);
+    let imported = import_captured(
+        &env,
+        budget(),
+        &n("pairRule"),
+        &proof,
+        3,
+        &[pat],
+        &[n("outerTag"), n("Wrap")],
+    )
+    .expect("wildcard-bearing nested support app must validate and import");
+    assert_eq!(imported.data_params, 2);
+
+    // Pattern referencing a trailing proof parameter (`bvar 0` when `num_params=3, data_params=2`)
+    // is valid foreign metadata (e.g. `Init.GetElem List.getElem_mem`) and must defer as
+    // `Unsupported`, never `Malformed`.
+    let env = axiom(
+        &env,
+        "proofTag",
+        vec![n("u")],
+        pi(
+            "α",
+            Expr::sort(u.clone().succ().unwrap()),
+            pi(
+                "x",
+                Expr::app(Expr::const_(n("Wrap"), vec![u.clone()]), b(0)),
+                pi("h", c("P"), Expr::sort(Level::zero())),
+            ),
+        ),
+    );
+    let proof_pat = Expr::app(
+        Expr::app(Expr::app(Expr::const_(n("proofTag"), vec![u]), b(2)), b(1)),
+        b(0),
+    );
+    assert!(matches!(
+        import_captured(
+            &env,
+            budget(),
+            &n("pairRule"),
+            &proof,
+            3,
+            &[proof_pat],
+            &[n("proofTag")],
+        ),
+        Err(NatDefinitionElabError::Inference(
+            SourceInferenceError::GrindPattern(GrindPatternError::Unsupported(_))
+        )),
+    ));
+}
