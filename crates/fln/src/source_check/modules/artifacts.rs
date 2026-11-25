@@ -1468,3 +1468,229 @@ pub(super) fn encode_pending(
     }
     Ok(Outcome::Complete(artifacts))
 }
+
+/// Extract normalized declaration-attribute tags introduced between `base` and
+/// `checked` from the exact native journals used by `.olean` export.
+///
+/// This is read-only inspection metadata for differential comparison (bead
+/// `fln-file-scale-t2-differential-5f1b`); it grants no kernel authority.
+pub fn extract_native_module_attributes(
+    base: &Environment,
+    checked: &Environment,
+) -> std::collections::BTreeMap<Name, std::collections::BTreeSet<String>> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut attrs: BTreeMap<Name, BTreeSet<String>> = BTreeMap::new();
+    let mut tag = |decl: Name, label: String| {
+        attrs.entry(decl).or_default().insert(label);
+    };
+    let work = 1_000_000usize;
+
+    if let Ok(Some((registrations, _))) =
+        fln_elab::instances::export::registrations(base, checked, work)
+    {
+        for class in registrations.classes {
+            tag(class.name.clone(), "class".to_owned());
+            if !class.parameters.out_params.is_empty() {
+                tag(
+                    class.name.clone(),
+                    format!("class:out_params={:?}", class.parameters.out_params),
+                );
+            }
+            if !class.parameters.out_level_params.is_empty() {
+                tag(
+                    class.name,
+                    format!(
+                        "class:out_level_params={:?}",
+                        class.parameters.out_level_params
+                    ),
+                );
+            }
+        }
+        for instance in registrations.instances {
+            tag(
+                instance.declaration.clone(),
+                format!("instance:priority={}", instance.priority),
+            );
+            if let Some(scope) = instance.scope {
+                tag(
+                    instance.declaration,
+                    format!("instance:scope={}", scope.to_display_string()),
+                );
+            }
+        }
+    }
+
+    if let Ok(defaults) = fln_elab::instances::defaults::registrations(base, checked, work) {
+        for row in defaults.entries {
+            tag(
+                row.candidate.declaration,
+                format!(
+                    "default_instance:class={},priority={}",
+                    row.class.to_display_string(),
+                    row.candidate.priority
+                ),
+            );
+        }
+    }
+
+    if let Ok(simps) = fln_elab::source::scope::simp::export::registrations(base, checked, work) {
+        use fln_elab::source::scope::simp::export::Kind;
+        for row in simps.entries {
+            match row {
+                Kind::Unfold(decl) => tag(decl, "simp:unfold".to_owned()),
+                Kind::UnfoldTheorems { declaration, .. } => {
+                    tag(declaration, "simp:unfold_theorems".to_owned());
+                }
+                Kind::Theorem(theorem) => {
+                    tag(
+                        theorem.origin,
+                        format!("simp:theorem:priority={}", theorem.priority),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Ok(exported) = fln_elab::reducibility::export::statuses(base, checked, work) {
+        let status_label = |status: fln_elab::reducibility::Reducibility| match status {
+            fln_elab::reducibility::Reducibility::Reducible => "reducibility:reducible",
+            fln_elab::reducibility::Reducibility::Semireducible => "reducibility:semireducible",
+            fln_elab::reducibility::Reducibility::Irreducible => "reducibility:irreducible",
+            fln_elab::reducibility::Reducibility::ImplicitReducible => {
+                "reducibility:implicit_reducible"
+            }
+        };
+        let mut explicit = BTreeSet::new();
+        for row in exported.owned {
+            explicit.insert(row.declaration.clone());
+            tag(row.declaration, status_label(row.status).to_owned());
+        }
+        for row in exported.imported {
+            tag(
+                row.declaration,
+                format!("extra:{}", status_label(row.status)),
+            );
+        }
+        if let Ok(Some((registrations, _))) =
+            fln_elab::instances::export::registrations(base, checked, work)
+        {
+            for instance in registrations.instances {
+                if explicit.insert(instance.declaration.clone()) {
+                    tag(
+                        instance.declaration,
+                        "reducibility:implicit_reducible".to_owned(),
+                    );
+                }
+            }
+        }
+    }
+
+    if let (Ok(inherited), Ok(current)) = (
+        fln_elab::protected_names::ProtectedNames::read(base),
+        fln_elab::protected_names::ProtectedNames::read(checked),
+    ) {
+        for name in current.iter() {
+            if !inherited.contains(name) {
+                tag(name.clone(), "protected".to_owned());
+            }
+        }
+    }
+
+    if let (Ok(inherited), Ok(current)) = (
+        fln_elab::deprecations::Deprecations::read(base),
+        fln_elab::deprecations::Deprecations::read(checked),
+    ) {
+        for row in current.iter() {
+            if inherited.get(&row.declaration).is_none() {
+                tag(row.declaration.clone(), "deprecated".to_owned());
+            }
+        }
+    }
+
+    if let (Ok(inherited), Ok(current)) = (
+        fln_elab::aux_recursors::AuxRecursors::read(base),
+        fln_elab::aux_recursors::AuxRecursors::read(checked),
+    ) {
+        for name in current.iter() {
+            if !inherited.contains(name) {
+                tag(name.clone(), "aux_recursor".to_owned());
+            }
+        }
+    }
+
+    if let (Ok(inherited), Ok(current)) = (
+        fln_elab::noncomputable::read(base),
+        fln_elab::noncomputable::read(checked),
+    ) {
+        for name in current {
+            if !inherited.contains(&name) {
+                tag(name, "noncomputable".to_owned());
+            }
+        }
+    }
+
+    if let (Ok(inherited), Ok(current)) =
+        (fln_elab::unbox::read(base), fln_elab::unbox::read(checked))
+    {
+        for name in current {
+            if !inherited.contains(&name) {
+                tag(name, "unbox".to_owned());
+            }
+        }
+    }
+
+    if let (Ok(inherited), Ok(current)) = (
+        fln_elab::match_pattern::read(base),
+        fln_elab::match_pattern::read(checked),
+    ) {
+        for name in current {
+            if !inherited.contains(&name) {
+                tag(name, "match_pattern".to_owned());
+            }
+        }
+    }
+
+    if let (Ok(inherited), Ok(current)) =
+        (fln_elab::symm::read(base), fln_elab::symm::read(checked))
+        && current.starts_with(&inherited)
+    {
+        for entry in current.into_iter().skip(inherited.len()) {
+            tag(entry.lemma.declaration, "symm".to_owned());
+        }
+    }
+
+    if let (Ok(inherited), Ok(current)) = (
+        fln_elab::delaborator_tags::coercions::read(base),
+        fln_elab::delaborator_tags::coercions::read(checked),
+    ) && current.starts_with(&inherited)
+    {
+        use fln_elab::delaborator_tags::CoeFnKind;
+        for (decl, info) in current.into_iter().skip(inherited.len()) {
+            let kind = match info.kind {
+                CoeFnKind::Coe => "coe",
+                CoeFnKind::CoeFun => "coe_fun",
+                CoeFnKind::CoeSort => "coe_sort",
+            };
+            tag(
+                decl,
+                format!("coe:{kind}:{}:{}", info.num_args, info.coercee),
+            );
+        }
+    }
+
+    if let Ok(Some(inline)) = fln_elab::macro_inline::export::registrations(base, checked, work) {
+        for decl in inline.declarations {
+            tag(decl, "inline:macro_inline".to_owned());
+        }
+    }
+
+    if let Ok(structures) = fln_elab::records::imported::export::registrations(base, checked, work)
+    {
+        for row in structures.structures {
+            tag(row.name, "structure".to_owned());
+        }
+    }
+
+    attrs
+}

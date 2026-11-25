@@ -128,6 +128,42 @@ impl Loaded {
             .is_some_and(|oleans| oleans.iter().any(|olean| &olean.name == module))
     }
 
+    /// Process-local content digest over every `.olean` byte and import root in
+    /// this closure. Used by `LeanImportBaseCache` so repeated read-only `lean`
+    /// captures over identical `.olean` bytes share the council-admitted receipt
+    /// in memory without weakening admission authority.
+    pub(super) fn closure_cache_key(&self) -> Result<Option<fln_hash::domain::Digest>, Failure> {
+        if !self.has_external_imports() {
+            return Ok(None);
+        }
+        let oleans = self.oleans()?;
+        if oleans.is_empty() {
+            return Ok(None);
+        }
+        let inputs: Vec<fln::OleanModuleInput<'_>> = oleans
+            .iter()
+            .map(|import| {
+                let [exported, server, private] = &import.parts;
+                fln::OleanModuleInput {
+                    name: &import.name,
+                    artifact: exported,
+                    server_artifact: (!server.is_empty()).then_some(server.as_slice()),
+                    private_artifact: (!private.is_empty()).then_some(private.as_slice()),
+                }
+            })
+            .collect();
+        let digest = fln::source_check::modules::reuse::ImportClosureKey::compute(
+            &inputs,
+            &self.olean_roots,
+            &fln::KVMap::new(),
+            fln::source_check::modules::reuse::CheckerIdentity::of_executable(
+                b"fln.lean-capture-import-world/1",
+            ),
+        )
+        .digest();
+        Ok(Some(digest))
+    }
+
     /// The base engine source is checked against: the council-admitted
     /// `.olean` closure when the source imports one, else `seed()`. `jobs`
     /// closure modules are checked at once, each worker on a stack of the

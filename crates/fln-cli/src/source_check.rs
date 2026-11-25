@@ -4,6 +4,7 @@ use fln::source_check::modules::imported::SourceOleanImport;
 use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
 mod imports;
 pub(super) mod lsp;
+pub use imports::execution::LeanImportBaseCache;
 pub(super) use imports::macros::Config as ImportedMacroConfig;
 
 /// An admitted or reused external import closure, with the posture report that says which.
@@ -294,6 +295,19 @@ pub(super) fn run_imported_lean(
             4,
         )
     })
+}
+
+/// Capture the exact `lean` front-door output and newly-admitted checked module
+/// declarations/attributes without bypassing or duplicating the production
+/// pipeline (bead `fln-file-scale-t2-differential-5f1b`).
+pub(super) fn capture_imported_lean(
+    path: &Path,
+    max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
+    vm_limits: fln::VmExecutionLimits,
+    base_cache: Option<std::sync::Arc<LeanImportBaseCache>>,
+) -> (MultiplexerOutput, Vec<crate::CapturedLeanModule>) {
+    imports::execution::capture_lean(path, max_bytes, import_jobs, vm_limits, base_cache)
 }
 
 /// Execute a script in its ordinary Lean import world, then invoke its main.

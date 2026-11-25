@@ -62,6 +62,7 @@ pub enum PinRig {
     G04NoMockE2e,
     DiagnosticProjectionNoMockE2e,
     OleanMixedProducerNoMockE2e,
+    FileScaleT2Differential,
 }
 
 impl PinRig {
@@ -80,6 +81,7 @@ impl PinRig {
         Self::G04NoMockE2e,
         Self::DiagnosticProjectionNoMockE2e,
         Self::OleanMixedProducerNoMockE2e,
+        Self::FileScaleT2Differential,
     ];
 
     /// The exact executable unit this record describes.
@@ -125,6 +127,9 @@ impl PinRig {
             Self::OleanMixedProducerNoMockE2e => {
                 "test:fln-conformance::olean_mixed_producer_no_mock_e2e::olean_mixed_producer_no_mock_e2e"
             }
+            Self::FileScaleT2Differential => {
+                "test:fln-conformance::file_scale_t2_differential::file_scale_t2_differential_matches_ratchet_and_controls"
+            }
         }
     }
 
@@ -145,6 +150,7 @@ impl PinRig {
             Self::G04NoMockE2e => "G04NoMockE2e",
             Self::DiagnosticProjectionNoMockE2e => "DiagnosticProjectionNoMockE2e",
             Self::OleanMixedProducerNoMockE2e => "OleanMixedProducerNoMockE2e",
+            Self::FileScaleT2Differential => "FileScaleT2Differential",
         }
     }
 
@@ -164,6 +170,7 @@ impl PinRig {
             Self::G04NoMockE2e => "g0_4_no_mock_e2e",
             Self::DiagnosticProjectionNoMockE2e => "diagnostic_projection_no_mock_e2e",
             Self::OleanMixedProducerNoMockE2e => "olean_mixed_producer_no_mock_e2e",
+            Self::FileScaleT2Differential => "file_scale_t2_differential",
         }
     }
 

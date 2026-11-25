@@ -7,7 +7,7 @@ use super::*;
 use crate::SourceModuleInput;
 use std::collections::BTreeMap;
 
-mod artifacts;
+pub(crate) mod artifacts;
 mod cache;
 mod contexts;
 pub mod execution;

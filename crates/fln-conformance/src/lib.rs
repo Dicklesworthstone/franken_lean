@@ -73,6 +73,7 @@ mod public_surface_generated;
 pub mod stdlib_frontier;
 pub mod suite_upgrade;
 pub mod syntax_hygiene;
+pub mod t2_differential;
 pub mod tcb_inventory;
 pub mod trace_replay;
 pub mod tree_identity;

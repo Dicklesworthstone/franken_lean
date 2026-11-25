@@ -15905,6 +15905,90 @@ pub fn run_lean(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     run_lean_with_optional_input(arguments, None)
 }
 
+/// One checked source module captured from the exact production `lean` front
+/// door (bead `fln-file-scale-t2-differential-5f1b`). Read-only inspection data;
+/// grants no kernel or cache authority.
+#[derive(Debug, Clone)]
+pub struct CapturedLeanModule {
+    pub module: fln::Name,
+    pub constants: Vec<fln::ConstantInfo>,
+    pub attributes: BTreeMap<fln::Name, BTreeSet<String>>,
+}
+
+/// Typed classification of a front-door `lean` capture run (FL-INV-07:
+/// resource/capability/inconclusive stops are never promoted to rejection).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeanSourceCaptureOutcome {
+    Accepted,
+    Rejected,
+    Inconclusive { exit_code: u8 },
+    InternalFault { exit_code: u8 },
+}
+
+/// Complete output and checked module deltas from running the exact production
+/// `lean` front door on a single entry file (including any local imports).
+#[derive(Debug)]
+pub struct LeanSourceCapture {
+    pub output: MultiplexerOutput,
+    pub outcome: LeanSourceCaptureOutcome,
+    pub modules: Vec<CapturedLeanModule>,
+}
+
+pub use source_check::LeanImportBaseCache;
+
+/// Run the exact production `lean` front-door pipeline on `path` and return
+/// both its process output and the checked declaration/attribute deltas for
+/// every local source module elaborated during the run.
+pub fn capture_lean_source(
+    path: &Path,
+    max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
+    vm_limits: fln::VmExecutionLimits,
+) -> LeanSourceCapture {
+    capture_lean_source_impl(path, max_bytes, import_jobs, vm_limits, None)
+}
+
+/// Same exact production `lean` front-door capture as [`capture_lean_source`],
+/// sharing council-admitted `.olean` import receipts across calls whose
+/// `.olean` closure digest matches identically.
+pub fn capture_lean_source_with_cache(
+    path: &Path,
+    max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
+    vm_limits: fln::VmExecutionLimits,
+    base_cache: &std::sync::Arc<LeanImportBaseCache>,
+) -> LeanSourceCapture {
+    capture_lean_source_impl(
+        path,
+        max_bytes,
+        import_jobs,
+        vm_limits,
+        Some(std::sync::Arc::clone(base_cache)),
+    )
+}
+
+fn capture_lean_source_impl(
+    path: &Path,
+    max_bytes: usize,
+    import_jobs: std::num::NonZeroUsize,
+    vm_limits: fln::VmExecutionLimits,
+    base_cache: Option<std::sync::Arc<LeanImportBaseCache>>,
+) -> LeanSourceCapture {
+    let (output, modules) =
+        source_check::capture_imported_lean(path, max_bytes, import_jobs, vm_limits, base_cache);
+    let outcome = match output.exit_code {
+        0 => LeanSourceCaptureOutcome::Accepted,
+        1 => LeanSourceCaptureOutcome::Rejected,
+        4 => LeanSourceCaptureOutcome::InternalFault { exit_code: 4 },
+        code => LeanSourceCaptureOutcome::Inconclusive { exit_code: code },
+    };
+    LeanSourceCapture {
+        output,
+        outcome,
+        modules,
+    }
+}
+
 /// Run the bounded native `lean` personality with an explicit standard-input
 /// source. The reader is touched only when `arguments` selects `--stdin`.
 pub fn run_lean_with_input(

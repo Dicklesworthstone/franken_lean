@@ -8706,6 +8706,37 @@ impl SourceCommandBatchExecution {
             complete: true,
         }
     }
+
+    /// Return the checked constants admitted by this file above its import base,
+    /// in deterministic display-name order. Read-only inspection view; grants no
+    /// authority.
+    pub fn newly_admitted_constants(&self) -> Vec<ConstantInfo> {
+        let mut constants: Vec<ConstantInfo> = self
+            .batch
+            .engine
+            .environment()
+            .constants()
+            .filter(|(name, _)| !self.final_file_base.contains(name))
+            .map(|(_, info)| info.clone())
+            .collect();
+        constants.sort_by(|a, b| {
+            a.name()
+                .to_display_string()
+                .cmp(&b.name().to_display_string())
+        });
+        constants
+    }
+
+    /// Return the normalized native attribute tags introduced by this file above
+    /// its import base. Read-only inspection view; grants no authority.
+    pub fn newly_admitted_attributes(
+        &self,
+    ) -> std::collections::BTreeMap<Name, std::collections::BTreeSet<String>> {
+        crate::source_check::modules::artifacts::extract_native_module_attributes(
+            &self.final_file_base,
+            self.batch.engine.environment(),
+        )
+    }
 }
 
 impl<'a> SourceCommandObservation<'a> {

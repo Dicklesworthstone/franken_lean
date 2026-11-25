@@ -141,6 +141,10 @@ pub const ARTIFACT_PUBLICATION_PREFIX: &str = "fln-artifact-publication-";
 /// `crates/fln-conformance/tests/olean_mixed_producer_no_mock_e2e.rs` — the fresh
 /// FrankenLean-written module generations the pinned Reference consumes.
 pub const OLEAN_MIXED_PRODUCER_PREFIX: &str = "fln-olean-mixed-producer-";
+/// `crates/fln-conformance/src/t2_differential.rs` — file-scale T2 declaration-identity
+/// differential workspaces, pinned `.olean` outputs, and crash/resume checkpoints
+/// (bead `fln-file-scale-t2-differential-5f1b`).
+pub const T2_DIFFERENTIAL_PREFIX: &str = "fln-t2-differential-";
 
 /// One scratch-root namespace: its prefix, the constant producers name it by, the source
 /// that produces it, and whether that source routes through [`ScratchRoot`].
@@ -253,6 +257,12 @@ pub const SCRATCH_FAMILIES: &[ScratchFamily] = &[
         prefix: OLEAN_MIXED_PRODUCER_PREFIX,
         constant: "OLEAN_MIXED_PRODUCER_PREFIX",
         producer: "crates/fln-conformance/tests/olean_mixed_producer_no_mock_e2e.rs",
+        routed: true,
+    },
+    ScratchFamily {
+        prefix: T2_DIFFERENTIAL_PREFIX,
+        constant: "T2_DIFFERENTIAL_PREFIX",
+        producer: "crates/fln-conformance/src/t2_differential.rs",
         routed: true,
     },
     // --- declared remainders; each one's reason is in the module header. A row here

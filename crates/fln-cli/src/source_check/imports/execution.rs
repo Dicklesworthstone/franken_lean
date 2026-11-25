@@ -225,6 +225,34 @@ fn with_observed_prefix(
     failed
 }
 
+type CachedOleanSlot = std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<SourceOleanImport>>>>;
+
+/// Process-local cache of council-admitted `.olean` import closures keyed by
+/// exact `(olean_roots, artifact bytes)` digest. Only consulted on read-only
+/// `lean` captures with no imported user macros; never weakens admission
+/// authority.
+#[derive(Default)]
+pub struct LeanImportBaseCache {
+    slots: std::sync::Mutex<std::collections::BTreeMap<fln_hash::domain::Digest, CachedOleanSlot>>,
+}
+
+impl LeanImportBaseCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn slot(&self, key: fln_hash::domain::Digest) -> CachedOleanSlot {
+        let mut map = self
+            .slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::sync::Arc::clone(
+            map.entry(key)
+                .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(None))),
+        )
+    }
+}
+
 /// Legacy FlN inputs retain their bounded runner. Every Lean source file uses
 /// ordinary module semantics, independently of whether `main` is invoked.
 /// Header parsing and admission stay on a worker sized for imported declarations.
@@ -239,19 +267,81 @@ pub(in crate::source_check) fn run(
     vm_limits: fln::VmExecutionLimits,
     main_arguments: Option<Vec<String>>,
 ) -> Option<MultiplexerOutput> {
+    run_with_capture(
+        paths,
+        max_bytes,
+        presentation,
+        publication,
+        jobs,
+        posture,
+        vm_limits,
+        main_arguments,
+        false,
+        None,
+    )
+    .0
+}
+
+pub(in crate::source_check) fn capture_lean(
+    path: &Path,
+    max_bytes: usize,
+    jobs: std::num::NonZeroUsize,
+    vm_limits: fln::VmExecutionLimits,
+    base_cache: Option<std::sync::Arc<LeanImportBaseCache>>,
+) -> (MultiplexerOutput, Vec<crate::CapturedLeanModule>) {
+    let (output, modules) = run_with_capture(
+        &[path.to_path_buf()],
+        max_bytes,
+        Presentation::Lean,
+        SourcePublication::None,
+        jobs,
+        ImportPosture::ReuseVerified,
+        vm_limits,
+        None,
+        true,
+        base_cache,
+    );
+    let output = output.unwrap_or_else(|| {
+        source_failure(
+            "internal-fault",
+            "the Lean source route did not retain its import context",
+            false,
+            SourcePresentation::Lean,
+            4,
+        )
+    });
+    (output, modules)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_capture(
+    paths: &[PathBuf],
+    max_bytes: usize,
+    presentation: Presentation,
+    publication: SourcePublication,
+    jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
+    vm_limits: fln::VmExecutionLimits,
+    main_arguments: Option<Vec<String>>,
+    capture_modules: bool,
+    base_cache: Option<std::sync::Arc<LeanImportBaseCache>>,
+) -> (Option<MultiplexerOutput>, Vec<crate::CapturedLeanModule>) {
     let ordinary_lean = matches!(presentation, Presentation::Lean);
     let sources = match read_source_batch(paths, max_bytes) {
         Ok(sources) => sources,
         Err(error) if ordinary_lean => {
-            return Some(source_failure(
-                error.class(),
-                &error.to_string(),
-                false,
-                SourcePresentation::Lean,
-                error.exit_code(),
-            ));
+            return (
+                Some(source_failure(
+                    error.class(),
+                    &error.to_string(),
+                    false,
+                    SourcePresentation::Lean,
+                    error.exit_code(),
+                )),
+                Vec::new(),
+            );
         }
-        Err(_) => return None,
+        Err(_) => return (None, Vec::new()),
     };
     let paths = paths.to_vec();
     run_loaded(
@@ -266,6 +356,8 @@ pub(in crate::source_check) fn run(
         posture,
         vm_limits,
         main_arguments,
+        capture_modules,
+        base_cache,
     )
 }
 
@@ -287,7 +379,10 @@ pub(in crate::source_check) fn run_stdin(
         ImportPosture::ReuseVerified,
         vm_limits,
         None,
+        false,
+        None,
     )
+    .0
 }
 
 pub(in crate::source_check) fn run_package(
@@ -316,7 +411,10 @@ pub(in crate::source_check) fn run_package(
         posture,
         vm_limits,
         arguments,
+        false,
+        None,
     )
+    .0
     .unwrap_or_else(|| {
         failure(
             internal("the package source route lost its import context"),
@@ -338,8 +436,13 @@ fn run_loaded(
     posture: ImportPosture,
     vm_limits: fln::VmExecutionLimits,
     main_arguments: Option<Vec<String>>,
-) -> Option<MultiplexerOutput> {
+    capture_modules: bool,
+    base_cache: Option<std::sync::Arc<LeanImportBaseCache>>,
+) -> (Option<MultiplexerOutput>, Vec<crate::CapturedLeanModule>) {
     let ordinary_lean = matches!(presentation, Presentation::Lean);
+    let captured_modules: std::sync::Arc<std::sync::Mutex<Vec<crate::CapturedLeanModule>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_for_worker = std::sync::Arc::clone(&captured_modules);
     let worker = std::thread::Builder::new()
         .name("fln-imported-source-run".to_owned())
         .stack_size(OLEAN_CHECK_KERNEL_STACK_BYTES)
@@ -448,22 +551,56 @@ fn run_loaded(
             if let Err(error) = preflight {
                 return Some(module_failure(error, presentation, &names[0], &sources[0], &display));
             }
-            let (_, mut base) = match loaded.base_engine(
-                || Ok(fln::Engine::from_environment(fln::Environment::new())),
-                jobs,
-                posture,
-            ) {
-                Ok(base) => base,
-                Err(error) => return Some(failure(error, presentation)),
-            };
-            let mut empty;
-            let receipt = match &mut base {
-                Some(base) => &mut base.receipt,
-                None => {
-                    empty = SourceOleanImport::empty(&fln::KVMap::new());
-                    &mut empty
+            let cached_receipt: Option<std::sync::Arc<SourceOleanImport>> =
+                if macro_inputs.is_none()
+                    && ordinary_lean
+                    && let Some(cache) = base_cache.as_ref()
+                    && let Some(key) = match loaded.closure_cache_key() {
+                        Ok(key) => key,
+                        Err(error) => return Some(failure(error, presentation)),
+                    }
+                {
+                    let slot = cache.slot(key);
+                    let mut guard = slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(existing) = guard.as_ref() {
+                        Some(std::sync::Arc::clone(existing))
+                    } else {
+                        let (_, admitted) = match loaded.base_engine(
+                            || Ok(fln::Engine::from_environment(fln::Environment::new())),
+                            jobs,
+                            posture,
+                        ) {
+                            Ok(base) => base,
+                            Err(error) => return Some(failure(error, presentation)),
+                        };
+                        let Some(admitted) = admitted else {
+                            return Some(failure(
+                                internal("external import closure returned no receipt"),
+                                presentation,
+                            ));
+                        };
+                        let arc = std::sync::Arc::new(admitted.receipt);
+                        *guard = Some(std::sync::Arc::clone(&arc));
+                        Some(arc)
+                    }
+                } else {
+                    None
+                };
+            let mut base = if cached_receipt.is_some() {
+                None
+            } else {
+                match loaded.base_engine(
+                    || Ok(fln::Engine::from_environment(fln::Environment::new())),
+                    jobs,
+                    posture,
+                ) {
+                    Ok((_, base)) => base,
+                    Err(error) => return Some(failure(error, presentation)),
                 }
             };
+            let mut empty;
             if macro_inputs.is_some()
                 && matches!(&publication, SourcePublication::Flbc { sidecar: Some(_), .. })
             {
@@ -484,6 +621,13 @@ fn run_loaded(
                 }
             };
             let execution = if let Some(prepared) = macro_inputs {
+                let receipt = match &mut base {
+                    Some(base) => &mut base.receipt,
+                    None => {
+                        empty = SourceOleanImport::empty(&fln::KVMap::new());
+                        &mut empty
+                    }
+                };
                 if let Err(error) = prepared.enable_syntax(receipt) {
                     return Some(failure(error, presentation));
                 }
@@ -533,6 +677,16 @@ fn run_loaded(
                     })
                 }
             } else if ordinary_lean {
+                let receipt: &SourceOleanImport = match cached_receipt.as_deref() {
+                    Some(receipt) => receipt,
+                    None => match &base {
+                        Some(base) => &base.receipt,
+                        None => {
+                            empty = SourceOleanImport::empty(&fln::KVMap::new());
+                            &empty
+                        }
+                    },
+                };
                 receipt.execute_lean_source_modules_with_observer_and_validation(
                     &inputs, &names[0], &fln::KVMap::new(), limits, None, evaluation_presentation,
                     &mut observe,
@@ -547,6 +701,13 @@ fn run_loaded(
                     fln::source_check::modules::execution::SourceProgramExecutionError::Validation { error, .. } => error,
                 })
             } else {
+                let receipt = match &base {
+                    Some(base) => &base.receipt,
+                    None => {
+                        empty = SourceOleanImport::empty(&fln::KVMap::new());
+                        &empty
+                    }
+                };
                 receipt.execute_source_modules_with_presentation(
                     &inputs, &names[0], &fln::KVMap::new(), limits, None, evaluation_presentation,
                 )
@@ -572,15 +733,32 @@ fn run_loaded(
                         source: &sources[0],
                     },
                 ) {
-                    Ok(output) => match main_arguments.as_ref() {
-                        Some(arguments) => main_output(
-                            &completed,
-                            arguments,
-                            limits.execution,
-                            output,
-                        ),
-                        None => output,
-                    },
+                    Ok(output) => {
+                        let final_output = match main_arguments.as_ref() {
+                            Some(arguments) => main_output(
+                                &completed,
+                                arguments,
+                                limits.execution,
+                                output,
+                            ),
+                            None => output,
+                        };
+                        if capture_modules && final_output.exit_code == 0 {
+                            let captured: Vec<crate::CapturedLeanModule> = completed
+                                .modules
+                                .iter()
+                                .map(|module| crate::CapturedLeanModule {
+                                    module: module.module.clone(),
+                                    constants: module.commands.newly_admitted_constants(),
+                                    attributes: module.commands.newly_admitted_attributes(),
+                                })
+                                .collect();
+                            if let Ok(mut guard) = captured_for_worker.lock() {
+                                *guard = captured;
+                            }
+                        }
+                        final_output
+                    }
                     Err(error) => failure(error, presentation),
                 },
                 Presentation::Fln { json } => {
@@ -601,7 +779,7 @@ fn run_loaded(
             })
             })
         });
-    match worker {
+    let output = match worker {
         Err(error) => Some(failure(
             Failure::resource(format!("could not start imported source worker: {error}")),
             presentation,
@@ -613,7 +791,12 @@ fn run_loaded(
                 presentation,
             )),
         },
-    }
+    };
+    let modules = captured_modules
+        .lock()
+        .map(|mut guard| std::mem::take(&mut *guard))
+        .unwrap_or_default();
+    (output, modules)
 }
 
 fn preflight_publication(publication: &SourcePublication) -> Result<(), Failure> {
