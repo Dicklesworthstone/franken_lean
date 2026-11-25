@@ -7037,15 +7037,22 @@ fn dispatch_intrinsic(
         }
         IntrinsicImplementation::Int64OfNat => {
             expect_arity(row, args, 1)?;
-            let low = with_int_view(&args[0], "Int64.ofNat", 0, |view| {
-                let limbs = view.magnitude.limbs_le();
-                let low_word = limbs.first().copied().unwrap_or(0);
-                if view.negative {
-                    (!low_word).wrapping_add(1)
-                } else {
-                    low_word
-                }
-            })?;
+            // Nat immediates retain the full unsigned payload; decoding them
+            // as Int would truncate/sign-extend through the i32 scalar plane.
+            // The pin's lean_int64_of_nat and lean_int64_of_int differ here.
+            let low = if row == "extern:Int64.ofNat" {
+                nat_low_u64(&args[0], "Int64.ofNat", 0)?
+            } else {
+                with_int_view(&args[0], "Int64.ofInt", 0, |view| {
+                    let limbs = view.magnitude.limbs_le();
+                    let low_word = limbs.first().copied().unwrap_or(0);
+                    if view.negative {
+                        (!low_word).wrapping_add(1)
+                    } else {
+                        low_word
+                    }
+                })?
+            };
             Ok(int64_result(low as i64))
         }
         IntrinsicImplementation::Int64ToInt => {
@@ -7169,15 +7176,19 @@ fn dispatch_intrinsic(
         }
         IntrinsicImplementation::ISizeOfNat => {
             expect_arity(row, args, 1)?;
-            let low = with_int_view(&args[0], "ISize.ofNat", 0, |view| {
-                let limbs = view.magnitude.limbs_le();
-                let low_word = limbs.first().copied().unwrap_or(0) as usize;
-                if view.negative {
-                    (!low_word).wrapping_add(1)
-                } else {
-                    low_word
-                }
-            })?;
+            let low = if row == "extern:ISize.ofNat" {
+                nat_low_u64(&args[0], "ISize.ofNat", 0)? as usize
+            } else {
+                with_int_view(&args[0], "ISize.ofInt", 0, |view| {
+                    let limbs = view.magnitude.limbs_le();
+                    let low_word = limbs.first().copied().unwrap_or(0) as usize;
+                    if view.negative {
+                        (!low_word).wrapping_add(1)
+                    } else {
+                        low_word
+                    }
+                })?
+            };
             Ok(isize_result(low as isize))
         }
         IntrinsicImplementation::ISizeToInt => {
@@ -11178,6 +11189,84 @@ mod tests {
             -999999
         );
         assert_eq!(int_i64(invoke("extern:Int64.toInt", &[n(42)])), 42);
+    }
+
+    #[test]
+    fn wide_signed_of_nat_preserves_the_full_scalar_payload() {
+        // Nat uses all 63 payload bits on the pinned 64-bit runtime. Int
+        // immediates instead represent i32, so the same payload has a
+        // different mathematical value once bit 31 is set.
+        let values = [
+            0,
+            (1_u64 << 31) - 1,
+            1_u64 << 31,
+            (1_u64 << 32) - 1,
+            1_u64 << 32,
+            (1_u64 << 32) + 7,
+            1_u64 << 62,
+            (usize::MAX >> 1) as u64,
+        ];
+        for row in ["extern:Int64.ofNat", "extern:ISize.ofNat"] {
+            for value in values {
+                let input = Obj::mk_nat(value as usize);
+                assert!(input.is_scalar());
+                for _ in 0..2 {
+                    assert_eq!(
+                        u64_val(invoke(row, std::slice::from_ref(&input))),
+                        value,
+                        "{row}: Nat {value}"
+                    );
+                    assert_eq!(input.unbox() as u64, value);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_signed_conversions_distinguish_nat_and_int_representations() {
+        for (of_nat, of_int) in [
+            ("extern:Int64.ofNat", "extern:Int64.ofInt"),
+            ("extern:ISize.ofNat", "extern:ISize.ofInt"),
+        ] {
+            // Higher limbs are discarded modulo 2^64; the low limb may
+            // itself have the sign bit set or be zero.
+            for low in [0, 7, 1_u64 << 63, u64::MAX] {
+                let positive = Obj::mk_mpz(&[low, 3], false);
+                for row in [of_nat, of_int] {
+                    assert_eq!(
+                        u64_val(invoke(row, std::slice::from_ref(&positive))),
+                        low,
+                        "{row}: positive mpz"
+                    );
+                }
+                assert_eq!(positive.try_mpz_view().unwrap().2, &[low, 3]);
+
+                let negative = Obj::mk_mpz(&[low, 3], true);
+                assert_eq!(
+                    u64_val(invoke(of_int, std::slice::from_ref(&negative))),
+                    low.wrapping_neg(),
+                    "{of_int}: negative mpz"
+                );
+                assert!(matches!(
+                    invoke(of_nat, std::slice::from_ref(&negative)),
+                    Err(VmRefusal::TypeMismatch { expected: "Nat", .. })
+                ));
+            }
+            for value in [
+                -1,
+                i64::from(i32::MIN),
+                i64::from(i32::MIN) - 1,
+                i64::from(i32::MAX) + 1,
+                i64::MIN,
+                i64::MAX,
+            ] {
+                assert_eq!(
+                    i64_val(invoke(of_int, &[Obj::mk_int(value)])),
+                    value,
+                    "{of_int}: Int {value}"
+                );
+            }
+        }
     }
 
     #[test]
