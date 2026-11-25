@@ -21,6 +21,22 @@ enum Taken {
     Eta(bool),
 }
 
+/// Classification of two same-head applications in [`Probe::same_head_arguments`].
+#[derive(Debug, PartialEq, Eq)]
+enum SameHeadMatch {
+    /// Same `Regular(_)` delta definition (optionally beneath matching bare
+    /// projections), matching pinned `type_checker.cpp:936` and `1131`: tried
+    /// speculatively under `Work::Attempt` so argument failure falls back to
+    /// lazy delta unfolding.
+    Speculative(Vec<(ExprId, ExprId)>),
+    /// Direct applications (no peeled projection) of an injective non-delta,
+    /// non-`Prop`, non-unit-like head (`Inductive`, or `Constructor` with
+    /// `num_fields > 0` of a statically non-`Prop` inductive): congruence is
+    /// exact (iff), so arguments are queued directly without `Work::Attempt`
+    /// or rollback/retry overhead.
+    Exact(Vec<(ExprId, ExprId)>),
+}
+
 #[derive(Debug)]
 pub(crate) enum ProofConversionOutcome {
     Complete { equal: bool, polls: u64 },
@@ -944,21 +960,24 @@ impl Probe<'_> {
         }
         Ok(answer)
     }
-    /// The argument pairs of two applications (possibly wrapped in identical
-    /// projection spines) of one non-`Abbrev` head: the same local, or the same
-    /// constant at equal universe levels, applied to equally many arguments.
-    ///
-    /// Matches pinned `type_checker.cpp:936` (`d_t->get_hints().is_regular()`)
-    /// and `defeq::collect_matching_regular_spine_args`: `Abbrev` heads (such
-    /// as `DFunLike.coe` / `LinearMap.instFunLike`) and projections over
-    /// differing heads never trigger speculative `Work::Attempt` congruence and
-    /// instead unfold directly via lazy delta.
+    /// Classify two applications of one matching constant head (at equal
+    /// universe levels and arity):
+    /// - `SameHeadMatch::Speculative` for `Regular(_)` delta definitions
+    ///   (optionally beneath matching bare projections), matching pinned
+    ///   `type_checker.cpp:936` (`d_t->get_hints().is_regular()`) and `1131`.
+    /// - `SameHeadMatch::Exact` for direct (unprojected) applications of
+    ///   injective non-delta, non-`Prop`, non-unit-like heads (`Inductive`, or
+    ///   a `Constructor` with `num_fields > 0` whose inductive lives in a
+    ///   statically nonzero `Sort`).
+    /// - `None` for `Abbrev` definitions, `Free` variables, `Axiom`/`Opaque`/
+    ///   `Theorem`/`Recursor`/`Quot`, `Prop`/0-field constructors, and applied
+    ///   projections so they never stack speculative `Work::Attempt` frames.
     fn same_head_arguments(
         &mut self,
         left: &WireExpr,
         right: &WireExpr,
         context: &InferenceContext,
-    ) -> Result<Option<Vec<(ExprId, ExprId)>>> {
+    ) -> Result<Option<SameHeadMatch>> {
         let spine = |term: &WireExpr, start: ExprId| {
             let mut arguments = Vec::new();
             let mut id = start;
@@ -1019,18 +1038,7 @@ impl Probe<'_> {
                         levels: right_levels,
                     }),
                 ) => {
-                    if batches.is_empty() && !peeled_projection {
-                        return Ok(None);
-                    }
-                    let reduction = context.reduction();
-                    let is_abbrev = reduction
-                        .constants()
-                        .find(left_name)
-                        .and_then(|constant| reduction.delta_body(constant))
-                        .is_some_and(|definition| {
-                            definition.hint() == crate::environment::ReducibilityHint::Abbrev
-                        });
-                    if is_abbrev
+                    if (batches.is_empty() && !peeled_projection)
                         || left_name != right_name
                         || left_levels.len() != right_levels.len()
                         || !left_levels.iter().zip(right_levels).all(|(l, r)| {
@@ -1040,30 +1048,44 @@ impl Probe<'_> {
                     {
                         return Ok(None);
                     }
-                    let mut pairs = Vec::new();
-                    for batch in batches.into_iter().rev() {
-                        pairs.extend(batch);
+                    let reduction = context.reduction();
+                    let constants = reduction.constants();
+                    let Some(constant) = constants.find(left_name) else {
+                        return Ok(None);
+                    };
+                    let is_regular_delta = reduction.delta_body(constant).is_some_and(|def| {
+                        matches!(def.hint(), crate::environment::ReducibilityHint::Regular(_))
+                    });
+                    if is_regular_delta {
+                        let mut pairs = Vec::new();
+                        for batch in batches.into_iter().rev() {
+                            pairs.extend(batch);
+                        }
+                        return Ok((!pairs.is_empty()).then_some(SameHeadMatch::Speculative(pairs)));
                     }
-                    return Ok((!pairs.is_empty()).then_some(pairs));
-                }
-                (Some(ExprNode::Free { name: l }), Some(ExprNode::Free { name: r })) if l == r => {
-                    let mut pairs = Vec::new();
-                    for batch in batches.into_iter().rev() {
-                        pairs.extend(batch);
+                    if !peeled_projection && is_exact_injective_head(constants, left_name) {
+                        let mut pairs = Vec::new();
+                        for batch in batches.into_iter().rev() {
+                            pairs.extend(batch);
+                        }
+                        return Ok((!pairs.is_empty()).then_some(SameHeadMatch::Exact(pairs)));
                     }
-                    return Ok((!pairs.is_empty()).then_some(pairs));
+                    return Ok(None);
                 }
                 _ => return Ok(None),
             }
         }
     }
     fn proof_status(&mut self, term: &WireExpr, context: &InferenceContext) -> Result<ProofStatus> {
-        // A type constructor cannot itself be a proof. Avoid expensive failed
-        // queries while descending the declaration's outer function telescope.
+        // A type constructor, Sort, Forall, or constructor of a statically
+        // non-Prop inductive cannot itself be a proof. Avoid expensive failed
+        // inference queries while descending outer telescopes and towers.
         if matches!(
             term.node(term.root()),
             Some(ExprNode::Sort { .. } | ExprNode::Forall { .. })
-        ) {
+        ) || head_constant(term)
+            .is_some_and(|name| is_statically_non_proof_head(context.constants(), name))
+        {
             return Ok(ProofStatus::NotProof);
         }
         let Some(type_) = self.infer(term, context)? else {
@@ -1131,7 +1153,14 @@ impl Probe<'_> {
         if matches!(
             left.node(left.root()),
             Some(ExprNode::Sort { .. } | ExprNode::Forall { .. })
-        ) {
+        ) || head_constant(left).is_some_and(|name| {
+            context.constants().find(name).is_some_and(|constant| {
+                constant.inductive_metadata().is_some()
+                    || constant
+                        .constructor_metadata()
+                        .is_some_and(|ctor| ctor.num_fields() > 0)
+            })
+        }) {
             return Ok(None);
         }
         let Some(left_type) = self.infer(left, context)? else {
@@ -2021,9 +2050,13 @@ impl Probe<'_> {
             // sufficient, so a pair it cannot establish goes on to the rules
             // below unchanged.
             if try_congruence
-                && let Some(arguments) = self.same_head_arguments(&left, &right, &context)?
                 && !self.incongruent.contains(&left, &right)
+                && let Some(matched) = self.same_head_arguments(&left, &right, &context)?
             {
+                let (is_speculative, arguments) = match matched {
+                    SameHeadMatch::Speculative(arguments) => (true, arguments),
+                    SameHeadMatch::Exact(arguments) => (false, arguments),
+                };
                 let mut obligations = Vec::with_capacity(arguments.len());
                 for (left_argument, right_argument) in arguments {
                     obligations.push(Work::Pair(
@@ -2032,15 +2065,17 @@ impl Probe<'_> {
                         context.clone(),
                     ));
                 }
-                work.push(Work::Attempt {
-                    left,
-                    right,
-                    context,
-                    skip_untyped: skip,
-                    state,
-                    trail: trail.len(),
-                });
-                attempts += 1;
+                if is_speculative {
+                    work.push(Work::Attempt {
+                        left,
+                        right,
+                        context,
+                        skip_untyped: skip,
+                        state,
+                        trail: trail.len(),
+                    });
+                    attempts += 1;
+                }
                 // Push in forward order so the LIFO stack compares trailing
                 // arguments first (matching `type_checker.cpp:786` `is_def_eq_args`),
                 // failing fast on differing value/index arguments before leading
@@ -2291,6 +2326,9 @@ impl Probe<'_> {
             }
             match (l.node(l.root()), r.node(r.root())) {
                 (Some(ExprNode::Apply { .. }), Some(ExprNode::Apply { .. })) => {
+                    if self.incongruent.contains(&l, &r) {
+                        fail!();
+                    }
                     // Peel all matching outer Apply layers in one shot to avoid
                     // O(n^2) prefix WireExpr materializations and `taken` clones.
                     let mut l_cursor = l.root();
@@ -2517,6 +2555,97 @@ fn head_constant(term: &WireExpr) -> Option<&WireName> {
             _ => return None,
         }
     }
+}
+
+/// Whether `root` is strictly nonzero (`>= 1`) for every universe-parameter
+/// instantiation (`Succ(_)`, `Max` containing a nonzero branch, or `IMax` with
+/// a nonzero second argument).
+fn level_is_always_nonzero(levels: &[LevelNode], root: crate::wire::LevelId) -> bool {
+    let mut stack = vec![root];
+    let mut budget = levels.len().saturating_add(1);
+    while let Some(id) = stack.pop() {
+        if budget == 0 {
+            return false;
+        }
+        budget -= 1;
+        match levels.get(id.index()) {
+            Some(LevelNode::Succ(_)) => return true,
+            Some(LevelNode::Max(left, right)) => {
+                stack.push(*left);
+                stack.push(*right);
+            }
+            Some(LevelNode::IMax(_, right)) => {
+                stack.push(*right);
+            }
+            Some(LevelNode::Zero | LevelNode::Parameter(_) | LevelNode::Meta(_)) | None => {}
+        }
+    }
+    false
+}
+
+/// Whether an inductive declaration's telescope terminates in a statically
+/// nonzero `Sort`, guaranteeing no term of that inductive (or partial
+/// application of its constructors) can ever inhabit `Prop`.
+fn inductive_result_sort_is_nonzero(inductive: &crate::environment::ConstantDeclaration) -> bool {
+    let ty = inductive.type_();
+    let mut id = ty.root();
+    let mut budget = ty.nodes().len().saturating_add(1);
+    while budget > 0 {
+        budget -= 1;
+        match ty.node(id) {
+            Some(ExprNode::Forall { body, .. }) => id = *body,
+            Some(ExprNode::Metadata { expression, .. }) => id = *expression,
+            Some(ExprNode::Sort { level }) => {
+                return level_is_always_nonzero(ty.levels(), *level);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Whether an application headed by `name` is statically guaranteed NOT to be
+/// a proof (`Inductive` type constructors and constructors of statically
+/// non-`Prop` inductives).
+fn is_statically_non_proof_head(
+    constants: &crate::environment::ConstantEnvironment,
+    name: &WireName,
+) -> bool {
+    let Some(constant) = constants.find(name) else {
+        return false;
+    };
+    if constant.inductive_metadata().is_some() {
+        return true;
+    }
+    constant
+        .constructor_metadata()
+        .and_then(|ctor| constants.find(ctor.inductive()))
+        .is_some_and(inductive_result_sort_is_nonzero)
+}
+
+/// Whether direct applications of `name` obey exact (iff) structural
+/// congruence: non-delta, non-`Prop`, non-unit-like injective heads
+/// (`Inductive`, or a `Constructor` with `num_fields > 0` whose inductive lives
+/// in a statically nonzero `Sort`).
+fn is_exact_injective_head(
+    constants: &crate::environment::ConstantEnvironment,
+    name: &WireName,
+) -> bool {
+    let Some(constant) = constants.find(name) else {
+        return false;
+    };
+    if constant.inductive_metadata().is_some() {
+        return true;
+    }
+    let Some(ctor) = constant.constructor_metadata() else {
+        return false;
+    };
+    if ctor.num_fields() == 0 {
+        return false;
+    }
+    constants
+        .find(ctor.inductive())
+        .is_some_and(inductive_result_sort_is_nonzero)
 }
 
 /// Whether `term` has a Nat/String literal or `Nat.*` head where untyped
@@ -4397,5 +4526,334 @@ mod tests {
             ),
             "ProjCore must preserve exposed K-recursor beneath projection for typed KR-317: {outcome:?}"
         );
+    }
+
+    #[test]
+    fn nested_constructor_tower_fails_outer_regular_attempt_in_linear_steps_without_retry() {
+        use crate::environment::{
+            ConstantDeclaration, ConstantEntry, ConstantKind, ConstantSafety,
+            ConstructorDeclaration, DefinitionBody, DefinitionSafety, EnvironmentBudget,
+            EnvironmentOutcome, InductiveDeclaration, ReducibilityHint,
+        };
+        let name = |s: &str| WireName::from_parts(vec![NamePart::Text(s.into())]);
+        let sort_prop = WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: crate::wire::LevelId::ZERO,
+            }],
+            vec![crate::wire::LevelNode::Zero],
+            ExprId::ZERO,
+        );
+        let sort_type = WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: crate::wire::LevelId::from_index(1).expect("level 1"),
+            }],
+            vec![
+                crate::wire::LevelNode::Zero,
+                crate::wire::LevelNode::Succ(crate::wire::LevelId::ZERO),
+            ],
+            ExprId::ZERO,
+        );
+        let arrow = |dom: &str, cod: &str| {
+            WireExpr::from_parts(
+                vec![
+                    ExprNode::Constant {
+                        name: name(dom),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Constant {
+                        name: name(cod),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Forall {
+                        binder_name: name("x"),
+                        binder_type: ExprId::ZERO,
+                        body: ExprId::from_index(1).expect("cod"),
+                        style: crate::wire::BinderStyle::Default,
+                    },
+                ],
+                Vec::new(),
+                ExprId::from_index(2).expect("forall"),
+            )
+        };
+        let wrap_body = WireExpr::from_parts(
+            vec![
+                ExprNode::Constant {
+                    name: name("Box"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name("c"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Lambda {
+                    binder_name: name("_"),
+                    binder_type: ExprId::ZERO,
+                    body: ExprId::from_index(1).expect("c"),
+                    style: crate::wire::BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(2).expect("lambda"),
+        );
+        let entries = vec![
+            ConstantEntry::new(
+                name("Box"),
+                ConstantDeclaration::inductive(
+                    Vec::new(),
+                    sort_type.clone(),
+                    ConstantSafety::Safe,
+                    InductiveDeclaration::new(
+                        0,
+                        0,
+                        vec![name("Box")],
+                        vec![name("Box.mk")],
+                        0,
+                        true,
+                        false,
+                    ),
+                ),
+            ),
+            ConstantEntry::new(
+                name("Box.mk"),
+                ConstantDeclaration::constructor(
+                    Vec::new(),
+                    arrow("Box", "Box"),
+                    ConstantSafety::Safe,
+                    ConstructorDeclaration::new(name("Box"), 0, 0, 1),
+                ),
+            ),
+            ConstantEntry::new(
+                name("baseA"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    constant("Box"),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("baseB"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    constant("Box"),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("c"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    constant("Box"),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("wrap"),
+                ConstantDeclaration::definition(
+                    Vec::new(),
+                    arrow("Box", "Box"),
+                    ConstantSafety::Safe,
+                    DefinitionBody::new(
+                        wrap_body,
+                        ReducibilityHint::Regular(1),
+                        DefinitionSafety::Safe,
+                        Vec::new(),
+                    ),
+                ),
+            ),
+            // Soundness controls: unit-like 0-field structure & Prop inductive.
+            ConstantEntry::new(
+                name("Unit0"),
+                ConstantDeclaration::inductive(
+                    Vec::new(),
+                    sort_type,
+                    ConstantSafety::Safe,
+                    InductiveDeclaration::new(
+                        0,
+                        0,
+                        vec![name("Unit0")],
+                        vec![name("Unit0.mk")],
+                        0,
+                        false,
+                        false,
+                    ),
+                ),
+            ),
+            ConstantEntry::new(
+                name("Unit0.mk"),
+                ConstantDeclaration::constructor(
+                    Vec::new(),
+                    constant("Unit0"),
+                    ConstantSafety::Safe,
+                    ConstructorDeclaration::new(name("Unit0"), 0, 0, 0),
+                ),
+            ),
+            ConstantEntry::new(
+                name("toUnit"),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    arrow("Box", "Unit0"),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            ConstantEntry::new(
+                name("PropBox"),
+                ConstantDeclaration::inductive(
+                    Vec::new(),
+                    sort_prop,
+                    ConstantSafety::Safe,
+                    InductiveDeclaration::new(
+                        0,
+                        0,
+                        vec![name("PropBox")],
+                        vec![name("PropBox.mk")],
+                        0,
+                        false,
+                        false,
+                    ),
+                ),
+            ),
+            ConstantEntry::new(
+                name("PropBox.mk"),
+                ConstantDeclaration::constructor(
+                    Vec::new(),
+                    arrow("Box", "PropBox"),
+                    ConstantSafety::Safe,
+                    ConstructorDeclaration::new(name("PropBox"), 0, 0, 1),
+                ),
+            ),
+        ];
+        let constants = match crate::environment::ConstantEnvironment::build(
+            entries,
+            EnvironmentBudget::unlimited(),
+        ) {
+            EnvironmentOutcome::Complete { environment, .. } => environment,
+            other => panic!("environment must build: {other:?}"),
+        };
+        let context = InferenceContext::empty(constants);
+
+        let build_wrapped_tower = |leaf: &str, depth: usize| {
+            let mut nodes = vec![
+                ExprNode::Constant {
+                    name: name("Box.mk"),
+                    levels: Vec::new(),
+                },
+                ExprNode::Constant {
+                    name: name(leaf),
+                    levels: Vec::new(),
+                },
+            ];
+            let ctor_id = ExprId::ZERO;
+            let mut cur = ExprId::from_index(1).expect("leaf");
+            for _ in 0..depth {
+                let next = ExprId::from_index(nodes.len()).expect("apply");
+                nodes.push(ExprNode::Apply {
+                    function: ctor_id,
+                    argument: cur,
+                });
+                cur = next;
+            }
+            let wrap_id = ExprId::from_index(nodes.len()).expect("wrap");
+            nodes.push(ExprNode::Constant {
+                name: name("wrap"),
+                levels: Vec::new(),
+            });
+            let root = ExprId::from_index(nodes.len()).expect("wrap app");
+            nodes.push(ExprNode::Apply {
+                function: wrap_id,
+                argument: cur,
+            });
+            WireExpr::from_parts(nodes, Vec::new(), root)
+        };
+
+        let left = build_wrapped_tower("baseA", 16);
+        let right = build_wrapped_tower("baseB", 16);
+        let mut cancelled = || false;
+        let mut probe = Probe {
+            budget: InferenceBudget::unlimited(),
+            steps: 0,
+            polls: 0,
+            cancelled: &mut cancelled,
+            stop: None,
+            root_left: &left,
+            root_right: &right,
+            root_context: &context,
+            reserved: None,
+            unreserved_nested: Vec::new(),
+            next: 0,
+            incongruent: PairSet::default(),
+            proven: PairSet::default(),
+            disproven: PairSet::default(),
+            answers: PairAnswers::default(),
+            inferred: InferredTypes::default(),
+            opened: OpenedLocals::default(),
+        };
+        assert!(
+            probe
+                .run(&left, &right, &context, true)
+                .expect("outer Regular delta must unfold and succeed")
+        );
+        let incongruent_entries: usize = probe
+            .incongruent
+            .current
+            .buckets
+            .values()
+            .map(Vec::len)
+            .sum();
+        assert_eq!(
+            incongruent_entries, 1,
+            "only the outer Regular delta `wrap` may record an incongruent attempt; Box.mk towers must decompose directly without Work::Attempt"
+        );
+        assert!(
+            probe.steps < 1_000,
+            "depth-16 constructor tower must fail outer attempt in O(depth) steps, got {}",
+            probe.steps
+        );
+
+        let app1 = |f: &str, arg: &str| {
+            WireExpr::from_parts(
+                vec![
+                    ExprNode::Constant {
+                        name: name(f),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Constant {
+                        name: name(arg),
+                        levels: Vec::new(),
+                    },
+                    ExprNode::Apply {
+                        function: ExprId::ZERO,
+                        argument: ExprId::from_index(1).expect("arg"),
+                    },
+                ],
+                Vec::new(),
+                ExprId::from_index(2).expect("app"),
+            )
+        };
+        assert!(matches!(
+            proof_conversion_with(
+                &app1("toUnit", "baseA"),
+                &app1("toUnit", "baseB"),
+                &context,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+                &mut || false,
+            ),
+            ProofConversionOutcome::Complete { equal: true, .. }
+        ));
+        assert!(matches!(
+            proof_conversion_with(
+                &app1("PropBox.mk", "baseA"),
+                &app1("PropBox.mk", "baseB"),
+                &context,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+                &mut || false,
+            ),
+            ProofConversionOutcome::Complete { equal: true, .. }
+        ));
     }
 }
