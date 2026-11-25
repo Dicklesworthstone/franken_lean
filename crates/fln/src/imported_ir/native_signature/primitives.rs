@@ -8,6 +8,7 @@ use super::{GeneratedExternRow, IrExecutionError, IrType, Name, inferred_arity};
 mod expressions;
 mod levels;
 mod names;
+mod signed_words;
 
 #[derive(Clone, Copy)]
 pub(super) struct PrimitiveSignature {
@@ -34,6 +35,7 @@ pub(super) fn signature(
         .or_else(|| integer(row))
         .or_else(|| string(row))
         .or_else(|| word(row))
+        .or_else(|| signed_words::review(row))
         .or_else(|| floating(row))
         .or_else(|| floating_math(row))
         .or_else(|| float_array(row))

@@ -422,6 +422,7 @@ fn native_prototypes_from_library(library: &Path) -> IrModule {
         .into_iter()
         .chain(STRING_PREDICATES.into_iter().map(str::to_owned))
         .chain(STRING_CURSORS.into_iter().map(str::to_owned))
+        .chain(super::signed_words::names())
         .chain(
             super::array_operations::BYTE_ARRAY_NAMES
                 .into_iter()
@@ -441,6 +442,7 @@ fn native_prototypes_from_library(library: &Path) -> IrModule {
         "Init/Data/UInt/BasicAux.ir",
         "Init/Data/UInt/Basic.ir",
         "Init/Data/UInt/Log2.ir",
+        "Init/Data/SInt/Basic.ir",
     ] {
         let path = library.join(relative);
         let bytes = std::fs::read(&path).unwrap();

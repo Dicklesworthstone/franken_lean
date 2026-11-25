@@ -37,6 +37,9 @@ mod primitives_reference;
 #[path = "tests/integers.rs"]
 mod integers;
 
+#[path = "tests/signed_words.rs"]
+mod signed_words;
+
 #[path = "tests/levels_reference.rs"]
 mod levels_reference;
 
