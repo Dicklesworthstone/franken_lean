@@ -25,6 +25,14 @@ pub(super) const NAMES: [&str; 18] = [
 pub(super) const STRING_PREDICATES: [&str; 2] =
     ["String.Internal.isEmpty", "String.Internal.isPrefixOf"];
 
+pub(super) const STRING_TRAVERSALS: [&str; 5] = [
+    "String.Internal.foldl",
+    "String.Internal.any",
+    "String.Internal.nextWhile",
+    "Substring.Raw.Internal.all",
+    "Substring.Raw.Internal.takeWhile",
+];
+
 pub(super) const STRING_CURSORS: [&str; 14] = [
     "String.Internal.get",
     "String.Pos.Raw.get",
@@ -86,6 +94,7 @@ fn reviewed_boxed_primitives_bind_the_generated_row_before_admitting_a_wrapper()
         .into_iter()
         .chain(STRING_PREDICATES.into_iter().map(str::to_owned))
         .chain(STRING_CURSORS.into_iter().map(str::to_owned))
+        .chain(STRING_TRAVERSALS.into_iter().map(str::to_owned))
     {
         let original = row(&target);
         assert!(BoxedNative::from_row(original).unwrap().is_some());
@@ -152,12 +161,7 @@ fn reviewed_boxed_primitives_bind_the_generated_row_before_admitting_a_wrapper()
             );
         }
     }
-    for target in [
-        "Nat.divExact",
-        "Nat.gcd",
-        "String.Internal.foldl",
-        "Int.divExact",
-    ] {
+    for target in ["Nat.divExact", "Nat.gcd", "Int.divExact"] {
         assert!(BoxedNative::from_row(row(target)).unwrap().is_none());
     }
 }

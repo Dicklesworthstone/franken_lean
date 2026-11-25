@@ -19,6 +19,9 @@ mod array_proofs;
 #[path = "tests/string_proofs.rs"]
 mod string_proofs;
 
+#[path = "tests/string_traversals.rs"]
+mod string_traversals;
+
 #[path = "tests/array_operations.rs"]
 mod array_operations;
 

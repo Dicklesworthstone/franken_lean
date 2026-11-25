@@ -294,7 +294,10 @@ fn output_getters_bind_the_complete_raw_and_boxed_world_telescope() {
                     _ => unreachable!(),
                 }
                 assert!(
-                    matches!(compile(&malformed), Err(IrExecutionError::NativeContract { .. })),
+                    matches!(
+                        compile(&malformed),
+                        Err(IrExecutionError::NativeContract { .. })
+                    ),
                     "{getter}, boxed={boxed}, mutation={mutation}",
                 );
             }
@@ -357,7 +360,11 @@ fn first_class_output_actions_interleave_replay_and_keep_one_bounded_sink() {
     let expected = "aλ\0🙂\ntail".as_bytes();
     let compiled = prepare(&module, expected.len());
     for getter in ["IO.getStdout", "IO.getStderr"] {
-        assert!(compiled.native_externs().contains(&format!("extern:{getter}")));
+        assert!(
+            compiled
+                .native_externs()
+                .contains(&format!("extern:{getter}"))
+        );
         assert!(compiled.reference_functions().iter().all(|item| {
             item.name != name(getter) && item.name != Name::str(name(getter), "_boxed")
         }));

@@ -207,9 +207,10 @@ fn live_pinned_output_matches_reference_and_consumes_native_io_results() {
         String::from_utf8_lossy(&oracle.stdout),
         String::from_utf8_lossy(&oracle.stderr)
     );
-    assert_eq!(oracle.stdout, "α\0tail\n42\n".as_bytes());
-    assert_eq!(oracle.stderr, "err\0🙂\n".as_bytes());
+    // The pin captures both streams into the #eval diagnostic by default.
     let expected = "α\0err\0🙂\ntail\n".as_bytes();
+    assert_eq!(oracle.stdout, [expected, b"42\n"].concat());
+    assert!(oracle.stderr.is_empty());
     let compiled = prepare("localOutputBoth", &arguments, expected.len());
     let bytes =
         flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
@@ -235,9 +236,12 @@ fn live_pinned_output_matches_reference_and_consumes_native_io_results() {
     let report = prepare("localOutputBoth", &arguments, expected.len() - 1)
         .execute(ExecutionLimits::default(), None);
     assert!(matches!(report.outcome, Outcome::Inconclusive(_)));
-    assert_eq!(report.captured_output.unwrap().bytes, "α\0err\0🙂\n".as_bytes());
-    let report = prepare("localOutputError", &arguments, 3)
-        .execute(ExecutionLimits::default(), None);
+    assert_eq!(
+        report.captured_output.unwrap().bytes,
+        "α\0err\0🙂\n".as_bytes()
+    );
+    let report =
+        prepare("localOutputError", &arguments, 3).execute(ExecutionLimits::default(), None);
     assert!(matches!(
         report.outcome,
         Outcome::Complete(VmExit::Returned(_))

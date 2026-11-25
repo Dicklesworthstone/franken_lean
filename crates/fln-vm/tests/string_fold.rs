@@ -813,6 +813,129 @@ fn an_empty_string_returns_the_initial_value_without_entering_a_diverging_callba
 }
 
 #[test]
+fn erased_fold_callbacks_transfer_strings_and_curried_closures_without_leaks() {
+    let _guard = lock();
+    shadow::enable();
+    for input in ["", "aλ😀\0z"] {
+        let mut callback = push_callback(vec![A::Borrowed, A::Borrowed]);
+        callback.result_ownership = C::Erased;
+        let program = owned(&replay(vec![entry("prefix:", input), callback]));
+        for _ in 0..2 {
+            let result = returned(execute(&program, limits(2), None));
+            assert_eq!(text(&result.value), format!("prefix:{input}"));
+            assert_eq!(
+                result.usage.peak_stack_depth,
+                if input.is_empty() { 1 } else { 2 }
+            );
+        }
+    }
+    // The first erased result is a closure, not a String. The suspended fold
+    // validates and applies that closure before checking the final String.
+    let curried = owned(&replay(vec![
+        entry("kept:", "é\0😀"),
+        function(
+            1,
+            vec![A::Borrowed],
+            C::Erased,
+            2,
+            vec![closure(1, 2, &[0], &[A::Borrowed]), I::Return { src: r(1) }],
+        ),
+        function(
+            2,
+            vec![A::Borrowed, A::Borrowed],
+            C::Erased,
+            3,
+            vec![
+                intrinsic(2, "extern:String.push", &[0, 1]),
+                I::Return { src: r(2) },
+            ],
+        ),
+    ]));
+    for _ in 0..2 {
+        let result = returned(execute(&curried, limits(2), None));
+        assert_eq!(text(&result.value), "kept:é\0😀");
+        assert_eq!(result.usage.peak_stack_depth, 2);
+    }
+    clean_shadow();
+}
+
+#[test]
+fn erased_fold_results_are_checked_and_typed_callback_contracts_stay_exact() {
+    let _guard = lock();
+    shadow::enable();
+    for convention in [C::Scalar, C::OwnedOrScalar] {
+        for input in ["", "x"] {
+            let callback = function(
+                1,
+                vec![A::Borrowed, A::Borrowed],
+                convention,
+                2,
+                vec![I::Return { src: r(1) }],
+            );
+            let program = replay(vec![entry("prefix", input), callback]);
+            assert!(matches!(
+                execute(&program, limits(2), None),
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::ApplyResultOwnershipMismatch { .. },
+                    ..
+                })
+            ));
+        }
+    }
+    for callback in [
+        function(
+            1,
+            vec![A::Borrowed, A::Borrowed],
+            C::Erased,
+            2,
+            vec![I::Return { src: r(1) }],
+        ),
+        function(
+            1,
+            vec![A::Borrowed, A::Borrowed],
+            C::Erased,
+            3,
+            vec![
+                I::Array {
+                    dst: r(2),
+                    items: vec![r(0)],
+                },
+                I::Return { src: r(2) },
+            ],
+        ),
+        // A curried first stage returning a String cannot consume the
+        // pending character; it must return a callable instead.
+        function(
+            1,
+            vec![A::Borrowed],
+            C::Erased,
+            1,
+            vec![I::Return { src: r(0) }],
+        ),
+    ] {
+        let program = owned(&replay(vec![entry("prefix", "x"), callback]));
+        assert!(matches!(
+            execute(&program, limits(2), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::TypeMismatch { .. },
+                ..
+            })
+        ));
+    }
+    let mut unique = push_callback(vec![A::Unique, A::Borrowed]);
+    unique.result_ownership = C::Erased;
+    let program = replay(vec![entry("prefix", "x"), unique]);
+    assert!(matches!(
+        execute(&program, limits(2), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::ApplyOwnershipMismatch { .. },
+            ..
+        })
+    ));
+    clean_shadow();
+}
+
+#[test]
 fn malformed_fold_operands_and_callback_contracts_are_typed_refusals() {
     let _guard = lock();
     shadow::enable();

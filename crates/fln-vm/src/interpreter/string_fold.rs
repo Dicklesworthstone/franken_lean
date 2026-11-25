@@ -343,13 +343,7 @@ fn callback_plan(
     callback: &Obj,
     scalar_arguments: &[bool],
 ) -> Result<ApplyPlan, VmRefusal> {
-    let plan = plan_apply(
-        program,
-        callback,
-        scalar_arguments.len(),
-        None,
-        Some(CallableResultOwnership::Owned),
-    )?;
+    let plan = plan_apply(program, callback, scalar_arguments.len(), None, None)?;
     if plan.required > scalar_arguments.len() {
         return Err(VmRefusal::MalformedClosure {
             reason: "String.Internal.foldl callback requires too many arguments",
@@ -360,6 +354,23 @@ fn callback_plan(
         .ok_or(VmRefusal::MalformedClosure {
             reason: "target function is absent",
         })?;
+    // Imported IR has an erased ABI result: its ordinary Return still
+    // transfers the owned handle, and fold_resume checks the actual String
+    // before reusing it. A curried first stage similarly transfers a closure
+    // which prepare validates before the pending character is applied.
+    // This bridge is local to the fold; typed Apply sites keep their exact
+    // result-ownership contract, and other typed result conventions remain
+    // inadmissible even when an empty input would not invoke the callback.
+    if !matches!(
+        function.result_ownership,
+        CallableResultOwnership::Owned | CallableResultOwnership::Erased
+    ) {
+        return Err(VmRefusal::ApplyResultOwnershipMismatch {
+            function: plan.function,
+            expected: CallableResultOwnership::Owned,
+            actual: function.result_ownership,
+        });
+    }
     let parameters =
         &function.parameter_ownership[plan.captures.len()..plan.captures.len() + plan.required];
     for (argument, (expected, scalar)) in parameters

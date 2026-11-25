@@ -833,6 +833,51 @@ fn string(row: &GeneratedExternRow) -> Option<Review> {
             &[IrType::Object, IrType::Object],
             &IrType::UInt8,
         ),
+        "extern:String.Internal.foldl" => (
+            "String.Internal.foldl",
+            "lean_string_foldl",
+            "Init.Data.String.Bootstrap",
+            "opaque",
+            "rule(borrowed-args,owned-result)",
+            &[IrType::Object, IrType::Object, IrType::Object],
+            &IrType::Object,
+        ),
+        "extern:String.Internal.any" => (
+            "String.Internal.any",
+            "lean_string_any",
+            "Init.Data.String.Bootstrap",
+            "opaque",
+            "rule(borrowed-args,owned-result)",
+            &[IrType::Object, IrType::Object],
+            &IrType::UInt8,
+        ),
+        "extern:String.Internal.nextWhile" => (
+            "String.Internal.nextWhile",
+            "lean_string_nextwhile",
+            "Init.Data.String.Bootstrap",
+            "opaque",
+            "rule(borrowed-args,owned-result)",
+            &[IrType::Object, IrType::Object, IrType::TObject],
+            &IrType::TObject,
+        ),
+        "extern:Substring.Raw.Internal.all" => (
+            "Substring.Raw.Internal.all",
+            "lean_substring_all",
+            "Init.Data.String.Bootstrap",
+            "opaque",
+            "rule(borrowed-args,owned-result)",
+            &[IrType::Object, IrType::Object],
+            &IrType::UInt8,
+        ),
+        "extern:Substring.Raw.Internal.takeWhile" => (
+            "Substring.Raw.Internal.takeWhile",
+            "lean_substring_takewhile",
+            "Init.Data.String.Bootstrap",
+            "opaque",
+            "rule(borrowed-args,owned-result)",
+            &[IrType::Object, IrType::Object],
+            &IrType::Object,
+        ),
         // String.Pos.Raw and the dependent String.Pos wrappers erase to
         // their Nat byte offsets. Keep those TObject carriers distinct from
         // the UInt32 Char and UInt8 Bool results of get and atEnd.
@@ -982,14 +1027,20 @@ fn string(row: &GeneratedExternRow) -> Option<Review> {
         signature: PrimitiveSignature {
             parameters,
             result,
-            // Bootstrap's native declarations consume their String objects
-            // and return UInt8. The exported implementations in Defs.lean and
-            // TakeDrop.lean release those operands. Golem's generated rows
-            // instead borrow them and return a boxed Bool; keep that runtime
-            // contract while validating the pin's distinct raw IR telescope.
+            // Bootstrap's ignoreBorrowAnnotation declarations consume their
+            // objects, including higher-order callbacks. Golem's generated
+            // rows instead retain borrowed handles while its managed callback
+            // continuation runs. Keep that runtime contract while validating
+            // the pin's distinct raw IR telescope and scalar result types.
             exact_borrowed: match row.id {
                 "extern:String.Internal.isEmpty" => Some(&[false]),
-                "extern:String.Internal.isPrefixOf" => Some(&[false, false]),
+                "extern:String.Internal.isPrefixOf"
+                | "extern:String.Internal.any"
+                | "extern:Substring.Raw.Internal.all"
+                | "extern:Substring.Raw.Internal.takeWhile" => Some(&[false, false]),
+                "extern:String.Internal.foldl" | "extern:String.Internal.nextWhile" => {
+                    Some(&[false, false, false])
+                }
                 _ => None,
             },
         },
