@@ -403,7 +403,14 @@ pub(super) fn validated_ir_arity(
     arity: usize,
 ) -> Result<usize, IrExecutionError> {
     let expected = ir_arity(row)?;
-    if let Some(primitive) = BoxedNative::from_row(row)? {
+    // Output getters have no runtime operands, but the original IR must
+    // retain its world until the independently validated erasure pass. Their
+    // boxed wrappers also retain that slot until closure saturation.
+    if output_getter(row)? {
+        if arity == expected {
+            return Ok(expected);
+        }
+    } else if let Some(primitive) = BoxedNative::from_row(row)? {
         let runtime = primitive.runtime_parameters().len();
         if arity == runtime || arity == primitive.arity() {
             return Ok(runtime);
@@ -496,29 +503,44 @@ pub(super) fn inferred_arity(row: &GeneratedExternRow) -> Result<usize, IrExecut
 }
 
 /// Reference IR keeps the erased RealWorld argument at a BaseIO call site;
-/// Golem's native stream getter receives no runtime operand. Bind the single
-/// supported difference to the complete reviewed row, never to input IR.
+/// Golem's native stream getter receives no runtime operand. Bind this
+/// difference to the complete reviewed rows, never to input IR.
 pub(super) fn ir_arity(row: &GeneratedExternRow) -> Result<usize, IrExecutionError> {
-    if row.id != "extern:IO.getStdout" {
-        return inferred_arity(row);
+    if output_getter(row)? {
+        Ok(1)
+    } else {
+        inferred_arity(row)
     }
-    if row.name != "IO.getStdout"
+}
+
+fn output_getter(row: &GeneratedExternRow) -> Result<bool, IrExecutionError> {
+    let (name, symbol) = match row.id {
+        "extern:IO.getStdout" => ("IO.getStdout", "lean_get_stdout"),
+        "extern:IO.getStderr" => ("IO.getStderr", "lean_get_stderr"),
+        _ => return Ok(false),
+    };
+    if row.name != name
         || row.module != "Init.System.IO"
         || row.kind != "opaque"
-        || row.symbol != "lean_get_stdout"
+        || row.symbol != symbol
         || row.levels != 0
         || row.arity != 0
         || row.effect != "io"
         || row.safety != "safe"
         || row.ownership != "rule(borrowed-args,owned-result)"
+        || row.entry_class != "standard"
+        || row.entry_scope != "all"
+        || row.partition != "toolchain-api"
+        || row.mode != "all"
+        || row.profile != "faithful,sound"
         || inferred_arity(row)? != 0
     {
         return Err(IrExecutionError::NativeContract {
             declaration: Name::from_components(row.name.split('.')),
-            detail: "IO.getStdout differs from its reviewed erased-world bridge".to_owned(),
+            detail: "output getter differs from its reviewed erased-world bridge".to_owned(),
         });
     }
-    Ok(1)
+    Ok(true)
 }
 
 fn reviewed_rule_arity(

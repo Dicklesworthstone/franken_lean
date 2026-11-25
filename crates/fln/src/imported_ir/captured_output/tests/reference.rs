@@ -65,7 +65,11 @@ fn live_pinned_output_matches_reference_and_consumes_native_io_results() {
         .decls
         .iter()
         .filter_map(|decl| match decl {
-            IrDecl::Function { name, .. } if native_row(name).is_none() => Some(name.clone()),
+            IrDecl::Function { name, .. }
+                if native_row(name).is_none() && native_signature::boxed_row(name).is_none() =>
+            {
+                Some(name.clone())
+            }
             _ => None,
         })
         .collect();
@@ -164,4 +168,79 @@ fn live_pinned_output_matches_reference_and_consumes_native_io_results() {
         })
     ));
     assert!(report.captured_output.unwrap().bytes.is_empty());
+
+    // These are actual compiler-created PAPs, not fabricated wrapper names.
+    // Both getters return BaseIO's raw Stream, while putStr returns IO.Result.
+    for getter in ["IO.getStdout", "IO.getStderr"] {
+        let boxed = Name::str(name(getter), "_boxed");
+        assert!(
+            module.decls.iter().any(|declaration| {
+                let IrDecl::Function { body, .. } = declaration else {
+                    return false;
+                };
+                body.bodies().iter().any(|body| {
+                    body.stmts.iter().any(|statement| {
+                        matches!(statement, IrStmt::VDecl {
+                            expr: IrExpr::Pap { function, .. }, ..
+                        } if function == &boxed)
+                    })
+                })
+            }),
+            "{getter} first-class action was optimized away; {dir:?}",
+        );
+    }
+    std::fs::write(
+        dir.join("Both.lean"),
+        format!("{source}\n#eval localOutputBoth \"α\\x00\"\n"),
+    )
+    .unwrap();
+    let oracle = Command::new(&reference)
+        .current_dir(&dir)
+        .arg("Both.lean")
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("both.stdout"), &oracle.stdout).unwrap();
+    std::fs::write(dir.join("both.stderr"), &oracle.stderr).unwrap();
+    assert!(
+        oracle.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&oracle.stdout),
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+    assert_eq!(oracle.stdout, "α\0tail\n42\n".as_bytes());
+    assert_eq!(oracle.stderr, "err\0🙂\n".as_bytes());
+    let expected = "α\0err\0🙂\ntail\n".as_bytes();
+    let compiled = prepare("localOutputBoth", &arguments, expected.len());
+    let bytes =
+        flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
+    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+    for _ in 0..2 {
+        for program in [compiled.program.program(), &replay] {
+            let (outcome, output) =
+                execute(program, ExecutionLimits::default(), None, expected.len());
+            let Outcome::Complete(VmExit::Returned(result)) = outcome else {
+                panic!("{outcome:?}; {dir:?}")
+            };
+            assert_eq!(
+                (result.value.header().tag, result.value.header().other),
+                (0, 1)
+            );
+            assert_eq!(
+                nat_decimal(&result.value.try_ctor_child(0).unwrap()).as_deref(),
+                Some("42")
+            );
+            assert_eq!(output.bytes, expected);
+        }
+    }
+    let report = prepare("localOutputBoth", &arguments, expected.len() - 1)
+        .execute(ExecutionLimits::default(), None);
+    assert!(matches!(report.outcome, Outcome::Inconclusive(_)));
+    assert_eq!(report.captured_output.unwrap().bytes, "α\0err\0🙂\n".as_bytes());
+    let report = prepare("localOutputError", &arguments, 3)
+        .execute(ExecutionLimits::default(), None);
+    assert!(matches!(
+        report.outcome,
+        Outcome::Complete(VmExit::Returned(_))
+    ));
+    assert_eq!(report.captured_output.unwrap().bytes, "α\0".as_bytes());
 }

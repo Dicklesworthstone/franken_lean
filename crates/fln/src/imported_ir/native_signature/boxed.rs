@@ -42,6 +42,19 @@ impl BoxedNative {
     pub(in crate::imported_ir) fn from_row(
         row: &GeneratedExternRow,
     ) -> Result<Option<Self>, IrExecutionError> {
+        if super::output_getter(row)? {
+            // BaseIO's world survives in the boxed calling convention. The
+            // native getter returns FS.Stream directly, without an IO.Result
+            // envelope, and cannot execute until that final slot is supplied.
+            return Ok(Some(Self {
+                erased_prefix: 0,
+                erased_suffix: 0,
+                world_suffix: true,
+                parameters: &[],
+                result: &IrType::Object,
+                exact_borrowed: None,
+            }));
+        }
         if let Some(signature) = primitives::signature(row)? {
             return Ok(Some(Self {
                 erased_prefix: 0,

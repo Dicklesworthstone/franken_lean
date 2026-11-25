@@ -25,3 +25,20 @@ public section
 @[noinline] def localOutputRead : IO String := do
   let stdout ← IO.getStdout
   stdout.getLine
+
+-- Keeping the getter behind a noinline argument forces the pin's native
+-- _boxed action wrapper. BaseIO returns Stream directly; putStr returns IO.
+@[noinline] def localOutputGet
+    (getter : BaseIO IO.FS.Stream) (text : String) : IO Unit := do
+  let stream ← getter
+  stream.putStr text
+
+@[noinline] def localOutputBoth (text : String) : IO Nat := do
+  localOutputGet IO.getStdout text
+  localOutputGet IO.getStderr "err\x00🙂\n"
+  localOutputGet IO.getStdout "tail\n"
+  return 42
+
+@[noinline] def localOutputError (text : String) : IO Unit := do
+  let stderr ← IO.getStderr
+  stderr.putStr text

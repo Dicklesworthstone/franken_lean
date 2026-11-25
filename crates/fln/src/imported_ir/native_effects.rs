@@ -138,7 +138,9 @@ pub(super) fn classify(
             | "extern:ST.Prim.Ref.swap"
             | "extern:ST.Prim.Ref.take",
         ) => Ok(fir::EffectClass::State),
-        ("io", "extern:IO.getStdout") if captured_output => Ok(fir::EffectClass::Io),
+        ("io", "extern:IO.getStdout" | "extern:IO.getStderr") if captured_output => {
+            Ok(fir::EffectClass::Io)
+        }
         _ => Err(unsupported(
             &Name::from_components(row.name.split('.')),
             "effectful native call",
@@ -213,17 +215,25 @@ pub(super) fn validate_world_parameters(
     Ok(())
 }
 
-/// Remove only the pin's literal erased world from direct native stdout
+/// Remove only the pin's literal erased world from direct native output
 /// getter calls, after validating the original IR telescope. The rewritten
 /// graph is validated again against Golem's zero-argument native signature.
-/// A first-class getter or a data-bearing world is outside this narrow bridge.
+/// First-class getters use their reviewed boxed wrapper, which retains the
+/// world until saturation. A raw getter PAP or data-bearing world is refused.
 pub(super) fn erase_world_arguments(
     module: &mut IrModule,
     natives: &BTreeMap<Name, Native>,
     limits: IrExecutionLimits,
 ) -> Result<bool, IrExecutionError> {
-    let stdout = Name::from_components(["IO", "getStdout"]);
-    if !natives.contains_key(&stdout) {
+    let getters: BTreeSet<_> = natives
+        .iter()
+        .filter(|(_, native)| {
+            native.boxed.is_none()
+                && matches!(native.id, "extern:IO.getStdout" | "extern:IO.getStderr")
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    if getters.is_empty() {
         return Ok(false);
     }
     let mut changed = false;
@@ -243,9 +253,9 @@ pub(super) fn erase_world_arguments(
                     IrStmt::VDecl {
                         expr: IrExpr::Fap { function, args },
                         ..
-                    } if function == &stdout => {
+                    } if getters.contains(function) => {
                         if args.as_slice() != [IrArg::Erased] {
-                            return Err(unsupported(name, "non-erased native stdout world"));
+                            return Err(unsupported(name, "non-erased native output world"));
                         }
                         args.clear();
                         changed = true;
@@ -253,8 +263,8 @@ pub(super) fn erase_world_arguments(
                     IrStmt::VDecl {
                         expr: IrExpr::Pap { function, .. },
                         ..
-                    } if function == &stdout => {
-                        return Err(unsupported(name, "first-class native stdout getter"));
+                    } if getters.contains(function) => {
+                        return Err(unsupported(name, "first-class raw native output getter"));
                     }
                     IrStmt::JDecl { value, .. } => pending.push(value),
                     _ => {}

@@ -109,7 +109,7 @@ fn prepare(module: &IrModule, max_bytes: usize) -> CompiledIr {
 }
 
 #[test]
-fn output_capability_admits_only_the_exact_stdout_row_and_default_stays_closed() {
+fn output_capability_admits_only_output_getters_and_local_state() {
     let module = output_module(false);
     assert!(matches!(
         compile(
@@ -134,6 +134,7 @@ fn output_capability_admits_only_the_exact_stdout_row_and_default_stays_closed()
             matches!(
                 row.id,
                 "extern:IO.getStdout"
+                    | "extern:IO.getStderr"
                     | "extern:ST.Prim.mkRef"
                     | "extern:ST.Prim.Ref.get"
                     | "extern:ST.Prim.Ref.set"
@@ -164,10 +165,10 @@ fn stdout_world_bridge_validates_original_ir_and_refuses_data_or_getter_closures
         name: name("IO.getStdout"),
         params: vec![IrParam {
             x: 0,
-            borrow: true,
-            ty: IrType::Erased,
+            borrow: false,
+            ty: IrType::Void,
         }],
-        result: IrType::TObject,
+        result: IrType::Object,
         entries: vec![],
     });
     assert!(
@@ -223,9 +224,172 @@ fn stdout_world_bridge_validates_original_ir_and_refuses_data_or_getter_closures
             .insert(0, bind(8, IrExpr::Lit(IrLit::Num(IrNat::Small(0)))));
         assert!(
             matches!(compile(&module), Err(IrExecutionError::Unsupported { form, .. })
-            if form == if closure { "first-class native stdout getter" } else { "non-erased native stdout world" })
+            if form == if closure { "first-class raw native output getter" } else { "non-erased native output world" })
         );
     }
+}
+
+#[test]
+fn output_getters_bind_the_complete_raw_and_boxed_world_telescope() {
+    for getter in ["IO.getStdout", "IO.getStderr"] {
+        for boxed in [false, true] {
+            let target = if boxed {
+                Name::str(name(getter), "_boxed")
+            } else {
+                name(getter)
+            };
+            let mut module = output_module(false);
+            let IrDecl::Function { body, .. } = &mut module.decls[0] else {
+                unreachable!()
+            };
+            let IrStmt::VDecl {
+                expr: IrExpr::Fap { function, .. },
+                ..
+            } = &mut body.stmts[0]
+            else {
+                unreachable!()
+            };
+            *function = target.clone();
+            module.decls.push(IrDecl::Extern {
+                name: target,
+                params: vec![IrParam {
+                    x: 0,
+                    borrow: false,
+                    ty: if boxed { IrType::Tagged } else { IrType::Void },
+                }],
+                result: IrType::Object,
+                entries: vec![],
+            });
+            let compile = |module: &IrModule| {
+                compile_with_captured_output(
+                    std::slice::from_ref(module),
+                    &name("LocalOutput.main"),
+                    &[],
+                    &partition(),
+                    &BTreeSet::from([name("LocalOutput.main")]),
+                    IrExecutionLimits::default(),
+                    9,
+                )
+            };
+            let report = compile(&module)
+                .unwrap()
+                .execute(ExecutionLimits::default(), None);
+            assert!(matches!(
+                report.outcome,
+                Outcome::Complete(VmExit::Returned(_))
+            ));
+            assert_eq!(report.captured_output.unwrap().bytes, "aλ\0🙂\n".as_bytes());
+            for mutation in 0..6 {
+                let mut malformed = module.clone();
+                let IrDecl::Extern { params, result, .. } = &mut malformed.decls[1] else {
+                    unreachable!()
+                };
+                match mutation {
+                    0 => params[0].borrow = true,
+                    1 => params[0].ty = IrType::Erased,
+                    2 => params[0].ty = IrType::TObject,
+                    3 => *result = IrType::TObject,
+                    4 => params.clear(),
+                    5 => params.push(params[0].clone()),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    matches!(compile(&malformed), Err(IrExecutionError::NativeContract { .. })),
+                    "{getter}, boxed={boxed}, mutation={mutation}",
+                );
+            }
+        }
+    }
+}
+
+fn paired_output_module() -> IrModule {
+    let getter = |operation| IrExpr::Pap {
+        function: Name::str(name(operation), "_boxed"),
+        args: vec![],
+    };
+    let apply = |x, args| IrExpr::Ap { x, args };
+    IrModule {
+        decls: vec![IrDecl::Function {
+            name: name("LocalOutput.main"),
+            params: vec![],
+            result: IrType::TObject,
+            body: IrBody {
+                stmts: vec![
+                    bind(0, getter("IO.getStdout")),
+                    bind(1, getter("IO.getStderr")),
+                    bind(2, apply(0, vec![IrArg::Erased])),
+                    bind(3, apply(1, vec![IrArg::Erased])),
+                    bind(4, IrExpr::Proj { i: 4, x: 2 }),
+                    bind(5, IrExpr::Proj { i: 4, x: 3 }),
+                    bind(6, IrExpr::Lit(IrLit::Str("aλ\0".to_owned()))),
+                    bind(7, apply(4, vec![IrArg::Var(6), IrArg::Erased])),
+                    bind(8, IrExpr::Lit(IrLit::Str("🙂\n".to_owned()))),
+                    bind(9, apply(5, vec![IrArg::Var(8), IrArg::Erased])),
+                    // The same first-class getter remains callable after use.
+                    bind(10, apply(0, vec![IrArg::Erased])),
+                    bind(11, IrExpr::Proj { i: 4, x: 10 }),
+                    bind(12, IrExpr::Lit(IrLit::Str("tail".to_owned()))),
+                    bind(13, apply(11, vec![IrArg::Var(12), IrArg::Erased])),
+                    bind(14, IrExpr::Proj { i: 0, x: 13 }),
+                ],
+                terminal: Box::new(IrTerminal::Ret(IrArg::Var(14))),
+            },
+            sorry_dep: None,
+        }],
+        ..IrModule::default()
+    }
+}
+
+#[test]
+fn first_class_output_actions_interleave_replay_and_keep_one_bounded_sink() {
+    let module = paired_output_module();
+    assert!(matches!(
+        compile(
+            std::slice::from_ref(&module),
+            &name("LocalOutput.main"),
+            &[],
+            &partition(),
+            &BTreeSet::from([name("LocalOutput.main")]),
+            IrExecutionLimits::default(),
+        ),
+        Err(IrExecutionError::Unsupported { .. })
+    ));
+    let expected = "aλ\0🙂\ntail".as_bytes();
+    let compiled = prepare(&module, expected.len());
+    for getter in ["IO.getStdout", "IO.getStderr"] {
+        assert!(compiled.native_externs().contains(&format!("extern:{getter}")));
+        assert!(compiled.reference_functions().iter().all(|item| {
+            item.name != name(getter) && item.name != Name::str(name(getter), "_boxed")
+        }));
+    }
+    let bytes =
+        flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
+    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+    for _ in 0..2 {
+        for program in [compiled.program.program(), &replay] {
+            let (outcome, output) =
+                execute(program, ExecutionLimits::default(), None, expected.len());
+            let Outcome::Complete(VmExit::Returned(result)) = outcome else {
+                panic!("{outcome:?}")
+            };
+            assert_eq!(nat_decimal(&result.value).as_deref(), Some("0"));
+            assert_eq!(output.bytes, expected);
+        }
+    }
+    for (limit, prefix) in [(3, ""), (8, "aλ\0"), (12, "aλ\0🙂\n")] {
+        let report = prepare(&module, limit).execute(ExecutionLimits::default(), None);
+        assert!(matches!(report.outcome, Outcome::Inconclusive(_)));
+        assert_eq!(report.captured_output.unwrap().bytes, prefix.as_bytes());
+    }
+    let cancelled = compiled.execute(ExecutionLimits::default(), Some(&|| true));
+    assert!(matches!(cancelled.outcome, Outcome::Inconclusive(_)));
+    assert!(cancelled.captured_output.unwrap().bytes.is_empty());
+    let retried = compiled.execute(ExecutionLimits::default(), None);
+    assert!(matches!(
+        retried.outcome,
+        Outcome::Complete(VmExit::Returned(_))
+    ));
+    assert_eq!(retried.captured_output.unwrap().bytes, expected);
 }
 
 #[test]

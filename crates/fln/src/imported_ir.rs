@@ -6,7 +6,7 @@
 //! slice includes calls, closures, acyclic join points, immutable constructors,
 //! packed scalar fields and checked native reference-cell operations.
 //! Reference cells retain State effects. An explicit bounded output capability
-//! can additionally capture native stdout; other host I/O and runtime-global
+//! can additionally capture native stdout/stderr; other host I/O and runtime-global
 //! effects remain refused. Equivalent object updates use fresh construction.
 //! Other mutation, reset/reuse and observable reference counts are refused.
 //! Its RC annotations are replaced by Golem's checked managed ownership, not
@@ -631,10 +631,12 @@ pub fn compile(
     )
 }
 
-/// Compile with an explicit, per-execution native stdout capture allowance.
+/// Compile with an explicit, per-execution native output capture allowance.
 ///
-/// This admits only the exact native `IO.getStdout` row in addition to the
-/// effects allowed by [`compile`]. Native putStr callbacks require the capture
+/// This admits the exact native `IO.getStdout`/`IO.getStderr` getters and their
+/// first-class boxed actions in addition to the effects allowed by [`compile`].
+/// Both streams append to one ordered, bounded sink. Native putStr callbacks
+/// require the capture
 /// and return the compiled Reference IO-result ABI. Stream reads, filesystem,
 /// process, network, and initializer effects remain unavailable. The allowance
 /// counts raw UTF-8 bytes, including NULs and newlines; a rejected write is not
@@ -868,7 +870,10 @@ fn compile_with_policy(
             // function forwards to it natively, with the original ownership
             // contract, and never executes a supplied Reference wrapper body.
             pending.insert(name.parent());
-            natives.insert(name, Native::boxed(row, boxed)?);
+            natives.insert(
+                name,
+                Native::boxed(row, boxed, output_byte_limit.is_some())?,
+            );
             continue;
         }
         if let Some(row) = fln_vm::macro_native::row_for_name(&name) {
@@ -1161,8 +1166,9 @@ impl Native {
     fn boxed(
         row: &'static GeneratedExternRow,
         boxed: native_signature::BoxedNative,
+        captured_output: bool,
     ) -> Result<Self, IrExecutionError> {
-        let mut native = Self::new(row, native_signature::ir_arity(row)?)?;
+        let mut native = Self::with_output(row, native_signature::ir_arity(row)?, captured_output)?;
         native.ir_arity = boxed.arity();
         native.boxed = Some(boxed);
         Ok(native)
