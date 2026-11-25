@@ -1215,13 +1215,23 @@ fn lifted_join_functions_and_capture_expansion_obey_resource_limits() {
 
     let mut limits = IrExecutionLimits::default();
     limits.fir.max_operands = 5;
-    let error = compile_users(
-        vec![declaration.clone()],
-        "User.bounded",
-        &[nat(42)],
-        limits,
-    )
-    .unwrap_err();
+    // The operand budget is charged for real captures. Make this control
+    // actually read all six locals, so removing the budget check still fails.
+    let mut reads_all = declaration.clone();
+    let IrDecl::Function { body, .. } = &mut reads_all else {
+        unreachable!()
+    };
+    let Some(IrStmt::JDecl { value, .. }) = body.stmts.last_mut() else {
+        unreachable!()
+    };
+    value.stmts.push(binding(
+        8,
+        IrExpr::Ctor {
+            info: packed_test_info(6, 0, 0),
+            args: (1..=6).map(IrArg::Var).collect(),
+        },
+    ));
+    let error = compile_users(vec![reads_all], "User.bounded", &[nat(42)], limits).unwrap_err();
     assert!(matches!(
         error,
         IrExecutionError::Limit("join capture operands")
@@ -2212,6 +2222,75 @@ fn packed_test_info(objects: u64, usize: u64, bytes: u64) -> fln_olean::ir::IrCt
         size: objects,
         usize,
         ssize: bytes,
+    }
+}
+
+#[test]
+fn unrelated_join_does_not_freeze_a_packed_record_before_its_last_store() {
+    for capture_record in [false, true] {
+        // The join normally receives the completed record explicitly. A lexical
+        // read of the half-initialized record must still refuse at the join.
+        let receiver = if capture_record { 1 } else { 3 };
+        let decl = body_function(
+            "Packed.withJoin",
+            0,
+            ir_body(
+                vec![
+                    binding(
+                        1,
+                        IrExpr::Ctor {
+                            info: packed_test_info(0, 0, 1),
+                            args: vec![],
+                        },
+                    ),
+                    join(
+                        2,
+                        &[3],
+                        ir_body(
+                            vec![
+                                wide_ir_binding(
+                                    4,
+                                    &IrType::UInt8,
+                                    IrExpr::SProj {
+                                        n: 0,
+                                        offset: 0,
+                                        x: receiver,
+                                    },
+                                ),
+                                call(5, "UInt8.toNat", &[4]),
+                            ],
+                            IrTerminal::Ret(IrArg::Var(5)),
+                        ),
+                    ),
+                    wide_ir_binding(6, &IrType::UInt8, IrExpr::Lit(IrLit::Num(IrNat::Small(42)))),
+                    IrStmt::SSet {
+                        x: 1,
+                        i: 0,
+                        offset: 0,
+                        y: 6,
+                        ty: IrType::UInt8,
+                    },
+                ],
+                jump(2, &[1]),
+            ),
+        );
+        let compiled = compile_users(
+            vec![decl],
+            "Packed.withJoin",
+            &[],
+            IrExecutionLimits::default(),
+        );
+        if capture_record {
+            assert!(matches!(
+                compiled,
+                Err(IrExecutionError::Unsupported {
+                    form: "uninitialized packed constructor",
+                    ..
+                })
+            ));
+        } else {
+            assert_native_owned_result(&compiled.unwrap(), "42");
+        }
     }
 }
 

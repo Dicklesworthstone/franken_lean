@@ -41,6 +41,7 @@ mod lower;
 pub mod modules;
 mod native_effects;
 mod native_signature;
+mod operands;
 mod sha256;
 
 /// A census whose complete bytes match the checked-in pinned publication.
