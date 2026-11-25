@@ -1671,36 +1671,72 @@ impl<'a> Builder<'a> {
             // reference-count test or guessed object-to-number conversion.
             arms.sort_by_key(|(info, _)| fieldless_constructor(info));
         }
-        self.case_arm(
-            block,
-            x,
-            value,
-            &arms,
-            default,
-            (locals, joins, ty, shape_only),
-        )
+        // Sibling arms share a nesting level. Only their bodies can nest a case.
+        let mut next = block;
+        for (info, body) in arms {
+            let fieldless = fieldless_constructor(info);
+            let block = next;
+            let (constructor, condition) =
+                self.case_condition(block, value, ty, info, shape_only)?;
+            self.tables
+                .scope_work(locals.len().saturating_add(joins.len()))?;
+            let mut matching = locals.clone();
+            matching.insert(x, Local { value, constructor });
+            let nonzero = self.body(body, matching, joins.clone())?;
+            let zero = self.block()?;
+            if fieldless && !scalar && constructor.is_some() {
+                // Native data bridges can return a fieldless heap constructor,
+                // while Reference IR boxes the same nullary tag as a scalar.
+                // Both representations enter the same body without evaluating
+                // the receiver or its continuation a second time.
+                let scalar_condition = self.emit(
+                    zero,
+                    ValueType::Bool,
+                    Operation::ScalarTagTest {
+                        value,
+                        tag: info.cidx,
+                    },
+                )?;
+                let scalar_miss = self.block()?;
+                next = scalar_miss;
+                self.finish_block(
+                    zero,
+                    Terminator::BranchZero {
+                        condition: scalar_condition,
+                        zero: scalar_miss,
+                        nonzero,
+                    },
+                );
+            } else {
+                next = zero;
+            }
+            self.finish_block(
+                block,
+                Terminator::BranchZero {
+                    condition,
+                    zero,
+                    nonzero,
+                },
+            );
+        }
+        if let Some(body) = default {
+            let target = self.body(body, locals, joins)?;
+            self.finish_block(next, Terminator::Jump { target });
+        } else {
+            self.unreachable(next)?;
+        }
+        Ok(())
     }
 
-    fn case_arm(
+    fn case_condition(
         &mut self,
         block: BlockId,
-        x: u64,
         value: ValueId,
-        arms: &[(&IrCtorInfo, &IrBody)],
-        default: Option<&IrBody>,
-        scope: (Locals, Joins, &IrType, bool),
-    ) -> Result<()> {
-        let (locals, joins, ty, shape_only) = scope;
+        ty: &IrType,
+        info: &IrCtorInfo,
+        shape_only: bool,
+    ) -> Result<(Option<ConstructorId>, ValueId)> {
         let scalar = is_scalar_case(ty);
-        let Some(((info, body), rest)) = arms.split_first() else {
-            if let Some(body) = default {
-                let target = self.body(body, locals, joins)?;
-                self.finish_block(block, Terminator::Jump { target });
-            } else {
-                self.unreachable(block)?;
-            }
-            return Ok(());
-        };
         let fieldless = fieldless_constructor(info);
         let heap_tag = info.cidx <= u64::from(fln_rt::abi::TAG_MAX_CTOR_TAG);
         let constructor = if shape_only || fieldless && (scalar || !heap_tag) {
@@ -1768,60 +1804,6 @@ impl<'a> Builder<'a> {
                 }
             }
         };
-        self.tables
-            .scope_work(locals.len().saturating_add(joins.len()))?;
-        let mut matching = locals.clone();
-        matching.insert(x, Local { value, constructor });
-        let nonzero = self.body(body, matching, joins.clone())?;
-        let zero = self.block()?;
-        if fieldless && !scalar && constructor.is_some() {
-            // Native data bridges can return a fieldless heap constructor,
-            // while Reference IR boxes the same nullary tag as a scalar.
-            // Both representations enter the same body without evaluating
-            // the receiver or its continuation a second time.
-            let scalar_condition = self.emit(
-                zero,
-                ValueType::Bool,
-                Operation::ScalarTagTest {
-                    value,
-                    tag: info.cidx,
-                },
-            )?;
-            let scalar_miss = self.block()?;
-            self.case_arm(
-                scalar_miss,
-                x,
-                value,
-                rest,
-                default,
-                (locals, joins, ty, shape_only),
-            )?;
-            self.finish_block(
-                zero,
-                Terminator::BranchZero {
-                    condition: scalar_condition,
-                    zero: scalar_miss,
-                    nonzero,
-                },
-            );
-        } else {
-            self.case_arm(
-                zero,
-                x,
-                value,
-                rest,
-                default,
-                (locals, joins, ty, shape_only),
-            )?;
-        }
-        self.finish_block(
-            block,
-            Terminator::BranchZero {
-                condition,
-                zero,
-                nonzero,
-            },
-        );
-        Ok(())
+        Ok((constructor, condition))
     }
 }

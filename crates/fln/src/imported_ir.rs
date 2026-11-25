@@ -1120,8 +1120,10 @@ fn inspect_body(
             if matches!(x_type, IrType::Float | IrType::Float32) {
                 return Err(unsupported(name, "floating constructor case"));
             }
-            if alts.len() > limits.ir.max_depth.min(128) {
-                return Err(IrExecutionError::Limit("case alternatives"));
+            // Charge the complete frontier before enqueuing any of its bodies.
+            *work = work.saturating_add(alts.len() as u64);
+            if *work > limits.ir.max_work {
+                return Err(IrExecutionError::Limit("IR selection work"));
             }
             for alt in alts {
                 let child = match alt {
