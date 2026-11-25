@@ -400,35 +400,44 @@ fn generic_instance_prerequisites_keep_absolute_telescope_positions() {
 
 #[test]
 fn output_parameters_preserve_the_dependency_order_of_instance_prerequisites() {
-    let source = format!(
-        "{PICK}\ndef outParam.{{u}} (A : Sort u) : Sort u := A\nclass Need (A : Type) where\n  value : Token\nclass Choose (A : outParam Type) where\n  value : A\ninstance needToken : Need Token := Need.mk Token.right\ninstance chooseToken : Choose Token := Choose.mk Token.right\ninstance combined {{A : Type}} [need : Need A] [choice : Choose A] : Pick := Pick.mk (@Need.value A need)"
-    );
-    let built = compiled(&[("Main", &source)]);
-    assert_choice(&built.checked.checked.engine, "right");
-    let rows = metadata(&built.artifacts[0].bytes).instances;
-    let combined = rows
-        .iter()
-        .find(|row| row.declaration == name("combined"))
-        .unwrap();
-    assert_eq!(
-        combined.synth_order,
-        [2, 1],
-        "Choose supplies the type needed by the earlier Need prerequisite"
-    );
-    let choose = rows
-        .iter()
-        .find(|row| row.declaration == name("chooseToken"))
-        .unwrap();
-    assert_eq!(
-        choose.keys,
-        [
-            source_extensions::DiscrTreeKey::Const(name("Choose"), 1),
-            source_extensions::DiscrTreeKey::Const(name("Token"), 0)
-        ],
-        "the pin retains an explicit concrete output type in its index"
-    );
-    let receipt = imported(&built);
-    assert_choice(&receipt.engine, "right");
+    for (annotation, expected_outputs) in [("outParam", &[0u32][..]), ("semiOutParam", &[][..])] {
+        let source = format!(
+            "{PICK}\ndef {annotation}.{{u}} (A : Sort u) : Sort u := A\nclass Need (A : Type) where\n  value : Token\nclass Choose (A : {annotation} Type) where\n  value : A\ninstance needToken : Need Token := Need.mk Token.right\ninstance chooseToken : Choose Token := Choose.mk Token.right\ninstance combined {{A : Type}} [need : Need A] [choice : Choose A] : Pick := Pick.mk (@Need.value A need)"
+        );
+        let built = compiled(&[("Main", &source)]);
+        assert_choice(&built.checked.checked.engine, "right");
+        let metadata = metadata(&built.artifacts[0].bytes);
+        let class = metadata
+            .classes
+            .iter()
+            .find(|c| c.name == name("Choose"))
+            .unwrap();
+        assert_eq!(class.out_params.as_slice(), expected_outputs);
+        let rows = metadata.instances;
+        let combined = rows
+            .iter()
+            .find(|row| row.declaration == name("combined"))
+            .unwrap();
+        assert_eq!(
+            combined.synth_order,
+            [2, 1],
+            "Choose supplies the type needed by the earlier Need prerequisite"
+        );
+        let choose = rows
+            .iter()
+            .find(|row| row.declaration == name("chooseToken"))
+            .unwrap();
+        assert_eq!(
+            choose.keys,
+            [
+                source_extensions::DiscrTreeKey::Const(name("Choose"), 1),
+                source_extensions::DiscrTreeKey::Const(name("Token"), 0)
+            ],
+            "the pin retains an explicit concrete output type in its index"
+        );
+        let receipt = imported(&built);
+        assert_choice(&receipt.engine, "right");
+    }
 }
 
 #[test]

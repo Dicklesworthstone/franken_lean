@@ -328,25 +328,6 @@ impl Indexer<'_> {
             .constant_val()
             .type_
             .clone();
-        let mut domains = vec![&class_type];
-        while let Some(expr) = domains.pop() {
-            self.tick()?;
-            match expr.node() {
-                ExprNode::Const { name, .. }
-                    if *name == Name::from_components(["semiOutParam"]) =>
-                {
-                    // Semi-output metadata has its own contract; never pretend
-                    // that it is an ordinary input or an outParam.
-                    return Err(Error::Unsupported);
-                }
-                ExprNode::App { f, a } => domains.extend([f, a]),
-                ExprNode::ForallE {
-                    binder_type, body, ..
-                } => domains.extend([binder_type, body]),
-                ExprNode::MData { expr, .. } => domains.push(expr),
-                _ => {}
-            }
-        }
         let params = match self.imported_classes.get(&class) {
             Some(parameters) => {
                 *self.remaining = self
@@ -362,12 +343,34 @@ impl Indexer<'_> {
             self.tick()?;
             outputs.insert(index);
         }
+        // Lean/Meta/Instances.lean: computeSynthOrder adds semiOutParam
+        // positions to the ordinary outputs for readiness only. The class
+        // extension and discrimination keys retain their original policies.
+        let mut telescope = &class_type;
         let mut input = BTreeSet::new();
         for (index, arg) in args.iter().enumerate() {
             self.tick()?;
-            if !outputs.contains(&(index as u32)) {
+            while let ExprNode::MData { expr, .. } = telescope.node() {
+                self.tick()?;
+                telescope = expr;
+            }
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = telescope.node()
+            else {
+                return Err(Error::Unsupported);
+            };
+            let mut head = binder_type;
+            while let ExprNode::App { f, .. } = head.node() {
+                self.tick()?;
+                head = f;
+            }
+            let semi_output = matches!(head.node(), ExprNode::Const { name, .. }
+                if *name == Name::from_components(["semiOutParam"]));
+            if !semi_output && !outputs.contains(&(index as u32)) {
                 input.extend(self.dependencies(arg)?);
             }
+            telescope = body;
         }
         Ok(input)
     }
