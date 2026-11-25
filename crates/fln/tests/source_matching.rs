@@ -1,6 +1,9 @@
 //! Pattern matches are checked as ordinary recursor applications by both engines.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Name, Outcome, SourceCheckLimits};
+use fln::{
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Name, Outcome,
+    SourceCheckLimits, VmExit,
+};
 use fln_core::expr::{Expr, ExprNode};
 use fln_env::constants::ConstantInfo;
 use std::collections::HashSet;
@@ -76,6 +79,168 @@ fn bool_match_computes_both_alternatives_and_keeps_the_real_recursor() {
     };
     assert!(constants(&def.value).contains(&Name::from_components(["Bool", "rec"])));
     assert_eq!(result.theorems, 2);
+}
+
+#[test]
+fn explicit_match_motives_preserve_dependent_branch_types_and_universes() {
+    let checked = check(
+        r#"
+universe u
+def choose (P : Bool -> Sort u) (yes : P true) (no : P false) (b : Bool) : P b :=
+  match (motive := (x : Bool) -> P x) b with
+  | true => yes
+  | false => no
+theorem chooseTrue (P : Bool -> Sort u) (yes : P true) (no : P false) :
+    choose P yes no true = yes := by rfl
+theorem chooseFalse (P : Bool -> Sort u) (yes : P true) (no : P false) :
+    choose P yes no false = no := by rfl
+theorem explicitSelf (b : Bool) : b = b :=
+  match (motive := (x : Bool) -> x = x) b with
+  | true => by rfl
+  | false => by rfl
+abbrev SelfMotive := (b : Bool) -> b = b
+theorem aliasedSelf (b : Bool) : b = b :=
+  match (motive := SelfMotive) b with
+  | true => by rfl
+  | false => by rfl
+theorem capturedSelf (b : Bool) (h : b = b) : b = b :=
+  match (motive := Bool -> b = b) b with
+  | true => h
+  | false => h
+theorem implicitSelf (b : Bool) : b = b :=
+  match (motive := {x : Bool} -> x = x) b with
+  | true => by rfl
+  | false => by rfl
+"#,
+    );
+    assert_eq!(checked.theorems, 6);
+    let Some(ConstantInfo::Defn(definition)) = checked
+        .engine
+        .environment()
+        .find(&Name::from_components(["choose"]))
+    else {
+        panic!("checked dependent match");
+    };
+    assert!(constants(&definition.value).contains(&Name::from_components(["Bool", "rec"])));
+    assert!(!definition.value.has_fvar());
+    assert!(!definition.value.has_expr_mvar());
+    assert!(!definition.value.has_level_mvar());
+}
+
+#[test]
+fn explicit_match_motive_domains_guide_inference_and_keep_captured_locals() {
+    check(
+        r#"
+inductive Payload (A : Type) where | empty | value (item : A)
+def emptyPayload : Nat :=
+  match (motive := Payload Nat -> Nat) .empty with
+  | .empty => 7
+  | .value n => n
+theorem emptyPayloadValue : emptyPayload = 7 := by rfl
+def computed (b : Bool) : Nat :=
+  match (generalizing := false) (motive := Bool -> Nat) ((fun x => x) b) with
+  | true => 11
+  | false => 19
+theorem computedValue : computed false = 19 := by rfl
+def capture (b : Bool) (h : b = true) : Nat :=
+  let consume : b = true -> Nat := fun _ => 23
+  match (motive := Bool -> Nat) b with
+  | true => consume h
+  | false => consume h
+theorem captureValue : capture true rfl = 23 := by rfl
+"#,
+    );
+}
+
+#[test]
+fn explicit_match_motives_check_every_branch_and_never_abstract_captured_constants() {
+    for source in [
+        "def bad : Nat := match (motive := Nat) true with | true => 1 | false => 2",
+        "def bad : Nat := match (motive := fun (_ : Bool) => Nat) true with | true => 1 | false => 2",
+        "def bad : Nat := match (motive := String -> Nat) true with | true => 1 | false => 2",
+        "def bad : String := match (motive := Bool -> Nat) true with | true => 1 | false => 2",
+        "def bad : Nat := match (motive := Bool -> Nat) true with | true => 1 | false => \"wrong\"",
+        // Reconstructing the motive from `false = false` would incorrectly
+        // abstract both literals and make the impossible `true` arm pass.
+        "theorem bad : false = false := match (motive := (b : Bool) -> b = false) false with | true => by rfl | false => by rfl",
+        "theorem bad (b : Bool) : b = b := match (motive := (c : Bool) -> c = b) b with | true => by rfl | false => by rfl",
+        "def bad (P : Bool -> Type) (h : P false) : P false := match (motive := (b : Bool) -> P b) false with | true => h | false => h",
+        "def bad (b : Bool) : Nat := match (generalizing := true) (motive := Bool -> Nat) b with | true => 1 | false => 2",
+        "def bad (b : Bool) : Nat := match (motive := Bool -> Nat) h : b with | true => 1 | false => 2",
+    ] {
+        let base = engine();
+        let root = base.logical_root(&KVMap::new());
+        let refusal = base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        );
+        assert!(refusal.is_err(), "{source}");
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    check(
+        "theorem valid : false = false := match (motive := (b : Bool) -> b = b) false with | true => by rfl | false => by rfl",
+    );
+}
+
+#[test]
+fn explicit_match_motives_execute_and_replay_all_constructor_branches() {
+    let result = engine()
+        .execute_source_definitions(
+            &[br#"
+inductive Payload where | empty | value (item : Nat)
+def select (b : Bool) : Nat :=
+  match (motive := Bool -> Nat) b with
+  | true => 11
+  | false => 19
+def unpack (p : Payload) : Nat :=
+  match (motive := Payload -> Nat) p with
+  | .empty => 23
+  | .value n => n
+def branchFunction (b : Bool) : Nat -> Nat :=
+  match (motive := Bool -> Nat -> Nat) b with
+  | true => fun n => n + 1
+  | false => fun n => n + 2
+#eval select true
+#eval select false
+#eval unpack Payload.empty
+#eval unpack (Payload.value 42)
+#eval branchFunction true 40
+#eval branchFunction false 40
+"#],
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(result.source_evaluation_indices.len(), 6);
+    for (&index, expected) in result
+        .source_evaluation_indices
+        .iter()
+        .zip(["11", "19", "23", "42", "41", "42"])
+    {
+        let execution = &result.executions[index];
+        let VmExit::Returned(value) = &execution.exit else {
+            panic!("normal match result");
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+            Some(expected),
+        );
+        let replay =
+            fln::execute_flbc_artifact(&execution.flbc_artifact, &KVMap::new(), Default::default())
+                .unwrap()
+                .into_complete()
+                .unwrap();
+        let VmExit::Returned(value) = replay else {
+            panic!("normal replay result");
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+            Some(expected),
+        );
+    }
 }
 #[test]
 fn parameterized_variants_destructure_payloads_in_separate_scopes() {

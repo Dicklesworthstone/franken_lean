@@ -2530,7 +2530,8 @@ impl Context {
             CalcDeferredFinish(Typed),
             MatrixScope(Vec<Name>),
             CaptureRecursiveContext,
-            MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
+            MatchMotive(matching::MatchParts<'a>, Option<Expr>),
+            MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>, Option<Expr>),
             NomatchDiscriminant(Arguments<'a>, Vec<Typed>, Option<Expr>),
             MatchNext(Box<matching::MatchBuild<'a>>),
             MatchBranch(Box<matching::MatchBuild<'a>>, matching::BranchBinders),
@@ -3442,9 +3443,17 @@ impl Context {
                                     {
                                         let parts = self.match_parts(syntax)?;
                                         self.recheck_written_discriminant(&parts)?;
-                                        let discriminant = parts.discriminant;
-                                        tasks.push(Task::MatchDiscriminant(parts, expected));
-                                        tasks.push(Task::Visit(discriminant, None, true));
+                                        if let Some(motive) = parts.motive {
+                                            let sort = self.type_expected()?;
+                                            tasks.push(Task::MatchMotive(parts, expected));
+                                            tasks.push(Task::Visit(motive, Some(sort), true));
+                                        } else {
+                                            let discriminant = parts.discriminant;
+                                            tasks.push(Task::MatchDiscriminant(
+                                                parts, expected, None,
+                                            ));
+                                            tasks.push(Task::Visit(discriminant, None, true));
+                                        }
                                         continue;
                                     }
                                     // `bif c then a else b` is `cond c a b` (`Init/Notation.lean`).
@@ -4164,15 +4173,38 @@ impl Context {
                                     ));
                                 }
                             }
-                            Task::MatchDiscriminant(parts, expected) => {
+                            Task::MatchMotive(parts, expected) => {
+                                let motive = values.pop().expect("match motive visit");
+                                self.sort_level(&motive)?;
+                                let motive = self.whnf(&motive.value)?;
+                                let ExprNode::ForallE { binder_type, .. } = motive.node() else {
+                                    return Err(failure(SourceInferenceError::Match(
+                                        matching::MatchError::InvalidMotive,
+                                    )));
+                                };
+                                let domain = binder_type.clone();
+                                let discriminant = parts.discriminant;
+                                tasks.push(Task::MatchDiscriminant(parts, expected, Some(motive)));
+                                tasks.push(Task::Visit(discriminant, Some(domain), true));
+                            }
+                            Task::MatchDiscriminant(parts, expected, explicit_motive) => {
                                 let major = values.pop().expect("match discriminant visit");
-                                tasks.push(match self.start_match(parts, major, expected)? {
-                                    matching::MatchStart::Regular(state) => Task::MatchNext(state),
-                                    matching::MatchStart::Refined(proof) => Task::Proof(proof),
-                                    matching::MatchStart::Conditional(state) => {
-                                        Task::ConditionalNext(state)
-                                    }
-                                });
+                                tasks.push(
+                                    match self.start_match(
+                                        parts,
+                                        major,
+                                        expected,
+                                        explicit_motive,
+                                    )? {
+                                        matching::MatchStart::Regular(state) => {
+                                            Task::MatchNext(state)
+                                        }
+                                        matching::MatchStart::Refined(proof) => Task::Proof(proof),
+                                        matching::MatchStart::Conditional(state) => {
+                                            Task::ConditionalNext(state)
+                                        }
+                                    },
+                                );
                             }
                             Task::MatchNext(mut state) => {
                                 match self.next_match_branch(&mut state)? {

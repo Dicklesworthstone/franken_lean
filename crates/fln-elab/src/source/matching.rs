@@ -37,6 +37,10 @@ pub enum MatchError {
     DuplicateVariable,
     UnreachableRow,
     UnsupportedGeneralization,
+    InvalidMotive,
+    MotiveWithGeneralization,
+    MotiveWithEquality,
+    UnsupportedExplicitMotive,
     /// A tagged definition must normalize to a checked constructor/literal
     /// pattern while retaining every accessible source binder and type.
     UnsupportedDefinitionPattern(&'static str),
@@ -72,6 +76,14 @@ impl std::fmt::Display for MatchError {
             Self::UnsupportedGeneralization => {
                 "disabled match generalization requires an ordinary nonrecursive unindexed match"
             }
+            Self::InvalidMotive => "match motive requires a function type over the discriminant",
+            Self::MotiveWithGeneralization => "explicit match motives cannot enable generalization",
+            Self::MotiveWithEquality => {
+                "explicit match motives cannot bind discriminant equalities"
+            }
+            Self::UnsupportedExplicitMotive => {
+                "explicit match motives currently require an ordinary nonrecursive unindexed match"
+            }
             Self::UnsupportedDefinitionPattern(reason) => reason,
             Self::InaccessiblePatternVariable => {
                 "an explicit pattern variable occurs only in inaccessible positions after unfolding"
@@ -86,6 +98,9 @@ fn error(reason: MatchError) -> NatDefinitionElabError {
 #[derive(Clone, Copy)]
 pub(super) struct MatchParts<'a> {
     pub(super) discriminant: &'a Syntax,
+    /// The pin accepts a function *type*, not a type-valued lambda, here.
+    /// Its domain guides the discriminant and its body types every branch.
+    pub(super) motive: Option<&'a Syntax>,
     pub(super) equation: Option<&'a Syntax>,
     alternatives: &'a [Syntax],
     pub(super) generated: bool,
@@ -331,6 +346,7 @@ impl Context {
             expect_atom(&rest[3], "else", "conditional else")?;
             return Ok(MatchParts {
                 discriminant: &rest[0],
+                motive: None,
                 equation: None,
                 alternatives: &[],
                 generated: true,
@@ -365,6 +381,7 @@ impl Context {
                 };
             return Ok(MatchParts {
                 discriminant: &parts[2],
+                motive: None,
                 equation: None,
                 alternatives: &[],
                 generated: true,
@@ -386,8 +403,32 @@ impl Context {
             "match expression",
         )?;
         expect_atom(&parts[0], "match", "match keyword")?;
-        let generalizing = generalizing_annotation(&parts[1])?;
-        expect_empty_null(&parts[2], "unsupported explicit motive")?;
+        let mut generalizing = generalizing_annotation(&parts[1])?;
+        let motive = match expect_null_args(&parts[2], "optional match motive")? {
+            [] => None,
+            [motive] => {
+                let motive = expect_node(
+                    motive,
+                    &parser_kind(&["Term", "motive"]),
+                    5,
+                    "explicit match motive",
+                )?;
+                expect_atom(&motive[0], "(", "match motive opening")?;
+                expect_atom(&motive[1], "motive", "match motive keyword")?;
+                expect_atom(&motive[2], ":=", "match motive assignment")?;
+                expect_atom(&motive[4], ")", "match motive closing")?;
+                if generalizing
+                    && !expect_null_args(&parts[1], "generalizing parameter")?.is_empty()
+                {
+                    return Err(error(MatchError::MotiveWithGeneralization));
+                }
+                // Lean/Elab/Match.lean, elabMatchAux: an explicit motive
+                // disables generalization even when no flag was written.
+                generalizing = false;
+                Some(&motive[3])
+            }
+            _ => return Err(error(MatchError::InvalidMotive)),
+        };
         let [discriminant] = expect_null_args(&parts[3], "single discriminant")? else {
             return Err(error(MatchError::InvalidPattern));
         };
@@ -409,6 +450,9 @@ impl Context {
             }
             _ => return Err(error(MatchError::InvalidPattern)),
         };
+        if motive.is_some() && equation.is_some() {
+            return Err(error(MatchError::MotiveWithEquality));
+        }
         expect_atom(&parts[4], "with", "match alternatives keyword")?;
         let alternatives = expect_node(
             &parts[5],
@@ -425,6 +469,7 @@ impl Context {
         }
         Ok(MatchParts {
             discriminant: &discriminant[1],
+            motive,
             equation,
             alternatives,
             generated,
@@ -444,6 +489,7 @@ impl Context {
         if !parts.written
             || parts.generated
             || parts.conditional.is_some()
+            || parts.motive.is_some()
             || self.simple_match(parts.alternatives)
         {
             return Ok(());
@@ -546,6 +592,7 @@ impl Context {
         parts: MatchParts<'a>,
         major: Typed,
         expected: Option<Expr>,
+        explicit_motive: Option<Expr>,
     ) -> Result<MatchStart<'a>, NatDefinitionElabError> {
         if let Some(conditional) = parts.conditional {
             return self
@@ -553,6 +600,22 @@ impl Context {
                 .map(|state| MatchStart::Conditional(Box::new(state)));
         }
         let mut major = major;
+        let expected = if let Some(motive) = &explicit_motive {
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = motive.node()
+            else {
+                return Err(error(MatchError::InvalidMotive));
+            };
+            self.constrain_type(&major.type_, binder_type)?;
+            let target = self.substitute(body, &major.value)?;
+            if let Some(expected) = &expected {
+                self.constrain_type(&target, expected)?;
+            }
+            Some(target)
+        } else {
+            expected
+        };
         // A match as written is refused where the pin refuses its patterns' types; the lowering
         // below would solve index equations the pin leaves alone (`pattern_typing`).
         if parts.written && parts.equation.is_none() && parts.conditional.is_none() {
@@ -572,6 +635,9 @@ impl Context {
         // equation-refining backend; typing faults and resource stops propagate.
         let recursive = self.is_recursive_match(&major.value);
         let well_founded = self.well_founded_continuation().is_some();
+        if explicit_motive.is_some() && (parts.generated || recursive || well_founded) {
+            return Err(error(MatchError::UnsupportedExplicitMotive));
+        }
         if !parts.generalizing && (recursive || well_founded) {
             return Err(error(MatchError::UnsupportedGeneralization));
         }
@@ -593,7 +659,7 @@ impl Context {
                 .map(MatchStart::Refined);
         }
         let saved = self.clone();
-        match self.start_regular_match(parts, major.clone(), expected.clone()) {
+        match self.start_regular_match(parts, major.clone(), expected.clone(), explicit_motive) {
             Ok(build) => Ok(MatchStart::Regular(Box::new(build))),
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
                 MatchError::UnrefinedIndices | MatchError::UnrefinedIndexPattern,
@@ -613,6 +679,7 @@ impl Context {
         parts: MatchParts<'a>,
         major: Typed,
         expected: Option<Expr>,
+        explicit_motive: Option<Expr>,
     ) -> Result<MatchBuild<'a>, NatDefinitionElabError> {
         self.resolve_instances(false)?;
         self.flush(false)?;
@@ -642,6 +709,9 @@ impl Context {
         }
         if family.ctors.len() > 256 {
             return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        if explicit_motive.is_some() && family.num_indices != 0 {
+            return Err(error(MatchError::UnsupportedExplicitMotive));
         }
         if !parts.generalizing && family.num_indices != 0 {
             return Err(error(MatchError::UnsupportedGeneralization));
@@ -687,7 +757,7 @@ impl Context {
         // to a checked local binding, retaining the original discriminant type.
         // In particular, `match xs with | _ => xs` must not force `xs` to have
         // every constructor's result type.
-        if !recursive && parts.alternatives.len() == 1 {
+        if !recursive && explicit_motive.is_none() && parts.alternatives.len() == 1 {
             let alt = expect_node(
                 &parts.alternatives[0],
                 &parser_kind(&["Term", "matchAlt"]),
@@ -840,7 +910,28 @@ impl Context {
             value: motive_target.clone(),
             type_: target_type,
         })?;
-        let motive = self.indexed_match_motive(&motive_target, &major, &family_type, &indices)?;
+        let motive = if let Some(motive) = explicit_motive {
+            let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } = motive.node()
+            else {
+                return Err(error(MatchError::InvalidMotive));
+            };
+            // Preserve the supplied binder exactly. Re-abstracting the
+            // instantiated result could replace captured occurrences of the
+            // discriminant too, e.g. (b : Bool) -> b = false at `false`.
+            Expr::lam(
+                binder_name.clone(),
+                binder_type.clone(),
+                body.clone(),
+                *binder_info,
+            )
+        } else {
+            self.indexed_match_motive(&motive_target, &major, &family_type, &indices)?
+        };
         let motive_type = self
             .known_type(&motive)?
             .ok_or_else(|| error(MatchError::ExpectedInductive))?;

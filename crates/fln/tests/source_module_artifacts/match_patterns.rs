@@ -20,6 +20,65 @@ theorem classify_blue : Same (classify Color.blue) Color.blue := @Same.refl Colo
 "#;
 
 #[test]
+fn explicit_match_motives_survive_library_artifacts_and_checked_reimport() {
+    let consumer = r#"prelude
+import Lib
+def selectColor (color : Color) : Color :=
+  match (motive := Color -> Color) color with
+  | .red => Color.blue
+  | .blue => Color.red
+theorem selected_red : Same (selectColor Color.red) Color.blue := @Same.refl Color.blue
+theorem selected_blue : Same (selectColor Color.blue) Color.red := @Same.refl Color.red
+"#;
+    let built = compiled(&[("Lib", LIBRARY), ("Main", consumer)]);
+    let rebuilt = compiled(&[("Main", consumer), ("Lib", LIBRARY)]);
+    assert_eq!(built.artifacts.len(), 2);
+    for (first, second) in built.artifacts.iter().zip(&rebuilt.artifacts) {
+        assert_eq!(first.name, second.name);
+        assert_eq!(first.bytes, second.bytes);
+    }
+
+    // This is a fresh engine reading the physical artifacts and checking the
+    // declarations again, not the producer's in-memory source environment.
+    let receipt = imported(&built);
+    let base = &receipt.engine;
+    let root = base.logical_root(&KVMap::new());
+    let checked = base
+        .check_source_files(
+            &[br#"
+def dependentColor (color : Color) : Same color color :=
+  match (motive := (c : Color) -> Same c c) color with
+  | .red => @Same.refl Color.red
+  | .blue => @Same.refl Color.blue
+theorem imported_red : Same (selectColor Color.red) Color.blue := @Same.refl Color.blue
+theorem imported_blue : Same (selectColor Color.blue) Color.red := @Same.refl Color.red
+"#],
+            &KVMap::new(),
+            limits().source,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    for declaration in ["dependentColor", "imported_red", "imported_blue"] {
+        assert!(checked.engine.environment().contains(&name(declaration)));
+    }
+    assert!(
+        base.check_source_files(
+            &[br#"theorem invalid : Same Color.red Color.red :=
+  match (motive := (c : Color) -> Same c Color.red) Color.red with
+  | .red => @Same.refl Color.red
+  | .blue => @Same.refl Color.blue"#],
+            &KVMap::new(),
+            limits().source,
+        )
+        .is_err(),
+        "an impossible branch remains invalid after importing the family"
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(!base.environment().contains(&name("invalid")));
+}
+
+#[test]
 fn pattern_aliases_survive_compiled_import_cache_reuse_and_persisted_readmission() {
     use fln::source_check::modules::persisted::{
         PersistedModules, SourceModuleKey, SourceModuleStore,
