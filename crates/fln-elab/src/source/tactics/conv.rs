@@ -1204,8 +1204,14 @@ impl Context {
         let attempt = (|| -> Result<bool, NatDefinitionElabError> {
             self.txn.lctx = goal.lctx.clone();
             let target = self.instantiate(&goal.target)?;
-            if self.validate_instance_binder(&target).is_err() {
-                return Ok(false);
+            // A non-class target is an ordinary failed synthesis attempt.
+            // Resource and invariant failures must survive this fallback.
+            match self.validate_instance_binder(&target) {
+                Ok(()) => {}
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::InvalidInstanceBinder,
+                )) => return Ok(false),
+                Err(problem) => return Err(problem),
             }
             let value = self.instance_hole(target)?;
             self.resolve_instances(true)?;
@@ -1734,5 +1740,45 @@ impl Context {
         }
         let reduced = done[&root.allocation_identity()].clone();
         self.instantiate(&reduced)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_fallback_leaves_nonclass_goals_open_and_preserves_work() {
+        let mut context = Context::new(&Environment::new(), Budget::for_stack_bytes(128 * 1024));
+        let (_, goal) = context.proof_goal(Expr::sort(Level::zero())).unwrap();
+        let before = context.txn.budget.heartbeats_consumed;
+
+        assert!(!context.conv_infer_instance(&goal).unwrap());
+        assert!(!context.txn.mvars.is_assigned(&goal.id));
+        assert!(context.txn.budget.heartbeats_consumed > before);
+    }
+
+    #[test]
+    fn instance_fallback_propagates_resource_stops_in_binder_validation() {
+        let mut context = Context::new(&Environment::new(), Budget::for_stack_bytes(128 * 1024));
+        let (_, goal) = context.proof_goal(Expr::sort(Level::zero())).unwrap();
+        // Instantiating the already closed target consumes one heartbeat.
+        // The next heartbeat is inside validate_instance_binder, the site
+        // whose error the fallback previously discarded.
+        context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed + 1;
+        let mut control = context.clone();
+        assert!(control.instantiate(&goal.target).is_ok());
+
+        assert!(matches!(
+            context.conv_infer_instance(&goal),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
+        assert!(!context.txn.mvars.is_assigned(&goal.id));
+        assert!(
+            context.txn.budget.heartbeats_consumed > context.txn.budget.max_heartbeats,
+            "an aborted instance search must retain its consumed work"
+        );
     }
 }
