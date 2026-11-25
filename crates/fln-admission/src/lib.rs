@@ -31,6 +31,8 @@
 // Allocation failure unwinds to the import frontier's per-module guard.
 #![feature(alloc_error_hook)]
 
+#[cfg(target_os = "linux")]
+mod frontier_memory;
 mod import_closure;
 use import_closure::ImportClosure;
 
@@ -1553,9 +1555,10 @@ pub trait FrontierMemorySource: Sync {
     }
 }
 
-/// Production host-memory source reading `/proc/self/{status,limits}` and
-/// `/proc/meminfo` on Linux, honoring an optional `FLN_FRONTIER_MAX_MEMORY_BYTES`
-/// ceiling override.
+/// Production host-memory source reading process, host and cgroup limits on
+/// Linux. `FLN_FRONTIER_MAX_MEMORY_BYTES` is an optional process-RSS ceiling;
+/// it can lower admission headroom, but cannot override an operating-system
+/// limit or memory already consumed by other processes in the same cgroup.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HostProcessMemorySource;
 
@@ -1567,14 +1570,7 @@ impl FrontierMemorySource for HostProcessMemorySource {
             .filter(|limit| *limit > 0);
         #[cfg(target_os = "linux")]
         {
-            let (rss_bytes, vm_size_bytes) = linux_proc_self_memory_bytes();
-            let limit_bytes = override_limit
-                .or_else(|| linux_address_space_headroom_bytes(rss_bytes, vm_size_bytes))
-                .or_else(linux_mem_total_bytes);
-            FrontierMemorySample {
-                rss_bytes,
-                limit_bytes,
-            }
+            frontier_memory::sample(override_limit)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1584,61 +1580,6 @@ impl FrontierMemorySource for HostProcessMemorySource {
             }
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-fn parse_proc_kb_line(line: &str, prefix: &str) -> Option<u64> {
-    let rest = line.strip_prefix(prefix)?.trim();
-    let digits = rest.split_whitespace().next()?;
-    digits.parse::<u64>().ok()?.checked_mul(1024)
-}
-
-#[cfg(target_os = "linux")]
-fn linux_proc_self_memory_bytes() -> (u64, u64) {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return (0, 0);
-    };
-    let mut rss = 0_u64;
-    let mut vm_size = 0_u64;
-    for line in status.lines() {
-        if let Some(bytes) = parse_proc_kb_line(line, "VmRSS:") {
-            rss = bytes;
-        } else if let Some(bytes) = parse_proc_kb_line(line, "VmSize:") {
-            vm_size = bytes;
-        }
-    }
-    (rss, vm_size)
-}
-
-#[cfg(target_os = "linux")]
-fn linux_address_space_headroom_bytes(rss_bytes: u64, vm_size_bytes: u64) -> Option<u64> {
-    let limits = std::fs::read_to_string("/proc/self/limits").ok()?;
-    for line in limits.lines() {
-        if let Some(rest) = line.strip_prefix("Max address space") {
-            let soft = rest.split_whitespace().next()?;
-            if soft == "unlimited" {
-                return None;
-            }
-            let max_as = soft.parse::<u64>().ok()?;
-            // Non-resident virtual mappings (worker stacks, mapped code) already
-            // count against `RLIMIT_AS`, so subtract `vm_size - rss` to convert
-            // `Max address space` into an effective RSS ceiling.
-            let non_resident = vm_size_bytes.saturating_sub(rss_bytes);
-            return Some(max_as.saturating_sub(non_resident));
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn linux_mem_total_bytes() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in meminfo.lines() {
-        if let Some(bytes) = parse_proc_kb_line(line, "MemTotal:") {
-            return Some(bytes);
-        }
-    }
-    None
 }
 
 /// One row of a frontier run. `elapsed` is operational wall time, never part of any
