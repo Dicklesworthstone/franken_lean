@@ -35,6 +35,7 @@ pub(super) fn signature(
         .or_else(|| string(row))
         .or_else(|| word(row))
         .or_else(|| floating(row))
+        .or_else(|| floating_math(row))
         .or_else(|| float_array(row))
         .or_else(|| byte_array(row))
         .or_else(|| expressions::review(row))
@@ -432,6 +433,119 @@ fn floating(row: &GeneratedExternRow) -> Option<Review> {
     match family {
         "Float" => family!("Float", "lean_float", Float, UInt64),
         "Float32" => family!("Float32", "lean_float32", Float32, UInt32),
+        _ => None,
+    }
+}
+
+/// The remaining scalar math rows name C libm symbols in the pin, but Golem
+/// executes their existing owned fln-libm implementations. A symbol name is
+/// contract data here, never permission to call the host math library.
+fn floating_math(row: &GeneratedExternRow) -> Option<Review> {
+    // Both width conversions are declared in Init.Data.Float32, including
+    // Float.toFloat32. Do not infer a declaration's module from its namespace.
+    let conversion = match row.id {
+        "extern:Float.toFloat32" => Some((
+            "Float.toFloat32",
+            "lean_float_to_float32",
+            &[IrType::Float] as &'static [IrType],
+            &IrType::Float32,
+        )),
+        "extern:Float32.toFloat" => Some((
+            "Float32.toFloat",
+            "lean_float32_to_float",
+            &[IrType::Float32] as &'static [IrType],
+            &IrType::Float,
+        )),
+        _ => None,
+    };
+    if let Some((name, symbol, parameters, result)) = conversion {
+        return Some(Review {
+            name,
+            symbol,
+            module: "Init.Data.Float32",
+            kind: "opaque",
+            ownership: "abi((a: value) -> value)",
+            signature: PrimitiveSignature {
+                parameters,
+                result,
+                exact_borrowed: None,
+            },
+        });
+    }
+    let (family, operation) = row.id.strip_prefix("extern:")?.split_once('.')?;
+    #[rustfmt::skip]
+    macro_rules! family {
+        ($family:literal, $float:ident, $c:literal, $suffix:literal) => {{
+            macro_rules! review {
+                ($operation:literal, $symbol:expr, $parameters:expr,
+                 $result:expr, $ownership:literal) => {
+                    Some(Review {
+                        name: concat!($family, ".", $operation),
+                        symbol: $symbol,
+                        module: concat!("Init.Data.", $family),
+                        kind: "opaque",
+                        ownership: $ownership,
+                        signature: PrimitiveSignature {
+                            parameters: $parameters,
+                            result: $result,
+                            exact_borrowed: None,
+                        },
+                    })
+                };
+            }
+            macro_rules! unary {
+                ($operation:literal, $symbol:literal) => {
+                    review!($operation, concat!($symbol, $suffix),
+                        &[IrType::$float], &IrType::$float,
+                        "rule(scalar-args,scalar-result)")
+                };
+            }
+            match operation {
+                "abs" => unary!("abs", "fabs"),
+                "sqrt" => unary!("sqrt", "sqrt"),
+                "ceil" => unary!("ceil", "ceil"),
+                "floor" => unary!("floor", "floor"),
+                "round" => unary!("round", "round"),
+                "sin" => unary!("sin", "sin"),
+                "cos" => unary!("cos", "cos"),
+                "tan" => unary!("tan", "tan"),
+                "asin" => unary!("asin", "asin"),
+                "acos" => unary!("acos", "acos"),
+                "atan" => unary!("atan", "atan"),
+                "sinh" => unary!("sinh", "sinh"),
+                "cosh" => unary!("cosh", "cosh"),
+                "tanh" => unary!("tanh", "tanh"),
+                "asinh" => unary!("asinh", "asinh"),
+                "acosh" => unary!("acosh", "acosh"),
+                "atanh" => unary!("atanh", "atanh"),
+                "exp" => unary!("exp", "exp"),
+                "exp2" => unary!("exp2", "exp2"),
+                "log" => unary!("log", "log"),
+                "log2" => unary!("log2", "log2"),
+                "log10" => unary!("log10", "log10"),
+                "cbrt" => unary!("cbrt", "cbrt"),
+                "pow" => review!("pow", concat!("pow", $suffix),
+                    &[IrType::$float, IrType::$float], &IrType::$float,
+                    "rule(scalar-args,scalar-result)"),
+                "atan2" => review!("atan2", concat!("atan2", $suffix),
+                    &[IrType::$float, IrType::$float], &IrType::$float,
+                    "rule(scalar-args,scalar-result)"),
+                "isNaN" => review!("isNaN", concat!($c, "_isnan"),
+                    &[IrType::$float], &IrType::UInt8,
+                    "abi((a: value) -> value)"),
+                "isFinite" => review!("isFinite", concat!($c, "_isfinite"),
+                    &[IrType::$float], &IrType::UInt8,
+                    "abi((a: value) -> value)"),
+                "isInf" => review!("isInf", concat!($c, "_isinf"),
+                    &[IrType::$float], &IrType::UInt8,
+                    "abi((a: value) -> value)"),
+                _ => None,
+            }
+        }};
+    }
+    match family {
+        "Float" => family!("Float", Float, "lean_float", ""),
+        "Float32" => family!("Float32", Float32, "lean_float32", "f"),
         _ => None,
     }
 }
