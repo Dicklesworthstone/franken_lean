@@ -1402,8 +1402,8 @@ impl Context {
     /// Whether `contradiction` may inject into a same-constructor equation `ty`: only
     /// where the pin's `decide` branch would decide it. That needs a closed homogeneous
     /// equation with a `Decidable` instance. The instance query runs on a clone, so a
-    /// missing instance costs its heartbeats and leaves no other state behind; a
-    /// resource stop still propagates.
+    /// missing instance costs its heartbeats and leaves no other state behind.
+    /// Kernel inconclusives and registry faults are not failed instance queries.
     fn contradiction_may_descend(&mut self, ty: &Expr) -> Result<bool, NatDefinitionElabError> {
         let ty = self.instantiate(ty)?;
         if ty.has_fvar() || ty.has_expr_mvar() || ty.has_level_mvar() {
@@ -1417,10 +1417,15 @@ impl Context {
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
         match decided {
             Ok(_) => Ok(true),
-            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)) => {
-                Err(failure(SourceInferenceError::ResourceLimit))
+            Err(problem)
+                if matches!(
+                    &problem,
+                    NatDefinitionElabError::Inference(SourceInferenceError::InvalidInstanceBinder)
+                ) || super::backtrack::recoverable(&problem) =>
+            {
+                Ok(false)
             }
-            Err(_) => Ok(false),
+            Err(problem) => Err(problem),
         }
     }
 
@@ -1431,8 +1436,8 @@ impl Context {
     /// Available only where the pinned constants exist (a real `Init`
     /// environment); the frozen seed dialect has neither, so the arm never
     /// fires there and the seed dialect is unchanged. A failed instance query
-    /// or a `true` decision falls through to the ordinary refusal; resource
-    /// exhaustion keeps its typed outcome (FL-INV-07). The eligibility probe
+    /// or a `true` decision falls through to the ordinary refusal; kernel resource
+    /// stops and registry faults keep their typed outcome (FL-INV-07). The probe
     /// runs on a clone so a failed query cannot leak instance state, and the
     /// dictionary in the real proof term is re-synthesized on `self`.
     fn decided_false_evidence(
@@ -1459,10 +1464,15 @@ impl Context {
         match decided {
             Ok(true) => {}
             Ok(false) => return Ok(None),
-            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)) => {
-                return Err(failure(SourceInferenceError::ResourceLimit));
+            Err(problem)
+                if matches!(
+                    &problem,
+                    NatDefinitionElabError::Inference(SourceInferenceError::InvalidInstanceBinder)
+                ) || super::backtrack::recoverable(&problem) =>
+            {
+                return Ok(None);
             }
-            Err(_) => return Ok(None),
+            Err(problem) => return Err(problem),
         }
         let dictionary = self.decision_dictionary(&ty)?;
         let sort = self
@@ -1488,5 +1498,164 @@ impl Context {
             Expr::const_(absurd, vec![level]),
             [ty, target.clone(), evidence.value.clone(), negation],
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fln_env::constants::{AxiomVal, ConstantInfo, ConstantVal};
+
+    fn name(text: &str) -> Name {
+        Name::from_components(text.split('.'))
+    }
+
+    fn term(text: &str) -> Expr {
+        Expr::const_(name(text), Vec::new())
+    }
+
+    /// Small explicit signatures exercise the real instance search and kernel
+    /// conversion. The opaque decision cannot reduce to Bool.false; no proof
+    /// is manufactured or admitted by this fixture.
+    fn decision_fixture() -> (Environment, Typed) {
+        let prop = Expr::sort(Level::zero());
+        let type_ = Expr::sort(Level::one());
+        let decidable = Expr::forall_e(name("p"), prop.clone(), type_.clone(), BinderInfo::Default);
+        let decide = Expr::forall_e(
+            name("p"),
+            prop.clone(),
+            Expr::forall_e(
+                name("inst"),
+                Expr::app(term("Decidable"), Expr::bvar(0).unwrap()),
+                term("Bool"),
+                BinderInfo::InstImplicit,
+            ),
+            BinderInfo::Implicit,
+        );
+        let mut env = Environment::new();
+        for (label, signature) in [
+            ("P", prop.clone()),
+            ("Bool", type_),
+            ("Bool.false", term("Bool")),
+            ("Decidable", decidable),
+            ("dictionary", Expr::app(term("Decidable"), term("P"))),
+            ("decide", decide),
+            ("hypothesis", term("P")),
+            // Only their availability is queried in these unsuccessful probes.
+            ("of_decide_eq_false", prop.clone()),
+            ("absurd", prop),
+        ] {
+            env = env
+                .add_decl(ConstantInfo::Axiom(AxiomVal {
+                    base: ConstantVal {
+                        name: name(label),
+                        level_params: Vec::new(),
+                        type_: signature,
+                    },
+                    is_unsafe: false,
+                }))
+                .unwrap();
+        }
+        (
+            env,
+            Typed {
+                value: term("hypothesis"),
+                type_: term("P"),
+            },
+        )
+    }
+
+    #[test]
+    fn contradiction_decision_probes_preserve_ordinary_failure_and_state() {
+        let (env, evidence) = decision_fixture();
+        let mut context = Context::new(&env, Budget::for_stack_bytes(2 * 1024 * 1024));
+        let equation = equality::equation(
+            Level::one(),
+            term("Bool"),
+            term("Bool.false"),
+            term("Bool.false"),
+        );
+        // Seed grammars without a registered Decidable class still permit
+        // contradiction's other branches, just as a missing dictionary does.
+        assert!(!context.contradiction_may_descend(&equation).unwrap());
+        assert!(context.instance_goals.is_empty());
+        assert!(context.txn.mvars.assignments().is_empty());
+
+        let env = crate::instances::register_class(&env, &name("Decidable")).unwrap();
+        let mut context = Context::new(&env, Budget::for_stack_bytes(2 * 1024 * 1024));
+        assert!(
+            context
+                .decided_false_evidence(&evidence, &term("P"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(context.instance_goals.is_empty());
+        assert!(context.txn.mvars.assignments().is_empty());
+
+        let env = crate::instances::register_instance(&env, &name("dictionary"), 1000).unwrap();
+        let mut context = Context::new(&env, Budget::for_stack_bytes(2 * 1024 * 1024));
+        assert!(
+            context
+                .decided_false_evidence(&evidence, &term("P"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(context.instance_goals.is_empty());
+        assert!(context.txn.mvars.assignments().is_empty());
+        assert!(context.txn.budget.heartbeats_consumed > 0);
+    }
+
+    #[test]
+    fn contradiction_decision_keeps_kernel_exhaustion_inconclusive() {
+        let (env, evidence) = decision_fixture();
+        let env = crate::instances::register_class(&env, &name("Decidable")).unwrap();
+        let env = crate::instances::register_instance(&env, &name("dictionary"), 1000).unwrap();
+        let mut context = Context::new(&env, Budget::for_stack_bytes(2 * 1024 * 1024));
+        context.kernel = context.kernel.narrowed(0, context.kernel.depth);
+        let problem = context
+            .decided_false_evidence(&evidence, &term("P"))
+            .unwrap_err();
+        assert!(matches!(
+            problem,
+            NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(outcome))
+                if matches!(*outcome, Outcome::Inconclusive(_))
+        ));
+        assert!(context.instance_goals.is_empty());
+        assert!(context.txn.mvars.assignments().is_empty());
+        assert!(context.txn.budget.heartbeats_consumed > 0);
+    }
+
+    #[test]
+    fn contradiction_probes_do_not_treat_a_broken_registry_as_no_instance() {
+        let (env, evidence) = decision_fixture();
+        let env = crate::instances::register_class(&env, &name("Decidable")).unwrap();
+        let env = env
+            .push_extension_entry(
+                &Name::from_components(["FrankenLean", "sourceInstances", "v1"]),
+                Vec::new(),
+            )
+            .unwrap();
+        let mut context = Context::new(&env, Budget::for_stack_bytes(2 * 1024 * 1024));
+        let equation = equality::equation(
+            Level::one(),
+            term("Bool"),
+            term("Bool.false"),
+            term("Bool.false"),
+        );
+        for problem in [
+            context.contradiction_may_descend(&equation).unwrap_err(),
+            context
+                .decided_false_evidence(&evidence, &term("P"))
+                .unwrap_err(),
+        ] {
+            assert!(matches!(
+                problem,
+                NatDefinitionElabError::Inference(SourceInferenceError::InstanceRegistry(
+                    crate::instances::InstanceRegistryError::Malformed
+                ))
+            ));
+        }
+        assert!(context.instance_goals.is_empty());
+        assert!(context.txn.mvars.assignments().is_empty());
     }
 }

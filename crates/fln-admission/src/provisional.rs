@@ -293,9 +293,7 @@ fn unreviewed_declaration_verdict(
         Ok(Outcome::Inconclusive(reason)) => {
             Ok(PerDeclarationModuleOutcome::PartialAssumed(reason))
         }
-        Ok(Outcome::InternalFault(fault)) => {
-            Ok(PerDeclarationModuleOutcome::InternalFault(fault))
-        }
+        Ok(Outcome::InternalFault(fault)) => Ok(PerDeclarationModuleOutcome::InternalFault(fault)),
         Ok(Outcome::Complete(())) => Err(OleanCheckError::InternalInvariant {
             detail: "an independent reading objection completed without a refusal",
         }),

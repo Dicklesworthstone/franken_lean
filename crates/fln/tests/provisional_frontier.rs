@@ -1475,8 +1475,7 @@ fn repeated_declarations_preserve_independent_projection_nonanswers() {
         else {
             panic!("{label}: the ordinary council must admit the base");
         };
-        let base =
-            ProvisionalEnvironment::from_admitted(checked_base.engine.environment().clone());
+        let base = ProvisionalEnvironment::from_admitted(checked_base.engine.environment().clone());
         let base_root = base.as_check_environment().logical_root(&options);
         let decoded = fln_admission::decode_olean_module_input(&input, limits)
             .expect("repeat artifact must decode independently");
@@ -1546,7 +1545,10 @@ fn repeated_declarations_preserve_independent_projection_nonanswers() {
         ));
         assert_eq!(recovered.accepted_declarations, 1);
         assert!(recovered.final_env.is_some());
-        assert_eq!(base.as_check_environment().logical_root(&options), base_root);
+        assert_eq!(
+            base.as_check_environment().logical_root(&options),
+            base_root
+        );
         assert!(!base.has_assumptions());
     }
 }
