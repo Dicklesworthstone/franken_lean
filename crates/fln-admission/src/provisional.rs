@@ -1059,7 +1059,9 @@ pub fn check_decoded_olean_per_declaration(
     let entries: Vec<(EnvironmentEntry, bool)> = decoded
         .constants
         .iter()
-        .filter(|info| !base.contains(info.name()))
+        // A rechecked theorem can add an assumption for an existing name.
+        // Include its retained entry so non-base imports receive that mark too.
+        .filter(|info| assumed_names.contains(info.name()) || !base.contains(info.name()))
         .filter_map(|info| {
             let entry = env.entry(info.name())?;
             let is_assumed = assumed_names.contains(info.name());
@@ -1411,7 +1413,12 @@ fn run_phase2_module(
             .collect::<Vec<_>>(),
     );
     let own_assumed_count = checked.assumed_declaration_names.len();
-    let total_assumed = closure_assumed_count.saturating_add(own_assumed_count);
+    // Rechecking another copy of a theorem can assume a name already in the
+    // closure. Count distinct names in the environment passed to descendants.
+    let total_assumed = checked
+        .final_env
+        .as_ref()
+        .map_or(closure_assumed_count, ProvisionalEnvironment::assumed_count);
     let memory = OleanFrontierMemoryAttribution::from_components(
         work.estimated_bytes,
         admitted_bytes,
