@@ -1,5 +1,6 @@
 //! Judge each transported mutation twice, against immutable imports only.
 //! No acceptance, rejection, or missing answer can change the next trial.
+#![forbid(unsafe_code)]
 use super::*;
 use fln_checker::admit::{Verdict as CheckerVerdict, admit};
 use fln_checker::environment::{ConstantEnvironment, EnvironmentOutcome};
