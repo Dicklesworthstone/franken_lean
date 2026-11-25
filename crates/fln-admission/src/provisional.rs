@@ -254,6 +254,8 @@ impl<E> ProvisionalFrontier<E> {
 pub struct PerDeclarationModuleCheck {
     pub verdict: PerDeclarationModuleOutcome,
     pub entries: Vec<(EnvironmentEntry, bool)>,
+    /// Complete checked-or-assumed module context. A whole-module reading
+    /// nonanswer, or an early stop without assumptions, leaves this absent.
     pub final_env: Option<ProvisionalEnvironment>,
     pub accepted_declarations: usize,
     pub total_declarations: usize,
@@ -269,13 +271,35 @@ pub struct PerDeclarationModuleCheck {
 pub enum PerDeclarationModuleOutcome {
     /// Every declaration unit was accepted without assuming any unit in this module.
     AllAccepted,
-    /// At least one declaration unit hit a resource stop and was assumed whole;
-    /// every remaining unit either passed or was assumed whole.
+    /// A resource or availability stop prevented unconditional acceptance.
+    /// A present `final_env` means every unit was checked or explicitly assumed;
+    /// an absent one means no complete module context is available to import.
     PartialAssumed(Inconclusive),
     /// A declaration unit was rejected or disagreed between K1 and the checker.
     Failed(OleanCheckError),
     /// An internal invariant fault stopped the check.
     InternalFault(InternalFault),
+}
+
+/// Preserve both kinds of independent-reading refusal for declarations that
+/// need no fresh council check. A projection budget stop is still a nonanswer
+/// when an earlier environment already contains the same declaration.
+fn unreviewed_declaration_verdict(
+    name: &Name,
+    objection: ReadingObjection,
+) -> Result<PerDeclarationModuleOutcome, OleanCheckError> {
+    match unreviewed_reading_refusal::<()>(name, objection) {
+        Err(error) => Ok(PerDeclarationModuleOutcome::Failed(error)),
+        Ok(Outcome::Inconclusive(reason)) => {
+            Ok(PerDeclarationModuleOutcome::PartialAssumed(reason))
+        }
+        Ok(Outcome::InternalFault(fault)) => {
+            Ok(PerDeclarationModuleOutcome::InternalFault(fault))
+        }
+        Ok(Outcome::Complete(())) => Err(OleanCheckError::InternalInvariant {
+            detail: "an independent reading objection completed without a refusal",
+        }),
+    }
 }
 
 /// Compute exact import-graph dominator unlock values and first-blocker chain
@@ -702,11 +726,9 @@ pub fn check_decoded_olean_per_declaration(
                 detail: "an already-present declaration is not in the decoded table",
             });
         };
-        if let Some(objection) = readings.objection(info, limits.admission.checker.decode)
-            && let Err(error) = unreviewed_reading_refusal::<()>(name, objection)
-        {
+        if let Some(objection) = readings.objection(info, limits.admission.checker.decode) {
             return Ok(PerDeclarationModuleCheck {
-                verdict: PerDeclarationModuleOutcome::Failed(error),
+                verdict: unreviewed_declaration_verdict(name, objection)?,
                 entries: Vec::new(),
                 final_env: None,
                 accepted_declarations: 0,
@@ -996,11 +1018,9 @@ pub fn check_decoded_olean_per_declaration(
                 }
             }
             ConstantInfo::Axiom(_) => {
-                if let Some(objection) = objection
-                    && let Err(error) = unreviewed_reading_refusal::<()>(&name, objection)
-                {
+                if let Some(objection) = objection {
                     return Ok(PerDeclarationModuleCheck {
-                        verdict: PerDeclarationModuleOutcome::Failed(error),
+                        verdict: unreviewed_declaration_verdict(&name, objection)?,
                         entries: Vec::new(),
                         final_env: None,
                         accepted_declarations,
@@ -1402,6 +1422,11 @@ fn run_phase2_module(
         admitted_bytes,
         0,
     );
+    // A whole-module reading failure can be inconclusive without producing a
+    // complete checked-or-assumed import environment. Only completed module
+    // environments may unlock descendants, regardless of whether this result
+    // needs to retain its environment for a later consumer.
+    let usable = checked.final_env.is_some();
     let retain_env = work.retain_final_env.then_some(checked.final_env).flatten();
     let retain_entries = work.retain_payload_entries;
 
@@ -1451,15 +1476,15 @@ fn run_phase2_module(
             final_env: None,
         },
         PerDeclarationModuleOutcome::PartialAssumed(reason) => {
-            let payload = retain_entries.then_some(Phase2ModulePayload {
+            let payload = (usable && retain_entries).then_some(Phase2ModulePayload {
                 position: 0, // overwritten by scheduler with frontier position
                 entries: checked.entries,
             });
             Phase2Done {
                 index,
                 host_memory_refusal: false,
-                usable: true,
-                contributes_assumptions: own_assumed_count > 0,
+                usable,
+                contributes_assumptions: usable && own_assumed_count > 0,
                 row: ProvisionalFrontierRow {
                     name: module_name.clone(),
                     phase: 2,

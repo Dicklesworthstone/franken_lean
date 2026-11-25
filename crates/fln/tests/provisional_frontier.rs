@@ -1305,3 +1305,248 @@ fn phase2_cancellation_settles_a_pending_memory_retry_without_running_it() {
     assert_eq!(recovered.counts().inconclusive, 1);
     assert!(!recovered.is_authoritative());
 }
+
+#[test]
+fn phase2_unread_artifact_blocks_descendants_without_inventing_assumptions() {
+    use std::sync::atomic::AtomicUsize;
+
+    // Refuse the independent reading both at the inconclusive root B and at
+    // its provisional descendant C. A missing whole-module reading provides
+    // no complete import environment, unlike a checked atomic unit that was
+    // explicitly assumed after exhausting its budget.
+    for unread_index in [1, 2] {
+        let mut serial_signature = None;
+        for threads in [1, 4] {
+            let fixture = chain_fixture();
+            let inputs = to_inputs(&fixture);
+            let limits = limits_with_steps(120);
+            let options = KVMap::new();
+            let calls: Vec<_> = (0..inputs.len()).map(|_| AtomicUsize::new(0)).collect();
+            let admitted = fln_admission::Admitted {
+                environment: Environment::new(),
+                checker_environment: None,
+                imported_modules: Default::default(),
+                imported_environment: None,
+                imported_module_dependencies: Default::default(),
+                executable_opaques: Default::default(),
+                runtime_initializers: Default::default(),
+                options: KVMap::new(),
+            };
+            let frontier = admitted
+                .check_olean_frontier_provisional_using(
+                    &inputs,
+                    limits,
+                    jobs(threads),
+                    None,
+                    &mut |_| {},
+                    fln_admission::FrontierRunHooks {
+                        check: &|job| admitted.frontier_check_module(job, &options, limits),
+                        decode: &|index| {
+                            let attempt = calls[index].fetch_add(1, Ordering::SeqCst);
+                            let mut decoded =
+                                fln_admission::decode_olean_module_input(&inputs[index], limits)?;
+                            if index == unread_index && attempt == 1 {
+                                assert!(matches!(
+                                    &decoded.independent,
+                                    fln_admission::IndependentReading::Read(_)
+                                ));
+                                decoded.independent = fln_admission::IndependentReading::Unread(
+                                    "independent reader resource stop".to_owned(),
+                                );
+                            }
+                            Ok(decoded)
+                        },
+                        memory: &fln_admission::HostProcessMemorySource,
+                    },
+                )
+                .expect("an unavailable reading must settle the frontier");
+
+            let unread = frontier
+                .rows
+                .iter()
+                .find(|row| row.name == fixture[unread_index].0)
+                .expect("unread module has a final row");
+            assert_eq!(calls[unread_index].load(Ordering::SeqCst), 2);
+            assert!(
+                matches!(
+                    &unread.verdict,
+                    ProvisionalModuleVerdict::Inconclusive {
+                        accepted_declarations: 0,
+                        assumed_declaration_names,
+                        ..
+                    } if assumed_declaration_names.is_empty()
+                ),
+                "an unread module must remain a nonanswer without assumed declarations: {:?}",
+                unread.verdict
+            );
+            assert!(unread.unit_reports.is_empty());
+            assert!(unread.memory_retry.is_none());
+            assert_eq!(unread.assumed_declarations, usize::from(unread_index == 2));
+
+            for index in unread_index + 1..fixture.len() {
+                assert_eq!(
+                    calls[index].load(Ordering::SeqCst),
+                    1,
+                    "a dependent must not decode again after its Phase-2 import became unavailable"
+                );
+                let dependent = frontier
+                    .rows
+                    .iter()
+                    .find(|row| row.name == fixture[index].0)
+                    .expect("blocked descendant has a final row");
+                assert!(
+                    matches!(
+                        &dependent.verdict,
+                        ProvisionalModuleVerdict::Blocked { by, .. }
+                            if by == &fixture[index - 1].0
+                    ),
+                    "a missing import environment must block its dependent: {:?}",
+                    dependent.verdict
+                );
+                assert!(dependent.unit_reports.is_empty());
+            }
+
+            let counts = frontier.counts();
+            counts.assert_conservation();
+            assert_eq!(counts.accepted, 1);
+            assert_eq!(counts.inconclusive, unread_index);
+            assert_eq!(counts.blocked, fixture.len() - unread_index - 1);
+            assert_eq!(counts.accepted_under_assumptions, 0);
+            assert_eq!(counts.failed + counts.internal_fault, 0);
+            assert!(!frontier.is_authoritative());
+            let signature = row_signature(&frontier);
+            if let Some(serial) = &serial_signature {
+                assert_eq!(
+                    &signature, serial,
+                    "resource stops must be schedule independent"
+                );
+            } else {
+                serial_signature = Some(signature);
+            }
+        }
+    }
+}
+
+#[test]
+fn repeated_declarations_preserve_independent_projection_nonanswers() {
+    use fln_admission::{
+        CheckerDecodeBudget, PerDeclarationModuleOutcome, check_decoded_olean_per_declaration,
+    };
+    use fln_core::outcome::Outcome;
+    use fln_env::constants::TheoremVal;
+
+    let options = KVMap::new();
+    let limits = limits_with_steps(10_000);
+    let proposition = Expr::const_(n("Repeat.P"), Vec::new());
+    let repeated = axiom("Repeat.t", proposition.clone());
+    let theorem = ConstantInfo::Thm(TheoremVal {
+        base: ConstantVal {
+            name: n("Repeat.t"),
+            level_params: Vec::new(),
+            type_: proposition.clone(),
+        },
+        value: Expr::const_(n("Repeat.w"), Vec::new()),
+        all: vec![n("Repeat.t")],
+    });
+    let artifact = encode_module(&[], std::slice::from_ref(&repeated));
+    let module_name = n("Repeat");
+    let input = OleanModuleInput {
+        name: &module_name,
+        artifact: &artifact,
+        server_artifact: None,
+        private_artifact: None,
+    };
+
+    // Exact duplicate axioms take already_present; a theorem of the same
+    // proposition subsumes the imported axiom and takes the repeat branch.
+    // Both paths still owe an independent reading of this artifact.
+    for (label, prior) in [("exact duplicate", repeated), ("subsumed axiom", theorem)] {
+        let base_artifact = encode_module(
+            &[],
+            &[
+                axiom("Repeat.P", Expr::sort(Level::zero())),
+                axiom("Repeat.w", proposition.clone()),
+                prior,
+            ],
+        );
+        let Outcome::Complete(checked_base) = Engine::from_environment(Environment::new())
+            .check_olean_artifact(&base_artifact, &options, limits)
+            .expect("base artifact must decode")
+        else {
+            panic!("{label}: the ordinary council must admit the base");
+        };
+        let base =
+            ProvisionalEnvironment::from_admitted(checked_base.engine.environment().clone());
+        let base_root = base.as_check_environment().logical_root(&options);
+        let decoded = fln_admission::decode_olean_module_input(&input, limits)
+            .expect("repeat artifact must decode independently");
+
+        let complete = check_decoded_olean_per_declaration(&base, &decoded, limits, true)
+            .expect("valid repeat must be checked");
+        assert!(
+            matches!(&complete.verdict, PerDeclarationModuleOutcome::AllAccepted),
+            "{label}: {:?}",
+            complete.verdict
+        );
+        assert_eq!(complete.accepted_declarations, 1);
+        assert!(complete.final_env.is_some());
+        assert!(complete.assumed_declaration_names.is_empty());
+
+        let mut exhausted = limits;
+        exhausted.admission.checker.decode = CheckerDecodeBudget::new(0, 0);
+        let stopped = check_decoded_olean_per_declaration(&base, &decoded, exhausted, true)
+            .expect("projection exhaustion is a typed nonanswer");
+        assert!(
+            matches!(
+                &stopped.verdict,
+                PerDeclarationModuleOutcome::PartialAssumed(_)
+            ),
+            "{label}: a failed reading projection must not count as acceptance: {:?}",
+            stopped.verdict
+        );
+        assert_eq!(stopped.accepted_declarations, 0);
+        assert_eq!(stopped.total_declarations, 1);
+        assert!(stopped.entries.is_empty());
+        assert!(stopped.final_env.is_none());
+        assert!(stopped.assumed_declaration_names.is_empty());
+        assert!(stopped.unit_reports.is_empty());
+        assert!(matches!(
+            checked_base
+                .engine
+                .check_olean_artifact(&artifact, &options, exhausted)
+                .expect("the authoritative path must preserve the same budget stop"),
+            Outcome::Inconclusive(_)
+        ));
+
+        // A disagreeing independent reader remains a concrete failure, never
+        // a provisional assumption. This is an adversarial reading mutation.
+        let mut mismatched = fln_admission::decode_olean_module_input(&input, limits)
+            .expect("unchanged repeat bytes still decode");
+        mismatched.independent = fln_admission::IndependentReading::Read(Vec::new());
+        let failed = check_decoded_olean_per_declaration(&base, &mismatched, limits, true)
+            .expect("the disagreement must have a terminal module outcome");
+        assert!(
+            matches!(
+                &failed.verdict,
+                PerDeclarationModuleOutcome::Failed(
+                    OleanCheckError::IndependentReadingDiffers { name, .. }
+                ) if name == &n("Repeat.t")
+            ),
+            "{label}: {:?}",
+            failed.verdict
+        );
+        assert!(failed.final_env.is_none());
+        assert!(failed.assumed_declaration_names.is_empty());
+
+        let recovered = check_decoded_olean_per_declaration(&base, &decoded, limits, true)
+            .expect("a fresh check with the original budget recovers");
+        assert!(matches!(
+            &recovered.verdict,
+            PerDeclarationModuleOutcome::AllAccepted
+        ));
+        assert_eq!(recovered.accepted_declarations, 1);
+        assert!(recovered.final_env.is_some());
+        assert_eq!(base.as_check_environment().logical_root(&options), base_root);
+        assert!(!base.has_assumptions());
+    }
+}
