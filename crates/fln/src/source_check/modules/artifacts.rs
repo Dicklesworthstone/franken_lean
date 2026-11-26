@@ -1564,7 +1564,13 @@ pub fn extract_native_module_attributes(
         let mut explicit = BTreeSet::new();
         for row in exported.owned {
             explicit.insert(row.declaration.clone());
-            tag(row.declaration, status_label(row.status).to_owned());
+            // The pin's `reducibilityCore` omits the default `semireducible` status for
+            // owned declarations; native journals may still record it internally so
+            // `ReducibilityTable::effective` does not promote standalone/proof instances
+            // to `implicit_reducible` (so `explicit.insert` above must still run).
+            if row.status != fln_elab::reducibility::Reducibility::Semireducible {
+                tag(row.declaration, status_label(row.status).to_owned());
+            }
         }
         for row in exported.imported {
             tag(

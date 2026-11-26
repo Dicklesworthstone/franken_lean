@@ -216,9 +216,44 @@ impl Engine {
                 }
             }
             if !pattern_equations {
-                batch.engine.environment =
-                    source_simp::update(batch.engine.environment(), name, rule)
-                        .map_err(metadata_error)?;
+                let mut registered_aux_proof = false;
+                if source_owned
+                    && equations.is_empty()
+                    && let Some((priority, false)) = rule
+                    && let Some(aux_decl) =
+                        source_simp::export::prepare_iff_auxiliary(batch.engine.environment(), name)
+                            .map_err(metadata_error)?
+                {
+                    let Declaration::Thm(theorem) = &aux_decl else {
+                        return Err(EngineExecutionError::UnexpectedPublication {
+                            detail: "a source iff simp auxiliary must be a theorem",
+                        });
+                    };
+                    let aux_name = theorem.base.name.clone();
+                    let admitted = match batch
+                        .engine
+                        .admit_declaration(aux_decl, options, limits)?
+                    {
+                        Outcome::Complete(admitted) => admitted,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    batch.engine = admitted.engine.clone();
+                    batch.admissions.push(admitted);
+                    batch.engine.environment = source_simp::register_proof(
+                        batch.engine.environment(),
+                        name,
+                        &aux_name,
+                        priority,
+                    )
+                    .map_err(metadata_error)?;
+                    registered_aux_proof = true;
+                }
+                if !registered_aux_proof {
+                    batch.engine.environment =
+                        source_simp::update(batch.engine.environment(), name, rule)
+                            .map_err(metadata_error)?;
+                }
             }
         } else {
             // Validate the same requested rule without retaining its global

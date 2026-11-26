@@ -276,24 +276,14 @@ impl<'a> Indexer<'a> {
         name: &Name,
         hints: ReducibilityHints,
     ) -> Result<Reducibility, SimpSetError> {
+        // One lookup in the environment's effective table, which `reducibility::table`
+        // validates once per journal change within its own limits. Charging the entire
+        // library's `importedInstances` / `sourceReducibility` bytes against a single
+        // declaration's 2^20 snapshot meter exhausted the budget on every `@[simp]`
+        // theorem importing `Init` (same root cause as `export::known_status`,
+        // fln-simp-equation-set-limit-regression-re4l).
+        self.meter.work(1)?;
         if self.reducibility.is_none() {
-            // The cached table reads both journals. Charge their complete rows
-            // before obtaining it, independently of whether a prior call cached it.
-            for (name, version) in [
-                ("sourceReducibility", "v1"),
-                ("sourceInstances", "v1"),
-                ("importedInstances", "v2"),
-            ] {
-                if let Some(state) =
-                    self.env
-                        .extension(&Name::from_components(["FrankenLean", name, version]))
-                {
-                    for row in state.entries() {
-                        self.meter.work(1 + row.payload.len())?;
-                        self.meter.bytes(row.payload.len())?;
-                    }
-                }
-            }
             self.reducibility =
                 Some(
                     crate::reducibility::table(self.env).map_err(|error| match error {
@@ -316,18 +306,8 @@ impl<'a> Indexer<'a> {
     }
 
     fn class(&mut self, name: &Name) -> Result<bool, SimpSetError> {
+        self.meter.work(1)?;
         if self.registry.is_none() {
-            for (journal, version) in [("sourceInstances", "v1"), ("importedInstances", "v2")] {
-                if let Some(state) =
-                    self.env
-                        .extension(&Name::from_components(["FrankenLean", journal, version]))
-                {
-                    for row in state.entries() {
-                        self.meter.work(1 + row.payload.len())?;
-                        self.meter.bytes(row.payload.len())?;
-                    }
-                }
-            }
             self.registry = Some(InstanceRegistry::read(self.env).map_err(registry_error)?);
         }
         Ok(self

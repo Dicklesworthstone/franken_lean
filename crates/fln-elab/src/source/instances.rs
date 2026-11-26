@@ -725,6 +725,134 @@ impl Context {
         )))
     }
 
+    /// Pinned `MutualDef.cleanupOfNat` (`Lean/Elab/MutualDef.lean:189-204`):
+    /// rewrite `OfNat <type> (OfNat.ofNat Nat <num> <inst>)` into `OfNat <type> <num>`
+    /// inside an `instance` declaration's return type.
+    pub(super) fn cleanup_of_nat_in_instance_type(
+        &mut self,
+        root: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        enum Step {
+            Visit(Expr),
+            App,
+            Lam(Name, BinderInfo),
+            ForallE(Name, BinderInfo),
+            LetE(Name, bool),
+            MData(KVMap),
+            Proj(Name, u64),
+        }
+
+        let of_nat = Name::from_components(["OfNat"]);
+        let of_nat_fn = Name::from_components(["OfNat", "ofNat"]);
+        let nat = Name::from_components(["Nat"]);
+        let mut work = vec![Step::Visit(root.clone())];
+        let mut out: Vec<Expr> = Vec::new();
+        while let Some(step) = work.pop() {
+            self.tick()?;
+            match step {
+                Step::Visit(expr) => {
+                    if let ExprNode::App { f, a } = expr.node()
+                        && let ExprNode::App { f: head, .. } = f.node()
+                        && matches!(head.node(), ExprNode::Const { name, .. } if *name == of_nat)
+                    {
+                        let arg = self.instantiate(a)?;
+                        if let ExprNode::App { f: f2, .. } = arg.node()
+                            && let ExprNode::App { f: f1, a: num } = f2.node()
+                            && let ExprNode::App { f: h, a: nat_ty } = f1.node()
+                            && matches!(h.node(), ExprNode::Const { name, .. } if *name == of_nat_fn)
+                            && matches!(nat_ty.node(), ExprNode::Const { name, .. } if *name == nat)
+                        {
+                            out.push(Expr::app(f.clone(), num.clone()));
+                            continue;
+                        }
+                    }
+                    match expr.node() {
+                        ExprNode::App { f, a } => {
+                            work.push(Step::App);
+                            work.push(Step::Visit(a.clone()));
+                            work.push(Step::Visit(f.clone()));
+                        }
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => {
+                            work.push(Step::Lam(binder_name.clone(), *binder_info));
+                            work.push(Step::Visit(body.clone()));
+                            work.push(Step::Visit(binder_type.clone()));
+                        }
+                        ExprNode::ForallE {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => {
+                            work.push(Step::ForallE(binder_name.clone(), *binder_info));
+                            work.push(Step::Visit(body.clone()));
+                            work.push(Step::Visit(binder_type.clone()));
+                        }
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            value,
+                            body,
+                            non_dep,
+                        } => {
+                            work.push(Step::LetE(decl_name.clone(), *non_dep));
+                            work.push(Step::Visit(body.clone()));
+                            work.push(Step::Visit(value.clone()));
+                            work.push(Step::Visit(type_.clone()));
+                        }
+                        ExprNode::MData { data, expr } => {
+                            work.push(Step::MData(data.clone()));
+                            work.push(Step::Visit(expr.clone()));
+                        }
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => {
+                            work.push(Step::Proj(struct_name.clone(), *idx));
+                            work.push(Step::Visit(expr.clone()));
+                        }
+                        _ => out.push(expr),
+                    }
+                }
+                Step::App => {
+                    let a = out.pop().expect("cleanupOfNat app arg");
+                    let f = out.pop().expect("cleanupOfNat app fn");
+                    out.push(Expr::app(f, a));
+                }
+                Step::Lam(name, info) => {
+                    let body = out.pop().expect("cleanupOfNat lam body");
+                    let binder_type = out.pop().expect("cleanupOfNat lam type");
+                    out.push(Expr::lam(name, binder_type, body, info));
+                }
+                Step::ForallE(name, info) => {
+                    let body = out.pop().expect("cleanupOfNat forall body");
+                    let binder_type = out.pop().expect("cleanupOfNat forall type");
+                    out.push(Expr::forall_e(name, binder_type, body, info));
+                }
+                Step::LetE(name, non_dep) => {
+                    let body = out.pop().expect("cleanupOfNat let body");
+                    let value = out.pop().expect("cleanupOfNat let value");
+                    let type_ = out.pop().expect("cleanupOfNat let type");
+                    out.push(Expr::let_e(name, type_, value, body, non_dep));
+                }
+                Step::MData(data) => {
+                    let expr = out.pop().expect("cleanupOfNat mdata expr");
+                    out.push(Expr::mdata(data, expr));
+                }
+                Step::Proj(struct_name, idx) => {
+                    let expr = out.pop().expect("cleanupOfNat proj expr");
+                    out.push(Expr::proj(struct_name, idx, expr));
+                }
+            }
+        }
+        Ok(out.pop().expect("cleanupOfNat root result"))
+    }
+
     /// The pin's `checkBinderAnnotations` gates both annotation checks
     /// (Lean/Elab/Binders.lean): the target must be a class, and non-instance
     /// parameters of parametric local instances must have forward dependencies.

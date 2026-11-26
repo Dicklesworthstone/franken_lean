@@ -457,7 +457,7 @@ impl Context {
                 .value
                 .abstract_fvar(&local.id, 0)
                 .map_err(|_| failure(SourceInferenceError::Scope))?;
-            term.type_ = term
+            let abstracted_type = term
                 .type_
                 .abstract_fvar(&local.id, 0)
                 .map_err(|_| failure(SourceInferenceError::Scope))?;
@@ -468,7 +468,9 @@ impl Context {
                 term.value,
                 false,
             );
-            term.type_ = Expr::let_e(Name::anonymous(), type_, value, term.type_, false);
+            if abstracted_type != term.type_ {
+                term.type_ = Expr::let_e(Name::anonymous(), type_, value, abstracted_type, false);
+            }
         }
         self.txn.lctx = state.frame.saved_lctx.clone();
         Ok(RecordStep::Complete(term))

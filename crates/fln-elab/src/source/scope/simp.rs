@@ -482,6 +482,9 @@ const SNAPSHOT_MAGIC: &[u8] = b"FLNSIMP\x04";
 // Equation theorem origins remain separate from their definition's unfolding.
 // The association records only the pin's recursive attribute-erasure relation.
 const UNFOLD_THEOREMS_MAGIC: &[u8] = b"FLNSIMP\x05";
+// Native auxiliary-proof simp entries (e.g. `_simp_1` for `Iff` rules) carry
+// both their checked proof constant and their registration-time export snapshot.
+const PROOF_SNAPSHOT_MAGIC: &[u8] = b"FLNSIMP\x06";
 // A proof's type traversal and an imported library's journal are independent
 // resources. Init alone carries 10,335 simp events.
 const MAX_TYPE_STEPS: usize = 4096;
@@ -799,8 +802,9 @@ fn decode_entry(payload: &[u8], order: usize) -> Result<JournalEntry, SimpSetErr
     }
     let mut bytes = payload;
     let header = take(&mut bytes, MAGIC.len())?;
-    let proof_row = header == PROOF_MAGIC;
-    let snapshot_row = header == SNAPSHOT_MAGIC;
+    let proof_snapshot_row = header == PROOF_SNAPSHOT_MAGIC;
+    let proof_row = header == PROOF_MAGIC || proof_snapshot_row;
+    let snapshot_row = header == SNAPSHOT_MAGIC || proof_snapshot_row;
     let unfold_theorems_row = header == UNFOLD_THEOREMS_MAGIC;
     let structural = match header {
         header if header == MAGIC => false,
@@ -860,7 +864,7 @@ fn decode_entry(payload: &[u8], order: usize) -> Result<JournalEntry, SimpSetErr
         _ => return Err(SimpSetError::Malformed),
     };
     let snapshot = if snapshot_row {
-        if operation != 0 {
+        if operation != 0 && !(proof_snapshot_row && operation == 2) {
             return Err(SimpSetError::Malformed);
         }
         let snapshot = export::Snapshot::read(&mut bytes)?;
@@ -1060,6 +1064,24 @@ pub fn update(
         return Ok(env.clone());
     }
     append(env, source_payload(declaration, rule)?)
+}
+
+/// Record a checked auxiliary proof (such as `<decl>._simp_1` for an `Iff` rule)
+/// under its user declaration `origin`, retaining its registration-time export snapshot.
+pub fn register_proof(
+    env: &Environment,
+    origin: &Name,
+    proof: &Name,
+    priority: u32,
+) -> Result<Environment, SimpSetError> {
+    if !env.contains(origin) {
+        return Err(SimpSetError::UnknownDeclaration(origin.clone()));
+    }
+    imports::validate_proof(env, proof)?;
+    append(
+        env,
+        export::proof_snapshot_payload(env, origin, proof, priority)?,
+    )
 }
 
 fn source_payload(declaration: &Name, rule: Option<(u32, bool)>) -> Result<Vec<u8>, SimpSetError> {

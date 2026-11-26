@@ -328,22 +328,58 @@ impl Indexer<'_> {
             .constant_val()
             .type_
             .clone();
-        let mut domains = vec![&class_type];
-        while let Some(expr) = domains.pop() {
+        // Match pinned `getSemiOutParamPositionsOf` (`Lean/Meta/Instances.lean:156-165`):
+        // top-level `semiOutParam` binders count as output positions for `computeSynthOrder`,
+        // while any unexpected nested `semiOutParam` occurrence still fails closed.
+        let mut semi_outputs = BTreeSet::new();
+        let mut cursor = &class_type;
+        let mut binder_index = 0u32;
+        let mut nested = Vec::new();
+        loop {
+            self.tick()?;
+            match cursor.node() {
+                ExprNode::MData { expr, .. } => cursor = expr,
+                ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    let mut domain = binder_type;
+                    while let ExprNode::MData { expr, .. } = domain.node() {
+                        self.tick()?;
+                        domain = expr;
+                    }
+                    if let ExprNode::App { f, a } = domain.node()
+                        && matches!(f.node(), ExprNode::Const { name, .. }
+                            if *name == Name::from_components(["semiOutParam"]))
+                    {
+                        semi_outputs.insert(binder_index);
+                        nested.push(a);
+                    } else {
+                        nested.push(domain);
+                    }
+                    binder_index = binder_index
+                        .checked_add(1)
+                        .ok_or(InstanceRegistryError::Limit)?;
+                    cursor = body;
+                }
+                _ => {
+                    nested.push(cursor);
+                    break;
+                }
+            }
+        }
+        while let Some(expr) = nested.pop() {
             self.tick()?;
             match expr.node() {
                 ExprNode::Const { name, .. }
                     if *name == Name::from_components(["semiOutParam"]) =>
                 {
-                    // Semi-output metadata has its own contract; never pretend
-                    // that it is an ordinary input or an outParam.
                     return Err(Error::Unsupported);
                 }
-                ExprNode::App { f, a } => domains.extend([f, a]),
+                ExprNode::App { f, a } => nested.extend([f, a]),
                 ExprNode::ForallE {
                     binder_type, body, ..
-                } => domains.extend([binder_type, body]),
-                ExprNode::MData { expr, .. } => domains.push(expr),
+                } => nested.extend([binder_type, body]),
+                ExprNode::MData { expr, .. } => nested.push(expr),
                 _ => {}
             }
         }
@@ -357,7 +393,7 @@ impl Indexer<'_> {
             }
             None => parameters_with_budget(self.env, &class, self.remaining)?,
         };
-        let mut outputs = BTreeSet::new();
+        let mut outputs = semi_outputs;
         for index in params.out_params {
             self.tick()?;
             outputs.insert(index);

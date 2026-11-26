@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 mod keys;
 mod theorems;
+pub use theorems::prepare_iff_auxiliary;
 
 pub fn journal_name() -> Name {
     descriptor().name
@@ -70,43 +71,9 @@ pub fn export_source_module(
     if !has_local_erasure {
         return Ok(result.clone());
     }
-    let limits = fln_env::extensions::CheckpointLimits::new(
-        (MAX_JOURNAL_BYTES / ENTRY_ACCOUNTING_BYTES) as usize,
-        MAX_JOURNAL_BYTES,
-    );
-    let epoch = fln_env::modules::ModuleEpoch::new(
-        "frankenlean-source-simp",
-        "0000000000000000000000000000000000000000",
-    );
-    let empty_base;
-    let checkpoint_source = if base.extension(&expected.name).is_some() {
-        base
-    } else {
-        empty_base = Environment::new()
-            .register_extension(expected.clone())
-            .map_err(|_| SimpSetError::Malformed)?;
-        &empty_base
-    };
-    let checkpoint = match checkpoint_source.checkpoint_extension(
-        &expected.name,
-        None,
-        limits,
-        fln_env::extensions::ProofBudget::UNBOUNDED,
-        &epoch,
-        None,
-    ) {
-        fln_core::outcome::Outcome::Complete(Ok(checkpoint)) => checkpoint,
-        _ => return Err(SimpSetError::Malformed),
-    };
-    let mut exported = match result.apply_extension_checkpoint(
-        &checkpoint,
-        limits,
-        fln_env::extensions::ProofBudget::UNBOUNDED,
-        None,
-    ) {
-        fln_core::outcome::Outcome::Complete(Ok(env)) => env,
-        _ => return Err(SimpSetError::Malformed),
-    };
+    let mut exported = result
+        .reset_extension_from(base, &expected.name)
+        .map_err(|_| SimpSetError::Malformed)?;
     for payload in kept {
         exported = exported
             .push_extension_entry(&expected.name, payload)
@@ -246,7 +213,13 @@ impl Snapshot {
                 reflexive,
                 backward_reflexive,
             } => Ok(Kind::Theorem(Theorem {
-                proof: Expr::const_(entry.declaration.clone(), Vec::new()),
+                proof: Expr::const_(
+                    entry
+                        .proof
+                        .clone()
+                        .unwrap_or_else(|| entry.declaration.clone()),
+                    Vec::new(),
+                ),
                 level_params: Vec::new(),
                 origin: entry.declaration.clone(),
                 origin_reverse: false,
@@ -280,6 +253,44 @@ pub(super) fn snapshot_payload(
         reverse,
         &Snapshot::capture(env, &entry)?,
     )
+}
+
+pub(super) fn proof_snapshot_payload(
+    env: &Environment,
+    origin: &Name,
+    proof: &Name,
+    priority: u32,
+) -> Result<Vec<u8>, SimpSetError> {
+    if origin.is_anonymous() || proof.is_anonymous() {
+        return Err(SimpSetError::Malformed);
+    }
+    let entry = SimpEntry {
+        declaration: origin.clone(),
+        proof: Some(proof.clone()),
+        priority,
+        reverse: false,
+        order: 0,
+    };
+    let snapshot = Snapshot::capture(env, &entry)?;
+    let mut payload = PROOF_SNAPSHOT_MAGIC.to_vec();
+    payload.push(2);
+    crate::instances::write_name(origin, &mut payload).map_err(codec)?;
+    crate::instances::write_name(proof, &mut payload).map_err(codec)?;
+    payload.extend(priority.to_le_bytes());
+    payload.push(0);
+    let prefix = payload.len();
+    if prefix >= MAX_BYTES {
+        return Err(SimpSetError::Limit);
+    }
+    match snapshot.write(&mut payload) {
+        Ok(()) if payload.len() <= MAX_BYTES => {}
+        Ok(()) | Err(SimpSetError::Limit) => {
+            payload.truncate(prefix);
+            Snapshot::ResourceLimit.write(&mut payload)?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(payload)
 }
 
 fn encode_snapshot(

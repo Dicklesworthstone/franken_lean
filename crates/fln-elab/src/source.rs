@@ -4275,24 +4275,45 @@ impl Context {
                             Task::AscribedValue(annotation, expected, show) => {
                                 let term =
                                     values.pop().expect("ascribed term follows its annotation");
-                                // The value's actual type guides surrounding inference.
-                                // The written annotation still constrains the inner value
-                                // and remains in the checked term even when ignored later.
-                                // Expected types guide inference but closed constraints are
-                                // left to K1. Retain this assertion in the checked term,
-                                // including when the surrounding program ignores its value.
-                                let ascribed = Typed {
-                                    value: Expr::let_e(
-                                        Name::anonymous(),
-                                        annotation.clone(),
-                                        term.value,
-                                        Expr::bvar(0).expect("fixed ascription identity binder"),
-                                        show,
-                                    ),
-                                    // `show` pins the structural result type, not merely
-                                    // a definitionally equal inferred type. Rewriters
-                                    // consume precisely the equation the user wrote.
-                                    type_: if show { annotation } else { term.type_ },
+                                // Pinned `elabTypeAscription` (`Lean/Elab/BuiltinNotation.lean:133-146`)
+                                // elaborates `(e : T)` without wrapping in an identity `let`, whereas
+                                // `show T from e` (`BuiltinNotation.lean:428-432`) emits
+                                // `have this : T := e; this`. Drop the wrapper for `(e : T)` once
+                                // `term.type_` is verified equal to `annotation`; retain it when
+                                // unverified or mismatched so K1 still checks the written annotation
+                                // even if the surrounding program ignores the value.
+                                let verified_ascription = if show {
+                                    false
+                                } else {
+                                    let actual = self.instantiate(&term.type_)?;
+                                    let target = self.instantiate(&annotation)?;
+                                    actual == target
+                                        || (!actual.has_expr_mvar()
+                                            && !target.has_expr_mvar()
+                                            && !actual.has_level_mvar()
+                                            && !target.has_level_mvar()
+                                            && self.coercion_eq(&actual, &target)?)
+                                };
+                                let ascribed = if verified_ascription {
+                                    Typed {
+                                        value: term.value,
+                                        type_: term.type_,
+                                    }
+                                } else {
+                                    Typed {
+                                        value: Expr::let_e(
+                                            Name::anonymous(),
+                                            annotation.clone(),
+                                            term.value,
+                                            Expr::bvar(0)
+                                                .expect("fixed ascription identity binder"),
+                                            show,
+                                        ),
+                                        // `show` pins the structural result type, not merely
+                                        // a definitionally equal inferred type. Rewriters
+                                        // consume precisely the equation the user wrote.
+                                        type_: if show { annotation } else { term.type_ },
+                                    }
                                 };
                                 // Coerce outside the assertion: its inner annotation
                                 // must remain checked even if a conversion discards it.
@@ -7502,6 +7523,13 @@ fn definition_elaboration(
         owned_name = context.generated_instance_name(&parameters, expected)?;
         context.local_function_lifting.parent = Some(owned_name.clone());
         context.diagnostic_declaration = Some(owned_name.clone());
+    }
+    if is_instance && let Some(target) = expected.as_mut() {
+        // Mirror pinned `MutualDef.elabHeaders` (line 272-273): `cleanupOfNat` runs
+        // on the elaborated instance type AFTER anonymous instance naming so
+        // `OfNat Bit 0` generates `instOfNatBitOfNatNat` while the admitted type
+        // carries the cleaned `OfNat Bit 0` literal (issue #1389).
+        *target = context.cleanup_of_nat_in_instance_type(target)?;
     }
     if is_instance && !hidden_instance {
         // Naming may consult the private predecessor only for collisions. Once

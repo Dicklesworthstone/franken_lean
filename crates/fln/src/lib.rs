@@ -5430,6 +5430,7 @@ impl Engine {
                     Some(
                         EvaluationResultPresentation::Format { .. }
                             | EvaluationResultPresentation::IoFormat { .. }
+                            | EvaluationResultPresentation::IoUnit
                             | EvaluationResultPresentation::Guard
                     )
                 ) {

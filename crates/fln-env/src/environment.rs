@@ -1547,6 +1547,38 @@ impl Environment {
         self.extensions.get(name).map(Arc::as_ref)
     }
 
+    /// Replace one registered extension slot with the exact immutable state from
+    /// `base` (or an empty state with the same descriptor if `base` did not register
+    /// it), preserving `Arc` payload sharing for every inherited entry.
+    pub fn reset_extension_from(
+        &self,
+        base: &Environment,
+        name: &Name,
+    ) -> Result<Environment, EnvError> {
+        let Some(current) = self.extensions.get(name) else {
+            return Err(EnvError::UnknownExtension { name: name.clone() });
+        };
+        let replacement = match base.extensions.get(name) {
+            Some(prior) => {
+                if prior.descriptor != current.descriptor {
+                    return Err(EnvError::Checkpoint(CheckpointError::ContractMismatch {
+                        expected: current.descriptor.clone(),
+                        actual: prior.descriptor.clone(),
+                    }));
+                }
+                Arc::clone(prior)
+            }
+            None => Arc::new(ExtensionState::new(current.descriptor.clone())),
+        };
+        Ok(Environment {
+            constants: self.constants.clone(),
+            digests: self.digests.clone(),
+            extensions: self.extensions.insert(name.clone(), replacement),
+            metadata_validation: self.metadata_validation.clone(),
+            assumptions: self.assumptions.clone(),
+        })
+    }
+
     /// Capture one registered extension under its declared checkpoint contract.
     /// A suffix base is another immutable environment snapshot; full-journal mode
     /// requires `None` and carries no ambient extension history.
