@@ -225,9 +225,9 @@ impl Context {
                             .pop()
                             .ok_or_else(|| error(LevelSyntaxError::Malformed))?;
                         level = if imax {
-                            Level::imax(left, level)
+                            Level::try_smart_imax(left, level)
                         } else {
-                            Level::max(left, level)
+                            Level::try_smart_max(left, level)
                         }
                         .map_err(|_| failure(SourceInferenceError::ResourceLimit))?;
                     }
@@ -483,5 +483,77 @@ mod tests {
             context.declaration_levels(&roots).unwrap(),
             vec![scope_z, scope_a, explicit, automatic_a, automatic_z]
         );
+    }
+
+    #[test]
+    fn smart_imax_matches_pin_for_sort_and_unannotated_pi_abbrevs() {
+        use fln_env::constants::{AxiomVal, ConstantVal};
+        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::Declaration;
+        use fln_kernel::capability::{Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+        let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
+        let dec_decl = Declaration::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: name("Dec"),
+                level_params: Vec::new(),
+                type_: Expr::forall_e(
+                    name("p"),
+                    Expr::sort(Level::zero()),
+                    Expr::sort(Level::one()),
+                    BinderInfo::Default,
+                ),
+            },
+            is_unsafe: false,
+        });
+        let base = Environment::new();
+        let fln_core::outcome::Outcome::Complete(admitted) = admit(&base, dec_decl, budget) else {
+            panic!("Dec axiom must reach kernel verdict");
+        };
+        let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+        else {
+            panic!("Dec axiom must pass council");
+        };
+        let fln_core::outcome::Outcome::Complete(Published::Committed(
+            DeclarationCommitted::Published(publication),
+        )) = checked.publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        )
+        else {
+            panic!("Dec axiom must publish");
+        };
+        let env = publication.environment;
+        let mut scope = SourceScope::default();
+        scope.universes.push(name("u"));
+
+        for src in [
+            "abbrev DP := Sort (imax u 1)".as_bytes(),
+            "abbrev DP {α : Sort u} (r : α → Prop) := (a : α) → Dec (r a)".as_bytes(),
+            "abbrev DP {α : Sort u} := α → Prop".as_bytes(),
+        ] {
+            let parsed = fln_parse::parse_definition(src)
+                .expect("parses")
+                .expanded()
+                .expect("expands");
+            let decl =
+                elaborate_definition_in_scope_with_budget(parsed.syntax(), &env, budget, &scope)
+                    .unwrap_or_else(|err| {
+                        panic!("failed on {}: {err}", String::from_utf8_lossy(src))
+                    });
+            assert!(
+                matches!(
+                    fln_kernel::check(&env, &decl, budget),
+                    fln_core::outcome::Outcome::Complete(
+                        fln_kernel::verdict::Verdict::Accepted { .. }
+                    )
+                ),
+                "kernel must accept elaborated {}",
+                String::from_utf8_lossy(src)
+            );
+        }
     }
 }

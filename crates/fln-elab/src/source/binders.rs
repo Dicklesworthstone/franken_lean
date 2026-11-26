@@ -764,8 +764,11 @@ impl Context {
                     local.binder_info,
                 );
                 universe = Some(
-                    Level::imax(level.clone(), universe.take().expect("Pi body universe"))
-                        .map_err(|_| invalid())?,
+                    Level::try_smart_imax(
+                        level.clone(),
+                        universe.take().expect("Pi body universe"),
+                    )
+                    .map_err(|_| invalid())?,
                 );
             }
         }

@@ -5407,7 +5407,7 @@ impl Context {
                                 let left = values.pop().expect("arrow domain visit");
                                 let u = self.sort_level(&left)?;
                                 let v = self.sort_level(&right)?;
-                                let level = Level::imax(u, v)
+                                let level = Level::try_smart_imax(u, v)
                                     .map_err(|_| failure(SourceInferenceError::Scope))?;
                                 let body = right
                                     .value

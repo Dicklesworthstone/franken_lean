@@ -187,7 +187,7 @@ impl Context {
                             return Ok(None);
                         };
                         Expr::sort(
-                            Level::imax(level, body_level.clone())
+                            Level::try_smart_imax(level, body_level.clone())
                                 .map_err(|_| failure(SourceInferenceError::Scope))?,
                         )
                     };
