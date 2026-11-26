@@ -25,6 +25,9 @@ pub struct SourceCheckLimits {
     pub admission: EngineAdmissionLimits,
     pub max_bytes: usize,
     pub max_commands: usize,
+    /// Worker-thread width for declaration-granular parallel elaboration of
+    /// contiguous effect-free declarations (FL-INV-01). Defaults to `1`.
+    pub worker_threads: usize,
 }
 impl SourceCheckLimits {
     pub fn new(admission: EngineAdmissionLimits) -> Self {
@@ -32,7 +35,13 @@ impl SourceCheckLimits {
             admission,
             max_bytes: 1024 * 1024,
             max_commands: 4096,
+            worker_threads: 1,
         }
+    }
+
+    pub fn with_worker_threads(mut self, worker_threads: usize) -> Self {
+        self.worker_threads = worker_threads.max(1);
+        self
     }
 }
 
@@ -1059,6 +1068,20 @@ impl Engine {
         )
     }
 
+    /// Check ordered, import-free declarations using up to `jobs` worker threads
+    /// for contiguous runs of effect-free declarations via
+    /// [`crate::parallel_elab::check_source_definitions_parallel`].
+    /// Schedule-independent by construction (FL-INV-01).
+    pub fn check_source_files_with_jobs(
+        &self,
+        sources: &[&[u8]],
+        options: &KVMap,
+        limits: SourceCheckLimits,
+        jobs: usize,
+    ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
+        self.check_source_files(sources, options, limits.with_worker_threads(jobs))
+    }
+
     // Module imports record only the candidates that survived ordinary admission.
     // The optional recorder is private and never returned on a failed batch.
     #[allow(clippy::too_many_arguments)]
@@ -1237,6 +1260,96 @@ impl Engine {
                         Outcome::Complete(()) => {}
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
+                }
+                if control.is_none()
+                    && top_level
+                    && limits.worker_threads > 1
+                    && public.is_none()
+                    && macros.is_none()
+                    && !grammar.has_declared_syntax()
+                    && scopes.is_default_scope(&engine)
+                    && !source_records::may_name_equation_theorems(command)
+                    && let Some(first_name) =
+                        grammar.enter(|| crate::parallel_elab::is_declaration_only_source(command))
+                {
+                    let mut batch_sources: Vec<&[u8]> = vec![command];
+                    let mut seen_names = std::collections::BTreeSet::new();
+                    seen_names.insert(first_name);
+                    let mut extra = 0usize;
+                    while let Some(SourceStep::Command((next_start, next_cmd), true)) =
+                        queue.get(extra)
+                    {
+                        if grammar
+                            .enter(|| {
+                                parse_control_command(
+                                    next_cmd,
+                                    *next_start,
+                                    file,
+                                    count + 1 + extra,
+                                )
+                            })
+                            .ok()
+                            .flatten()
+                            .is_some()
+                        {
+                            break;
+                        }
+                        if source_records::may_name_equation_theorems(next_cmd) {
+                            break;
+                        }
+                        let Some(next_name) = grammar
+                            .enter(|| crate::parallel_elab::is_declaration_only_source(next_cmd))
+                        else {
+                            break;
+                        };
+                        if !seen_names.insert(next_name) {
+                            break;
+                        }
+                        batch_sources.push(next_cmd);
+                        extra += 1;
+                    }
+                    if batch_sources.len() >= 2 {
+                        match grammar.enter(|| {
+                            crate::parallel_elab::check_source_definitions_parallel_with_declarations(
+                                &engine,
+                                &batch_sources,
+                                options,
+                                limits.worker_threads,
+                                limits.admission,
+                            )
+                        }) {
+                            Ok(Outcome::Complete((checked, admitted_decls)))
+                                if checked.strategy
+                                    == crate::parallel_elab::ParallelSourceStrategy::Dataflow =>
+                            {
+                                for _ in 0..extra {
+                                    queue.pop_front();
+                                }
+                                theorems += admitted_decls
+                                    .iter()
+                                    .filter(|decl| matches!(decl, Declaration::Thm(_)))
+                                    .count();
+                                for decl in admitted_decls {
+                                    scopes.admitted(&decl);
+                                    if let Some(journal) = declarations.as_deref_mut() {
+                                        journal.push(decl);
+                                    }
+                                }
+                                engine = checked.engine;
+                                count += batch_sources.len();
+                                continue;
+                            }
+                            Ok(Outcome::Inconclusive(reason)) => {
+                                return Ok(Outcome::Inconclusive(reason));
+                            }
+                            Ok(Outcome::InternalFault(fault)) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
+                            // Fall back to ordinary sequential execution so
+                            // error coordinates and messages stay bit-identical.
+                            Ok(Outcome::Complete(_)) | Err(_) => {}
+                        }
                     }
                 }
                 if let Some(control) = control {

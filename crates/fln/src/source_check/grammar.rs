@@ -355,6 +355,12 @@ impl SourceGrammar {
         with_grammar(&self.file.grammar(), parse)
     }
 
+    /// Whether this file declared any local syntax or notation rules beyond
+    /// the ambient grammar.
+    pub(crate) fn has_declared_syntax(&self) -> bool {
+        self.declared_syntax || !self.rule_sources.is_empty()
+    }
+
     /// The exact lexical template view for the imported MacroM dispatcher.
     /// The dispatcher performs root expansion inside its ordinary traversal;
     /// no independent native expansion pass runs before or after it.

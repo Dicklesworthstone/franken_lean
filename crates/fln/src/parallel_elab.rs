@@ -124,32 +124,33 @@ fn uses_declaration_only_path(syntax: &Syntax) -> bool {
     {
         return false;
     }
-    if definition.kind()
-        != Some(&Name::from_components([
-            "Lean",
-            "Parser",
-            "Command",
-            "definition",
-        ]))
-    {
+    if !matches!(
+        definition.kind().map(Name::to_display_string).as_deref(),
+        Some("Lean.Parser.Command.definition" | "Lean.Parser.Command.theorem")
+    ) {
         return false;
     }
-    let mut pending = vec![definition];
-    while let Some(node) = pending.pop() {
+    let mut pending = vec![(definition, false)];
+    while let Some((node, in_decl_id)) = pending.pop() {
         match node {
             Syntax::Ident {
                 val, preresolved, ..
-            } if !val.parent().is_anonymous() || !preresolved.is_empty() => return false,
+            } if !preresolved.is_empty() || (in_decl_id && !val.parent().is_anonymous()) => {
+                return false;
+            }
             Syntax::Node { kind, args, .. } => {
+                let kind_name = kind.to_display_string();
                 if !matches!(
-                    kind.to_display_string().as_str(),
+                    kind_name.as_str(),
                     "null"
                         | "num"
                         | "str"
                         | "char"
                         | "scientific"
                         | "Lean.Parser.Command.definition"
+                        | "Lean.Parser.Command.theorem"
                         | "Lean.Parser.Command.declId"
+                        | "Lean.Parser.Command.declSig"
                         | "Lean.Parser.Command.optDeclSig"
                         | "Lean.Parser.Command.declValSimple"
                         | "Lean.Parser.Term.typeSpec"
@@ -172,6 +173,12 @@ fn uses_declaration_only_path(syntax: &Syntax) -> bool {
                         | "term_%_"
                         | "term_^_"
                         | "term_++_"
+                        | "term_=_"
+                        | "term_≠_"
+                        | "term_↔_"
+                        | "term_∧_"
+                        | "term_∨_"
+                        | "term_¬_"
                         | "term_==_"
                         | "term_!=_"
                         | "term_&&_"
@@ -185,7 +192,8 @@ fn uses_declaration_only_path(syntax: &Syntax) -> bool {
                 ) {
                     return false;
                 }
-                pending.extend(args);
+                let child_in_decl_id = in_decl_id || kind_name == "Lean.Parser.Command.declId";
+                pending.extend(args.iter().map(|arg| (arg, child_in_decl_id)));
             }
             Syntax::Missing => return false,
             Syntax::Atom { .. } | Syntax::Ident { .. } => {}
@@ -378,6 +386,20 @@ fn effects_for_constants(constants: &[ConstantInfo]) -> EffectSummary {
 /// not a replacement for the engine's source scope. Scheduler workers allocate
 /// the stack required by `limits.kernel`. Final admission and the ordered route
 /// retain the ordinary `Engine` requirement that the caller supplies that stack.
+/// Whether `source` is a single effect-free declaration eligible for the
+/// [`DeterministicScheduler`] dataflow path, returning its declared name.
+pub(crate) fn is_declaration_only_source(source: &[u8]) -> Option<Name> {
+    let parsed = fln_parse::parse_definition(source)
+        .and_then(fln_parse::ParsedDefinition::expanded)
+        .ok()?;
+    if !uses_declaration_only_path(parsed.syntax()) {
+        return None;
+    }
+    collect_syntax_identifiers(parsed.syntax())
+        .into_iter()
+        .next()
+}
+
 pub fn check_source_definitions_parallel(
     engine: &Engine,
     sources: &[&[u8]],
@@ -385,6 +407,23 @@ pub fn check_source_definitions_parallel(
     worker_threads: usize,
     limits: EngineAdmissionLimits,
 ) -> Result<Outcome<ParallelSourceCheck>, ParallelElabError> {
+    check_source_definitions_parallel_with_declarations(
+        engine,
+        sources,
+        options,
+        worker_threads,
+        limits,
+    )
+    .map(|outcome| outcome.map_complete(|(checked, _)| checked))
+}
+
+pub(crate) fn check_source_definitions_parallel_with_declarations(
+    engine: &Engine,
+    sources: &[&[u8]],
+    options: &KVMap,
+    worker_threads: usize,
+    limits: EngineAdmissionLimits,
+) -> Result<Outcome<(ParallelSourceCheck, Vec<Declaration>)>, ParallelElabError> {
     if sources.is_empty() {
         return Err(ParallelElabError::EmptyBatch);
     }
@@ -406,7 +445,8 @@ pub fn check_source_definitions_parallel(
         .iter()
         .any(|parsed| !uses_declaration_only_path(parsed.syntax()))
     {
-        return check_in_source_order(engine, sources, options, worker_threads, limits);
+        return check_in_source_order(engine, sources, options, worker_threads, limits)
+            .map(|outcome| outcome.map_complete(|checked| (checked, Vec::new())));
     }
 
     for (index, parsed) in parsed.into_iter().enumerate() {
@@ -414,7 +454,15 @@ pub fn check_source_definitions_parallel(
         let idents = collect_syntax_identifiers(&syntax);
         let declared = idents.first().cloned();
         let declared_names: Vec<Name> = declared.iter().cloned().collect();
-        let referenced_names: Vec<Name> = idents.into_iter().skip(1).collect();
+        let mut referenced_names: Vec<Name> = Vec::new();
+        for name in idents.into_iter().skip(1) {
+            let mut prefix = name.parent();
+            referenced_names.push(name);
+            while !prefix.is_anonymous() {
+                referenced_names.push(prefix.clone());
+                prefix = prefix.parent();
+            }
+        }
         if let Some(name) = declared.clone() {
             ordered_decl_names.push(name);
         }
@@ -545,15 +593,18 @@ pub fn check_source_definitions_parallel(
         };
     }
 
-    Ok(Outcome::Complete(ParallelSourceCheck {
-        result_logical_root: result_engine.logical_root(options),
-        engine: result_engine,
-        base_logical_root: batch.base_logical_root,
-        committed_order: scheduled.committed_order,
-        retry_count: scheduled.retry_count,
-        worker_threads: config.worker_threads,
-        strategy: ParallelSourceStrategy::Dataflow,
-    }))
+    Ok(Outcome::Complete((
+        ParallelSourceCheck {
+            result_logical_root: result_engine.logical_root(options),
+            engine: result_engine,
+            base_logical_root: batch.base_logical_root,
+            committed_order: scheduled.committed_order,
+            retry_count: scheduled.retry_count,
+            worker_threads: config.worker_threads,
+            strategy: ParallelSourceStrategy::Dataflow,
+        },
+        declarations,
+    )))
 }
 
 #[cfg(test)]
@@ -611,5 +662,73 @@ mod tests {
             ))),
             Outcome::Inconclusive(_)
         ));
+    }
+
+    #[test]
+    fn check_source_files_with_jobs_matches_sequential_across_worker_counts() {
+        let limits_1 = crate::SourceCheckLimits::new(EngineAdmissionLimits::new(
+            fln_kernel::verdict::Budget::for_stack_bytes(2 * 1024 * 1024),
+        ));
+        let engine = Engine::with_coercion_seed(limits_1.admission)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let options = KVMap::new();
+        let source = br#"
+def a : Nat := 1
+def b : Nat := 2
+def c : Nat := a + b
+def d (x : Nat) : Nat := x + c
+theorem t_sum : c = 3 := Eq.refl 3
+theorem t_d : d 4 = 7 := Eq.refl 7
+namespace Scoped
+def inner : Nat := c + 1
+end Scoped
+def after_ns : Nat := Scoped.inner + b
+def after_two : Nat := after_ns + 1
+"#;
+        let seq = engine
+            .check_source_files_with_jobs(&[source.as_slice()], &options, limits_1, 1)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(seq.commands, 11);
+        assert_eq!(seq.theorems, 2);
+
+        for jobs in [2, 4, 8] {
+            let par = engine
+                .check_source_files_with_jobs(&[source.as_slice()], &options, limits_1, jobs)
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            assert_eq!(par.result_logical_root, seq.result_logical_root);
+            assert_eq!(par.base_logical_root, seq.base_logical_root);
+            assert_eq!(par.commands, seq.commands);
+            assert_eq!(par.theorems, seq.theorems);
+        }
+
+        // Verify the contiguous theorem + def prefix directly enters Dataflow.
+        let batch: [&[u8]; 4] = [
+            b"def a : Nat := 1",
+            b"def b : Nat := 2",
+            b"def c : Nat := a + b",
+            b"theorem t_sum : c = 3 := Eq.refl 3",
+        ];
+        let direct =
+            check_source_definitions_parallel(&engine, &batch, &options, 4, limits_1.admission)
+                .unwrap()
+                .into_complete()
+                .unwrap();
+        assert_eq!(direct.strategy, ParallelSourceStrategy::Dataflow);
+
+        // Error coordinates stay identical when a parallel batch fails and falls back.
+        let broken = b"def ok1 : Nat := 1\ndef ok2 : Nat := 2\ndef bad : Nat := missing_ident\n";
+        let err_1 = engine
+            .check_source_files_with_jobs(&[broken.as_slice()], &options, limits_1, 1)
+            .unwrap_err();
+        let err_4 = engine
+            .check_source_files_with_jobs(&[broken.as_slice()], &options, limits_1, 4)
+            .unwrap_err();
+        assert_eq!(err_1.to_string(), err_4.to_string());
     }
 }

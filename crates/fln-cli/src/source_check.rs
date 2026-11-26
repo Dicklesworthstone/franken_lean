@@ -558,6 +558,7 @@ pub(super) fn run(
             };
             let mut limits = fln::SourceCheckLimits::new(admission);
             limits.max_bytes = max_bytes;
+            limits.worker_threads = jobs.get();
             // Headers and bytes were checked by the loader. User syntax needs
             // its receipt-bound grammar before parsing bodies. Ordinary imports
             // retain their native preflight and do not open executable inputs.
