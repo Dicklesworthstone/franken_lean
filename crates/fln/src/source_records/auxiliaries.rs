@@ -790,10 +790,9 @@ impl Engine {
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
             for fn_name in &defs.functions {
-                successor.engine.environment = fln_elab::reducibility::register(
+                successor.engine.environment = fln_elab::reducibility::register_default(
                     successor.engine.environment(),
                     fn_name,
-                    fln_elab::reducibility::Reducibility::Semireducible,
                 )
                 .map_err(|error| {
                     frontend(SourceInferenceError::Unification(Box::new(

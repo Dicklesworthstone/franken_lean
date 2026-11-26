@@ -21,6 +21,9 @@ use std::sync::Arc;
 pub mod export;
 
 const MAGIC: &[u8] = b"FLNREDUC\x01";
+// Version 1 records explicit attributes. Version 2 records only a known
+// semireducible default, which must not invent a `reducibilityCore` entry.
+const DEFAULT_MAGIC: &[u8] = b"FLNREDUC\x02";
 const MAX_ROWS: usize = 1 << 20;
 const MAX_ENTRY_BYTES: usize = 65_536;
 
@@ -117,12 +120,38 @@ pub fn register(
     declaration: &Name,
     status: Reducibility,
 ) -> Result<Environment, ReducibilityError> {
+    register_entry(env, declaration, Some(status))
+}
+
+/// Record the semireducible default independently of an explicit attribute.
+/// This prevents fallback to a definition's kernel hints without exporting an
+/// attribute the source never set. Explicit statuses take precedence, even if
+/// this default is recorded after them.
+pub fn register_default(
+    env: &Environment,
+    declaration: &Name,
+) -> Result<Environment, ReducibilityError> {
+    register_entry(env, declaration, None)
+}
+
+fn register_entry(
+    env: &Environment,
+    declaration: &Name,
+    status: Option<Reducibility>,
+) -> Result<Environment, ReducibilityError> {
     if !env.contains(declaration) {
         return Err(ReducibilityError::UnknownDeclaration(declaration.clone()));
     }
-    let mut payload = MAGIC.to_vec();
+    let prefix = if status.is_some() {
+        MAGIC
+    } else {
+        DEFAULT_MAGIC
+    };
+    let mut payload = prefix.to_vec();
     write_name(declaration, &mut payload).map_err(codec)?;
-    payload.push(status.tag());
+    if let Some(status) = status {
+        payload.push(status.tag());
+    }
     if payload.len() > MAX_ENTRY_BYTES {
         return Err(ReducibilityError::Limit);
     }
@@ -140,6 +169,34 @@ pub fn register(
     }
     env.push_extension_entry(&extension_name(), payload)
         .map_err(|_| ReducibilityError::Malformed)
+}
+
+/// Keep existing explicit-status payloads readable. A default has a distinct
+/// version and no status tag; trailing bytes and unknown legacy tags are errors.
+fn read_entry(payload: &[u8]) -> Result<(Name, Option<Reducibility>), ReducibilityError> {
+    if payload.len() > MAX_ENTRY_BYTES {
+        return Err(ReducibilityError::Limit);
+    }
+    let (mut bytes, default) = if let Some(bytes) = payload.strip_prefix(MAGIC) {
+        (bytes, false)
+    } else if let Some(bytes) = payload.strip_prefix(DEFAULT_MAGIC) {
+        (bytes, true)
+    } else {
+        return Err(ReducibilityError::Malformed);
+    };
+    let declaration = read_name(&mut bytes).map_err(codec)?;
+    if default {
+        if !bytes.is_empty() {
+            return Err(ReducibilityError::Malformed);
+        }
+        Ok((declaration, None))
+    } else {
+        let [tag] = bytes else {
+            return Err(ReducibilityError::Malformed);
+        };
+        let status = Reducibility::from_tag(*tag).ok_or(ReducibilityError::Malformed)?;
+        Ok((declaration, Some(status)))
+    }
 }
 
 /// Lexical transparency overrides. They live in a source scope, never in the
@@ -221,7 +278,7 @@ impl LocalReducibility {
     }
 }
 
-/// Every recorded status, the last entry for a declaration winning.
+/// Every known status. The last explicit entry wins; defaults fill only absence.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReducibilityTable {
     statuses: HashMap<Name, Reducibility>,
@@ -243,28 +300,23 @@ impl ReducibilityTable {
         }
         let mut table = Self::default();
         for (entry, validation) in env.metadata_validation_entries(&extension_name()) {
-            if entry.payload.len() > MAX_ENTRY_BYTES {
-                return Err(ReducibilityError::Limit);
-            }
-            let mut bytes: &[u8] = &entry.payload;
-            if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
-                return Err(ReducibilityError::Malformed);
-            }
-            bytes = &bytes[MAGIC.len()..];
-            let declaration = read_name(&mut bytes).map_err(codec)?;
-            let [tag] = bytes else {
-                return Err(ReducibilityError::Malformed);
-            };
-            let status = Reducibility::from_tag(*tag).ok_or(ReducibilityError::Malformed)?;
+            let (declaration, status) = read_entry(&entry.payload)?;
             if !validation.contains(&declaration) {
                 return Err(ReducibilityError::UnknownDeclaration(declaration));
             }
-            if status == Reducibility::Irreducible {
-                table.opaque_definitions.insert(declaration.clone());
+            if let Some(status) = status {
+                if status == Reducibility::Irreducible {
+                    table.opaque_definitions.insert(declaration.clone());
+                } else {
+                    table.opaque_definitions.remove(&declaration);
+                }
+                table.statuses.insert(declaration, status);
             } else {
-                table.opaque_definitions.remove(&declaration);
+                table
+                    .statuses
+                    .entry(declaration)
+                    .or_insert(Reducibility::Semireducible);
             }
-            table.statuses.insert(declaration, status);
         }
         table.statuses.retain(|name, _| env.contains(name));
         table.opaque_definitions.retain(|name| env.contains(name));
@@ -296,8 +348,8 @@ impl ReducibilityTable {
             .unwrap_or(Reducibility::Semireducible)
     }
 
-    /// `declaration`'s status if one is known: recorded in the journal, or given
-    /// to an instance declared here. `None` is "unknown", not "semireducible".
+    /// `declaration`'s status if one is known: an explicit journal status, a
+    /// known default, or a native instance's status. `None` is "unknown".
     pub fn get(&self, declaration: &Name) -> Option<Reducibility> {
         self.statuses.get(declaration).copied()
     }
@@ -408,10 +460,56 @@ mod tests {
     }
 
     #[test]
+    fn versioned_defaults_preserve_legacy_statuses_and_explicit_precedence() {
+        let base = with_axiom(&Environment::new(), "a");
+        let default = register_default(&base, &n("a")).unwrap();
+        assert_eq!(
+            known_status(&default, &n("a")),
+            Ok(Some(Reducibility::Semireducible))
+        );
+        let opaque = register(&default, &n("a"), Reducibility::Irreducible).unwrap();
+        let opaque = register_default(&opaque, &n("a")).unwrap();
+        assert_eq!(
+            known_status(&opaque, &n("a")),
+            Ok(Some(Reducibility::Irreducible))
+        );
+        assert!(
+            table(&opaque)
+                .unwrap()
+                .opaque_definitions()
+                .contains(&n("a"))
+        );
+        let explicit = register(&opaque, &n("a"), Reducibility::Semireducible).unwrap();
+        let explicit = register_default(&explicit, &n("a")).unwrap();
+        assert_eq!(
+            known_status(&explicit, &n("a")),
+            Ok(Some(Reducibility::Semireducible))
+        );
+        assert!(table(&explicit).unwrap().opaque_definitions().is_empty());
+        let entries: Vec<_> = explicit
+            .extension(&extension_name())
+            .unwrap()
+            .entries()
+            .collect();
+        assert!(entries[0].payload.starts_with(DEFAULT_MAGIC));
+        assert!(entries[1].payload.starts_with(MAGIC));
+        assert_eq!(
+            read_entry(&entries[1].payload).unwrap(),
+            (n("a"), Some(Reducibility::Irreducible))
+        );
+        assert_eq!(read_entry(&entries[2].payload).unwrap(), (n("a"), None));
+        assert_eq!(known_status(&base, &n("a")), Ok(None));
+    }
+
+    #[test]
     fn a_status_cannot_name_what_the_environment_does_not_hold() {
         let env = with_axiom(&Environment::new(), "a");
         assert_eq!(
             register(&env, &n("missing"), Reducibility::Reducible),
+            Err(ReducibilityError::UnknownDeclaration(n("missing")))
+        );
+        assert_eq!(
+            register_default(&env, &n("missing")),
             Err(ReducibilityError::UnknownDeclaration(n("missing")))
         );
     }
@@ -421,11 +519,15 @@ mod tests {
         let env = with_axiom(&Environment::new(), "a");
         let mut good = MAGIC.to_vec();
         write_name(&n("a"), &mut good).unwrap();
+        let mut default = DEFAULT_MAGIC.to_vec();
+        write_name(&n("a"), &mut default).unwrap();
         for payload in [
             Vec::new(),
             MAGIC.to_vec(),
             [good.as_slice(), &[4]].concat(),
             [good.as_slice(), &[0, 0]].concat(),
+            DEFAULT_MAGIC.to_vec(),
+            [default.as_slice(), &[1]].concat(),
         ] {
             let broken = env
                 .register_extension(descriptor())

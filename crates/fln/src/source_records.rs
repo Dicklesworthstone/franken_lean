@@ -1182,7 +1182,7 @@ impl Engine {
     }
 
     /// Metadata follows a completed admission. Native instance fallback is
-    /// implicitReducible, so proof instances need an explicit semireducible row;
+    /// implicitReducible, so proof instances need a known semireducible default;
     /// data instances retain the pin's automatic reducibility behavior.
     pub(super) fn register_checked_source_instance(
         &self,
@@ -1276,19 +1276,19 @@ impl Engine {
         };
         engine.environment = registered.map_err(registry_error)?;
         if proof || local {
-            engine.environment = fln_elab::reducibility::register(
-                engine.environment(),
-                name,
-                if proof {
-                    fln_elab::reducibility::Reducibility::Semireducible
-                } else {
-                    // Local data instances have no persistent instance row
-                    // from which the usual implicit-reducibility fallback
-                    // could be derived. The status belongs to the declaration.
-                    fln_elab::reducibility::Reducibility::ImplicitReducible
-                },
-            )
-            .map_err(|error| {
+            let registered = if proof {
+                fln_elab::reducibility::register_default(engine.environment(), name)
+            } else {
+                // Local data instances have no persistent instance row
+                // from which the usual implicit-reducibility fallback
+                // could be derived. The status belongs to the declaration.
+                fln_elab::reducibility::register(
+                    engine.environment(),
+                    name,
+                    fln_elab::reducibility::Reducibility::ImplicitReducible,
+                )
+            };
+            engine.environment = registered.map_err(|error| {
                 EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
                     fln_elab::NatDefinitionElabError::Inference(
                         fln_elab::source::SourceInferenceError::Unification(Box::new(
@@ -1500,12 +1500,20 @@ impl Engine {
                     } else {
                         fln_elab::reducibility::Reducibility::Reducible
                     };
-                    batch.engine.environment = fln_elab::reducibility::register(
-                        batch.engine.environment(),
-                        &definition.base.name,
-                        status,
-                    )
-                    .map_err(|error| {
+                    let registered =
+                        if status == fln_elab::reducibility::Reducibility::Semireducible {
+                            fln_elab::reducibility::register_default(
+                                batch.engine.environment(),
+                                &definition.base.name,
+                            )
+                        } else {
+                            fln_elab::reducibility::register(
+                                batch.engine.environment(),
+                                &definition.base.name,
+                                status,
+                            )
+                        };
+                    batch.engine.environment = registered.map_err(|error| {
                         EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
                             fln_elab::NatDefinitionElabError::Inference(
                                 fln_elab::source::SourceInferenceError::Unification(Box::new(
@@ -1699,19 +1707,22 @@ impl Engine {
                         error,
                     ))
                 })?;
-                successor.engine.environment = fln_elab::reducibility::register(
-                    successor.engine.environment(),
-                    &derived.instance,
-                    if matches!(
-                        successor.engine.environment().find(&derived.instance),
-                        Some(ConstantInfo::Thm(_))
-                    ) {
-                        fln_elab::reducibility::Reducibility::Semireducible
-                    } else {
-                        fln_elab::reducibility::Reducibility::ImplicitReducible
-                    },
-                )
-                .map_err(|error| {
+                let registered = if matches!(
+                    successor.engine.environment().find(&derived.instance),
+                    Some(ConstantInfo::Thm(_))
+                ) {
+                    fln_elab::reducibility::register_default(
+                        successor.engine.environment(),
+                        &derived.instance,
+                    )
+                } else {
+                    fln_elab::reducibility::register(
+                        successor.engine.environment(),
+                        &derived.instance,
+                        fln_elab::reducibility::Reducibility::ImplicitReducible,
+                    )
+                };
+                successor.engine.environment = registered.map_err(|error| {
                     frontend(fln_elab::source::SourceInferenceError::Unification(
                         Box::new(fln_elab::constraint::unify::UnificationError::Reducibility(
                             error,
@@ -1995,12 +2006,19 @@ pub(crate) fn tag_noncomputable(
 
 /// Record a `@[reducible]`-style attribute's status for an admitted declaration of this module
 /// (`scope::simp::reducibility` validated it), as the pin's `setReducibilityStatus`.
+/// Its semireducible result is the default retained by an inline instance
+/// attribute; explicit standalone overrides use the source attribute handler.
 pub(crate) fn set_reducibility(
     engine: &Engine,
     name: &Name,
     status: fln_elab::reducibility::Reducibility,
 ) -> Result<Environment, EngineExecutionError> {
-    fln_elab::reducibility::register(engine.environment(), name, status).map_err(|error| {
+    let registered = if status == fln_elab::reducibility::Reducibility::Semireducible {
+        fln_elab::reducibility::register_default(engine.environment(), name)
+    } else {
+        fln_elab::reducibility::register(engine.environment(), name, status)
+    };
+    registered.map_err(|error| {
         EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
             fln_elab::NatDefinitionElabError::Inference(
                 fln_elab::source::SourceInferenceError::Unification(Box::new(

@@ -17,6 +17,8 @@ mod instances;
 mod macro_inline;
 #[path = "match_patterns.rs"]
 mod match_patterns;
+#[path = "reducibility.rs"]
+mod reducibility;
 #[path = "simp.rs"]
 mod simp;
 #[path = "structures.rs"]

@@ -537,6 +537,10 @@ impl ArtifactData {
             }
         };
         let mut explicit_statuses = std::collections::BTreeSet::new();
+        for declaration in exported.default_semireducible {
+            meter.work(1)?;
+            explicit_statuses.insert(declaration);
+        }
         for row in exported.owned {
             use fln_olean::source_extensions::ReducibilityEntry;
             meter.work(1)?;
@@ -558,10 +562,16 @@ impl ArtifactData {
         }
         // Native instances have this default in ReducibilityTable::effective.
         // Once imported, their status must come from reducibilityCore instead;
-        // an explicit owned status always wins, including later overrides.
+        // An explicit owned status always wins, including later overrides.
+        // Known semireducible defaults (such as proof instances) deliberately
+        // have no wire row and must not acquire this data-instance fallback.
+        // Retagging an imported declaration preserves its original policy;
+        // imported overrides belong only to reducibilityExtra above.
         for instance in &metadata.instances {
             meter.work(1)?;
-            if explicit_statuses.insert(instance.declaration.clone()) {
+            if !base.contains(&instance.declaration)
+                && explicit_statuses.insert(instance.declaration.clone())
+            {
                 metadata
                     .reducibility
                     .push(fln_olean::source_extensions::ReducibilityEntry {

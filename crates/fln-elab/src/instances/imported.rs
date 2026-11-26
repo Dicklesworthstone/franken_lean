@@ -804,6 +804,16 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain the pin's absent-attribute default independently of kernel hints.
+    /// Explicit imported statuses keep precedence and no wire row is invented.
+    pub fn register_reducibility_default(
+        mut self,
+        declaration: &Name,
+    ) -> Result<Self, crate::reducibility::ReducibilityError> {
+        self.env = crate::reducibility::register_default(&self.env, declaration)?;
+        Ok(self)
+    }
+
     /// Retain explicit imported extern intentions for an admitted declaration.
     /// This separate journal does not change kept class or instance state.
     pub fn register_extern(

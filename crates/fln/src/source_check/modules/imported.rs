@@ -2064,6 +2064,23 @@ impl Engine {
                         reducibility::error(&report.module, &row.declaration, error)
                     })?;
             }
+            // Abbrev kernel hints do not imply a reducible attribute. Restore
+            // this module's absent-attribute defaults after explicit statuses
+            // and before header validators consult its transparency policy.
+            // Markers cannot override explicit core or extra entries.
+            for constant in &checked.modules[index].decoded.constants {
+                cancelled!("source-olean/reducibility-default");
+                if let ConstantInfo::Defn(definition) = constant
+                    && definition.hints == fln_env::constants::ReducibilityHints::Abbrev
+                    && activation.environment().find(&definition.base.name) == Some(constant)
+                {
+                    activation = activation
+                        .register_reducibility_default(&definition.base.name)
+                        .map_err(|error| {
+                            reducibility::error(&report.module, &definition.base.name, error)
+                        })?;
+                }
+            }
             // Header validation observes the module's imported reducibility policies.
             for _ in 0..report.symms {
                 cancelled!("source-olean/symm");
@@ -2741,6 +2758,10 @@ trait Registrar: Sized {
         declaration: &Name,
         status: fln_elab::reducibility::Reducibility,
     ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError>;
+    fn register_reducibility_default(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError>;
     fn register_extern(
         self,
         declaration: &Name,
@@ -2888,6 +2909,12 @@ impl Registrar for instances::imported::ImportActivation {
         status: fln_elab::reducibility::Reducibility,
     ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError> {
         self.register_reducibility(declaration, status)
+    }
+    fn register_reducibility_default(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError> {
+        self.register_reducibility_default(declaration)
     }
     fn register_extern(
         self,
@@ -4894,6 +4921,12 @@ pub(super) mod tests {
             status: fln_elab::reducibility::Reducibility,
         ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError> {
             fln_elab::reducibility::register(&self.0, declaration, status).map(Sequential)
+        }
+        fn register_reducibility_default(
+            self,
+            declaration: &Name,
+        ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError> {
+            fln_elab::reducibility::register_default(&self.0, declaration).map(Sequential)
         }
         fn register_extern(
             self,

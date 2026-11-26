@@ -16,6 +16,9 @@ pub struct Registration {
 pub struct Statuses {
     pub owned: Vec<Registration>,
     pub imported: Vec<Registration>,
+    /// Owned defaults have no wire row but must suppress native-instance
+    /// fallback when the artifact's explicit statuses are assembled.
+    pub default_semireducible: Vec<Name>,
     pub work: usize,
 }
 
@@ -77,27 +80,23 @@ pub fn statuses(
     }
     let mut rows = BTreeMap::new();
     let mut imported = Vec::new();
+    let mut defaults = BTreeSet::new();
     for entry in entries {
         charge(&mut remaining, 1)?;
         charge(&mut remaining, entry.payload.len())?;
-        if entry.payload.len() > MAX_ENTRY_BYTES {
-            return Err(ReducibilityError::Limit);
-        }
-        let mut bytes = entry
-            .payload
-            .strip_prefix(MAGIC)
-            .ok_or(ReducibilityError::Malformed)?;
-        let declaration = read_name(&mut bytes).map_err(codec)?;
-        let [tag] = bytes else {
-            return Err(ReducibilityError::Malformed);
-        };
-        let status = Reducibility::from_tag(*tag).ok_or(ReducibilityError::Malformed)?;
+        let (declaration, status) = read_entry(&entry.payload)?;
         if declaration.is_anonymous() {
             return Err(ReducibilityError::Malformed);
         }
         if !result.contains(&declaration) {
             return Err(ReducibilityError::UnknownDeclaration(declaration));
         }
+        let Some(status) = status else {
+            if !base.contains(&declaration) {
+                defaults.insert(declaration);
+            }
+            continue;
+        };
         if base.contains(&declaration) {
             // ScopedEnvExtension exports newEntries in chronological order.
             // Repeated imported updates are valid and their final one wins.
@@ -110,6 +109,10 @@ pub fn statuses(
             rows.insert(declaration, status);
         }
     }
+    let default_semireducible = defaults
+        .into_iter()
+        .filter(|name| !rows.contains_key(name))
+        .collect();
     Ok(Statuses {
         owned: rows
             .into_iter()
@@ -119,6 +122,7 @@ pub fn statuses(
             })
             .collect(),
         imported,
+        default_semireducible,
         work: max_work - remaining,
     })
 }
@@ -223,6 +227,40 @@ mod tests {
         assert_eq!(exported.owned.len(), 1);
         assert_eq!(exported.work, suffix_cost + 1);
         assert_eq!(statuses(&base, &base, 0).unwrap(), Statuses::default());
+    }
+
+    #[test]
+    fn defaults_omit_wire_rows_without_dropping_explicit_semireducible_overrides() {
+        let base = with_axiom(&Environment::new(), "Imported");
+        let base = register(&base, &n("Imported"), Reducibility::Irreducible).unwrap();
+        let result = with_axiom(&with_axiom(&base, "Default"), "Explicit");
+        let result = register_default(&result, &n("Default")).unwrap();
+        let result = register_default(&result, &n("Explicit")).unwrap();
+        let result = register(&result, &n("Explicit"), Reducibility::Semireducible).unwrap();
+        let result = register_default(&result, &n("Explicit")).unwrap();
+        let result = register_default(&result, &n("Imported")).unwrap();
+        let result = register(&result, &n("Imported"), Reducibility::Semireducible).unwrap();
+        let exported = statuses(&base, &result, usize::MAX).unwrap();
+        assert_eq!(exported.default_semireducible, [n("Default")]);
+        assert_eq!(
+            exported.owned,
+            [Registration {
+                declaration: n("Explicit"),
+                status: Reducibility::Semireducible,
+            }]
+        );
+        assert_eq!(
+            exported.imported,
+            [Registration {
+                declaration: n("Imported"),
+                status: Reducibility::Semireducible,
+            }]
+        );
+        assert_eq!(statuses(&base, &result, exported.work).unwrap(), exported);
+        assert_eq!(
+            statuses(&base, &result, exported.work - 1),
+            Err(ReducibilityError::Limit)
+        );
     }
 
     #[test]
