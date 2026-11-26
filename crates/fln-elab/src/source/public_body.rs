@@ -78,7 +78,8 @@ impl Context {
         let mut context = Self::scoped(worlds.public, kernel, &scope)?;
         context.generated_name_environment = Some(worlds.private.clone());
         if !scope.expose_definitions {
-            context.private_proof_body = Some((worlds.private.clone(), worlds.private_scope.clone()));
+            context.private_proof_body =
+                Some((worlds.private.clone(), worlds.private_scope.clone()));
             context.private_definition_body = true;
         }
         Ok(context)

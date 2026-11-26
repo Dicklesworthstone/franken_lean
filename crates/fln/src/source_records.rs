@@ -721,15 +721,16 @@ impl Engine {
             };
             admitted.declaration.clone()
         };
-        let private_implementation = match auxiliaries
-            .private
-            .engine
-            .admit_declarations(&[declaration], options, limits)?
-        {
-            Outcome::Complete(admitted) => admitted,
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-        };
+        let private_implementation =
+            match auxiliaries
+                .private
+                .engine
+                .admit_declarations(&[declaration], options, limits)?
+            {
+                Outcome::Complete(admitted) => admitted,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
         // Inspect the owner's own receipt before prepending its auxiliaries.
         // An earlier auxiliary can never become the owner's public interface.
         let [admitted] = private_implementation.admissions.as_slice() else {

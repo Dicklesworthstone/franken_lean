@@ -135,15 +135,16 @@ impl Engine {
             .iter()
             .map(|admitted| admitted.declaration.clone())
             .collect();
-        let private = match auxiliaries
-            .private
-            .engine
-            .admit_declarations(&declarations, options, limits)?
-        {
-            Outcome::Complete(checked) => checked,
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-        };
+        let private =
+            match auxiliaries
+                .private
+                .engine
+                .admit_declarations(&declarations, options, limits)?
+            {
+                Outcome::Complete(checked) => checked,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
         // PublicWorld replays the owner's metadata after both successors have
         // succeeded. Reapplying it here would duplicate instance/simp histories.
         Ok(Outcome::Complete(PublicSourceAdmission {

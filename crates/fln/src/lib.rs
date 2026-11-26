@@ -4112,11 +4112,10 @@ impl Engine {
                     // world, including implementations behind public headers.
                     // Logical elaboration still uses the selected public/private
                     // scopes, and its resulting auxiliaries pass both checkers.
-                    let native_capture = (presentation == EvaluationPresentation::Lean
-                        && isolate_stderr)
-                        .then(|| {
-                            source_execution::NativeCaptureBuffer::new(evaluation_output_bytes)
-                        });
+                    let native_capture =
+                        (presentation == EvaluationPresentation::Lean && isolate_stderr).then(
+                            || source_execution::NativeCaptureBuffer::new(evaluation_output_bytes),
+                        );
                     let is_theorem = grammar.enter(|| match expanded.as_ref() {
                         Some(ProgramCommandSyntax::Single(parsed)) => {
                             fln_elab::source::is_theorem(parsed.syntax())

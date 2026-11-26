@@ -760,10 +760,10 @@ fn extended_operand(
                 "guard_expr" => guard_expr(leaves, view, tokens, range, keyword_atom)?,
                 _ => guard_hyp::parse(leaves, view, tokens, range, keyword_atom)?,
             };
-            let Syntax::Node { args, .. } = parsed else {
+            let Syntax::Node { args, .. } = &parsed else {
                 return Err(refusal(view, tokens, start));
             };
-            return Ok(Syntax::node(parser_kind(&["Tactic", kind]), args));
+            return Ok(Syntax::node(parser_kind(&["Tactic", kind]), args.clone()));
         }
     }
     // `"dsimp" optConfig (discharger)? (&" only")? (" [" (simpErase <|> simpLemma),* "]")?`
