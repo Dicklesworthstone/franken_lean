@@ -60,7 +60,20 @@ fn has_ctor_elim_deps(env: &fln_env::environment::Environment) -> bool {
 }
 
 fn has_no_confusion_deps(env: &fln_env::environment::Environment) -> bool {
-    fln_elab::source::equation_theorems::has_no_confusion_deps(env)
+    // These are shared by the generated construction. `eq_of_heq` is needed
+    // only when a heterogeneous equality is actually substituted; requiring it
+    // here suppresses early Prelude families such as Bool and Empty. Any such
+    // branch must still generate and check its real dependencies normally.
+    [
+        ["PUnit"].as_slice(),
+        &["Eq"],
+        &["Eq", "refl"],
+        &["Eq", "ndrec"],
+        &["HEq"],
+        &["HEq", "refl"],
+    ]
+    .into_iter()
+    .all(|parts| env.contains(&Name::from_components(parts.iter().copied())))
 }
 
 fn has_no_confusion_enum_deps(env: &fln_env::environment::Environment) -> bool {
@@ -736,88 +749,6 @@ impl Engine {
             Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
         }
-    }
-
-    /// On-demand realization of `<family>.noConfusionType` and `<family>.noConfusion`
-    /// for an inductive family that was admitted before `has_no_confusion_deps` held
-    /// (e.g. `Bool` in `Init/Prelude.lean`). Every generated declaration still crosses
-    /// both K1 and the independent checker via `admit_auxiliary_declarations`.
-    pub(crate) fn realize_inductive_no_confusion(
-        &self,
-        family: &Name,
-        options: &KVMap,
-        limits: EngineAdmissionLimits,
-    ) -> Result<Outcome<Option<DeclarationBatchAdmission>>, EngineExecutionError> {
-        let env = self.environment();
-        if !has_no_confusion_deps(env) {
-            return Ok(Outcome::Complete(None));
-        }
-        let nct_name = Name::str(family.clone(), "noConfusionType");
-        let nc_name = Name::str(family.clone(), "noConfusion");
-        if env.contains(&nct_name) && env.contains(&nc_name) {
-            return Ok(Outcome::Complete(None));
-        }
-        let Some(ConstantInfo::Induct(inductive)) = env.find(family) else {
-            return Ok(Outcome::Complete(None));
-        };
-        let cases_on_name = Name::str(family.clone(), "casesOn");
-        let Some(ConstantInfo::Defn(cases_on)) = env.find(&cases_on_name) else {
-            return Ok(Outcome::Complete(None));
-        };
-        let mut ctors = Vec::with_capacity(inductive.ctors.len());
-        for ctor_name in &inductive.ctors {
-            let Some(ConstantInfo::Ctor(ctor)) = env.find(ctor_name) else {
-                return Err(EngineExecutionError::UnexpectedPublication {
-                    detail: "an admitted source inductive is missing a checked constructor",
-                });
-            };
-            ctors.push(ctor.clone());
-        }
-        let use_enum_helper = has_no_confusion_enum_deps(env);
-        let budget = fln_elab::records::RecordBudget::default();
-        let generated =
-            no_confusion_declarations(inductive, &ctors, cases_on, use_enum_helper, budget, |n| {
-                env.find(n)
-            })
-            .map_err(|error| frontend(SourceInferenceError::Auxiliary(error)))?;
-        let Some(cands) = generated else {
-            return Ok(Outcome::Complete(None));
-        };
-        let protected = !cands.is_enum_construction;
-        let mut nc_candidates = Candidates::default();
-        if !env.contains(&cands.no_confusion_type.base.name) {
-            nc_candidates.push(cands.no_confusion_type, true, false, protected);
-        }
-        if !env.contains(&cands.no_confusion.base.name) {
-            nc_candidates.push(cands.no_confusion, true, false, protected);
-        }
-        if nc_candidates.declarations.is_empty() {
-            return Ok(Outcome::Complete(None));
-        }
-        let root = self.logical_root(options);
-        let mut batch = DeclarationBatchAdmission {
-            engine: self.clone(),
-            base_logical_root: root,
-            result_logical_root: root,
-            admissions: Vec::new(),
-            local_instance: None,
-            local_symm: Vec::new(),
-        };
-        let mut metadata = AuxiliaryMetadata::default();
-        match self.admit_auxiliary_declarations(
-            &mut batch,
-            nc_candidates,
-            &mut metadata,
-            options,
-            limits,
-        )? {
-            Outcome::Complete(()) => {}
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-        }
-        Self::finish_auxiliary_metadata(&mut batch, &metadata)?;
-        batch.result_logical_root = batch.engine.logical_root(options);
-        Ok(Outcome::Complete(Some(batch)))
     }
 
     /// Generate and admit `<first>._sizeOf_<k>`, `<I>._sizeOf_inst`, and

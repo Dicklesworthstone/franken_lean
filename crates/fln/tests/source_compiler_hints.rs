@@ -180,6 +180,10 @@ fn prelude_compiler_and_metadata_tags_match_the_pin() {
             "Invalid `export` function name: `foo'` is not a valid C++ identifier",
         ),
         (
+            "@[export α] def d (x : Nat) : Nat := x\n",
+            "Invalid `export` function name: `α` is not a valid C++ identifier",
+        ),
+        (
             "@[local export my_sym] def d (x : Nat) : Nat := x\n",
             "Invalid attribute scope: Attribute `[export]` must be global",
         ),

@@ -726,16 +726,14 @@ impl Scopes {
         }
     }
 
-    /// Whether no namespace, section, open, variable, option, or module-system
-    /// private scope diverges from `engine.base_source_scope()`.
+    /// Whether no namespace, section, open, variable, option, computability,
+    /// or module-system scope diverges from `engine.base_source_scope()`.
     pub(crate) fn is_default_scope(&self, engine: &Engine) -> bool {
         if !self.stack.is_empty() || self.imported_macros.is_some() {
             return false;
         }
         let mut normalized = self.current.clone();
         normalized.source_site = None;
-        normalized.computability = None;
-        normalized.source_module = None;
         normalized == engine.base_source_scope()
     }
     pub fn check_limits(&self, command: &ScopeCommand) -> Result<(), (&'static str, usize)> {

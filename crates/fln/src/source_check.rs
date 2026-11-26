@@ -1266,6 +1266,9 @@ impl Engine {
                     && top_level
                     && limits.worker_threads > 1
                     && public.is_none()
+                    && private_module.is_none()
+                    && source_module.is_none()
+                    && cancellation.is_none()
                     && macros.is_none()
                     && !grammar.has_declared_syntax()
                     && scopes.is_default_scope(&engine)

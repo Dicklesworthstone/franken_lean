@@ -730,5 +730,44 @@ def after_two : Nat := after_ns + 1
             .check_source_files_with_jobs(&[broken.as_slice()], &options, limits_1, 4)
             .unwrap_err();
         assert_eq!(err_1.to_string(), err_4.to_string());
+
+        // Module-system visibility and private naming must stay identical at jobs=4.
+        let mod_name = Name::from_components(["ParVis"]);
+        let mod_src =
+            b"module\nprelude\npublic section\ndef a : Nat := 1\nend\ndef b : Nat := a + 1\n";
+        let mod_limits_1 = crate::source_check::modules::SourceModuleCheckLimits::new(limits_1);
+        let mod_limits_4 = crate::source_check::modules::SourceModuleCheckLimits::new(
+            limits_1.with_worker_threads(4),
+        );
+        let mod_inputs = [crate::SourceModuleInput {
+            name: &mod_name,
+            source: mod_src.as_slice(),
+        }];
+        let m1 = engine
+            .check_source_modules(&mod_inputs, &mod_name, &options, mod_limits_1)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let m4 = engine
+            .check_source_modules(&mod_inputs, &mod_name, &options, mod_limits_4)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(
+            m1.checked.result_logical_root,
+            m4.checked.result_logical_root
+        );
+        assert!(
+            m4.checked
+                .engine
+                .environment()
+                .contains(&Name::from_components(["a"]))
+        );
+        assert!(
+            !m4.checked
+                .engine
+                .environment()
+                .contains(&Name::from_components(["b"]))
+        );
     }
 }

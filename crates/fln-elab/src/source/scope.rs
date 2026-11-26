@@ -941,14 +941,11 @@ impl Context {
         match self.source_scope.resolve_with_aliases(
             name,
             // The pin's `containsDeclOrReserved`: an equation-like name of a definition
-            // or an unrealized `<T>.noConfusion`/`<T>.noConfusionType` resolves before
-            // it is generated (`equation_theorems`).
+            // resolves before it is generated (`equation_theorems`).
             |candidate| {
                 self.txn.env.contains(candidate)
                     || local(candidate)
                     || super::equation_theorems::target(&self.txn.env, candidate).is_some()
-                    || super::equation_theorems::no_confusion_target(&self.txn.env, candidate)
-                        .is_some()
             },
             &aliases,
             &protected,

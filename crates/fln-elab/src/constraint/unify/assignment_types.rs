@@ -315,9 +315,10 @@ impl Engine<'_> {
                         let ExprNode::Sort { level } = inferred.node() else {
                             return Ok(None);
                         };
-                        // Pi is impredicative in Prop: use imax, not max and
-                        // never default an unknown codomain universe to zero.
-                        let level = Level::imax(domain_level, level.clone())
+                        // Pi is impredicative in Prop: use smart imax (matching
+                        // pinned `mkLevelIMax'`), never defaulting an unknown
+                        // codomain universe to zero.
+                        let level = Level::try_smart_imax(domain_level, level.clone())
                             .map_err(|_| UnificationError::ExpressionScope)?;
                         inferred = Expr::sort(simplify_level(&level, &mut self.meter)?);
                         context.truncate(checkpoint);

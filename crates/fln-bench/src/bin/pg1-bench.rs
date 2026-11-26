@@ -202,22 +202,31 @@ fn hash_file(path: &Path) -> Result<Digest, String> {
     Ok(hash(Domain::OperationalMeta, &bytes))
 }
 
-fn corpus_and_order_roots(sources: &[PathBuf]) -> Result<(Digest, Digest), String> {
+fn corpus_root(sources: &[PathBuf]) -> Result<Digest, String> {
     let mut corpus_bytes = Vec::new();
-    let mut order_bytes = Vec::new();
     for path in sources {
         let content =
             fs::read(path).map_err(|e| format!("failed to read `{}`: {e}", path.display()))?;
-        let display = path.to_string_lossy();
-        order_bytes.extend_from_slice(&(display.len() as u64).to_le_bytes());
-        order_bytes.extend_from_slice(display.as_bytes());
         corpus_bytes.extend_from_slice(&(content.len() as u64).to_le_bytes());
         corpus_bytes.extend_from_slice(&content);
     }
-    Ok((
-        hash(Domain::OperationalMeta, &corpus_bytes),
-        hash(Domain::OperationalMeta, &order_bytes),
-    ))
+    Ok(hash(Domain::OperationalMeta, &corpus_bytes))
+}
+
+fn input_order_root(sources: &[PathBuf], extra_args: &[String]) -> Digest {
+    let mut order_bytes = Vec::new();
+    order_bytes.extend_from_slice(&(extra_args.len() as u64).to_le_bytes());
+    for arg in extra_args {
+        order_bytes.extend_from_slice(&(arg.len() as u64).to_le_bytes());
+        order_bytes.extend_from_slice(arg.as_bytes());
+    }
+    order_bytes.extend_from_slice(&(sources.len() as u64).to_le_bytes());
+    for path in sources {
+        let display = path.to_string_lossy();
+        order_bytes.extend_from_slice(&(display.len() as u64).to_le_bytes());
+        order_bytes.extend_from_slice(display.as_bytes());
+    }
+    hash(Domain::OperationalMeta, &order_bytes)
 }
 
 fn now_unix_ns() -> u64 {
@@ -250,23 +259,26 @@ fn run_one_process(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-    let (pid, status) = match spawn {
+    let (pid, elapsed_ns, status) = match spawn {
         Ok(mut child) => {
             let pid = child.id();
             match child.wait() {
                 Ok(exit) => {
-                    let elapsed_ns =
-                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    let elapsed_ns = u64::try_from(started.elapsed().as_nanos())
+                        .unwrap_or(u64::MAX)
+                        .max(1);
                     if exit.success() {
                         (
                             pid,
+                            elapsed_ns,
                             AttemptStatus::Valid {
-                                measurement: elapsed_ns.max(1),
+                                measurement: elapsed_ns,
                             },
                         )
                     } else {
                         (
                             pid,
+                            elapsed_ns,
                             AttemptStatus::TargetFailed {
                                 exit_code: exit.code().unwrap_or(-1),
                             },
@@ -275,6 +287,9 @@ fn run_one_process(
                 }
                 Err(_) => (
                     pid,
+                    u64::try_from(started.elapsed().as_nanos())
+                        .unwrap_or(u64::MAX)
+                        .max(1),
                     AttemptStatus::InfrastructureFault {
                         code: "wait-failed".to_owned(),
                     },
@@ -283,14 +298,14 @@ fn run_one_process(
         }
         Err(_) => (
             0,
+            u64::try_from(started.elapsed().as_nanos())
+                .unwrap_or(u64::MAX)
+                .max(1),
             AttemptStatus::InfrastructureFault {
                 code: "spawn-failed".to_owned(),
             },
         ),
     };
-    let elapsed_ns = u64::try_from(started.elapsed().as_nanos())
-        .unwrap_or(u64::MAX)
-        .max(1);
     let record = AttemptRecord {
         attempt_id: attempt_id.clone(),
         ordinal,
@@ -409,7 +424,9 @@ fn run() -> Result<ExitCode, String> {
 
     let ref_hash = hash_file(&config.reference)?;
     let cand_hash = hash_file(&config.candidate)?;
-    let (corpus_root, input_order_root) = corpus_and_order_roots(&config.sources)?;
+    let corpus_root = corpus_root(&config.sources)?;
+    let ref_order_root = input_order_root(&config.sources, &config.reference_args);
+    let cand_order_root = input_order_root(&config.sources, &config.candidate_args);
 
     let mut tools = vec![
         OracleToolIdentity {
@@ -423,20 +440,25 @@ fn run() -> Result<ExitCode, String> {
     ];
     tools.sort();
 
+    let warmed = if config.warmup > 0 {
+        CacheCondition::Warm
+    } else {
+        CacheCondition::Cold
+    };
     let ref_cache = CacheState {
-        filesystem: CacheCondition::Warm,
-        page_cache: CacheCondition::Warm,
-        reference_artifacts: CacheCondition::Warm,
+        filesystem: warmed,
+        page_cache: warmed,
+        reference_artifacts: warmed,
         candidate_artifacts: CacheCondition::NotApplicable,
         build_cache: CacheCondition::Cold,
         imported_modules: CacheCondition::Cold,
         daemon: CacheCondition::Cold,
     };
     let cand_cache = CacheState {
-        filesystem: CacheCondition::Warm,
-        page_cache: CacheCondition::Warm,
+        filesystem: warmed,
+        page_cache: warmed,
         reference_artifacts: CacheCondition::NotApplicable,
-        candidate_artifacts: CacheCondition::Warm,
+        candidate_artifacts: warmed,
         build_cache: CacheCondition::Cold,
         imported_modules: CacheCondition::Cold,
         daemon: CacheCondition::Cold,
@@ -452,7 +474,7 @@ fn run() -> Result<ExitCode, String> {
         workload_kind: config.workload_kind,
         oracle_tools: tools.clone(),
         corpus_root,
-        input_order_root,
+        input_order_root: ref_order_root,
         warmup_iterations: config.warmup,
         samples: config.samples,
         cache_state: ref_cache,
@@ -463,16 +485,18 @@ fn run() -> Result<ExitCode, String> {
         workload_kind: config.workload_kind,
         oracle_tools: tools,
         corpus_root,
-        input_order_root,
+        input_order_root: cand_order_root,
         warmup_iterations: config.warmup,
         samples: config.samples,
         cache_state: cand_cache,
         host_policy,
     });
 
-    // Interleaved warmup pairs (not included in timed attempts).
+    // Interleaved warmup pairs (not included in timed attempts). Fail fast if
+    // either binary rejects the workload so misconfigured flags do not masquerade
+    // as timed samples.
     for w in 0..config.warmup {
-        let _ = Command::new(&config.reference)
+        let ref_status = Command::new(&config.reference)
             .args(&config.reference_args)
             .args(&config.sources)
             .stdin(Stdio::null())
@@ -480,7 +504,12 @@ fn run() -> Result<ExitCode, String> {
             .stderr(Stdio::null())
             .status()
             .map_err(|e| format!("warmup reference #{w} failed to spawn: {e}"))?;
-        let _ = Command::new(&config.candidate)
+        if !ref_status.success() {
+            return Err(format!(
+                "warmup reference #{w} exited non-zero ({ref_status})"
+            ));
+        }
+        let cand_status = Command::new(&config.candidate)
             .args(&config.candidate_args)
             .args(&config.sources)
             .stdin(Stdio::null())
@@ -488,6 +517,11 @@ fn run() -> Result<ExitCode, String> {
             .stderr(Stdio::null())
             .status()
             .map_err(|e| format!("warmup candidate #{w} failed to spawn: {e}"))?;
+        if !cand_status.success() {
+            return Err(format!(
+                "warmup candidate #{w} exited non-zero ({cand_status})"
+            ));
+        }
     }
 
     let host_root = host.root();

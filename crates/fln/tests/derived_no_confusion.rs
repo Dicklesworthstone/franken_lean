@@ -745,7 +745,7 @@ fn cj7s_required_mutants_and_anti_vacuity_floors_are_killed() {
 }
 
 #[test]
-fn on_demand_no_confusion_realizes_bootstrap_inductives_in_module_and_plain_mode() {
+fn bootstrap_bool_no_confusion_works_in_module_mode_and_refuses_pre_eq_punit() {
     use fln::source_check::modules::SourceModuleCheckLimits;
     use fln::source_check::modules::imported::SourceOleanImport;
     use fln::{Budget, EngineAdmissionLimits, KVMap, SourceCheckLimits, SourceModuleInput};
@@ -773,14 +773,6 @@ inductive Bool : Type where
 inductive False : Prop
 
 def Not (a : Prop) : Prop := a → False
-
-def cast {α β : Sort u} (h : Eq α β) (a : α) : β :=
-  Eq.rec (motive := fun x _ => x) a h
-
-theorem eq_of_heq {α : Sort u} {a a' : α} (h : HEq a a') : Eq a a' :=
-  have helper : (α β : Sort u) → (a : α) → (b : β) → HEq a b → (h : Eq α β) → Eq (cast h a) b :=
-    fun _ _ _ _ h₁ => h₁.rec (fun _ => Eq.refl _)
-  helper α α a a' h (Eq.refl α)
 
 theorem ne_false_of_eq_true : {b : Bool} → Eq b Bool.true → Not (Eq b Bool.false)
   | Bool.true, _ => fun h => Bool.noConfusion h
@@ -813,6 +805,29 @@ theorem ne_false_of_eq_true : {b : Bool} → Eq b Bool.true → Not (Eq b Bool.f
         let env = checked.checked.engine.environment();
         assert!(env.contains(&name("Bool.noConfusionType")));
         assert!(env.contains(&name("Bool.noConfusion")));
+        assert!(!env.contains(&name("PUnit.noConfusionType")));
+        assert!(!env.contains(&name("PUnit.noConfusion")));
         assert!(env.contains(&name("ne_false_of_eq_true")));
+
+        // Pin parity (`v4.32.0`): `PUnit` precedes `Eq`/`HEq`, so `PUnit.noConfusion`
+        // does not exist even on demand (`Unknown constant PUnit.noConfusion`).
+        let invalid = format!(
+            "{source}\ntheorem bad (P : Prop) (h : Eq PUnit.unit PUnit.unit) (k : P) : P := PUnit.noConfusion h k\n"
+        );
+        assert!(
+            SourceOleanImport::empty(&KVMap::new())
+                .check_source_modules(
+                    &[SourceModuleInput {
+                        name: &entry,
+                        source: invalid.as_bytes(),
+                    }],
+                    &entry,
+                    &KVMap::new(),
+                    limits,
+                    None,
+                )
+                .is_err(),
+            "pin refuses PUnit.noConfusion ({prefix})"
+        );
     }
 }

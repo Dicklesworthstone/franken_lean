@@ -13,19 +13,17 @@ use fln_elab::source::equation_theorems as equations;
 use fln_elab::source::scope::simp::equations as simp_equations;
 use fln_syntax::tree::Syntax;
 
-/// Whether `source` can name an equation theorem or unrealized `noConfusion`
-/// auxiliary at all: a cheap filter before parsing.
+/// Whether `source` can name an equation theorem at all: a cheap filter before parsing.
 pub(crate) fn may_name_equation_theorems(source: &[u8]) -> bool {
     source.windows(3).any(|window| window == b"eq_")
         || source.windows(2).any(|w| w == b"rw")
         || source.windows(7).any(|window| window == b"rewrite")
         || source.windows(5).any(|window| window == b"grind")
-        || source.windows(11).any(|window| window == b"noConfusion")
 }
 
 impl Engine {
-    /// Generate and admit the equation theorems and unrealized `noConfusion`
-    /// auxiliaries `syntaxes` refer to. `None` when there are none to generate.
+    /// Generate and admit the equation theorems `syntaxes` refer to. `None` when there are
+    /// none to generate.
     pub(crate) fn realize_equation_theorems(
         &self,
         syntaxes: &[&Syntax],
@@ -34,16 +32,6 @@ impl Engine {
         limits: EngineAdmissionLimits,
         source_base: Option<&Environment>,
     ) -> Result<Outcome<Option<DeclarationBatchAdmission>>, EngineExecutionError> {
-        let no_confusion_families = match elaboration_outcome(equations::no_confusion_requests(
-            syntaxes,
-            self.environment(),
-            scope,
-            limits.kernel,
-        ))? {
-            Outcome::Complete(families) => families,
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-        };
         let requests = match elaboration_outcome(equations::requests(
             syntaxes,
             self.environment(),
@@ -54,23 +42,12 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        if no_confusion_families.is_empty() && requests.is_empty() {
+        if requests.is_empty() {
             return Ok(Outcome::Complete(None));
         }
         let base_logical_root = self.logical_root(options);
         let mut engine = self.clone();
         let mut admissions = Vec::new();
-        for family in &no_confusion_families {
-            match engine.realize_inductive_no_confusion(family, options, limits)? {
-                Outcome::Complete(Some(batch)) => {
-                    engine = batch.engine;
-                    admissions.extend(batch.admissions);
-                }
-                Outcome::Complete(None) => {}
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            }
-        }
         for request in &requests {
             // Plain equation references and simp attributes share the same
             // candidate builder and post-admission provenance. Preparing it

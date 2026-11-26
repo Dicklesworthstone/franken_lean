@@ -49,14 +49,14 @@ impl Attribute {
 }
 
 /// Mirror pinned `Lean/Compiler/ExportAttr.lean:15-22`: every component of an
-/// `@[export ...]` symbol must be a string segment starting with an alphabetic
-/// character followed by alphanumeric or `_` characters.
+/// `@[export ...]` symbol must be an ASCII identifier starting with an ASCII
+/// letter (`Char.isAlpha`) followed by ASCII letters, digits, or `_`.
 fn is_valid_cpp_id(segment: &str) -> bool {
     let mut chars = segment.chars();
     let Some(first) = chars.next() else {
         return false;
     };
-    first.is_alphabetic() && chars.all(|ch| ch.is_alphanumeric() || ch == '_')
+    first.is_ascii_alphabetic() && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn is_valid_cpp_name(name: &Name) -> bool {
