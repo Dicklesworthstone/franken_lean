@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - crates/fln-admission/**
+      - crates/fln-checker/**
       - crates/fln/tests/provisional_frontier.rs
       - Cargo.lock
       - SUITE.lock
@@ -14,6 +15,7 @@ on:
     branches: [main]
     paths:
       - crates/fln-admission/**
+      - crates/fln-checker/**
       - crates/fln/tests/provisional_frontier.rs
       - Cargo.lock
       - SUITE.lock
@@ -68,3 +70,37 @@ jobs:
         run: |
           cargo clippy --locked -p fln-admission --all-targets -- -D warnings
           cargo clippy --locked -p fln --test provisional_frontier -- -D warnings
+
+  checker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Provision the locked suite dependency
+        run: bash scripts/ci/checkout_asupersync.sh
+      - name: Install the pinned toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          rustc -Vv
+          git rev-parse HEAD
+      - name: Check checker formatting
+        run: cargo fmt --package fln-checker --check
+      - name: Test the independent checker and memo retention limits
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p fln-checker --no-fail-fast
+      - name: Check all independent checker targets
+        if: ${{ !cancelled() }}
+        run: cargo check --locked -p fln-checker --all-targets
+      - name: Lint all independent checker targets
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked -p fln-checker --all-targets -- -D warnings
