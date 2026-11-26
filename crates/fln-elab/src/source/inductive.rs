@@ -473,6 +473,7 @@ struct Header<'a> {
     name: Name,
     /// The name as written, without the namespace: the pin's `shortDeclName`.
     short_name: Name,
+    is_protected: bool,
     parameters: Vec<LocalDecl>,
     indices: Vec<LocalDecl>,
     explicit: Option<Level>,
@@ -507,7 +508,7 @@ fn header<'a>(
         2,
         "inductive declaration",
     )?;
-    scope::visibility::data_modifiers(&root[0])?;
+    let is_protected = scope::visibility::data_modifiers(&root[0])?;
     let scope = scope.for_declaration(syntax)?;
     let (is_class, parts) = command_parts(&root[1])?;
     if is_class {
@@ -566,6 +567,9 @@ fn header<'a>(
         return Err(failure(SourceInferenceError::ResourceLimit));
     }
     let mut context = Context::scoped(env, kernel, &scope)?;
+    if is_protected {
+        context.check_protected_declaration_name(name)?;
+    }
     let short_name = name.clone();
     let name = context.enter_declaration(name)?;
     if env.contains(&name) {
@@ -668,6 +672,7 @@ fn header<'a>(
         context,
         name,
         short_name,
+        is_protected,
         parameters,
         indices,
         explicit,
@@ -687,12 +692,16 @@ pub(super) fn elaborate_inductive_scoped(
         mut context,
         name,
         short_name: _,
+        is_protected,
         mut parameters,
         mut indices,
         explicit,
         family_type,
         ctors,
     } = header(syntax, env, kernel, budget, scope)?;
+    if is_protected {
+        context.protected_declarations.push(name.clone());
+    }
     let self_id = FVarId(context.fresh_name()?);
     context.txn.lctx.add_param(
         self_id.clone(),

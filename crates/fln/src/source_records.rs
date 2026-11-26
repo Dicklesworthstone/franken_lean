@@ -813,7 +813,9 @@ impl Engine {
         let result = self
             .admit_declarations(&[candidate], options, limits)
             .map_err(EngineExecutionError::from)?;
-        let result = self.finish_source_inductive_auxiliaries(result, options, limits, scope)?;
+        // Multi-family mutual blocks never contain classes (`mutual.rs`).
+        let result =
+            self.finish_source_inductive_auxiliaries(result, options, limits, scope, false)?;
         self.finish_source_data_attributes(result, members, options, scope)
     }
 
@@ -856,6 +858,24 @@ impl Engine {
                 )
                 .map_err(DefinitionFrontendError::Elaborate)
                 .map_err(EngineExecutionError::Frontend)?;
+            }
+            if let Some(protected_name) = fln_elab::source::protected_registration(syntax)
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?
+            {
+                let resolved = scope
+                    .for_declaration(syntax)
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?
+                    .declaration_name(&protected_name)
+                    .map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::NameScope(error),
+                            ),
+                        ))
+                    })?;
+                batch.engine.environment = tag_protected(&batch.engine, &resolved)?;
             }
         }
         batch.result_logical_root = batch.engine.logical_root(options);
@@ -1358,8 +1378,12 @@ impl Engine {
             let result = self
                 .admit_declarations(&[candidate], options, limits)
                 .map_err(EngineExecutionError::from)?;
+            let is_class = fln_elab::source::class_inductive_registration(syntax, scope)
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?
+                .is_some();
             let result =
-                self.finish_source_inductive_auxiliaries(result, options, limits, scope)?;
+                self.finish_source_inductive_auxiliaries(result, options, limits, scope, is_class)?;
             let result = self.finish_source_data_attributes(
                 result,
                 std::slice::from_ref(syntax),
@@ -1477,7 +1501,13 @@ impl Engine {
         }
         // Complete the declaration stream before adding any record journals,
         // so adjacent council receipts retain their exact predecessor roots.
-        let result = self.finish_source_inductive_auxiliaries(result, options, limits, scope)?;
+        let result = self.finish_source_inductive_auxiliaries(
+            result,
+            options,
+            limits,
+            scope,
+            record.is_class,
+        )?;
         let result = match result {
             Outcome::Complete(mut batch) => {
                 // Projection hints and reducibility status are different facts.
@@ -1572,6 +1602,19 @@ impl Engine {
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     };
+                }
+                if !record.protected_projections.is_empty() {
+                    batch.engine.environment = fln_elab::protected_names::register_module(
+                        batch.engine.environment(),
+                        &record.protected_projections,
+                    )
+                    .map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::ProtectedJournal(error),
+                            ),
+                        ))
+                    })?;
                 }
                 batch.result_logical_root = batch.engine.logical_root(options);
                 Outcome::Complete(batch)

@@ -145,6 +145,16 @@ pub const ROWS: &[Row] = &[
         "Lean/Elab/MutualInductive.lean:57",
         Honored,
     ),
+    row(
+        "bootstrap.genMatcherCode",
+        Bool(true),
+        "Lean/Meta/Match/Match.lean:1069",
+        Inert(
+            "disables code generation and `@[inline]` on auxiliary matcher definitions during \
+             bootstrap; this engine compiles source matches directly to recursors without \
+             auxiliary matcher codegen",
+        ),
+    ),
     // Read by every declaration, term and section instance-binder validator.
     row(
         "checkBinderAnnotations",

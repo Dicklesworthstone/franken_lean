@@ -101,7 +101,8 @@ pub(in crate::source) fn exposure_attribute(
 
 /// Top-level data modifiers, distinct from constructor/field modifiers whose
 /// individual visibility semantics are not implemented by this source door.
-pub(in crate::source) fn data_modifiers(syntax: &Syntax) -> Result<(), NatDefinitionElabError> {
+/// Returns whether the top-level data declaration is `protected`.
+pub(in crate::source) fn data_modifiers(syntax: &Syntax) -> Result<bool, NatDefinitionElabError> {
     let parts = expect_node(
         syntax,
         &parser_kind(&["Command", "declModifiers"]),
@@ -119,10 +120,11 @@ pub(in crate::source) fn data_modifiers(syntax: &Syntax) -> Result<(), NatDefini
         }
     }
     modifier(&parts[2])?;
-    for part in &parts[3..] {
+    let is_protected = super::super::protected_slot(&parts[3])?;
+    for part in &parts[4..] {
         expect_empty_null(part, "absent unsupported data modifier")?;
     }
-    Ok(())
+    Ok(is_protected)
 }
 
 impl SourceScope {

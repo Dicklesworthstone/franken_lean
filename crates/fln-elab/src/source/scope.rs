@@ -894,13 +894,15 @@ impl Context {
         let user_name = self.source_scope.user_name(name);
         let atomic = components(&user_name).map_err(error)?.len() == 1 && user_name == *name;
         let held_back_recursion =
-            |candidate: &Name| atomic && self.protected_declaration.as_ref() == Some(candidate);
+            |candidate: &Name| atomic && self.protected_declarations.contains(candidate);
         // The declaration being defined is a local of its own body at the pin (the
         // auxiliary declaration `elabMutualDef` adds), before its recursion context
         // exists here: `namespace A` / `def foo : Nat := foo` names `A.foo`, never a
         // root `foo`, and `open P` never makes `foo` mean `P.foo` there.
         let local = |candidate: &Name| {
-            !hygienic && self.txn.lctx.find_by_user_name(candidate).is_some()
+            (!hygienic
+                && self.txn.lctx.find_by_user_name(candidate).is_some()
+                && !held_back_recursion(candidate))
                 || self
                     .recursion
                     .as_ref()

@@ -48,6 +48,8 @@ pub(super) struct Inheritance {
     /// Subset of `labels` naming subobject or copied parent projections (never leaf fields),
     /// matching `StructFieldKind.isParent` in vendored `Lean/Elab/Structure.lean:145,765`.
     pub parent_labels: HashSet<Name>,
+    /// Copied fields inherited from a `protected` parent projection (`Structure.lean:669`).
+    pub protected_fields: Vec<Name>,
     pub level: Level,
 }
 
@@ -91,6 +93,7 @@ impl Context {
             defaults: Vec::new(),
             labels: HashSet::new(),
             parent_labels: HashSet::new(),
+            protected_fields: Vec::new(),
             level: Level::one(),
         };
         let syntax = match expect_null_args(syntax, "optional parent clause")? {
@@ -433,6 +436,16 @@ impl Context {
                     )?
                 }
             } else {
+                let protected = self
+                    .protected_cache
+                    .read(&self.txn.env)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                if protected.contains(&parent.append_core(&field)) {
+                    let projection = record.append_core(&field);
+                    if !result.protected_fields.contains(&projection) {
+                        result.protected_fields.push(projection);
+                    }
+                }
                 result.labels.insert(field.clone());
                 let id = FVarId(self.fresh_name()?);
                 let style = styles.get(index).copied().unwrap_or(BinderInfo::Default);

@@ -849,8 +849,9 @@ struct Context {
     // of the earliest rewrite found so far: the next rule's occurrence search reads it once and
     // stops past it (`aclt.rs`, `simp_first_rewrite`).
     simp_reach_limit: Option<usize>,
-    // The declaration being elaborated, when it is `protected`.
-    protected_declaration: Option<Name>,
+    // The declaration(s) being elaborated that are `protected`, held back from
+    // atomic self-references just as the pin's `applyVisibility` holds them back.
+    protected_declarations: Vec<Name>,
     refinements: Vec<tactics::RefinementFrame>,
     /// Synthetic-hole user names belong to the declaration's metavariable
     /// context, not to one refine call (pin BuiltinTerm.lean:81).
@@ -1050,7 +1051,7 @@ impl Context {
             check_deprecated: true,
             simp_key_cache: tactics::SimpKeyCache::default(),
             simp_reach_limit: None,
-            protected_declaration: None,
+            protected_declarations: Vec::new(),
             refinements: Vec::new(),
             named_refinement_holes: std::collections::HashMap::new(),
             defining: None,
@@ -2540,6 +2541,7 @@ impl Context {
             Ascription(&'a Syntax, Option<Expr>, bool),
             AscribedValue(Expr, Option<Expr>, bool),
             Noindex,
+            Borrowed,
             /// `↑e`'s value, made to have the expected type.
             Coerced(Option<Expr>),
             /// A field path, the syntax it is spelled at the end of, the arguments.
@@ -3492,6 +3494,17 @@ impl Context {
                                         tasks.push(Task::Visit(&parts[1], expected, finish));
                                         continue;
                                     }
+                                    // `Lean/Elab/BuiltinNotation.lean:106`, `elabBorrowed`:
+                                    // `@& e` elaborates `e` with the expected type and wraps it in
+                                    // `mkAnnotation `borrowed` (transparent to typing, preserved
+                                    // in declaration types for the compiler/ABI surface).
+                                    if kind == &parser_kind(&["Term", "borrowed"]) {
+                                        let parts = expect_node(syntax, kind, 2, "borrowed")?;
+                                        expect_atom(&parts[0], "@&", "borrowed")?;
+                                        tasks.push(Task::Borrowed);
+                                        tasks.push(Task::Visit(&parts[1], expected, finish));
+                                        continue;
+                                    }
                                     // `e |>.f args` is `(e).f args` (`Term.pipeProj`'s macro,
                                     // `Lean/Elab/BuiltinNotation.lean`).
                                     if kind == &parser_kind(&["Term", "pipeProj"]) {
@@ -4243,6 +4256,16 @@ impl Context {
                                 let mut data = KVMap::new();
                                 data.insert(
                                     Name::from_components(["noindex"]),
+                                    fln_core::options::DataValue::OfBool(true),
+                                );
+                                term.value = Expr::mdata(data, term.value);
+                                values.push(term);
+                            }
+                            Task::Borrowed => {
+                                let mut term = values.pop().expect("borrowed term visit");
+                                let mut data = KVMap::new();
+                                data.insert(
+                                    Name::from_components(["borrowed"]),
                                     fln_core::options::DataValue::OfBool(true),
                                 );
                                 term.value = Expr::mdata(data, term.value);
@@ -7407,7 +7430,10 @@ fn definition_elaboration(
     // The pin tags a protected declaration before elaborating its body, and
     // names its recursive local `<last namespace component>.<short name>`, so
     // the body cannot reach it by its atomic name either.
-    context.protected_declaration = is_protected.then(|| owned_name.clone());
+    context.protected_declarations = is_protected
+        .then(|| owned_name.clone())
+        .into_iter()
+        .collect();
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
     let signature = expect_node(

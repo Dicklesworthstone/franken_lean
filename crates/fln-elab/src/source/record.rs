@@ -28,6 +28,8 @@ pub struct SourceRecord {
     /// Authored structure identity, never inferred from a one-constructor inductive.
     /// The caller registers it only after admitting the complete declaration batch.
     pub structure: StructureEntry,
+    /// Field projections marked `protected` (authored or copied from a protected parent field).
+    pub protected_projections: Vec<Name>,
 }
 
 pub fn is_record(syntax: &Syntax) -> bool {
@@ -37,18 +39,44 @@ pub fn is_record(syntax: &Syntax) -> bool {
             if kind == &parser_kind(&["Command", "structure"])))
 }
 
-fn empty_modifiers(syntax: &Syntax) -> Result<(), NatDefinitionElabError> {
+/// Validate structure field modifiers against `checkValidFieldModifier` and
+/// `expandFields` in vendored `Lean/Elab/Structure.lean:320-364`.
+fn field_modifiers(
+    syntax: &Syntax,
+    structure_modifiers: &Syntax,
+) -> Result<bool, NatDefinitionElabError> {
     let parts = expect_node(
         syntax,
         &parser_kind(&["Command", "declModifiers"]),
         7,
-        "record modifiers",
+        "record field modifiers",
     )?;
     super::doc_comment_slot(&parts[0])?;
-    for part in &parts[1..] {
-        expect_empty_null(part, "absent record modifiers")?;
+    expect_empty_null(&parts[1], "field without attributes")?;
+    let visibility = scope::visibility::modifier(&parts[2])?;
+    let is_protected = super::protected_slot(&parts[3])?;
+    for part in &parts[4..] {
+        expect_empty_null(part, "absent unsupported record field modifier")?;
     }
-    Ok(())
+    let structure_modifiers = expect_node(
+        structure_modifiers,
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "structure modifiers",
+    )?;
+    if scope::visibility::modifier(&structure_modifiers[2])? == Some(false)
+        && (visibility == Some(false) || is_protected)
+    {
+        return Err(failure(SourceInferenceError::Record(
+            crate::records::RecordError::InvalidName,
+        )));
+    }
+    if visibility.is_some() {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "absent record field visibility modifier",
+        });
+    }
+    Ok(is_protected)
 }
 
 /// Expand grouped fields while preserving their constructor binder style. The
@@ -172,7 +200,7 @@ pub(super) fn elaborate_record_scoped(
         2,
         "record declaration",
     )?;
-    scope::visibility::data_modifiers(&root[0])?;
+    let is_protected = scope::visibility::data_modifiers(&root[0])?;
     let scope = scope.for_declaration(syntax)?;
     let parts = expect_node(
         &root[1],
@@ -221,6 +249,9 @@ pub(super) fn elaborate_record_scoped(
     )?;
     let own = super::own_short_name(name);
     let mut context = Context::scoped(environment, kernel, &scope)?;
+    if is_protected {
+        context.check_protected_declaration_name(name)?;
+    }
     let user_name = context
         .source_scope
         .user_declaration_name(name)
@@ -356,6 +387,7 @@ pub(super) fn elaborate_record_scoped(
     let mut default_uses = Vec::new();
     let mut written_fields = std::collections::HashSet::new();
     let mut overrides = Vec::new();
+    let mut protected_projections = std::mem::take(&mut inheritance.protected_fields);
     for (field, style) in fields {
         context.tick()?;
         let parts = expect_node(
@@ -364,7 +396,7 @@ pub(super) fn elaborate_record_scoped(
             4,
             "named structure field",
         )?;
-        empty_modifiers(&parts[0])?;
+        let field_protected = field_modifiers(&parts[0], &root[0])?;
         // `h : P := by tac` is the pin's `binderTactic`, an `autoParam` field: an omitted field
         // is filled by running its tactic. It is read as a default proved by that tactic, as the
         // checker read the field before its tree was the pin's: the constructor then takes `P`,
@@ -419,6 +451,17 @@ pub(super) fn elaborate_record_scoped(
                 .lctx
                 .find_by_user_name(user_name)
                 .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            if field_protected {
+                if inherited.value.is_some() {
+                    return Err(NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "protected modifier only on owned structure field projections",
+                    });
+                }
+                let projection = name.append_core(user_name);
+                if !protected_projections.contains(&projection) {
+                    protected_projections.push(projection);
+                }
+            }
             // Only the flat leaf traversal can distinguish a real inherited
             // field from an indirect parent projection. Validate that below,
             // after every new field is available to the default.
@@ -430,6 +473,12 @@ pub(super) fn elaborate_record_scoped(
                 tactic: is_tactic_default,
             });
             continue;
+        }
+        if field_protected {
+            let projection = name.append_core(user_name);
+            if !protected_projections.contains(&projection) {
+                protected_projections.push(projection);
+            }
         }
         if parameters
             .len()
@@ -865,5 +914,6 @@ pub(super) fn elaborate_record_scoped(
         parent_instances,
         flat_constructor,
         structure,
+        protected_projections,
     })
 }

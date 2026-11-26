@@ -241,10 +241,16 @@ pub(in crate::source) fn elaborate_mutual(
         .map(|h| family_type(h, &provisional, budget))
         .collect::<Result<Vec<_>, _>>()?;
     let family_names: Vec<_> = headers.iter().map(|h| h.name.clone()).collect();
+    let protected_families: Vec<_> = headers
+        .iter()
+        .filter(|h| h.is_protected)
+        .map(|h| h.name.clone())
+        .collect();
     let mut all_bodies = Vec::new();
     let mut inferred = Level::one();
     let mut base = LocalContext::new();
     for (i, h) in headers.iter_mut().enumerate() {
+        h.context.protected_declarations = protected_families.clone();
         for ((id, name), ty) in ids.iter().zip(&family_names).zip(&initial_types) {
             h.context.tick()?;
             h.context
