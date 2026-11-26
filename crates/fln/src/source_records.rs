@@ -588,6 +588,9 @@ impl Engine {
             }
             ScopedCommandSyntax::Definition(parsed)
                 if fln_elab::source::is_theorem(parsed.syntax())
+                    || (fln_elab::source::is_definition_body(parsed.syntax())
+                        && !fln_elab::source::partial::is_partial(parsed.syntax())
+                        && !fln_elab::source::partial::is_unsafe_definition(parsed.syntax()))
                     || fln_elab::source::instance_registration(parsed.syntax())
                         .map_err(DefinitionFrontendError::Elaborate)
                         .map_err(EngineExecutionError::Frontend)?
@@ -621,99 +624,92 @@ impl Engine {
             private_scope,
         };
         let is_theorem = fln_elab::source::is_theorem(parsed.syntax());
+        let is_instance = fln_elab::source::is_instance(parsed.syntax());
         let candidate = if is_theorem {
-            fln_elab::source::elaborate_public_theorem(parsed.syntax(), &worlds, limits.kernel).map(
-                |theorem| {
-                    (
-                        theorem.declaration,
-                        true,
-                        true,
-                        theorem.noncomputable,
-                        theorem.local_functions,
-                    )
-                },
-            )
-        } else {
+            fln_elab::source::elaborate_public_theorem(parsed.syntax(), &worlds, limits.kernel)
+                .map(|theorem| (theorem, true, true))
+        } else if is_instance {
             fln_elab::source::elaborate_public_instance(parsed.syntax(), &worlds, limits.kernel)
                 .map(|instance| {
+                    let proof_valued = instance.proof_valued;
+                    let hidden_body = instance.hidden_body;
                     (
-                        instance.declaration,
-                        instance.proof_valued,
-                        instance.hidden_body,
-                        instance.noncomputable,
-                        instance.local_functions,
+                        fln_elab::source::ElaboratedDeclaration {
+                            declaration: instance.declaration,
+                            auxiliary_declarations: instance.auxiliary_declarations,
+                            equation_info: None,
+                            local_functions: instance.local_functions,
+                            irreducible: false,
+                            noncomputable: instance.noncomputable,
+                        },
+                        proof_valued,
+                        hidden_body,
                     )
                 })
+        } else {
+            fln_elab::source::elaborate_public_definition(parsed.syntax(), &worlds, limits.kernel)
+                .map(|definition| (definition, false, false))
         };
-        let (candidate, proof_valued, hidden_body, inferred_noncomputable, local_functions) =
-            match elaboration_outcome(candidate)? {
-                Outcome::Complete(candidate) => candidate,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            };
+        let (candidate, proof_valued, hidden_body) = match elaboration_outcome(candidate)? {
+            Outcome::Complete(candidate) => candidate,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         if !proof_valued {
             if hidden_body {
                 return self.admit_hidden_public_candidate(
                     public,
                     parsed.syntax(),
-                    fln_elab::source::ElaboratedDeclaration {
-                        declaration: candidate,
-                        auxiliary_declarations: Vec::new(),
-                        equation_info: None,
-                        local_functions,
-                        irreducible: false,
-                        noncomputable: inferred_noncomputable,
-                    },
+                    candidate,
                     options,
                     limits,
                     public_scope,
                 );
             }
-            if !matches!(&candidate, Declaration::Defn(definition)
+            if is_instance
+                && !matches!(&candidate.declaration, Declaration::Defn(definition)
                     if definition.safety == DefinitionSafety::Safe)
             {
                 return Err(EngineExecutionError::NotImplemented {
                     feature: "a public data instance requires its exposed safe definition",
                 });
             }
-            return Ok(
-                match public.admit_scoped_candidate(
-                    parsed.syntax(),
-                    candidate,
-                    false,
-                    None,
-                    inferred_noncomputable,
-                    local_functions,
-                    options,
-                    limits,
-                    public_scope,
-                )? {
-                    Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
-                        public,
-                        private_implementation: None,
-                    }),
-                    Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
-                    Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
-                },
+            return self.admit_exposed_public_candidate(
+                public,
+                parsed.syntax(),
+                candidate,
+                options,
+                limits,
+                public_scope,
             );
         }
-        if !matches!(&candidate, Declaration::Thm(_)) {
+        if !matches!(&candidate.declaration, Declaration::Thm(_)) {
             return Err(EngineExecutionError::NotImplemented {
                 feature: "a public proof must retain its theorem declaration kind",
             });
         }
-        let candidate = if hidden_body {
-            candidate
+        let auxiliaries = match self.admit_public_auxiliaries(
+            public,
+            &candidate.auxiliary_declarations,
+            hidden_body,
+            options,
+            limits,
+        )? {
+            Outcome::Complete(checked) => checked,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let declaration = if hidden_body {
+            candidate.declaration
         } else {
-            // Expose changes the proof's checking world, not its exported
-            // declaration kind (Lean.AddDecl.addDeclCore). Obtain a real
-            // public council receipt before re-admitting its exact theorem in
-            // the private world. This scratch successor installs no metadata
-            // and cannot escape if either later admission fails.
-            let checked = match public
-                .admit_declarations(&[candidate], options, limits)
-                .map_err(EngineExecutionError::from)?
-            {
+            // Exposure changes the proof's checking world, not its exported
+            // declaration kind. Its public auxiliary signatures are already
+            // checked, and no hidden predecessor may justify this body.
+            let checked = match auxiliaries.public.engine.admit_declarations(
+                &[candidate.declaration],
+                options,
+                limits,
+            )? {
                 Outcome::Complete(checked) => checked,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -725,16 +721,17 @@ impl Engine {
             };
             admitted.declaration.clone()
         };
-        let private_implementation = match self
-            .admit_declarations(&[candidate], options, limits)
-            .map_err(EngineExecutionError::from)?
+        let private_implementation = match auxiliaries
+            .private
+            .engine
+            .admit_declarations(&[declaration], options, limits)?
         {
             Outcome::Complete(admitted) => admitted,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        // Obtain the interface from the actual successful admission, never
-        // from an independently supplied or caller-authored signature.
+        // Inspect the owner's own receipt before prepending its auxiliaries.
+        // An earlier auxiliary can never become the owner's public interface.
         let [admitted] = private_implementation.admissions.as_slice() else {
             return Err(EngineExecutionError::NotImplemented {
                 feature: "a public proof must admit exactly one checked implementation",
@@ -751,7 +748,7 @@ impl Engine {
         });
         let private_implementation = match self.finish_local_function_batch(
             private_implementation,
-            &local_functions,
+            &candidate.local_functions,
             options,
             limits,
         )? {
@@ -759,8 +756,10 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        let private_implementation =
+            public_body::prepend_auxiliaries(private_implementation, auxiliaries.private);
         Ok(
-            match public.admit_scoped_candidate(
+            match auxiliaries.public.engine.admit_scoped_candidate(
                 parsed.syntax(),
                 interface,
                 false,
@@ -772,7 +771,7 @@ impl Engine {
                 public_scope,
             )? {
                 Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
-                    public,
+                    public: public_body::prepend_auxiliaries(public, auxiliaries.public),
                     private_implementation: Some(private_implementation),
                 }),
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),

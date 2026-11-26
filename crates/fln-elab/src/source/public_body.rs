@@ -12,20 +12,22 @@ pub fn is_definition_body(syntax: &Syntax) -> bool {
                 args[1].kind() == Some(&parser_kind(&["Command", form]))))
 }
 
-/// Elaborate a public signature before entering its private implementation.
-/// Inferred result types must still pass admission in the public predecessor;
-/// no filtered environment or caller-provided axiom stands in for that check.
+/// Elaborate a public signature in its export world, entering the private world
+/// only for a hidden implementation. Inferred result types still require public
+/// admission; every auxiliary effect accompanies the candidate to both checkers.
 pub fn elaborate_public_definition(
     syntax: &Syntax,
     worlds: &TheoremWorlds<'_>,
     kernel: Budget,
 ) -> Result<ElaboratedDeclaration, NatDefinitionElabError> {
     let mut context = Context::public_definition(syntax, worlds, kernel)?;
+    context.allow_auxiliary_declarations = true;
+    context.native = worlds.public_scope.native.clone();
     let declaration = definition_in_context(syntax, &mut context)?;
     let local_functions = context.lift_local_functions(&declaration)?;
     Ok(ElaboratedDeclaration {
         declaration,
-        auxiliary_declarations: Vec::new(),
+        auxiliary_declarations: std::mem::take(&mut context.auxiliary_declarations),
         equation_info: context.equation_info.take(),
         local_functions,
         irreducible: context.well_founded_definition,
@@ -68,14 +70,17 @@ impl Context {
         kernel: Budget,
     ) -> Result<Self, NatDefinitionElabError> {
         let scope = worlds.public_scope.for_declaration(syntax)?;
-        if !is_definition_body(syntax) || !scope.exports_declaration() || scope.expose_definitions {
+        if !is_definition_body(syntax) || !scope.exports_declaration() {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "a public definition with a hidden implementation",
+                expected: "a public definition in a module file",
             });
         }
         let mut context = Self::scoped(worlds.public, kernel, &scope)?;
-        context.private_proof_body = Some((worlds.private.clone(), worlds.private_scope.clone()));
-        context.private_definition_body = true;
+        context.generated_name_environment = Some(worlds.private.clone());
+        if !scope.expose_definitions {
+            context.private_proof_body = Some((worlds.private.clone(), worlds.private_scope.clone()));
+            context.private_definition_body = true;
+        }
         Ok(context)
     }
 

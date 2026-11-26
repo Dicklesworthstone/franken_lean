@@ -129,7 +129,7 @@ fn generated_permutations(len: usize) -> Vec<Vec<usize>> {
     );
     assert_eq!(
         out.len(),
-        (1..=len).product(),
+        (1..=len).product::<usize>(),
         "permutation generator did not cover the factorial state space"
     );
     out

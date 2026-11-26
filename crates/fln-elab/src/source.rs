@@ -953,6 +953,9 @@ struct Context {
     auxiliary_declarations: Vec<Declaration>,
     // Only entry points that return all ordered effects may create auxiliaries.
     allow_auxiliary_declarations: bool,
+    // A public owner's hidden body creates private auxiliaries even though the
+    // owner's declaration scope still exports its frozen public signature.
+    private_auxiliary_declarations: bool,
     aux_lemma_cache: tactics::AuxLemmaCache,
     // The pin's `DeclNameGenerator` for the declaration being elaborated (`mkAuxDeclName`).
     aux_names: Option<tactics::AuxNames>,
@@ -1084,6 +1087,7 @@ impl Context {
             native: None,
             auxiliary_declarations: Vec::new(),
             allow_auxiliary_declarations: false,
+            private_auxiliary_declarations: false,
             aux_lemma_cache: Default::default(),
             aux_names: None,
             equation_info: None,
@@ -6451,6 +6455,8 @@ pub fn is_instance(syntax: &Syntax) -> bool {
 #[derive(Debug)]
 pub struct PublicInstance {
     pub declaration: Declaration,
+    /// Checked predecessors of the instance, retained in its selected body world.
+    pub auxiliary_declarations: Vec<Declaration>,
     /// Independently checked local helpers, kept in the selected body world.
     pub local_functions: Vec<Declaration>,
     pub proof_valued: bool,
@@ -6469,9 +6475,12 @@ pub fn elaborate_public_instance(
     kernel: Budget,
 ) -> Result<PublicInstance, NatDefinitionElabError> {
     let mut context = Context::public_instance(syntax, worlds, kernel)?;
+    context.allow_auxiliary_declarations = true;
+    context.native = worlds.public_scope.native.clone();
     let declaration = definition_in_context(syntax, &mut context)?;
     let local_functions = context.lift_local_functions(&declaration)?;
     Ok(PublicInstance {
+        auxiliary_declarations: std::mem::take(&mut context.auxiliary_declarations),
         local_functions,
         proof_valued: matches!(&declaration, Declaration::Thm(_)),
         hidden_body: context.private_instance_body,
@@ -6530,11 +6539,13 @@ pub fn elaborate_public_theorem(
     kernel: Budget,
 ) -> Result<ElaboratedDeclaration, NatDefinitionElabError> {
     let mut context = Context::public_theorem(syntax, worlds, kernel)?;
+    context.allow_auxiliary_declarations = true;
+    context.native = worlds.public_scope.native.clone();
     let declaration = definition_in_context(syntax, &mut context)?;
     let local_functions = context.lift_local_functions(&declaration)?;
     Ok(ElaboratedDeclaration {
         declaration,
-        auxiliary_declarations: Vec::new(),
+        auxiliary_declarations: std::mem::take(&mut context.auxiliary_declarations),
         equation_info: None,
         local_functions,
         irreducible: false,
@@ -6555,6 +6566,7 @@ impl Context {
             });
         }
         let mut context = Self::scoped(worlds.public, kernel, &scope)?;
+        context.generated_name_environment = Some(worlds.private.clone());
         context.private_proof_body = Some((worlds.private.clone(), worlds.private_scope.clone()));
         Ok(context)
     }
@@ -6571,6 +6583,7 @@ impl Context {
             });
         }
         let mut context = Self::scoped(worlds.public, kernel, &scope)?;
+        context.generated_name_environment = Some(worlds.private.clone());
         context.private_proof_body = Some((worlds.private.clone(), worlds.private_scope.clone()));
         Ok(context)
     }
@@ -6641,6 +6654,10 @@ impl Context {
         // its declaration and metadata identities. Keep the public declaration
         // policy, but use the private world's provider once its body is entered.
         self.source_scope.computability = scope.computability;
+        self.private_auxiliary_declarations = true;
+        if self.allow_auxiliary_declarations {
+            self.native = scope.native;
+        }
         self.registry_cache = crate::instances::RegistryCache::default();
         self.txn.registry_cache = self.registry_cache.clone();
         self.alias_cache = crate::aliases::AliasCache::default();
