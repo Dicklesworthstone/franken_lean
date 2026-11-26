@@ -64,7 +64,7 @@ source_ladder	crates/fln-cli/tests/fixtures/source_ladder/typeclass_polymorphic_
 source_ladder	crates/fln-cli/tests/fixtures/source_ladder/user_macro.lean	accept	accept	diff	diff	diff	primary_name_set	fln-macro-rung-e1rk:syntax_parser_descr
 source_ladder	crates/fln-cli/tests/fixtures/source_ladder/user_notation.lean	accept	accept	diff	diff	diff	primary_name_set	fln-macro-rung-e1rk:syntax_parser_descr
 local_imports	crates/fln-conformance/tests/fixtures/t2_local_imports/Consumer.lean	accept	accept	identical	identical	identical	identical	verified
-local_imports	crates/fln-conformance/tests/fixtures/t2_local_imports/Lib.lean	accept	accept	identical	diff	diff	auxiliary_t2_interface	fln-j0hb:attribute_journal_parity
+local_imports	crates/fln-conformance/tests/fixtures/t2_local_imports/Lib.lean	accept	accept	identical	identical	identical	identical	verified
 local_imports	crates/fln-conformance/tests/fixtures/t2_local_imports/Main.lean	accept	accept	identical	identical	identical	identical	verified
 source_ladder	examples/native_closure_data.lean	accept	accept	identical	diff	diff	auxiliary_name_set	franken_lean-z8j.1.12:inductive_auxiliaries
 source_ladder	examples/native_collection_notation.lean	accept	accept	identical	diff	diff	auxiliary_name_set	fln-fln-definition-auxiliary-names-lv0n
@@ -85,7 +85,7 @@ source_ladder	examples/native_default_simp.lean	accept	accept	identical	diff	dif
 source_ladder	examples/native_dependent_indices.lean	reject	reject	n/a	n/a	n/a	both_reject	negative_control:both_reject
 source_ladder	examples/native_dependent_vector_pipeline.lean	accept	accept	identical	diff	diff	auxiliary_name_set	fln-matcher-auxiliary-definitions-lzxm
 source_ladder	examples/native_do.lean	accept	accept	identical	identical	identical	identical	verified
-source_ladder	examples/native_empty_elimination.lean	accept	reject	n/a	n/a	n/a	native_rejects	fln-upstream-suite-scoreboard-n04o
+source_ladder	examples/native_empty_elimination.lean	accept	accept	identical	diff	diff	auxiliary_name_set	fln-j0hb:proof_aux
 source_ladder	examples/native_equality.lean	accept	accept	identical	identical	diff	identical	verified
 source_ladder	examples/native_equality_transport.lean	reject	reject	n/a	n/a	n/a	both_reject	negative_control:both_reject
 source_ladder	examples/native_equations.lean	accept	accept	identical	diff	diff	auxiliary_name_set	fln-fln-definition-auxiliary-names-lv0n
@@ -167,7 +167,7 @@ source_ladder	examples/native_tactic_sequencing.lean	accept	accept	identical	dif
 source_ladder	examples/native_term_binders.lean	accept	accept	identical	diff	diff	auxiliary_name_set	franken_lean-z8j.1.12:inductive_auxiliaries
 source_ladder	examples/native_variants.lean	accept	accept	identical	diff	diff	auxiliary_name_set	fln-fln-definition-auxiliary-names-lv0n
 upstream_elab	vendor/lean4-src/tests/elab/1029.lean	accept	accept	identical	diff	diff	auxiliary_name_set	franken_lean-z8j.1.12:inductive_auxiliaries
-upstream_elab	vendor/lean4-src/tests/elab/1389.lean	accept	accept	identical	diff	diff	auxiliary_t2_interface	fln-j0hb:attribute_journal_parity
+upstream_elab	vendor/lean4-src/tests/elab/1389.lean	accept	accept	identical	identical	identical	identical	verified
 upstream_elab	vendor/lean4-src/tests/elab/1674.lean	accept	accept	diff	diff	diff	primary_name_set	franken_lean-z8j.1.12:inductive_auxiliaries
 upstream_elab	vendor/lean4-src/tests/elab/1883.lean	accept	accept	identical	identical	identical	identical	verified
 upstream_elab	vendor/lean4-src/tests/elab/1954.lean	accept	accept	identical	identical	identical	identical	verified
@@ -190,4 +190,4 @@ upstream_elab	vendor/lean4-src/tests/elab/reduce2.lean	accept	accept	identical	d
 upstream_elab	vendor/lean4-src/tests/elab/root.lean	accept	accept	identical	identical	identical	identical	verified
 upstream_elab	vendor/lean4-src/tests/elab/simpIssue.lean	accept	accept	identical	identical	identical	identical	verified
 upstream_elab	vendor/lean4-src/tests/elab/subscript_parser.lean	accept	accept	identical	identical	identical	identical	verified
-upstream_elab	vendor/lean4-src/tests/elab/univPolyEnum.lean	accept	accept	identical	diff	diff	auxiliary_t2_interface	fln-j0hb:attribute_journal_parity
+upstream_elab	vendor/lean4-src/tests/elab/univPolyEnum.lean	accept	accept	identical	identical	identical	identical	verified
