@@ -1,7 +1,11 @@
 //! Real source equality proofs, never a mock checker.
 #![forbid(unsafe_code)]
 use fln_core::{name::Name, outcome::Outcome};
-use fln_elab::{check_definition_source, seed::source_seed_declarations};
+use fln_elab::{
+    DefinitionFrontendError, NatDefinitionElabError, check_definition_source,
+    seed::source_seed_declarations,
+    source::{SourceInferenceError, TacticError},
+};
 use fln_env::{
     environment::{DeclarationBudget, DeclarationCommitted, Environment},
     pmap::CollisionBudget,
@@ -170,4 +174,116 @@ fn equality_has_its_own_precedence_and_does_not_widen_nat_only() {
     assert!(fln_parse::parse_definition(b"theorem bad : 1 = 2 = 3 := by rfl").is_err());
     assert!(fln_parse::parse_nat_definition(b"def bad : Nat := 1 = 1").is_err());
     assert!(env().contains(&Name::from_components(["Eq", "rec"])));
+}
+
+#[test]
+fn conv_guards_share_relations_and_inspect_the_focused_expression() {
+    for (equal, colon, value) in [
+        ("=", ":", ":="),
+        ("=~", ":~", ":=~"),
+        ("=ₛ", ":ₛ", ":=ₛ"),
+        ("=ₐ", ":ₐ", ":=ₐ"),
+    ] {
+        accepted(&format!(
+            "theorem checked (x : Nat) : x = x := by
+  guard_target {equal} (x = x)
+  let y := x
+  conv =>
+    guard_target {equal} (x = x)
+    lhs
+    guard_target {equal} x
+    guard_expr x {equal} x
+    guard_hyp x {colon} Nat
+    guard_hyp y {colon} Nat {value} x
+"
+        ));
+    }
+    // The expected type comes from the focus: Nat here, not the equality goal's Prop.
+    accepted("theorem numeral : 7 = 7 := by conv => lhs; guard_target = 7");
+}
+
+#[test]
+fn conv_guards_resolve_live_locals_and_leave_failed_alternatives_unchanged() {
+    accepted(
+        "theorem shadow (x h : Nat) : x = x := by
+  let h := x
+  conv =>
+    lhs
+    guard_hyp h : Nat :=ₛ x
+    guard_expr h = x
+",
+    );
+    accepted(
+        "theorem alternatives (x y : Nat) : x = x := by
+  conv =>
+    lhs
+    first | guard_expr x = y | guard_target =ₛ x
+    fail_if_success guard_target = y
+    guard_target = (fun n : Nat => n) x
+    fail_if_success guard_target =ₛ (fun n : Nat => n) x
+    guard_expr (fun n : Nat => n) =ₐ (fun m : Nat => m)
+",
+    );
+}
+
+#[test]
+fn conv_guard_mismatches_are_semantic_failures_and_never_prove_a_goal() {
+    let environment = env();
+    for (body, expected) in [
+        (
+            "conv => lhs; guard_target = y",
+            TacticError::GuardTargetMismatch,
+        ),
+        (
+            "conv => lhs; guard_expr x =~ y",
+            TacticError::GuardExprMismatch,
+        ),
+        (
+            "conv => lhs; guard_hyp x : Prop",
+            TacticError::GuardHypTypeMismatch(Name::from_components(["x"])),
+        ),
+        (
+            "conv => lhs; guard_hyp Nat",
+            TacticError::GuardHypExpectedLocal,
+        ),
+        (
+            "conv => lhs; guard_hyp x := x",
+            TacticError::GuardHypNotLet(Name::from_components(["x"])),
+        ),
+        (
+            "let z := x\n  conv => lhs; guard_hyp z : Nat",
+            TacticError::GuardHypMissingValue(Name::from_components(["z"])),
+        ),
+        (
+            "let z := x\n  conv => lhs; guard_hyp z := y",
+            TacticError::GuardHypValueMismatch(Name::from_components(["z"])),
+        ),
+    ] {
+        let source = format!("theorem mismatch (x y : Nat) : x = x := by\n  {body}\n");
+        let problem = check_definition_source(source.as_bytes(), &environment, budget());
+        assert!(
+            matches!(
+                problem,
+                Err(DefinitionFrontendError::Elaborate(
+                    NatDefinitionElabError::Inference(SourceInferenceError::Tactic(ref actual))
+                )) if actual == &expected
+            ),
+            "{source}\n{problem:?}"
+        );
+    }
+    let source = b"theorem unsolved (x y : Nat) : x = y := by
+  conv =>
+    lhs
+    guard_target = x
+    guard_expr x = x
+    guard_hyp x : Nat
+";
+    assert!(matches!(
+        check_definition_source(source, &environment, budget()),
+        Err(DefinitionFrontendError::Elaborate(
+            NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
+                TacticError::UnsolvedGoals { .. }
+            ))
+        ))
+    ));
 }
