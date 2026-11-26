@@ -168,21 +168,78 @@ run_cmd do
 fn never_extract_remains_global_owned_argument_free_and_kernel_checked() {
     let initial = Engine::builder().build_empty();
     let root = initial.logical_root(&KVMap::new());
-    for source in [
-        "prelude\naxiom target : Type\nattribute [local never_extract] target",
-        "prelude\nnamespace Tagged\naxiom target : Type\nattribute [scoped never_extract] target\nend Tagged",
-        "prelude\naxiom target : Type\nattribute [never_extract 1] target",
-        "prelude\n@[never_extract] axiom target : Type\nattribute [-never_extract] target",
-        "prelude\naxiom target : Type\nattribute [never_extract] target missing",
-        "prelude\n@[never_extract] theorem invalid (P Q : Prop) (h : P) : Q := h",
+    let module = name("Policy");
+    // These inputs have module headers, so both the positive control and the
+    // refusals must go through the module checker rather than the command API.
+    let valid = initial
+        .check_source_modules(
+            &[SourceModuleInput {
+                name: &module,
+                source: b"prelude\naxiom target : Type\nattribute [never_extract] target\n@[never_extract] theorem valid (P : Prop) (h : P) : P := h",
+            }],
+            &module,
+            &KVMap::new(),
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        fln_elab::never_extract::read(valid.checked.engine.environment()).unwrap(),
+        BTreeSet::from([name("target"), name("valid")])
+    );
+    assert_eq!(valid.checked.theorems, 1);
+    for (source, expected_command) in [
+        (
+            "prelude\naxiom target : Type\nattribute [local never_extract] target",
+            1,
+        ),
+        (
+            "prelude\nnamespace Tagged\naxiom target : Type\nattribute [scoped never_extract] target\nend Tagged",
+            2,
+        ),
+        (
+            "prelude\naxiom target : Type\nattribute [never_extract 1] target",
+            1,
+        ),
+        (
+            "prelude\n@[never_extract] axiom target : Type\nattribute [-never_extract] target",
+            1,
+        ),
+        (
+            "prelude\naxiom target : Type\nattribute [never_extract] target missing",
+            1,
+        ),
+        (
+            "prelude\n@[never_extract] theorem invalid (P Q : Prop) (h : P) : Q := h",
+            0,
+        ),
     ] {
+        let error = initial
+            .check_source_modules(
+                &[SourceModuleInput {
+                    name: &module,
+                    source: source.as_bytes(),
+                }],
+                &module,
+                &KVMap::new(),
+                limits(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("invalid module was not refused: {source}"));
         assert!(
-            initial
-                .check_source_files(&[source.as_bytes()], &KVMap::new(), limits().source)
-                .is_err(),
-            "{source}"
+            matches!(
+                &error,
+                SourceModuleCheckError::Source {
+                    error: fln::SourceCheckError::Scope { command, .. }
+                        | fln::SourceCheckError::Command { command, .. },
+                    ..
+                } if *command == expected_command
+            ),
+            "expected refusal at command {expected_command}: {source}: {error}"
         );
         assert_eq!(initial.logical_root(&KVMap::new()), root);
+        assert!(initial.environment().is_empty());
         assert!(
             fln_elab::never_extract::read(initial.environment())
                 .unwrap()

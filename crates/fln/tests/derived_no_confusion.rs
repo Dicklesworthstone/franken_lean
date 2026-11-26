@@ -250,6 +250,137 @@ fn compare_def(
 }
 
 #[test]
+fn bootstrap_source_no_confusion_precedes_heterogeneous_conversion_and_matches_the_pin() {
+    use fln::source_check::modules::SourceModuleCheckLimits;
+    use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits, SourceModuleInput};
+    use fln_elab::aux_recursors::AuxRecursors;
+    use fln_elab::protected_names::ProtectedNames;
+    use fln_elab::reducibility::{Reducibility, ReducibilityTable};
+
+    let initial = Engine::builder().build_empty();
+    let options = KVMap::new();
+    let initial_root = initial.logical_root(&options);
+    let limits = SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(
+        2 * 1024 * 1024,
+    )));
+    let module = name("EarlyBootstrap");
+    let bootstrap = initial
+        .check_source_modules(
+            &[SourceModuleInput {
+                name: &module,
+                source: include_bytes!("fixtures/early_no_confusion.lean"),
+            }],
+            &module,
+            &options,
+            SourceModuleCheckLimits::new(limits),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .checked;
+    let env = bootstrap.engine.environment();
+    assert!(!env.contains(&name("eq_of_heq")));
+    assert!(!env.contains(&name("noConfusionEnum")));
+    assert!(!env.contains(&name("Nat")));
+    let protected = ProtectedNames::read(env).unwrap();
+    let reducibility = ReducibilityTable::read(env).unwrap();
+    let auxiliary = AuxRecursors::read(env).unwrap();
+    for family in ["Bool", "Empty", "PEmpty"] {
+        for suffix in ["noConfusionType", "noConfusion"] {
+            let declaration = name(&format!("{family}.{suffix}"));
+            let Some(ConstantInfo::Defn(actual)) = env.find(&declaration) else {
+                panic!("bootstrap source did not admit {declaration:?}");
+            };
+            let Some(ConstantInfo::Defn(expected)) = retained_prelude().get(&declaration) else {
+                panic!("the retained pin has no {declaration:?}");
+            };
+            compare_def(actual, expected, false).unwrap();
+            assert!(protected.contains(&declaration));
+            assert_eq!(
+                reducibility.get(&declaration),
+                Some(Reducibility::Reducible)
+            );
+            assert!(!auxiliary.contains(&declaration));
+        }
+    }
+    for family in ["Eq", "HEq"] {
+        assert!(!env.contains(&name(&format!("{family}.noConfusion"))));
+    }
+    assert_eq!(initial.logical_root(&options), initial_root);
+
+    // The same early-bootstrap path must work for arbitrary user families,
+    // and the generated definitions remain ordinary checked proof terms.
+    let checked = bootstrap
+        .engine
+        .check_source_files(
+            &[b"inductive Signal where | low | middle | high\n\
+                theorem bool_disjoint (P : Prop) (h : Eq Bool.false Bool.true) : P := Bool.noConfusion h\n\
+                theorem signal_disjoint (P : Prop) (h : Eq Signal.low Signal.high) : P := Signal.noConfusion h"],
+            &options,
+            limits,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(
+        checked
+            .engine
+            .environment()
+            .contains(&name("Signal.noConfusion"))
+    );
+    assert!(!checked.engine.environment().contains(&name("eq_of_heq")));
+    let root = checked.engine.logical_root(&options);
+    for invalid in [
+        "theorem impossible (P : Prop) : P := Bool.noConfusion (Eq.refl Bool.false)",
+        "theorem impossible (P : Prop) : P := Signal.noConfusion (Eq.refl Signal.low)",
+    ] {
+        assert!(
+            checked
+                .engine
+                .check_source_files(&[invalid.as_bytes()], &options, limits)
+                .is_err(),
+            "{invalid}"
+        );
+        assert_eq!(checked.engine.logical_root(&options), root);
+        assert!(!checked.engine.environment().contains(&name("impossible")));
+    }
+
+    // A parameterized family's second major premise really is heterogeneous.
+    // Removing the global gate must not hide its missing conversion dependency
+    // or publish the earlier family/casesOn/noConfusionType prefix on failure.
+    let with_id = checked
+        .engine
+        .check_source_files(
+            &[b"def id.{u} {A : Sort u} (x : A) : A := x"],
+            &options,
+            limits,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let root = with_id.engine.logical_root(&options);
+    assert!(
+        with_id
+            .engine
+            .check_source_files(
+                &[b"inductive Box (A : Type) where | mk (x : A) : Box A"],
+                &options,
+                limits,
+            )
+            .is_err()
+    );
+    assert_eq!(with_id.engine.logical_root(&options), root);
+    for suffix in ["", ".mk", ".casesOn", ".noConfusionType", ".noConfusion"] {
+        assert!(
+            !with_id
+                .engine
+                .environment()
+                .contains(&name(&format!("Box{suffix}")))
+        );
+    }
+}
+
+#[test]
 fn retained_prelude_no_confusion_family_is_identical() {
     let prelude = retained_prelude();
     let budget = generation_budget();

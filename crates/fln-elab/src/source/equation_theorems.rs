@@ -1094,6 +1094,10 @@ fn no_confusion_leaf(name: &Name) -> bool {
 
 /// Core prelude constants required by `Lean/Meta/Constructions/NoConfusion.lean`.
 pub fn has_no_confusion_deps(env: &Environment) -> bool {
+    // These are shared by the generated construction. `eq_of_heq` is needed
+    // only when a heterogeneous equality is actually substituted; requiring it
+    // here suppresses early Prelude families such as Bool and Empty. Any such
+    // branch must still generate and check its real dependencies normally.
     [
         ["PUnit"].as_slice(),
         &["Eq"],
@@ -1101,7 +1105,6 @@ pub fn has_no_confusion_deps(env: &Environment) -> bool {
         &["Eq", "ndrec"],
         &["HEq"],
         &["HEq", "refl"],
-        &["eq_of_heq"],
     ]
     .into_iter()
     .all(|parts| env.contains(&Name::from_components(parts.iter().copied())))
