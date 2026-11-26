@@ -1927,7 +1927,17 @@ impl Admitted {
             (0..count).map(|_| None).collect();
         let mut retry_pending: BTreeSet<(usize, usize)> = BTreeSet::new();
         let mut isolated_running: Option<usize> = None;
-        let threads = jobs.threads.get();
+        let mut phase1_root_running: Option<usize> = None;
+        // Phase 2 runs while Phase 1's remaining import payloads are still
+        // resident near the virtual-address ceiling. Cap the Phase-2 pool so
+        // spawning workers (64 MiB stacks + per-thread allocator arenas) never
+        // exhausts RLIMIT_AS when Phase 1 ran at high --jobs (e.g. 24).
+        const PHASE2_MAX_THREADS: usize = 4;
+        let threads = jobs
+            .threads
+            .get()
+            .min(phase2_candidates.len())
+            .clamp(1, PHASE2_MAX_THREADS);
         let base_env = &self.environment;
         let decode = hooks.decode;
         let memory = hooks.memory;
@@ -2262,13 +2272,21 @@ impl Admitted {
                     }
                 }
 
-                // Do not start new concurrent modules while a memory retry is pending or isolated.
-                for index in ready
-                    .into_iter()
-                    .filter(|_| retry_pending.is_empty() && isolated_running.is_none())
-                {
+                // Do not start new concurrent modules while a memory retry or
+                // Phase-1 inconclusive root is running. Phase-1 roots often
+                // failed Phase 1 near peak memory; isolating each root avoids
+                // root-vs-root VSZ contention and lets `release_consumers` drop
+                // exclusive Phase-1 payloads before the next root starts.
+                let can_dispatch_ready = retry_pending.is_empty()
+                    && isolated_running.is_none()
+                    && phase1_root_running.is_none();
+                for index in ready.into_iter().filter(|_| can_dispatch_ready) {
                     if in_flight >= threads {
                         break;
+                    }
+                    let is_phase1_root = phase1_root_set.contains(&index);
+                    if is_phase1_root && in_flight > 0 {
+                        continue;
                     }
                     // Phase 1's retained import payloads remain resident here.
                     // Account for that live baseline and reserve each in-flight
@@ -2298,6 +2316,9 @@ impl Admitted {
                         &phase2_contributes_assumptions,
                     );
                     phase2_running[index] = true;
+                    if is_phase1_root {
+                        phase1_root_running = Some(index);
+                    }
                     in_flight += 1;
                     in_flight_estimated_bytes =
                         in_flight_estimated_bytes.saturating_add(estimated_bytes[index]);
@@ -2308,6 +2329,9 @@ impl Admitted {
                         in_flight_estimated_bytes =
                             in_flight_estimated_bytes.saturating_sub(estimated_bytes[index]);
                         phase2_running[index] = false;
+                        if phase1_root_running == Some(index) {
+                            phase1_root_running = None;
+                        }
                         phase2_decided[index] = true;
                         phase2_usable[index] = done.usable;
                         phase2_contributes_assumptions[index] = done.contributes_assumptions;
@@ -2342,6 +2366,9 @@ impl Admitted {
                             detail: "every provisional frontier worker thread has stopped",
                         });
                     }
+                    if phase1_root_running.is_some() {
+                        break;
+                    }
                 }
 
                 if threads == 1 {
@@ -2365,6 +2392,9 @@ impl Admitted {
                 in_flight_estimated_bytes =
                     in_flight_estimated_bytes.saturating_sub(estimated_bytes[idx]);
                 phase2_running[idx] = false;
+                if phase1_root_running == Some(idx) {
+                    phase1_root_running = None;
+                }
                 if done.host_memory_refusal
                     && isolated_running != Some(idx)
                     && phase2_memory_retries[idx].is_none()
