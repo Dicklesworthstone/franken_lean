@@ -156,3 +156,29 @@ fn recursive_local_equations_open_their_expected_implicit_parameters() {
           @go n",
     );
 }
+
+#[test]
+fn anonymous_equations_preserve_dependent_results_and_nested_scopes() {
+    accepted(
+        "theorem same (n : Nat) : n = n := match _ : n with | Nat.zero => rfl | Nat.succ k => rfl",
+    );
+    accepted(
+        "def nested (n m : Nat) : Nat := match _ : n with | Nat.zero => (match _ : m with | Nat.zero => 0 | Nat.succ k => k) | Nat.succ k => k",
+    );
+    accepted(
+        "def outer (h n : Nat) : Nat := let k : Nat := match _ : n with | Nat.zero => h | Nat.succ k => k; h",
+    );
+}
+
+#[test]
+fn anonymous_equations_do_not_assume_facts_or_discard_bad_branches() {
+    for source in [
+        "theorem bad : 0 = 1 := match _ : Nat.zero with | Nat.zero => rfl | Nat.succ k => rfl",
+        "def bad : Nat := match _ : Nat.zero with | Nat.zero => 0 | Nat.succ k => True.intro",
+        "def leak (n : Nat) : Nat := match _ : n with | Nat.zero => h | Nat.succ k => k",
+        "def missing (n : Nat) : Nat := match _ : n with | Nat.zero => 0",
+        "def motive (n : Nat) : Nat := match (motive := Nat -> Nat) _ : n with | Nat.zero => 0 | Nat.succ k => k",
+    ] {
+        refused(source);
+    }
+}

@@ -440,11 +440,11 @@ impl Context {
         )?;
         let equation = match expect_null_args(&discriminant[0], "pattern equality binder")? {
             [] => None,
-            [name, colon]
-                if matches!(name, Syntax::Ident { val, .. }
-                    if !val.is_anonymous() && val.parent().is_anonymous())
-                    || matches!(name, Syntax::Atom { val, .. } if val == "_") =>
-            {
+            [name, colon] => {
+                // The generated grammar represents an anonymous binder as
+                // Term.hole; the bounded parser retains its original atom.
+                // Both select equality generalization, even without a name.
+                conditional_binding(name)?;
                 expect_atom(colon, ":", "pattern equality colon")?;
                 Some(name)
             }

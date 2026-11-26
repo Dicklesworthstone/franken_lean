@@ -627,10 +627,9 @@ impl Context {
             if recursive {
                 return Err(error(TacticError::UnsupportedEliminator));
             }
-            let equality = match equation {
-                Syntax::Ident { val, .. } => val.clone(),
-                Syntax::Atom { val, .. } if val == "_" => self.fresh_name()?,
-                _ => return Err(error(TacticError::MalformedScript)),
+            let equality = match matching::conditional_binding(equation)? {
+                Some(name) => name.clone(),
+                None => self.fresh_name()?,
             };
             let name = self.fresh_name()?;
             let (child, id) =
