@@ -60,6 +60,10 @@ fn has_ctor_elim_deps(env: &fln_env::environment::Environment) -> bool {
 }
 
 fn has_no_confusion_deps(env: &fln_env::environment::Environment) -> bool {
+    // These are shared by the generated construction. `eq_of_heq` is needed
+    // only when a heterogeneous equality is actually substituted; requiring it
+    // here suppresses early Prelude families such as Bool and Empty. Any such
+    // branch must still generate and check its real dependencies normally.
     [
         ["PUnit"].as_slice(),
         &["Eq"],
@@ -67,7 +71,6 @@ fn has_no_confusion_deps(env: &fln_env::environment::Environment) -> bool {
         &["Eq", "ndrec"],
         &["HEq"],
         &["HEq", "refl"],
-        &["eq_of_heq"],
     ]
     .into_iter()
     .all(|parts| env.contains(&Name::from_components(parts.iter().copied())))
