@@ -238,7 +238,7 @@ class SizeOf (α : Sort u) where
 class NoSizeOf (α : Type) where
   op : α → α
 inductive NeverValue : Type where
-def elimNever (x : NeverValue) : Nat := NeverValue.casesOn x
+def elimNever (x : NeverValue) : Nat := by cases x
 ";
     let checked =
         check(source).unwrap_or_else(|e| panic!("empty inductive with SizeOf must succeed: {e}"));
