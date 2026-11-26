@@ -49,6 +49,8 @@ fn has_required_prelude(env: &Environment) -> bool {
     REQUIRED_PRELUDE
         .iter()
         .all(|parts| env.contains(&Name::from_components(parts.iter().copied())))
+        && crate::instances::InstanceRegistry::read(env)
+            .is_ok_and(|registry| registry.is_class(&Name::from_components(["SizeOf"])))
 }
 
 fn is_prop_former(inductive: &InductiveVal) -> bool {
@@ -780,6 +782,9 @@ pub fn generate_inductive_size_of_defs(
         instances.push(instance.base.name.clone());
         declarations.push(Declaration::Defn(instance));
     }
+    if declarations.is_empty() {
+        return Ok(None);
+    }
     Ok(Some(GeneratedSizeOfDefs {
         declarations,
         functions,
@@ -818,6 +823,9 @@ pub fn generate_inductive_size_of_specs(
             theorems.push(theorem.base.name.clone());
             declarations.push(Declaration::Thm(theorem));
         }
+    }
+    if declarations.is_empty() {
+        return Ok(None);
     }
     Ok(Some(GeneratedSizeOfSpecs {
         declarations,

@@ -164,6 +164,7 @@ impl Engine {
         options: &KVMap,
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
+        is_class: bool,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         let mut batch = match result {
             Outcome::Complete(batch) => batch,
@@ -302,11 +303,15 @@ impl Engine {
         // chain of kernel declaration transitions (`pair[0].result == pair[1].base`)
         // before `sizeOf` elaboration runs.
         Self::finish_auxiliary_metadata(&mut batch, &metadata)?;
-        batch = match self.finish_source_inductive_size_of(batch, options, limits)? {
-            Outcome::Complete(batch) => batch,
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-        };
+        // Vendored `Lean/Elab/MutualInductive.lean:1574-1575`:
+        // `unless view0.isClass do mkSizeOfInstances view0.declName`.
+        if !is_class {
+            batch = match self.finish_source_inductive_size_of(batch, options, limits)? {
+                Outcome::Complete(batch) => batch,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+        }
         batch.result_logical_root = batch.engine.logical_root(options);
         Ok(Outcome::Complete(batch))
     }
@@ -783,6 +788,9 @@ impl Engine {
                     ));
                 }
             };
+            if defs.declarations.is_empty() {
+                continue;
+            }
             let mut successor = match batch
                 .engine
                 .admit_declarations(&defs.declarations, options, limits)
@@ -832,6 +840,9 @@ impl Engine {
                     ));
                 }
             };
+            if specs.declarations.is_empty() {
+                continue;
+            }
             let mut spec_batch = match batch
                 .engine
                 .admit_declarations(&specs.declarations, options, limits)
