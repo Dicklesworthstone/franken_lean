@@ -561,6 +561,13 @@ fn natural(row: &GeneratedExternRow) -> Option<Review> {
         "extern:Nat.mod" => ("Nat.mod", "lean_nat_mod", false, false),
         "extern:Nat.pow" => ("Nat.pow", "lean_nat_pow", false, false),
         "extern:Nat.pred" => ("Nat.pred", "lean_nat_pred", false, true),
+        "extern:Nat.gcd" => ("Nat.gcd", "lean_nat_gcd", false, false),
+        "extern:Nat.land" => ("Nat.land", "lean_nat_land", false, false),
+        "extern:Nat.lor" => ("Nat.lor", "lean_nat_lor", false, false),
+        "extern:Nat.xor" => ("Nat.xor", "lean_nat_lxor", false, false),
+        "extern:Nat.shiftLeft" => ("Nat.shiftLeft", "lean_nat_shiftl", false, false),
+        "extern:Nat.shiftRight" => ("Nat.shiftRight", "lean_nat_shiftr", false, false),
+        "extern:Nat.log2" => ("Nat.log2", "lean_nat_log2", false, true),
         "extern:Nat.beq" => ("Nat.beq", "lean_nat_dec_eq", true, false),
         "extern:Nat.ble" => ("Nat.ble", "lean_nat_dec_le", true, false),
         "extern:Nat.decEq" => ("Nat.decEq", "lean_nat_dec_eq", true, false),
@@ -571,9 +578,20 @@ fn natural(row: &GeneratedExternRow) -> Option<Review> {
     Some(Review {
         name,
         symbol,
-        module: "Init.Prelude",
+        module: match row.id {
+            "extern:Nat.gcd" => "Init.Data.Nat.Gcd",
+            "extern:Nat.log2" => "Init.Data.Nat.Log2",
+            "extern:Nat.land"
+            | "extern:Nat.lor"
+            | "extern:Nat.xor"
+            | "extern:Nat.shiftLeft"
+            | "extern:Nat.shiftRight" => "Init.Data.Nat.Bitwise.Basic",
+            _ => "Init.Prelude",
+        },
         kind: "defn",
-        ownership: if unary {
+        ownership: if row.id == "extern:Nat.log2" {
+            "abi((a: borrowed_arg) -> owned_res)"
+        } else if unary {
             "abi((n: borrowed_arg) -> owned_res)"
         } else if comparison {
             "abi((a1: borrowed_arg, a2: borrowed_arg) -> value)"

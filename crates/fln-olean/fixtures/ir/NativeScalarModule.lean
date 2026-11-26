@@ -13,6 +13,11 @@ set_option linter.deprecated false
 @[noinline, nospecialize] def useNatTransform (f : Nat → Nat) (n : Nat) : Nat :=
   f n + f (n + 1)
 
+-- Retain the erased divisibility proof in the first-class function's arity.
+@[noinline, nospecialize] def useNatExactDivision
+    (f : (n d : Nat) → d ∣ n → Nat) (n : Nat) : Nat :=
+  f n 1 (Nat.one_dvd n) + f (n + 1) 1 (Nat.one_dvd (n + 1))
+
 @[noinline, nospecialize] def useNatPredicate (f : Nat → Bool) (n : Nat) : Nat :=
   (if f n then 1 else 0) + (if f (n + 1) then 2 else 0)
 
@@ -29,6 +34,15 @@ set_option linter.deprecated false
 @[noinline] def natBoxedMod (a b : Nat) : Nat := useNatTransform (Nat.mod a) b
 @[noinline] def natBoxedPow (a b : Nat) : Nat := useNatTransform (Nat.pow a) b
 @[noinline] def natBoxedPred (n : Nat) : Nat := useNatTransform Nat.pred n
+@[noinline] def natBoxedGcd (a b : Nat) : Nat := useNatTransform (Nat.gcd a) b
+@[noinline] def natBoxedLand (a b : Nat) : Nat := useNatTransform (Nat.land a) b
+@[noinline] def natBoxedLor (a b : Nat) : Nat := useNatTransform (Nat.lor a) b
+@[noinline] def natBoxedXor (a b : Nat) : Nat := useNatTransform (Nat.xor a) b
+@[noinline] def natBoxedShiftLeft (a b : Nat) : Nat := useNatTransform (Nat.shiftLeft a) b
+@[noinline] def natBoxedShiftRight (a b : Nat) : Nat := useNatTransform (Nat.shiftRight a) b
+@[noinline] def natBoxedLog2 (n : Nat) : Nat := useNatTransform Nat.log2 n
+@[noinline] def natBoxedDivExact (n : Nat) : Nat := useNatExactDivision Nat.divExact n
+@[noinline] def natNativeDivExact (n : Nat) : Nat := Nat.divExact n 1 (Nat.one_dvd n)
 @[noinline] def natBoxedBeq (a b : Nat) : Nat := useNatPredicate (Nat.beq a) b
 @[noinline] def natBoxedBle (a b : Nat) : Nat := useNatPredicate (Nat.ble a) b
 @[noinline] def natBoxedDecEq (a b : Nat) : Nat := useNatDecision (Nat.decEq a) b

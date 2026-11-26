@@ -55,7 +55,9 @@ pub(super) fn erase_type_arguments(
                 proof_suffix: 0,
             })
         } else {
-            array_proofs::erased_operands(row)?.or(string_proofs::erased_operands(row)?)
+            array_proofs::erased_operands(row)?
+                .or(string_proofs::erased_operands(row)?)
+                .or(natural_division_operands(row)?)
         };
         if let Some(bridge) = bridge {
             bridges.insert(name.clone(), bridge);
@@ -131,6 +133,44 @@ pub(super) fn erase_type_arguments(
         }
     }
     Ok(())
+}
+
+/// Nat.divExact retains its divisibility proof in the pin's IR telescope,
+/// while lean_nat_div_exact receives only the two naturals. Direct calls may
+/// erase only a literal proof placeholder; a boxed closure must keep the slot
+/// until saturation. This is runtime erasure, never proof or kernel authority.
+fn natural_division_operands(
+    row: &GeneratedExternRow,
+) -> Result<Option<ErasedOperands>, IrExecutionError> {
+    if row.id != "extern:Nat.divExact" {
+        return Ok(None);
+    }
+    if row.name != "Nat.divExact"
+        || row.symbol != "lean_nat_div_exact"
+        || row.module != "Init.Data.Nat.Div.Basic"
+        || row.kind != "defn"
+        || row.levels != 0
+        || row.arity != 3
+        || row.effect != "pure"
+        || row.safety != "safe"
+        || row.ownership != "abi((a1: borrowed_arg, a2: borrowed_arg) -> owned_res)"
+        || row.entry_class != "standard"
+        || row.entry_scope != "all"
+        || row.partition != "toolchain-api"
+        || row.mode != "all"
+        || row.profile != "faithful,sound"
+        || inferred_arity(row)? != 2
+    {
+        return Err(IrExecutionError::NativeContract {
+            declaration: Name::from_components(row.name.split('.')),
+            detail: "Nat.divExact differs from its reviewed erased proof bridge".to_owned(),
+        });
+    }
+    Ok(Some(ErasedOperands {
+        runtime: 2,
+        type_prefix: false,
+        proof_suffix: 1,
+    }))
 }
 
 fn erased_type_runtime_arity(row: &GeneratedExternRow) -> Result<Option<usize>, IrExecutionError> {

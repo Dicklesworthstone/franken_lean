@@ -1,7 +1,7 @@
 use super::*;
 use fln_vm::interpreter::VmRefusal;
 
-pub(super) const NAMES: [&str; 18] = [
+pub(super) const NAMES: [&str; 26] = [
     "Nat.add",
     "Nat.sub",
     "Nat.mul",
@@ -9,6 +9,14 @@ pub(super) const NAMES: [&str; 18] = [
     "Nat.mod",
     "Nat.pow",
     "Nat.pred",
+    "Nat.gcd",
+    "Nat.land",
+    "Nat.lor",
+    "Nat.xor",
+    "Nat.shiftLeft",
+    "Nat.shiftRight",
+    "Nat.log2",
+    "Nat.divExact",
     "Nat.beq",
     "Nat.ble",
     "Nat.decEq",
@@ -144,7 +152,15 @@ fn reviewed_boxed_primitives_bind_the_generated_row_before_admitting_a_wrapper()
                 ..*original
             },
             GeneratedExternRow {
+                entry_class: "unreviewed",
+                ..*original
+            },
+            GeneratedExternRow {
                 entry_scope: "unreviewed",
+                ..*original
+            },
+            GeneratedExternRow {
+                mode: "unreviewed",
                 ..*original
             },
             GeneratedExternRow {
@@ -161,7 +177,9 @@ fn reviewed_boxed_primitives_bind_the_generated_row_before_admitting_a_wrapper()
             );
         }
     }
-    for target in ["Nat.divExact", "Nat.gcd", "Int.divExact"] {
+    // modCore is noncomputable and has no compiler-emitted boxed wrapper.
+    // The auxiliary unary gcd census row has no reviewed native telescope.
+    for target in ["Nat.modCore", "Nat.gcd._unary", "Int.divExact"] {
         assert!(BoxedNative::from_row(row(target)).unwrap().is_none());
     }
 }
@@ -174,6 +192,24 @@ fn primitive_prototypes_distinguish_borrowing_and_boxed_scalar_representations()
             vec![(IrType::TObject, true), (IrType::TObject, true)],
             IrType::TObject,
             vec![IrType::TObject, IrType::TObject],
+            IrType::TObject,
+        ),
+        (
+            "Nat.log2",
+            vec![(IrType::TObject, true)],
+            IrType::TObject,
+            vec![IrType::TObject],
+            IrType::TObject,
+        ),
+        (
+            "Nat.divExact",
+            vec![
+                (IrType::TObject, true),
+                (IrType::TObject, true),
+                (IrType::Erased, false),
+            ],
+            IrType::TObject,
+            vec![IrType::TObject, IrType::TObject, IrType::TObject],
             IrType::TObject,
         ),
         (
@@ -234,6 +270,26 @@ fn primitive_prototypes_distinguish_borrowing_and_boxed_scalar_representations()
         ),
     ]
     .into_iter()
+    .chain(
+        [
+            "Nat.gcd",
+            "Nat.land",
+            "Nat.lor",
+            "Nat.xor",
+            "Nat.shiftLeft",
+            "Nat.shiftRight",
+        ]
+        .into_iter()
+        .map(|target| {
+            (
+                target,
+                vec![(IrType::TObject, true), (IrType::TObject, true)],
+                IrType::TObject,
+                vec![IrType::TObject, IrType::TObject],
+                IrType::TObject,
+            )
+        }),
+    )
     .chain(STRING_CURSORS.into_iter().map(|target| {
         let mut parameters = vec![(IrType::Object, true), (IrType::TObject, true)];
         let mut boxed_parameters = vec![IrType::Object, IrType::TObject];
@@ -270,7 +326,11 @@ fn primitive_prototypes_distinguish_borrowing_and_boxed_scalar_representations()
                 Err(IrExecutionError::NativeContract { .. })
             ));
             wrong = params.clone();
-            wrong[index].ty = IrType::Erased;
+            wrong[index].ty = if wrong[index].ty == IrType::Erased {
+                IrType::TObject
+            } else {
+                IrType::Erased
+            };
             assert!(matches!(
                 validate_extern_signature(native, &wrong, &result),
                 Err(IrExecutionError::NativeContract { .. })
@@ -281,7 +341,7 @@ fn primitive_prototypes_distinguish_borrowing_and_boxed_scalar_representations()
             Err(IrExecutionError::NativeContract { .. })
         ));
         assert!(matches!(
-            validated_ir_arity(native, params.len() - 1),
+            validated_ir_arity(native, bridge.runtime_parameters().len() - 1),
             Err(IrExecutionError::NativeContract { .. })
         ));
         if result != boxed_result {
@@ -907,4 +967,195 @@ fn boxed_primitive_bodies_bad_scope_and_bad_values_cannot_replace_native_semanti
         })
     ));
     assert_nat(&compile_declarations(vec![caller(var(1))]).unwrap(), "42");
+}
+
+fn natural_closure_program(target: &str, arguments: &[IrNat], captured: usize) -> IrDecl {
+    let mut statements = Vec::new();
+    let mut operands = Vec::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        let x = index as u64 + 1;
+        statements.push(bind(x, IrExpr::Lit(IrLit::Num(argument.clone()))));
+        operands.push(var(x));
+    }
+    if target == "Nat.divExact" {
+        operands.push(IrArg::Erased);
+    }
+    assert!(captured < operands.len());
+    statements.push(IrStmt::VDecl {
+        x: 10,
+        ty: IrType::Object,
+        expr: IrExpr::Pap {
+            function: name(&format!("{target}._boxed")),
+            args: operands[..captured].to_vec(),
+        },
+    });
+    for x in [11, 12] {
+        statements.push(bind(
+            x,
+            IrExpr::Ap {
+                x: 10,
+                args: operands[captured..].to_vec(),
+            },
+        ));
+    }
+    statements.push(call(13, "Nat.add", &[11, 12]));
+    statements.push(call(14, "Nat.add", &[13, 1]));
+    entry(statements, 14)
+}
+
+#[test]
+fn natural_bitwise_closures_preserve_multiword_values_and_reused_captures() {
+    // Arithmetic expectations are independent integer calculations. Returning
+    // two applications plus the original first operand detects consumed or
+    // overwritten captures, not just the operation's first answer.
+    let large = IrNat::Big(vec![5, 1]);
+    let cases = [
+        (
+            "Nat.land",
+            vec![large.clone(), IrNat::Big(vec![3, 1])],
+            "55340232221128654855",
+        ),
+        (
+            "Nat.lor",
+            vec![large.clone(), IrNat::Big(vec![3, 1])],
+            "55340232221128654867",
+        ),
+        (
+            "Nat.xor",
+            vec![large.clone(), IrNat::Big(vec![3, 1])],
+            "18446744073709551633",
+        ),
+        (
+            "Nat.gcd",
+            vec![large.clone(), IrNat::Big(vec![3, 1])],
+            "18446744073709551623",
+        ),
+        (
+            "Nat.shiftLeft",
+            vec![large, IrNat::Small(65)],
+            "1361129467683753854240880055274973429765",
+        ),
+        (
+            "Nat.shiftRight",
+            vec![IrNat::Big(vec![16, 1, 1]), IrNat::Small(64)],
+            "340282366920938463518714839652896866322",
+        ),
+        (
+            "Nat.log2",
+            vec![IrNat::Big(vec![0, 0, 1])],
+            "340282366920938463463374607431768211712",
+        ),
+        ("Nat.gcd", vec![IrNat::Small(0), IrNat::Small(42)], "84"),
+        ("Nat.gcd", vec![IrNat::Small(42), IrNat::Small(0)], "126"),
+        ("Nat.log2", vec![IrNat::Small(0)], "0"),
+        ("Nat.log2", vec![IrNat::Small(1)], "1"),
+        (
+            "Nat.shiftRight",
+            vec![IrNat::Small(42), IrNat::Big(vec![0, 1])],
+            "42",
+        ),
+    ];
+    for (target, arguments, expected) in cases {
+        for captured in 0..arguments.len() {
+            let compiled =
+                compile_declarations(vec![natural_closure_program(target, &arguments, captured)])
+                    .unwrap_or_else(|error| panic!("{target} capture {captured}: {error}"));
+            assert_nat(&compiled, expected);
+            let native_id = format!("extern:{target}");
+            assert!(compiled.native_externs().contains(&native_id));
+        }
+    }
+}
+
+#[test]
+fn natural_exact_division_preserves_the_proof_slot_until_closure_saturation() {
+    for (arguments, expected) in [
+        (vec![IrNat::Small(0), IrNat::Small(0)], "0"),
+        (vec![IrNat::Small(126), IrNat::Small(3)], "210"),
+        (
+            vec![IrNat::Big(vec![5, 1]), IrNat::Small(3)],
+            "30744573456182586035",
+        ),
+    ] {
+        // Capture neither operand, one operand, or both. In the last case the
+        // only missing argument is the proof: executing before it arrives
+        // would replace a closure with a Nat and the final application fails.
+        for captured in 0..3 {
+            let compiled = compile_declarations(vec![natural_closure_program(
+                "Nat.divExact",
+                &arguments,
+                captured,
+            )])
+            .unwrap();
+            assert_nat(&compiled, expected);
+        }
+    }
+    let direct = |proof| {
+        entry(
+            vec![
+                num(1, 126),
+                num(2, 3),
+                bind(
+                    3,
+                    IrExpr::Fap {
+                        function: name("Nat.divExact"),
+                        args: vec![var(1), var(2), proof],
+                    },
+                ),
+            ],
+            3,
+        )
+    };
+    assert_nat(
+        &compile_declarations(vec![direct(IrArg::Erased)]).unwrap(),
+        "42",
+    );
+    assert!(matches!(
+        compile_declarations(vec![direct(var(1))]),
+        Err(IrExecutionError::Unsupported {
+            form: "unreviewed native erased operand",
+            ..
+        })
+    ));
+    assert_nat(
+        &compile_declarations(vec![direct(IrArg::Erased)]).unwrap(),
+        "42",
+    );
+}
+
+#[test]
+fn natural_closures_keep_resource_stops_type_refusals_and_clean_retry() {
+    let arguments = [IrNat::Small(1), IrNat::Small(128)];
+    let make = || natural_closure_program("Nat.shiftLeft", &arguments, 1);
+    let compiled = compile_declarations(vec![make()]).unwrap();
+    assert!(matches!(
+        compiled
+            .execute(
+                ExecutionLimits {
+                    max_nat_magnitude_bytes: 8,
+                    ..ExecutionLimits::default()
+                },
+                None
+            )
+            .outcome,
+        Outcome::Inconclusive(_)
+    ));
+    assert_nat(&compiled, "680564733841876926926749214863536422913");
+    let mut invalid = make();
+    let IrDecl::Function { body, .. } = &mut invalid else {
+        unreachable!()
+    };
+    body.stmts[0] = bind(1, IrExpr::Lit(IrLit::Str("not a natural".to_owned())));
+    let invalid = compile_declarations(vec![invalid]).unwrap();
+    assert!(matches!(
+        invalid.execute(ExecutionLimits::default(), None).outcome,
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch { .. },
+            ..
+        })
+    ));
+    assert_nat(
+        &compile_declarations(vec![make()]).unwrap(),
+        "680564733841876926926749214863536422913",
+    );
 }

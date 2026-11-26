@@ -101,6 +101,7 @@ fn live_pinned_boxed_primitives_preserve_values_captures_and_canonical_replay() 
     users.extend(
         [
             "useNatTransform",
+            "useNatExactDivision",
             "useNatPredicate",
             "useNatDecision._redArg",
             "useStringTransform",
@@ -112,6 +113,8 @@ fn live_pinned_boxed_primitives_preserve_values_captures_and_canonical_replay() 
             "useStringTransform._closed_0",
             "useStringMeasure._closed_0",
             "natBoxedPred._closed_0",
+            "natBoxedLog2._closed_0",
+            "natBoxedDivExact._closed_0",
             "stringBoxedLength._closed_0",
             "stringBoxedBytes._closed_0",
             "stringBoxedHash._closed_0",
@@ -291,13 +294,29 @@ fn cases() -> Vec<(&'static str, Vec<EntryArgument>)> {
         "natBoxedDiv",
         "natBoxedMod",
         "natBoxedPow",
+        "natBoxedGcd",
+        "natBoxedLand",
+        "natBoxedLor",
+        "natBoxedXor",
     ] {
         for (a, b) in [(0, 0), (42, 0), (42, 7), (u64::MAX, 2)] {
             cases.push((entry, vec![nat(a), nat(b)]));
         }
     }
-    for value in [0, 1, 42, u64::MAX] {
-        cases.push(("natBoxedPred", vec![nat(value)]));
+    for entry in ["natBoxedShiftLeft", "natBoxedShiftRight"] {
+        for (a, b) in [(0, 0), (1, 0), (42, 7), (u64::MAX, 64), (u64::MAX, 65)] {
+            cases.push((entry, vec![nat(a), nat(b)]));
+        }
+    }
+    for entry in [
+        "natBoxedPred",
+        "natBoxedLog2",
+        "natBoxedDivExact",
+        "natNativeDivExact",
+    ] {
+        for value in [0, 1, 42, u64::MAX] {
+            cases.push((entry, vec![nat(value)]));
+        }
     }
     for entry in [
         "natBoxedBeq",
@@ -434,6 +453,10 @@ fn native_prototypes_from_library(library: &Path) -> IrModule {
     let mut declarations = Vec::new();
     for relative in [
         "Init/Prelude.ir",
+        "Init/Data/Nat/Gcd.ir",
+        "Init/Data/Nat/Bitwise/Basic.ir",
+        "Init/Data/Nat/Log2.ir",
+        "Init/Data/Nat/Div/Basic.ir",
         "Init/Data/String/Defs.ir",
         "Init/Data/String/Bootstrap.ir",
         "Init/Data/String/Length.ir",
@@ -486,7 +509,7 @@ fn native_prototypes_from_library(library: &Path) -> IrModule {
                 });
                 assert_eq!(
                     validated_ir_arity(row, params.len()).unwrap(),
-                    bridge.arity()
+                    bridge.runtime_parameters().len()
                 );
                 assert!(externs.insert(row.name.to_owned()));
             }
