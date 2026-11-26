@@ -52,12 +52,12 @@ fn auxiliaries(engine: &Engine, owner: &Name) -> Vec<Name> {
     engine
         .environment()
         .constants()
-        .filter_map(|(name, _)| {
-            (name.parent() == *owner
+        .filter(|(name, _)| {
+            name.parent() == *owner
                 && matches!(name.leaf_view(), fln_core::name::LeafView::Str(part)
-                    if part.starts_with("_proof_")))
-            .then(|| name.clone())
+                    if part.starts_with("_proof_"))
         })
+        .map(|(name, _)| name.clone())
         .collect()
 }
 
