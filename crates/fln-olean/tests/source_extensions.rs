@@ -235,6 +235,59 @@ fn real_auxiliary_tags_roundtrip_in_the_pins_binary_search_order() {
     }
 }
 
+/// The pinned compiler reports these exact Prelude rows, including the first
+/// source-bootstrap blocker at sorryAx.
+#[test]
+fn real_never_extract_tags_roundtrip_in_the_pins_binary_search_order() {
+    use fln_olean::source_extensions::NEVER_EXTRACT_EXTENSION;
+    use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
+    use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget};
+    let decoded = read(blocks()).unwrap();
+    assert!(!decoded.uninterpreted.contains(&n(NEVER_EXTRACT_EXTENSION)));
+    assert_eq!(
+        decoded.never_extract,
+        [n("sorryAx"), n("panicCore"), n("panic")]
+    );
+    assert!(
+        decoded
+            .never_extract
+            .windows(2)
+            .all(|pair| pair[0].quick_lt(&pair[1]))
+    );
+    let mut supplied = decoded.never_extract.clone();
+    supplied.reverse();
+    for version in fln_olean::format::OLEAN_ACCEPTED_VERSIONS {
+        let encoded = encode_module_with_source_metadata(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[],
+                extra_const_names: &[],
+            },
+            &SourceMetadata {
+                never_extract: supplied.clone(),
+                ..SourceMetadata::default()
+            },
+            OleanWriteHeader {
+                version: *version,
+                flags: 1,
+                lean_version: fln_olean::format::PIN_TAG.strip_prefix('v').unwrap(),
+                githash: fln_olean::format::PIN_COMMIT,
+                base_addr: 2 * fln_olean::format::REGION_ALIGN as u64,
+            },
+            WriteBudget::default(),
+        )
+        .unwrap();
+        let actual = OleanView::parse(&encoded.bytes)
+            .unwrap()
+            .extension_payloads(WalkBudget::default(), 4 << 20)
+            .unwrap();
+        let actual = read(&actual).unwrap();
+        assert_eq!(actual.never_extract, decoded.never_extract);
+        assert!(actual.uninterpreted.is_empty());
+    }
+}
+
 #[test]
 fn real_match_pattern_tags_roundtrip_in_the_pins_binary_search_order() {
     use fln_olean::source_extensions::MATCH_PATTERN_EXTENSION;
@@ -307,6 +360,26 @@ fn match_pattern_decode_refuses_anonymous_duplicate_and_non_name_rows() {
     for object in [inject_name(&Name::anonymous()), Obj::mk_nat(7)] {
         assert!(
             !read(&one(MATCH_PATTERN_EXTENSION, &object))
+                .unwrap_err()
+                .is_resource()
+        );
+    }
+    let mut repeated = valid;
+    let duplicate = repeated[0].entries[0].clone();
+    repeated[0].entries.push(duplicate);
+    assert!(!read(&repeated).unwrap_err().is_resource());
+}
+
+#[test]
+fn never_extract_decode_refuses_anonymous_duplicate_and_non_name_rows() {
+    use fln_olean::source_extensions::NEVER_EXTRACT_EXTENSION;
+    let valid = one(NEVER_EXTRACT_EXTENSION, &inject_name(&n("Effect.call")));
+    let decoded = read(&valid).unwrap();
+    assert_eq!(decoded.never_extract, [n("Effect.call")]);
+    assert!(decoded.uninterpreted.is_empty());
+    for object in [inject_name(&Name::anonymous()), Obj::mk_nat(7)] {
+        assert!(
+            !read(&one(NEVER_EXTRACT_EXTENSION, &object))
                 .unwrap_err()
                 .is_resource()
         );

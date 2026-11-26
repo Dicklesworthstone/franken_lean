@@ -288,6 +288,35 @@ fn native_trace() -> Engine {
     decorate_trace(&engine, "lean_dbg_trace")
 }
 
+#[test]
+fn never_extract_preserves_repeated_calls_with_identical_closed_arguments() {
+    if parent(
+        "never_extract_preserves_repeated_calls_with_identical_closed_arguments",
+        "repeat\nrepeat\n",
+    ) {
+        return;
+    }
+    let engine = checked(
+        &native_trace(),
+        r#"@[never_extract] def repeated (value : Nat) : Nat :=
+  dbgTrace "repeat" (fun _ => value)"#,
+    );
+    assert!(
+        fln_elab::never_extract::has_tag(
+            engine.environment(),
+            &fln::Name::from_components(["repeated"]),
+        )
+        .unwrap()
+    );
+    // Both calls must reach the checked native diagnostic implementation. A
+    // closed-call hoist or CSE would print only once even if the scalar agrees.
+    let result = run(&engine, "#eval repeated 21 + repeated 21");
+    assert_eq!(
+        fln::closed_vm_value(&result.executions[0].exit).unwrap(),
+        Some(fln::ClosedVmValue::Scalar(42))
+    );
+}
+
 fn decorate_trace(engine: &Engine, symbol: &str) -> Engine {
     Engine::from_environment(
         fln_elab::externs::register(

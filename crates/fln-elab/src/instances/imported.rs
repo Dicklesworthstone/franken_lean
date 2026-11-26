@@ -739,6 +739,15 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain the owning module's closed-call extraction/CSE inhibition tag.
+    pub fn register_never_extract(
+        mut self,
+        declaration: &Name,
+    ) -> Result<Self, crate::never_extract::NeverExtractError> {
+        self.env = crate::never_extract::register(&self.env, declaration)?;
+        Ok(self)
+    }
+
     /// Retain a checked owning module's pattern-expansion tag without changing
     /// cached class or instance metadata. Registration requires a visible definition.
     pub fn register_match_pattern(

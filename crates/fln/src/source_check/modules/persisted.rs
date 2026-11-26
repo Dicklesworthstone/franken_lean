@@ -473,6 +473,7 @@ impl SourceModuleRecord {
             fln_elab::reducibility::export::journal_name(),
             fln_elab::noncomputable::journal_name(),
             fln_elab::unbox::journal_name(),
+            fln_elab::never_extract::journal_name(),
             fln_elab::match_pattern::journal_name(),
             fln_elab::symm::journal_name(),
             fln_elab::grind_patterns::journal_name(),

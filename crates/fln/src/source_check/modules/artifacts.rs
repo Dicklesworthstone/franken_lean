@@ -745,6 +745,41 @@ impl ArtifactData {
                 metadata.unbox.push(tagged);
             }
         }
+        let never_extract = |env: &Environment, meter: &mut Meter| {
+            if let Some(journal) = env.extension(&fln_elab::never_extract::journal_name()) {
+                for entry in journal.entries() {
+                    meter.work(1)?;
+                    meter.bytes(entry.payload.len())?;
+                }
+            }
+            fln_elab::never_extract::read(env).map_err(|error| match error {
+                fln_elab::never_extract::NeverExtractError::Limit => {
+                    SourceModuleCheckError::Limit {
+                        resource: "native never_extract tags",
+                        limit: fln_elab::never_extract::MAX_ROWS,
+                    }
+                }
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::never_extract::journal_name(),
+                    reason: "invalid never_extract journal",
+                },
+            })
+        };
+        let inherited = never_extract(base, meter)?;
+        for tagged in never_extract(checked, meter)? {
+            meter.work(1)?;
+            if !inherited.contains(&tagged) {
+                if base.contains(&tagged) {
+                    return Err(SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::never_extract::journal_name(),
+                        reason: "a module cannot tag an imported never_extract declaration",
+                    });
+                }
+                metadata.never_extract.push(tagged);
+            }
+        }
         let match_patterns = |env: &Environment, meter: &mut Meter| {
             if let Some(journal) = env.extension(&fln_elab::match_pattern::journal_name()) {
                 for entry in journal.entries() {
@@ -1646,6 +1681,17 @@ pub fn extract_native_module_attributes(
         for name in current {
             if !inherited.contains(&name) {
                 tag(name, "unbox".to_owned());
+            }
+        }
+    }
+
+    if let (Ok(inherited), Ok(current)) = (
+        fln_elab::never_extract::read(base),
+        fln_elab::never_extract::read(checked),
+    ) {
+        for name in current {
+            if !inherited.contains(&name) {
+                tag(name, "never_extract".to_owned());
             }
         }
     }

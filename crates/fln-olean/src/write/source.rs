@@ -61,6 +61,8 @@ pub struct SourceMetadata {
     pub noncomputable: Vec<Name>,
     /// Owned nonrecursive inductive `[unbox]` tags in the pin's `Name.quickLt` order.
     pub unbox: Vec<Name>,
+    /// Owned closed-call extraction/CSE inhibition tags, sorted by Name.quickLt.
+    pub never_extract: Vec<Name>,
     /// Owned exposed definitions carrying `[match_pattern]`, sorted by `Name.quickLt`.
     /// These tags only select bodies for ordinary checked pattern elaboration.
     pub match_patterns: Vec<Name>,
@@ -261,6 +263,13 @@ impl Encoder {
                 layout::UNBOX_EXTENSION,
                 &metadata.unbox,
                 "anonymous or duplicate unbox declaration",
+            )?);
+        }
+        if !metadata.never_extract.is_empty() {
+            blocks.push(self.tagged_names_block(
+                layout::NEVER_EXTRACT_EXTENSION,
+                &metadata.never_extract,
+                "anonymous or duplicate never-extract declaration",
             )?);
         }
         if !metadata.match_patterns.is_empty() {
