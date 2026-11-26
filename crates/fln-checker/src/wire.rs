@@ -91,7 +91,10 @@ impl WireName {
     /// Storage kept alive by this name, including unused string capacity.
     /// Shared names are deliberately charged in full at each occurrence.
     pub(crate) fn retained_bytes(&self) -> usize {
-        let part_bytes = self.parts.len().saturating_mul(std::mem::size_of::<NamePart>());
+        let part_bytes = self
+            .parts
+            .len()
+            .saturating_mul(std::mem::size_of::<NamePart>());
         self.parts.iter().fold(
             (2 * std::mem::size_of::<usize>()).saturating_add(part_bytes),
             |bytes, part| {
@@ -407,7 +410,9 @@ fn expression_retained_bytes(node: &ExprNode) -> usize {
         ExprNode::Bound { .. } | ExprNode::Sort { .. } | ExprNode::Apply { .. } => 0,
         ExprNode::Free { name } | ExprNode::Meta { name } => name.retained_bytes(),
         ExprNode::Constant { name, levels } => name.retained_bytes().saturating_add(
-            levels.capacity().saturating_mul(std::mem::size_of::<LevelId>()),
+            levels
+                .capacity()
+                .saturating_mul(std::mem::size_of::<LevelId>()),
         ),
         ExprNode::Lambda { binder_name, .. } | ExprNode::Forall { binder_name, .. } => {
             binder_name.retained_bytes()
@@ -415,9 +420,9 @@ fn expression_retained_bytes(node: &ExprNode) -> usize {
         ExprNode::Let {
             declaration_name, ..
         } => declaration_name.retained_bytes(),
-        ExprNode::NatLiteral { limbs_le } => {
-            limbs_le.capacity().saturating_mul(std::mem::size_of::<u64>())
-        }
+        ExprNode::NatLiteral { limbs_le } => limbs_le
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u64>()),
         ExprNode::StringLiteral(text) => text.capacity(),
         ExprNode::Metadata { entries, .. } => entries.iter().fold(
             entries
@@ -538,8 +543,12 @@ impl WireExpr {
         nodes.hash(&mut hasher);
         levels.hash(&mut hasher);
         let hash = hasher.finish();
-        let node_bytes = nodes.capacity().saturating_mul(std::mem::size_of::<ExprNode>());
-        let level_bytes = levels.capacity().saturating_mul(std::mem::size_of::<LevelNode>());
+        let node_bytes = nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ExprNode>());
+        let level_bytes = levels
+            .capacity()
+            .saturating_mul(std::mem::size_of::<LevelNode>());
         let arena_bytes = std::mem::size_of::<WireExprData>()
             .saturating_add(2 * std::mem::size_of::<usize>())
             .saturating_add(node_bytes)
@@ -1602,8 +1611,14 @@ mod tests {
                 ExprNode::Bound { index: 0 },
                 ExprNode::Metadata {
                     entries: vec![
-                        (padded_name(CAPACITY), MetadataValue::Text(padded_text(CAPACITY))),
-                        (padded_name(CAPACITY), MetadataValue::Name(padded_name(CAPACITY))),
+                        (
+                            padded_name(CAPACITY),
+                            MetadataValue::Text(padded_text(CAPACITY)),
+                        ),
+                        (
+                            padded_name(CAPACITY),
+                            MetadataValue::Name(padded_name(CAPACITY)),
+                        ),
                     ],
                     expression: ExprId::ZERO,
                 },

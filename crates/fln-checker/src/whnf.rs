@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
-use memo::{FastHashMap, WhnfMemo};
+use memo::{FastHashMap, RememberedKGate, WhnfMemo};
 
 /// Work the KR-317 gate's conversion may spend (see
 /// `Reducer::k_constructor_types_convert`): comparisons, normalizations, WHNF
@@ -2234,15 +2234,18 @@ impl<'a, 'c> Reducer<'a, 'c> {
         if K_GATE_CONVERTING.with(Cell::get) {
             return Ok(false);
         }
+        let materialization = self.control.budget.materialization;
         let memo = self.context.source.memo().cloned();
-        if let Some(equal) = memo
+        if let Some(value) = memo
             .as_ref()
-            .and_then(|memo| memo.recall_k_gate(domain, result))
+            .and_then(|memo| memo.recall_k_gate(domain, result, materialization))
         {
+            self.control.steps = self.control.steps.saturating_add(value.steps);
+            self.control.reductions = self.control.reductions.saturating_add(value.reductions);
             self.control.step(at, self.cancelled)?;
-            return Ok(equal);
+            return Ok(value.equal);
         }
-        let budget = k_gate_conversion_budget(self.control.budget.materialization);
+        let budget = k_gate_conversion_budget(materialization);
         let context = self.context.source;
         let cancelled = &mut *self.cancelled;
         let mut saw_cancellation = false;
@@ -2253,13 +2256,13 @@ impl<'a, 'c> Reducer<'a, 'c> {
             stop
         });
         K_GATE_CONVERTING.with(|converting| converting.set(false));
-        let (equal, progress) = match &outcome {
-            crate::defeq::DefEqOutcome::Equal(progress) => (true, *progress),
-            crate::defeq::DefEqOutcome::NotEqual { progress, .. }
-            | crate::defeq::DefEqOutcome::Deferred { progress, .. }
-            | crate::defeq::DefEqOutcome::Refused { progress, .. } => (false, *progress),
+        let (mut equal, progress, mut remember) = match &outcome {
+            crate::defeq::DefEqOutcome::Equal(progress) => (true, *progress, true),
+            crate::defeq::DefEqOutcome::NotEqual { progress, .. } => (false, *progress, true),
+            crate::defeq::DefEqOutcome::Deferred { progress, .. }
+            | crate::defeq::DefEqOutcome::Refused { progress, .. } => (false, *progress, false),
             crate::defeq::DefEqOutcome::Inconclusive(stop) => {
-                (false, crate::defeq::stop_progress(stop))
+                (false, crate::defeq::stop_progress(stop), false)
             }
             crate::defeq::DefEqOutcome::InternalFault(fault) => {
                 return Err(Halt::Fault(WhnfFault::KGateConversion {
@@ -2276,20 +2279,34 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 completed_reductions: self.control.reductions,
             })));
         }
-        self.control.steps = self
-            .control
-            .steps
-            .saturating_add(progress.whnf_steps)
-            .saturating_add(progress.slow_comparisons);
+        let mut steps = progress.whnf_steps.saturating_add(progress.slow_comparisons);
+        self.control.steps = self.control.steps.saturating_add(steps);
         self.control.reductions = self
             .control
             .reductions
             .saturating_add(progress.whnf_reductions);
-        let deferred = matches!(outcome, crate::defeq::DefEqOutcome::Deferred { .. });
-        let equal =
-            equal || (deferred && self.k_constructor_types_proof_convert(domain, result, at)?);
-        if let Some(memo) = memo {
-            memo.remember_k_gate(Arc::clone(domain), Arc::clone(result), equal);
+        if matches!(outcome, crate::defeq::DefEqOutcome::Deferred { .. })
+            && let Some((typed_equal, polls)) =
+                self.k_constructor_types_proof_convert(domain, result, at)?
+        {
+            equal = typed_equal;
+            steps = steps.saturating_add(polls);
+            self.control.steps = self.control.steps.saturating_add(polls);
+            remember = true;
+        }
+        if remember
+            && let Some(memo) = memo
+        {
+            memo.remember_k_gate(
+                Arc::clone(domain),
+                Arc::clone(result),
+                materialization,
+                RememberedKGate {
+                    equal,
+                    steps,
+                    reductions: progress.whnf_reductions,
+                },
+            );
         }
         self.control.step(at, self.cancelled)?;
         Ok(equal)
@@ -2310,13 +2327,15 @@ impl<'a, 'c> Reducer<'a, 'c> {
     /// declarations, so a side naming a local, a metavariable or a loose bound
     /// variable is left to the gate's other checks; for closed sides an empty
     /// local context is exact. Only `equal: true` passes. A stop is a miss, as
-    /// for the untyped conversion; a fault is never one.
+    /// for the untyped conversion; a fault is never one. Only a completed typed
+    /// answer returns its poll charge for memoization; a skipped or halted
+    /// comparison must not be remembered as a negative answer.
     fn k_constructor_types_proof_convert(
         &mut self,
         domain: &Arc<WireExpr>,
         result: &Arc<WireExpr>,
         at: usize,
-    ) -> Result<bool, Halt> {
+    ) -> Result<Option<(bool, u64)>, Halt> {
         let materialization = self.control.budget.materialization;
         for side in [domain, result] {
             let facts = self.control.term_halt(
@@ -2328,7 +2347,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 || facts.contains_expression_meta
                 || facts.contains_universe_meta
             {
-                return Ok(false);
+                return Ok(None);
             }
         }
         let work = K_GATE_CONVERSION_WORK;
@@ -2366,8 +2385,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         }
         match outcome {
             crate::infer::ProofConversionOutcome::Complete { equal, polls } => {
-                self.control.steps = self.control.steps.saturating_add(polls);
-                Ok(equal)
+                Ok(Some((equal, polls)))
             }
             crate::infer::ProofConversionOutcome::Halted(outcome) => match *outcome {
                 crate::infer::InferenceOutcome::InternalFault { fault, .. } => {
@@ -2376,7 +2394,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                         fault: Box::new(fault),
                     }))
                 }
-                _ => Ok(false),
+                _ => Ok(None),
             },
         }
     }
