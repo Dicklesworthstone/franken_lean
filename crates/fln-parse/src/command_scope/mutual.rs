@@ -195,6 +195,45 @@ pub fn tree(source: &[u8]) -> Result<Option<Syntax>, DefinitionParseError> {
     )))
 }
 
+/// Read the members of a canonical expanded `Command.mutual` without reparsing
+/// generated text. Apply the same size and member-family restrictions as
+/// [`parse`]; no command sequence or scope control gains declaration authority.
+/// The returned syntax is still untrusted and requires atomic elaboration and
+/// kernel admission.
+pub fn syntax_members(syntax: &Syntax) -> Option<&[Syntax]> {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return None;
+    };
+    if kind != &parser_kind(&["Command", "mutual"]) {
+        return None;
+    }
+    let [
+        Syntax::Atom { val: opening, .. },
+        Syntax::Node {
+            kind: members_kind,
+            args: members,
+            ..
+        },
+        Syntax::Atom { val: closing, .. },
+    ] = args.as_slice()
+    else {
+        return None;
+    };
+    if opening != "mutual"
+        || closing != "end"
+        || members_kind != &Name::from_components(["null"])
+        || members.is_empty()
+        || members.len() > 8
+    {
+        return None;
+    }
+    let first = member_kind(&members[0])?;
+    members
+        .iter()
+        .all(|member| member_kind(member) == Some(first))
+        .then_some(members.as_slice())
+}
+
 /// [`parse`], with each member's byte offset in `source`: a member's own positions are
 /// relative to its start, so this offset places them in the group.
 pub fn parse_with_offsets(
@@ -329,6 +368,84 @@ fn member_kind(syntax: &Syntax) -> Option<MemberKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expanded_groups_preserve_supported_member_families_and_order() {
+        for source in [
+            "mutual\ndef first : Nat := second\ndef second : Nat := 42\nend",
+            "mutual\ntheorem first : True := True.intro\ntheorem second : True := first\nend",
+            "mutual\npartial def first : Nat := second\npartial def second : Nat := first\nend",
+            "mutual\nunsafe def first : Nat := second\nunsafe def second : Nat := 42\nend",
+            "mutual\ninductive First where | mk (next : Second)\ninductive Second where | nil\nend",
+            "mutual\ndef only : Nat := 42\nend",
+        ] {
+            let syntax = tree(source.as_bytes()).unwrap().unwrap();
+            let members = syntax_members(&syntax).unwrap();
+            assert_eq!(members, parse(source.as_bytes()).unwrap().unwrap());
+        }
+    }
+
+    #[test]
+    fn expanded_groups_refuse_malformed_mixed_and_oversized_trees() {
+        let declaration = parse_definition(b"def first : Nat := 42").unwrap().syntax;
+        let theorem = parse_definition(b"theorem proof : True := True.intro")
+            .unwrap()
+            .syntax;
+        let example = parse_source_command(b"example : Nat := 42")
+            .unwrap()
+            .syntax()
+            .clone();
+        let group = |members| {
+            Syntax::node(
+                parser_kind(&["Command", "mutual"]),
+                vec![
+                    Syntax::atom(SourceInfo::None, "mutual"),
+                    null_node(members),
+                    Syntax::atom(SourceInfo::None, "end"),
+                ],
+            )
+        };
+        let valid = group(vec![declaration.clone()]);
+        let mut malformed_open = valid.clone();
+        let Syntax::Node { args, .. } = &mut malformed_open else {
+            unreachable!()
+        };
+        args[0] = Syntax::atom(SourceInfo::None, "namespace");
+        let mut malformed_end = valid.clone();
+        let Syntax::Node { args, .. } = &mut malformed_end else {
+            unreachable!()
+        };
+        args[2] = Syntax::Missing;
+        let mut malformed_members = valid.clone();
+        let Syntax::Node { args, .. } = &mut malformed_members else {
+            unreachable!()
+        };
+        args[1] = Syntax::node(Name::from_components(["choice"]), vec![declaration.clone()]);
+        let mut extra_argument = valid.clone();
+        let Syntax::Node { args, .. } = &mut extra_argument else {
+            unreachable!()
+        };
+        args.push(Syntax::Missing);
+        for invalid in [
+            Syntax::Missing,
+            null_node(vec![declaration.clone()]),
+            group(vec![]),
+            group(vec![declaration.clone(); 9]),
+            group(vec![declaration.clone(), theorem]),
+            group(vec![example]),
+            group(vec![Syntax::node(
+                parser_kind(&["Command", "namespace"]),
+                vec![],
+            )]),
+            group(vec![valid]),
+            malformed_open,
+            malformed_end,
+            malformed_members,
+            extra_argument,
+        ] {
+            assert!(syntax_members(&invalid).is_none(), "{invalid:?}");
+        }
+    }
 
     #[test]
     fn partial_groups_preserve_indentation_trivia_and_lexical_boundaries() {

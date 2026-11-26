@@ -1071,7 +1071,7 @@ fn generic_in(
     end: usize,
 ) -> Option<ScopeCommand> {
     let explicit_open = keyword == "open"
-        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "(" || s == "renaming");
+        && matches!(tokens.get(2).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if matches!(s.as_str(), "(" | "renaming" | "hiding"));
     // A global `attribute [a] x in …` is not one: the pin refuses it ("Despite the `in`, the
     // attribute … is added globally"). A `local` one scopes to the body. Instance
     // erasure is state-only as well: the pin applies eraseAttr without adding a

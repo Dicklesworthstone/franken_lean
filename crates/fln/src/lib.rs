@@ -3879,13 +3879,35 @@ impl Engine {
                     }
                 } else {
                     grammar
-                        .enter(|| source_records::parse_deriving_command(command_source))
+                        .enter(|| {
+                            if let Some(parsed) =
+                                source_records::parse_deriving_command(command_source)?
+                            {
+                                return Ok(Some(ProgramCommandSyntax::Deriving(
+                                    parsed.syntax().clone(),
+                                )));
+                            }
+                            let Ok(parsed) = fln_parse::parse_source_command(command_source) else {
+                                return Ok(None);
+                            };
+                            if !fln_parse::extensions::is_active_command_macro(parsed.syntax()) {
+                                return Ok(None);
+                            }
+                            let parsed = parsed
+                                .expanded()
+                                .map_err(DefinitionFrontendError::Parse)
+                                .map_err(EngineExecutionError::Frontend)?;
+                            ProgramCommandSyntax::from_expanded_command(parsed)
+                                .map(Some)
+                                .map_err(
+                                    imported_macros::source::SourceMacroError::into_execution_error,
+                                )
+                        })
                         .map_err(|error| EngineExecutionError::BatchCommand {
                             index: command_index,
                             error: Box::new(error),
                             at: Some(original_offset),
                         })?
-                        .map(|parsed| ProgramCommandSyntax::Deriving(parsed.syntax().clone()))
                 };
                 let mut scope = if public.is_some() {
                     let scope = match &expanded {
