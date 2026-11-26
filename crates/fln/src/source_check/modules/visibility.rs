@@ -105,6 +105,13 @@ impl<'a> PublicWorld<'a> {
         }
         // Resolve names in the real private lexical scope. A same-spelled
         // private definition must never trigger generation for a public one.
+        let no_confusion_families = match crate::source_records::elaboration_outcome(
+            equations::no_confusion_requests(syntaxes, private.environment(), scope, limits.kernel),
+        )? {
+            Outcome::Complete(families) => families,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         let requests = match crate::source_records::elaboration_outcome(equations::requests(
             syntaxes,
             private.environment(),
@@ -117,6 +124,31 @@ impl<'a> PublicWorld<'a> {
         };
         let mut public = self.engine.clone();
         let mut equations = Vec::new();
+        for family in no_confusion_families {
+            if self
+                .cancellation
+                .is_some_and(CancellationProbe::is_cancelled)
+            {
+                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                    "source-module/private-equations",
+                )));
+            }
+            if !matches!(
+                public.environment().find(&family),
+                Some(ConstantInfo::Induct(_))
+            ) {
+                continue;
+            }
+            match public.realize_inductive_no_confusion(&family, options, limits)? {
+                Outcome::Complete(Some(batch)) => {
+                    public = batch.engine;
+                    equations.extend(batch.admissions);
+                }
+                Outcome::Complete(None) => {}
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
+        }
         for request in requests {
             if self
                 .cancellation

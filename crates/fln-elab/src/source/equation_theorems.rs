@@ -1085,6 +1085,96 @@ fn equation_like_leaf(name: &Name) -> bool {
             || leaf.strip_prefix("eq_").is_some_and(is_nat))
 }
 
+fn no_confusion_leaf(name: &Name) -> bool {
+    matches!(
+        name.leaf_view(),
+        LeafView::Str("noConfusion" | "noConfusionType")
+    )
+}
+
+/// Core prelude constants required by `Lean/Meta/Constructions/NoConfusion.lean`.
+pub fn has_no_confusion_deps(env: &Environment) -> bool {
+    [
+        ["PUnit"].as_slice(),
+        &["Eq"],
+        &["Eq", "refl"],
+        &["Eq", "ndrec"],
+        &["HEq"],
+        &["HEq", "refl"],
+        &["eq_of_heq"],
+    ]
+    .into_iter()
+    .all(|parts| env.contains(&Name::from_components(parts.iter().copied())))
+}
+
+/// If `name` is `<T>.noConfusion` or `<T>.noConfusionType` for an admitted
+/// inductive `T` whose `casesOn` and core `noConfusion` dependencies already
+/// exist in `env`, return `Some(T)`.
+pub fn no_confusion_target(env: &Environment, name: &Name) -> Option<Name> {
+    if !no_confusion_leaf(name) || !has_no_confusion_deps(env) {
+        return None;
+    }
+    let family = name.parent();
+    if family.is_anonymous() {
+        return None;
+    }
+    let Some(ConstantInfo::Induct(_)) = env.find(&family) else {
+        return None;
+    };
+    let cases_on = Name::str(family.clone(), "casesOn");
+    matches!(env.find(&cases_on), Some(ConstantInfo::Defn(_))).then_some(family)
+}
+
+/// Inductive families whose `<T>.noConfusion` or `<T>.noConfusionType` is named
+/// by `syntaxes` before it has been realized in `env`, in source order.
+///
+/// Mirrors the pin's reserved-name action for `noConfusion` (`Init/Prelude.lean`
+/// declares `Bool` before `eq_of_heq`, then invokes `Bool.noConfusion` once the
+/// core equality helpers exist).
+pub fn no_confusion_requests(
+    syntaxes: &[&Syntax],
+    env: &Environment,
+    scope: &SourceScope,
+    kernel: Budget,
+) -> Result<Vec<Name>, NatDefinitionElabError> {
+    if !has_no_confusion_deps(env) {
+        return Ok(Vec::new());
+    }
+    let mut context = Context::scoped(env, kernel, scope)?;
+    let declaration_id = parser_kind(&["Command", "declId"]);
+    let mut found: Vec<Name> = Vec::new();
+    let mut pending: Vec<&Syntax> = syntaxes.iter().rev().copied().collect();
+    while let Some(syntax) = pending.pop() {
+        context.tick()?;
+        match syntax {
+            Syntax::Ident {
+                val, preresolved, ..
+            } if no_confusion_leaf(val)
+                || preresolved.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        fln_syntax::tree::Preresolved::Decl { name, .. } if no_confusion_leaf(name)
+                    )
+                }) =>
+            {
+                if let (Some(resolved), _) = context.resolve_unambiguous_identifier_name(syntax)?
+                    && !env.contains(&resolved)
+                    && let Some(family) = no_confusion_target(env, &resolved)
+                    && !found.contains(&family)
+                {
+                    found.push(family);
+                }
+            }
+            Syntax::Node { kind, .. } if kind == &declaration_id => {}
+            Syntax::Node { args, .. } => {
+                pending.extend(args.iter().rev());
+            }
+            _ => {}
+        }
+    }
+    Ok(found)
+}
+
 /// The equation theorems `syntax` refers to that are not generated yet, in source order: each
 /// identifier that resolves in `scope` to an equation-like name of a definition, and each
 /// `rw [f]`/`rewrite [f]` rule or `grind [f]` parameter naming a definition.

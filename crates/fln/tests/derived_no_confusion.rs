@@ -612,3 +612,76 @@ fn cj7s_required_mutants_and_anti_vacuity_floors_are_killed() {
         "anti-vacuity: truncated family scan must fail floor check"
     );
 }
+
+#[test]
+fn on_demand_no_confusion_realizes_bootstrap_inductives_in_module_and_plain_mode() {
+    use fln::source_check::modules::SourceModuleCheckLimits;
+    use fln::source_check::modules::imported::SourceOleanImport;
+    use fln::{Budget, EngineAdmissionLimits, KVMap, SourceCheckLimits, SourceModuleInput};
+
+    let body = r#"
+universe u
+
+set_option bootstrap.inductiveCheckResultingUniverse false in
+inductive PUnit : Sort u where
+  | unit : PUnit
+
+inductive Eq : α → α → Prop where
+  | refl (a : α) : Eq a a
+
+abbrev Eq.ndrec.{u1, u2} {α : Sort u2} {a : α} {motive : α → Sort u1} (m : motive a) {b : α} (h : Eq a b) : motive b :=
+  h.rec m
+
+inductive HEq : {α : Sort u} → α → {β : Sort u} → β → Prop where
+  | refl (a : α) : HEq a a
+
+inductive Bool : Type where
+  | false : Bool
+  | true : Bool
+
+inductive False : Prop
+
+def Not (a : Prop) : Prop := a → False
+
+def cast {α β : Sort u} (h : Eq α β) (a : α) : β :=
+  Eq.rec (motive := fun x _ => x) a h
+
+theorem eq_of_heq {α : Sort u} {a a' : α} (h : HEq a a') : Eq a a' :=
+  have helper : (α β : Sort u) → (a : α) → (b : β) → HEq a b → (h : Eq α β) → Eq (cast h a) b :=
+    fun _ _ _ _ h₁ => h₁.rec (fun _ => Eq.refl _)
+  helper α α a a' h (Eq.refl α)
+
+theorem ne_false_of_eq_true : {b : Bool} → Eq b Bool.true → Not (Eq b Bool.false)
+  | Bool.true, _ => fun h => Bool.noConfusion h
+  | Bool.false, h => Bool.noConfusion h
+"#;
+
+    let limits = SourceModuleCheckLimits::new(SourceCheckLimits::new(EngineAdmissionLimits::new(
+        Budget::for_stack_bytes(2 * 1024 * 1024),
+    )));
+    let entry = name("Bootstrap");
+    for prefix in [
+        "prelude\n",
+        "module\nprelude\npublic section\n@[expose] section\n",
+    ] {
+        let source = format!("{prefix}{body}");
+        let checked = SourceOleanImport::empty(&KVMap::new())
+            .check_source_modules(
+                &[SourceModuleInput {
+                    name: &entry,
+                    source: source.as_bytes(),
+                }],
+                &entry,
+                &KVMap::new(),
+                limits,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{prefix}\n{error:?}"))
+            .into_complete()
+            .unwrap_or_else(|reason| panic!("{prefix}\n{reason:?}"));
+        let env = checked.checked.engine.environment();
+        assert!(env.contains(&name("Bool.noConfusionType")));
+        assert!(env.contains(&name("Bool.noConfusion")));
+        assert!(env.contains(&name("ne_false_of_eq_true")));
+    }
+}
