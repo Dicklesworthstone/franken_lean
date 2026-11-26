@@ -4108,9 +4108,36 @@ impl Engine {
                 if scope.exports_declaration()
                     && let Some(public) = public.as_deref_mut()
                 {
-                    // Public interfaces are fixed in the export world; a theorem
-                    // alone checks its hidden proof privately before publication.
-                    // Queries continue to observe the complete private world.
+                    // Native evaluation executes the complete checked command
+                    // world, including implementations behind public headers.
+                    // Logical elaboration still uses the selected public/private
+                    // scopes, and its resulting auxiliaries pass both checkers.
+                    let native_capture =
+                        (presentation == EvaluationPresentation::Lean && isolate_stderr).then(
+                            || source_execution::NativeCaptureBuffer::new(evaluation_output_bytes),
+                        );
+                    let is_theorem = grammar.enter(|| match expanded.as_ref() {
+                        Some(ProgramCommandSyntax::Single(parsed)) => {
+                            fln_elab::source::is_theorem(parsed.syntax())
+                        }
+                        Some(_) => false,
+                        None => fln_parse::parse_source_command(command_source)
+                            .is_ok_and(|parsed| fln_elab::source::is_theorem(parsed.syntax())),
+                    });
+                    let is_async_theorem = is_theorem
+                        && scope.options.get_bool(
+                            &Name::from_components(["Elab", "async"]),
+                            options.get_bool(&Name::from_components(["Elab", "async"]), true),
+                        );
+                    let public_scope =
+                        native_scope(&scope, &engine, options, limits, native_capture.clone());
+                    let private_scope = native_scope(
+                        &scopes.current,
+                        &engine,
+                        options,
+                        limits,
+                        native_capture.clone(),
+                    );
                     let (mut next, mut admission) = match grammar
                         .enter(|| match expanded.take() {
                             Some(parsed) => public.admit_command_syntax(
@@ -4119,16 +4146,16 @@ impl Engine {
                                 parsed.into_scoped()?,
                                 options,
                                 limits.admission(),
-                                &scope,
-                                &scopes.current,
+                                &public_scope,
+                                &private_scope,
                             ),
                             None => public.admit_command(
                                 &engine,
                                 command_source,
                                 options,
                                 limits.admission(),
-                                &scope,
-                                &scopes.current,
+                                &public_scope,
+                                &private_scope,
                             ),
                         })
                         .map_err(|error| {
@@ -4145,6 +4172,15 @@ impl Engine {
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     };
+                    flush_native_capture(
+                        native_capture.as_ref(),
+                        &mut evaluation_output_bytes,
+                        &mut trace_messages,
+                        &mut trace_bytes,
+                        command_index,
+                        original_offset,
+                        !is_async_theorem,
+                    )?;
                     let noncomputable = check_compilation(
                         next.environment(),
                         &admission,

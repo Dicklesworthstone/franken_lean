@@ -5,7 +5,7 @@
 //! `rewrite`, `simp`, `dsimp`, `apply e`, `change e`, `pattern (occs)? p`, `clear h …`,
 //! `tactic => tacs`, `first | … | …`, `try`, `repeat`, `fail_if_success`, a nested `conv => …`,
 //! `all_goals`, `any_goals`, `focus`, `case`, `case'`, `next`, `<;>`, `· convSeq`, `{ … }`,
-//! `( … )` and `calc`; any other is
+//! `( … )`, `calc`, `guard_expr`, `guard_target` and `guard_hyp`; any other is
 //! refused where it starts. A tactic
 //! ending in a sequence of its own takes the `;`-separated tactics after it, as the pin's
 //! `sepByIndent` does. Columns count codepoints. A `(conv| …)` quotation holds one of them.
@@ -731,7 +731,7 @@ fn conv_operand(
 }
 
 /// The conv tactics beyond [`conv_operand`]'s: `dsimp`, `pattern`, `clear`, a nested `conv =>`,
-/// `try`, `repeat`, `fail_if_success`, `{ … }`, `( … )` and `calc`.
+/// `try`, `repeat`, `fail_if_success`, `{ … }`, `( … )`, `calc` and the guard tactics.
 #[inline(never)]
 fn extended_operand(
     leaves: &Leaves,
@@ -746,6 +746,26 @@ fn extended_operand(
             val: text.to_owned(),
         })
     };
+    // Init/Guard.lean declares these conv forms in Tactic, outside the Conv namespace.
+    // Their operands and precedence are shared with the ordinary tactic forms.
+    for (keyword, kind) in [
+        ("guard_target", "guardTargetConv"),
+        ("guard_expr", "guardExprConv"),
+        ("guard_hyp", "guardHypConv"),
+    ] {
+        if word(tokens, start, keyword) {
+            let keyword_atom = atom(start, keyword)?;
+            let parsed = match keyword {
+                "guard_target" => guard_target(leaves, view, tokens, range, keyword_atom)?,
+                "guard_expr" => guard_expr(leaves, view, tokens, range, keyword_atom)?,
+                _ => guard_hyp::parse(leaves, view, tokens, range, keyword_atom)?,
+            };
+            let Syntax::Node { args, .. } = parsed else {
+                return Err(refusal(view, tokens, start));
+            };
+            return Ok(Syntax::node(parser_kind(&["Tactic", kind]), args));
+        }
+    }
     // `"dsimp" optConfig (discharger)? (&" only")? (" [" (simpErase <|> simpLemma),* "]")?`
     // (`Conv.dsimp`): `dsimp`'s slots without a location.
     if word(tokens, start, "dsimp") {
@@ -972,4 +992,64 @@ fn first_operand(
         conv_kind("first"),
         vec![keyword, null_node(alternatives)],
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guards_keep_the_pinned_conv_kind_and_lossless_operands() {
+        for (guard, kind, arity) in [
+            ("guard_target =ₛ (x = x)", "guardTargetConv", 3),
+            ("guard_expr (x = x) =ₐ (x = x)", "guardExprConv", 4),
+            ("guard_hyp h :~ Nat :=ₛ x", "guardHypConv", 4),
+        ] {
+            for source in [
+                format!("theorem t : True := by\r\n  conv => /- λ -/ {guard}\r\n"),
+                format!("def stx := `(conv| {guard})"),
+            ] {
+                let parsed = parse_source_command(source.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+                assert_eq!(
+                    parsed.reconstruct_normalized().unwrap(),
+                    source.replace("\r\n", "\n").as_bytes()
+                );
+                let mut pending = vec![parsed.syntax()];
+                let mut found = 0;
+                while let Some(syntax) = pending.pop() {
+                    if let Syntax::Node {
+                        kind: actual, args, ..
+                    } = syntax
+                    {
+                        if actual == &parser_kind(&["Tactic", kind]) {
+                            assert_eq!(args.len(), arity);
+                            found += 1;
+                        }
+                        pending.extend(args);
+                    }
+                }
+                assert_eq!(found, 1, "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_conv_guards_are_not_silently_shortened() {
+        for guard in [
+            "guard_target",
+            "guard_target == x",
+            "guard_target =",
+            "guard_expr x",
+            "guard_expr = x",
+            "guard_expr x =",
+            "guard_hyp",
+            "guard_hyp f x : Nat",
+            "guard_hyp x :",
+            "guard_hyp x :=",
+        ] {
+            let source = format!("theorem t : True := by conv => {guard}");
+            assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
+        }
+    }
 }

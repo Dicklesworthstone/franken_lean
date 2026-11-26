@@ -1591,29 +1591,71 @@ impl Context {
         {
             proof.work.push(Work::Goal(goal));
             self.trace_proof_state(proof, instruction)?;
-        } else if kind == &parser_kind(&["Tactic", "guardTarget"]) {
+        } else if kind == &parser_kind(&["Tactic", "guardTarget"])
+            || kind == &parser_kind(&["Tactic", "guardTargetConv"])
+        {
             let [keyword, relation, expected] = args.as_slice() else {
                 return Err(error(TacticError::MalformedScript));
             };
             expect_atom(keyword, "guard_target", "guard_target keyword")?;
-            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "guardTarget"])?;
+            let in_conv = kind == &parser_kind(&["Tactic", "guardTargetConv"]);
+            self.require_declared_tactic(&[
+                "Lean",
+                "Parser",
+                "Tactic",
+                if in_conv {
+                    "guardTargetConv"
+                } else {
+                    "guardTarget"
+                },
+            ])?;
             let relation = guard::relation(relation)?;
-            if !self.guard_target_matches(&goal, relation, expected)? {
+            let target = if in_conv {
+                self.txn.lctx = goal.lctx.clone();
+                // The pin's Conv.getLhs inspects the focused expression, not lhs = ?rhs.
+                self.conv_sides(&goal)?.2
+            } else {
+                goal.target.clone()
+            };
+            if !self.guard_target_matches(&goal, &target, relation, expected)? {
                 return Err(error(TacticError::GuardTargetMismatch));
             }
             proof.work.push(Work::Goal(goal));
-        } else if kind == &parser_kind(&["Tactic", "guardExpr"]) {
+        } else if kind == &parser_kind(&["Tactic", "guardExpr"])
+            || kind == &parser_kind(&["Tactic", "guardExprConv"])
+        {
             let [keyword, left, relation, right] = args.as_slice() else {
                 return Err(error(TacticError::MalformedScript));
             };
             expect_atom(keyword, "guard_expr", "guard_expr keyword")?;
-            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "guardExpr"])?;
+            self.require_declared_tactic(&[
+                "Lean",
+                "Parser",
+                "Tactic",
+                if kind == &parser_kind(&["Tactic", "guardExprConv"]) {
+                    "guardExprConv"
+                } else {
+                    "guardExpr"
+                },
+            ])?;
             let relation = guard::relation(relation)?;
             if !self.guard_expr_holds(&goal, left, relation, right)? {
                 return Err(error(TacticError::GuardExprMismatch));
             }
             proof.work.push(Work::Goal(goal));
-        } else if kind == &parser_kind(&["Tactic", "guardHyp"]) {
+        } else if kind == &parser_kind(&["Tactic", "guardHyp"])
+            || kind == &parser_kind(&["Tactic", "guardHypConv"])
+        {
+            self.require_declared_tactic(&[
+                "Lean",
+                "Parser",
+                "Tactic",
+                if kind == &parser_kind(&["Tactic", "guardHypConv"]) {
+                    "guardHypConv"
+                } else {
+                    "guardHyp"
+                },
+            ])?;
             self.guard_hypothesis(&goal, args)?;
             proof.work.push(Work::Goal(goal));
         } else if kind == &parser_kind(&["Tactic", "fail"]) {

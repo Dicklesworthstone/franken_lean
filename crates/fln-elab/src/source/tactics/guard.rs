@@ -49,23 +49,16 @@ fn consume_mdata(mut expr: &Expr) -> &Expr {
 impl Context {
     /// Elaborate the expected term before the read-only comparison, as the pin does.
     /// Constraints from that elaboration remain available to subsequent tactics.
+    /// `target` is the main target in tactic mode and `Conv.getLhs` in conv mode.
     pub(super) fn guard_target_matches(
         &mut self,
         goal: &ProofGoal,
-        relation: Relation,
-        expected: &Syntax,
-    ) -> Result<bool, NatDefinitionElabError> {
-        self.guard_target_check(goal, relation, expected)
-    }
-
-    fn guard_target_check(
-        &mut self,
-        goal: &ProofGoal,
+        target: &Expr,
         relation: Relation,
         expected: &Syntax,
     ) -> Result<bool, NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
-        let target = self.instantiate(&goal.target)?;
+        let target = self.instantiate(target)?;
         let target_type = self
             .known_type(&target)?
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;

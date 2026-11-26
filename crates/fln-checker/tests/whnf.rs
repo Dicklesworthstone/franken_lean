@@ -3493,9 +3493,9 @@ fn k_gate_falls_back_to_conversion_when_the_structural_comparison_cannot_tell() 
 /// The KR-317 gate's conversion outcome is remembered for the context: a second
 /// cast whose gate compares the same two types reads it instead of converting
 /// again. The casts differ only in their evidence, so neither is the other's
-/// whole-term memo entry. The conversion runs on a fixed budget, so the
-/// remembered outcome is the one a recomputation would reach. In Cpop, 240 gate
-/// misses were 32 distinct pairs.
+/// whole-term memo entry. Both use the same conversion and materialization
+/// budgets. The hit saves actual work (callback polls) while replaying the
+/// conversion's step and reduction charges. In Cpop, 240 misses were 32 pairs.
 #[test]
 fn a_k_gate_conversion_is_not_repeated_for_the_same_pair() {
     let (context, unfolding, identity, _) = k_endpoints_under_a_binder();
@@ -3514,22 +3514,27 @@ fn a_k_gate_conversion_is_not_repeated_for_the_same_pair() {
             Expr::app,
         )
     };
-    let mut steps = Vec::new();
+    let mut work = Vec::new();
     for evidence in ["firstEvidence", "secondEvidence"] {
-        let WhnfOutcome::Complete(result) =
-            whnf(&decoded(&cast(evidence)), &context, WhnfBudget::unlimited())
-        else {
+        let (outcome, polls) =
+            polled_whnf(&decoded(&cast(evidence)), &context, WhnfBudget::unlimited());
+        let WhnfOutcome::Complete(result) = outcome else {
             panic!("the K gate must complete");
         };
         assert_eq!(
             root_constant_name(&result.term),
             Some(&checker_name("KTestMinor"))
         );
-        steps.push(result.steps);
+        work.push((result.steps, result.reductions, polls));
     }
+    assert_eq!(
+        (work[1].0, work[1].1),
+        (work[0].0, work[0].1),
+        "a cached gate preserves charged work"
+    );
     assert!(
-        steps[1] < steps[0],
-        "the second cast repeated the gate's conversion: {steps:?} steps"
+        work[1].2 < work[0].2,
+        "the second cast repeated the gate's conversion: {work:?}"
     );
 }
 

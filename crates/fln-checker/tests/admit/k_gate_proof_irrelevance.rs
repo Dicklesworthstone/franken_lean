@@ -218,3 +218,42 @@ fn a_k_gate_whose_sides_have_a_loose_bound_variable_is_not_typed() {
         "the open gate must miss and the pair defer, not fault: {outcome:?}"
     );
 }
+
+/// A different well-typed major avoids the whole-term memo but uses the same
+/// K-gate pair. The typed fallback's poll charge belongs to both reductions.
+#[test]
+fn a_cached_typed_k_gate_preserves_cold_progress_and_budget_stops() {
+    let left = app(c("f"), [c("p1")]);
+    let right = app(c("f"), [c("p2")]);
+    let first = decoded(&cast(left.clone(), right.clone(), c("h")));
+    let wrapped_major = app(lam(eq_nat(left.clone(), right.clone()), bv(0)), [c("h")]);
+    let second = decoded(&cast(left, right, wrapped_major));
+    let context = WhnfContext::new(Vec::new(), Vec::new(), environment());
+    assert!(reduced_to_w(&whnf(
+        &first,
+        &context,
+        WhnfBudget::unlimited()
+    )));
+    let cold = whnf(
+        &second,
+        &WhnfContext::new(Vec::new(), Vec::new(), environment()),
+        WhnfBudget::unlimited(),
+    );
+    assert!(reduced_to_w(&cold));
+    assert_eq!(
+        whnf(&second, &context, WhnfBudget::unlimited()),
+        cold,
+        "typed conversion work must be charged on a cache hit"
+    );
+    let WhnfOutcome::Complete(result) = cold else {
+        unreachable!("the cold control reduced");
+    };
+    let tight = WhnfBudget::new(result.steps - 1, u64::MAX, TermBudget::unlimited());
+    let cold_stop = whnf(
+        &second,
+        &WhnfContext::new(Vec::new(), Vec::new(), environment()),
+        tight,
+    );
+    assert!(matches!(&cold_stop, WhnfOutcome::Inconclusive(_)));
+    assert_eq!(whnf(&second, &context, tight), cold_stop);
+}

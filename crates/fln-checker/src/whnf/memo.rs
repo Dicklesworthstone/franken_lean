@@ -122,21 +122,113 @@ fn admits(
             .any(|entry| entry.matches(input, delta_mode, head_nat, materialization, bindings))
 }
 
-/// Per-generation bounds: when the current generation reaches either bound it
-/// rotates into `previous` and the old `previous` is dropped, keeping memory
-/// bounded while keeping the active working set hot on large declarations.
+/// Reserve optional cache storage before publishing an entry. In particular,
+/// a failed bucket allocation must not accumulate uncharged empty buckets.
+fn try_push_bucket<T>(map: &mut PrehashedMap<Vec<T>>, key: u64, entry: T) -> bool {
+    if let Some(bucket) = map.get_mut(&key) {
+        if bucket.try_reserve(1).is_err() {
+            return false;
+        }
+        bucket.push(entry);
+        return true;
+    }
+    let mut bucket = Vec::new();
+    if bucket.try_reserve_exact(1).is_err() || map.try_reserve(1).is_err() {
+        return false;
+    }
+    bucket.push(entry);
+    map.insert(key, bucket);
+    true
+}
+
+/// Per-generation retention bounds: a full generation rotates into `previous`
+/// and the old `previous` is dropped. These are optional cache limits, never
+/// checking fuel. Count entire arenas, including levels and let-bound values,
+/// even when several references share storage. The byte estimate also covers
+/// payloads and spare capacities; allocator metadata and bounded table overhead
+/// are additional. It is not a process RSS limit.
 const MAX_ENTRIES: usize = 1 << 16;
 const MAX_STORED_NODES: usize = 1 << 20;
+const MAX_STORED_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Clone, Copy, Default)]
+struct RetainedSize {
+    nodes: usize,
+    bytes: usize,
+}
+
+impl RetainedSize {
+    fn add_term(&mut self, term: &WireExpr) {
+        self.nodes = self
+            .nodes
+            .saturating_add(term.nodes().len())
+            .saturating_add(term.levels().len());
+        self.bytes = self
+            .bytes
+            .saturating_add(term.retained_bytes())
+            .saturating_add(std::mem::size_of::<WireExpr>())
+            .saturating_add(2 * std::mem::size_of::<usize>());
+    }
+
+    fn pair(left: &WireExpr, right: &WireExpr, entry_bytes: usize) -> Self {
+        let mut size = Self {
+            nodes: 0,
+            bytes: entry_bytes,
+        };
+        size.add_term(left);
+        size.add_term(right);
+        size
+    }
+
+    fn fits(self) -> bool {
+        self.nodes <= MAX_STORED_NODES && self.bytes <= MAX_STORED_BYTES
+    }
+}
+
+fn entry_size(
+    input: &WireExpr,
+    result: &WireExpr,
+    bindings: &[FreeBinding],
+) -> Option<RetainedSize> {
+    let mut size = RetainedSize::pair(input, result, std::mem::size_of::<Entry>());
+    size.bytes = size.bytes.saturating_add(
+        bindings
+            .len()
+            .saturating_mul(std::mem::size_of::<FreeBinding>()),
+    );
+    if !size.fits() {
+        return None;
+    }
+    for binding in bindings {
+        size.add_term(&binding.value);
+        size.bytes = size.bytes.saturating_add(binding.name.retained_bytes());
+        if !size.fits() {
+            return None;
+        }
+    }
+    Some(size)
+}
+
 /// A full bucket takes no more entries, so no input, however it collides, makes
 /// a lookup compare more than this many terms.
 const MAX_BUCKET_ENTRIES: usize = 8;
 
-/// One remembered KR-317 gate outcome: the two types compared and whether they
-/// converted.
+/// A completed KR-317 conversion and its auxiliary work. The final gate step
+/// and cancellation poll are performed by the caller on both misses and hits.
+#[derive(Clone, Copy)]
+pub(super) struct RememberedKGate {
+    pub(super) equal: bool,
+    pub(super) steps: u64,
+    pub(super) reductions: u64,
+}
+
+/// One remembered gate answer under the exact materialization limits used to
+/// compute it. Resource-stopped or deferred conversions are not answers.
 struct GateEntry {
     domain: Arc<WireExpr>,
     result: Arc<WireExpr>,
-    equal: bool,
+    materialization: TermBudget,
+    value: RememberedKGate,
 }
 
 #[derive(Default)]
@@ -145,10 +237,11 @@ struct Table {
     /// process; entries in a bucket are compared exactly.
     buckets: PrehashedMap<Vec<Entry>>,
     /// KR-317 gate outcomes by conversion, keyed the same way (see
-    /// `WhnfMemo::recall_k_gate`). They share the entry and node bounds.
+    /// `WhnfMemo::recall_k_gate`). They share all retention bounds.
     k_gate: PrehashedMap<Vec<GateEntry>>,
     entries: usize,
     stored_nodes: usize,
+    stored_bytes: usize,
 }
 
 #[derive(Default)]
@@ -167,6 +260,18 @@ struct LookupKey<'a> {
 }
 
 impl Table {
+    fn fits(&self, size: RetainedSize) -> bool {
+        self.entries < MAX_ENTRIES
+            && self.stored_nodes.saturating_add(size.nodes) <= MAX_STORED_NODES
+            && self.stored_bytes.saturating_add(size.bytes) <= MAX_STORED_BYTES
+    }
+
+    fn retained(&mut self, size: RetainedSize) {
+        self.entries += 1;
+        self.stored_nodes = self.stored_nodes.saturating_add(size.nodes);
+        self.stored_bytes = self.stored_bytes.saturating_add(size.bytes);
+    }
+
     fn recall(&self, key: LookupKey<'_>, budget: &WhnfBudget) -> Option<(WhnfResult, bool)> {
         self.buckets
             .get(&key.fp)?
@@ -211,12 +316,22 @@ impl Table {
             .map(|entry| (entry.result.clone(), entry.nat_progress, entry.copied))
     }
 
-    fn recall_k_gate(&self, fp: u64, domain: &WireExpr, result: &WireExpr) -> Option<bool> {
+    fn recall_k_gate(
+        &self,
+        fp: u64,
+        domain: &WireExpr,
+        result: &WireExpr,
+        materialization: TermBudget,
+    ) -> Option<RememberedKGate> {
         self.k_gate
             .get(&fp)?
             .iter()
-            .find(|entry| *entry.domain == *domain && *entry.result == *result)
-            .map(|entry| entry.equal)
+            .find(|entry| {
+                entry.materialization == materialization
+                    && *entry.domain == *domain
+                    && *entry.result == *result
+            })
+            .map(|entry| entry.value)
     }
 }
 
@@ -405,109 +520,136 @@ impl WhnfMemo {
         if value.result.reductions == 0 && value.result.delta_reductions == 0 {
             return;
         }
-        let nodes = input
-            .nodes()
-            .len()
-            .saturating_add(value.result.term.nodes().len());
-        if nodes > MAX_STORED_NODES {
+        let Some(mut size) = entry_size(&input, &value.result.term, bindings) else {
             return;
-        }
+        };
         let Ok(mut tables) = self.0.lock() else {
             return;
         };
-        if tables.current.entries >= MAX_ENTRIES
-            || tables.current.stored_nodes.saturating_add(nodes) > MAX_STORED_NODES
-        {
-            tables.previous = std::mem::take(&mut tables.current);
-        }
         let fp = fingerprint(&input, delta_mode, head_nat, materialization, bindings);
-        let bucket = tables.current.buckets.entry(fp).or_default();
-        if !admits(
-            bucket,
-            &input,
-            delta_mode,
-            head_nat,
-            materialization,
-            bindings,
-        ) {
+        if tables.current.buckets.get(&fp).is_some_and(|bucket| {
+            !admits(
+                bucket,
+                &input,
+                delta_mode,
+                head_nat,
+                materialization,
+                bindings,
+            )
+        }) {
             return;
         }
-        bucket.push(Entry {
-            input,
-            delta_mode,
-            head_nat,
-            materialization,
-            bindings: bindings.to_vec(),
-            result: value.result.clone(),
-            nat_progress: value.nat_progress,
-            copied: value.copied,
-        });
-        tables.current.entries += 1;
-        tables.current.stored_nodes = tables.current.stored_nodes.saturating_add(nodes);
+        // Optional retention must not turn a completed reduction into a host
+        // allocation failure. Cloning FreeBinding only increments shared refs.
+        let mut retained_bindings = Vec::new();
+        if retained_bindings.try_reserve_exact(bindings.len()).is_err() {
+            return;
+        }
+        size.bytes = size.bytes.saturating_add(
+            retained_bindings
+                .capacity()
+                .saturating_sub(bindings.len())
+                .saturating_mul(std::mem::size_of::<FreeBinding>()),
+        );
+        if !size.fits() {
+            return;
+        }
+        if !tables.current.fits(size) {
+            tables.previous = std::mem::take(&mut tables.current);
+        }
+        retained_bindings.extend_from_slice(bindings);
+        if try_push_bucket(
+            &mut tables.current.buckets,
+            fp,
+            Entry {
+                input,
+                delta_mode,
+                head_nat,
+                materialization,
+                bindings: retained_bindings,
+                result: value.result.clone(),
+                nat_progress: value.nat_progress,
+                copied: value.copied,
+            },
+        ) {
+            tables.current.retained(size);
+        }
     }
 }
 
 impl WhnfMemo {
-    /// The KR-317 gate's conversion outcome for exactly these two types, if one
-    /// was recorded. The conversion runs on the fixed `K_GATE_CONVERSION_WORK`,
-    /// so, as for the results above, its outcome depends only on the pair and
-    /// the context: recording it changes no answer and saves the conversion. In
-    /// Cpop, 240 gate misses were 32 distinct pairs.
-    pub(super) fn recall_k_gate(&self, domain: &WireExpr, result: &WireExpr) -> Option<bool> {
+    /// The completed KR-317 gate answer for this pair and materialization budget.
+    /// Other conversion work limits are fixed at `K_GATE_CONVERSION_WORK`; the
+    /// caller's materialization limits are not. Replay the saved charges even
+    /// though no conversion is executed. In Cpop, 240 misses were 32 pairs.
+    pub(super) fn recall_k_gate(
+        &self,
+        domain: &WireExpr,
+        result: &WireExpr,
+        materialization: TermBudget,
+    ) -> Option<RememberedKGate> {
         let tables = self.0.lock().ok()?;
-        let fp = pair_fingerprint(domain, result);
+        let fp = pair_fingerprint(domain, result, materialization);
         tables
             .current
-            .recall_k_gate(fp, domain, result)
-            .or_else(|| tables.previous.recall_k_gate(fp, domain, result))
+            .recall_k_gate(fp, domain, result, materialization)
+            .or_else(|| {
+                tables
+                    .previous
+                    .recall_k_gate(fp, domain, result, materialization)
+            })
     }
 
-    /// Record a gate outcome. Never called for a cancelled or faulted
-    /// conversion, whose outcome is not a function of the pair.
+    /// Record only a completed conversion, never a cancelled, faulted, deferred
+    /// or resource-stopped attempt interpreted as a gate miss.
     pub(super) fn remember_k_gate(
         &self,
         domain: Arc<WireExpr>,
         result: Arc<WireExpr>,
-        equal: bool,
+        materialization: TermBudget,
+        value: RememberedKGate,
     ) {
-        let nodes = domain.nodes().len().saturating_add(result.nodes().len());
-        if nodes > MAX_STORED_NODES {
+        let size = RetainedSize::pair(&domain, &result, std::mem::size_of::<GateEntry>());
+        if !size.fits() {
             return;
         }
         let Ok(mut tables) = self.0.lock() else {
             return;
         };
-        if tables.current.entries >= MAX_ENTRIES
-            || tables.current.stored_nodes.saturating_add(nodes) > MAX_STORED_NODES
-        {
-            tables.previous = std::mem::take(&mut tables.current);
-        }
-        let bucket = tables
-            .current
-            .k_gate
-            .entry(pair_fingerprint(&domain, &result))
-            .or_default();
-        if bucket.len() >= MAX_BUCKET_ENTRIES
-            || bucket
-                .iter()
-                .any(|entry| entry.domain == domain && entry.result == result)
-        {
+        let fp = pair_fingerprint(&domain, &result, materialization);
+        if tables.current.k_gate.get(&fp).is_some_and(|bucket| {
+            bucket.len() >= MAX_BUCKET_ENTRIES
+                || bucket.iter().any(|entry| {
+                    entry.materialization == materialization
+                        && entry.domain == domain
+                        && entry.result == result
+                })
+        }) {
             return;
         }
-        bucket.push(GateEntry {
-            domain,
-            result,
-            equal,
-        });
-        tables.current.entries += 1;
-        tables.current.stored_nodes = tables.current.stored_nodes.saturating_add(nodes);
+        if !tables.current.fits(size) {
+            tables.previous = std::mem::take(&mut tables.current);
+        }
+        if try_push_bucket(
+            &mut tables.current.k_gate,
+            fp,
+            GateEntry {
+                domain,
+                result,
+                materialization,
+                value,
+            },
+        ) {
+            tables.current.retained(size);
+        }
     }
 }
 
-fn pair_fingerprint(domain: &WireExpr, result: &WireExpr) -> u64 {
+fn pair_fingerprint(domain: &WireExpr, result: &WireExpr, materialization: TermBudget) -> u64 {
     let mut hasher = Fingerprinter::default();
     domain.hash(&mut hasher);
     result.hash(&mut hasher);
+    materialization.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -716,6 +858,146 @@ mod tests {
         assert_eq!(remembered(&context), 1);
     }
 
+    fn unused_value(label: &str, nodes: usize) -> WireExpr {
+        let mut arena = vec![ExprNode::Constant {
+            name: name(label),
+            levels: Vec::new(),
+        }];
+        for index in 1..nodes {
+            arena.push(ExprNode::Apply {
+                function: id(index - 1),
+                argument: ExprId::ZERO,
+            });
+        }
+        WireExpr::from_parts(arena, Vec::new(), id(nodes - 1))
+    }
+
+    fn bind_unused(context: &mut WhnfContext, value: &Arc<WireExpr>, count: usize) {
+        for index in 0..count {
+            context.push_scoped_binding(FreeBinding::from_shared(
+                name(&format!("unused{index}")),
+                Arc::clone(value),
+            ));
+        }
+    }
+
+    /// Use shared values to cross the conservative retention bound without
+    /// allocating hundreds of megabytes in a unit test. These values are not
+    /// read by the reduction, but the old memo kept every one after scope exit.
+    fn assert_unused_values_are_not_retained(value: WireExpr, count: usize) {
+        let value = Arc::new(value);
+        let weak = Arc::downgrade(&value);
+        let mut context = WhnfContext::default();
+        bind_unused(&mut context, &value, count);
+        drop(value);
+        let input = identity_at_x();
+        let first = whnf(&input, &context, WhnfBudget::unlimited());
+        assert!(matches!(first, WhnfOutcome::Complete(_)), "{first:?}");
+        assert_eq!(remembered(&context), 0);
+        assert_eq!(whnf(&input, &context, WhnfBudget::unlimited()), first);
+        context.free_bindings.clear();
+        assert!(
+            weak.upgrade().is_none(),
+            "the memo retained an expired local"
+        );
+        assert_eq!(
+            normal_form(&input, &context),
+            ExprNode::Free { name: name("x") }
+        );
+        assert_eq!(remembered(&context), 1, "ordinary results still cache");
+    }
+
+    #[test]
+    fn unused_let_values_count_toward_the_memo_node_limit() {
+        const NODES: usize = 4096;
+        assert_unused_values_are_not_retained(
+            unused_value("held", NODES),
+            MAX_STORED_NODES / NODES + 1,
+        );
+    }
+
+    #[test]
+    fn unused_let_universes_count_even_when_expression_arenas_are_small() {
+        const LEVELS: usize = 4096;
+        let levels = vec![LevelNode::Parameter(name("u")); LEVELS];
+        let level_ids = (0..LEVELS)
+            .map(|index| LevelId::from_index(index).expect("small level index"))
+            .collect();
+        let value = WireExpr::from_parts(
+            vec![ExprNode::Constant {
+                name: name("held"),
+                levels: level_ids,
+            }],
+            levels,
+            ExprId::ZERO,
+        );
+        assert_unused_values_are_not_retained(value, MAX_STORED_NODES / LEVELS + 1);
+    }
+
+    #[test]
+    fn spare_literal_capacity_counts_toward_the_memo_byte_limit() {
+        const CAPACITY: usize = 1024 * 1024;
+        let mut text = String::with_capacity(CAPACITY);
+        text.push('x');
+        let value = WireExpr::from_parts(
+            vec![ExprNode::StringLiteral(text)],
+            Vec::new(),
+            ExprId::ZERO,
+        );
+        assert_unused_values_are_not_retained(value, MAX_STORED_BYTES / CAPACITY + 1);
+    }
+
+    #[test]
+    fn rotation_releases_old_let_values_at_the_aggregate_limit() {
+        const NODES: usize = 4096;
+        let count = MAX_STORED_NODES / (2 * NODES) + 1;
+        let mut context = WhnfContext::default();
+        let mut oldest = None;
+        for label in ["first", "second", "third"] {
+            let value = Arc::new(unused_value(label, NODES));
+            if oldest.is_none() {
+                oldest = Some(Arc::downgrade(&value));
+            }
+            bind_unused(&mut context, &value, count);
+            assert_eq!(
+                normal_form(&identity_at_x(), &context),
+                ExprNode::Free { name: name("x") }
+            );
+            context.free_bindings.clear();
+        }
+        assert!(oldest.unwrap().upgrade().is_none());
+        assert_eq!(remembered(&context), 2, "only two generations survive");
+        let tables = context.memo.0.lock().expect("the memo lock");
+        for table in [&tables.current, &tables.previous] {
+            assert!(table.stored_nodes <= MAX_STORED_NODES);
+            assert!(table.stored_bytes <= MAX_STORED_BYTES);
+        }
+    }
+
+    #[test]
+    fn retained_results_preserve_cold_outcomes_and_tight_budget_stops() {
+        let input = identity_at_x();
+        let context = WhnfContext::default();
+        let complete = whnf(&input, &context, WhnfBudget::unlimited());
+        let WhnfOutcome::Complete(result) = &complete else {
+            panic!("the control must reduce: {complete:?}");
+        };
+        assert_eq!(remembered(&context), 1);
+        let budgets = [
+            WhnfBudget::unlimited(),
+            WhnfBudget::new(result.steps - 1, u64::MAX, TermBudget::unlimited()),
+            WhnfBudget::new(u64::MAX, result.reductions - 1, TermBudget::unlimited()),
+            WhnfBudget::new(u64::MAX, u64::MAX, TermBudget::new(0, u64::MAX)),
+        ];
+        for budget in budgets {
+            assert_eq!(
+                whnf(&input, &context, budget),
+                whnf(&input, &WhnfContext::default(), budget),
+                "retention must not change the verdict or its fuel accounting"
+            );
+        }
+    }
+
     /// The same name bound to another value is another binding set: the result
     /// remembered under `x := a` must not answer for `x := b`, though the input
     /// and the binding names are the same.
@@ -733,5 +1015,203 @@ mod tests {
         context.push_scoped_binding(FreeBinding::new(name("x"), constant("a")));
         assert_eq!(normal_form(&term, &context), constant("a").nodes()[0]);
         assert_eq!(remembered(&context), 2);
+    }
+
+    /// The closed type-level beta redex `(fun X : Sort 1 => X) (Sort 0)`.
+    fn k_gate_beta_pair() -> (Arc<WireExpr>, Arc<WireExpr>) {
+        let domain = WireExpr::from_parts(
+            vec![
+                ExprNode::Sort { level: id_level(1) },
+                ExprNode::Bound { index: 0 },
+                ExprNode::Lambda {
+                    binder_name: name("X"),
+                    binder_type: id(0),
+                    body: id(1),
+                    style: BinderStyle::Default,
+                },
+                ExprNode::Sort {
+                    level: LevelId::ZERO,
+                },
+                ExprNode::Apply {
+                    function: id(2),
+                    argument: id(3),
+                },
+            ],
+            vec![LevelNode::Zero, LevelNode::Succ(LevelId::ZERO)],
+            id(4),
+        );
+        let result = WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: LevelId::ZERO,
+            }],
+            vec![LevelNode::Zero],
+            id(0),
+        );
+        (Arc::new(domain), Arc::new(result))
+    }
+
+    fn id_level(index: usize) -> LevelId {
+        LevelId::from_index(index).expect("small test level")
+    }
+
+    /// Run the actual conversion gate, including its outer budget check, without
+    /// a whole-term WHNF entry hiding the gate cache being exercised.
+    fn run_k_gate(
+        context: &WhnfContext,
+        domain: &Arc<WireExpr>,
+        result: &Arc<WireExpr>,
+        budget: WhnfBudget,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> (Result<bool, WhnfOutcome>, u64, u64) {
+        let mut control = Control::new(budget);
+        let prepared = match PreparedContext::prepare(context, &mut control, cancelled) {
+            Ok(prepared) => prepared,
+            Err(halt) => {
+                return (Err(outcome(Err(halt))), control.steps, control.reductions);
+            }
+        };
+        let mut reducer = Reducer {
+            context: prepared,
+            control,
+            cancelled,
+            unfolded_bindings: BTreeSet::new(),
+            acyclic_bindings: BTreeSet::new(),
+            delta_mode: DeltaMode::Eager,
+            head_nat: NatReductionScope::WhnfHead,
+            numeric_budget: None,
+            nat_progress: WhnfNatProgress::default(),
+            nat_pow_cap: None,
+            delta_reductions: 0,
+            discarded_reductions: 0,
+            discarded_delta_reductions: 0,
+            has_auxiliary_work: false,
+            string_progress: StringExpansionProgress::default(),
+            force_string_delta: false,
+            skip_nat: false,
+            facts: FastHashMap::default(),
+            string_expansions: FastHashMap::default(),
+            bodies: FastHashMap::default(),
+            keyed_thunks: FastHashMap::default(),
+            entry: None,
+            copied_result: false,
+        };
+        let answer = match reducer.k_constructor_types_convert(domain, result, 0) {
+            Ok(equal) => Ok(equal),
+            Err(halt) => Err(outcome(Err(halt))),
+        };
+        (answer, reducer.control.steps, reducer.control.reductions)
+    }
+
+    fn remembered_gates(context: &WhnfContext) -> usize {
+        let tables = context.memo.0.lock().expect("unpoisoned test memo");
+        tables.current.k_gate.values().map(Vec::len).sum::<usize>()
+            + tables.previous.k_gate.values().map(Vec::len).sum::<usize>()
+    }
+
+    #[test]
+    fn k_gate_materialization_limits_are_isolated_in_both_orders() {
+        let (domain, result) = k_gate_beta_pair();
+        let unlimited = WhnfBudget::unlimited();
+        let cold_full = run_k_gate(
+            &WhnfContext::default(),
+            &domain,
+            &result,
+            unlimited,
+            &mut || false,
+        );
+        assert_eq!(cold_full.0, Ok(true));
+        for materialization in [
+            TermBudget::new(0, u64::MAX),
+            TermBudget::new(u64::MAX, 0),
+            TermBudget::unlimited().with_max_arena_nodes(0),
+        ] {
+            let limited = WhnfBudget::new(u64::MAX, u64::MAX, materialization);
+            let context = WhnfContext::default();
+            let cold_limited = run_k_gate(&context, &domain, &result, limited, &mut || false);
+            assert_eq!(cold_limited.0, Ok(false));
+            assert_eq!(
+                remembered_gates(&context),
+                0,
+                "a resource stop must not become a cached negative answer"
+            );
+            assert_eq!(
+                run_k_gate(&context, &domain, &result, unlimited, &mut || false),
+                cold_full,
+                "a stopped attempt must not poison the larger-budget retry"
+            );
+            assert_eq!(remembered_gates(&context), 1);
+
+            let context = WhnfContext::default();
+            assert_eq!(
+                run_k_gate(&context, &domain, &result, unlimited, &mut || false),
+                cold_full
+            );
+            assert_eq!(
+                run_k_gate(&context, &domain, &result, limited, &mut || false),
+                cold_limited,
+                "a cached answer must not bypass smaller materialization limits"
+            );
+            assert_eq!(remembered_gates(&context), 1);
+        }
+    }
+
+    #[test]
+    fn k_gate_hits_replay_work_before_enforcing_the_outer_step_budget() {
+        let (domain, result) = k_gate_beta_pair();
+        let context = WhnfContext::default();
+        let full = run_k_gate(
+            &context,
+            &domain,
+            &result,
+            WhnfBudget::unlimited(),
+            &mut || false,
+        );
+        assert_eq!(full.0, Ok(true));
+        assert!(
+            full.1 > 1 && full.2 > 0,
+            "the gate must perform real conversion work"
+        );
+        assert_eq!(
+            run_k_gate(
+                &context,
+                &domain,
+                &result,
+                WhnfBudget::unlimited(),
+                &mut || false,
+            ),
+            full,
+            "a hit must replay both step and reduction charges"
+        );
+        let tight = WhnfBudget::new(full.1 - 1, u64::MAX, TermBudget::unlimited());
+        let cold = run_k_gate(
+            &WhnfContext::default(),
+            &domain,
+            &result,
+            tight,
+            &mut || false,
+        );
+        assert!(matches!(
+            &cold.0,
+            Err(WhnfOutcome::Inconclusive(WhnfStop::Resource {
+                limit: WhnfLimit::Steps,
+                ..
+            }))
+        ));
+        assert_eq!(
+            run_k_gate(&context, &domain, &result, tight, &mut || false),
+            cold,
+            "the cached gate must stop at the same limit with the same progress"
+        );
+        assert!(matches!(
+            run_k_gate(
+                &context,
+                &domain,
+                &result,
+                WhnfBudget::unlimited(),
+                &mut || true,
+            )
+            .0,
+            Err(WhnfOutcome::Inconclusive(WhnfStop::Cancelled { .. }))
+        ));
     }
 }

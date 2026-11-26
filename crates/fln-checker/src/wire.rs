@@ -88,6 +88,24 @@ impl WireName {
         self.parts.is_empty()
     }
 
+    /// Storage kept alive by this name, including unused string capacity.
+    /// Shared names are deliberately charged in full at each occurrence.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let part_bytes = self
+            .parts
+            .len()
+            .saturating_mul(std::mem::size_of::<NamePart>());
+        self.parts.iter().fold(
+            (2 * std::mem::size_of::<usize>()).saturating_add(part_bytes),
+            |bytes, part| {
+                bytes.saturating_add(match part {
+                    NamePart::Text(text) => text.capacity(),
+                    NamePart::Numeric { .. } => 0,
+                })
+            },
+        )
+    }
+
     pub(crate) fn from_parts(parts: Vec<NamePart>) -> WireName {
         WireName {
             parts: parts.into(),
@@ -385,11 +403,57 @@ impl std::hash::Hasher for WireExprHasher {
     }
 }
 
+/// Heap payload beyond the inline expression node. Arena capacities account
+/// for the inline storage separately; shared names are charged conservatively.
+fn expression_retained_bytes(node: &ExprNode) -> usize {
+    match node {
+        ExprNode::Bound { .. } | ExprNode::Sort { .. } | ExprNode::Apply { .. } => 0,
+        ExprNode::Free { name } | ExprNode::Meta { name } => name.retained_bytes(),
+        ExprNode::Constant { name, levels } => name.retained_bytes().saturating_add(
+            levels
+                .capacity()
+                .saturating_mul(std::mem::size_of::<LevelId>()),
+        ),
+        ExprNode::Lambda { binder_name, .. } | ExprNode::Forall { binder_name, .. } => {
+            binder_name.retained_bytes()
+        }
+        ExprNode::Let {
+            declaration_name, ..
+        } => declaration_name.retained_bytes(),
+        ExprNode::NatLiteral { limbs_le } => limbs_le
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u64>()),
+        ExprNode::StringLiteral(text) => text.capacity(),
+        ExprNode::Metadata { entries, .. } => entries.iter().fold(
+            entries
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(WireName, MetadataValue)>()),
+            |bytes, (name, value)| {
+                bytes
+                    .saturating_add(name.retained_bytes())
+                    .saturating_add(match value {
+                        MetadataValue::Text(text) => text.capacity(),
+                        MetadataValue::Name(name) => name.retained_bytes(),
+                        MetadataValue::Bool(_)
+                        | MetadataValue::Nat(_)
+                        | MetadataValue::Int(_)
+                        | MetadataValue::Syntax(_) => 0,
+                    })
+            },
+        ),
+        ExprNode::Projection { structure_name, .. } => structure_name.retained_bytes(),
+    }
+}
+
 struct WireExprData {
     nodes: Vec<ExprNode>,
     levels: Vec<LevelNode>,
     /// Immutable precomputed structural hash of `(nodes, levels)`.
     hash: u64,
+    /// Owned storage estimate for optional retention policies, never identity
+    /// or semantic fuel. Allocator metadata is not included; shared payloads
+    /// are conservatively charged at every occurrence.
+    retained_bytes: usize,
 }
 
 /// One independently decoded expression and all levels embedded in it.
@@ -454,6 +518,12 @@ impl WireExpr {
         self.root
     }
 
+    /// Storage retained by the immutable arena, including universe nodes,
+    /// payloads, and spare vector capacity. Reading this never walks the term.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.data.retained_bytes
+    }
+
     pub fn node(&self, id: ExprId) -> Option<&ExprNode> {
         self.data.nodes.get(id.index())
     }
@@ -473,11 +543,34 @@ impl WireExpr {
         nodes.hash(&mut hasher);
         levels.hash(&mut hasher);
         let hash = hasher.finish();
+        let node_bytes = nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ExprNode>());
+        let level_bytes = levels
+            .capacity()
+            .saturating_mul(std::mem::size_of::<LevelNode>());
+        let arena_bytes = std::mem::size_of::<WireExprData>()
+            .saturating_add(2 * std::mem::size_of::<usize>())
+            .saturating_add(node_bytes)
+            .saturating_add(level_bytes);
+        let retained_bytes = nodes.iter().fold(arena_bytes, |bytes, node| {
+            bytes.saturating_add(expression_retained_bytes(node))
+        });
+        let retained_bytes = levels.iter().fold(retained_bytes, |bytes, level| {
+            bytes.saturating_add(match level {
+                LevelNode::Parameter(name) | LevelNode::Meta(name) => name.retained_bytes(),
+                LevelNode::Zero
+                | LevelNode::Succ(_)
+                | LevelNode::Max(_, _)
+                | LevelNode::IMax(_, _) => 0,
+            })
+        });
         WireExpr {
             data: std::sync::Arc::new(WireExprData {
                 nodes,
                 levels,
                 hash,
+                retained_bytes,
             }),
             root,
         }
@@ -1439,4 +1532,100 @@ pub fn decode_expr_dag_with(
     mut cancelled: impl FnMut() -> bool,
 ) -> DecodeOutcome<WireExpr> {
     outcome(run_expr_dag(bytes, budget, &mut cancelled))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::hash::{Hash, Hasher};
+
+    fn padded_text(capacity: usize) -> String {
+        let mut text = String::with_capacity(capacity);
+        text.push('x');
+        text
+    }
+
+    fn padded_name(capacity: usize) -> WireName {
+        WireName::from_parts(vec![NamePart::Text(padded_text(capacity))])
+    }
+
+    fn fingerprint(term: &WireExpr) -> u64 {
+        let mut hasher = WireExprHasher::default();
+        term.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn spare_storage_changes_retention_but_not_expression_identity() {
+        let tight = WireExpr::from_parts(
+            vec![ExprNode::StringLiteral("x".to_owned())],
+            vec![LevelNode::Zero],
+            ExprId::ZERO,
+        );
+        let mut nodes = Vec::with_capacity(512);
+        nodes.push(ExprNode::StringLiteral(padded_text(4096)));
+        let mut levels = Vec::with_capacity(512);
+        levels.push(LevelNode::Zero);
+        let reserved = WireExpr::from_parts(nodes, levels, ExprId::ZERO);
+        assert_eq!(tight, reserved);
+        assert_eq!(fingerprint(&tight), fingerprint(&reserved));
+        assert!(reserved.retained_bytes() >= tight.retained_bytes() + 4095);
+        assert_eq!(reserved.clone().retained_bytes(), reserved.retained_bytes());
+    }
+
+    #[test]
+    fn retained_payloads_include_names_levels_literals_and_metadata() {
+        const CAPACITY: usize = 4096;
+        let mut limbs = Vec::with_capacity(CAPACITY);
+        limbs.push(42);
+        let numeric = WireExpr::from_parts(
+            vec![ExprNode::NatLiteral { limbs_le: limbs }],
+            Vec::new(),
+            ExprId::ZERO,
+        );
+        assert!(numeric.retained_bytes() >= CAPACITY * std::mem::size_of::<u64>());
+
+        let universe = WireExpr::from_parts(
+            vec![ExprNode::Sort {
+                level: LevelId::ZERO,
+            }],
+            vec![LevelNode::Parameter(padded_name(CAPACITY))],
+            ExprId::ZERO,
+        );
+        assert!(universe.retained_bytes() >= CAPACITY);
+
+        let mut arguments = Vec::with_capacity(CAPACITY);
+        arguments.push(LevelId::ZERO);
+        let constant = WireExpr::from_parts(
+            vec![ExprNode::Constant {
+                name: padded_name(CAPACITY),
+                levels: arguments,
+            }],
+            vec![LevelNode::Zero],
+            ExprId::ZERO,
+        );
+        assert!(constant.retained_bytes() >= CAPACITY * (1 + std::mem::size_of::<LevelId>()));
+
+        let metadata = WireExpr::from_parts(
+            vec![
+                ExprNode::Bound { index: 0 },
+                ExprNode::Metadata {
+                    entries: vec![
+                        (
+                            padded_name(CAPACITY),
+                            MetadataValue::Text(padded_text(CAPACITY)),
+                        ),
+                        (
+                            padded_name(CAPACITY),
+                            MetadataValue::Name(padded_name(CAPACITY)),
+                        ),
+                    ],
+                    expression: ExprId::ZERO,
+                },
+            ],
+            Vec::new(),
+            ExprId::from_index(1).expect("small index"),
+        );
+        assert!(metadata.retained_bytes() >= 4 * CAPACITY);
+    }
 }

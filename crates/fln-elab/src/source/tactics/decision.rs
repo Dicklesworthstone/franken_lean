@@ -163,6 +163,44 @@ impl Context {
         self.close_proof_goal(goal, value)
     }
 
+    pub(in crate::source) fn auxiliary_declarations_are_private(&self) -> bool {
+        self.private_auxiliary_declarations
+            || (self.source_scope.private_module.is_some()
+                && !self.source_scope.public_declarations)
+    }
+
+    /// Strip only this module's exact private prefix. Hygiene and generated
+    /// suffixes may contain numeric components, which must remain unchanged.
+    fn auxiliary_user_name(&mut self, name: &Name) -> Result<Name, NatDefinitionElabError> {
+        let Some(module) = self.source_scope.private_identity().cloned() else {
+            return Ok(name.clone());
+        };
+        let prefix = Name::num(Name::from_components(["_private"]).append_core(&module), 0);
+        let mut suffix = Vec::new();
+        let mut cursor = name.clone();
+        while cursor != prefix && !cursor.is_anonymous() {
+            self.tick()?;
+            suffix.push(cursor.clone());
+            cursor = cursor.parent();
+        }
+        if cursor != prefix {
+            return Ok(name.clone());
+        }
+        let mut user = Name::anonymous();
+        for component in suffix.into_iter().rev() {
+            self.tick()?;
+            user = match component.leaf_view() {
+                LeafView::Str(text) => Name::str(user, text),
+                LeafView::Num(value) if component.component_overflowed() => {
+                    Name::num_overflowing(user, value)
+                }
+                LeafView::Num(value) => Name::num(user, value),
+                LeafView::Anonymous => unreachable!("anonymous was excluded above"),
+            };
+        }
+        Ok(user)
+    }
+
     /// `mkAuxDeclName infix` (vendored Lean/CoreM.lean:149-153): the generator's next name that
     /// no constant has, keeping the index it reached.
     pub(super) fn aux_decl_name(&mut self, infix: &Name) -> Result<Name, NatDefinitionElabError> {
@@ -173,8 +211,29 @@ impl Context {
         let base = names.prefix.append_core(infix);
         loop {
             self.tick()?;
-            let name = names.current(&base);
-            if !self.txn.env.contains(&name) {
+            let generated = names.current(&base);
+            // `DeclNameGenerator.mkUniqueName` names auxiliaries of a hidden
+            // public body privately, independently of its public owner name.
+            let name = if self.private_auxiliary_declarations {
+                self.source_scope.private_name(&generated)
+            } else {
+                generated
+            };
+            let counterpart = if self.auxiliary_declarations_are_private() {
+                self.auxiliary_user_name(&name)?
+            } else {
+                self.source_scope.private_name(&name)
+            };
+            // Freshness ignores privacy. An exposed body's logical world may
+            // omit private declarations, so consult that checked predecessor
+            // only for name collisions, never for typing or reduction.
+            let conflict = [&self.txn.env]
+                .into_iter()
+                .chain(self.generated_name_environment.as_ref())
+                .any(|environment| {
+                    environment.contains(&name) || environment.contains(&counterpart)
+                });
+            if !conflict {
                 self.aux_names = Some(names);
                 return Ok(name);
             }
@@ -916,6 +975,32 @@ mod tests {
         // No generator: the declaration's route did not name one.
         context.aux_names = None;
         assert!(context.aux_decl_name(&infix).is_err());
+    }
+
+    #[test]
+    fn private_auxiliary_freshness_preserves_numeric_hygiene_components() {
+        let user = Name::str(Name::num(n("owner._@.Api"), 7), "_hyg");
+        let private_prefix = Name::num(n("_private.Api"), 0);
+        let taken = Name::str(user.clone(), "_proof_1");
+        let env = Environment::new()
+            .add_decl(fln_env::constants::ConstantInfo::Axiom(
+                fln_env::constants::AxiomVal {
+                    base: fln_env::constants::ConstantVal {
+                        name: taken,
+                        level_params: Vec::new(),
+                        type_: Expr::sort(Level::zero()),
+                    },
+                    is_unsafe: false,
+                },
+            ))
+            .unwrap();
+        let mut context = Context::new(&env, Budget::for_stack_bytes(2 * 1024 * 1024));
+        context.source_scope.private_module = Some(n("Api"));
+        context.aux_names = Some(AuxNames::new(private_prefix.append_core(&user), false));
+        assert_eq!(
+            context.aux_decl_name(&n("_proof")).unwrap(),
+            private_prefix.append_core(&Name::str(user, "_proof_2"))
+        );
     }
 
     #[test]

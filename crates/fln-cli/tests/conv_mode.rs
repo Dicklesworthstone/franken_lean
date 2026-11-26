@@ -1869,3 +1869,153 @@ example (a b c d : Nat) (h : a = b) : combine a c = combine b d := by
         "unsolved goals",
     ),
 ];
+
+/// Guard syntax lives in Init.Guard and keeps the same elaboration/comparison
+/// semantics in both tactic categories. The target is Conv.getLhs in conv mode.
+#[test]
+fn conv_guards_check_the_focus_and_live_locals_as_the_pin_does() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace("guards");
+    for (name, body) in CONV_GUARD_ACCEPTED {
+        let source = format!("prelude\nimport Init.Guard\n{body}");
+        std::fs::write(root.join(name), source).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!((code, stdout.as_str()), (0, ""), "{name}: {stdout}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 0, "{name}: {stdout}{stderr}");
+        assert!(stdout.is_empty(), "{name}: {stdout}{stderr}");
+    }
+}
+
+#[test]
+fn conv_guards_keep_mismatches_and_import_scope_visible() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace("guards-refused");
+    for (name, body, message) in CONV_GUARD_REFUSED {
+        let source = format!("prelude\nimport Init.Guard\n{body}");
+        std::fs::write(root.join(name), source).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!(code, 1, "{name}: the pin accepted: {stdout}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+        let diagnostic = format!("{stdout}{stderr}");
+        assert!(diagnostic.contains(message), "{name}: {diagnostic}");
+        assert!(
+            !diagnostic.contains("unsupported tactic") && !diagnostic.contains("parse refused"),
+            "{name}: {diagnostic}"
+        );
+    }
+    // Init.Conv alone has no Guard declarations. Neither parser category may
+    // gain these tactics merely because a builtin implementation exists.
+    for (name, guard) in [
+        ("TargetNotImported.lean", "guard_target = x"),
+        ("ExprNotImported.lean", "guard_expr x = x"),
+        ("HypNotImported.lean", "guard_hyp x : Nat"),
+    ] {
+        let source = format!(
+            "prelude\nimport Init.Conv\nexample (x : Nat) : x = x := by\n  conv => lhs; {guard}\n"
+        );
+        std::fs::write(root.join(name), source).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!(code, 1, "{name}: the pin accepted: {stdout}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+    }
+}
+
+const CONV_GUARD_ACCEPTED: &[(&str, &str)] = &[
+    (
+        "FocusedGuards.lean",
+        r#"example (x : Nat) : x = x := by
+  guard_target =ₛ (x = x)
+  let y := x
+  conv =>
+    guard_target = (x = x)
+    lhs
+    guard_target = x
+    guard_target =~ x
+    guard_target =ₛ x
+    guard_target =ₐ x
+    guard_expr x = x
+    guard_expr x =~ x
+    guard_expr x =ₛ x
+    guard_expr x =ₐ x
+    guard_hyp x : Nat
+    guard_hyp x :~ Nat
+    guard_hyp x :ₛ Nat
+    guard_hyp x :ₐ Nat
+    guard_hyp y : Nat := x
+    guard_hyp y :~ Nat :=~ x
+    guard_hyp y :ₛ Nat :=ₛ x
+    guard_hyp y :ₐ Nat :=ₐ x
+example : 7 = 7 := by conv => lhs; guard_target = 7
+"#,
+    ),
+    (
+        "GuardScopesAndRecovery.lean",
+        r#"example (x h : Nat) : x = x := by
+  let h := x
+  conv =>
+    lhs
+    guard_hyp h : Nat :=ₛ x
+    guard_expr h = x
+example (x y : Nat) : x = x := by
+  conv =>
+    lhs
+    first | guard_expr x = y | guard_target =ₛ x
+    fail_if_success guard_target = y
+    guard_target = (fun n : Nat => n) x
+    fail_if_success guard_target =ₛ (fun n : Nat => n) x
+    guard_expr (fun n : Nat => n) =ₐ (fun m : Nat => m)
+"#,
+    ),
+    (
+        "GuardTransparency.lean",
+        r#"def wrapped (x : Nat) : Nat := x
+example (x : Nat) : wrapped x = x := by
+  conv =>
+    lhs
+    fail_if_success guard_target = x
+    guard_target =~ x
+    guard_target =ₛ wrapped x
+    fail_if_success guard_expr wrapped x = x
+    guard_expr wrapped x =~ x
+  rfl
+"#,
+    ),
+];
+
+const CONV_GUARD_REFUSED: &[(&str, &str, &str)] = &[
+    (
+        "FocusMismatch.lean",
+        "example (x y : Nat) : x = x := by conv => lhs; guard_target = y\n",
+        "guard_target: the main goal is not what it was expected to be",
+    ),
+    (
+        "ExpressionMismatch.lean",
+        "example (x y : Nat) : x = x := by conv => lhs; guard_expr x =~ y\n",
+        "guard_expr: the two terms do not match",
+    ),
+    (
+        "HypothesisMismatch.lean",
+        "example (x : Nat) : x = x := by conv => lhs; guard_hyp x : Prop\n",
+        "guard_hyp: hypothesis `x` has a different type",
+    ),
+    (
+        "LetValueMismatch.lean",
+        "example (x y : Nat) : x = x := by\n  let z := x\n  conv => lhs; guard_hyp z := y\n",
+        "guard_hyp: hypothesis `z` has a different value",
+    ),
+    (
+        "GuardsLeaveTheGoal.lean",
+        "example (x y : Nat) : x = y := by conv => lhs; guard_target = x\n",
+        "unsolved goals",
+    ),
+];

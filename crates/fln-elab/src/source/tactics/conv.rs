@@ -190,7 +190,7 @@ impl Context {
     }
 
     /// A conv goal's sides: `(u, α, lhs, rhs)` of its target `@Eq.{u} α lhs rhs`.
-    fn conv_sides(
+    pub(super) fn conv_sides(
         &mut self,
         goal: &ProofGoal,
     ) -> Result<(Level, Expr, Expr, Expr), NatDefinitionElabError> {

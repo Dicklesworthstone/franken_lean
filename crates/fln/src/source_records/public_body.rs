@@ -2,7 +2,157 @@
 //! The caller holds both successors until their metadata replay is atomic.
 use super::*;
 
+/// The same auxiliary candidates are checked in the selected body world.
+/// Public theorem interfaces come only from successful body admissions.
+pub(super) struct PublicAuxiliaries {
+    pub(super) public: DeclarationBatchAdmission,
+    pub(super) private: DeclarationBatchAdmission,
+}
+
+/// Keep owner-specific metadata and helper processing on the owner's batch.
+/// Its checked predecessors join the receipt only when the command succeeds.
+pub(super) fn prepend_auxiliaries(
+    mut owner: DeclarationBatchAdmission,
+    prefix: DeclarationBatchAdmission,
+) -> DeclarationBatchAdmission {
+    owner.base_logical_root = prefix.base_logical_root;
+    owner.admissions.splice(0..0, prefix.admissions);
+    owner
+}
+
 impl Engine {
+    /// An absent predecessor is an identity transition, not an empty request
+    /// to the public declaration-admission API, which deliberately rejects one.
+    fn admit_auxiliary_prefix(
+        &self,
+        declarations: &[Declaration],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        if declarations.is_empty() {
+            let root = self.logical_root(options);
+            return Ok(Outcome::Complete(DeclarationBatchAdmission {
+                engine: self.clone(),
+                base_logical_root: root,
+                result_logical_root: root,
+                admissions: Vec::new(),
+                local_instance: None,
+                local_symm: Vec::new(),
+            }));
+        }
+        self.admit_declarations(declarations, options, limits)
+            .map_err(EngineExecutionError::from)
+    }
+
+    /// Hidden bodies keep every auxiliary private. Exposed bodies first check
+    /// the complete auxiliary proofs in the public predecessor, then admit
+    /// their public interfaces as the pin's AddDecl.addDeclCore does. The
+    /// private successor always retains the actual independently checked proof.
+    pub(super) fn admit_public_auxiliaries(
+        &self,
+        public: &Engine,
+        declarations: &[Declaration],
+        hidden: bool,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<PublicAuxiliaries>, EngineExecutionError> {
+        let private = match self.admit_auxiliary_prefix(declarations, options, limits)? {
+            Outcome::Complete(checked) => checked,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let mut interfaces = Vec::new();
+        if !hidden && !declarations.is_empty() {
+            let checked = match public.admit_declarations(declarations, options, limits)? {
+                Outcome::Complete(checked) => checked,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            for admitted in checked.admissions {
+                interfaces.push(match admitted.declaration {
+                    Declaration::Thm(theorem) => Declaration::Axiom(AxiomVal {
+                        base: theorem.base,
+                        is_unsafe: false,
+                    }),
+                    Declaration::Axiom(axiom) => Declaration::Axiom(axiom),
+                    _ => {
+                        return Err(EngineExecutionError::UnexpectedPublication {
+                            detail: "source proof auxiliaries must preserve theorem or native axiom kind",
+                        });
+                    }
+                });
+            }
+        }
+        let public = match public.admit_auxiliary_prefix(&interfaces, options, limits)? {
+            Outcome::Complete(checked) => checked,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        Ok(Outcome::Complete(PublicAuxiliaries { public, private }))
+    }
+
+    /// Exposed data keeps its checked value in both worlds. Auxiliary theorem
+    /// bodies still remain private: the public owner checks against their
+    /// admitted signatures, while private replay retains their actual proofs.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn admit_exposed_public_candidate(
+        &self,
+        public: &Engine,
+        syntax: &fln_syntax::tree::Syntax,
+        candidate: fln_elab::source::ElaboratedDeclaration,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        public_scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<PublicSourceAdmission>, EngineExecutionError> {
+        let auxiliaries = match self.admit_public_auxiliaries(
+            public,
+            &candidate.auxiliary_declarations,
+            false,
+            options,
+            limits,
+        )? {
+            Outcome::Complete(checked) => checked,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let public = match auxiliaries.public.engine.admit_scoped_candidate(
+            syntax,
+            candidate.declaration,
+            candidate.irreducible,
+            candidate.equation_info,
+            candidate.noncomputable,
+            candidate.local_functions,
+            options,
+            limits,
+            public_scope,
+        )? {
+            Outcome::Complete(checked) => checked,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let declarations: Vec<_> = public
+            .admissions
+            .iter()
+            .map(|admitted| admitted.declaration.clone())
+            .collect();
+        let private =
+            match auxiliaries
+                .private
+                .engine
+                .admit_declarations(&declarations, options, limits)?
+            {
+                Outcome::Complete(checked) => checked,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+        // PublicWorld replays the owner's metadata after both successors have
+        // succeeded. Reapplying it here would duplicate instance/simp histories.
+        Ok(Outcome::Complete(PublicSourceAdmission {
+            public: prepend_auxiliaries(public, auxiliaries.public),
+            private_implementation: Some(prepend_auxiliaries(private, auxiliaries.private)),
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn admit_hidden_public_definition(
         &self,
@@ -135,7 +285,17 @@ impl Engine {
         limits: EngineAdmissionLimits,
         public_scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<PublicSourceAdmission>, EngineExecutionError> {
-        let mut private_implementation = match self
+        let auxiliaries = match self.admit_auxiliary_prefix(
+            &candidate.auxiliary_declarations,
+            options,
+            limits,
+        )? {
+            Outcome::Complete(checked) => checked,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let mut private_implementation = match auxiliaries
+            .engine
             .admit_declarations(&[candidate.declaration], options, limits)
             .map_err(EngineExecutionError::from)?
         {
@@ -210,6 +370,7 @@ impl Engine {
             base: base.clone(),
             is_unsafe,
         });
+        let private_implementation = prepend_auxiliaries(private_implementation, auxiliaries);
         Ok(
             match public.admit_scoped_candidate(
                 syntax,

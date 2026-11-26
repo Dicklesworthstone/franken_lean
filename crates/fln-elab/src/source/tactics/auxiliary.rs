@@ -25,9 +25,9 @@ impl Context {
         goal: &ProofGoal,
         body: &'a Syntax,
     ) -> Result<ProofState<'a>, NatDefinitionElabError> {
-        if !self.allow_auxiliary_declarations {
+        if !self.allow_auxiliary_declarations || self.aux_names.is_none() {
             return Err(error(TacticError::AuxLemmaUnsupported(
-                "an entry point that does not return auxiliary declarations",
+                "an entry point or declaration header that does not return auxiliary declarations",
             )));
         }
         self.txn.lctx = goal.lctx.clone();
@@ -177,8 +177,7 @@ impl Context {
         let renamed: Vec<_> = levels.iter().cloned().map(Level::param).collect();
         term.type_ = self.instantiate_params(&term.type_, &parameters, &renamed)?;
         term.value = self.instantiate_params(&term.value, &parameters, &renamed)?;
-        let private =
-            self.source_scope.private_module.is_some() && !self.source_scope.public_declarations;
+        let private = self.auxiliary_declarations_are_private();
         let mut cached = None;
         for index in 0..self.aux_lemma_cache.0.len() {
             self.tick()?;

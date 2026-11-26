@@ -66,7 +66,6 @@ impl Context {
             return Err(error(TacticError::MalformedScript));
         };
         expect_atom(keyword, "guard_hyp", "guard_hyp keyword")?;
-        self.require_declared_tactic(&["Lean", "Parser", "Tactic", "guardHyp"])?;
         let type_clause = clause(type_slot, false)?;
         let value_clause = clause(value_slot, true)?;
         self.txn.lctx = goal.lctx.clone();
