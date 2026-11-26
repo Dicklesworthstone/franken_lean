@@ -570,3 +570,53 @@ fn resource_exhaustion_during_signature_analysis_is_a_nonanswer() {
     missing(&source, "lcAny");
     accepted(&format!("prelude\n{MARKERS}{POLY}"));
 }
+
+#[test]
+fn inductive_constructor_fields_and_trivial_structure_unboxing_require_markers() {
+    // Concrete/nullary/arrow constructor fields need neither marker.
+    for source in [
+        "prelude\ninductive Empty : Type\n",
+        "prelude\ninductive True : Prop | intro\n",
+        "prelude\nuniverse u\ninductive Phantom (A : Type u) | mk\n",
+        "prelude\nuniverse u\ninductive MyEq {α : Sort u} (a : α) : α → Prop | refl : MyEq a a\n",
+        "prelude\ninductive E | a\ninductive Wrap | mk (e : E)\n",
+        "prelude\ninductive E | a\ninductive Fn | mk (f : E → E)\n",
+        "prelude\nuniverse u\ninductive PolyFn (A : Type u) | mk (f : A → A)\n",
+        "prelude\nuniverse u\naxiom lcAny : Type\ninductive Box (A : Type u) | mk (val : A)\n",
+        "prelude\nuniverse u\naxiom lcAny : Type\nstructure Box (A : Type u) where val : A\n",
+        "prelude\nuniverse u\naxiom lcAny : Type\nstructure Pair (A : Type u) (B : Type u) where\n  fst : A\n  snd : B\n",
+        "prelude\nuniverse u\naxiom lcAny : Type\nstructure A (T : Type u) where x : T\nstructure B (T : Type u) extends A T where y : T\n",
+    ] {
+        accepted(source);
+    }
+
+    // Polymorphic constructor fields require `lcAny`, even for `Prop` inductives
+    // and inside `noncomputable section` (`compileInductives` runs unconditionally).
+    for source in [
+        "prelude\nuniverse u\ninductive Box (A : Type u) | mk (val : A)\n",
+        "prelude\nuniverse u\ninductive BoxP (A : Type u) : Prop | mk (val : A)\n",
+        "prelude\nuniverse u\nnoncomputable section\ninductive Box (A : Type u) | mk (val : A)\nend\n",
+        "prelude\nuniverse u\nstructure Box (A : Type u) where val : A\n",
+        "prelude\nuniverse u\nnoncomputable section\nstructure Box (A : Type u) where val : A\nend\n",
+        "prelude\nuniverse u\ninductive Exists {α : Sort u} (p : α → Prop) : Prop | intro (w : α) (h : p w)\n",
+        "prelude\nuniverse u\nmutual\ninductive A (T : Type u) | mk (b : B T)\ninductive B (T : Type u) | mk (x : T)\nend\n",
+    ] {
+        missing(source, "lcAny");
+    }
+
+    // Erased constructor fields (`Prop` / `Type`), trivial-structure unboxing
+    // (`Wrap Type`), and copied diamond parent projections require `lcErased`.
+    for source in [
+        "prelude\ninductive P : Prop | intro\ninductive Hold | mk (h : P)\n",
+        "prelude\ninductive Hold | mk (A : Type)\n",
+        "prelude\ninductive Hold (P : Prop) | mk (h : P)\n",
+        "prelude\ninductive E | a\ninductive Dep (P : E → Prop) | mk (h : (e : E) → P e)\n",
+        "prelude\nuniverse u\ninductive Exist | mk (A : Type u) (x : A)\n",
+        "prelude\nuniverse u\naxiom lcAny : Type\ninductive Exists {α : Sort u} (p : α → Prop) : Prop | intro (w : α) (h : p w)\n",
+        "prelude\naxiom lcAny : Type\ninductive Wrap (A : Type 1) | mk (x : A)\ninductive Hold | mk (w : Wrap Type)\n",
+        "prelude\naxiom lcAny : Type\ninductive E | a\ninductive Wrap (A : Type 1) | mk (x : A)\ndef f (w : Wrap Type) : E := E.a\n",
+        "prelude\nuniverse u\naxiom lcAny : Type\nstructure A (T : Type u) where x : T\nstructure B (T : Type u) extends A T where y : T\nstructure C (T : Type u) extends A T where z : T\nstructure D (T : Type u) extends B T, C T where w : T\n",
+    ] {
+        missing(source, "lcErased");
+    }
+}
