@@ -11,6 +11,49 @@ pub(super) struct Parts<'a> {
     pub local: bool,
 }
 
+/// The pin's `cleanupOfNat` (Lean/Elab/MutualDef.lean) rewrites the index
+/// only within an instance result type, after header synthesis and before
+/// closing over its parameters. The dictionary is deliberately not reduced.
+pub(super) fn cleanup_of_nat(
+    context: &mut Context,
+    result: &Expr,
+) -> Result<Expr, NatDefinitionElabError> {
+    let of_nat = Name::from_components(["OfNat"]);
+    let method = Name::from_components(["OfNat", "ofNat"]);
+    let nat = Name::from_components(["Nat"]);
+    let (result, _) = context.transform_subterms(result, |context, term| {
+        let ExprNode::App { f: class, a: index } = term.node() else {
+            return Ok(None);
+        };
+        if !matches!(class.node(), ExprNode::App { f, .. }
+            if matches!(f.node(), ExprNode::Const { name, .. } if name == &of_nat))
+        {
+            return Ok(None);
+        }
+        let index = context.instantiate(index)?;
+        // OfNat.ofNat Nat n inst: retain n, even if it is an expression.
+        let ExprNode::App { f: indexed, .. } = index.node() else {
+            return Ok(None);
+        };
+        let ExprNode::App {
+            f: specialized,
+            a: n,
+        } = indexed.node()
+        else {
+            return Ok(None);
+        };
+        if matches!(specialized.node(), ExprNode::App { f, a }
+            if matches!(f.node(), ExprNode::Const { name, .. } if name == &method)
+            && matches!(a.node(), ExprNode::Const { name, .. } if name == &nat))
+        {
+            Ok(Some(Expr::app(class.clone(), n.clone())))
+        } else {
+            Ok(None)
+        }
+    })?;
+    Ok(result)
+}
+
 /// The pin exposes data instances automatically, while a proof instance needs
 /// its own `expose` attribute. An expose section only supplies a default for
 /// ordinary definitions, and `no_expose` wins over either exposure source.

@@ -104,6 +104,43 @@ fn generated_numeral(source: &str, spelling: &str) -> Syntax {
 }
 
 #[test]
+fn instance_result_types_cleanup_ofnat_indices_as_in_upstream_1389() {
+    let source = include_str!("../../../vendor/lean4-src/tests/elab/1389.lean");
+    let result = checked(&base(), source);
+    let nested = checked(
+        &result.engine,
+        r#"
+class Holder (T : Type) where
+  val : T
+instance wrapped : Holder (OfNat Bit 0) := Holder.mk inst0
+def ordinary : OfNat Bit 0 := inst0
+"#,
+    );
+    let type_of = |name| {
+        nested
+            .engine
+            .environment()
+            .find(&Name::from_components([name]))
+            .unwrap()
+            .constant_val()
+            .type_
+            .clone()
+    };
+    let index = |term| {
+        let (head, args) = application(term);
+        constant(&head, "OfNat");
+        args[1].clone()
+    };
+    let zero = Expr::lit(Literal::Nat(NatLit::from_u64(0)));
+    assert_eq!(index(type_of("inst0")), zero);
+    let (head, args) = application(type_of("wrapped"));
+    constant(&head, "Holder");
+    assert_eq!(index(args[0].clone()), zero);
+    let (head, _) = application(index(type_of("ordinary")));
+    constant(&head, "OfNat.ofNat");
+}
+
+#[test]
 fn generated_numerals_keep_their_value_and_ordinary_dictionary_admission() {
     let base = base();
     let options = KVMap::new();

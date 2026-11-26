@@ -450,6 +450,154 @@ fn builtin_command_operands_reenter_the_imported_grammar_with_original_source_po
     assert!(executed.states.is_some());
 }
 
+const MUTUAL_COMMAND_SOURCE: &str = r#"prelude
+import SourceLibrary
+declare! (
+  mutual
+    def first : Bool + Nat := 3 + second
+    def second : Bool + Nat := 7 + 11
+  end)
+theorem verified : first = 11 := by rfl
+"#;
+
+#[test]
+fn imported_custom_commands_admit_mutual_groups_once_with_both_hygiene_modes() {
+    let (imported, code) = command_fixture(Payload::BuiltinCommand, Some(2));
+    let before = imported.engine.logical_root(&KVMap::new());
+    for command_hygiene in [false, true] {
+        let report = if command_hygiene {
+            check_with_command_hygiene(&imported, &code, MUTUAL_COMMAND_SOURCE)
+        } else {
+            check(
+                &imported,
+                &code,
+                &[("Main", MUTUAL_COMMAND_SOURCE)],
+                MacroTreeLimits::default(),
+                None,
+            )
+        };
+        let checked = &succeeded(&report).checked;
+        assert_eq!(checked.theorems, 1);
+        assert_declared_value(&checked.engine, "first", 11);
+        assert_declared_value(&checked.engine, "second", 11);
+        assert_eq!(
+            report
+                .attempts
+                .iter()
+                .filter(|attempt| attempt.declaration == name("SourceLibrary.commandMacro"))
+                .count(),
+            1,
+            "the complete command expands once before its members are checked"
+        );
+        assert_eq!(report.attempts.len(), 9);
+        assert!(report.completed_vm_usage.steps > 0);
+    }
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    for declaration in ["first", "second", "verified"] {
+        assert!(!imported.engine.environment().contains(&name(declaration)));
+    }
+}
+
+#[test]
+fn imported_custom_command_mutual_groups_reach_program_execution() {
+    let (imported, code) = command_fixture(Payload::BuiltinCommand, Some(2));
+    let before = imported.engine.logical_root(&KVMap::new());
+    let declarations = users(&code);
+    let compilation =
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let source = format!("{MUTUAL_COMMAND_SOURCE}\n#eval first");
+    let report = execute_graph(
+        &imported,
+        compilation,
+        &[("Main", &source)],
+        crate::source_check::modules::execution::SourceProgramLimits::new(execution_limits()),
+        MacroRegistryLimits::default(),
+        None,
+    );
+    let Outcome::Complete(Ok(program)) = &report.outcome else {
+        panic!("{report:?}")
+    };
+    let batch = &program.modules[0].commands.batch;
+    assert_eq!(batch.source_evaluation_indices.len(), 1);
+    let index = batch.source_evaluation_indices[0];
+    assert_eq!(
+        crate::closed_vm_value(&batch.executions[index].exit)
+            .unwrap()
+            .unwrap(),
+        crate::ClosedVmValue::Scalar(11)
+    );
+    assert!(batch.engine.environment().contains(&name("first")));
+    assert!(batch.engine.environment().contains(&name("second")));
+    assert_eq!(report.attempts.len(), 9);
+    assert!(report.states.is_some());
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn imported_custom_command_mutual_groups_reject_late_errors_and_share_all_budgets() {
+    let (imported, code) = command_fixture(Payload::BuiltinCommand, Some(2));
+    let before = imported.engine.logical_root(&KVMap::new());
+    for group in [
+        "def first : Nat := 42\n    def second : Nat := True",
+        "theorem first : True := True.intro\n    theorem second : False := True.intro",
+        "def first : Nat := 42\n    theorem second : True := True.intro",
+    ] {
+        let source = format!(
+            "prelude\nimport SourceLibrary\ndef checkedPrefix : Nat := 7\n\
+             declare! (\n  mutual\n    {group}\n  end)"
+        );
+        for report in [
+            check(
+                &imported,
+                &code,
+                &[("Main", &source)],
+                MacroTreeLimits::default(),
+                None,
+            ),
+            check_with_command_hygiene(&imported, &code, &source),
+        ] {
+            assert!(
+                matches!(report.outcome, Outcome::Complete(Err(_))),
+                "{report:?}"
+            );
+            assert!(report.states.is_none());
+        }
+    }
+
+    let files = [("Main", MUTUAL_COMMAND_SOURCE)];
+    let complete = check(&imported, &code, &files, MacroTreeLimits::default(), None);
+    let expected = succeeded(&complete).checked.result_logical_root;
+    let mut exact = MacroTreeLimits::default();
+    exact.dispatch.max_attempts = complete.attempts.len() as u64;
+    exact.dispatch.execution.vm.max_steps = complete.completed_vm_usage.steps;
+    exact.max_visits = complete.tree_usage.visits;
+    exact.generation.max_nodes = complete.tree_usage.generated_nodes;
+    exact.generation.max_bytes = complete.tree_usage.generated_bytes;
+    let replay = check(&imported, &code, &files, exact, None);
+    assert_eq!(succeeded(&replay).checked.result_logical_root, expected);
+    for resource in ["attempts", "steps", "visits", "nodes", "bytes"] {
+        let mut limits = exact;
+        match resource {
+            "attempts" => limits.dispatch.max_attempts -= 1,
+            "steps" => limits.dispatch.execution.vm.max_steps -= 1,
+            "visits" => limits.max_visits -= 1,
+            "nodes" => limits.generation.max_nodes -= 1,
+            "bytes" => limits.generation.max_bytes -= 1,
+            _ => unreachable!(),
+        }
+        let stopped = check(&imported, &code, &files, limits, None);
+        assert!(
+            matches!(stopped.outcome, Outcome::Inconclusive(_)),
+            "{resource}: {stopped:?}"
+        );
+        assert!(stopped.states.is_none(), "{resource}");
+    }
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    for declaration in ["checkedPrefix", "first", "second", "verified"] {
+        assert!(!imported.engine.environment().contains(&name(declaration)));
+    }
+}
+
 #[test]
 fn custom_command_scopes_restore_and_do_not_escape_source_modules() {
     let (imported, code) = command_fixture(Payload::Definition, Some(2));

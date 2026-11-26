@@ -1035,16 +1035,19 @@ impl ParsedSourceCommand {
     /// The caller must establish the original command's parser and macro
     /// registrations before expanding it. Unlike [`Self::with_expanded_declaration`],
     /// its original root may be a custom command kind, but its result must be
-    /// one canonical named declaration or anonymous example. An example changes
-    /// the command kind so that its checked successor is discarded. Queries,
-    /// scope controls and command sequences cannot cross this boundary. The
+    /// one canonical named declaration, anonymous example or supported mutual
+    /// group. An example changes the command kind so that its checked successor
+    /// is discarded. Queries, scope controls and arbitrary command sequences
+    /// cannot cross this boundary. The
     /// original source view and epilogue survive; the ordinary checker still
     /// validates the complete replacement tree.
     pub fn with_expanded_command_declaration(mut self, syntax: Syntax) -> Option<Self> {
         if self.kind != SourceCommandKind::Definition {
             return None;
         }
-        self.kind = if is_named_declaration_syntax(&syntax) {
+        self.kind = if is_named_declaration_syntax(&syntax)
+            || command_scope::mutual::syntax_members(&syntax).is_some()
+        {
             SourceCommandKind::Definition
         } else if is_example_declaration_syntax(&syntax) {
             SourceCommandKind::Example
@@ -1053,6 +1056,37 @@ impl ParsedSourceCommand {
         };
         self.syntax = syntax;
         Some(self)
+    }
+
+    /// Retain a supported mutual group's original source metadata while
+    /// expanding its members. Both trees must remain canonical mutual groups;
+    /// declarations, examples and queries cannot acquire group authority.
+    pub fn with_expanded_mutual(mut self, syntax: Syntax) -> Option<Self> {
+        if self.kind == SourceCommandKind::Definition
+            && command_scope::mutual::syntax_members(&self.syntax).is_some()
+            && command_scope::mutual::syntax_members(&syntax).is_some()
+        {
+            self.syntax = syntax;
+            return Some(self);
+        }
+        None
+    }
+
+    /// Transfer a supported mutual group's untrusted members to atomic
+    /// declaration checking without cloning or reparsing the expansion.
+    pub fn into_mutual(mut self) -> Option<Vec<Syntax>> {
+        if self.kind != SourceCommandKind::Definition
+            || command_scope::mutual::syntax_members(&self.syntax).is_none()
+        {
+            return None;
+        }
+        let Syntax::Node { args, .. } = &mut self.syntax else {
+            return None;
+        };
+        let Syntax::Node { args: members, .. } = args.get_mut(1)? else {
+            return None;
+        };
+        Some(std::mem::take(members))
     }
 
     /// Replace an anonymous example's complete syntax while retaining its
@@ -1079,8 +1113,8 @@ impl ParsedSourceCommand {
 
     /// This command with the entered grammar's notations expanded, as
     /// [`ParsedDefinition::expanded`]; its query term's text stays the source's.
-    /// An active native command macro transfers only a single canonical
-    /// declaration or example to the appropriate checked command kind.
+    /// An active native command macro transfers a canonical declaration,
+    /// example or supported mutual group to its ordinary checked command path.
     pub fn expanded(mut self) -> Result<ParsedSourceCommand, NatDefinitionParseError> {
         let command_macro = self.kind == SourceCommandKind::Definition
             && extensions::is_active_command_macro(&self.syntax);
@@ -6653,7 +6687,56 @@ mod nat_definition_tests {
             source
         );
 
+        let mutual = command_scope::mutual::tree(
+            b"mutual\ndef first : Nat := second\ndef second : Nat := 42\nend",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            parsed
+                .clone()
+                .with_expanded_mutual(mutual.clone())
+                .is_none(),
+            "only the command-macro boundary may grant group authority"
+        );
+        let expanded = parsed
+            .clone()
+            .with_expanded_command_declaration(mutual.clone())
+            .unwrap();
+        assert_eq!(expanded.kind(), SourceCommandKind::Definition);
+        assert_eq!(expanded.source_view(), parsed.source_view());
+        assert_eq!(expanded.epilogue(), parsed.epilogue());
+        assert_eq!(expanded.reconstruct_original(), source);
+        assert!(expanded.clone().into_definition().is_none());
+        assert_eq!(
+            expanded.clone().into_mutual().unwrap().as_slice(),
+            command_scope::mutual::syntax_members(&mutual).unwrap()
+        );
+        assert!(
+            expanded
+                .clone()
+                .with_expanded_mutual(mutual.clone())
+                .is_some()
+        );
+        assert!(
+            expanded
+                .clone()
+                .with_expanded_mutual(declaration.clone())
+                .is_none()
+        );
+        assert!(
+            expanded
+                .with_expanded_declaration(declaration.clone())
+                .is_none()
+        );
+
         let example = parse_source_command(b"example : Nat := 42").unwrap();
+        assert!(
+            example
+                .clone()
+                .with_expanded_command_declaration(mutual.clone())
+                .is_none()
+        );
         let expanded = parsed
             .clone()
             .with_expanded_command_declaration(example.syntax().clone())
@@ -6685,6 +6768,13 @@ mod nat_definition_tests {
 
         for source in [b"#check Nat".as_slice(), b"#eval 42"] {
             let other = parse_source_command(source).unwrap();
+            assert!(other.clone().with_expanded_mutual(mutual.clone()).is_none());
+            assert!(
+                other
+                    .clone()
+                    .with_expanded_command_declaration(mutual.clone())
+                    .is_none()
+            );
             assert!(
                 other
                     .clone()

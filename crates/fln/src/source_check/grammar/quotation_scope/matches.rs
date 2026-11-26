@@ -172,6 +172,27 @@ fn patterns(
                 tasks.push(Walk::Copy(open));
             }
             Walk::Pattern(node @ Syntax::Node { kind, args, .. })
+                if *kind == Name::from_components(["term_+_"]) =>
+            {
+                let [pattern, plus, offset] = args.as_slice() else {
+                    return Err(unsupported_binder());
+                };
+                if !atom(plus, &["+"])
+                    || !matches!(offset, Syntax::Node { kind, args, .. }
+                        if *kind == Name::from_components(["num"])
+                            && args.len() == 1
+                            && matches!(args[0], Syntax::Atom { .. }))
+                {
+                    return Err(unsupported_binder());
+                }
+                // A numeral offset does not bind a second pattern. Its left
+                // pattern owns the variables used by the equation's body.
+                tasks.push(Walk::Build(node, 3));
+                tasks.push(Walk::Copy(offset));
+                tasks.push(Walk::Copy(plus));
+                tasks.push(Walk::Pattern(pattern));
+            }
+            Walk::Pattern(node @ Syntax::Node { kind, args, .. })
                 if term_kind(kind, "hole") && args.len() == 1 && atom(&args[0], &["_"]) =>
             {
                 built.push(node.clone());
@@ -303,6 +324,24 @@ pub(super) fn schedule<'a>(
     }
     tasks.push(Task::Copy(keyword));
     Ok(())
+}
+
+/// Equation clauses infer their pattern arity from the first row. The shared
+/// scheduler checks that every subsequent row has exactly the same width.
+pub(super) fn equation_columns(alternatives: &Syntax) -> Result<usize, EngineExecutionError> {
+    let [alt_list] = term_args(alternatives, "matchAlts")? else {
+        return Err(unsupported_binder());
+    };
+    let first = null_args(alt_list)?
+        .first()
+        .ok_or_else(unsupported_binder)?;
+    let [_, rows, _, _] = term_args(first, "matchAlt")? else {
+        return Err(unsupported_binder());
+    };
+    let row = separated(rows, "|")?
+        .first()
+        .ok_or_else(unsupported_binder)?;
+    Ok(separated(row, ",")?.len().div_ceil(2))
 }
 
 /// Match expressions, do matches and pattern catch handlers share one

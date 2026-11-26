@@ -188,6 +188,53 @@ fn nullary_defaults_keep_the_native_heap_list_representation() {
 }
 
 #[test]
+fn flat_case_width_consumes_blocks_without_consuming_nesting_depth() {
+    let mut arms: Vec<_> = (0..140)
+        .map(|tag| IrAlt::Ctor {
+            info: info(tag, 0),
+            body: ir_body(
+                vec![number(2 + tag, 5 + 3 * tag)],
+                IrTerminal::Ret(IrArg::Var(2 + tag)),
+            ),
+        })
+        .collect();
+    arms.push(IrAlt::Default {
+        body: ir_body(vec![number(142, 99)], IrTerminal::Ret(IrArg::Var(142))),
+    });
+    let entry = body_function(
+        "LocalCase.many",
+        1,
+        ir_body(
+            vec![],
+            IrTerminal::Case {
+                type_name: name("LocalCase.Wide"),
+                x: 1,
+                x_type: IrType::TObject,
+                alts: arms,
+            },
+        ),
+    );
+    let run =
+        |tag, limits| compile_users(vec![entry.clone()], "LocalCase.many", &[nat(tag)], limits);
+    let mut limits = IrExecutionLimits::default();
+    limits.ir.max_depth = 8;
+    for (tag, expected) in [
+        (0, "5"),
+        (69, "212"),
+        (128, "389"),
+        (139, "422"),
+        (140, "99"),
+    ] {
+        assert_native_owned_result(&run(tag, limits).unwrap(), expected);
+    }
+    limits.fir.max_blocks = 128;
+    assert!(matches!(
+        run(139, limits),
+        Err(IrExecutionError::Limit("lowered blocks"))
+    ));
+}
+
+#[test]
 fn selected_cases_do_not_run_the_default_and_stopped_dispatch_can_retry() {
     let compiled = compile_users(
         vec![packet_case(ir_body(Vec::new(), IrTerminal::Unreachable))],
@@ -253,8 +300,16 @@ fn live_pin_syntax_option_and_user_sum_defaults_match_reference() {
         .as_nanos();
     let dir = root.join(format!("case-reference-{}-{tick}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
-    let source = include_str!("../../../../fln-olean/fixtures/ir/CaseModule.lean");
-    std::fs::write(dir.join("CaseModule.lean"), source).unwrap();
+    let mut source = include_str!("../../../../fln-olean/fixtures/ir/CaseModule.lean").to_owned();
+    source.push_str("\ninductive WideEnum where\n");
+    for tag in 0..140 {
+        source.push_str(&format!("  | t{tag}\n"));
+    }
+    source.push_str("\n@[noinline] def wideCase (tag : WideEnum) : Nat :=\n  match tag with\n");
+    for tag in 0..140 {
+        source.push_str(&format!("  | .t{tag} => {}\n", 5 + 3 * tag));
+    }
+    std::fs::write(dir.join("CaseModule.lean"), &source).unwrap();
     let generated = Command::new(&reference)
         .current_dir(&dir)
         .args(["-o", "CaseModule.olean", "CaseModule.lean"])
@@ -310,9 +365,13 @@ fn live_pin_syntax_option_and_user_sum_defaults_match_reference() {
         ("optionEntry", 0, "13"),
         ("optionEntry", 1, "26"),
     ];
-    let mut oracle_source = source.to_owned();
+    let wide_cases = [(0, "5"), (69, "212"), (128, "389"), (139, "422")];
+    let mut oracle_source = source;
     for (entry, argument, _) in cases {
         oracle_source.push_str(&format!("\n#eval {entry} {argument}\n"));
+    }
+    for (tag, _) in wide_cases {
+        oracle_source.push_str(&format!("\n#eval wideCase .t{tag}\n"));
     }
     std::fs::write(dir.join("Oracle.lean"), oracle_source).unwrap();
     let oracle = Command::new(&reference)
@@ -330,7 +389,9 @@ fn live_pin_syntax_option_and_user_sum_defaults_match_reference() {
     );
     let expected = cases
         .iter()
-        .map(|(_, _, expected)| format!("{expected}\n"))
+        .map(|(_, _, expected)| *expected)
+        .chain(wide_cases.iter().map(|(_, expected)| *expected))
+        .map(|expected| format!("{expected}\n"))
         .collect::<String>();
     assert_eq!(String::from_utf8(oracle.stdout).unwrap(), expected);
     for (entry, argument, expected) in cases {
@@ -354,6 +415,29 @@ fn live_pin_syntax_option_and_user_sum_defaults_match_reference() {
                     flbc::Instruction::ScalarTagTest { .. }
                 )))
         );
+        assert_native_owned_result(&compiled, expected);
+    }
+    let IrDecl::Function { body, .. } = module
+        .decls
+        .iter()
+        .find(|d| d.name() == &name("wideCase"))
+        .unwrap()
+    else {
+        panic!("wideCase has no IR body");
+    };
+    assert!(body.bodies().iter().any(
+        |b| matches!(b.terminal.as_ref(), IrTerminal::Case { alts, .. } if alts.len() == 140)
+    ));
+    for (tag, expected) in wide_cases {
+        let compiled = compile(
+            std::slice::from_ref(&module),
+            &name("wideCase"),
+            &[nat(tag)],
+            &bounded_partition(&[]),
+            &users,
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
         assert_native_owned_result(&compiled, expected);
     }
 }

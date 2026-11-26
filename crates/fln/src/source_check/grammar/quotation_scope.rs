@@ -17,6 +17,9 @@ mod matches;
 
 enum Task<'a> {
     Visit(&'a Syntax),
+    CommandDeclaration(&'a Syntax, Vec<Name>),
+    DeclarationValue(&'a Syntax),
+    Constructors(&'a Syntax),
     DoSequence(&'a Syntax, bool),
     Copy(&'a Syntax),
     Emit(Syntax),
@@ -768,6 +771,15 @@ pub(super) fn preresolve(
             }
             Task::DoSequence(sequence, scoped) => {
                 do_notation::sequence(sequence, &mut tasks, scoped.then_some(locals.len()))?;
+            }
+            Task::CommandDeclaration(syntax, peers) => {
+                command_declarations::declaration(syntax, rule, &mut tasks, locals.len(), &peers)?;
+            }
+            Task::DeclarationValue(syntax) => {
+                command_declarations::value(syntax, rule, resolve, &mut tasks, &locals)?;
+            }
+            Task::Constructors(syntax) => {
+                command_declarations::constructors(syntax, &mut tasks, locals.len())?;
             }
             Task::Visit(leaf) | Task::Copy(leaf) => built.push(leaf.clone()),
             Task::Emit(syntax) => built.push(syntax),

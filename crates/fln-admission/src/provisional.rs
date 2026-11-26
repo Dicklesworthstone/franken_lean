@@ -18,6 +18,34 @@ use super::*;
 use fln_core::outcome::InconclusiveCause;
 pub use fln_env::environment::ProvisionalEnvironment;
 
+/// Worker limits for the authoritative pass and its provisional follow-up.
+/// Both passes use the same kernel budget and configured worker stack size.
+#[derive(Debug, Clone, Copy)]
+pub struct ProvisionalFrontierJobs {
+    authoritative: OleanFrontierJobs,
+    provisional: OleanFrontierJobs,
+}
+
+impl OleanFrontierJobs {
+    /// Limit concurrent provisional checks while keeping all workers available
+    /// for authoritative checks. A cap of one uses the caller's kernel-sized stack.
+    pub fn with_provisional_cap(self, cap: std::num::NonZeroUsize) -> ProvisionalFrontierJobs {
+        ProvisionalFrontierJobs {
+            authoritative: self,
+            provisional: Self {
+                threads: self.threads.min(cap),
+                ..self
+            },
+        }
+    }
+}
+
+impl From<OleanFrontierJobs> for ProvisionalFrontierJobs {
+    fn from(jobs: OleanFrontierJobs) -> Self {
+        jobs.with_provisional_cap(jobs.threads)
+    }
+}
+
 /// Outcome of checking one atomic declaration unit (a single declaration, or an
 /// entire mutual/inductive/quotient block) in declaration-by-declaration mode.
 #[derive(Debug)]
@@ -1059,7 +1087,9 @@ pub fn check_decoded_olean_per_declaration(
     let entries: Vec<(EnvironmentEntry, bool)> = decoded
         .constants
         .iter()
-        .filter(|info| !base.contains(info.name()))
+        // A rechecked theorem can add an assumption for an existing name.
+        // Include its retained entry so non-base imports receive that mark too.
+        .filter(|info| assumed_names.contains(info.name()) || !base.contains(info.name()))
         .filter_map(|info| {
             let entry = env.entry(info.name())?;
             let is_assumed = assumed_names.contains(info.name());
@@ -1411,7 +1441,12 @@ fn run_phase2_module(
             .collect::<Vec<_>>(),
     );
     let own_assumed_count = checked.assumed_declaration_names.len();
-    let total_assumed = closure_assumed_count.saturating_add(own_assumed_count);
+    // Rechecking another copy of a theorem can assume a name already in the
+    // closure. Count distinct names in the environment passed to descendants.
+    let total_assumed = checked
+        .final_env
+        .as_ref()
+        .map_or(closure_assumed_count, ProvisionalEnvironment::assumed_count);
     let memory = OleanFrontierMemoryAttribution::from_components(
         work.estimated_bytes,
         admitted_bytes,
@@ -1690,11 +1725,12 @@ impl Admitted {
         modules: &[OleanModuleInput<'_>],
         options: &KVMap,
         limits: OleanCheckLimits,
-        jobs: OleanFrontierJobs,
+        jobs: impl Into<ProvisionalFrontierJobs>,
         cancellation: Option<&dyn CancellationProbe>,
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
         on_phase2: Option<Phase2ProgressCallback<'_>>,
     ) -> Result<ProvisionalFrontier<()>, OleanCheckError> {
+        let jobs = jobs.into();
         let hooks = FrontierRunHooks {
             check: &|job| self.frontier_check_module(job, options, limits),
             decode: &|index| {
@@ -1705,7 +1741,7 @@ impl Admitted {
         let phase1 = self.check_olean_frontier_phase1_core_with_options(
             modules,
             limits,
-            jobs,
+            jobs.authoritative,
             on_event,
             hooks,
             FrontierExecutionOptions::STREAMING_PROVISIONAL_ROWS,
@@ -1714,7 +1750,7 @@ impl Admitted {
             phase1,
             modules,
             limits,
-            jobs,
+            jobs.provisional,
             cancellation,
             on_phase2,
             hooks,
@@ -1749,19 +1785,25 @@ impl Admitted {
         &self,
         modules: &[OleanModuleInput<'_>],
         limits: OleanCheckLimits,
-        jobs: OleanFrontierJobs,
+        jobs: impl Into<ProvisionalFrontierJobs>,
         cancellation: Option<&dyn CancellationProbe>,
         on_event: &mut dyn FnMut(OleanFrontierEvent<'_>),
         on_phase2: Option<Phase2ProgressCallback<'_>>,
         hooks: FrontierRunHooks<'_>,
     ) -> Result<ProvisionalFrontier, OleanCheckError> {
-        let phase1 =
-            self.check_olean_frontier_phase1_core(modules, limits, jobs, on_event, hooks)?;
+        let jobs = jobs.into();
+        let phase1 = self.check_olean_frontier_phase1_core(
+            modules,
+            limits,
+            jobs.authoritative,
+            on_event,
+            hooks,
+        )?;
         self.check_olean_frontier_provisional_after_phase1(
             phase1,
             modules,
             limits,
-            jobs,
+            jobs.provisional,
             cancellation,
             on_phase2,
             hooks,
@@ -1927,17 +1969,7 @@ impl Admitted {
             (0..count).map(|_| None).collect();
         let mut retry_pending: BTreeSet<(usize, usize)> = BTreeSet::new();
         let mut isolated_running: Option<usize> = None;
-        let mut phase1_root_running: Option<usize> = None;
-        // Phase 2 runs while Phase 1's remaining import payloads are still
-        // resident near the virtual-address ceiling. Cap the Phase-2 pool so
-        // spawning workers (64 MiB stacks + per-thread allocator arenas) never
-        // exhausts RLIMIT_AS when Phase 1 ran at high --jobs (e.g. 24).
-        const PHASE2_MAX_THREADS: usize = 4;
-        let threads = jobs
-            .threads
-            .get()
-            .min(phase2_candidates.len())
-            .clamp(1, PHASE2_MAX_THREADS);
+        let threads = jobs.threads.get();
         let base_env = &self.environment;
         let decode = hooks.decode;
         let memory = hooks.memory;
@@ -2272,21 +2304,13 @@ impl Admitted {
                     }
                 }
 
-                // Do not start new concurrent modules while a memory retry or
-                // Phase-1 inconclusive root is running. Phase-1 roots often
-                // failed Phase 1 near peak memory; isolating each root avoids
-                // root-vs-root VSZ contention and lets `release_consumers` drop
-                // exclusive Phase-1 payloads before the next root starts.
-                let can_dispatch_ready = retry_pending.is_empty()
-                    && isolated_running.is_none()
-                    && phase1_root_running.is_none();
-                for index in ready.into_iter().filter(|_| can_dispatch_ready) {
+                // Do not start new concurrent modules while a memory retry is pending or isolated.
+                for index in ready
+                    .into_iter()
+                    .filter(|_| retry_pending.is_empty() && isolated_running.is_none())
+                {
                     if in_flight >= threads {
                         break;
-                    }
-                    let is_phase1_root = phase1_root_set.contains(&index);
-                    if is_phase1_root && in_flight > 0 {
-                        continue;
                     }
                     // Phase 1's retained import payloads remain resident here.
                     // Account for that live baseline and reserve each in-flight
@@ -2316,9 +2340,6 @@ impl Admitted {
                         &phase2_contributes_assumptions,
                     );
                     phase2_running[index] = true;
-                    if is_phase1_root {
-                        phase1_root_running = Some(index);
-                    }
                     in_flight += 1;
                     in_flight_estimated_bytes =
                         in_flight_estimated_bytes.saturating_add(estimated_bytes[index]);
@@ -2329,9 +2350,6 @@ impl Admitted {
                         in_flight_estimated_bytes =
                             in_flight_estimated_bytes.saturating_sub(estimated_bytes[index]);
                         phase2_running[index] = false;
-                        if phase1_root_running == Some(index) {
-                            phase1_root_running = None;
-                        }
                         phase2_decided[index] = true;
                         phase2_usable[index] = done.usable;
                         phase2_contributes_assumptions[index] = done.contributes_assumptions;
@@ -2366,9 +2384,6 @@ impl Admitted {
                             detail: "every provisional frontier worker thread has stopped",
                         });
                     }
-                    if phase1_root_running.is_some() {
-                        break;
-                    }
                 }
 
                 if threads == 1 {
@@ -2392,9 +2407,6 @@ impl Admitted {
                 in_flight_estimated_bytes =
                     in_flight_estimated_bytes.saturating_sub(estimated_bytes[idx]);
                 phase2_running[idx] = false;
-                if phase1_root_running == Some(idx) {
-                    phase1_root_running = None;
-                }
                 if done.host_memory_refusal
                     && isolated_running != Some(idx)
                     && phase2_memory_retries[idx].is_none()

@@ -760,6 +760,20 @@ impl Context {
         pattern: &Expr,
         replacement: &Expr,
     ) -> Result<(Expr, bool), NatDefinitionElabError> {
+        self.transform_subterms(target, |context, term| {
+            Ok(context
+                .rewrite_same(term, pattern)?
+                .then(|| replacement.clone()))
+        })
+    }
+
+    /// Replace matching subterms outside-in, without revisiting a replacement.
+    /// The rule must be independent of binder depth. Unchanged subgraphs are shared.
+    pub(in crate::source) fn transform_subterms(
+        &mut self,
+        target: &Expr,
+        mut replace: impl FnMut(&mut Self, &Expr) -> Result<Option<Expr>, NatDefinitionElabError>,
+    ) -> Result<(Expr, bool), NatDefinitionElabError> {
         let mut done = HashMap::<usize, (Expr, bool)>::new();
         let mut work = vec![(target, false)];
         while let Some((term, exit)) = work.pop() {
@@ -769,8 +783,8 @@ impl Context {
             }
             self.tick()?;
             if !exit {
-                if self.rewrite_same(term, pattern)? {
-                    done.insert(key, (replacement.clone(), true));
+                if let Some(value) = replace(self, term)? {
+                    done.insert(key, (value, true));
                     continue;
                 }
                 work.push((term, true));

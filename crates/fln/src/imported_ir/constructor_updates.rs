@@ -323,87 +323,16 @@ fn alt_body(alt: &IrAlt) -> &IrBody {
     }
 }
 
-fn visit_stmt_reads(stmt: &IrStmt, mut visit: impl FnMut(u64), meter: &mut Meter) -> Result<()> {
-    match stmt {
-        IrStmt::VDecl { expr, .. } => {
-            let args = match expr {
-                IrExpr::Ctor { args, .. } | IrExpr::Fap { args, .. } | IrExpr::Pap { args, .. } => {
-                    args.as_slice()
-                }
-                IrExpr::Reuse { x, args, .. } | IrExpr::Ap { x, args } => {
-                    meter.charge(1)?;
-                    visit(*x);
-                    args.as_slice()
-                }
-                IrExpr::Reset { x, .. }
-                | IrExpr::Proj { x, .. }
-                | IrExpr::UProj { x, .. }
-                | IrExpr::SProj { x, .. }
-                | IrExpr::Box { x, .. }
-                | IrExpr::Unbox { x }
-                | IrExpr::IsShared { x } => {
-                    meter.charge(1)?;
-                    visit(*x);
-                    &[]
-                }
-                IrExpr::Lit(_) => &[],
-            };
-            for arg in args {
-                meter.charge(1)?;
-                if let IrArg::Var(x) = arg {
-                    visit(*x);
-                }
-            }
-        }
-        IrStmt::Set { x, y, .. } => {
-            meter.charge(2)?;
-            visit(*x);
-            if let IrArg::Var(y) = y {
-                visit(*y);
-            }
-        }
-        IrStmt::USet { x, y, .. } | IrStmt::SSet { x, y, .. } => {
-            meter.charge(2)?;
-            visit(*x);
-            visit(*y);
-        }
-        IrStmt::SetTag { x, .. }
-        | IrStmt::Inc { x, .. }
-        | IrStmt::Dec { x, .. }
-        | IrStmt::Del { x } => {
-            meter.charge(1)?;
-            visit(*x);
-        }
-        IrStmt::JDecl { .. } => {}
-    }
-    Ok(())
+fn visit_stmt_reads(stmt: &IrStmt, visit: impl FnMut(u64), meter: &mut Meter) -> Result<()> {
+    super::operands::visit_stmt_reads(stmt, visit, |count| meter.charge(count))
 }
 
 fn visit_terminal_reads(
     terminal: &IrTerminal,
-    mut visit: impl FnMut(u64),
+    visit: impl FnMut(u64),
     meter: &mut Meter,
 ) -> Result<()> {
-    match terminal {
-        IrTerminal::Case { x, .. } => {
-            meter.charge(1)?;
-            visit(*x);
-        }
-        IrTerminal::Ret(IrArg::Var(x)) => {
-            meter.charge(1)?;
-            visit(*x);
-        }
-        IrTerminal::Jmp { args, .. } => {
-            for arg in args {
-                meter.charge(1)?;
-                if let IrArg::Var(x) = arg {
-                    visit(*x);
-                }
-            }
-        }
-        IrTerminal::Ret(IrArg::Erased) | IrTerminal::Unreachable => {}
-    }
-    Ok(())
+    super::operands::visit_terminal_reads(terminal, visit, |count| meter.charge(count))
 }
 
 fn normalize_body(

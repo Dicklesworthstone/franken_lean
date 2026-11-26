@@ -1104,7 +1104,7 @@ fn phase2_memory_admission_accounts_for_retained_rss_and_inflight_estimates() {
         runtime_initializers: Default::default(),
         options: KVMap::new(),
     };
-    let run = |threads, limit| {
+    let run = |threads, limit, cap| {
         let memory = RetainedMemory {
             phase2: AtomicBool::new(false),
             limit,
@@ -1114,7 +1114,7 @@ fn phase2_memory_admission_accounts_for_retained_rss_and_inflight_estimates() {
             .check_olean_frontier_provisional_using_with_progress(
                 &inputs,
                 limits,
-                jobs(threads),
+                jobs(threads).with_provisional_cap(NonZeroUsize::new(cap).unwrap()),
                 None,
                 &mut |event| {
                     if matches!(
@@ -1168,8 +1168,8 @@ fn phase2_memory_admission_accounts_for_retained_rss_and_inflight_estimates() {
         frontier
     };
 
-    let serial = run(1, Some(100));
-    let bounded = run(4, Some(100));
+    let serial = run(1, Some(100), 1);
+    let bounded = run(4, Some(100), 4);
     assert_eq!(row_signature(&serial), row_signature(&bounded));
     assert!(
         bounded
@@ -1179,14 +1179,25 @@ fn phase2_memory_admission_accounts_for_retained_rss_and_inflight_estimates() {
         "80 retained + 15 reserved + 15 next exceeds 100, although live RSS alone does not"
     );
 
+    // With the same ceiling and four authoritative workers, the explicit
+    // one-worker follow-up never reserves two closures concurrently.
+    let capped = run(4, Some(100), 1);
+    assert_eq!(row_signature(&serial), row_signature(&capped));
+    assert!(
+        capped
+            .rows
+            .iter()
+            .all(|row| row.memory.admission_deferrals == 0)
+    );
+
     // An idle worker must still try when its estimate alone exceeds the cap:
     // only the actual decoder/checkers can produce a resource non-answer.
-    let below_retained = run(4, Some(10));
+    let below_retained = run(4, Some(10), 4);
     assert_eq!(row_signature(&serial), row_signature(&below_retained));
 
     // Without a ceiling, --jobs keeps its ordinary parallel scheduling; there
     // is no arbitrary Phase-2 cap masquerading as memory admission control.
-    let unbounded = run(4, None);
+    let unbounded = run(4, None, 4);
     assert_eq!(row_signature(&serial), row_signature(&unbounded));
     assert!(
         unbounded
@@ -1550,5 +1561,88 @@ fn repeated_declarations_preserve_independent_projection_nonanswers() {
             base_root
         );
         assert!(!base.has_assumptions());
+    }
+}
+
+#[test]
+fn repeated_theorem_assumptions_survive_both_sides_of_a_diamond() {
+    use fln_env::constants::TheoremVal;
+
+    let proposition = Expr::const_(n("A.P"), Vec::new());
+    let theorem = |value| {
+        ConstantInfo::Thm(TheoremVal {
+            base: ConstantVal {
+                name: n("A.t"),
+                level_params: Vec::new(),
+                type_: proposition.clone(),
+            },
+            value,
+            all: vec![n("A.t")],
+        })
+    };
+    let base = encode_module(
+        &[],
+        &[
+            axiom("A.P", Expr::sort(Level::zero())),
+            axiom("A.p", proposition.clone()),
+            theorem(Expr::const_(n("A.p"), Vec::new())),
+        ],
+    );
+    let repeated = theorem(beta_chain("A.P", "A.p", 80));
+    let repeat = encode_module(&["A"], std::slice::from_ref(&repeated));
+    let heavy = encode_module(
+        &["A"],
+        &[safe_def(
+            "Other.heavy",
+            proposition.clone(),
+            beta_chain("A.P", "A.p", 80),
+        )],
+    );
+    let join = encode_module(
+        &["Left", "Right"],
+        &[safe_def(
+            "Join.use",
+            proposition,
+            Expr::const_(n("A.t"), Vec::new()),
+        )],
+    );
+    let repeat_again = encode_module(&["Join"], &[repeated]);
+
+    // Tied import sizes select the first branch as the persistent base. The
+    // other branch must carry every newly assumed name in its delta.
+    for (repeated, other) in [("Left", "Right"), ("Right", "Left")] {
+        let modules = vec![
+            (n("A"), base.clone()),
+            (n(repeated), repeat.clone()),
+            (n(other), heavy.clone()),
+            (n("Join"), join.clone()),
+            (n("Again"), repeat_again.clone()),
+        ];
+        for workers in [1, 2] {
+            let frontier = Engine::from_environment(Environment::new())
+                .check_olean_frontier_provisional_scheduled(
+                    &to_inputs(&modules),
+                    &KVMap::new(),
+                    limits_with_steps(120),
+                    jobs(workers),
+                    None,
+                    &mut |_| {},
+                )
+                .unwrap();
+            let row = frontier.rows.iter().find(|r| r.name == n("Join")).unwrap();
+            assert!(matches!(
+                row.verdict,
+                ProvisionalModuleVerdict::AcceptedUnderAssumptions { .. }
+            ));
+            assert_eq!(row.assumes, vec![n("Left"), n("Right")]);
+            assert_eq!(row.assumed_declarations, 2, "repeat in {repeated}");
+            let again = frontier.rows.iter().find(|r| r.name == n("Again")).unwrap();
+            assert!(matches!(
+                again.verdict,
+                ProvisionalModuleVerdict::Inconclusive { .. }
+            ));
+            assert_eq!(again.assumed_declarations, 2, "repeat of an assumed name");
+            assert!(!frontier.is_authoritative());
+        }
     }
 }

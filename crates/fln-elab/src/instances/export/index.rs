@@ -328,61 +328,6 @@ impl Indexer<'_> {
             .constant_val()
             .type_
             .clone();
-        // Match pinned `getSemiOutParamPositionsOf` (`Lean/Meta/Instances.lean:156-165`):
-        // top-level `semiOutParam` binders count as output positions for `computeSynthOrder`,
-        // while any unexpected nested `semiOutParam` occurrence still fails closed.
-        let mut semi_outputs = BTreeSet::new();
-        let mut cursor = &class_type;
-        let mut binder_index = 0u32;
-        let mut nested = Vec::new();
-        loop {
-            self.tick()?;
-            match cursor.node() {
-                ExprNode::MData { expr, .. } => cursor = expr,
-                ExprNode::ForallE {
-                    binder_type, body, ..
-                } => {
-                    let mut domain = binder_type;
-                    while let ExprNode::MData { expr, .. } = domain.node() {
-                        self.tick()?;
-                        domain = expr;
-                    }
-                    if let ExprNode::App { f, a } = domain.node()
-                        && matches!(f.node(), ExprNode::Const { name, .. }
-                            if *name == Name::from_components(["semiOutParam"]))
-                    {
-                        semi_outputs.insert(binder_index);
-                        nested.push(a);
-                    } else {
-                        nested.push(domain);
-                    }
-                    binder_index = binder_index
-                        .checked_add(1)
-                        .ok_or(InstanceRegistryError::Limit)?;
-                    cursor = body;
-                }
-                _ => {
-                    nested.push(cursor);
-                    break;
-                }
-            }
-        }
-        while let Some(expr) = nested.pop() {
-            self.tick()?;
-            match expr.node() {
-                ExprNode::Const { name, .. }
-                    if *name == Name::from_components(["semiOutParam"]) =>
-                {
-                    return Err(Error::Unsupported);
-                }
-                ExprNode::App { f, a } => nested.extend([f, a]),
-                ExprNode::ForallE {
-                    binder_type, body, ..
-                } => nested.extend([binder_type, body]),
-                ExprNode::MData { expr, .. } => nested.push(expr),
-                _ => {}
-            }
-        }
         let params = match self.imported_classes.get(&class) {
             Some(parameters) => {
                 *self.remaining = self
@@ -393,17 +338,39 @@ impl Indexer<'_> {
             }
             None => parameters_with_budget(self.env, &class, self.remaining)?,
         };
-        let mut outputs = semi_outputs;
+        let mut outputs = BTreeSet::new();
         for index in params.out_params {
             self.tick()?;
             outputs.insert(index);
         }
+        // Lean/Meta/Instances.lean: computeSynthOrder adds semiOutParam
+        // positions to the ordinary outputs for readiness only. The class
+        // extension and discrimination keys retain their original policies.
+        let mut telescope = &class_type;
         let mut input = BTreeSet::new();
         for (index, arg) in args.iter().enumerate() {
             self.tick()?;
-            if !outputs.contains(&(index as u32)) {
+            while let ExprNode::MData { expr, .. } = telescope.node() {
+                self.tick()?;
+                telescope = expr;
+            }
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = telescope.node()
+            else {
+                return Err(Error::Unsupported);
+            };
+            let mut head = binder_type;
+            while let ExprNode::App { f, .. } = head.node() {
+                self.tick()?;
+                head = f;
+            }
+            let semi_output = matches!(head.node(), ExprNode::Const { name, .. }
+                if *name == Name::from_components(["semiOutParam"]));
+            if !semi_output && !outputs.contains(&(index as u32)) {
                 input.extend(self.dependencies(arg)?);
             }
+            telescope = body;
         }
         Ok(input)
     }

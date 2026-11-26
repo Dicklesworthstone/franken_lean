@@ -40,6 +40,181 @@ theorem use_generated (p : Prop) (h : p) : p := generated_identity p h
 }
 
 #[test]
+fn command_macros_admit_mutual_forward_references_and_recursive_definitions() {
+    let source = r#"
+def n : Nat := 99
+macro "mutual_values " first:ident second:ident : command =>
+  `(mutual
+      def $first : Nat := $second + 1
+      def $second : Nat := 41
+    end)
+macro "mutual_counts " left:ident right:ident : command =>
+  `(mutual
+      def $left : Nat -> Nat
+        | 0 => 7
+        | n+1 => $right n + 1
+      def $right : Nat -> Nat
+        | 0 => 13
+        | n+1 => $left n + 2
+    end)
+namespace Generated
+mutual_values answer predecessor
+mutual_counts countLeft countRight
+theorem answer_ok : answer = 42 := rfl
+theorem count_left_ok : countLeft 4 = 13 := rfl
+theorem count_right_ok : countRight 4 = 19 := rfl
+end Generated
+theorem exported_ok : Generated.answer = 42 := rfl
+"#;
+    assert_eq!(check(source).unwrap(), 4);
+    assert!(check(&source.replace("countLeft 4 = 13", "countLeft 4 = 14")).is_err());
+}
+
+#[test]
+fn quoted_mutual_headers_and_constructor_siblings_keep_their_own_scopes() {
+    let source = r#"
+abbrev Carrier : Type := Nat
+def peer : Nat := 99
+macro "scoped_group " result:ident : command =>
+  `(mutual
+      def Carrier : Nat := 1
+      def peer : Nat := 42
+      def $result : Carrier := peer
+    end)
+scoped_group answer
+theorem answer_ok : answer = 42 := rfl
+macro "scoped_inductive " family:ident poly:ident mono:ident : command =>
+  `(inductive $family where
+      | $poly:ident (Carrier : Type) (value : Carrier)
+      | $mono:ident (value : Carrier))
+scoped_inductive ScopedFamily poly mono
+def constructor_type : Nat -> ScopedFamily := @ScopedFamily.mono
+theorem constructor_ok : constructor_type 7 = ScopedFamily.mono 7 := rfl
+"#;
+    assert_eq!(check(source).unwrap(), 2);
+    assert!(check(&source.replace("answer = 42", "answer = 99")).is_err());
+}
+
+#[test]
+fn command_macros_admit_mutually_inductive_types() {
+    let source = r#"
+macro "mutual_types " tree:ident forest:ident leaf:ident node:ident nil:ident cons:ident : command =>
+  `(mutual
+      inductive $tree where
+        | $leaf:ident (value : Nat)
+        | $node:ident (children : $forest)
+      inductive $forest where
+        | $nil:ident
+        | $cons:ident (head : $tree) (tail : $forest)
+    end)
+mutual_types MacroTree MacroForest leaf node nil cons
+def unpack (tree : MacroTree) : Nat := match tree with
+  | MacroTree.leaf n => n
+  | MacroTree.node _ => 0
+theorem unpack_ok : unpack (MacroTree.leaf 11) = 11 := rfl
+"#;
+    let checked = check_file(source).unwrap();
+    assert_eq!(checked.theorems, 1);
+    for declaration in ["MacroTree", "MacroForest"] {
+        let name = fln::Name::from_components([declaration]);
+        assert!(matches!(
+            checked.engine.environment().find(&name),
+            Some(fln_env::constants::ConstantInfo::Induct(info)) if info.all.len() == 2
+        ));
+    }
+    assert!(check(&source.replace("= 11 := rfl", "= 12 := rfl")).is_err());
+}
+
+#[test]
+fn command_macro_mutual_groups_execute_through_the_checked_batch() {
+    let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(EngineAdmissionLimits::new(limits.kernel))
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    let source = br#"
+macro "mutual_values " first:ident second:ident : command =>
+  `(mutual
+      def $first : Nat := $second + 1
+      def $second : Nat := 41
+    end)
+mutual_values answer predecessor
+example : answer = 42 := rfl
+#eval answer
+"#;
+    let completed = engine
+        .execute_source_commands_with_checks(source, &options, limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(completed.batch.executions.len(), 1);
+    let fln::VmExit::Returned(returned) = &completed.batch.executions[0].exit else {
+        panic!("the evaluation following a macro-generated mutual group must return")
+    };
+    assert_eq!(fln::nat_decimal(&returned.value).as_deref(), Some("42"));
+    for declaration in ["answer", "predecessor"] {
+        let name = fln::Name::from_components([declaration]);
+        assert!(completed.batch.engine.environment().contains(&name));
+        assert!(!engine.environment().contains(&name));
+    }
+    assert_eq!(engine.logical_root(&options), root);
+}
+
+#[test]
+fn command_macro_mutual_groups_reject_invalid_members_without_a_successor() {
+    let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let admission = EngineAdmissionLimits::new(limits.kernel);
+    let engine = Engine::with_source_seed(admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    let macros = r#"
+macro "mutual_values " first:ident second:ident " := " value:term : command =>
+  `(mutual
+      def $first : Nat := 42
+      def $second : Nat := $value
+    end)
+macro "mutual_proofs " first:ident second:ident : command =>
+  `(mutual
+      theorem $first : True := True.intro
+      theorem $second : False := True.intro
+    end)
+def checkedPrefix : Nat := 7
+"#;
+    for command in [
+        "mutual_values first second := True",
+        "mutual_proofs first second",
+        "mutual_values first first := 42",
+    ] {
+        let source = format!("{macros}\n{command}\n");
+        let checked = engine.check_source_files(
+            &[source.as_bytes()],
+            &options,
+            SourceCheckLimits::new(admission),
+        );
+        assert!(checked.is_err(), "{command}: {checked:?}");
+        let executed = engine.execute_source_commands_with_checks(
+            format!("{source}\n#eval checkedPrefix").as_bytes(),
+            &options,
+            limits,
+        );
+        assert!(executed.is_err(), "{command}: {executed:?}");
+        for declaration in ["checkedPrefix", "first", "second"] {
+            assert!(
+                !engine
+                    .environment()
+                    .contains(&fln::Name::from_components([declaration]))
+            );
+        }
+        assert_eq!(engine.logical_root(&options), root);
+    }
+}
+
+#[test]
 fn command_macro_rules_match_and_expand_without_reparsing_generated_text() {
     let source = r#"
 syntax "quoted_def " ident " := " term : command
@@ -125,7 +300,8 @@ macro "nested_command " c:command : command => `(pass_command $c:command)
 macro "checked_shadow " ty:term " := " proof:term : command =>
   `(example (h : Nat) : $ty := $proof)
 "#;
-    let baseline = check_file(macros).unwrap();
+    // Namespace declarations persist independently of the examples they contain.
+    let baseline = check_file(&format!("{macros}\nnamespace Scoped\nend Scoped\n")).unwrap();
     let source = format!(
         r#"{macros}
 checked (∀ (P : Prop), P → P) := fun _ h => h
@@ -164,18 +340,30 @@ macro "checked " ty:term " := " proof:term : command =>
 macro "pass_command " c:command : command => `($c:command)
 "#;
     let baseline = engine
-        .execute_source_commands_with_checks(
-            format!("{macros}\n#eval (43 : Nat)").as_bytes(),
-            &options,
-            limits,
-        )
+        .execute_source_commands_with_checks(macros.as_bytes(), &options, limits)
         .unwrap()
         .into_complete()
         .unwrap();
-    let source = format!(
+    let examples = format!(
         "{macros}\nchecked Nat := 42\n\
-         pass_command example (n : Nat) : n = n := by rfl\n#eval (43 : Nat)"
+         pass_command example (n : Nat) : n = n := by rfl"
     );
+    let checked = engine
+        .execute_source_commands_with_checks(examples.as_bytes(), &options, limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked.checks.len(), 2);
+    assert!(checked.batch.executions.is_empty());
+    assert!(checked.batch.source_admissions.is_empty());
+    assert_eq!(checked.batch.result_logical_root, root);
+    assert_eq!(
+        checked.batch.result_logical_root,
+        baseline.batch.result_logical_root
+    );
+    // Raw #eval retains its generated evaluator, whose name includes its command
+    // index. Check its result separately from the examples' scratch-only root.
+    let source = format!("{examples}\n#eval (43 : Nat)");
     let completed = engine
         .execute_source_commands_with_checks(source.as_bytes(), &options, limits)
         .unwrap()
@@ -185,10 +373,6 @@ macro "pass_command " c:command : command => `($c:command)
     assert_eq!(completed.batch.executions.len(), 1);
     assert_eq!(completed.batch.source_evaluation_indices, [0]);
     assert!(completed.batch.source_admissions.is_empty());
-    assert_eq!(
-        completed.batch.result_logical_root,
-        baseline.batch.result_logical_root
-    );
     for check in &completed.checks {
         let fln::Declaration::Defn(candidate) = &check.declaration else {
             panic!("an example must produce only a scratch checking candidate")

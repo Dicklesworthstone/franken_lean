@@ -1356,6 +1356,56 @@ impl<'a> Builder<'a> {
         Ok(Local { value, constructor })
     }
 
+    /// Variable indices are unique throughout the validated declaration. Reads in
+    /// nested helpers and case arms capture a value only if it is already in
+    /// this outer scope. A jump also forwards the destination's implicit captures.
+    fn join_captures(
+        &mut self,
+        body: &IrBody,
+        locals: &Locals,
+        pending: &PendingConstructors,
+        joins: &Joins,
+    ) -> Result<Vec<u64>> {
+        let mut captures = BTreeSet::new();
+        let mut read = |x| {
+            if locals.contains_key(&x) || pending.contains_key(&x) {
+                captures.insert(x);
+            }
+        };
+        let mut bodies = vec![body];
+        while let Some(body) = bodies.pop() {
+            self.tables.scope_work(body.stmts.len().saturating_add(1))?;
+            for stmt in &body.stmts {
+                if let IrStmt::JDecl { value, .. } = stmt {
+                    bodies.push(value);
+                }
+                operands::visit_stmt_reads(stmt, &mut read, |n| self.tables.scope_work(n))?;
+            }
+            operands::visit_terminal_reads(&body.terminal, &mut read, |n| {
+                self.tables.scope_work(n)
+            })?;
+            match body.terminal.as_ref() {
+                IrTerminal::Case { alts, .. } => {
+                    self.tables.scope_work(alts.len())?;
+                    for alt in alts {
+                        let (IrAlt::Ctor { body, .. } | IrAlt::Default { body }) = alt;
+                        bodies.push(body);
+                    }
+                }
+                IrTerminal::Jmp { j, .. } => {
+                    if let Some(target) = joins.get(j) {
+                        self.tables.scope_work(target.captures.len())?;
+                        for &x in &target.captures {
+                            read(x);
+                        }
+                    }
+                }
+                IrTerminal::Ret(_) | IrTerminal::Unreachable => {}
+            }
+        }
+        Ok(captures.into_iter().collect())
+    }
+
     fn join(
         &mut self,
         j: u64,
@@ -1363,8 +1413,9 @@ impl<'a> Builder<'a> {
         body: &IrBody,
         locals: &Locals,
         joins: &mut Joins,
+        captures: Vec<u64>,
     ) -> Result<()> {
-        let arity = locals
+        let arity = captures
             .len()
             .checked_add(params.len())
             .and_then(|arity| arity.checked_add(usize::from(self.global_environment.is_some())))
@@ -1382,7 +1433,7 @@ impl<'a> Builder<'a> {
         }
         let function = self.tables.helper_id()?;
         self.tables.scope_work(
-            locals
+            captures
                 .len()
                 .saturating_mul(2)
                 .saturating_add(joins.len())
@@ -1390,21 +1441,20 @@ impl<'a> Builder<'a> {
         )?;
         let environment_parameters = usize::from(self.global_environment.is_some());
         self.tables
-            .capture_operands(locals.len() + environment_parameters)?;
+            .capture_operands(captures.len() + environment_parameters)?;
 
         // Lambda lifting gives each join a normal checked FIR function. Capture
         // lexical values in structural index order, followed by explicit jump
         // arguments. Known constructor shapes survive the parameter remapping.
-        let captures: Vec<_> = locals.keys().copied().collect();
-        let mut helper_locals: Locals = locals
+        let mut helper_locals: Locals = captures
             .iter()
             .enumerate()
-            .map(|(i, (x, local))| {
+            .map(|(i, x)| {
                 (
                     *x,
                     Local {
                         value: ValueId::new((i + environment_parameters) as u32),
-                        constructor: local.constructor,
+                        constructor: locals[x].constructor,
                     },
                 )
             })
@@ -1468,10 +1518,11 @@ impl<'a> Builder<'a> {
                     }
                 }
                 IrStmt::JDecl { j, params, value } => {
-                    // Lifted joins capture their lexical scope. Complete any
-                    // pending value before it becomes part of that capture.
-                    self.materialize_all_packed(block, &mut locals, &mut pending)?;
-                    self.join(*j, params, value, &locals, &mut joins)?;
+                    let captures = self.join_captures(value, &locals, &pending, &joins)?;
+                    for &x in &captures {
+                        self.materialize_packed_constructor(block, x, &mut locals, &mut pending)?;
+                    }
+                    self.join(*j, params, value, &locals, &mut joins, captures)?;
                 }
                 IrStmt::USet { x, i, y } => {
                     let offset = self.packed_offset(*i, 0)?;
@@ -1620,36 +1671,72 @@ impl<'a> Builder<'a> {
             // reference-count test or guessed object-to-number conversion.
             arms.sort_by_key(|(info, _)| fieldless_constructor(info));
         }
-        self.case_arm(
-            block,
-            x,
-            value,
-            &arms,
-            default,
-            (locals, joins, ty, shape_only),
-        )
+        // Sibling arms share a nesting level. Only their bodies can nest a case.
+        let mut next = block;
+        for (info, body) in arms {
+            let fieldless = fieldless_constructor(info);
+            let block = next;
+            let (constructor, condition) =
+                self.case_condition(block, value, ty, info, shape_only)?;
+            self.tables
+                .scope_work(locals.len().saturating_add(joins.len()))?;
+            let mut matching = locals.clone();
+            matching.insert(x, Local { value, constructor });
+            let nonzero = self.body(body, matching, joins.clone())?;
+            let zero = self.block()?;
+            if fieldless && !scalar && constructor.is_some() {
+                // Native data bridges can return a fieldless heap constructor,
+                // while Reference IR boxes the same nullary tag as a scalar.
+                // Both representations enter the same body without evaluating
+                // the receiver or its continuation a second time.
+                let scalar_condition = self.emit(
+                    zero,
+                    ValueType::Bool,
+                    Operation::ScalarTagTest {
+                        value,
+                        tag: info.cidx,
+                    },
+                )?;
+                let scalar_miss = self.block()?;
+                next = scalar_miss;
+                self.finish_block(
+                    zero,
+                    Terminator::BranchZero {
+                        condition: scalar_condition,
+                        zero: scalar_miss,
+                        nonzero,
+                    },
+                );
+            } else {
+                next = zero;
+            }
+            self.finish_block(
+                block,
+                Terminator::BranchZero {
+                    condition,
+                    zero,
+                    nonzero,
+                },
+            );
+        }
+        if let Some(body) = default {
+            let target = self.body(body, locals, joins)?;
+            self.finish_block(next, Terminator::Jump { target });
+        } else {
+            self.unreachable(next)?;
+        }
+        Ok(())
     }
 
-    fn case_arm(
+    fn case_condition(
         &mut self,
         block: BlockId,
-        x: u64,
         value: ValueId,
-        arms: &[(&IrCtorInfo, &IrBody)],
-        default: Option<&IrBody>,
-        scope: (Locals, Joins, &IrType, bool),
-    ) -> Result<()> {
-        let (locals, joins, ty, shape_only) = scope;
+        ty: &IrType,
+        info: &IrCtorInfo,
+        shape_only: bool,
+    ) -> Result<(Option<ConstructorId>, ValueId)> {
         let scalar = is_scalar_case(ty);
-        let Some(((info, body), rest)) = arms.split_first() else {
-            if let Some(body) = default {
-                let target = self.body(body, locals, joins)?;
-                self.finish_block(block, Terminator::Jump { target });
-            } else {
-                self.unreachable(block)?;
-            }
-            return Ok(());
-        };
         let fieldless = fieldless_constructor(info);
         let heap_tag = info.cidx <= u64::from(fln_rt::abi::TAG_MAX_CTOR_TAG);
         let constructor = if shape_only || fieldless && (scalar || !heap_tag) {
@@ -1717,60 +1804,6 @@ impl<'a> Builder<'a> {
                 }
             }
         };
-        self.tables
-            .scope_work(locals.len().saturating_add(joins.len()))?;
-        let mut matching = locals.clone();
-        matching.insert(x, Local { value, constructor });
-        let nonzero = self.body(body, matching, joins.clone())?;
-        let zero = self.block()?;
-        if fieldless && !scalar && constructor.is_some() {
-            // Native data bridges can return a fieldless heap constructor,
-            // while Reference IR boxes the same nullary tag as a scalar.
-            // Both representations enter the same body without evaluating
-            // the receiver or its continuation a second time.
-            let scalar_condition = self.emit(
-                zero,
-                ValueType::Bool,
-                Operation::ScalarTagTest {
-                    value,
-                    tag: info.cidx,
-                },
-            )?;
-            let scalar_miss = self.block()?;
-            self.case_arm(
-                scalar_miss,
-                x,
-                value,
-                rest,
-                default,
-                (locals, joins, ty, shape_only),
-            )?;
-            self.finish_block(
-                zero,
-                Terminator::BranchZero {
-                    condition: scalar_condition,
-                    zero: scalar_miss,
-                    nonzero,
-                },
-            );
-        } else {
-            self.case_arm(
-                zero,
-                x,
-                value,
-                rest,
-                default,
-                (locals, joins, ty, shape_only),
-            )?;
-        }
-        self.finish_block(
-            block,
-            Terminator::BranchZero {
-                condition,
-                zero,
-                nonzero,
-            },
-        );
-        Ok(())
+        Ok((constructor, condition))
     }
 }

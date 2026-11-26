@@ -4,8 +4,8 @@
 //! Standalone calls use the native parser. Module sessions also consume the
 //! receipt-bound parser product installed by the source driver. That product
 //! is closed parser-description data, and a standalone embedding registry
-//! supplies no imported grammar. Custom commands must expand to one named
-//! declaration. The prepared registry owns the
+//! supplies no imported grammar. Custom commands must expand to a named
+//! declaration, anonymous example or supported atomic mutual group. The prepared registry owns the
 //! expansion pass. Active quoted source templates join that same registry;
 //! no separate template pass runs before it or replays its results.
 //! The resulting native Syntax enters the same elaborator
@@ -144,7 +144,7 @@ impl std::fmt::Display for SourceMacroError {
             Self::CommandDeclarationRequired => {
                 write!(
                     f,
-                    "source command macro requires one declaration or anonymous example"
+                    "source command macro requires a declaration, anonymous example or mutual group"
                 )
             }
             Self::ExampleRequired => {
@@ -293,6 +293,19 @@ pub(crate) enum ProgramCommandSyntax {
 }
 
 impl ProgramCommandSyntax {
+    pub(crate) fn from_expanded_command(
+        parsed: ParsedSourceCommand,
+    ) -> Result<Self, SourceMacroError> {
+        if fln_parse::command_scope::mutual::syntax_members(parsed.syntax()).is_some() {
+            parsed
+                .into_mutual()
+                .map(Self::Mutual)
+                .ok_or(SourceMacroError::CommandDeclarationRequired)
+        } else {
+            Ok(Self::Single(Box::new(parsed)))
+        }
+    }
+
     pub(crate) fn syntaxes(&self) -> Vec<&Syntax> {
         match self {
             Self::Single(parsed) => vec![parsed.syntax()],
@@ -712,7 +725,9 @@ impl<'a> FileSession<'a> {
         if self.is_imported_command(registry, &parsed) {
             return self
                 .expand_imported_command(engine, registry, parsed, scope)
-                .map_complete(|result| result.map(Box::new).map(ProgramCommandSyntax::Single));
+                .map_complete(|result| {
+                    result.and_then(ProgramCommandSyntax::from_expanded_command)
+                });
         }
         let expected = parsed.kind();
         let declaration = matches!(
@@ -1035,9 +1050,10 @@ impl<'a> FileSession<'a> {
     }
 
     /// The caller has checked both registrations and the source preflight.
-    /// Expand the complete original tree once, then require one ordinary
-    /// declaration or anonymous example. The usual elaborator and council still
-    /// check it; the example's checked successor is discarded by its caller.
+    /// Expand the original root, then require a declaration, anonymous example
+    /// or supported mutual group before expanding its contents. Mutual names
+    /// seed one shared quotation context. The usual elaborator and council
+    /// still check the result atomically; an example's successor is discarded.
     fn expand_imported_command(
         &mut self,
         engine: &Engine,
@@ -1079,7 +1095,14 @@ impl<'a> FileSession<'a> {
         let Some(parsed) = parsed.with_expanded_command_declaration(root) else {
             return Outcome::Complete(Err(SourceMacroError::CommandDeclarationRequired));
         };
-        match self.enter_declaration_hygiene(parsed.syntax()) {
+        let mutual = fln_parse::command_scope::mutual::syntax_members(parsed.syntax());
+        let group = mutual.is_some();
+        let hygiene = if let Some(members) = mutual {
+            self.enter_mutual_hygiene(members)
+        } else {
+            self.enter_declaration_hygiene(parsed.syntax())
+        };
+        match hygiene {
             Outcome::Complete(()) => {}
             Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
@@ -1095,6 +1118,7 @@ impl<'a> FileSession<'a> {
             result.and_then(|syntax| {
                 match parsed.kind() {
                     SourceCommandKind::Example => parsed.with_expanded_example(syntax),
+                    SourceCommandKind::Definition if group => parsed.with_expanded_mutual(syntax),
                     SourceCommandKind::Definition => parsed.with_expanded_declaration(syntax),
                     _ => None,
                 }

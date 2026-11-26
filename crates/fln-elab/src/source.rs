@@ -7500,19 +7500,11 @@ fn definition_elaboration(
         }
     }
     let (proof_instance, hidden_instance) = if is_instance {
-        context.validate_instance_binder(
-            expected
-                .as_ref()
-                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
-        )?;
-        instance_command::prepare_header(
-            context,
-            &parameters,
-            expected
-                .as_ref()
-                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
-            &modifiers[1],
-        )?
+        let result = expected
+            .as_ref()
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        context.validate_instance_binder(result)?;
+        instance_command::prepare_header(context, &parameters, result, &modifiers[1])?
     } else {
         (false, false)
     };
@@ -7529,7 +7521,7 @@ fn definition_elaboration(
         // on the elaborated instance type AFTER anonymous instance naming so
         // `OfNat Bit 0` generates `instOfNatBitOfNatNat` while the admitted type
         // carries the cleaned `OfNat Bit 0` literal (issue #1389).
-        *target = context.cleanup_of_nat_in_instance_type(target)?;
+        *target = instance_command::cleanup_of_nat(context, target)?;
     }
     if is_instance && !hidden_instance {
         // Naming may consult the private predecessor only for collisions. Once

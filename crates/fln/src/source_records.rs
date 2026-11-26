@@ -1749,7 +1749,11 @@ impl ScopedCommandSyntax {
         match parsed.kind() {
             fln_parse::SourceCommandKind::Example => Some(Self::Example(parsed)),
             fln_parse::SourceCommandKind::Definition => {
-                parsed.into_definition().map(Self::Definition)
+                if fln_parse::command_scope::mutual::syntax_members(parsed.syntax()).is_some() {
+                    parsed.into_mutual().map(Self::Mutual)
+                } else {
+                    parsed.into_definition().map(Self::Definition)
+                }
             }
             _ => None,
         }
@@ -1824,7 +1828,7 @@ pub(crate) fn parse_native_command_macro(
         .map_err(EngineExecutionError::Frontend)?;
     let declaration = ScopedCommandSyntax::from_declaration(parsed).ok_or(
         EngineExecutionError::NotImplemented {
-            feature: "a command macro that does not expand to one declaration or anonymous example",
+            feature: "a command macro that does not expand to a declaration, example or mutual group",
         },
     )?;
     Ok(Some(declaration))
