@@ -12,11 +12,11 @@ pub enum Attribute {
     ImplementedBy(Name),
     Extern(Vec<ExternEntry>),
     Unbox,
+    NeverExtract,
     AnonymousConstructor,
     Coe,
     MatchPattern,
     WeakSpecialize,
-    NeverExtract,
     NoSpecialize,
     Export(Name),
     SuggestFor(Vec<Name>),
@@ -29,11 +29,11 @@ impl Attribute {
         matches!(
             self,
             Self::Unbox
+                | Self::NeverExtract
                 | Self::AnonymousConstructor
                 | Self::Coe
                 | Self::MatchPattern
                 | Self::WeakSpecialize
-                | Self::NeverExtract
                 | Self::NoSpecialize
                 | Self::Export(_)
                 | Self::SuggestFor(_)
@@ -128,6 +128,9 @@ pub(in crate::source) fn attribute(
             if val == &Name::from_components(["unbox"]) {
                 expect_empty_null(argument, "unbox without arguments")?;
                 Attribute::Unbox
+            } else if val == &Name::from_components(["never_extract"]) {
+                expect_empty_null(argument, "never_extract without arguments")?;
+                Attribute::NeverExtract
             } else if val == &Name::from_components(["match_pattern"]) {
                 expect_empty_null(argument, "match_pattern without arguments")?;
                 Attribute::MatchPattern
@@ -137,9 +140,6 @@ pub(in crate::source) fn attribute(
             } else if val == &Name::from_components(["weak_specialize"]) {
                 expect_empty_null(argument, "weak_specialize without arguments")?;
                 Attribute::WeakSpecialize
-            } else if val == &Name::from_components(["never_extract"]) {
-                expect_empty_null(argument, "never_extract without arguments")?;
-                Attribute::NeverExtract
             } else if val == &Name::from_components(["nospecialize"]) {
                 expect_empty_null(argument, "nospecialize without arguments")?;
                 Attribute::NoSpecialize
@@ -516,6 +516,18 @@ pub fn apply(
                     crate::unbox::UnboxError::Malformed => refused("a valid unbox journal"),
                 })?
             }
+            Attribute::NeverExtract => crate::never_extract::register(&result, declaration)
+                .map_err(|error| match error {
+                    crate::never_extract::NeverExtractError::Limit => {
+                        failure(SourceInferenceError::ResourceLimit)
+                    }
+                    crate::never_extract::NeverExtractError::UnknownDeclaration(_) => {
+                        refused("never_extract on an admitted declaration")
+                    }
+                    crate::never_extract::NeverExtractError::Malformed => {
+                        refused("a valid never_extract journal")
+                    }
+                })?,
             Attribute::MatchPattern => {
                 // Public validation uses the exporting view at the pin. The
                 // implementation's access to a hidden public body cannot make
@@ -557,7 +569,6 @@ pub fn apply(
                 )?
             }
             Attribute::WeakSpecialize
-            | Attribute::NeverExtract
             | Attribute::NoSpecialize
             | Attribute::Export(_)
             | Attribute::SuggestFor(_) => {

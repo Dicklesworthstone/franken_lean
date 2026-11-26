@@ -537,6 +537,10 @@ impl ArtifactData {
             }
         };
         let mut explicit_statuses = std::collections::BTreeSet::new();
+        for declaration in exported.default_semireducible {
+            meter.work(1)?;
+            explicit_statuses.insert(declaration);
+        }
         for row in exported.owned {
             use fln_olean::source_extensions::ReducibilityEntry;
             meter.work(1)?;
@@ -558,10 +562,16 @@ impl ArtifactData {
         }
         // Native instances have this default in ReducibilityTable::effective.
         // Once imported, their status must come from reducibilityCore instead;
-        // an explicit owned status always wins, including later overrides.
+        // An explicit owned status always wins, including later overrides.
+        // Known semireducible defaults (such as proof instances) deliberately
+        // have no wire row and must not acquire this data-instance fallback.
+        // Retagging an imported declaration preserves its original policy;
+        // imported overrides belong only to reducibilityExtra above.
         for instance in &metadata.instances {
             meter.work(1)?;
-            if explicit_statuses.insert(instance.declaration.clone()) {
+            if !base.contains(&instance.declaration)
+                && explicit_statuses.insert(instance.declaration.clone())
+            {
                 metadata
                     .reducibility
                     .push(fln_olean::source_extensions::ReducibilityEntry {
@@ -733,6 +743,41 @@ impl ArtifactData {
                     });
                 }
                 metadata.unbox.push(tagged);
+            }
+        }
+        let never_extract = |env: &Environment, meter: &mut Meter| {
+            if let Some(journal) = env.extension(&fln_elab::never_extract::journal_name()) {
+                for entry in journal.entries() {
+                    meter.work(1)?;
+                    meter.bytes(entry.payload.len())?;
+                }
+            }
+            fln_elab::never_extract::read(env).map_err(|error| match error {
+                fln_elab::never_extract::NeverExtractError::Limit => {
+                    SourceModuleCheckError::Limit {
+                        resource: "native never_extract tags",
+                        limit: fln_elab::never_extract::MAX_ROWS,
+                    }
+                }
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::never_extract::journal_name(),
+                    reason: "invalid never_extract journal",
+                },
+            })
+        };
+        let inherited = never_extract(base, meter)?;
+        for tagged in never_extract(checked, meter)? {
+            meter.work(1)?;
+            if !inherited.contains(&tagged) {
+                if base.contains(&tagged) {
+                    return Err(SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::never_extract::journal_name(),
+                        reason: "a module cannot tag an imported never_extract declaration",
+                    });
+                }
+                metadata.never_extract.push(tagged);
             }
         }
         let match_patterns = |env: &Environment, meter: &mut Meter| {
@@ -1562,15 +1607,12 @@ pub fn extract_native_module_attributes(
             }
         };
         let mut explicit = BTreeSet::new();
+        for declaration in exported.default_semireducible {
+            explicit.insert(declaration);
+        }
         for row in exported.owned {
             explicit.insert(row.declaration.clone());
-            // The pin's `reducibilityCore` omits the default `semireducible` status for
-            // owned declarations; native journals may still record it internally so
-            // `ReducibilityTable::effective` does not promote standalone/proof instances
-            // to `implicit_reducible` (so `explicit.insert` above must still run).
-            if row.status != fln_elab::reducibility::Reducibility::Semireducible {
-                tag(row.declaration, status_label(row.status).to_owned());
-            }
+            tag(row.declaration, status_label(row.status).to_owned());
         }
         for row in exported.imported {
             tag(
@@ -1582,7 +1624,9 @@ pub fn extract_native_module_attributes(
             fln_elab::instances::export::registrations(base, checked, work)
         {
             for instance in registrations.instances {
-                if explicit.insert(instance.declaration.clone()) {
+                if !base.contains(&instance.declaration)
+                    && explicit.insert(instance.declaration.clone())
+                {
                     tag(
                         instance.declaration,
                         "reducibility:implicit_reducible".to_owned(),
@@ -1642,6 +1686,17 @@ pub fn extract_native_module_attributes(
         for name in current {
             if !inherited.contains(&name) {
                 tag(name, "unbox".to_owned());
+            }
+        }
+    }
+
+    if let (Ok(inherited), Ok(current)) = (
+        fln_elab::never_extract::read(base),
+        fln_elab::never_extract::read(checked),
+    ) {
+        for name in current {
+            if !inherited.contains(&name) {
+                tag(name, "never_extract".to_owned());
             }
         }
     }

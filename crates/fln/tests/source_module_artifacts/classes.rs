@@ -17,6 +17,10 @@ mod instances;
 mod macro_inline;
 #[path = "match_patterns.rs"]
 mod match_patterns;
+#[path = "never_extract.rs"]
+mod never_extract;
+#[path = "reducibility.rs"]
+mod reducibility;
 #[path = "simp.rs"]
 mod simp;
 #[path = "structures.rs"]

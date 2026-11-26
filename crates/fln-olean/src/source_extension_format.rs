@@ -45,6 +45,7 @@
 //! stage0/stdlib/Lean/Meta/Tactic/Grind/Attr.c: sha256 767512344301c18e3b41c780beb3374b87f8f8d55eee6312da72b119a911ced5
 //! stage0/stdlib/Lean/Meta/Tactic/Grind/EMatchTheorem.c: sha256 11d5046ed8607eac5c77fe3a655bc038370a40e395f8265bea30acd2bad58636
 //! stage0/stdlib/Lean/HeadIndex.c: sha256 357a938edda3ae067fb3d6d541a99e1c87467892a67b1de1e9d3f94aaf547524
+//! src/Lean/Compiler/NeverExtractAttr.lean: sha256 d8d3696924e8de7a22bef04fe1bda5d3e31a34e286f3144a500117b45b7034f7
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -144,6 +145,7 @@ pub const NONCOMPUTABLE_EXTENSION: &str = "Lean.noncomputableExt";
 pub const DEFEQ_EXTENSION: &str = "Lean.defeqAttr";
 pub const BACKWARD_DEFEQ_EXTENSION: &str = "Lean.backwardDefeqAttr";
 pub const UNBOX_EXTENSION: &str = "Lean.IR.UnboxResult.unboxAttr";
+pub const NEVER_EXTRACT_EXTENSION: &str = "Lean.neverExtractAttr";
 pub const MATCH_PATTERN_EXTENSION: &str = "Lean.matchPatternAttr";
 pub const SYMM_EXTENSION: &str = "Lean.Meta.Symm.symmExt";
 pub const COE_FN_COE: u8 = 0;

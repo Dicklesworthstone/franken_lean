@@ -162,6 +162,8 @@ pub struct SourceMetadataReport {
     pub noncomputable: usize,
     /// Persistent `[unbox]` tags on this module's nonrecursive inductive types.
     pub unbox: usize,
+    /// Owned declarations inhibiting closed-call extraction and CSE.
+    pub never_extract: usize,
     /// Owned exposed definitions carrying the pin's `[match_pattern]` tag.
     pub match_patterns: usize,
     /// Ordered symmetry registrations, including dormant scoped rows.
@@ -1131,6 +1133,7 @@ fn prepare_source_metadata_view(
             metadata::sparse_cases_on_extension_name(),
             Name::from_components(metadata::COE_EXTENSION.split('.')),
             Name::from_components(metadata::GRIND_EXTENSION.split('.')),
+            Name::from_components(metadata::NEVER_EXTRACT_EXTENSION.split('.')),
         ])
         .collect();
     let mut blocks: Vec<_> = selected
@@ -1201,6 +1204,7 @@ fn prepare_source_metadata_view(
             sparse_cases_on: 0,
             noncomputable: 0,
             unbox: 0,
+            never_extract: 0,
             match_patterns: 0,
             symms: 0,
             grind_entries: 0,
@@ -1310,6 +1314,7 @@ fn prepare_source_metadata_view(
                     27 => report.sparse_cases_on = entries.len(),
                     28 => report.coercions = entries.len(),
                     29 => report.grind_entries = entries.len(),
+                    30 => report.never_extract = entries.len(),
                     _ => {
                         return Err(SourceOleanImportError::Internal(
                             "unknown selected metadata kind",
@@ -1508,6 +1513,7 @@ impl Engine {
         let mut sparse_cases_on = decoded.sparse_cases_on.into_iter();
         let mut noncomputable = decoded.noncomputable.into_iter();
         let mut unbox = decoded.unbox.into_iter();
+        let mut never_extract = decoded.never_extract.into_iter();
         let mut match_patterns = decoded.match_patterns.into_iter();
         let mut symm_scopes =
             symm::Scopes::new(&checked, &decoded.symms, limits.metadata.max_objects)?;
@@ -1948,6 +1954,27 @@ impl Engine {
                         .map_err(|error| unbox_error(&report.module, error))?;
                 }
             }
+            if report.never_extract != 0 {
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.never_extract,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..report.never_extract {
+                    cancelled!("source-olean/never_extract");
+                    let declaration =
+                        never_extract
+                            .next()
+                            .ok_or(SourceOleanImportError::Internal(
+                                "never_extract count changed during decode",
+                            ))?;
+                    owners.validate(activation.environment(), &report.module, &declaration)?;
+                    activation = activation
+                        .register_never_extract(&declaration)
+                        .map_err(|error| never_extract_error(&report.module, error))?;
+                }
+            }
             if report.match_patterns != 0 {
                 let mut owners = AttributeOwners::new(
                     &checked.modules[index].decoded.constants,
@@ -2063,6 +2090,23 @@ impl Engine {
                     .map_err(|error| {
                         reducibility::error(&report.module, &row.declaration, error)
                     })?;
+            }
+            // Abbrev kernel hints do not imply a reducible attribute. Restore
+            // this module's absent-attribute defaults after explicit statuses
+            // and before header validators consult its transparency policy.
+            // Markers cannot override explicit core or extra entries.
+            for constant in &checked.modules[index].decoded.constants {
+                cancelled!("source-olean/reducibility-default");
+                if let ConstantInfo::Defn(definition) = constant
+                    && definition.hints == fln_env::constants::ReducibilityHints::Abbrev
+                    && activation.environment().find(&definition.base.name) == Some(constant)
+                {
+                    activation = activation
+                        .register_reducibility_default(&definition.base.name)
+                        .map_err(|error| {
+                            reducibility::error(&report.module, &definition.base.name, error)
+                        })?;
+                }
             }
             // Header validation observes the module's imported reducibility policies.
             for _ in 0..report.symms {
@@ -2348,6 +2392,9 @@ impl Engine {
         })?;
         fln_elab::unbox::read(&engine.environment)
             .map_err(|error| unbox_error(&roots.first().cloned().unwrap_or_default(), error))?;
+        fln_elab::never_extract::read(&engine.environment).map_err(|error| {
+            never_extract_error(&roots.first().cloned().unwrap_or_default(), error)
+        })?;
         fln_elab::match_pattern::read(&engine.environment).map_err(|error| {
             match_pattern_error(&roots.first().cloned().unwrap_or_default(), error)
         })?;
@@ -2406,6 +2453,7 @@ impl Engine {
             || sparse_cases_on.next().is_some()
             || noncomputable.next().is_some()
             || unbox.next().is_some()
+            || never_extract.next().is_some()
             || match_patterns.next().is_some()
             || symms.next().is_some()
             || defeq.next().is_some()
@@ -2716,6 +2764,10 @@ trait Registrar: Sized {
         self,
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::unbox::UnboxError>;
+    fn register_never_extract(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::never_extract::NeverExtractError>;
     fn register_match_pattern(
         self,
         declaration: &Name,
@@ -2740,6 +2792,10 @@ trait Registrar: Sized {
         self,
         declaration: &Name,
         status: fln_elab::reducibility::Reducibility,
+    ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError>;
+    fn register_reducibility_default(
+        self,
+        declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError>;
     fn register_extern(
         self,
@@ -2852,6 +2908,12 @@ impl Registrar for instances::imported::ImportActivation {
     ) -> std::result::Result<Self, fln_elab::unbox::UnboxError> {
         self.register_unbox(declaration)
     }
+    fn register_never_extract(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::never_extract::NeverExtractError> {
+        self.register_never_extract(declaration)
+    }
     fn register_match_pattern(
         self,
         declaration: &Name,
@@ -2888,6 +2950,12 @@ impl Registrar for instances::imported::ImportActivation {
         status: fln_elab::reducibility::Reducibility,
     ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError> {
         self.register_reducibility(declaration, status)
+    }
+    fn register_reducibility_default(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError> {
+        self.register_reducibility_default(declaration)
     }
     fn register_extern(
         self,
@@ -3196,6 +3264,25 @@ fn registry_error(
         module: module.clone(),
         declaration: declaration.clone(),
         error,
+    }
+}
+
+fn never_extract_error(
+    module: &Name,
+    error: fln_elab::never_extract::NeverExtractError,
+) -> SourceOleanImportError {
+    use fln_elab::never_extract::NeverExtractError;
+    let (declaration, reason) = match error {
+        NeverExtractError::Limit => return SourceOleanImportError::Limit("never_extract journal"),
+        NeverExtractError::UnknownDeclaration(name) => {
+            (name, "a never_extract tag names no admitted declaration")
+        }
+        NeverExtractError::Malformed => (module.clone(), "malformed never_extract journal"),
+    };
+    SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration,
+        reason,
     }
 }
 
@@ -4856,6 +4943,12 @@ pub(super) mod tests {
         ) -> std::result::Result<Self, fln_elab::unbox::UnboxError> {
             fln_elab::unbox::register(&self.0, declaration).map(Sequential)
         }
+        fn register_never_extract(
+            self,
+            declaration: &Name,
+        ) -> std::result::Result<Self, fln_elab::never_extract::NeverExtractError> {
+            fln_elab::never_extract::register(&self.0, declaration).map(Sequential)
+        }
         fn register_match_pattern(
             self,
             declaration: &Name,
@@ -4894,6 +4987,12 @@ pub(super) mod tests {
             status: fln_elab::reducibility::Reducibility,
         ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError> {
             fln_elab::reducibility::register(&self.0, declaration, status).map(Sequential)
+        }
+        fn register_reducibility_default(
+            self,
+            declaration: &Name,
+        ) -> std::result::Result<Self, fln_elab::reducibility::ReducibilityError> {
+            fln_elab::reducibility::register_default(&self.0, declaration).map(Sequential)
         }
         fn register_extern(
             self,

@@ -44,6 +44,7 @@ pub mod messages;
 pub mod mvar;
 pub mod namespaces;
 pub mod native;
+pub mod never_extract;
 pub mod noncomputable;
 pub mod perturbation;
 pub mod protected_names;

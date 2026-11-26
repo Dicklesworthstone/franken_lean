@@ -21,7 +21,7 @@ pub use format::{
     CLASS_EXTENSION, COE_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION, DEPRECATED_EXTENSION,
     ELAB_AS_ELIM_EXTENSION, EXTERN_EXTENSION, GRIND_DONT_CARE, GRIND_EXTENSION,
     GRIND_GROUND_PATTERN_ANNOTATION, IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION,
-    INSTANCE_EXTENSION, MATCH_PATTERN_EXTENSION, NONCOMPUTABLE_EXTENSION,
+    INSTANCE_EXTENSION, MATCH_PATTERN_EXTENSION, NEVER_EXTRACT_EXTENSION, NONCOMPUTABLE_EXTENSION,
     PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION, PROTECTED_EXTENSION,
     REDUCIBILITY_EXTENSION, REDUCIBILITY_EXTRA_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
     SYMM_EXTENSION, UNBOX_EXTENSION,
@@ -240,6 +240,8 @@ pub struct SourceExtensions {
     pub noncomputable: Vec<Name>,
     /// Nonrecursive inductive types carrying the pin's persistent `[unbox]` tag.
     pub unbox: Vec<Name>,
+    /// Owning-module tags preventing closed-call extraction and CSE.
+    pub never_extract: Vec<Name>,
     /// Definitions marked for pattern expansion, still awaiting checked ownership
     /// and visible-body validation before a source consumer can unfold them.
     pub match_patterns: Vec<Name>,
@@ -793,6 +795,7 @@ fn decode_batch(
         sparse_cases_on_extension_name(),
         name(format::COE_EXTENSION),
         name(format::GRIND_EXTENSION),
+        name(format::NEVER_EXTRACT_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -805,6 +808,7 @@ fn decode_batch(
     let mut sparse_cases_on = BTreeSet::new();
     let mut noncomputable = BTreeSet::new();
     let mut unbox = BTreeSet::new();
+    let mut never_extract = BTreeSet::new();
     let mut match_patterns = BTreeSet::new();
     let mut defeq = BTreeSet::new();
     let mut backward_defeq = BTreeSet::new();
@@ -994,7 +998,14 @@ fn decode_batch(
                     }
                     out.grind_patterns.push(row);
                 }
-                _ => unreachable!("thirty selected extension families"),
+                30 => {
+                    let declaration = reader.name(&obj)?;
+                    if declaration.is_anonymous() || !never_extract.insert(declaration.clone()) {
+                        return Err(shape("anonymous or repeated never-extract declaration"));
+                    }
+                    out.never_extract.push(declaration);
+                }
+                _ => unreachable!("thirty-one selected extension families"),
             }
         }
         if grind_deferred {

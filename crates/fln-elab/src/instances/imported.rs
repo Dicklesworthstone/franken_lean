@@ -739,6 +739,15 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain the owning module's closed-call extraction/CSE inhibition tag.
+    pub fn register_never_extract(
+        mut self,
+        declaration: &Name,
+    ) -> Result<Self, crate::never_extract::NeverExtractError> {
+        self.env = crate::never_extract::register(&self.env, declaration)?;
+        Ok(self)
+    }
+
     /// Retain a checked owning module's pattern-expansion tag without changing
     /// cached class or instance metadata. Registration requires a visible definition.
     pub fn register_match_pattern(
@@ -801,6 +810,16 @@ impl ImportActivation {
         status: crate::reducibility::Reducibility,
     ) -> Result<Self, crate::reducibility::ReducibilityError> {
         self.env = crate::reducibility::register(&self.env, declaration, status)?;
+        Ok(self)
+    }
+
+    /// Retain the pin's absent-attribute default independently of kernel hints.
+    /// Explicit imported statuses keep precedence and no wire row is invented.
+    pub fn register_reducibility_default(
+        mut self,
+        declaration: &Name,
+    ) -> Result<Self, crate::reducibility::ReducibilityError> {
+        self.env = crate::reducibility::register_default(&self.env, declaration)?;
         Ok(self)
     }
 

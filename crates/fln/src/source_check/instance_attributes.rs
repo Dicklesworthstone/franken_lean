@@ -145,8 +145,8 @@ pub(super) fn apply(
                 )),
             )),
         })?;
-        if let Some(status) = unrecorded_status {
-            next = fln_elab::reducibility::register(&next, &name, status)
+        if unrecorded_status.is_some() {
+            next = fln_elab::reducibility::register_default(&next, &name)
                 .map_err(|error| reducibility::registry_error(error, (file, command, offset)))?;
         }
     }

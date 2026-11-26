@@ -125,6 +125,7 @@ pub(super) fn encode(
             && metadata.sparse_cases_on.is_empty()
             && metadata.noncomputable.is_empty()
             && metadata.unbox.is_empty()
+            && metadata.never_extract.is_empty()
             && metadata.match_patterns.is_empty()
             && metadata.symms.is_empty()
             && metadata.grind_patterns.is_empty()
