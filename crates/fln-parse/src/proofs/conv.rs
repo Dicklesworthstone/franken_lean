@@ -755,15 +755,18 @@ fn extended_operand(
     ] {
         if word(tokens, start, keyword) {
             let keyword_atom = atom(start, keyword)?;
-            let parsed = match keyword {
+            let mut parsed = match keyword {
                 "guard_target" => guard_target(leaves, view, tokens, range, keyword_atom)?,
                 "guard_expr" => guard_expr(leaves, view, tokens, range, keyword_atom)?,
                 _ => guard_hyp::parse(leaves, view, tokens, range, keyword_atom)?,
             };
-            let Syntax::Node { args, .. } = parsed else {
+            let Syntax::Node { args, .. } = &mut parsed else {
                 return Err(refusal(view, tokens, start));
             };
-            return Ok(Syntax::node(parser_kind(&["Tactic", kind]), args));
+            return Ok(Syntax::node(
+                parser_kind(&["Tactic", kind]),
+                std::mem::take(args),
+            ));
         }
     }
     // `"dsimp" optConfig (discharger)? (&" only")? (" [" (simpErase <|> simpLemma),* "]")?`
