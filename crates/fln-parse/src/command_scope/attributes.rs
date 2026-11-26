@@ -833,6 +833,12 @@ pub(super) fn parse_executable(
                         | "pp_using_anonymous_constructor"
                         | "coe"
                         | "match_pattern"
+                        | "weak_specialize"
+                        | "never_extract"
+                        | "nospecialize"
+                        | "export"
+                        | "suggest_for"
+                        | "inherit_doc"
                 )
             )
         });

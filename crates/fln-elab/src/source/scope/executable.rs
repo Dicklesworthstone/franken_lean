@@ -15,6 +15,12 @@ pub enum Attribute {
     AnonymousConstructor,
     Coe,
     MatchPattern,
+    WeakSpecialize,
+    NeverExtract,
+    NoSpecialize,
+    Export(Name),
+    SuggestFor(Vec<Name>),
+    InheritDoc(Name),
 }
 
 impl Attribute {
@@ -22,7 +28,16 @@ impl Attribute {
     pub fn is_tag(&self) -> bool {
         matches!(
             self,
-            Self::Unbox | Self::AnonymousConstructor | Self::Coe | Self::MatchPattern
+            Self::Unbox
+                | Self::AnonymousConstructor
+                | Self::Coe
+                | Self::MatchPattern
+                | Self::WeakSpecialize
+                | Self::NeverExtract
+                | Self::NoSpecialize
+                | Self::Export(_)
+                | Self::SuggestFor(_)
+                | Self::InheritDoc(_)
         )
     }
 
@@ -31,6 +46,34 @@ impl Attribute {
     pub fn permits_imported_target(&self) -> bool {
         matches!(self, Self::Coe)
     }
+}
+
+/// Mirror pinned `Lean/Compiler/ExportAttr.lean:15-22`: every component of an
+/// `@[export ...]` symbol must be a string segment starting with an alphabetic
+/// character followed by alphanumeric or `_` characters.
+fn is_valid_cpp_id(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_alphabetic() && chars.all(|ch| ch.is_alphanumeric() || ch == '_')
+}
+
+fn is_valid_cpp_name(name: &Name) -> bool {
+    if name.is_anonymous() {
+        return false;
+    }
+    let mut current = name.clone();
+    for _ in 0..1024 {
+        match current.leaf_view() {
+            fln_core::name::LeafView::Anonymous => return true,
+            fln_core::name::LeafView::Str(segment) if is_valid_cpp_id(segment) => {
+                current = current.parent();
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn implemented_error(error: crate::implemented_by::ImplementedByError) -> NatDefinitionElabError {
@@ -91,6 +134,33 @@ pub(in crate::source) fn attribute(
             } else if val == &Name::from_components(["pp_using_anonymous_constructor"]) {
                 expect_empty_null(argument, "pp_using_anonymous_constructor without arguments")?;
                 Attribute::AnonymousConstructor
+            } else if val == &Name::from_components(["weak_specialize"]) {
+                expect_empty_null(argument, "weak_specialize without arguments")?;
+                Attribute::WeakSpecialize
+            } else if val == &Name::from_components(["never_extract"]) {
+                expect_empty_null(argument, "never_extract without arguments")?;
+                Attribute::NeverExtract
+            } else if val == &Name::from_components(["nospecialize"]) {
+                expect_empty_null(argument, "nospecialize without arguments")?;
+                Attribute::NoSpecialize
+            } else if val == &Name::from_components(["inherit_doc"]) {
+                let [Syntax::Ident { val, .. }] = expect_null_args(argument, "inherit_doc target")?
+                else {
+                    return Err(refused("one inherit_doc target declaration name"));
+                };
+                if val.is_anonymous() {
+                    return Err(refused("a named inherit_doc target"));
+                }
+                Attribute::InheritDoc(val.clone())
+            } else if val == &Name::from_components(["suggest_for"]) {
+                let [Syntax::Ident { val, .. }] = expect_null_args(argument, "suggest_for target")?
+                else {
+                    return Err(refused("one suggest_for target name"));
+                };
+                if val.is_anonymous() {
+                    return Err(refused("a named suggest_for target"));
+                }
+                Attribute::SuggestFor(vec![val.clone()])
             } else if val == &Name::from_components(["implemented_by"]) {
                 let [Syntax::Ident { val, .. }] =
                     expect_null_args(argument, "implemented_by target")?
@@ -104,6 +174,45 @@ pub(in crate::source) fn attribute(
             } else {
                 return Ok(None);
             }
+        }
+        Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Attr", "export"]) => {
+            let [keyword, target] = args.as_slice() else {
+                return Err(refused("export attribute"));
+            };
+            expect_atom(keyword, "export", "export attribute keyword")?;
+            let Syntax::Ident { val, .. } = target else {
+                return Err(refused("an export symbol name"));
+            };
+            if !is_valid_cpp_name(val) {
+                return Err(refused("a valid C++ export symbol name"));
+            }
+            Attribute::Export(val.clone())
+        }
+        Syntax::Node { kind, args, .. }
+            if kind == &Name::from_components(["Lean", "suggest_for"]) =>
+        {
+            let [keyword, targets] = args.as_slice() else {
+                return Err(refused("suggest_for attribute"));
+            };
+            expect_atom(keyword, "suggest_for", "suggest_for attribute keyword")?;
+            let targets = expect_null_args(targets, "suggest_for targets")?;
+            if targets.is_empty() {
+                return Err(refused("at least one suggest_for identifier"));
+            }
+            if targets.len() > MAX_ATTRIBUTE_ITEMS {
+                return Err(failure(SourceInferenceError::ResourceLimit));
+            }
+            let mut names = Vec::with_capacity(targets.len());
+            for target in targets {
+                let Syntax::Ident { val, .. } = target else {
+                    return Err(refused("a suggest_for identifier"));
+                };
+                if val.is_anonymous() {
+                    return Err(refused("a named suggest_for identifier"));
+                }
+                names.push(val.clone());
+            }
+            Attribute::SuggestFor(names)
         }
         Syntax::Node { kind, args, .. }
             if kind == &Name::from_components(["Lean", "Attr", "coe"]) =>
@@ -446,6 +555,27 @@ pub fn apply(
                         _ => refused("a valid coercion delaborator journal"),
                     },
                 )?
+            }
+            Attribute::WeakSpecialize
+            | Attribute::NeverExtract
+            | Attribute::NoSpecialize
+            | Attribute::Export(_)
+            | Attribute::SuggestFor(_) => {
+                if !result.contains(declaration) {
+                    return Err(refused(
+                        "an admitted declaration for compiler/hint attribute",
+                    ));
+                }
+                result
+            }
+            Attribute::InheritDoc(target) => {
+                if !result.contains(declaration) {
+                    return Err(refused("an admitted declaration for inherit_doc"));
+                }
+                if resolve(&result, scope, target)?.is_none() {
+                    return Err(refused("a known inherit_doc target declaration"));
+                }
+                result
             }
         };
     }

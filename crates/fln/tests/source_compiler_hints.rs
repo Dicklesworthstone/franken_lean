@@ -130,3 +130,72 @@ fn compiler_hint_refusals_match_the_pin() {
         assert!(check(source).is_err(), "accepted {source} (the pin: {pin})");
     }
 }
+
+#[test]
+fn prelude_compiler_and_metadata_tags_match_the_pin() {
+    for source in [
+        "class C where\n  x : Nat\nattribute [weak_specialize] C\n",
+        "@[weak_specialize] def d (n : Nat) : Nat := n\n",
+        "@[weak_specialize] theorem t : 1 = 1 := rfl\n",
+        "@[never_extract] def d (n : Nat) : Nat := n\n",
+        "@[noinline, never_extract] def d (n : Nat) : Nat := n\n",
+        "@[never_extract] theorem t : 1 = 1 := rfl\n",
+        "@[never_extract] structure S where\n  x : Nat\n",
+        "def d : Nat := 0\nattribute [never_extract] d\n",
+        "@[nospecialize] def d (n : Nat) : Nat := n\n",
+        "@[nospecialize] theorem t : 1 = 1 := rfl\n",
+        "@[nospecialize] structure S where\n  x : Nat\n",
+        "@[export my_sym] def d (x : Nat) : Nat := x\n",
+        "@[export foo.bar] def d (x : Nat) : Nat := x\n",
+        "@[export my_thm] theorem t : 1 = 1 := rfl\n",
+        "@[export my_s] structure S where\n  x : Nat\n",
+        "@[suggest_for Foo, suggest_for Bar] inductive Baz | mk\n",
+        "@[suggest_for Foo] def d : Nat := 0\n",
+        "inductive Baz | mk\nattribute [suggest_for Foo] Baz\n",
+        "def a : Nat := 0\n@[inherit_doc a] def b : Nat := 0\n",
+        "def a : Nat := 0\n@[always_inline, inline, inherit_doc a] def b : Nat := a\n",
+    ] {
+        check(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+    }
+
+    for (source, pin) in [
+        (
+            "@[local weak_specialize] def d : Nat := 0\n",
+            "Invalid attribute scope: Attribute `[weak_specialize]` must be global",
+        ),
+        (
+            "@[weak_specialize 1] def d : Nat := 0\n",
+            "Unexpected attribute argument: This attribute takes no arguments",
+        ),
+        (
+            "@[local never_extract] def d : Nat := 0\n",
+            "Invalid attribute scope: Attribute `[never_extract]` must be global",
+        ),
+        (
+            "@[local nospecialize] def d : Nat := 0\n",
+            "Invalid attribute scope: Attribute `[nospecialize]` must be global",
+        ),
+        (
+            "@[export foo'] def d (x : Nat) : Nat := x\n",
+            "Invalid `export` function name: `foo'` is not a valid C++ identifier",
+        ),
+        (
+            "@[local export my_sym] def d (x : Nat) : Nat := x\n",
+            "Invalid attribute scope: Attribute `[export]` must be global",
+        ),
+        (
+            "@[local suggest_for Foo] inductive Baz | mk\n",
+            "Invalid attribute scope: Attribute `[suggest_for]` must be global",
+        ),
+        (
+            "@[inherit_doc noSuchDecl999] def b : Nat := 0\n",
+            "Unknown constant `noSuchDecl999`",
+        ),
+        (
+            "def a : Nat := 0\n@[local inherit_doc a] def b : Nat := 0\n",
+            "Invalid attribute scope: Attribute `[inherit_doc]` must be global",
+        ),
+    ] {
+        assert!(check(source).is_err(), "accepted {source} (the pin: {pin})");
+    }
+}
