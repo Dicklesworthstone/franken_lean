@@ -59,19 +59,36 @@ fn native_axioms(engine: &Engine, owner: &Name) -> Vec<Name> {
         .collect()
 }
 
+fn source_inference(
+    error: &SourceModuleCheckError,
+) -> Option<&fln_elab::source::SourceInferenceError> {
+    let SourceModuleCheckError::Source {
+        error: fln::SourceCheckError::Command { error, .. },
+        ..
+    } = error
+    else {
+        return None;
+    };
+    match error.as_ref() {
+        fln::EngineExecutionError::Frontend(fln::DefinitionFrontendError::Elaborate(
+            fln_elab::NatDefinitionElabError::Inference(error),
+        )) => Some(error),
+        _ => None,
+    }
+}
+
 #[test]
-fn public_native_provider_does_not_resolve_a_private_decision_dictionary() {
-    // This source-only fixture stops before compilation: a private dictionary
-    // must not satisfy an exposed body's public instance search. Reaching that
-    // error also checks that the runtime route installed its native provider.
+fn public_native_decide_requires_its_syntax_import() {
+    // An execution provider does not install syntax. This source-only module
+    // must retain the ordinary missing-Init.Tactics boundary even when its
+    // declaration has an otherwise valid direct proof.
     const BASE: &str = "prelude
 inductive False : Prop
 inductive Truth : Prop where
 | make
-inductive Decidable (P : Prop) where
+class inductive Decidable (P : Prop) : Type where
 | isFalse (proof : P -> False)
 | isTrue (proof : P)
-attribute [class] Decidable
 class Law : Prop where
   proof : Truth
 ";
@@ -96,37 +113,14 @@ private noncomputable instance secret : Decidable Truth := Decidable.isTrue Trut
     let bad =
         format!("{PREFIX}@[expose] public instance publicLaw : Law := Law.mk (by native_decide)");
     let error = execute(&imported, &[("Api", &bad), ("Base", BASE)], 2 * 1024 * 1024).unwrap_err();
-    let rendered = format!("{error:?}");
-    assert!(rendered.contains("InstanceSynthesisRequired"), "{rendered}");
-    assert!(!rendered.contains("Unavailable"), "{rendered}");
+    assert!(
+        matches!(source_inference(&error),
+            Some(fln_elab::source::SourceInferenceError::UnknownConstant(name))
+                if name == &n("Lean.Parser.Tactic.nativeDecide")),
+        "{error:?}"
+    );
     assert_eq!(imported.engine.logical_root(&options), before);
     assert!(imported.engine.environment().is_empty());
-
-    // The checking-only route remains unable to execute native proofs.
-    let checked_only = format!("{PREFIX}public theorem checkedOnly : Truth := by native_decide");
-    let names = [n("Api"), n("Base")];
-    let inputs = [
-        SourceModuleInput {
-            name: &names[0],
-            source: checked_only.as_bytes(),
-        },
-        SourceModuleInput {
-            name: &names[1],
-            source: BASE.as_bytes(),
-        },
-    ];
-    let error = Engine::builder()
-        .build_empty()
-        .check_source_modules(
-            &inputs,
-            &names[0],
-            &options,
-            SourceModuleCheckLimits::new(SourceCheckLimits::new(EngineAdmissionLimits::new(
-                Budget::for_stack_bytes(2 * 1024 * 1024),
-            ))),
-        )
-        .unwrap_err();
-    assert_eq!(error.disposition(), ("capability", false, 5));
 }
 
 fn pinned_lib() -> Option<PathBuf> {
@@ -160,7 +154,7 @@ fn import_pinned(lib: &Path) -> SourceOleanImport {
         .iter()
         .map(|name| {
             let base = name
-                .to_string()
+                .to_display_string()
                 .split('.')
                 .fold(lib.to_path_buf(), |path, part| path.join(part))
                 .with_extension("olean");
@@ -283,10 +277,10 @@ public theorem useExposedData : exposedData.val = 41 := by rfl
                                 if value.base.name == axiom)
                         })
                         .collect();
-                    assert_eq!(receipts.len(), 1, "{axiom}");
+                    assert_eq!(receipts.len(), 1, "{axiom:?}");
                     assert_eq!(receipts[0].declaration, Declaration::Axiom(accepted.clone()));
                     if hidden {
-                        assert!(!client.environment().contains(&axiom), "{axiom}");
+                        assert!(!client.environment().contains(&axiom), "{axiom:?}");
                     } else {
                         assert_eq!(
                             client.environment().find(&axiom),
@@ -321,6 +315,62 @@ public theorem useExposedData : exposedData.val = 41 := by rfl
                 assert!(!rendered.contains("Unavailable"), "{rendered}");
                 assert_eq!(imported.engine.logical_root(&options), before);
             }
+
+            // The native provider can execute private implementations, but an
+            // exposed body's instance search still uses only public entries.
+            let dictionary_prefix = format!(
+                "{HEADER}public inductive NativeTruth : Prop where
+| make
+public class NativeLaw : Prop where
+  proof : NativeTruth
+private instance secretDecision : Decidable NativeTruth := Decidable.isTrue NativeTruth.make
+"
+            );
+            let direct = format!(
+                "{dictionary_prefix}@[expose] public instance publicLaw : NativeLaw := NativeLaw.mk NativeTruth.make"
+            );
+            let control = execute(&imported, &[("Api", &direct)], STACK);
+            assert!(matches!(control, Ok(Outcome::Complete(_))), "{control:?}");
+            let private_dictionary = format!(
+                "{dictionary_prefix}@[expose] public instance publicLaw : NativeLaw := NativeLaw.mk (by native_decide)"
+            );
+            let error = execute(&imported, &[("Api", &private_dictionary)], STACK).unwrap_err();
+            assert!(
+                matches!(source_inference(&error),
+                    Some(fln_elab::source::SourceInferenceError::InstanceSynthesisRequired(_))),
+                "{error:?}"
+            );
+            assert_eq!(imported.engine.logical_root(&options), before);
+
+            // Real syntax and dictionaries do not grant a checking-only API
+            // the capability to execute a native proof.
+            let module = n("Api");
+            let checked_only = format!(
+                "{HEADER}public theorem checkedOnly : 2 + 2 = 4 := by native_decide"
+            );
+            let error = imported
+                .check_source_modules(
+                    &[SourceModuleInput {
+                        name: &module,
+                        source: checked_only.as_bytes(),
+                    }],
+                    &module,
+                    &options,
+                    SourceModuleCheckLimits::new(SourceCheckLimits::new(
+                        EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)),
+                    )),
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(error.disposition(), ("capability", false, 5));
+            assert!(
+                matches!(source_inference(&error),
+                    Some(fln_elab::source::SourceInferenceError::NativeEvaluation(
+                        fln_elab::native::NativeEvaluationError::Unavailable
+                    ))),
+                "{error:?}"
+            );
+            assert_eq!(imported.engine.logical_root(&options), before);
         })
         .expect("spawn the checking thread")
         .join()

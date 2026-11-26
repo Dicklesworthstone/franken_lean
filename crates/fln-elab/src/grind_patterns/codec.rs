@@ -213,10 +213,8 @@ fn read_expr(bytes: &mut &[u8]) -> Result<Expr, Error> {
                 let length = u32_(bytes)? as usize;
                 let raw = take(bytes, length.checked_mul(8).ok_or(Error::Limit)?)?;
                 let mut limbs = Vec::with_capacity(length);
-                for limb in raw.chunks_exact(8) {
-                    limbs.push(u64::from_le_bytes(
-                        limb.try_into().map_err(|_| Error::Malformed)?,
-                    ));
+                for limb in raw.as_chunks::<8>().0 {
+                    limbs.push(u64::from_le_bytes(*limb));
                 }
                 if limbs.last() == Some(&0) {
                     return Err(Error::Malformed);

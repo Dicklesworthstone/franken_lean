@@ -64,7 +64,7 @@ fn auxiliaries(engine: &Engine, owner: &Name) -> Vec<Name> {
         .collect()
 }
 
-const BASE: &str = "prelude\ninductive Truth : Prop where\n| make\nstructure Box where\n  proof : Truth\nclass Law : Prop where\n  proof : Truth\nclass Pick where\n  proof : Truth";
+const BASE: &str = "prelude\ninductive Truth : Prop where\n| make\nstructure Box : Type where\n  proof : Truth\nclass Law : Prop where\n  proof : Truth\nclass Pick : Type where\n  proof : Truth";
 const HEADER: &str = "module\nprelude\npublic import Base\n";
 
 #[test]
@@ -303,6 +303,97 @@ fn multiple_auxiliaries_leave_instance_and_simp_metadata_on_the_owner() {
 }
 
 #[test]
+fn anonymous_public_simp_instances_keep_namespaced_owner_metadata_after_auxiliaries() {
+    let base = Engine::with_source_seed(limits().source.admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let names = [n("Main"), n("Api")];
+    let api = "module\nprelude\npublic inductive OtherTruth : Prop where\n| make\npublic class Bundle : Prop where\n  left : True\n  right : OtherTruth\nnamespace Rules\n@[simp] public instance : Bundle := by\n  constructor\n  as_aux_lemma => exact True.intro\n  as_aux_lemma => exact OtherTruth.make\nend Rules";
+    let local = base
+        .check_source_modules(
+            &[SourceModuleInput {
+                name: &names[1],
+                source: api.as_bytes(),
+            }],
+            &names[1],
+            &KVMap::new(),
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let registry =
+        fln_elab::instances::InstanceRegistry::read(local.checked.engine.environment()).unwrap();
+    let [instance] = registry.candidates(&n("Bundle")) else {
+        panic!("the anonymous command must register exactly its checked owner");
+    };
+    let owner = instance.declaration.clone();
+    assert_eq!(owner.parent(), n("Rules"));
+    assert!(matches!(
+        local.checked.engine.environment().find(&owner),
+        Some(ConstantInfo::Thm(_))
+    ));
+    let private_owner = Name::num(n("_private.Api"), 0).append_core(&owner);
+    let helpers = auxiliaries(&local.checked.engine, &private_owner);
+    assert_eq!(helpers.len(), 2);
+    for helper in &helpers {
+        assert!(matches!(
+            local.checked.engine.environment().find(helper),
+            Some(ConstantInfo::Thm(_))
+        ));
+    }
+    assert!(auxiliaries(&local.checked.engine, &owner).is_empty());
+
+    let main = "module\nprelude\npublic import Api\npublic theorem byInstance : Bundle := by infer_instance\npublic theorem bySimp : Bundle := by simp";
+    let imported = base
+        .check_source_modules(
+            &[
+                SourceModuleInput {
+                    name: &names[0],
+                    source: main.as_bytes(),
+                },
+                SourceModuleInput {
+                    name: &names[1],
+                    source: api.as_bytes(),
+                },
+            ],
+            &names[0],
+            &KVMap::new(),
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(matches!(
+        imported.checked.engine.environment().find(&owner),
+        Some(ConstantInfo::Axiom(_))
+    ));
+    for helper in &helpers {
+        assert!(!imported.checked.engine.environment().contains(helper));
+    }
+    assert!(auxiliaries(&imported.checked.engine, &owner).is_empty());
+    for engine in [&local.checked.engine, &imported.checked.engine] {
+        let registry = fln_elab::instances::InstanceRegistry::read(engine.environment()).unwrap();
+        let [instance] = registry.candidates(&n("Bundle")) else {
+            panic!("auxiliary predecessors must not replace the anonymous instance owner");
+        };
+        assert_eq!(instance.declaration, owner);
+        let simp = fln_elab::source::scope::simp::read(engine.environment()).unwrap();
+        assert_eq!(
+            simp.iter()
+                .filter(|entry| entry.declaration == owner)
+                .count(),
+            1
+        );
+        assert!(
+            simp.iter()
+                .all(|entry| !helpers.contains(&entry.declaration))
+        );
+    }
+}
+
+#[test]
 fn exposed_auxiliaries_cannot_borrow_private_bodies_or_header_dependencies() {
     for body in [
         "@[expose] public noncomputable def bad : Box := Box.mk (by as_aux_lemma => exact secret)",
@@ -427,9 +518,9 @@ fn module_artifacts_retain_checked_auxiliaries_only_in_private_companions() {
         .unwrap()
         .module_data(OleanWalkBudget::default())
         .unwrap();
-    assert!(public.const_names.contains(&n("proof")));
+    assert!(public.const_names.contains(&n("proof").to_display_string()));
     let auxiliary = private("Api", "proof._proof_1_1");
-    assert!(!public.const_names.contains(&auxiliary));
+    assert!(!public.const_names.contains(&auxiliary.to_display_string()));
     let parts = artifact.companions.as_ref().unwrap();
     let imported = initial
         .import_olean_modules_for_source(

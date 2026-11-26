@@ -287,13 +287,28 @@ impl Engine {
             };
         }
         if let Some((name, priority, reverse)) = registration {
-            let name = scope.declaration_name(&name).map_err(|error| {
-                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                    fln_elab::NatDefinitionElabError::Inference(
-                        fln_elab::source::SourceInferenceError::NameScope(error),
-                    ),
-                ))
-            })?;
+            let name = if name.is_anonymous() {
+                // Anonymous instances have no source name to qualify. This
+                // batch still starts with the checked owner; auxiliary
+                // predecessors are prepended after its metadata is complete.
+                // Its generated identity already includes namespace/privacy.
+                batch
+                    .admissions
+                    .first()
+                    .and_then(|admitted| declared_name(&admitted.declaration))
+                    .cloned()
+                    .ok_or(EngineExecutionError::UnexpectedPublication {
+                        detail: "anonymous simp registration requires a checked owner",
+                    })?
+            } else {
+                scope.declaration_name(&name).map_err(|error| {
+                    EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                        fln_elab::NatDefinitionElabError::Inference(
+                            fln_elab::source::SourceInferenceError::NameScope(error),
+                        ),
+                    ))
+                })?
+            };
             let checked = match batch.engine.apply_checked_source_simp(
                 &name,
                 Some((priority, reverse)),

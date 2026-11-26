@@ -435,6 +435,18 @@ pub fn registration(
             });
         }
     };
+    if declaration[1].kind() == Some(&parser_kind(&["Command", "instance"])) {
+        // The pin applies simp to the admitted constant: proof instances are
+        // theorem rules, and data instances are definitions to unfold. Reuse
+        // the instance reader, including its anonymous-name marker; only the
+        // eventual owner admission can supply that generated name.
+        let Some((name, _)) = instance_command::registration(syntax)? else {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "simp instance declaration",
+            });
+        };
+        return Ok(Some((name, priority, reverse)));
+    }
     let definition = match &declaration[1] {
         Syntax::Node { kind, .. } if kind == &parser_kind(&["Command", "definition"]) => {
             expect_node(&declaration[1], kind, 5, "definition")?
@@ -449,7 +461,7 @@ pub fn registration(
         }
         _ => {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "simp definition, abbreviation or theorem",
+                expected: "simp definition, abbreviation, theorem or instance",
             });
         }
     };
