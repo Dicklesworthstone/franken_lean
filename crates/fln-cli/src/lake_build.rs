@@ -465,6 +465,15 @@ fn module_target<'a>(
     Ok((module, owner))
 }
 
+/// Explicit source-file selectors have a .lean path before the facet.
+fn source_facet(target: &str) -> Option<(&str, &str)> {
+    let (selector, facet) = target.rsplit_once(':')?;
+    if selector.starts_with(['+', '@']) || selector.contains("/+") || !selector.ends_with(".lean") {
+        return None;
+    }
+    Some((selector, facet))
+}
+
 fn plan_modules<'a>(
     sources: &'a local_dependencies::Sources,
     targets: &[String],
@@ -485,7 +494,7 @@ fn plan_modules<'a>(
         requests: Vec::new(),
     };
     for target in targets {
-        let Some((module, facet)) = target.split_once(':') else {
+        let Some((module, facet)) = target.rsplit_once(':') else {
             return Err(Failure::unsupported(format!(
                 "default target `{target}` requires Lean artifacts or executable linking that are unavailable; request +Module:olean for a declared library module"
             )));
@@ -1335,7 +1344,7 @@ fn build(
         &config,
         &sources,
         &targets,
-        &plan.owners,
+        &plan,
         &modules,
         &artifacts,
         &destinations,
@@ -1506,7 +1515,7 @@ fn record_snapshot(
     config: &LakeConfig,
     sources: &local_dependencies::Sources,
     targets: &[String],
-    owners: &ModuleOwners<'_>,
+    plan: &BuildPlan<'_>,
     modules: &BTreeMap<Name, Module>,
     artifacts: &BTreeMap<Name, ModuleArtifacts>,
     destinations: &BTreeMap<Name, (PathBuf, PathBuf)>,
@@ -1527,7 +1536,7 @@ fn record_snapshot(
             .get(name)
             .ok_or("an artifact has no source module")?;
         let source = sources
-            .resolve_build(name, owners)
+            .resolve_build(name, &plan.owners)
             .map_err(|failure| failure.detail)?
             .ok_or("a built module has no source owner")?;
         let (owner, output_dir) = destinations
@@ -1583,7 +1592,26 @@ fn record_snapshot(
     let text = snapshot::Snapshot {
         posture: posture.as_str().to_owned(),
         records: records.to_owned(),
-        targets: targets.to_vec(),
+        // A source path is relative to the build process, even with --dir.
+        // Persist its resolved package and module so explain can replay the
+        // selection after a change of directory or a workspace relocation.
+        targets: targets
+            .iter()
+            .zip(&plan.requests)
+            .map(|(target, (module, facet))| {
+                if source_facet(target).is_some() {
+                    let owner = plan.owners[module];
+                    format!(
+                        "@{}/+{}:{}",
+                        owner.identity,
+                        module.to_display_string(),
+                        facet.extension()
+                    )
+                } else {
+                    target.clone()
+                }
+            })
+            .collect(),
         configurations: sources.configuration_rows(root),
         modules: rows,
         externals,

@@ -533,7 +533,10 @@ current tree and reports why each module of the recorded build (or of `MODULE`'s
 closure) would rebuild. It elaborates and admits nothing, so this command still
 requires a TOML configuration and explicitly refuses `lakefile.lean`. It resolves
 the current selected packages and their source and output owners again; recorded
-paths never authorize reading arbitrary artifacts. It writes no artifacts,
+paths never authorize reading arbitrary artifacts. A build requested by source path records
+its resolved package and module, so the explanation works from another directory.
+For an older snapshot with an ambiguous relative source path, a fresh build
+records the missing identity. It writes no artifacts,
 manifests, or snapshots. `+Module:olean`, `+Module:ilean`, and `+Module:ir` can
 select the recorded module's closure.
 

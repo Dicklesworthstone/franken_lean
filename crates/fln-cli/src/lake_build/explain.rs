@@ -89,6 +89,7 @@ struct Report {
 /// path. A package qualifier is checked against the recorded build's owner.
 fn target_name<'a>(
     sources: &'a local_dependencies::Sources,
+    root: &Path,
     text: &str,
 ) -> std::result::Result<
     (
@@ -98,19 +99,110 @@ fn target_name<'a>(
     ),
     Failure,
 > {
-    if let Some(path) = text.strip_suffix(".lean") {
-        return name(&path.trim_start_matches("./").replace(['/', '\\'], "."))
-            .map(|module| (module, None, None));
-    }
     let (bare, facet) = text
         .rsplit_once(':')
         .and_then(|(target, facet)| ModuleFacet::parse(facet).map(|facet| (target, Some(facet))))
         .unwrap_or((text, None));
+    if let Some(stem) = bare.strip_suffix(".lean")
+        && !bare.starts_with(['+', '@'])
+    {
+        // Prefer a file selected from the caller's directory, as lake build
+        // does. Also accept a path relative to the chosen workspace (--dir).
+        if let Some((module, owner)) = source_file_target(sources, bare)? {
+            return Ok((module, Some(owner), facet));
+        }
+        let from_root = root.join(bare);
+        if let Some(path) = from_root.to_str()
+            && let Some((module, owner)) = source_file_target(sources, path)?
+        {
+            return Ok((module, Some(owner), facet));
+        }
+        // Preserve the logical-path spelling used to explain a deleted source.
+        if facet.is_none() {
+            return name(&stem.trim_start_matches("./").replace(['/', '\\'], "."))
+                .map(|module| (module, None, None));
+        }
+    }
     if bare.contains('/') || bare.starts_with('@') || bare.ends_with(".lean") {
         module_target(sources, bare).map(|(module, owner)| (module, Some(owner), facet))
     } else {
         name(bare.strip_prefix('+').unwrap_or(bare)).map(|module| (module, None, facet))
     }
+}
+
+/// Legacy snapshots stored the caller's source-file argument without its
+/// working directory. Match it only against recorded source identities and
+/// ask the current package configuration to confirm the original owner.
+fn recorded_target(
+    root: &Path,
+    sources: &local_dependencies::Sources,
+    snapshot: &Snapshot,
+    target: &str,
+) -> std::result::Result<String, Refusal> {
+    let Some((selector, facet)) = source_facet(target) else {
+        return Ok(target.to_owned());
+    };
+    let input = Path::new(selector);
+    let mut suffix = PathBuf::new();
+    for component in input.components() {
+        match component {
+            Component::ParentDir => {
+                suffix.pop();
+            }
+            Component::CurDir => {}
+            component => suffix.push(component.as_os_str()),
+        }
+    }
+    let unavailable = || {
+        Refusal::Unavailable(format!(
+            "cannot recover the recorded source target `{target}` and its package; rebuild to refresh the snapshot"
+        ))
+    };
+    let mut rows = snapshot.modules.iter().filter(|row| {
+        let recorded = root.join(&row.source);
+        if input.is_absolute() {
+            recorded == suffix
+        } else {
+            recorded.ends_with(&suffix)
+        }
+    });
+    let Some(row) = rows.next() else {
+        // A module name ending in ".lean" can also be a named selector.
+        if snapshot.modules.iter().any(|row| row.name == selector) {
+            return Ok(format!("+{selector}:{facet}"));
+        }
+        return Err(unavailable());
+    };
+    if rows.next().is_some() {
+        return Err(unavailable());
+    }
+    let module = name(&row.name)?;
+    let source = root.join(&row.source);
+    let mut owners = Vec::new();
+    for package in &sources.packages {
+        if package.target_path(&module)?.as_ref() == Some(&source) {
+            owners.push(package);
+        }
+    }
+    if owners.len() > 1 {
+        // Multiple aliases can share a source while using separate buildDirs.
+        let artifact = root.join(&row.artifact);
+        let relative = source_import_relative_path(&module)
+            .map_err(Failure::from)?
+            .with_extension("olean");
+        owners.retain(|package| {
+            package
+                .root
+                .join(&package.config.build_dir)
+                .join("lib/lean")
+                .join(&relative)
+                == artifact
+        });
+    }
+    let [owner] = owners.as_slice() else {
+        return Err(unavailable());
+    };
+    Ok(format!("@{}/+{}:{facet}", owner.identity, row.name))
 }
 
 fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result<Report, Refusal> {
@@ -187,12 +279,20 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
             (old != new).then(|| (path, old.map(str::to_owned), new.map(str::to_owned)))
         })
         .collect();
-    let recorded_plan = plan_modules(&sources, &recorded.targets)?;
+    if recorded.targets.len() > MAX_MODULES || recorded.modules.len() > MAX_MODULES {
+        return Err(Failure::new("resource", "recorded build exceeds 256 targets or modules").into());
+    }
+    let targets = recorded
+        .targets
+        .iter()
+        .map(|target| recorded_target(&root, &sources, &recorded, target))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let recorded_plan = plan_modules(&sources, &targets)?;
     let resolve = |module: &Name| sources.resolve_build_package(module, &recorded_plan.owners);
     let mut selected_facet = None;
     let entries = match target {
         Some(text) => {
-            let (module, requested_owner, facet) = target_name(&sources, text)?;
+            let (module, requested_owner, facet) = target_name(&sources, &root, text)?;
             let display = module.to_display_string();
             if !recorded.modules.iter().any(|row| row.name == display) {
                 return Err(Failure::input(format!(
