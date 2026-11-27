@@ -296,28 +296,30 @@ pub(super) fn elaborate_record_scoped(
     let mut inheritance = context.record_parents(&parts[3], name, is_class, budget)?;
     let mut labels = std::mem::take(&mut inheritance.labels);
     let mut inferred = inheritance.level.clone();
-    let (constructor, fields) = match expect_null_args(&parts[4], "record body")? {
-        [] => (Name::from_components(["mk"]), &[][..]),
-        [keyword, ctor, fields] => {
-            // `where`, or the pin's older `:=` (`" := " <|> " where "`), for which the pin's
-            // `expandFields` only logs a deprecation lint, a warning.
-            if expect_atom(keyword, ":=", "record body keyword").is_err() {
-                expect_atom(keyword, "where", "record body keyword")?;
+    let (constructor, constructor_protected, fields) =
+        match expect_null_args(&parts[4], "record body")? {
+            [] => (Name::from_components(["mk"]), false, &[][..]),
+            [keyword, ctor, fields] => {
+                // `where`, or the pin's older `:=` (`" := " <|> " where "`), for which the pin's
+                // `expandFields` only logs a deprecation lint, a warning.
+                if expect_atom(keyword, ":=", "record body keyword").is_err() {
+                    expect_atom(keyword, "where", "record body keyword")?;
+                }
+                let (constructor, constructor_protected) = constructor::name(ctor, &root[0])?;
+                let fields = expect_node(
+                    fields,
+                    &parser_kind(&["Command", "structFields"]),
+                    1,
+                    "record fields",
+                )?;
+                (
+                    constructor,
+                    constructor_protected,
+                    expect_null_args(&fields[0], "record field array")?,
+                )
             }
-            let constructor = constructor::name(ctor, &root[0])?;
-            let fields = expect_node(
-                fields,
-                &parser_kind(&["Command", "structFields"]),
-                1,
-                "record fields",
-            )?;
-            (
-                constructor,
-                expect_null_args(&fields[0], "record field array")?,
-            )
-        }
-        _ => return Err(failure(SourceInferenceError::Scope)),
-    };
+            _ => return Err(failure(SourceInferenceError::Scope)),
+        };
     let constructor_name = context.record_constructor_name(name, &user_name, &constructor)?;
     let fields = &simple_fields(fields)?;
     if parameters.len().saturating_add(fields.len()) > budget.max_binders {
@@ -388,6 +390,9 @@ pub(super) fn elaborate_record_scoped(
     let mut written_fields = std::collections::HashSet::new();
     let mut overrides = Vec::new();
     let mut protected_projections = std::mem::take(&mut inheritance.protected_fields);
+    if constructor_protected && !protected_projections.contains(&constructor_name) {
+        protected_projections.push(constructor_name.clone());
+    }
     for (field, style) in fields {
         context.tick()?;
         let parts = expect_node(
@@ -451,12 +456,7 @@ pub(super) fn elaborate_record_scoped(
                 .lctx
                 .find_by_user_name(user_name)
                 .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-            if field_protected {
-                if inherited.value.is_some() {
-                    return Err(NatDefinitionElabError::UnexpectedSyntax {
-                        expected: "protected modifier only on owned structure field projections",
-                    });
-                }
+            if field_protected && inherited.value.is_none() {
                 let projection = name.append_core(user_name);
                 if !protected_projections.contains(&projection) {
                     protected_projections.push(projection);

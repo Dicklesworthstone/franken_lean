@@ -90,7 +90,7 @@ def raised {A : Sort u} (a : A) : PLift A := PLift.up a
             panic!("missing source record {record}");
         };
         let constructor = name(&format!("{record}.{ctor}"));
-        assert_eq!(family.ctors, [constructor.clone()]);
+        assert_eq!(family.ctors.as_slice(), std::slice::from_ref(&constructor));
         assert!(matches!(
             env.find(&constructor),
             Some(ConstantInfo::Ctor(_))
@@ -519,19 +519,17 @@ fn invalid_constructor_names_and_uses_do_not_publish_partial_records() {
 fn unsupported_constructor_visibility_is_a_capability_stop() {
     let base = engine();
     let root = base.logical_root(&KVMap::new());
-    for modifier in ["private", "protected"] {
-        let source = format!("structure Hidden where\n  {modifier} create ::\n  value : Nat\n");
-        let error = base
-            .check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits()),
-            )
-            .expect_err(&source);
-        assert_eq!(error.disposition(), ("capability", false, 5), "{error:?}");
-        assert!(!base.environment().contains(&name("Hidden")));
-        assert_eq!(base.logical_root(&KVMap::new()), root);
-    }
+    let source = "structure Hidden where\n  private create ::\n  value : Nat\n";
+    let error = base
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err(source);
+    assert_eq!(error.disposition(), ("capability", false, 5), "{error:?}");
+    assert!(!base.environment().contains(&name("Hidden")));
+    assert_eq!(base.logical_root(&KVMap::new()), root);
 }
 
 #[test]
@@ -555,13 +553,13 @@ fn constructor_visibility_and_name_checks_distinguish_authored_private_from_modu
         ),
         (
             format!(
-                "module\nprelude\npublic section\n{compiler_markers}end\nstructure Hidden where\n  private create ::\n  value : Type\n"
+                "prelude\n{compiler_markers}private structure TwiceProtected where\n  protected build ::\n  value : Type\n"
             ),
-            true,
+            false,
         ),
         (
             format!(
-                "module\nprelude\npublic section\n{compiler_markers}end\nstructure Hidden where\n  protected create ::\n  value : Type\n"
+                "module\nprelude\npublic section\n{compiler_markers}end\nstructure Hidden where\n  private create ::\n  value : Type\n"
             ),
             true,
         ),
@@ -585,6 +583,38 @@ fn constructor_visibility_and_name_checks_distinguish_authored_private_from_modu
         assert_eq!(base.logical_root(&KVMap::new()), root);
         assert!(base.environment().is_empty());
     }
+    // Pin-verified (`Lean/Elab/Structure.lean:262`): module-default privacy is not authored
+    // `private`, so `protected create ::` is accepted on `structure Hidden` inside a module.
+    let module_protected = format!(
+        "module\nprelude\npublic section\n{compiler_markers}end\nstructure Hidden where\n  protected create ::\n  value : Type\n"
+    );
+    let checked = base
+        .check_source_modules(
+            &[SourceModuleInput {
+                name: &module,
+                source: module_protected.as_bytes(),
+            }],
+            &module,
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        )
+        .unwrap_or_else(|error| panic!("{module_protected}\n{error:?}"))
+        .into_complete()
+        .expect("complete module check");
+    let protected =
+        fln_elab::protected_names::ProtectedNames::read(checked.checked.engine.environment())
+            .unwrap();
+    let ctor_name = Name::str(
+        Name::str(
+            Name::num(Name::from_components(["_private", "Main"]), 0),
+            "Hidden",
+        ),
+        "create",
+    );
+    assert!(
+        protected.contains(&ctor_name),
+        "module-default structure protected constructor must be recorded in ProtectedNames"
+    );
 }
 
 #[test]

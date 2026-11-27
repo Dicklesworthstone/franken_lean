@@ -134,6 +134,47 @@ private structure Priv where
         check(priv_struct).is_err(),
         "protected field on private structure must be refused"
     );
+
+    // Pin (`Structure.lean:262`): `protected` structure constructor is accepted on public
+    // structures, tags `S.mk` protected, and is refused on `private` structures.
+    let prot_ctor = "\
+structure ProtCtor where
+  protected mk ::
+  x : Nat
+def okCtor : ProtCtor := ProtCtor.mk 1
+";
+    let prot_ctor_env =
+        check(prot_ctor).unwrap_or_else(|e| panic!("expected protected ctor accept: {e}"));
+    let prot_ctor_set = ProtectedNames::read(prot_ctor_env.environment()).unwrap();
+    assert!(prot_ctor_set.contains(&Name::from_components(["ProtCtor", "mk"])));
+    assert!(!prot_ctor_set.contains(&Name::from_components(["ProtCtor", "x"])));
+    assert!(
+        check("structure ProtCtor where\n  protected mk ::\n  x : Nat\nopen ProtCtor\ndef bad : ProtCtor := mk 1\n").is_err(),
+        "protected structure constructor must not resolve unqualified via open"
+    );
+    assert!(
+        check("private structure PrivCtor where\n  protected mk ::\n  x : Nat\n").is_err(),
+        "protected constructor on private structure must be refused"
+    );
+
+    // Pin-verified: grouped `protected (a b : Nat)` marks every field in the group protected,
+    // and a subobject default override with `protected` is accepted without mutating parent `A.x`.
+    let grouped_and_override = "\
+structure Grouped where
+  protected (a b : Nat)
+structure Base where
+  x : Nat
+structure Sub extends Base where
+  protected x := 1
+open Base
+def parentX (b : Base) : Nat := x b
+";
+    let grouped_env = check(grouped_and_override)
+        .unwrap_or_else(|e| panic!("expected grouped/override accept: {e}"));
+    let grouped_protected = ProtectedNames::read(grouped_env.environment()).unwrap();
+    assert!(grouped_protected.contains(&Name::from_components(["Grouped", "a"])));
+    assert!(grouped_protected.contains(&Name::from_components(["Grouped", "b"])));
+    assert!(!grouped_protected.contains(&Name::from_components(["Base", "x"])));
 }
 
 #[test]
@@ -237,6 +278,10 @@ class SizeOf (α : Sort u) where
   sizeOf : α → Nat
 class NoSizeOf (α : Type) where
   op : α → α
+mutual
+class inductive SingleMutClass : Type where
+  | mk : SingleMutClass
+end
 inductive NeverValue : Type where
 def elimNever (x : NeverValue) : Nat := by cases x
 ";
@@ -254,16 +299,18 @@ def elimNever (x : NeverValue) : Nat := by cases x
             .contains(&Name::from_components(["NeverValue", "_sizeOf_inst"])),
         "SizeOf instance must be admitted for NeverValue"
     );
-    assert!(
-        !checked
-            .environment()
-            .contains(&Name::from_components(["NoSizeOf", "_sizeOf_1"])),
-        "Pin (`MutualInductive.lean:1574`) does not generate SizeOf for classes"
-    );
-    assert!(
-        !checked
-            .environment()
-            .contains(&Name::from_components(["NoSizeOf", "_sizeOf_inst"])),
-        "Pin (`MutualInductive.lean:1574`) does not generate SizeOf instances for classes"
-    );
+    for class_name in ["NoSizeOf", "SingleMutClass"] {
+        assert!(
+            !checked
+                .environment()
+                .contains(&Name::from_components([class_name, "_sizeOf_1"])),
+            "Pin (`MutualInductive.lean:1574`) does not generate SizeOf for class {class_name}"
+        );
+        assert!(
+            !checked
+                .environment()
+                .contains(&Name::from_components([class_name, "_sizeOf_inst"])),
+            "Pin (`MutualInductive.lean:1574`) does not generate SizeOf instances for class {class_name}"
+        );
+    }
 }

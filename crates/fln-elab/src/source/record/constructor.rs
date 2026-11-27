@@ -27,9 +27,9 @@ impl Context {
 pub(super) fn name(
     syntax: &Syntax,
     structure_modifiers: &Syntax,
-) -> Result<Name, NatDefinitionElabError> {
+) -> Result<(Name, bool), NatDefinitionElabError> {
     let ctor = match expect_null_args(syntax, "optional structure constructor")? {
-        [] => return Ok(Name::from_components(["mk"])),
+        [] => return Ok((Name::from_components(["mk"]), false)),
         [ctor] => expect_node(
             ctor,
             &parser_kind(&["Command", "structCtor"]),
@@ -46,20 +46,7 @@ pub(super) fn name(
     )?;
     doc_comment_slot(&modifiers[0])?;
     let visibility = scope::visibility::modifier(&modifiers[2])?;
-    let protected = match expect_null_args(&modifiers[3], "constructor protection")? {
-        [] => false,
-        [modifier] => {
-            let parts = expect_node(
-                modifier,
-                &parser_kind(&["Command", "protected"]),
-                1,
-                "protected constructor modifier",
-            )?;
-            expect_atom(&parts[0], "protected", "constructor protection keyword")?;
-            true
-        }
-        _ => return Err(failure(SourceInferenceError::Scope)),
-    };
+    let protected = protected_slot(&modifiers[3])?;
     expect_empty_null(&modifiers[1], "constructor without attributes")?;
     for modifier in &modifiers[4..] {
         expect_empty_null(modifier, "constructor without unsupported modifiers")?;
@@ -72,9 +59,9 @@ pub(super) fn name(
     }
     expect_atom(&ctor[3], "::", "structure constructor separator")?;
     // The pin rejects a second private/protected modifier on an already private
-    // structure. Other constructor-only visibility needs separate publication
-    // and lookup metadata, so it remains a typed nonanswer rather than being
-    // silently applied to the entire public structure bundle.
+    // structure (`Lean/Elab/Structure.lean:259-263`). Public/private constructor
+    // visibility needs separate publication and lookup metadata, so it remains a
+    // typed nonanswer rather than silently applying to the whole structure bundle.
     let structure_modifiers = expect_node(
         structure_modifiers,
         &parser_kind(&["Command", "declModifiers"]),
@@ -88,11 +75,11 @@ pub(super) fn name(
             crate::records::RecordError::InvalidName,
         )));
     }
-    if visibility.is_some() || protected {
+    if visibility.is_some() {
         return Err(unsupported("constructor visibility is not yet supported"));
     }
     if !expect_null_args(&ctor[2], "constructor parameter overrides")?.is_empty() {
         return Err(unsupported("parameter overrides are not yet supported"));
     }
-    Ok(name.clone())
+    Ok((name.clone(), protected))
 }
