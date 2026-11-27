@@ -4,7 +4,8 @@
 
 use fln_comp::flbc::{
     self, ArgumentOwnership as A, CallableResultOwnership as C, CodecLimits, Function, FunctionId,
-    Instruction as I, OwnershipLimits, Pc, Program, Register, ResultOwnership as R, ValidatedProgram,
+    Instruction as I, OwnershipLimits, Pc, Program, Register, ResultOwnership as R,
+    ValidatedProgram,
 };
 use fln_core::diag::ResourceReason;
 use fln_core::outcome::{InconclusiveCause, Outcome};
@@ -116,12 +117,13 @@ fn composition(mode: A, bind: bool, heap: bool, partial: bool) -> Program {
         code.push(I::Drop { src: r(10) });
         code.push(nat(4, 0));
         code.push(I::Apply {
-            dst: r(7),
+            dst: r(11),
             closure: r(7),
             args: vec![r(4)],
             argument_ownership: vec![A::Borrowed],
             result_ownership: C::Erased,
         });
+        code.push(I::Drop { src: r(7) });
         code.push(if heap {
             string(8, "retained")
         } else {
@@ -130,14 +132,25 @@ fn composition(mode: A, bind: bool, heap: bool, partial: bool) -> Program {
     } else {
         code.push(call(8, "extern:Task.get", &[10]));
     }
-    code.extend([
-        if heap {
-            call(9, "extern:String.append", &[7, 8])
-        } else {
-            call(9, "extern:Nat.add", &[7, 8])
-        },
-        I::Return { src: r(9) },
-    ]);
+    let mapped = if partial { 11 } else { 7 };
+    code.push(if heap {
+        call(9, "extern:String.append", &[mapped, 8])
+    } else {
+        call(9, "extern:Nat.add", &[mapped, 8])
+    });
+    if partial {
+        // An explicit Drop selects validation of an existing ownership
+        // schedule. Release its remaining borrowed handles as well.
+        code.extend([
+            I::Drop { src: r(4) },
+            I::Drop { src: r(5) },
+            I::Drop { src: r(8) },
+        ]);
+        if !heap {
+            code.push(I::Drop { src: r(mapped) });
+        }
+    }
+    code.push(I::Return { src: r(9) });
     let mut parameters = vec![A::Owned, mode];
     if partial {
         parameters.push(A::Borrowed);
@@ -155,7 +168,7 @@ fn composition(mode: A, bind: bool, heap: bool, partial: bool) -> Program {
                 arity: 0,
                 parameter_ownership: vec![],
                 result_ownership: C::Erased,
-                register_count: 11,
+                register_count: 12,
                 code,
             },
             Function {
@@ -188,7 +201,10 @@ fn check_result(value: &Obj, heap: bool) {
 
 fn clean_shadow() {
     let (events, live) = shadow::disable_and_drain();
-    assert_eq!(live, 0, "Task callbacks and stops release retained payloads");
+    assert_eq!(
+        live, 0,
+        "Task callbacks and stops release retained payloads"
+    );
     assert!(events.iter().all(|event| !matches!(
         event.kind,
         shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer

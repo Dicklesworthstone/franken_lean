@@ -6785,92 +6785,94 @@ impl Context {
     ) -> Result<Vec<LocalDecl>, NatDefinitionElabError> {
         let mut parameters = Vec::new();
         for syntax in expect_null_args(syntax, "declaration binders")? {
-            let expanded = self.expand_optional_binder_node(syntax.clone(), false)?;
-            let syntax = &expanded;
-            let Syntax::Node { kind, .. } = syntax else {
-                return Err(failure(SourceInferenceError::Scope));
-            };
-            if kind == &parser_kind(&["Term", "instBinder"]) {
-                let parts = expect_node(syntax, kind, 4, "instance binder")?;
-                expect_atom(&parts[0], "[", "instance binder opener")?;
-                expect_atom(&parts[3], "]", "instance binder closer")?;
-                let optional = expect_null_args(&parts[1], "optional instance name")?;
-                let user_name = match optional {
-                    [] => self.fresh_inaccessible(&Name::from_components(["inst"]))?,
-                    [Syntax::Ident { val, .. }, colon] => {
-                        expect_atom(colon, ":", "instance name colon")?;
-                        val.clone()
-                    }
-                    _ => return Err(failure(SourceInferenceError::Scope)),
+            let binders = self.declaration_binder_views(syntax)?;
+            for syntax in &binders {
+                let Syntax::Node { kind, .. } = syntax else {
+                    return Err(failure(SourceInferenceError::Scope));
                 };
-                let domain = self.type_term(&parts[2])?;
-                self.validate_instance_binder(&domain)?;
-                let id = FVarId(self.fresh_name()?);
-                self.txn.lctx.add_param(
-                    id.clone(),
-                    user_name.clone(),
-                    domain.clone(),
-                    BinderInfo::InstImplicit,
-                );
-                parameters.push(self.txn.lctx.find(&id).expect("inserted parameter").clone());
-                continue;
-            }
-            let (style, open, close, arity) = if kind == &parser_kind(&["Term", "implicitBinder"]) {
-                (BinderInfo::Implicit, "{", "}", 4)
-            } else if kind == &parser_kind(&["Term", "strictImplicitBinder"]) {
-                (BinderInfo::StrictImplicit, "⦃", "⦄", 4)
-            } else if kind == &parser_kind(&["Term", "explicitBinder"]) {
-                (BinderInfo::Default, "(", ")", 5)
-            } else {
-                return Err(failure(SourceInferenceError::Scope));
-            };
-            let parts = expect_node(syntax, kind, arity, "typed binder")?;
-            expect_atom(&parts[0], open, "binder opener")?;
-            expect_atom(&parts[arity - 1], close, "binder closer")?;
-            if style == BinderInfo::Default {
-                expect_empty_null(&parts[3], "absent binder default")?;
-            }
-            let names = expect_null_args(&parts[1], "binder names")?;
-            if names.is_empty() {
-                return Err(failure(SourceInferenceError::Scope));
-            }
-            let type_parts = expect_null_args(&parts[2], "binder type")?;
-            // `toBinderViews` gives every name its own copy of the type, elaborated after the
-            // preceding names are bound: `(A B : Type _)` has two universe holes, and `{α β}`
-            // two type holes, not one shared between them.
-            let domain_of = |context: &mut Self| match type_parts {
-                [colon, type_syntax] => {
-                    expect_atom(colon, ":", "binder type ascription")?;
-                    context.type_term(type_syntax)
-                }
-                // `{α}`: the pin elaborates an omitted binder type as a hole
-                // (`Lean/Elab/Binders.lean`, `mkHole`), which unification must fill.
-                [] => {
-                    let hole = Syntax::node(
-                        parser_kind(&["Term", "hole"]),
-                        vec![Syntax::atom(fln_syntax::source::SourceInfo::None, "_")],
+                if kind == &parser_kind(&["Term", "instBinder"]) {
+                    let parts = expect_node(syntax, kind, 4, "instance binder")?;
+                    expect_atom(&parts[0], "[", "instance binder opener")?;
+                    expect_atom(&parts[3], "]", "instance binder closer")?;
+                    let optional = expect_null_args(&parts[1], "optional instance name")?;
+                    let user_name = match optional {
+                        [] => self.fresh_inaccessible(&Name::from_components(["inst"]))?,
+                        [Syntax::Ident { val, .. }, colon] => {
+                            expect_atom(colon, ":", "instance name colon")?;
+                            val.clone()
+                        }
+                        _ => return Err(failure(SourceInferenceError::Scope)),
+                    };
+                    let domain = self.type_term(&parts[2])?;
+                    self.validate_instance_binder(&domain)?;
+                    let id = FVarId(self.fresh_name()?);
+                    self.txn.lctx.add_param(
+                        id.clone(),
+                        user_name.clone(),
+                        domain.clone(),
+                        BinderInfo::InstImplicit,
                     );
-                    context.type_term(&hole)
+                    parameters.push(self.txn.lctx.find(&id).expect("inserted parameter").clone());
+                    continue;
                 }
-                _ => Err(failure(SourceInferenceError::ExpectedType)),
-            };
-            for name in names {
-                let domain = domain_of(self)?;
-                let name = match name {
-                    Syntax::Ident { val, .. } => val.clone(),
-                    // `_` binds a name no source identifier spells, as an unnamed instance
-                    // binder does above (the pin's `mkFreshIdent`).
-                    Syntax::Node { kind, args, .. }
-                        if kind == &parser_kind(&["Term", "hole"])
-                            && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "_") =>
-                    {
-                        self.fresh_name()?
+                let (style, open, close, arity) =
+                    if kind == &parser_kind(&["Term", "implicitBinder"]) {
+                        (BinderInfo::Implicit, "{", "}", 4)
+                    } else if kind == &parser_kind(&["Term", "strictImplicitBinder"]) {
+                        (BinderInfo::StrictImplicit, "⦃", "⦄", 4)
+                    } else if kind == &parser_kind(&["Term", "explicitBinder"]) {
+                        (BinderInfo::Default, "(", ")", 5)
+                    } else {
+                        return Err(failure(SourceInferenceError::Scope));
+                    };
+                let parts = expect_node(syntax, kind, arity, "typed binder")?;
+                expect_atom(&parts[0], open, "binder opener")?;
+                expect_atom(&parts[arity - 1], close, "binder closer")?;
+                if style == BinderInfo::Default {
+                    expect_empty_null(&parts[3], "absent binder default")?;
+                }
+                let names = expect_null_args(&parts[1], "binder names")?;
+                if names.is_empty() {
+                    return Err(failure(SourceInferenceError::Scope));
+                }
+                let type_parts = expect_null_args(&parts[2], "binder type")?;
+                // `toBinderViews` gives every name its own copy of the type, elaborated after the
+                // preceding names are bound: `(A B : Type _)` has two universe holes, and `{α β}`
+                // two type holes, not one shared between them.
+                let domain_of = |context: &mut Self| match type_parts {
+                    [colon, type_syntax] => {
+                        expect_atom(colon, ":", "binder type ascription")?;
+                        context.type_term(type_syntax)
                     }
-                    _ => return Err(failure(SourceInferenceError::Scope)),
+                    // `{α}`: the pin elaborates an omitted binder type as a hole
+                    // (`Lean/Elab/Binders.lean`, `mkHole`), which unification must fill.
+                    [] => {
+                        let hole = Syntax::node(
+                            parser_kind(&["Term", "hole"]),
+                            vec![Syntax::atom(fln_syntax::source::SourceInfo::None, "_")],
+                        );
+                        context.type_term(&hole)
+                    }
+                    _ => Err(failure(SourceInferenceError::ExpectedType)),
                 };
-                let id = FVarId(self.fresh_name()?);
-                self.txn.lctx.add_param(id.clone(), name, domain, style);
-                parameters.push(self.txn.lctx.find(&id).expect("inserted parameter").clone());
+                for name in names {
+                    let domain = domain_of(self)?;
+                    let name = match name {
+                        Syntax::Ident { val, .. } => val.clone(),
+                        // `_` binds a name no source identifier spells, as an unnamed instance
+                        // binder does above (the pin's `mkFreshIdent`).
+                        Syntax::Node { kind, args, .. }
+                            if kind == &parser_kind(&["Term", "hole"])
+                                && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "_") =>
+                        {
+                            self.fresh_name()?
+                        }
+                        _ => return Err(failure(SourceInferenceError::Scope)),
+                    };
+                    let id = FVarId(self.fresh_name()?);
+                    self.txn.lctx.add_param(id.clone(), name, domain, style);
+                    parameters.push(self.txn.lctx.find(&id).expect("inserted parameter").clone());
+                }
             }
         }
         Ok(parameters)
@@ -7145,6 +7147,10 @@ pub(super) fn definition(
 /// set and are checked in full in both public and private worlds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuxiliaryVisibility {
+    /// Safe Syntax quotations created in declaration headers. Their full
+    /// checked data accompanies the public type even when the owner hides its
+    /// implementation; ordinary body auxiliaries do not receive this marker.
+    pub header_quotations: std::collections::HashSet<Name>,
     /// Auxiliaries synthesized by `private_decl%`: checked in full in the
     /// private world and exposed only as checked public `Axiom` signatures.
     pub private_bridge: std::collections::HashSet<Name>,

@@ -1,7 +1,13 @@
 use super::*;
 use crate::imported_ir::{EntryArgument, native_effects};
 
-const TASKS: [&str; 5] = ["Task.pure", "Task.get", "Task.spawn", "Task.map", "Task.bind"];
+const TASKS: [&str; 5] = [
+    "Task.pure",
+    "Task.get",
+    "Task.spawn",
+    "Task.map",
+    "Task.bind",
+];
 
 fn typed(x: u64, ty: IrType, expr: IrExpr) -> IrStmt {
     IrStmt::VDecl { x, ty, expr }
@@ -178,12 +184,9 @@ fn imported_tasks_execute_direct_boxed_and_partial_native_calls() {
             5
         );
         assert_eq!(compiled.reference_functions().len(), 4);
-        assert!(
-            compiled.reference_functions().iter().all(|function| {
-                function.name == name("Arity.main")
-                    || function.name.to_string().starts_with("TaskIR.")
-            })
-        );
+        assert!(compiled.reference_functions().iter().all(|function| {
+            function.name == name("Arity.main") || function.name.to_string().starts_with("TaskIR.")
+        }));
     }
 }
 
@@ -201,13 +204,23 @@ fn task_contracts_bind_full_and_native_telescopes_boxing_and_effects() {
         (
             "Task.map",
             2,
-            vec![IrType::TObject, IrType::Object, IrType::TObject, IrType::UInt8],
+            vec![
+                IrType::TObject,
+                IrType::Object,
+                IrType::TObject,
+                IrType::UInt8,
+            ],
             IrType::Object,
         ),
         (
             "Task.bind",
             2,
-            vec![IrType::Object, IrType::Object, IrType::TObject, IrType::UInt8],
+            vec![
+                IrType::Object,
+                IrType::Object,
+                IrType::TObject,
+                IrType::UInt8,
+            ],
             IrType::Object,
         ),
     ] {
@@ -224,7 +237,10 @@ fn task_contracts_bind_full_and_native_telescopes_boxing_and_effects() {
             })
             .collect();
         for supplied in [&params[..], &params[prefix..]] {
-            assert_eq!(validated_ir_arity(row, supplied.len()).unwrap(), types.len());
+            assert_eq!(
+                validated_ir_arity(row, supplied.len()).unwrap(),
+                types.len()
+            );
             validate_extern_signature(row, supplied, &result).unwrap();
             for index in 0..supplied.len() {
                 let mut changed = supplied.to_vec();
@@ -456,7 +472,12 @@ fn live_pinned_task_ir_preserves_native_prototypes_partial_calls_and_universes()
     std::fs::write(directory.join("NativeTaskModule.lean"), source).unwrap();
     let generated = Command::new(&reference)
         .current_dir(&directory)
-        .args(["-j1", "-o", "NativeTaskModule.olean", "NativeTaskModule.lean"])
+        .args([
+            "-j1",
+            "-o",
+            "NativeTaskModule.olean",
+            "NativeTaskModule.lean",
+        ])
         .output()
         .unwrap();
     std::fs::write(directory.join("compile.stdout"), &generated.stdout).unwrap();

@@ -44,7 +44,9 @@ impl Engine {
             .map_err(EngineExecutionError::from)
     }
 
-    /// Hidden bodies keep every auxiliary private. Exposed bodies first check
+    /// Header quotations are closed Syntax data needed by the public type and
+    /// remain fully checked definitions in both worlds, even for hidden owners.
+    /// Hidden bodies keep all other auxiliaries private. Exposed bodies first check
     /// ordinary auxiliary proofs in the public predecessor, then admit their
     /// public interfaces as the pin's AddDecl.addDeclCore does. Explicit
     /// `private_decl%` bridge auxiliaries are checked in full in the private
@@ -69,7 +71,7 @@ impl Engine {
         let mut public_engine = public.clone();
         let base_logical_root = public_engine.logical_root(options);
         let mut public_admissions = Vec::new();
-        if !hidden && !declarations.is_empty() {
+        if !declarations.is_empty() && (!hidden || !visibility.header_quotations.is_empty()) {
             if private.admissions.len() != declarations.len() {
                 return Err(EngineExecutionError::UnexpectedPublication {
                     detail: "private auxiliary prefix admission count must match candidate count",
@@ -84,11 +86,52 @@ impl Engine {
                     Declaration::Opaque(val) => Some(&val.base.name),
                     _ => None,
                 };
-                if name.is_some_and(|name| visibility.private_only.contains(name)) {
+                let header_quotation =
+                    name.is_some_and(|name| visibility.header_quotations.contains(name));
+                if header_quotation
+                    && name.is_some_and(|name| {
+                        visibility.private_only.contains(name)
+                            || visibility.private_bridge.contains(name)
+                            || visibility.computable_private_bridge.contains(name)
+                    })
+                {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "a public header quotation cannot be a private body auxiliary",
+                    });
+                }
+                if (hidden && !header_quotation)
+                    || name.is_some_and(|name| visibility.private_only.contains(name))
+                {
                     continue;
                 }
-                let interface = if name.is_some_and(|name| visibility.private_bridge.contains(name))
-                {
+                let interface = if header_quotation {
+                    // A visibility marker is not authority. Restrict this path
+                    // to the actual closed data shape, then independently check
+                    // the full value in the public predecessor below.
+                    match &admitted_private.declaration {
+                        Declaration::Defn(definition)
+                            if definition.safety == DefinitionSafety::Safe
+                                && definition.base.level_params.is_empty()
+                                && definition.base.type_
+                                    == Expr::const_(
+                                        Name::from_components(["Lean", "Syntax"]),
+                                        Vec::new(),
+                                    )
+                                && !definition.value.has_fvar()
+                                && !definition.value.has_loose_bvars()
+                                && !definition.value.has_expr_mvar()
+                                && !definition.value.has_level_mvar()
+                                && !definition.value.has_level_param() =>
+                        {
+                            Declaration::Defn(definition.clone())
+                        }
+                        _ => {
+                            return Err(EngineExecutionError::UnexpectedPublication {
+                                detail: "a public header quotation must be closed safe Lean.Syntax data",
+                            });
+                        }
+                    }
+                } else if name.is_some_and(|name| visibility.private_bridge.contains(name)) {
                     // Already checked in full by K1 + independent checker in `private`.
                     // Expose only its checked signature in `public`; K1 + independent
                     // checker below verify that the signature uses only public constants.
@@ -356,8 +399,11 @@ impl Engine {
         limits: EngineAdmissionLimits,
         public_scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<PublicSourceAdmission>, EngineExecutionError> {
-        let auxiliaries = match self.admit_auxiliary_prefix(
+        let auxiliaries = match self.admit_public_auxiliaries(
+            public,
             &candidate.auxiliary_declarations,
+            &candidate.auxiliary_visibility,
+            true,
             options,
             limits,
         )? {
@@ -366,6 +412,7 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
         let mut private_implementation = match auxiliaries
+            .private
             .engine
             .admit_declarations(&[candidate.declaration], options, limits)
             .map_err(EngineExecutionError::from)?
@@ -441,9 +488,10 @@ impl Engine {
             base: base.clone(),
             is_unsafe,
         });
-        let private_implementation = prepend_auxiliaries(private_implementation, auxiliaries);
+        let private_implementation =
+            prepend_auxiliaries(private_implementation, auxiliaries.private);
         Ok(
-            match public.admit_scoped_candidate(
+            match auxiliaries.public.engine.admit_scoped_candidate(
                 syntax,
                 interface,
                 false,
@@ -455,7 +503,7 @@ impl Engine {
                 public_scope,
             )? {
                 Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
-                    public,
+                    public: prepend_auxiliaries(public, auxiliaries.public),
                     private_implementation: Some(private_implementation),
                 }),
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),

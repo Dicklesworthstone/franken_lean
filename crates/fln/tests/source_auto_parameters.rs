@@ -1,4 +1,4 @@
-//! General imported `autoParam` behavior over the actual pinned Syntax and
+//! Source and imported `autoParam` behavior over the actual pinned Syntax and
 //! tactic declarations. Raw artifact installation is only a fixture: every
 //! quotation, function, and theorem below passes normal source admission.
 #![forbid(unsafe_code)]
@@ -398,5 +398,325 @@ fn recursive_default_elaboration_reports_a_typed_resource_stop() {
         ));
         assert!(usage.is_genuine_exhaustion());
         assert!(!engine.environment().contains(&name("tooDeep")));
+    });
+}
+
+fn checked_quote(engine: &Engine, label: &str) {
+    let Some(ConstantInfo::Defn(quote)) = engine.environment().find(&name(label)) else {
+        panic!("missing checked tactic quotation {label}");
+    };
+    assert_eq!(quote.safety, fln_env::constants::DefinitionSafety::Safe);
+    assert_eq!(quote.hints, fln_env::constants::ReducibilityHints::Opaque);
+    assert!(quote.base.level_params.is_empty());
+    assert_eq!(
+        quote.base.type_,
+        fln_core::expr::Expr::const_(name("Lean.Syntax"), Vec::new())
+    );
+    assert!(!quote.value.has_fvar());
+    assert!(!quote.value.has_expr_mvar());
+    assert!(!quote.value.has_level_mvar());
+}
+
+#[test]
+fn source_binder_tactics_wait_for_result_and_later_argument_constraints() {
+    fixture(|engine| {
+        let engine = check(
+            engine,
+            r#"
+def sourceAuto {α : Type} (value : α := by assumption) : α := value
+def sourceImplicit (value : α := by assumption) : α := value
+def sourceImplicitCaller (wanted : Nat) : Nat := sourceImplicit
+def sourceLater {α : Type} (value : α := by assumption) (witness : α) : α := value
+def sourceExpected (wanted : Nat) (_distractor : Bool) : Nat := sourceAuto
+def sourceNamed (wanted : Nat) (_distractor : Bool) : Nat :=
+  sourceLater (witness := wanted)
+theorem source_implicit (wanted : Nat) : sourceImplicitCaller wanted = wanted := rfl
+theorem source_expected (wanted : Nat) (distractor : Bool) :
+    sourceExpected wanted distractor = wanted := rfl
+theorem source_named (wanted : Nat) (distractor : Bool) :
+    sourceNamed wanted distractor = wanted := rfl
+"#,
+        );
+        theorem(&engine, "source_expected");
+        theorem(&engine, "source_named");
+        theorem(&engine, "source_implicit");
+        checked_quote(&engine, "sourceImplicit._auto_1");
+        assert!(
+            !engine
+                .environment()
+                .contains(&name("sourceImplicit._auto_2"))
+        );
+        checked_quote(&engine, "sourceAuto._auto_1");
+        checked_quote(&engine, "sourceLater._auto_1");
+    });
+}
+
+#[test]
+fn source_grouped_defaults_have_distinct_quotes_and_explicit_calls_stay_partial() {
+    fixture(|engine| {
+        let engine = check(
+            engine,
+            r#"
+def sourceGrouped
+    (first : Nat := by exact Nat.zero)
+    (left right : Nat := by exact Nat.succ Nat.zero) : Nat :=
+  Nat.add first (Nat.add left right)
+def sourceRaw : Nat → Nat → Nat → Nat := @sourceGrouped
+def sourceOverride : Nat := sourceGrouped (right := Nat.zero)
+def sourceBeforeEta (value : Nat := by assumption) (later : Nat)
+    (tail : Nat := Nat.zero) : Nat := value
+def sourceCaptures (wanted : Nat) : Nat → Nat := sourceBeforeEta
+theorem source_grouped :
+    sourceGrouped = Nat.succ (Nat.succ Nat.zero) := rfl
+theorem source_raw :
+    sourceRaw Nat.zero Nat.zero Nat.zero = Nat.zero := rfl
+theorem source_override : sourceOverride = Nat.succ Nat.zero := rfl
+theorem source_capture (wanted later : Nat) :
+    sourceCaptures wanted later = wanted := rfl
+"#,
+        );
+        for label in [
+            "source_grouped",
+            "source_raw",
+            "source_override",
+            "source_capture",
+        ] {
+            theorem(&engine, label);
+        }
+        for label in [
+            "sourceGrouped._auto_1",
+            "sourceGrouped._auto_2",
+            "sourceGrouped._auto_3",
+        ] {
+            checked_quote(&engine, label);
+        }
+        assert!(matches!(
+            error(
+                &engine,
+                "def sourceForbiddenEta : Nat → Nat := sourceBeforeEta\n"
+            ),
+            NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
+                TacticError::NoMatchingAssumption
+            ))
+        ));
+    });
+}
+
+#[test]
+fn source_quotes_preserve_call_site_identifiers_and_rooted_global_names() {
+    fixture(|engine| {
+        let engine = check(
+            engine,
+            r#"
+def sourceNamedDefault (value : Nat := by exact «π alias») : Nat := value
+def sourceNamedCaller («π alias» : Nat) : Nat := sourceNamedDefault
+theorem source_identifier («π alias» : Nat) :
+    sourceNamedCaller «π alias» = «π alias» := rfl
+namespace SourceAutoScope
+def anchor : Nat := Nat.succ Nat.zero
+def autoParam : Nat := Nat.zero
+def rooted (value : Nat := by exact _root_.SourceAutoScope.anchor) : Nat := value
+end SourceAutoScope
+def sourceRootedCaller (anchor : Nat) : Nat := SourceAutoScope.rooted
+theorem source_rooted (anchor : Nat) :
+    sourceRootedCaller anchor = Nat.succ Nat.zero := rfl
+"#,
+        );
+        theorem(&engine, "source_identifier");
+        theorem(&engine, "source_rooted");
+        checked_quote(&engine, "SourceAutoScope.rooted._auto_1");
+    });
+}
+
+#[test]
+fn source_tactic_failures_do_not_publish_the_owner_or_its_header_quotes() {
+    fixture(|engine| {
+        // A tactic default is not executed at definition time. It may be
+        // overridden, while selecting the false default must fail.
+        let engine = check(
+            engine,
+            r#"
+def sourceBadDefault (_proof : Nat.zero = Nat.succ Nat.zero := by rfl) : Nat :=
+  Nat.zero
+def sourceExplicitProof (proof : Nat.zero = Nat.succ Nat.zero) : Nat :=
+  sourceBadDefault proof
+theorem source_explicit_proof (proof : Nat.zero = Nat.succ Nat.zero) :
+    sourceExplicitProof proof = Nat.zero := rfl
+"#,
+        );
+        checked_quote(&engine, "sourceBadDefault._auto_1");
+        theorem(&engine, "source_explicit_proof");
+        let root = engine.logical_root(&KVMap::new());
+        let rejected = error(&engine, "def sourceFalseUse : Nat := sourceBadDefault\n");
+        assert!(
+            matches!(
+                rejected,
+                NatDefinitionElabError::Inference(SourceInferenceError::Tactic(_))
+            ),
+            "{rejected:?}"
+        );
+        assert!(
+            engine
+                .check_source_files(
+                    &[b"def sourceBadBody (value : Nat := by exact Nat.zero) : Nat := True.intro\n"],
+                    &KVMap::new(),
+                    limits(),
+                )
+                .is_err()
+        );
+        for label in ["sourceFalseUse", "sourceBadBody", "sourceBadBody._auto_1"] {
+            assert!(!engine.environment().contains(&name(label)));
+        }
+        assert_eq!(root, engine.logical_root(&KVMap::new()));
+        theorem(
+            &check(
+                &engine,
+                "theorem source_after_failure (n : Nat) : n = n := rfl\n",
+            ),
+            "source_after_failure",
+        );
+    });
+}
+
+#[test]
+fn source_data_and_proof_defaults_execute_through_the_public_vm_path() {
+    fixture(|engine| {
+        let source = r#"
+def sourceChoice (value : Nat := by exact Nat.succ Nat.zero) : Nat := value
+def sourceProofChoice (value : Nat) (_proof : value = value := by rfl) : Nat := value
+#eval sourceChoice
+#eval sourceChoice (value := Nat.succ (Nat.succ Nat.zero))
+#eval sourceProofChoice (Nat.succ Nat.zero)
+"#;
+        let report = engine
+            .execute_source_commands_with_checks(
+                source.as_bytes(),
+                &KVMap::new(),
+                fln::EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            )
+            .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+            .into_complete()
+            .unwrap();
+        assert_eq!(report.batch.source_evaluation_indices.len(), 3);
+        for (index, expected) in report.batch.source_evaluation_indices.iter().zip([1, 2, 1]) {
+            assert_eq!(
+                fln::closed_vm_value(&report.batch.executions[*index].exit).unwrap(),
+                Some(fln::ClosedVmValue::Scalar(expected))
+            );
+        }
+
+        // Execute the identical program with the pin as a differential oracle.
+        // Its compiler is never used by FrankenLean's source or VM path.
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let library = PathBuf::from(std::env::var_os("FLN_REFERENCE_LIB").unwrap());
+        let compiler = std::env::var_os("FLN_REFERENCE_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| library.parent().unwrap().parent().unwrap().join("bin/lean"));
+        let mut child = Command::new(compiler)
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(source.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n2\n1\n");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    });
+}
+
+#[test]
+fn public_module_headers_preserve_checked_tactic_quotation_predecessors() {
+    fixture(|engine| {
+        let module = name("SourceAutoModule");
+        let consumer = name("SourceAutoConsumer");
+        let inputs = [
+            fln::SourceModuleInput {
+                name: &module,
+                source: b"module\nprelude\n\
+                    public def moduleAuto (value : Nat := by exact Nat.succ Nat.zero) : Nat := value\n\
+                    public theorem moduleAutoProof (n : Nat) (h : n = n := by rfl) : n = n := h\n\
+                    @[expose] public def moduleExposed (value : Nat := by exact Nat.zero) : Nat := value\n",
+            },
+            fln::SourceModuleInput {
+                name: &consumer,
+                source: b"module\nprelude\npublic import SourceAutoModule\n\
+                    public noncomputable def importedDefault : Nat := moduleAuto\n\
+                    public theorem importedDefaultValue : moduleAuto = moduleAuto (value := Nat.succ Nat.zero) := rfl\n\
+                    public theorem importedProof (n : Nat) : n = n := moduleAutoProof n\n\
+                    public theorem importedExposed : moduleExposed = Nat.zero := rfl\n",
+            },
+        ];
+        let checked = engine
+            .check_source_modules(
+                &inputs,
+                &consumer,
+                &KVMap::new(),
+                fln::source_check::modules::SourceModuleCheckLimits::new(limits()),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let imported = &checked.checked.engine;
+        for label in [
+            "moduleAuto._auto_1",
+            "moduleAutoProof._auto_1",
+            "moduleExposed._auto_1",
+        ] {
+            checked_quote(imported, label);
+        }
+        // Modern imports hide ordinary public bodies. The quote must remain
+        // full checked data even though its owning API is only a signature.
+        for label in ["moduleAuto", "moduleAutoProof"] {
+            assert!(matches!(
+                imported.environment().find(&name(label)),
+                Some(ConstantInfo::Axiom(_))
+            ));
+        }
+        assert!(matches!(
+            imported.environment().find(&name("moduleExposed")),
+            Some(ConstantInfo::Defn(_))
+        ));
+        for label in ["importedDefaultValue", "importedProof", "importedExposed"] {
+            theorem(imported, label);
+        }
+    });
+}
+
+#[test]
+fn source_quotation_data_does_not_bypass_unsafe_constant_checks() {
+    fixture(|engine| {
+        let engine = check(
+            engine,
+            r#"
+unsafe def sourceUnsafeValue : Nat := Nat.zero
+def sourceUnsafeDefault (value : Nat := by exact sourceUnsafeValue) : Nat := value
+unsafe def sourceUnsafeCaller : Nat := sourceUnsafeDefault
+def sourceSafeOverride : Nat := sourceUnsafeDefault (value := Nat.succ Nat.zero)
+theorem source_safe_override : sourceSafeOverride = Nat.succ Nat.zero := rfl
+"#,
+        );
+        checked_quote(&engine, "sourceUnsafeDefault._auto_1");
+        theorem(&engine, "source_safe_override");
+        let root = engine.logical_root(&KVMap::new());
+        assert!(
+            engine
+                .check_source_files(
+                    &[b"def sourceUnsafeLeak : Nat := sourceUnsafeDefault\n"],
+                    &KVMap::new(),
+                    limits(),
+                )
+                .is_err()
+        );
+        assert!(!engine.environment().contains(&name("sourceUnsafeLeak")));
+        assert_eq!(root, engine.logical_root(&KVMap::new()));
     });
 }

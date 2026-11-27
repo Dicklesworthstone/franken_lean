@@ -729,7 +729,9 @@ impl Context {
         let mut found = false;
         while let Some(node) = scan.pop() {
             self.tick()?;
-            if overload::syntax_alternatives(node).is_some() {
+            if overload::syntax_alternatives(node).is_some()
+                || node.kind() == Some(&parser_kind(&["Term", "binderTactic"]))
+            {
                 continue;
             }
             if let_equations(node) {
@@ -752,7 +754,10 @@ impl Context {
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
-                Task::Visit(node) if overload::syntax_alternatives(node).is_some() => {
+                Task::Visit(node)
+                    if overload::syntax_alternatives(node).is_some()
+                        || node.kind() == Some(&parser_kind(&["Term", "binderTactic"])) =>
+                {
                     built.push(self.copy_pattern_syntax(node)?);
                 }
                 Task::Visit(node @ Syntax::Node { args, .. }) => {
@@ -1834,7 +1839,9 @@ impl Context {
         let mut needed = false;
         while let Some(node) = scan.pop() {
             self.tick()?;
-            if overload::syntax_alternatives(node).is_some() {
+            if overload::syntax_alternatives(node).is_some()
+                || node.kind() == Some(&parser_kind(&["Term", "binderTactic"]))
+            {
                 continue;
             }
             if alternative_groups(node) > 1 {
@@ -1858,7 +1865,10 @@ impl Context {
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
-                Task::Visit(node) if overload::syntax_alternatives(node).is_some() => {
+                Task::Visit(node)
+                    if overload::syntax_alternatives(node).is_some()
+                        || node.kind() == Some(&parser_kind(&["Term", "binderTactic"])) =>
+                {
                     built.push(self.copy_pattern_syntax(node)?);
                 }
                 Task::Visit(node @ Syntax::Node { args, .. }) => {
@@ -1918,6 +1928,7 @@ impl Context {
         while let Some(node) = scan.pop() {
             self.tick()?;
             if node.kind() == Some(&parser_kind(&["Term", "localRecValue"]))
+                || node.kind() == Some(&parser_kind(&["Term", "binderTactic"]))
                 || overload::syntax_alternatives(node).is_some()
             {
                 continue;
@@ -1994,6 +2005,7 @@ impl Context {
             match task {
                 Task::Visit(node, _)
                     if node.kind() == Some(&parser_kind(&["Term", "localRecValue"]))
+                        || node.kind() == Some(&parser_kind(&["Term", "binderTactic"]))
                         || overload::syntax_alternatives(node).is_some() =>
                 {
                     built.push(self.copy_pattern_syntax(node)?);
@@ -2033,7 +2045,7 @@ impl Context {
                     let node = self.expand_collection_node(node, pattern)?;
                     let node = self.expand_do_node(node, pattern)?;
                     let node = self.expand_binder_predicate_node(node, pattern)?;
-                    let node = self.expand_optional_binder_node(node, pattern)?;
+                    let node = self.expand_optional_binder_node(node, pattern, false)?;
                     let node = self.expand_exists_node(node, pattern)?;
                     let node = self.expand_record_field_node(node, pattern)?;
                     let node = self.expand_offset_pattern(node, pattern)?;

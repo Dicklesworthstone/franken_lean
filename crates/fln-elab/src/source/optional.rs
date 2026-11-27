@@ -4,6 +4,7 @@
 use super::*;
 use fln_syntax::source::{ByteSpan, SourceInfo};
 
+mod quotation;
 mod tactic;
 pub(super) use tactic::AutoParameter;
 
@@ -43,17 +44,19 @@ pub(super) fn is_auto_param(domain: &Expr) -> bool {
 }
 
 impl Context {
-    /// Expand one already-rebuilt binder, using the ordinary application
-    /// worklist to check both its type and its default. The global qualification
-    /// has the pin's quotation hygiene: a local `optParam` cannot capture it.
-    /// Tactic defaults retain their node and the existing explicit refusal;
-    /// they need a quoted `Lean.Syntax` declaration, not an eager proof value.
+    /// Expand one already-rebuilt binder. The ordinary application worklist
+    /// checks the annotation. Root qualification keeps a local optParam or
+    /// autoParam from capturing the generated application, as at the pin.
     pub(super) fn expand_optional_binder_node(
         &mut self,
         mut syntax: Syntax,
         pattern: bool,
+        allow_tactic: bool,
     ) -> Result<Syntax, NatDefinitionElabError> {
-        if pattern || syntax.kind() != Some(&parser_kind(&["Term", "explicitBinder"])) {
+        if pattern {
+            return Ok(syntax);
+        }
+        if syntax.kind() != Some(&parser_kind(&["Term", "explicitBinder"])) {
             return Ok(syntax);
         }
         self.tick()?;
@@ -67,16 +70,46 @@ impl Context {
         let [modifier] = modifier else {
             return Ok(syntax);
         };
-        if modifier.kind() != Some(&parser_kind(&["Term", "binderDefault"])) {
-            return Ok(syntax);
-        }
-        let modifier = expect_node(
-            modifier,
-            &parser_kind(&["Term", "binderDefault"]),
-            2,
-            "value binder default",
-        )?;
-        expect_atom(&modifier[0], ":=", "binder default assignment")?;
+        let (annotation_name, value) =
+            if modifier.kind() == Some(&parser_kind(&["Term", "binderDefault"])) {
+                let modifier = expect_node(
+                    modifier,
+                    &parser_kind(&["Term", "binderDefault"]),
+                    2,
+                    "value binder default",
+                )?;
+                expect_atom(&modifier[0], ":=", "binder default assignment")?;
+                ("optParam", modifier[1].clone())
+            } else if modifier.kind() == Some(&parser_kind(&["Term", "binderTactic"])) {
+                // Each name has its own quoted declaration at the pin. A
+                // grouped binder is split by its enclosing null telescope.
+                if !allow_tactic
+                    || expect_null_args(&parts[1], "binder names")?.len() > 1
+                    || (self.aux_names.is_none() && self.diagnostic_declaration.is_none())
+                {
+                    return Ok(syntax);
+                }
+                let modifier = expect_node(
+                    modifier,
+                    &parser_kind(&["Term", "binderTactic"]),
+                    3,
+                    "tactic binder default",
+                )?;
+                expect_atom(&modifier[0], ":=", "binder tactic assignment")?;
+                expect_atom(&modifier[1], "by", "binder tactic introducer")?;
+                let name = self.declare_auto_tactic(&modifier[2])?;
+                (
+                    "autoParam",
+                    Syntax::Ident {
+                        info: SourceInfo::None,
+                        raw_val: ByteSpan::default().into(),
+                        val: Name::from_components(["_root_"]).append_core(&name),
+                        preresolved: Vec::new(),
+                    },
+                )
+            } else {
+                return Ok(syntax);
+            };
         let type_parts = expect_null_args(&parts[2], "binder type")?;
         let domain = match type_parts {
             [] => Syntax::node(
@@ -95,10 +128,10 @@ impl Context {
                 Syntax::Ident {
                     info: SourceInfo::None,
                     raw_val: ByteSpan::default().into(),
-                    val: Name::from_components(["_root_", "optParam"]),
+                    val: Name::from_components(["_root_", annotation_name]),
                     preresolved: Vec::new(),
                 },
-                null(vec![domain, modifier[1].clone()]),
+                null(vec![domain, value]),
             ],
         );
         let Syntax::Node { args, .. } = &mut syntax else {
@@ -106,6 +139,69 @@ impl Context {
         };
         args[2] = null(vec![Syntax::atom(SourceInfo::None, ":"), annotation]);
         args[3] = null(Vec::new());
+        Ok(syntax)
+    }
+
+    /// elabBindersAux prepares one original bracket at a time. Its
+    /// toBinderViews declares every grouped quote before elaborating any of
+    /// those domains, while earlier brackets have already bound their locals.
+    pub(super) fn declaration_binder_views(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<Vec<Syntax>, NatDefinitionElabError> {
+        let binder = self.copy_pattern_syntax(syntax)?;
+        let grouped = self.expand_grouped_tactic_binders(null(vec![binder]))?;
+        let Syntax::Node { args, .. } = grouped else {
+            unreachable!("constructed null binder telescope");
+        };
+        let mut views = Vec::with_capacity(args.len());
+        for binder in args {
+            views.push(self.expand_optional_binder_node(binder, false, true)?);
+        }
+        Ok(views)
+    }
+
+    /// toBinderViews expands the modifier separately for every identifier.
+    /// Splitting only grouped tactic binders leaves ordinary binder elaboration
+    /// intact while giving each quote the same auxiliary identity as the pin.
+    fn expand_grouped_tactic_binders(
+        &mut self,
+        mut syntax: Syntax,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let Syntax::Node { args, .. } = &mut syntax else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let mut expanded = Vec::with_capacity(args.len());
+        for binder in std::mem::take(args) {
+            self.tick()?;
+            let split = match &binder {
+                Syntax::Node { kind, args, .. }
+                    if kind == &parser_kind(&["Term", "explicitBinder"]) && args.len() == 5 =>
+                {
+                    let modifier = expect_null_args(&args[3], "optional binder modifier")?;
+                    matches!(modifier, [modifier]
+                        if modifier.kind() == Some(&parser_kind(&["Term", "binderTactic"])))
+                        && expect_null_args(&args[1], "binder names")?.len() > 1
+                }
+                _ => false,
+            };
+            if !split {
+                expanded.push(binder);
+                continue;
+            }
+            let Syntax::Node { args: parts, .. } = &binder else {
+                unreachable!("validated explicit binder");
+            };
+            for identifier in expect_null_args(&parts[1], "binder names")? {
+                let mut single = self.copy_pattern_syntax(&binder)?;
+                let Syntax::Node { args, .. } = &mut single else {
+                    unreachable!("copied explicit binder");
+                };
+                args[1] = null(vec![identifier.clone()]);
+                expanded.push(single);
+            }
+        }
+        *args = expanded;
         Ok(syntax)
     }
 
