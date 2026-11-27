@@ -649,7 +649,9 @@ fn invalid_executable_attributes_and_post_compilation_updates_are_refused_atomic
         )],
         OleanWriteBudget::default(),
     )
-    .expect("standalone extern on structure ctor and projection succeeds");
+    .expect("standalone extern on structure ctor and projection succeeds")
+    .into_complete()
+    .expect("standalone extern build completes");
     let receipt = imported(&built);
     let externs = ExternTable::read(receipt.engine.environment()).unwrap();
     assert_eq!(
