@@ -463,9 +463,7 @@ impl Context {
                 self.auxiliary_visibility.private_only.insert(name.clone());
             }
         }
-        // Admit the full declaration into the private world (kernel-checked!).
-        let priv_checked_env = self.txn.env.clone();
-        let _ = self.admit_auxiliary_into_env(&priv_checked_env, full_decl.clone())?;
+        // Admit the full declaration once into the private world (kernel-checked!).
         if let Some((mut raw_priv_env, _)) = self.private_decl_world.clone() {
             for decl in nested_aux {
                 if declaration_name(&decl).is_some_and(|name| !raw_priv_env.contains(name)) {
@@ -476,6 +474,9 @@ impl Context {
             if let Some((stored_env, _)) = self.private_decl_world.as_mut() {
                 *stored_env = raw_priv_env;
             }
+        } else {
+            let priv_checked_env = self.txn.env.clone();
+            let _ = self.admit_auxiliary_into_env(&priv_checked_env, full_decl.clone())?;
         }
         // Restore the public world, then admit ONLY the public `Axiom` interface
         // (mechanically rejecting any private constant leaking into the type).
