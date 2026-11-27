@@ -129,19 +129,12 @@ struct DeferredMutant {
 }
 
 /// Names whose production state cannot yet carry the defect. Each entry expires
-/// automatically when its declared trigger appears.
-const NOT_YET_SEEDED: [DeferredMutant; 2] = [
-    DeferredMutant {
-        name: "leaked transaction assignment",
-        krate: "fln-elab",
-        trigger: SeedTrigger::ProductionNeedle("struct ElabTxn"),
-    },
-    DeferredMutant {
-        name: "stale cache hit accepted",
-        krate: "fln-ledger",
-        trigger: SeedTrigger::ProductionNeedle("fn query"),
-    },
-];
+/// automatically when its declared trigger appears anywhere under `crates/<krate>/src/`.
+const NOT_YET_SEEDED: [DeferredMutant; 1] = [DeferredMutant {
+    name: "stale cache hit accepted",
+    krate: "fln-ledger",
+    trigger: SeedTrigger::ProductionNeedle("fn query"),
+}];
 
 // ---------------------------------------------------------------------------
 // Deriving the obligation from AGENTS.md, never transcribing it
@@ -240,9 +233,25 @@ fn agents_md() -> String {
     std::fs::read_to_string(workspace_root().join("AGENTS.md")).expect("AGENTS.md is readable")
 }
 
-/// Whether `krate` still declares itself unimplemented.
+/// All production Rust source under `crates/<krate>/src/`, derived by search
+/// rather than hardcoding `src/lib.rs` (bead `franken_lean-z8j.1.22` item 3).
 fn crate_source(root: &std::path::Path, krate: &str) -> Option<String> {
-    std::fs::read_to_string(root.join("crates").join(krate).join("src/lib.rs")).ok()
+    let src_dir = root.join("crates").join(krate).join("src");
+    let mut files = Vec::new();
+    rust_files(&src_dir, &mut files);
+    files.sort();
+    if files.is_empty() {
+        return None;
+    }
+    let mut combined = String::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        combined.push_str(&text);
+        combined.push('\n');
+    }
+    Some(combined)
 }
 
 fn deferral_still_applies(root: &std::path::Path, deferred: DeferredMutant) -> bool {
@@ -325,12 +334,12 @@ fn every_mandated_mutant_is_killed_by_a_marked_test_or_declared_not_yet_seeded()
         "mandated_mutants: {} of {} §18 names killed by a marked test; {} declared \
          not-yet-seeded against absent production triggers. Declarations expire \
          automatically when their trigger appears. This counts MARKERS, not kills - that \
-         three of three \
-         applicable mutants actually die was established by planting them, and is not \
+         all {} applicable mutants actually die was established by planting them, and is not \
          re-established by this run.",
         names.len() - NOT_YET_SEEDED.len(),
         names.len(),
-        NOT_YET_SEEDED.len()
+        NOT_YET_SEEDED.len(),
+        PLANTS.len(),
     );
 }
 
@@ -525,13 +534,12 @@ struct Plant {
     killers: &'static [Killer],
 }
 
-/// The three mandated mutants that can be planted today.
+/// The four mandated mutants that can be planted today.
 ///
-/// The two absent names are not omissions: `leaked transaction assignment` and
-/// `stale cache hit accepted` are in [`NOT_YET_SEEDED`] because the first production
-/// construct that can carry each defect is absent, and
-/// `no_plant_exists_for_a_name_that_cannot_be_seeded_yet` refuses a recipe for either —
-/// a plant against unrelated partial implementation would be theatre.
+/// The remaining absent name is not an omission: `stale cache hit accepted` is in
+/// [`NOT_YET_SEEDED`] because the first production construct that can carry it (`fn query`
+/// in `fln-ledger`) is still absent, and `no_plant_exists_for_a_name_that_cannot_be_seeded_yet`
+/// refuses a recipe for it — a plant against unrelated partial implementation would be theatre.
 const PLANTS: &[Plant] = &[
     Plant {
         name: "skipped positivity check",
@@ -587,6 +595,22 @@ const PLANTS: &[Plant] = &[
             func: "rc_balance_property_random_graphs",
             file: "crates/fln-unsafe-abi/src/tests.rs",
             expect: "del on reserved/poisoned tag",
+        }],
+    },
+    Plant {
+        name: "leaked transaction assignment",
+        file: "crates/fln-elab/src/txn.rs",
+        // Copying `child.mvars` into `self` during `Rollback` leaks the child transaction's
+        // metavariable assignments back into the parent after rollback.
+        find: "            TxnDispositionV1::Rollback { reason } => {\n                self.decisions.record(DecisionRecord::TransactionRollback {",
+        replace: "            TxnDispositionV1::Rollback { reason } => {\n                self.mvars = child.mvars;\n                self.decisions.record(DecisionRecord::TransactionRollback {",
+        package: "fln-elab",
+        target: &["--test", "elab_txn_disposition_model"],
+        killers: &[Killer {
+            path: "rollback_never_leaks_child_mvar_assignments",
+            func: "rollback_never_leaks_child_mvar_assignments",
+            file: "crates/fln-elab/tests/elab_txn_disposition_model.rs",
+            expect: "leaked child mvar assignment survived transaction rollback",
         }],
     },
 ];
@@ -800,17 +824,7 @@ fn no_plant_exists_for_a_name_that_cannot_be_seeded_yet() {
 
 #[test]
 fn deferrals_expire_on_their_declared_production_trigger() {
-    let transaction = NOT_YET_SEEDED[0].trigger;
-    assert!(
-        !transaction.is_present("pub fn check_source() {}"),
-        "an unrelated bounded elaboration seam cannot carry a leaked ElabTxn assignment"
-    );
-    assert!(
-        transaction.is_present("pub struct ElabTxn {}"),
-        "the planned transaction type must expire the deferral"
-    );
-
-    let ledger = NOT_YET_SEEDED[1].trigger;
+    let ledger = NOT_YET_SEEDED[0].trigger;
     assert!(
         !ledger.is_present("pub struct LedgerRecord {}"),
         "unrelated record types cannot carry a stale cache hit defect"
@@ -818,6 +832,38 @@ fn deferrals_expire_on_their_declared_production_trigger() {
     assert!(
         ledger.is_present("pub fn query() {}"),
         "the planned query function must expire the deferral"
+    );
+}
+
+/// The deferral scanner must search every `.rs` file under `crates/<krate>/src/`,
+/// not only `src/lib.rs` (bead `franken_lean-z8j.1.22` item 3).
+#[test]
+fn deferral_scanner_discovers_triggers_in_submodules_not_only_lib_rs() {
+    let root = workspace_root();
+    let lib_rs = std::fs::read_to_string(root.join("crates/fln-elab/src/lib.rs"))
+        .expect("fln-elab/src/lib.rs is readable");
+    let trigger = SeedTrigger::ProductionNeedle("struct ElabTxn");
+    assert!(
+        !trigger.is_present(&lib_rs),
+        "control precondition: `struct ElabTxn` lives in a submodule, not in lib.rs"
+    );
+    let deferred = DeferredMutant {
+        name: "leaked transaction assignment",
+        krate: "fln-elab",
+        trigger,
+    };
+    assert!(
+        !deferral_still_applies(&root, deferred),
+        "a production trigger defined in a submodule (`crates/fln-elab/src/txn.rs`) must expire its deferral"
+    );
+    let absent = DeferredMutant {
+        name: "leaked transaction assignment",
+        krate: "fln-elab",
+        trigger: SeedTrigger::ProductionNeedle("struct NonexistentElabTxnTrigger9999"),
+    };
+    assert!(
+        deferral_still_applies(&root, absent),
+        "an absent production trigger across all submodules must keep deferring"
     );
 }
 

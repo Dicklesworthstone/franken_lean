@@ -80,9 +80,9 @@ jobs:
           # The campaign restores from `Drop`, including on panic. This asserts it, because a
           # lane that leaves a kernel with its positivity check disabled must not report
           # success — and because the next step's receipt would then describe mutated source.
-          if [[ -n "$(git status --porcelain -- crates/fln-kernel crates/fln-unsafe-abi)" ]]; then
+          if [[ -n "$(git status --porcelain -- crates/fln-kernel crates/fln-unsafe-abi crates/fln-elab)" ]]; then
             echo "the campaign did not restore the production files it mutated" >&2
-            git status --porcelain -- crates/fln-kernel crates/fln-unsafe-abi >&2
+            git status --porcelain -- crates/fln-kernel crates/fln-unsafe-abi crates/fln-elab >&2
             exit 2
           fi
 
