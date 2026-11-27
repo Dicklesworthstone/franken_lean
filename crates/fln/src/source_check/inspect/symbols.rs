@@ -515,7 +515,7 @@ fn identifier(syntax: &Syntax) -> Option<(&Name, Range<usize>)> {
     (!range.is_empty()).then_some((val, range))
 }
 
-fn node_args<'a>(syntax: &'a Syntax, leaf: &str) -> Option<&'a [Syntax]> {
+pub(super) fn node_args<'a>(syntax: &'a Syntax, leaf: &str) -> Option<&'a [Syntax]> {
     match syntax {
         Syntax::Node { kind, args, .. }
             if kind == &Name::from_components(["Lean", "Parser", "Command", leaf]) =>
@@ -526,7 +526,7 @@ fn node_args<'a>(syntax: &'a Syntax, leaf: &str) -> Option<&'a [Syntax]> {
     }
 }
 
-fn null_args(syntax: &Syntax) -> Option<&[Syntax]> {
+pub(super) fn null_args(syntax: &Syntax) -> Option<&[Syntax]> {
     match syntax {
         Syntax::Node { kind, args, .. } if kind == &Name::from_components(["null"]) => Some(args),
         _ => None,

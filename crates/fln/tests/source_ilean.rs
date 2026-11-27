@@ -57,6 +57,61 @@ fn complete(sources: &[(&str, &str)], entry: &str) -> Ilean {
     }
 }
 
+const ENUM: &str = concat!(
+    "module\nprelude\nnamespace N\n",
+    "public inductive Flag where\r\n  | off\r\n  | «on😀»\r\n",
+    "@[expose] public def chosen : Flag := Flag.«on😀»\nend N\n"
+);
+
+#[test]
+fn fieldless_inductives_record_type_and_constructor_definitions() {
+    let data = complete(&[("Enums", ENUM)], "Enums");
+    if let Some(reference) = reference() {
+        assert_eq!(data, Fixture::new().oracle(&reference, "Enums", ENUM));
+    }
+
+    for (name, line, column, end) in [
+        ("N.Flag", 3, 17, 21),
+        ("N.Flag.off", 4, 4, 7),
+        ("N.Flag.«on😀»", 5, 4, 10),
+    ] {
+        let reference = &data.references[&IleanRefIdent::Const {
+            module: "Enums".into(),
+            name: name.into(),
+        }];
+        let def = reference.definition.as_ref().unwrap();
+        assert_eq!(def.parent_decl.as_deref(), Some("N.Flag"));
+        assert_eq!(
+            (
+                def.start_line,
+                def.start_character,
+                def.end_line,
+                def.end_character
+            ),
+            (line, column, line, end),
+            "{name}"
+        );
+    }
+    assert!(data.decls.contains_key("N.Flag"));
+    assert!(!data.decls.contains_key("N.Flag.off"));
+    let used = &data.references[&IleanRefIdent::Const {
+        module: "Enums".into(),
+        name: "N.Flag.«on😀»".into(),
+    }]
+        .usages;
+    assert_eq!(used.len(), 1);
+    assert_eq!(used[0].parent_decl.as_deref(), Some("N.chosen"));
+    assert!(
+        !data
+            .references
+            .keys()
+            .any(|key| matches!(key, IleanRefIdent::Const { name, .. } if name == "N.Flag.rec"))
+    );
+    let unsupported = "prelude\ninductive Data (T : Type) where | item (value : T)\n";
+    let error = metadata(&[("Fields", unsupported)], "Fields", Default::default()).unwrap_err();
+    assert_eq!(error.disposition().2, 5, "{error}");
+}
+
 #[test]
 fn resolved_references_roundtrip_and_exclude_shadowed_locals() {
     let metadata = complete(&[("Native", BASIC)], "Native");
