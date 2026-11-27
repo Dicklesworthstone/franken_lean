@@ -241,7 +241,7 @@ fn structure_context(
 }
 
 #[test]
-fn structure_eta_single_field_converts_symmetrically() {
+fn single_field_structure_eta_needs_the_type_of_the_bound_variable() {
     let context = structure_context("PLift", "PLift.up", 1, 1);
     let alpha = constant("A");
     let b = Expr::bvar(0).unwrap();
@@ -252,16 +252,16 @@ fn structure_eta_single_field_converts_symmetrically() {
     let rhs = decoded(&b);
     assert!(matches!(
         def_eq(&lhs, &rhs, &context, DefEqBudget::unlimited()),
-        DefEqOutcome::Equal(_)
+        DefEqOutcome::Deferred { .. }
     ));
     assert!(matches!(
         def_eq(&rhs, &lhs, &context, DefEqBudget::unlimited()),
-        DefEqOutcome::Equal(_)
+        DefEqOutcome::Deferred { .. }
     ));
 }
 
 #[test]
-fn structure_eta_multi_field_converts_symmetrically() {
+fn multi_field_structure_eta_needs_the_type_of_the_bound_variable() {
     let context = structure_context("Pair", "Pair.mk", 2, 2);
     let alpha = constant("A");
     let beta = constant("B");
@@ -280,11 +280,11 @@ fn structure_eta_multi_field_converts_symmetrically() {
     let rhs = decoded(&p);
     assert!(matches!(
         def_eq(&lhs, &rhs, &context, DefEqBudget::unlimited()),
-        DefEqOutcome::Equal(_)
+        DefEqOutcome::Deferred { .. }
     ));
     assert!(matches!(
         def_eq(&rhs, &lhs, &context, DefEqBudget::unlimited()),
-        DefEqOutcome::Equal(_)
+        DefEqOutcome::Deferred { .. }
     ));
 }
 

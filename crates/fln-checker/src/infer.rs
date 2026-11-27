@@ -4194,17 +4194,16 @@ impl<'a> InferenceEngine<'a> {
                         expected.nodes()
                     );
                 }
-                if conversion == ConversionMode::Ordinary {
-                    let steps_before = self.control.progress.steps;
-                    if self.proof_conversion(actual, expected)? {
-                        if let Some(fp) = cache_fp {
-                            let steps_needed =
-                                self.control.progress.steps.saturating_sub(steps_before);
-                            self.domain_conversions
-                                .insert(fp, actual, expected, steps_needed);
-                        }
-                        return Ok(());
+                // Eager reduction can expose extra Nat equalities. A deferral
+                // still permits ordinary typed rules such as structure eta.
+                let steps_before = self.control.progress.steps;
+                if self.proof_conversion(actual, expected)? {
+                    if let Some(fp) = cache_fp {
+                        let steps_needed = self.control.progress.steps.saturating_sub(steps_before);
+                        self.domain_conversions
+                            .insert(fp, actual, expected, steps_needed);
                     }
+                    return Ok(());
                 }
                 Err(LeafHalt::Deferred(
                     InferenceDeferred::ApplicationConversion { argument, need },

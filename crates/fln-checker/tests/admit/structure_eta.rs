@@ -159,3 +159,138 @@ fn structure_eta_compares_every_field() {
         "a constructor whose data field differs must not convert: {outcome:?}"
     );
 }
+
+#[test]
+fn structure_eta_cannot_erase_a_phantom_parameter() {
+    use fln_checker::defeq::{DefEqOutcome, def_eq};
+    use fln_checker::infer::{InferenceContext, InferenceMode, InferenceOutcome, infer};
+
+    // Box tag has one field of type Data. Its value contains no evidence
+    // about the tag, so rebuilding that field at another tag changes the type.
+    let box_type = |tag| app(c("Box"), [c(tag)]);
+    let constructor = Name::from_components(["Box", "mk"]);
+    let rebuild = |tag, record| {
+        app(
+            Expr::const_(constructor.clone(), vec![]),
+            [c(tag), Expr::proj(primary_name("Box"), 0, record)],
+        )
+    };
+    let env = environment_of(vec![
+        axiom("Tag", ty()),
+        axiom("first", c("Tag")),
+        axiom("second", c("Tag")),
+        axiom("Data", ty()),
+        ConstantEntry::new(
+            checker_name("Box"),
+            ConstantDeclaration::inductive(
+                vec![],
+                decoded(&pi(c("Tag"), ty())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    1,
+                    0,
+                    vec![checker_name("Box")],
+                    vec![checker_qualified(&["Box", "mk"])],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Box", "mk"]),
+            ConstantDeclaration::constructor(
+                vec![],
+                decoded(&pi(
+                    c("Tag"),
+                    pi(c("Data"), app(c("Box"), [Expr::bvar(1).unwrap()])),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(checker_name("Box"), 0, 1, 1),
+            ),
+        ),
+        axiom("boxed", box_type("first")),
+        axiom("Family", pi(box_type("first"), ty())),
+        axiom("witness", app(c("Family"), [c("boxed")])),
+        axiom(
+            "consume",
+            pi(app(c("Family"), [rebuild("first", c("boxed"))]), c("Data")),
+        ),
+        axiom(
+            "eagerReduce",
+            pi(ty(), pi(Expr::bvar(0).unwrap(), Expr::bvar(1).unwrap())),
+        ),
+        axiom(
+            "family_for_all",
+            pi(box_type("first"), app(c("Family"), [Expr::bvar(0).unwrap()])),
+        ),
+    ]);
+    let context = InferenceContext::empty(env.clone());
+    let original = decoded(&c("boxed"));
+    let other = decoded(&rebuild("second", c("boxed")));
+    for (term, tag) in [(&original, "first"), (&other, "second")] {
+        let result = infer(
+            term,
+            &context,
+            InferenceMode::Checking {
+                declaration_safety: DefinitionSafety::Safe,
+            },
+            InferenceBudget::unlimited(),
+        );
+        let InferenceOutcome::Complete(result) = result else {
+            panic!("well-typed input: {result:?}");
+        };
+        assert!(matches!(
+            def_eq(
+                &result.type_,
+                &decoded(&box_type(tag)),
+                context.reduction(),
+                DefEqBudget::unlimited()
+            ),
+            DefEqOutcome::Equal(_)
+        ));
+    }
+    for (left, right) in [(&original, &other), (&other, &original)] {
+        let result = def_eq(left, right, context.reduction(), DefEqBudget::unlimited());
+        assert!(
+            matches!(result, DefEqOutcome::Deferred { .. }),
+            "heterogeneous eta: {result:?}"
+        );
+    }
+    let candidate = definition(
+        "homogeneous_rebuild",
+        decoded(&app(c("Family"), [rebuild("first", c("boxed"))])),
+        decoded(&c("witness")),
+    );
+    let verdict = admit(&env, &candidate, AdmissionBudget::unlimited());
+    assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
+
+    let eager = app(
+        c("eagerReduce"),
+        [app(c("Family"), [c("boxed")]), c("witness")],
+    );
+    let candidate = definition(
+        "eager_rebuild",
+        decoded(&c("Data")),
+        decoded(&app(c("consume"), [eager])),
+    );
+    let verdict = admit(&env, &candidate, AdmissionBudget::unlimited());
+    assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
+
+    for tag in ["first", "second"] {
+        let codomain = app(c("Family"), [rebuild(tag, Expr::bvar(0).unwrap())]);
+        let candidate = definition(
+            "under_binder",
+            decoded(&pi(box_type("first"), codomain)),
+            decoded(&c("family_for_all")),
+        );
+        let verdict = admit(&env, &candidate, AdmissionBudget::unlimited());
+        match tag {
+            "first" => assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}"),
+            _ => assert!(
+                matches!(verdict, Verdict::Rejected(_) | Verdict::Deferred(_)),
+                "{verdict:?}"
+            ),
+        }
+    }
+}
