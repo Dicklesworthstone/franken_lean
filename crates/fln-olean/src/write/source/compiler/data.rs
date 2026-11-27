@@ -6,12 +6,14 @@
 //! written data type usable by a downstream compiler.
 //!
 //! This projection follows `MonoTypes.lean`, `Irrelevant.lean` and
-//! `ToImpureType.lean` for nonrecursive, monomorphic Type0 families whose
-//! relevant fields are exactly Nat/String/Bool. Sole-field wrappers, erased
-//! fields, wider scalars, annotated field domains, aliases, dependencies and
-//! mutual families are excluded. Both trivial-structure caches are consequently
-//! `none`. Object fields precede the Bool scalar bytes; each group preserves
-//! source order. The layout records are extracted from `ToImpureType.lean`.
+//! `ToImpureType.lean` for monomorphic Type0 families whose relevant fields
+//! are exactly Nat/String/Bool or a direct recursive occurrence of the family.
+//! Nonrecursive sole-field wrappers, erased fields, wider scalars, annotated
+//! field domains, aliases, dependencies and mutual families are excluded.
+//! Runtime builtin families and Name's computed-field layout are also excluded.
+//! Both trivial-structure caches are consequently `none`. Object fields precede
+//! the Bool scalar bytes; each group preserves source order. The layout records
+//! are extracted from `ToImpureType.lean`.
 
 use super::*;
 use fln_core::expr::BinderInfo;
@@ -24,6 +26,7 @@ use fln_env::constants::InductiveVal;
 pub struct CompilerData {
     name: Name,
     carrier: IrType,
+    recursive: bool,
     constructors: Vec<DataConstructor>,
 }
 
@@ -45,7 +48,38 @@ fn without_metadata<'a, E>(
     Ok(value)
 }
 
+// These types use runtime representations that their logical constructor
+// telescopes do not completely describe. Keep the exact builtin list from
+// LCNF/Util.lean; Lean.Name additionally stores Prelude's computed hash field.
+fn runtime_special_family(name: &Name) -> bool {
+    [
+        "String",
+        "UInt8",
+        "UInt16",
+        "UInt32",
+        "UInt64",
+        "USize",
+        "Float",
+        "Float32",
+        "Thunk",
+        "Task",
+        "Array",
+        "ByteArray",
+        "FloatArray",
+        "Nat",
+        "Int",
+        "Lean.Name",
+    ]
+    .into_iter()
+    .any(|builtin| name == &Name::from_components(builtin.split('.')))
+}
+
 impl CompilerData {
+    /// Whether constructors contain direct occurrences of their own family.
+    pub fn is_recursive(&self) -> bool {
+        self.recursive
+    }
+
     /// The pin's source-facing carrier for this checked layout.
     pub fn carrier(&self) -> &IrType {
         &self.carrier
@@ -72,11 +106,11 @@ impl CompilerData {
         charge(1)?;
         let name = &inductive.base.name;
         if name.is_anonymous()
+            || runtime_special_family(name)
             || !inductive.base.level_params.is_empty()
             || inductive.num_params != 0
             || inductive.num_indices != 0
             || inductive.num_nested != 0
-            || inductive.is_rec
             || inductive.is_unsafe
             || inductive.all.as_slice() != std::slice::from_ref(name)
             || inductive.ctors.is_empty()
@@ -88,6 +122,7 @@ impl CompilerData {
         }
         charge(inductive.ctors.len())?;
         let mut constructors = Vec::with_capacity(inductive.ctors.len());
+        let mut recursive_fields = Vec::new();
         for (index, ctor_name) in inductive.ctors.iter().enumerate() {
             charge(1)?;
             let Some(ConstantInfo::Ctor(ctor)) = find(ctor_name) else {
@@ -129,6 +164,17 @@ impl CompilerData {
                 // metadata. Keep annotated domains outside this exact profile.
                 let field_type = binder_type;
                 let field = match field_type.node() {
+                    ExprNode::Const {
+                        name: field_name,
+                        levels,
+                    } if inductive.is_rec && levels.is_empty() && field_name == name => {
+                        // compileInductives computes the complete family carrier
+                        // before its constructor layouts. Resolve this slot once
+                        // all constructors have established whether nullary tags
+                        // coexist with heap objects.
+                        recursive_fields.push((index, fields.len()));
+                        IrType::Object
+                    }
                     ExprNode::Const { name, levels }
                         if levels.is_empty() && name == &Name::from_components(["Nat"]) =>
                     {
@@ -169,7 +215,9 @@ impl CompilerData {
                 fields,
             });
         }
-        if constructors.len() == 1 && constructors[0].fields.len() == 1 {
+        if inductive.is_rec != !recursive_fields.is_empty()
+            || (!inductive.is_rec && constructors.len() == 1 && constructors[0].fields.len() == 1)
+        {
             return Ok(None);
         }
         let nullary = constructors
@@ -187,9 +235,14 @@ impl CompilerData {
         } else {
             IrType::TObject
         };
+        for (constructor, field) in recursive_fields {
+            charge(1)?;
+            constructors[constructor].fields[field] = carrier.clone();
+        }
         Ok(Some(Self {
             name: name.clone(),
             carrier,
+            recursive: inductive.is_rec,
             constructors,
         }))
     }

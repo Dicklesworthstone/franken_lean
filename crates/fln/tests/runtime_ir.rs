@@ -189,6 +189,9 @@ const BOXED_DATA_HELPERS: &str = concat!(
     "structure IRAllBools where\n first : Bool\n second : Bool\n third : Bool\n",
     "structure IRProofBox where\n number : Nat\n proof : True\n",
     "inductive IRRecursive where\n | empty\n | next (n : Nat) (tail : IRRecursive)\n",
+    "inductive IRRecursiveFirst where\n | next (n : Nat) (tail : IRRecursiveFirst)\n | empty\n",
+    "inductive IRRecursiveTree where\n | leaf (n : Nat) (text : String)\n | node (left : IRRecursiveTree) (flag : Bool) (right : IRRecursiveTree)\n",
+    "inductive IRRecursiveLoop where\n | next (tail : IRRecursiveLoop)\n",
     "inductive IRBoxedParam (A : Type) where\n | mk (value : A) (n : Nat)\n",
     "abbrev IRBoxedAlias := IRBoxedRecord\n",
 );
@@ -531,6 +534,110 @@ fn boxed_export_cases() -> Vec<BoxedExportCase> {
             parameters: vec![IrType::Object, IrType::UInt8],
             result: IrType::UInt8,
             reduced: Some(("Bool -> Bool", "compiled true")),
+        },
+    ]
+}
+
+fn recursive_export_cases() -> Vec<BoxedExportCase> {
+    vec![
+        BoxedExportCase {
+            ty: "IRRecursive",
+            body: "IRRecursive.next 7 (IRRecursive.next 9 IRRecursive.empty)",
+            application: "match compiled with | .next n (.next m _) => n + m | _ => 0",
+            expected: "16",
+            parameters: vec![],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursive -> IRRecursive",
+            body: "fun p => p",
+            application: "let p := IRRecursive.next large (.next 2 .empty); let q := compiled p; ((match q with | .next n (.next m _) => n + m | _ => 0), (match p with | .next n _ => n | _ => 0))",
+            expected: "(184467440737095516162, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursive -> IRRecursive",
+            body: "fun p => match p with | .empty => .empty | .next _ tail => tail",
+            application: "let p := IRRecursive.next large (.next 2 .empty); ((match compiled .empty with | .empty => 0 | _ => 1), (match compiled p with | .next n _ => n | _ => 0), (match p with | .next n _ => n | _ => 0))",
+            expected: "(0, 2, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRRecursive -> IRRecursive) -> IRRecursive -> IRRecursive",
+            body: "fun f p => f p",
+            application: "let p := IRRecursive.next large .empty; let q := compiled (fun tail => .next 3 tail) p; ((match q with | .next n (.next m _) => n + m | _ => 0), (match p with | .next n _ => n | _ => 0))",
+            expected: "(184467440737095516163, 184467440737095516160)",
+            parameters: vec![IrType::Object, IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Nat -> IRRecursive -> IRRecursive",
+            body: "fun n tail => IRRecursive.next n tail",
+            application: "let tail := IRRecursive.next 2 .empty; let p := compiled large tail; ((match p with | .next n (.next m _) => n + m | _ => 0), (match tail with | .next n _ => n | _ => 0))",
+            expected: "(184467440737095516162, 2)",
+            parameters: vec![IrType::TObject, IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursive -> Nat",
+            body: "fun p => IRRecursive.rec (motive := fun _ => Nat) 0 (fun n _ total => n + total) p",
+            application: "let p := IRRecursive.next large (.next 2 (.next 3 .empty)); (compiled .empty, compiled p, (match p with | .next n _ => n | _ => 0))",
+            expected: "(0, 184467440737095516165, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursiveFirst -> IRRecursiveFirst",
+            body: "fun p => p",
+            application: "((match compiled .empty with | .empty => 7 | _ => 0), (match compiled (.next large .empty) with | .next n _ => n | _ => 0))",
+            expected: "(7, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursiveTree -> Bool -> IRRecursiveTree -> IRRecursiveTree",
+            body: "fun left flag right => IRRecursiveTree.node left flag right",
+            application: "let left := IRRecursiveTree.leaf large heap; let right := IRRecursiveTree.leaf 3 \"tail\"; match compiled left true right with | .node (.leaf n s) flag (.leaf m t) => (n + m, s, flag, t, (match left with | .leaf k _ => k | _ => 0)) | _ => (0, \"wrong\", false, \"wrong\", 0)",
+            expected: "(184467440737095516163, \"boxed heap payload\", true, \"tail\", 184467440737095516160)",
+            parameters: vec![IrType::Object, IrType::UInt8, IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursiveTree -> Bool",
+            body: "fun p => match p with | .node left _ _ => (match left with | .node _ b _ => b | .leaf _ _ => false) | .leaf _ _ => false",
+            application: "let leaf := IRRecursiveTree.leaf large heap; let p := IRRecursiveTree.node (.node leaf true leaf) false leaf; (compiled p, (match p with | .node _ b _ => b | _ => true))",
+            expected: "(true, false)",
+            parameters: vec![IrType::Object],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRRecursiveTree -> IRRecursiveTree) -> IRRecursiveTree -> Bool",
+            body: "fun f p => match f p with | .node _ b _ => b | .leaf _ _ => false",
+            application: "let p := IRRecursiveTree.leaf large heap; (compiled (fun t => .node t true t) p, (match p with | .leaf n s => (n, s) | _ => (0, \"wrong\")))",
+            expected: "(true, 184467440737095516160, \"boxed heap payload\")",
+            parameters: vec![IrType::Object, IrType::Object],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursive -> Nat -> Nat",
+            body: "fun _ n => n",
+            application: "compiled (IRRecursive.next large .empty) 42",
+            expected: "42",
+            parameters: vec![IrType::TObject, IrType::TObject],
+            result: IrType::TObject,
+            reduced: Some(("Nat -> Nat", "compiled 42")),
         },
     ]
 }
@@ -1067,7 +1174,25 @@ fn checked_definition(base: &Engine, source: &str) -> (fln::Declaration, Engine)
     let fln::ConstantInfo::Defn(definition) = environment.find(&name("compiled")).unwrap() else {
         panic!("source definition")
     };
-    (fln::Declaration::Defn(definition.clone()), checked.engine)
+    let declaration = fln::Declaration::Defn(definition.clone());
+    // The source frontend also records equationInfo journals for matches.
+    // compile_source_definition accepts this exact raw declaration, so its
+    // independent expected successor must use the same admission boundary.
+    let admitted = base
+        .admit_declaration(
+            declaration.clone(),
+            &KVMap::new(),
+            EngineAdmissionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        admitted.engine.environment().find(&name("compiled")),
+        environment.find(&name("compiled")),
+        "raw admission changed the source declaration: {source}",
+    );
+    (declaration, admitted.engine)
 }
 
 #[test]
@@ -1329,7 +1454,10 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
     let original = base.logical_root(&options);
     let mut no_execution = limits();
     no_execution.vm.max_steps = 0;
-    for case in boxed_export_cases() {
+    for case in boxed_export_cases()
+        .into_iter()
+        .chain(recursive_export_cases())
+    {
         let source = format!("def compiled : {} := {}", case.ty, case.body);
         let (declaration, checked) = checked_definition(&base, &source);
         let compiled = ir::compile_source_definition(
@@ -1344,7 +1472,8 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
         .unwrap();
         assert_eq!(
             compiled.admission.result_logical_root,
-            checked.logical_root(&options)
+            checked.logical_root(&options),
+            "{source}",
         );
         let IrDecl::Function { params, result, .. } = compiled
             .module
@@ -1396,6 +1525,8 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
     // tables, in addition to their typed signature and runtime cases above.
     for source in [
         "def compiled (x : IRPayload) : IRPayload := x",
+        "def compiled (x : IRRecursive) : IRRecursive := x",
+        "def compiled (x : IRRecursiveLoop) : IRRecursiveLoop := x",
         "def compiled (x : IRScalarBox) : IRScalarBox := x",
         "def compiled (x : IRScalarPayload) : IRScalarPayload := x",
         "def compiled (f : IRScalarPayload -> Nat) : Nat := f IRScalarPayload.empty",
@@ -1431,8 +1562,12 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
             "source export carrier",
         ),
         (
-            "def compiled (x : IRRecursive) : IRRecursive := x",
-            "source export carrier",
+            "def compiled (_ : IRRecursiveFirst) (n : Nat) : Nat := n",
+            "unused recursive source parameter",
+        ),
+        (
+            "def compiled (_ : IRRecursiveLoop) (n : Nat) : Nat := n",
+            "unused recursive source parameter",
         ),
         (
             "def compiled (x : IRBoxedParam Nat) : IRBoxedParam Nat := x",
@@ -2741,7 +2876,7 @@ fn consume_boxed_ir(
     // each call checks ownership of allocated payloads rather than literals.
     // Dynamic lookup also prevents logical bodies from replacing native IR.
     let source = format!(
-        "import Lean\nimport NativeIrCase\nunsafe def main : IO Unit := do\n  let heap ← IO.FS.readFile \"heap-input.txt\"\n  let digits ← IO.FS.readFile \"heap-nat.txt\"\n  let large := digits.toNat!\n  Lean.enableInitializersExecution\n  let env ← Lean.importModules #[{{ module := `NativeIrCase, isMeta := true }}] {{}} (loadExts := true)\n  match env.evalConst ({ty}) {{}} `{entry} (checkMeta := false) with\n  | .error message => throw (IO.userError message)\n  | .ok compiled => do\n    IO.println (reprStr ({application}))\n    IO.println (reprStr ({application}))\n",
+        "import Lean\nimport NativeIrCase\nset_option linter.unusedVariables false\nunsafe def main : IO Unit := do\n  let heap ← IO.FS.readFile \"heap-input.txt\"\n  let digits ← IO.FS.readFile \"heap-nat.txt\"\n  let large := digits.toNat!\n  Lean.enableInitializersExecution\n  let env ← Lean.importModules #[{{ module := `NativeIrCase, isMeta := true }}] {{}} (loadExts := true)\n  match env.evalConst ({ty}) {{}} `{entry} (checkMeta := false) with\n  | .error message => throw (IO.userError message)\n  | .ok compiled => do\n    IO.println (reprStr ({application}))\n    IO.println (reprStr ({application}))\n",
     );
     let filename = format!("BoxedRuntime-{label}.lean");
     std::fs::write(dir.join(&filename), source).unwrap();
@@ -2778,7 +2913,11 @@ fn the_pin_executes_boxed_data_exports_and_observes_payloads() {
     let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    for (index, case) in boxed_export_cases().into_iter().enumerate() {
+    for (index, case) in boxed_export_cases()
+        .into_iter()
+        .chain(recursive_export_cases())
+        .enumerate()
+    {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

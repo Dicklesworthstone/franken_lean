@@ -2304,6 +2304,13 @@ fn source_data_default(
             layout.carrier().clone(),
         )));
     }
+    // A nullary first constructor above is a valid inhabitant even for a
+    // recursive family. A recursive field cannot otherwise be replaced with a
+    // Nat/String dummy merely because it has the same object carrier; some
+    // recursive families have no finite inhabitant at all.
+    if layout.is_recursive() {
+        return Err(unsupported("unused recursive source parameter"));
+    }
     let mut fields = Vec::new();
     fields
         .try_reserve_exact(first_fields.len())
@@ -2820,9 +2827,10 @@ pub fn compile_definition(
 /// Export a checked definition under its source name and source argument count.
 /// Runtime types are closed arrows over Nat/String/Bool and checked closed data
 /// (including higher-order arguments), using the pin's object/scalar parameters.
-/// Data has 1..=244 constructors with only Nat/String/Bool fields and no parameters,
-/// indices or recursion. Single-field wrappers and conflicting
-/// public shapes at one ordinal remain unsupported. Source type/proof slots are
+/// Data has 1..=244 constructors with Nat/String/Bool or direct self fields and
+/// no parameters or indices. Nested and mutual recursion, nonrecursive
+/// single-field wrappers and conflicting public shapes at one ordinal remain
+/// unsupported. Source type/proof slots are
 /// classified in their original telescope and retained as erased parameters.
 /// A runtime carrier depending on a source type parameter remains unsupported.
 /// Source arrows require an explicit lambda telescope. Multiple arguments allow

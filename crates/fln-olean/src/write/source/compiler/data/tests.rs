@@ -60,6 +60,14 @@ inductive WriterProof where | mk (p : True) (n : Nat)
 inductive WriterParam (α : Type) where | mk (value : α)
 inductive WriterIndexed : Nat → Type where | zero : WriterIndexed 0
 inductive WriterRecursive where | stop | next (tail : WriterRecursive)
+inductive WriterRecursiveHeap where
+  | leaf (n : Nat) (s : String)
+  | node (left : WriterRecursiveHeap) (flag : Bool) (right : WriterRecursiveHeap)
+inductive WriterRecursiveFirst where
+  | next (tail : WriterRecursiveFirst) (flag : Bool) (n : Nat)
+  | stop
+inductive WriterRecursiveOnly where | next (tail : WriterRecursiveOnly)
+inductive WriterHigherRecursive where | node (children : Nat → WriterHigherRecursive)
 inductive WriterProp : Prop where | intro
 "#;
 
@@ -93,7 +101,7 @@ fn fixture() -> Option<(PathBuf, PathBuf, Vec<u8>)> {
     std::fs::write(directory.join("WriterData.lean"), SOURCE).unwrap();
     let output = Command::new(&lean)
         .current_dir(&directory)
-        .args(["-o", "WriterData.olean", "WriterData.lean"])
+        .args(["-j", "1", "-o", "WriterData.olean", "WriterData.lean"])
         .output()
         .unwrap();
     assert!(
@@ -122,6 +130,229 @@ fn projection(constants: &[ConstantInfo]) -> Vec<CompilerData> {
             .unwrap()
         })
         .collect()
+}
+
+fn closed_family(
+    family: &str,
+    recursive: bool,
+    fields: Vec<Vec<Expr>>,
+) -> (InductiveVal, Vec<ConstantInfo>) {
+    use fln_env::constants::{ConstantVal, ConstructorVal};
+
+    let family = name(family);
+    let constructors: Vec<_> = fields
+        .into_iter()
+        .enumerate()
+        .map(|(index, fields)| {
+            let num_fields = fields.len() as u32;
+            let ty = fields.into_iter().enumerate().rev().fold(
+                Expr::const_(family.clone(), Vec::new()),
+                |body, (field, ty)| {
+                    Expr::forall_e(
+                        Name::num(Name::anonymous(), field as u64),
+                        ty,
+                        body,
+                        BinderInfo::Default,
+                    )
+                },
+            );
+            ConstantInfo::Ctor(ConstructorVal {
+                base: ConstantVal {
+                    name: Name::str(family.clone(), format!("ctor{index}")),
+                    level_params: Vec::new(),
+                    type_: ty,
+                },
+                induct: family.clone(),
+                cidx: index as u32,
+                num_params: 0,
+                num_fields,
+                is_unsafe: false,
+            })
+        })
+        .collect();
+    let inductive = InductiveVal {
+        base: ConstantVal {
+            name: family.clone(),
+            level_params: Vec::new(),
+            type_: Expr::sort(Level::one()),
+        },
+        num_params: 0,
+        num_indices: 0,
+        all: vec![family],
+        ctors: constructors
+            .iter()
+            .map(|ctor| ctor.name().clone())
+            .collect(),
+        num_nested: 0,
+        is_rec: recursive,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    (inductive, constructors)
+}
+
+fn project_closed(inductive: &InductiveVal, constructors: &[ConstantInfo]) -> Option<CompilerData> {
+    CompilerData::from_inductive(
+        inductive,
+        |name| {
+            constructors
+                .iter()
+                .find(|constructor| constructor.name() == name)
+        },
+        |_| Ok::<_, ()>(()),
+    )
+    .unwrap()
+}
+
+#[test]
+fn recursive_data_uses_the_complete_family_carrier_in_every_self_field() {
+    let constant = |value| Expr::const_(name(value), Vec::new());
+    for (family, fields, carrier, expected) in [
+        (
+            "WriterList",
+            vec![
+                vec![],
+                vec![
+                    constant("Nat"),
+                    constant("WriterList"),
+                    constant("Bool"),
+                    constant("String"),
+                ],
+            ],
+            IrType::TObject,
+            vec![
+                vec![],
+                vec![
+                    IrType::TObject,
+                    IrType::TObject,
+                    IrType::UInt8,
+                    IrType::Object,
+                ],
+            ],
+        ),
+        (
+            "WriterTree",
+            vec![
+                vec![constant("Nat"), constant("Bool")],
+                vec![
+                    constant("WriterTree"),
+                    constant("Bool"),
+                    constant("WriterTree"),
+                ],
+            ],
+            IrType::Object,
+            vec![
+                vec![IrType::TObject, IrType::UInt8],
+                vec![IrType::Object, IrType::UInt8, IrType::Object],
+            ],
+        ),
+        (
+            "WriterLateStop",
+            vec![vec![constant("WriterLateStop"), constant("Bool")], vec![]],
+            IrType::TObject,
+            vec![vec![IrType::TObject, IrType::UInt8], vec![]],
+        ),
+        (
+            "WriterOnlySelf",
+            vec![vec![constant("WriterOnlySelf")]],
+            IrType::Object,
+            vec![vec![IrType::Object]],
+        ),
+    ] {
+        let (inductive, constructors) = closed_family(family, true, fields);
+        let projected = project_closed(&inductive, &constructors).unwrap();
+        assert!(projected.is_recursive(), "{family}");
+        assert_eq!(projected.carrier(), &carrier, "{family}");
+        assert_eq!(
+            projected
+                .constructors()
+                .map(|(_, fields)| fields.to_vec())
+                .collect::<Vec<_>>(),
+            expected,
+            "{family}",
+        );
+        // This also walks and encodes the recursive mono types: the projection
+        // must not need a recursive object graph or an already compiled cache.
+        encode(
+            &SourceMetadata {
+                compiler_data: vec![projected],
+                ..SourceMetadata::default()
+            },
+            WriteBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            CompilerData::from_inductive(
+                &inductive,
+                |name| constructors.iter().find(|ctor| ctor.name() == name),
+                |_| Err("work limit"),
+            )
+            .unwrap_err(),
+            "work limit",
+        );
+    }
+}
+
+#[test]
+fn recursive_projection_rejects_special_and_nonuniform_representations() {
+    let constant = |value| Expr::const_(name(value), Vec::new());
+    for family in ["Nat", "Int", "Lean.Name"] {
+        let (inductive, constructors) = closed_family(
+            family,
+            true,
+            vec![
+                vec![],
+                vec![constant(family), constant("Nat"), constant("String")],
+            ],
+        );
+        assert!(
+            project_closed(&inductive, &constructors).is_none(),
+            "{family}"
+        );
+    }
+    for (recursive, fields) in [
+        (false, vec![vec![], vec![constant("WriterInvalid")]]),
+        (true, vec![vec![], vec![constant("Nat")]]),
+        (
+            true,
+            vec![vec![Expr::forall_e(
+                name("n"),
+                constant("Nat"),
+                constant("WriterInvalid"),
+                BinderInfo::Default,
+            )]],
+        ),
+        (true, vec![vec![constant("UnrelatedFamily")]]),
+    ] {
+        let (inductive, constructors) = closed_family("WriterInvalid", recursive, fields);
+        assert!(project_closed(&inductive, &constructors).is_none());
+    }
+    // Recursion does not bypass any of the established closed-family bounds.
+    let (inductive, constructors) = closed_family(
+        "WriterBounded",
+        true,
+        vec![vec![], vec![constant("WriterBounded")]],
+    );
+    for unsupported in [
+        InductiveVal {
+            num_indices: 1,
+            ..inductive.clone()
+        },
+        InductiveVal {
+            num_params: 1,
+            ..inductive.clone()
+        },
+        InductiveVal {
+            num_nested: 1,
+            ..inductive.clone()
+        },
+        InductiveVal {
+            all: vec![name("WriterBounded"), name("Other")],
+            ..inductive.clone()
+        },
+    ] {
+        assert!(project_closed(&unsupported, &constructors).is_none());
+    }
 }
 
 #[test]
@@ -374,14 +605,16 @@ import WriterData
 open Lean Elab Command Compiler LCNF
 run_cmd liftCoreM do
   for n in [``WriterEnum, ``WriterSingleton, ``WriterMixed, ``WriterRecord, ``WriterHeap, ``WriterBinders,
-      ``WriterScalar, ``WriterInterleaved, ``WriterAllBools, ``WriterScalarSum, ``WriterScalarHeap] do
+      ``WriterScalar, ``WriterInterleaved, ``WriterAllBools, ``WriterScalarSum, ``WriterScalarHeap,
+      ``WriterRecursive, ``WriterRecursiveHeap, ``WriterRecursiveFirst, ``WriterRecursiveOnly] do
     unless (← hasTrivialStructure? n).isNone do throwError "wrong mono trivial cache"
     unless (← hasTrivialImpureStructure? n).isNone do throwError "wrong impure trivial cache"
     unless (← getOtherDeclMonoType n) == mkConst `lcErased do throwError "wrong mono type"
     let ty ← nameToImpureType n
     let expected := if n == ``WriterEnum then `UInt8
       else if n == ``WriterSingleton then `tagged
-      else if n == ``WriterMixed || n == ``WriterBinders || n == ``WriterScalarSum then `tobj else `obj
+      else if n == ``WriterMixed || n == ``WriterBinders || n == ``WriterScalarSum ||
+          n == ``WriterRecursive || n == ``WriterRecursiveFirst then `tobj else `obj
     unless ty == mkConst expected do throwError "wrong impure carrier"
     let .inductInfo iv ← getConstInfo n | throwError "missing type"
     for c in iv.ctors do
@@ -410,7 +643,7 @@ run_cmd liftCoreM do
         Command::new(lean)
             .current_dir(directory)
             .env("LEAN_PATH", directory)
-            .arg("Reader.lean")
+            .args(["-j", "1", "Reader.lean"])
             .output()
             .unwrap()
     };
@@ -496,6 +729,10 @@ fn compiler_data_maps_match_the_actual_pin_and_refuse_unsupported_layouts() {
         "WriterAllBools",
         "WriterScalarSum",
         "WriterScalarHeap",
+        "WriterRecursive",
+        "WriterRecursiveHeap",
+        "WriterRecursiveFirst",
+        "WriterRecursiveOnly",
     ]
     .into_iter()
     .map(name)
