@@ -73,6 +73,29 @@ fn overlapping_wildcards_follow_source_priority() {
     );
 }
 #[test]
+fn the_first_refutable_pattern_controls_open_term_reduction() {
+    let equations = "def choose : Bool → Bool → Bool
+      | _, true => true
+      | false, false => true
+      | true, false => false";
+    check(&format!(
+        "{equations}
+        theorem openColumn (a : Bool) : choose a true = true := by rfl
+        theorem tt : choose false false = true := by rfl
+        theorem ff : choose true false = false := by rfl"
+    ));
+    // The left-to-right setting really scrutinizes the unknown first
+    // argument, so the same equation is no longer definitional.
+    let column_major = format!("set_option backward.match.rowMajor false in\n{equations}");
+    check(&format!(
+        "{column_major}\ntheorem closedColumn : choose false true = true := by rfl"
+    ));
+    reject(&format!(
+        "{column_major}\ntheorem openColumn (a : Bool) : choose a true = true := by rfl"
+    ));
+}
+
+#[test]
 fn variable_columns_bind_values_without_erasing_discriminants() {
     check(
         "def copy (n : Nat) (b : Bool) : Nat := match n, b with

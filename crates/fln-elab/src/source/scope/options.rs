@@ -146,6 +146,12 @@ pub const ROWS: &[Row] = &[
         Honored,
     ),
     row(
+        "backward.match.rowMajor",
+        Bool(true),
+        "Lean/Meta/Match/Match.lean:74",
+        Honored,
+    ),
+    row(
         "bootstrap.genMatcherCode",
         Bool(true),
         "Lean/Meta/Match/Match.lean:1069",

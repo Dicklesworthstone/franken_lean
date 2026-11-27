@@ -1073,6 +1073,41 @@ impl Context {
         self.compile_pattern_matrix_recording(syntax, required, recursive_column, None)
     }
 
+    // Lean.Meta.Match.firstRefutablePattern picks a column from the first
+    // surviving row. Moving the entire column keeps row priority and all
+    // other columns' relative order. This matters even for nondependent
+    // matches: splitting an unknown variable can block definitional reduction.
+    fn select_row_major_column(
+        &mut self,
+        matrix: &mut Matrix<'_>,
+        arena: &[Pattern<'_>],
+    ) -> Result<(), NatDefinitionElabError> {
+        for (index, &root) in matrix.rows[0].patterns.iter().enumerate() {
+            self.tick()?;
+            let mut pattern = root;
+            while let Pattern::Named { pattern: inner, .. } = &arena[pattern] {
+                self.tick()?;
+                pattern = *inner;
+            }
+            if matches!(&arena[pattern], Pattern::Bind(_)) {
+                continue;
+            }
+            if index != 0 {
+                matrix.subjects[..=index].rotate_right(1);
+                for row in &mut matrix.rows {
+                    self.tick()?;
+                    row.patterns[..=index].rotate_right(1);
+                }
+            }
+            return Ok(());
+        }
+        // No refutable pattern is left in the winning row. Remaining rows
+        // cannot win this branch; their independent source witnesses remain
+        // required by matrixScope across the whole decision tree.
+        matrix.rows.truncate(1);
+        Ok(())
+    }
+
     fn compile_pattern_matrix_recording(
         &mut self,
         syntax: &Syntax,
@@ -1285,6 +1320,10 @@ impl Context {
                 row.patterns.swap(0, root_column);
             }
         }
+        let row_major = self.txn.options.get_bool(
+            &Name::from_components(["backward", "match", "rowMajor"]),
+            true,
+        );
         enum Task<'a> {
             Build(Matrix<'a>),
             Finish(Name, Vec<Alternative>, usize, bool),
@@ -1416,6 +1455,9 @@ impl Context {
                         }
                         built.push(body);
                         continue;
+                    }
+                    if row_major && !matrix.recursive_root {
+                        self.select_row_major_column(&mut matrix, &arena)?;
                     }
                     let subject = matrix.subjects.remove(0);
                     self.bind_named_matrix_column(&mut matrix, &subject, &arena)?;
