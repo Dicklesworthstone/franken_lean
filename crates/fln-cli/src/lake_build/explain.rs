@@ -90,20 +90,26 @@ struct Report {
 fn target_name<'a>(
     sources: &'a local_dependencies::Sources,
     text: &str,
-) -> std::result::Result<(Name, Option<&'a local_dependencies::Package>), Failure> {
+) -> std::result::Result<
+    (
+        Name,
+        Option<&'a local_dependencies::Package>,
+        Option<ModuleFacet>,
+    ),
+    Failure,
+> {
     if let Some(path) = text.strip_suffix(".lean") {
         return name(&path.trim_start_matches("./").replace(['/', '\\'], "."))
-            .map(|module| (module, None));
+            .map(|module| (module, None, None));
     }
-    let bare = text
-        .strip_suffix(":olean")
-        .or_else(|| text.strip_suffix(":ir"))
-        .or_else(|| text.strip_suffix(":ilean"))
-        .unwrap_or(text);
-    if bare.contains('/') || bare.starts_with('@') {
-        module_target(sources, bare).map(|(module, owner)| (module, Some(owner)))
+    let (bare, facet) = text
+        .rsplit_once(':')
+        .and_then(|(target, facet)| ModuleFacet::parse(facet).map(|facet| (target, Some(facet))))
+        .unwrap_or((text, None));
+    if bare.contains('/') || bare.starts_with('@') || bare.ends_with(".lean") {
+        module_target(sources, bare).map(|(module, owner)| (module, Some(owner), facet))
     } else {
-        name(bare.strip_prefix('+').unwrap_or(bare)).map(|module| (module, None))
+        name(bare.strip_prefix('+').unwrap_or(bare)).map(|module| (module, None, facet))
     }
 }
 
@@ -183,9 +189,10 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
         .collect();
     let recorded_plan = plan_modules(&sources, &recorded.targets)?;
     let resolve = |module: &Name| sources.resolve_build_package(module, &recorded_plan.owners);
+    let mut selected_facet = None;
     let entries = match target {
         Some(text) => {
-            let (module, requested_owner) = target_name(&sources, text)?;
+            let (module, requested_owner, facet) = target_name(&sources, text)?;
             let display = module.to_display_string();
             if !recorded.modules.iter().any(|row| row.name == display) {
                 return Err(Failure::input(format!(
@@ -194,6 +201,7 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
                 ))
                 .into());
             }
+            selected_facet = facet.map(|facet| (module.clone(), facet));
             let Some((owner, _)) = resolve(&module)? else {
                 return Err(Refusal::Unavailable(format!(
                     "recorded module `{display}` no longer belongs to a selected local package"
@@ -455,6 +463,41 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
             }
         }
         if let Some(row) = row {
+            if let Some((selected, facet)) = &selected_facet
+                && selected == &module
+            {
+                let produced = match facet {
+                    ModuleFacet::Olean => true,
+                    ModuleFacet::OleanServer | ModuleFacet::OleanPrivate => {
+                        row.companions.is_some()
+                    }
+                    ModuleFacet::Ir => row.ir_digest.is_some(),
+                    ModuleFacet::Ilean => row.ilean_digest.is_some(),
+                };
+                if !produced {
+                    // Every checked module-system file yields both split oleans.
+                    // Only an unchanged source establishes the recorded legacy
+                    // form still applies. An edit requires a fresh build.
+                    if matches!(facet, ModuleFacet::OleanServer | ModuleFacet::OleanPrivate)
+                        && now
+                            .digest
+                            .as_ref()
+                            .is_ok_and(|digest| digest == &row.source_digest)
+                    {
+                        return Err(Refusal::Unavailable(format!(
+                            "the recorded source for module `{display}` has no {} output; this facet requires the module system",
+                            facet.extension()
+                        )));
+                    }
+                    if rebuild.is_empty() {
+                        output_only = true;
+                    }
+                    rebuild.push(format!(
+                        "{} facet was not part of the recorded build",
+                        facet.extension()
+                    ));
+                }
+            }
             let destination = relative(&now.artifact);
             if row.artifact != destination {
                 if rebuild.is_empty() {

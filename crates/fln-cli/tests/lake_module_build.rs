@@ -1055,6 +1055,131 @@ fn switching_facets_rebuilds_installed_companions_across_source_edits() {
 }
 
 #[test]
+fn split_olean_selectors_build_and_query_the_checked_family() {
+    let package = module_library();
+    let report = success(&package.build(&["+Lib.Top:olean.private"]));
+    assert!(report.contains("\"facet\":\"olean.private\""), "{report}");
+    let targets = [
+        "+Lib.Base:olean.server",
+        "@/+Lib.Top:olean.private",
+        "+Lib.Base:olean.server",
+    ];
+    let query = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .arg("--dir")
+        .arg(&package.0)
+        .arg("query")
+        .args(targets)
+        .env("LEAN_PATH", package.0.join("no-imports"))
+        .env("FLN_IMPORT_REUSE_DIR", package.0.join(".records"))
+        .output()
+        .unwrap();
+    let server = package
+        .artifact("Lib.Base")
+        .with_extension("olean.server")
+        .canonicalize()
+        .unwrap();
+    let private = package
+        .artifact("Lib.Top")
+        .with_extension("olean.private")
+        .canonicalize()
+        .unwrap();
+    assert_eq!(
+        success(&query).lines().map(Path::new).collect::<Vec<_>>(),
+        [server.as_path(), private.as_path(), server.as_path()]
+    );
+    let explain = || {
+        success(
+            &Command::new(env!("CARGO_BIN_EXE_fln"))
+                .args(["build", "explain", "--json", "--dir"])
+                .arg(&package.0)
+                .arg("+Lib.Top:olean.private")
+                .env("LEAN_PATH", package.0.join("no-imports"))
+                .output()
+                .unwrap(),
+        )
+    };
+    let report = explain();
+    assert!(
+        report.contains("\"reference_decision\":\"up-to-date\""),
+        "{report}"
+    );
+    std::fs::remove_file(&private).unwrap();
+    let report = explain();
+    assert!(
+        report.contains("\"reference_decision\":\"rebuild\""),
+        "{report}"
+    );
+    assert!(report.contains("Top.olean.private"), "{report}");
+}
+
+#[test]
+fn split_facets_on_legacy_sources_never_return_stale_outputs_or_publish_other_targets() {
+    let package = library();
+    package.write("Lib/Other.lean", MODULE_BASE);
+    for (command, suffix) in [("build", "olean.server"), ("query", "olean.private")] {
+        let stale = package.artifact("Lib.Top").with_extension(suffix);
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"stale").unwrap();
+        let error = file_target_command(
+            &package,
+            &package.0,
+            command,
+            &["+Lib.Other:olean", &format!("+Lib.Top:{suffix}")],
+        );
+        let error = failure(&error);
+        assert!(error.contains("has no") && error.contains(suffix), "{error}");
+        assert_eq!(std::fs::read(stale).unwrap(), b"stale");
+        assert!(!package.artifact("Lib.Other").exists());
+        assert!(!package.artifact("Lib.Top").exists());
+        assert!(!package.0.join(".lake/build/fln-build.snapshot").exists());
+    }
+}
+
+#[test]
+fn explain_distinguishes_unbuilt_facets_from_an_unchanged_legacy_module() {
+    let explain = |package: &Package, suffix| {
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["build", "explain", "--json", "--dir"])
+            .arg(&package.0)
+            .arg(format!("+Lib.Top:{suffix}"))
+            .env("LEAN_PATH", package.0.join("no-imports"))
+            .output()
+            .unwrap()
+    };
+    let package = library();
+    success(&package.build(&["+Lib.Top:olean"]));
+    for suffix in ["olean.server", "olean.private"] {
+        std::fs::write(package.artifact("Lib.Top").with_extension(suffix), b"stale").unwrap();
+        let output = explain(&package, suffix);
+        assert_eq!(output.status.code(), Some(5), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains(&format!("has no {suffix} output")), "{error}");
+    }
+    package.write("Lib/Top.lean", MODULE_BASE);
+    let report = success(&explain(&package, "olean.private"));
+    assert!(
+        report.contains("\"reference_decision\":\"rebuild\""),
+        "{report}"
+    );
+
+    let package = module_library();
+    success(&package.build(&["+Lib.Top:olean"]));
+    for suffix in ["ir", "ilean"] {
+        std::fs::write(package.artifact("Lib.Top").with_extension(suffix), b"stale").unwrap();
+        let report = success(&explain(&package, suffix));
+        assert!(
+            report.contains("\"reference_decision\":\"rebuild\""),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("{suffix} facet was not part")),
+            "{report}"
+        );
+    }
+}
+
+#[test]
 fn source_file_targets_keep_dependency_package_output_ownership() {
     let package = Package::new(concat!(
         "name = \"root\"\nsrcDir = \"src\"\nbuildDir = \"root-out\"\n",
