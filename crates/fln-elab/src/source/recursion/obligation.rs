@@ -5,12 +5,25 @@
 //! both checkers validate it and runtime proof erasure removes the obligation.
 use super::*;
 
+/// Original header identities and lexical scope, saved before elaborating the
+/// source body. Nested matches/functions cannot change the certificate's self.
+pub(in crate::source) struct OriginalBody {
+    recursion: Recursion,
+    locals: LocalContext,
+}
+
 impl Context {
     pub(super) fn original_recursive_body_obligation(
         &mut self,
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        let original = self.start_recursive_body_obligation();
+        let term = self.term(syntax, expected)?;
+        self.finish_recursive_body_obligation(original, term)
+    }
+
+    pub(in crate::source) fn start_recursive_body_obligation(&mut self) -> OriginalBody {
         let recursion = self
             .recursion
             .clone()
@@ -23,7 +36,17 @@ impl Context {
             .as_mut()
             .expect("prepared structural candidate")
             .pending = false;
-        let original = self.term(syntax, expected)?;
+        OriginalBody { recursion, locals }
+    }
+
+    /// Close an already elaborated original body over its abstract self. Local
+    /// course candidates perform that pass on the shared source task stack.
+    pub(in crate::source) fn finish_recursive_body_obligation(
+        &mut self,
+        saved: OriginalBody,
+        original: Typed,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let OriginalBody { recursion, locals } = saved;
         self.resolve_instances_with_defaults()?;
         self.flush(true)?;
         let value = self

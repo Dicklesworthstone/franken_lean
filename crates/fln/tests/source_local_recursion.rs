@@ -593,3 +593,103 @@ fn enclosing_recursive_calls_still_require_structural_descent_inside_helpers() {
         "def recovery (n : Nat) : Nat := match n with | .zero => 0 | .succ k => let rec inside (m : Nat) : Nat := match m with | .zero => recovery k | .succ j => inside j + 1; inside 2\ntheorem computes : recovery 3 = 6 := by rfl",
     );
 }
+
+// The decreasing match is scoped under a dependent conditional's proof lambda,
+// as in Init.Prelude's Array.appendCore/Array.extract. The proof is consumed by
+// a checked dependent call rather than merely discarded by the fixture. The
+// bounded seed has checked equality decisions, but not Prelude's Nat order.
+// Stop at equality here; the full Prelude probe retains its original LT goal.
+const LOCAL_COURSE_COUNT: &str = r#"
+def boundedAdvance (limit index : Nat) (_ : Not (index = limit)) : Nat := Nat.succ index
+def countUntil (limit fuel : Nat) : Nat :=
+  let rec loop (i j : Nat) : Nat :=
+    dite (Not (j = limit))
+      (fun hlt =>
+        match i with
+        | 0 => j
+        | Nat.succ k => loop k (boundedAdvance limit j hlt))
+      (fun _ => j)
+  loop fuel 0
+"#;
+
+#[test]
+fn local_course_recursion_under_dependent_branches_keeps_proofs_and_execution() {
+    execute(
+        &format!(
+            "{LOCAL_COURSE_COUNT}\ntheorem stopAtLimit : countUntil 2 3 = 2 := rfl\ntheorem stopAtFuel : countUntil 3 2 = 2 := rfl\n#eval countUntil 2 3"
+        ),
+        "2",
+    );
+}
+
+#[test]
+fn local_course_recursion_generalizes_an_earlier_changing_accumulator() {
+    execute(
+        &format!(
+            r#"{LOCAL_COURSE_COUNT}
+def countFrom (limit start fuel : Nat) : Nat :=
+  let rec loop (j i : Nat) : Nat :=
+    dite (Not (j = limit))
+      (fun hlt =>
+        match i with
+        | 0 => j
+        | Nat.succ k => loop (boundedAdvance limit j hlt) k)
+      (fun _ => j)
+  loop start fuel
+theorem counted : countFrom 3 1 4 = 3 := rfl
+#eval countFrom 3 1 4
+"#
+        ),
+        "3",
+    );
+}
+
+#[test]
+fn local_course_candidates_reject_nondecreasing_calls_and_invalid_proofs() {
+    let base = checked(&engine(), LOCAL_COURSE_COUNT);
+    let before = base.logical_root(&KVMap::new());
+    for (source, recursive) in [
+        (
+            "def bad (limit fuel : Nat) : Nat := let rec loop (i j : Nat) : Nat := dite (Not (j = limit)) (fun _ => match i with | 0 => j | Nat.succ k => loop i j) (fun _ => j); loop fuel 0",
+            true,
+        ),
+        (
+            "def bad (limit fuel : Nat) : Nat := let rec loop (i j : Nat) : Nat := dite (Not (j = limit)) (fun _ => match i with | 0 => j | Nat.succ k => let unused := loop i j; loop k (Nat.succ j)) (fun _ => j); loop fuel 0",
+            true,
+        ),
+        (
+            "def bad (limit fuel : Nat) : Nat := let rec loop (i j : Nat) : Nat := dite (Not (j = limit)) (fun _ => match i with | 0 => let wrong : 0 = 1 := (by rfl); j | Nat.succ k => loop k (Nat.succ j)) (fun _ => j); loop fuel 0",
+            false,
+        ),
+        ("theorem bad : countUntil 2 3 = 3 := by rfl", false),
+    ] {
+        let problem = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err(source);
+        assert_eq!(
+            problem.disposition(),
+            ("elaboration", false, 1),
+            "{source}: {problem:?}"
+        );
+        let diagnostic = format!("{problem:?}");
+        if recursive {
+            assert!(
+                diagnostic.contains("Recursion(NotDecreasing)"),
+                "{source}: {diagnostic}"
+            );
+        } else {
+            assert!(
+                diagnostic.contains("TypeMismatch")
+                    || diagnostic.contains("ConversionRefused")
+                    || diagnostic.contains("Tactic(ApplyMismatch)"),
+                "{source}: {diagnostic}"
+            );
+        }
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+        assert!(!base.environment().contains(&Name::from_components(["bad"])));
+    }
+}

@@ -19,7 +19,9 @@ mod mutual_structural;
 mod obligation;
 mod well_founded;
 pub(super) use constrained::ConstrainedBranch;
+pub(super) use course::Build as CourseBuild;
 pub(in crate::source) use mutual_structural::{StructuralMember, StructuralPlan};
+pub(super) use obligation::OriginalBody;
 use std::collections::{HashMap, HashSet};
 pub(super) use well_founded::Executable as WellFoundedExecutable;
 pub(super) use well_founded::State as WellFounded;
@@ -1875,6 +1877,29 @@ impl Context {
             .iter()
             .rposition(|local| &local.user_name == val)
             .ok_or_else(|| error(RecursionError::RootMatchRequired))?;
+        self.prepare_recursion_parameter(name, parameters, expected, decreasing)?;
+        let recursion = self
+            .recursion
+            .as_mut()
+            .expect("prepared structural parameter");
+        recursion.column = column;
+        recursion.matched_parameters = matched.iter().copied().collect();
+        Ok(())
+    }
+
+    /// Prepare a real telescope parameter without inventing a source match.
+    /// Primitive candidates add their matrix column; course candidates use the
+    /// same typed self and parameter identities with no pending root split.
+    pub(super) fn prepare_recursion_parameter(
+        &mut self,
+        name: &Name,
+        parameters: &[LocalDecl],
+        expected: &Expr,
+        decreasing: usize,
+    ) -> Result<(), NatDefinitionElabError> {
+        if decreasing >= parameters.len() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
         let reference = self.reference_result(expected);
         let mut full_type = self.instantiate(&reference)?;
         for local in parameters.iter().rev() {
@@ -1905,8 +1930,8 @@ impl Context {
             marker,
             parameters: parameters.to_vec(),
             decreasing,
-            column,
-            matched_parameters: matched.iter().copied().collect(),
+            column: 0,
+            matched_parameters: HashSet::new(),
             generalized_parameters: HashSet::new(),
             pending: true,
             matrix: false,

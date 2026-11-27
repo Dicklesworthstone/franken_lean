@@ -51,6 +51,8 @@ pub(super) struct Build<'a> {
     outer_recursion: Option<recursion::Recursion>,
     marker: Option<FVarId>,
     generalized_parameters: HashSet<usize>,
+    /// A whole-body below/brecOn candidate, with no selected source match.
+    pub course_parameter: Option<usize>,
     /// A recursive local whose result type is omitted (`let rec go (i : Nat) := …`).
     pub omitted: Option<recursion::OmittedResult>,
 }
@@ -62,11 +64,27 @@ pub(super) struct Build<'a> {
 pub(super) struct Checkpoint<'a> {
     context: Box<Context>,
     build: Build<'a>,
-    candidates: Vec<Option<(usize, usize)>>,
+    candidates: Vec<Candidate>,
     next: usize,
     generalized_parameters: HashSet<usize>,
     pub tasks: usize,
     pub values: usize,
+}
+
+#[derive(Clone, Copy)]
+enum Candidate {
+    Nonrecursive,
+    Primitive { column: usize, decreasing: usize },
+    Course { decreasing: usize },
+}
+
+impl Candidate {
+    fn decreasing(self) -> Option<usize> {
+        match self {
+            Self::Nonrecursive => None,
+            Self::Primitive { decreasing, .. } | Self::Course { decreasing } => Some(decreasing),
+        }
+    }
 }
 
 fn prepared<'a>(
@@ -103,14 +121,36 @@ impl<'a> Checkpoint<'a> {
         values: usize,
     ) -> Result<Self, NatDefinitionElabError> {
         context.open_local_recursive_lambdas(&mut build)?;
-        let mut candidates = vec![None];
+        let mut candidates = vec![Candidate::Nonrecursive];
         let body = original(context, build.value_syntax)?;
         match context.recursion_columns(&build.parameters, body) {
-            Ok(columns) => candidates.extend(columns.into_iter().map(Some)),
+            Ok(columns) => candidates.extend(
+                columns
+                    .into_iter()
+                    .map(|(column, decreasing)| Candidate::Primitive { column, decreasing }),
+            ),
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
                 recursion::RecursionError::RootMatchRequired,
             ))) => {}
             Err(problem) => return Err(problem),
+        }
+        // A local body may match its decreasing argument inside an application
+        // or lambda. The checked below dictionary lowers that entire body, so
+        // these candidates need an actual inductive parameter, not a root match.
+        for (decreasing, parameter) in build.parameters.iter().enumerate() {
+            context.tick()?;
+            let type_ = context.whnf(&parameter.type_)?;
+            let (head, _) = context.course_spine(&type_)?;
+            let ExprNode::Const { name, .. } = head.node() else {
+                continue;
+            };
+            let single_family = matches!(
+                context.txn.env.find(name),
+                Some(fln_env::constants::ConstantInfo::Induct(family)) if family.all.len() == 1
+            );
+            if single_family && context.is_auxiliary_recursor(&Name::str(name.clone(), "brecOn"))? {
+                candidates.push(Candidate::Course { decreasing });
+            }
         }
         Ok(Self {
             context: Box::new(context.clone()),
@@ -128,7 +168,15 @@ impl<'a> Checkpoint<'a> {
         let mut build = self.build.clone();
         build.checkpoint = Some(index);
         build.generalized_parameters = self.generalized_parameters.clone();
-        (build, candidate.map(|(column, _)| column))
+        let column = match candidate {
+            Candidate::Nonrecursive => None,
+            Candidate::Primitive { column, .. } => Some(column),
+            Candidate::Course { decreasing } => {
+                build.course_parameter = Some(decreasing);
+                None
+            }
+        };
+        (build, column)
     }
     pub fn restore(&self, context: &mut Context) {
         let spent = context.txn.budget.heartbeats_consumed;
@@ -140,12 +188,13 @@ impl<'a> Checkpoint<'a> {
             recursion::RecursionError::GeneralizeParameter { owner, position },
         )) = problem
         {
-            if let Some(Some((_, decreasing))) = self
+            if let Some(decreasing) = self
                 .next
                 .checked_sub(1)
                 .and_then(|index| self.candidates.get(index))
-                && owner == &self.build.parameters[*decreasing].id
-                && position < decreasing
+                .and_then(|candidate| candidate.decreasing())
+                && owner == &self.build.parameters[decreasing].id
+                && *position < decreasing
                 && self.generalized_parameters.insert(*position)
             {
                 // Rebuild the same candidate with a strictly larger mask.
@@ -340,6 +389,7 @@ impl Context {
             outer_recursion: None,
             marker: None,
             generalized_parameters: HashSet::new(),
+            course_parameter: None,
             omitted,
         })
     }
@@ -430,7 +480,31 @@ impl Context {
             self.tick()?;
             body = inner;
         }
-        let marker = if let Some(column) = column {
+        let marker = if let Some(decreasing) = build.course_parameter {
+            if let Some(hint) = &build.binding.termination
+                && self.structural_hint_parameter(
+                    hint,
+                    &build.parameters,
+                    build.header_parameters,
+                )? != decreasing
+            {
+                return Err(failure(SourceInferenceError::Recursion(
+                    recursion::RecursionError::NotDecreasing,
+                )));
+            }
+            self.prepare_recursion_parameter(
+                &build.binding.name,
+                &build.parameters,
+                expected,
+                decreasing,
+            )?;
+            let recursion = self.recursion.as_mut().expect("local course candidate");
+            recursion.generalized_parameters = build.generalized_parameters.clone();
+            // First check the original body with only its abstract self. The
+            // driver's next phase installs the checked induction dictionary.
+            recursion.pending = false;
+            recursion.reference.clone()
+        } else if let Some(column) = column {
             let columns = self.recursion_columns(&build.parameters, body)?;
             if let Some(hint) = &build.binding.termination {
                 let parameter = self.structural_hint_parameter(
@@ -647,6 +721,7 @@ mod tests {
             outer_recursion: None,
             marker: None,
             generalized_parameters: HashSet::new(),
+            course_parameter: None,
             omitted: None,
         };
         let checkpoint = Checkpoint::new(&mut context, build, 3, 7).unwrap();

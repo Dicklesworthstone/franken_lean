@@ -2724,6 +2724,12 @@ impl Context {
             LocalFunctionAnnotation(Box<local_functions::Build<'a>>),
             LocalFunctionStart(Box<local_functions::Build<'a>>, Option<usize>),
             LocalFunctionValue(Box<local_functions::Build<'a>>, usize),
+            LocalCourseOriginal(
+                Box<local_functions::Build<'a>>,
+                Box<recursion::OriginalBody>,
+                usize,
+            ),
+            LocalCourseValue(Box<recursion::CourseBuild>, Typed, usize),
             LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>, LetKind),
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>, LetKind),
             LetBody(LocalContext, FVarId, Name, Typed, LetKind),
@@ -2853,6 +2859,8 @@ impl Context {
                                         | Task::MatrixAbstraction(..)
                                         | Task::PrivateDecl(..)
                                         | Task::LocalFunctionValue(..)
+                                        | Task::LocalCourseOriginal(..)
+                                        | Task::LocalCourseValue(..)
                                         | Task::MatchBranch(..)
                                         | Task::DoBindJoinBody(..)
                                         | Task::DoBindJoinValue(..)
@@ -2937,6 +2945,8 @@ impl Context {
                                     | Task::MatrixAbstraction(..)
                                     | Task::PrivateDecl(..)
                                     | Task::LocalFunctionValue(..)
+                                    | Task::LocalCourseOriginal(..)
+                                    | Task::LocalCourseValue(..)
                                     | Task::MatchBranch(..)
                                     | Task::DoBindJoinBody(..)
                                     | Task::DoBindJoinValue(..)
@@ -5669,11 +5679,40 @@ impl Context {
                                 self.start_local_function_value(&mut build, column)?;
                                 let value = build.value_syntax;
                                 let expected = build.result_type.clone();
-                                tasks.push(Task::LocalFunctionValue(
-                                    build,
-                                    self.postponed_application_errors.len(),
-                                ));
+                                let postponed_start = self.postponed_application_errors.len();
+                                tasks.push(if build.course_parameter.is_some() {
+                                    Task::LocalCourseOriginal(
+                                        build,
+                                        Box::new(self.start_recursive_body_obligation()),
+                                        postponed_start,
+                                    )
+                                } else {
+                                    Task::LocalFunctionValue(build, postponed_start)
+                                });
                                 tasks.push(Task::Visit(value, expected, true));
+                            }
+                            Task::LocalCourseOriginal(build, saved, postponed_start) => {
+                                self.require_no_postponed_recursion_since(postponed_start)?;
+                                let original = values.pop().expect("local course original body");
+                                let obligation =
+                                    self.finish_recursive_body_obligation(*saved, original)?;
+                                let expected =
+                                    build.result_type.clone().expect("local course result");
+                                let course = self.start_course_of_values(expected.clone())?;
+                                let value = build.value_syntax;
+                                tasks.push(Task::LocalFunctionValue(build, postponed_start));
+                                tasks.push(Task::LocalCourseValue(
+                                    Box::new(course),
+                                    obligation,
+                                    postponed_start,
+                                ));
+                                tasks.push(Task::Visit(value, Some(expected), true));
+                            }
+                            Task::LocalCourseValue(course, obligation, postponed_start) => {
+                                self.require_no_postponed_recursion_since(postponed_start)?;
+                                let term = values.pop().expect("local course functional body");
+                                values
+                                    .push(self.finish_course_of_values(*course, obligation, term)?);
                             }
                             Task::LocalFunctionValue(build, postponed_start) => {
                                 if build.checkpoint.is_some() {
