@@ -1056,6 +1056,7 @@ mod tests {
             .filter(|row| matches!(row.policy, Honored | HonoredAtLeast { .. } | HonoredOff))
             .map(|row| row.name)
             .collect();
+        // `genCtorIdx`: `finish_constructor_auxiliaries` (`fln`, `source_records/auxiliaries.rs`).
         // `simprocs`: rewrite/simplify.rs; source_simp_config selects and disables
         // conditional pre-steps with the ordinary ite_true theorem erased.
         // `tactic.skipAssignedInstances`: matching/instance_args.rs;
@@ -1092,6 +1093,7 @@ mod tests {
         assert_eq!(
             honored,
             [
+                "genCtorIdx",
                 "bootstrap.inductiveCheckResultingUniverse",
                 "checkBinderAnnotations",
                 "allowUnsafeReducibility",
