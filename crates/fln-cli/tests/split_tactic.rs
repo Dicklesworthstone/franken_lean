@@ -425,6 +425,22 @@ theorem split_indexed_hypothesis_source_order (n : Nat) (xs : SplitVec Nat n)
   split at h
   next k a tail => exact h
   next => exact False.elim h
+theorem split_indexed_forward_hypothesis {α : Type} (n : Nat) (xs : SplitVec α n)
+    (h : match xs with | .nil => False | .cons k a tail => True) (q : h = h) : True := by
+  split at h <;> exact True.intro
+theorem split_match_dependent_target (b : Bool)
+    (h : match b with | true => True | false => True) : h = h := by
+  split at h <;> rfl
+theorem split_match_transitive_dependencies (b : Bool)
+    (h : match b with | true => True | false => True) (q : h = h) (r : q = q) : q = q := by
+  split at h <;> exact r
+theorem split_match_dependent_let (b : Bool)
+    (h : match b with | true => True | false => True) : True := by
+  let q := h
+  have r : q = q := rfl
+  have checked : q = q := by
+    split at h <;> exact r
+  exact True.intro
 theorem split_indexed_under_binder {α : Type} (n : Nat) (xs : SplitVec α n) :
     ∀ y : Nat, (match xs with | .nil => y | .cons k a tail => y) = y := by
   split <;> intro y <;> rfl
@@ -441,7 +457,8 @@ const INDEXED_MATCH_FAMILY: &str =
 
 /// Each failing proof must reach both constructor obligations. A false branch, an omitted
 /// branch, or a false claim about the resulting index must never be discharged by metadata.
-/// Dependent hypotheses become inaccessible unless they are the selected `split at` target.
+/// Other index-dependent hypotheses become inaccessible; the selected hypothesis's forward
+/// dependency telescope keeps its names.
 const INDEXED_MATCH_REFUSALS: &[(&str, &str)] = &[
     (
         "IndexedFalseBranch.lean",
@@ -462,6 +479,14 @@ const INDEXED_MATCH_REFUSALS: &[(&str, &str)] = &[
     (
         "IndexedHiddenSibling.lean",
         "example (b : Bool) (s : SplitFlag b) (P : Bool → Prop) (q : P b) (h : match s with | .on => P true | .off => P false) : P b := by\n  split at h <;> exact q\n",
+    ),
+    (
+        "DependentFalseBranch.lean",
+        "example (b : Bool) (h : match b with | true => True | false => True) (q : h = h) : False := by\n  split at h <;> exact True.intro\n",
+    ),
+    (
+        "DependentMissingBranch.lean",
+        "example (b : Bool) (h : match b with | true => True | false => True) (q : h = h) : True := by\n  split at h\n  exact True.intro\n",
     ),
 ];
 
@@ -802,7 +827,10 @@ fn split_indexed_matches_checks_native_proofs_and_every_branch() {
         .unwrap_or_else(|error| panic!("{program}\n{error:?}"))
         .into_complete()
         .unwrap();
-    assert_eq!(checked.theorems, 8, "every indexed branch supplies a proof");
+    assert_eq!(
+        checked.theorems, 12,
+        "every indexed branch supplies a proof"
+    );
     assert_eq!(base.logical_root(&options), root);
     for (name, body) in INDEXED_MATCH_REFUSALS {
         let program = format!("{INDEXED_MATCH_FAMILY}{body}");
@@ -822,19 +850,22 @@ fn split_indexed_matches_checks_native_proofs_and_every_branch() {
         }
         assert_eq!(base.logical_root(&options), root);
     }
-    // A match elaborated at a variable index can survive tactics that specialize that
-    // index. Its annotation must not bypass the distinct-local precondition afterward.
+    // Metadata must not bypass the remaining capability boundaries: specialized indices,
+    // computed indexed majors, or a computed discriminant with a dependent selected hypothesis.
     for body in [
         "example (b : Bool) (s : SplitFlag b) :\n  (match s with | .off => false | .on => true) = b := by\n  cases b\n  all_goals split\n  all_goals rfl\n",
         "example (b : Bool) (f : Nat → SplitFlag b) (x : Nat) :\n  (match f x with | .off => false | .on => true) = b := by\n  split <;> rfl\n",
+        "example (f : Nat → Bool) (x : Nat) (h : match f x with | true => True | false => True) (q : h = h) : True := by\n  split at h <;> exact True.intro\n",
     ] {
         let program = format!("{INDEXED_MATCH_FAMILY}{body}");
         let error = base
             .check_source_files(&[program.as_bytes()], &options, limits)
-            .expect_err("constrained or computed indexed matchers still need equality refinement");
+            .expect_err(
+                "constrained or computed dependent matchers still need equality refinement",
+            );
         assert!(
             format!("{error:?}").contains("SplitMatchUnsupported"),
-            "constrained or computed indexed matches must retain a typed refusal: {error:?}"
+            "constrained or computed dependent matches must retain a typed refusal: {error:?}"
         );
         assert_eq!(base.logical_root(&options), root);
     }

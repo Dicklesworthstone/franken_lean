@@ -142,15 +142,37 @@ fn indexed_split_hides_nonselected_dependent_hypotheses() {
 }
 
 #[test]
-fn indexed_split_refuses_forward_dependencies_on_the_selected_hypothesis() {
+fn indexed_split_transports_the_selected_hypothesis_dependency_cone() {
     let environment = environment();
-    // The pin preserves q and leaves h's specialized match unsimplified. Until that
-    // congruence is supported, refuse before omitting the original h from the context.
-    let source = "theorem dependentSelected (A : Type) (n : Nat) (xs : Vec A n) (h : match xs with | .nil => False | .cons k a tail => True) (q : h = h) : True := by split at h <;> exact True.intro";
+    for source in [
+        "theorem dependentSelected (A : Type) (n : Nat) (xs : Vec A n) (h : match xs with | .nil => False | .cons k a tail => True) (q : h = h) : True := by split at h <;> exact True.intro",
+        "theorem dependentTarget (b : Bool) (h : match b with | true => True | false => True) : h = h := by split at h <;> rfl",
+        "theorem transitiveCone (b : Bool) (h : match b with | true => True | false => True) (q : h = h) (r : q = q) : q = q := by split at h <;> exact r",
+        "theorem letCone (b : Bool) (h : match b with | true => True | false => True) : True := by\n  let q := h\n  have r : q = q := rfl\n  have checked : q = q := by\n    split at h <;> exact r\n  exact True.intro",
+    ] {
+        accepted(&environment, source);
+    }
+}
+
+#[test]
+fn dependent_split_keeps_each_branch_and_the_computed_discriminant_boundary() {
+    let environment = environment();
+    for source in [
+        "theorem falseDependent (b : Bool) (h : match b with | true => True | false => True) (q : h = h) : False := by split at h <;> exact True.intro",
+        "theorem missingDependent (b : Bool) (h : match b with | true => True | false => True) (q : h = h) : True := by split at h; exact True.intro",
+    ] {
+        let error = check_definition_source(source.as_bytes(), &environment, budget())
+            .expect_err("reverting dependent hypotheses must not solve or drop a branch");
+        assert!(
+            !format!("{error:?}").contains("SplitMatchUnsupported"),
+            "the negative control must reach the dependent constructor goals: {source}\n{error:?}"
+        );
+    }
+    let source = "theorem computedDependent (f : Nat → Bool) (x : Nat) (h : match f x with | true => True | false => True) (q : h = h) : True := by split at h <;> exact True.intro";
     let error = check_definition_source(source.as_bytes(), &environment, budget())
-        .expect_err("forward dependencies must be refused before constructing split branches");
+        .expect_err("computed discriminants with dependent selected hypotheses remain unsupported");
     assert!(
         format!("{error:?}").contains("SplitMatchUnsupported"),
-        "the dependent context must retain its typed refusal: {source}\n{error:?}"
+        "computed discriminants must retain their typed refusal: {source}\n{error:?}"
     );
 }
