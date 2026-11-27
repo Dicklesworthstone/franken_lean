@@ -1177,6 +1177,21 @@ theorem bad {{n}} : ∀ {{i j : MyFin n}}, Eq i.val j.val → Eq i j
 theorem bad {{n}} : ∀ {{i j : MyFin n}}, Eq i.val j.val → Eq i j
   | ⟨0, _⟩, ⟨1, _⟩, myRfl => rfl"
         ),
+        // Rigid pattern variables under anonymous constructors must still fail
+        // pattern typing against constructor indices (no false accept when
+        // discriminant refinement compares `b` against `b.val`).
+        r#"
+structure Box where val : Nat
+inductive IsZero : Nat → Prop where | z : IsZero 0
+theorem bad : ∀ (b : Box), IsZero b.val → Eq b.val 0 | ⟨n⟩, IsZero.z => rfl
+"#
+        .to_string(),
+        r#"
+structure Box where val : Nat
+inductive EqN : Nat → Nat → Prop where | rfl (n : Nat) : EqN n n
+theorem bad : ∀ (a b : Box), EqN a.val b.val → Eq a b | ⟨x⟩, ⟨y⟩, EqN.rfl _ => rfl
+"#
+        .to_string(),
     ] {
         let e = engine();
         let root = e.logical_root(&KVMap::new());
@@ -1219,15 +1234,19 @@ instance (w : Nat) (a b : Box w) : Decidable (MyPred.holds a b) :=
   inferInstanceAs (Decidable (MyPred.holds a.toVal b.toVal))
 def viaPipe (w : Nat) (a b : Box w) : Decidable (MyPred.holds a b) :=
   inferInstanceAs <| Decidable (MyPred.holds a.toVal b.toVal)
+def withHole : Decidable (Eq (0 : Nat) 0) :=
+  inferInstanceAs (Decidable _)
 set_option backward.inferInstanceAs.wrap false in
 def withoutExpected := inferInstanceAs (Decidable (Eq (0 : Nat) 0))
 "#,
     );
 
     // Negative controls for `inferInstanceAs` matching pinned Lean 4.32.0:
-    // missing expected type (when wrap=true), non-defeq type, missing instance.
+    // missing expected type (when wrap=true), mvar in expected type, non-defeq type,
+    // missing instance.
     for bad in [
         "def bad := inferInstanceAs (Decidable (Eq (0 : Nat) 0))",
+        "def takeDec {P : Prop} (_ : Decidable P) : Nat := 0\ndef bad := takeDec (inferInstanceAs (Decidable (Eq (0 : Nat) 0)))",
         "def bad : Decidable (Eq (0 : Nat) 1) := inferInstanceAs (Decidable (Eq (0 : Nat) 0))",
         "class EmptyClass (α : Type) where\n  x : α\ndef bad : EmptyClass Nat := inferInstanceAs (EmptyClass Nat)",
     ] {

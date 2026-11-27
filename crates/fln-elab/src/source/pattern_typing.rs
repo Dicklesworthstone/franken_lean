@@ -760,6 +760,10 @@ impl Model<'_> {
                 pending.extend(record.fields.into_iter().rev().map(|(_, value)| value));
                 continue;
             }
+            if let Some(elements) = patterns::anonymous_elements(syntax)? {
+                pending.extend(elements.into_iter().rev());
+                continue;
+            }
             let (head, arguments) = match syntax {
                 Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Term", "app"]) => {
                     let [head, arguments] = args.as_slice() else {
@@ -1025,7 +1029,7 @@ impl Model<'_> {
                         Err(Stop::Unknown) | Err(Stop::Mismatch(..)) => return unknown(),
                     };
                     for discr in &discrs {
-                        match self.def_eq(&discr.value, &index)? {
+                        match self.discr_matches_index(&discr.value, &index)? {
                             Answer::Yes => return Ok(Some(first.unwrap_or(mismatch))),
                             Answer::Unknown => return unknown(),
                             Answer::No => {}
@@ -1377,6 +1381,35 @@ impl Model<'_> {
         Ok(answer)
     }
 
+    /// Compare an existing source discriminant against a candidate refinement
+    /// index (`Match.lean:936`). Both terms come from the source environment
+    /// without model metavariables or placeholders, so when the lightweight
+    /// pattern comparer returns `Unknown` (e.g. a local `b` vs `b.val`), fall
+    /// back to a rolled-back trial in the full source unifier.
+    fn discr_matches_index(
+        &mut self,
+        discr: &Expr,
+        index: &Expr,
+    ) -> Result<Answer, NatDefinitionElabError> {
+        match self.def_eq(discr, index)? {
+            Answer::Yes => Ok(Answer::Yes),
+            Answer::No => Ok(Answer::No),
+            Answer::Unknown => {
+                if discr.has_expr_mvar()
+                    || index.has_expr_mvar()
+                    || has_model_fvar(discr)
+                    || has_model_fvar(index)
+                {
+                    return Ok(Answer::Unknown);
+                }
+                let mut trial = self.cx.clone();
+                let equal = trial.coercion_eq(discr, index);
+                self.cx.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+                Ok(if equal? { Answer::Yes } else { Answer::No })
+            }
+        }
+    }
+
     fn compare(
         &mut self,
         left: &Expr,
@@ -1479,6 +1512,29 @@ impl Model<'_> {
                     literal: Literal::Str(_),
                 },
             ) => return Ok(Answer::No),
+            (
+                ExprNode::Proj {
+                    struct_name: left_struct,
+                    idx: left_idx,
+                    expr: left_expr,
+                },
+                ExprNode::Proj {
+                    struct_name: right_struct,
+                    idx: right_idx,
+                    expr: right_expr,
+                },
+            ) if left_struct == right_struct && left_idx == right_idx => {
+                if self.compare(left_expr, right_expr, depth + 1)? == Answer::Yes {
+                    return Ok(Answer::Yes);
+                }
+                // A discriminant placeholder (`_fln_pin_pattern.d`) stands for
+                // a bound variable in `matchType`, never definitionally equal
+                // to a closed source local (matching `kabstract`'s `!hasLooseBVars`).
+                if has_model_placeholder(left_expr) != has_model_placeholder(right_expr) {
+                    return Ok(Answer::No);
+                }
+                return Ok(Answer::Unknown);
+            }
             _ => {}
         }
         let (left_head, left_args) = spine(&left);
@@ -2732,10 +2788,23 @@ impl Model<'_> {
         }
         let (index_head, index_args) = spine(index);
         let (head, args) = spine(expr);
-        if const_name(head).is_some()
-            && const_name(head) == const_name(index_head)
-            && args.len() == index_args.len()
-        {
+        let heads_match = match (head.node(), index_head.node()) {
+            (ExprNode::Const { name: a, .. }, ExprNode::Const { name: b, .. }) => a == b,
+            (
+                ExprNode::Proj {
+                    struct_name: s1,
+                    idx: i1,
+                    ..
+                },
+                ExprNode::Proj {
+                    struct_name: s2,
+                    idx: i2,
+                    ..
+                },
+            ) => s1 == s2 && i1 == i2,
+            _ => false,
+        };
+        if heads_match && args.len() == index_args.len() {
             match self.def_eq(expr, index)? {
                 Answer::Yes => return Ok(Some(Expr::fvar(placeholder.clone()))),
                 Answer::Unknown => return Ok(None),
@@ -2992,6 +3061,20 @@ fn mentions_head(expr: &Expr, term: &Expr) -> bool {
         }
     }
     false
+}
+
+fn has_model_fvar(expr: &Expr) -> bool {
+    let mut seen = Vec::new();
+    collect_fvars(expr, &mut seen, 0);
+    let root = Name::from_components(["_fln_pin_pattern"]);
+    seen.iter().any(|id| id.0.parent().parent() == root)
+}
+
+fn has_model_placeholder(expr: &Expr) -> bool {
+    let mut seen = Vec::new();
+    collect_fvars(expr, &mut seen, 0);
+    let placeholder_root = Name::from_components(["_fln_pin_pattern", "d"]);
+    seen.iter().any(|id| id.0.parent() == placeholder_root)
 }
 
 fn replace_fvar(expr: &Expr, id: &FVarId, value: &Expr) -> Result<Expr, NatDefinitionElabError> {

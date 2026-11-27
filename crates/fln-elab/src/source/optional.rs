@@ -108,6 +108,24 @@ impl Context {
         &mut self,
         type_: &Expr,
     ) -> Result<bool, NatDefinitionElabError> {
+        self.has_optional_parameter_with(type_, false)
+    }
+
+    /// `hasOptAutoParams` (`Lean/Elab/App.lean:484`): like
+    /// `has_optional_parameter`, also recognizing `autoParam` domains when
+    /// deciding whether early expected-type propagation must postpone.
+    pub(super) fn has_optional_or_auto_parameter(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        self.has_optional_parameter_with(type_, true)
+    }
+
+    fn has_optional_parameter_with(
+        &mut self,
+        type_: &Expr,
+        include_auto: bool,
+    ) -> Result<bool, NatDefinitionElabError> {
         let saved = self.txn.lctx.clone();
         let result = (|| {
             let mut cursor = type_.clone();
@@ -123,7 +141,9 @@ impl Context {
                 else {
                     return Ok(false);
                 };
-                if default_value(binder_type).is_some() {
+                if default_value(binder_type).is_some()
+                    || (include_auto && is_auto_param(binder_type))
+                {
                     return Ok(true);
                 }
                 let id = FVarId(self.fresh_name()?);

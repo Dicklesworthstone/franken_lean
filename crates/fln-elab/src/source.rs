@@ -2309,7 +2309,7 @@ impl Context {
                 if reduced.has_loose_bvars() {
                     return Ok(None);
                 }
-                if !explicit && self.has_optional_parameter(&reduced)? {
+                if !explicit && self.has_optional_or_auto_parameter(&reduced)? {
                     return Ok(None);
                 }
                 break;
@@ -2347,6 +2347,8 @@ impl Context {
         );
         let expected_type = if wrap {
             let expected = expected.ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+            self.flush(false)?;
+            self.resolve_instances(false)?;
             let expected = self.instantiate(expected)?;
             if expected.has_expr_mvar() {
                 return Err(failure(SourceInferenceError::ExpectedType));
@@ -2357,6 +2359,12 @@ impl Context {
         };
         let type_term = self.term(type_syntax, None)?;
         let _ = self.sort_level(&type_term)?;
+        // Resolve already-determined instance-implicit arguments inside `type_syntax`
+        // before unifying holes against `expected_type`, so `expected_type`'s own
+        // instance choices do not poison `type_syntax` (`resynthInstImplicitArgs`,
+        // `Lean/Elab/BuiltinTerm.lean:389`).
+        self.flush(false)?;
+        self.resolve_instances(false)?;
         if let Some(expected_type) = &expected_type {
             self.constrain_result_hint(&type_term.value, expected_type)?;
         }
