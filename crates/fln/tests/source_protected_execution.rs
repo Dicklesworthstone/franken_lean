@@ -164,7 +164,7 @@ structure Grouped where
   protected (a b : Nat)
 structure Base where
   x : Nat
-structure Sub extends Base where
+structure Derived extends Base where
   protected x := 1
 open Base
 def parentX (b : Base) : Nat := x b
