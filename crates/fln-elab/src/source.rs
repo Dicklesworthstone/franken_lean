@@ -908,7 +908,9 @@ struct Context {
     // A supported compiler refusal suppressed by a noncomputable section.
     // Only the successful declaration result can carry it to post-admission metadata.
     noncomputable_definition: bool,
-    // Whether the enclosing declaration itself carries an explicit `noncomputable` modifier.
+    // Whether the enclosing declaration itself carries an explicit `noncomputable` modifier
+    // (`Lean/Elab/BuiltinTerm.lean:477`: `elabPrivateDecl` checks `isNoncomputable`, not
+    // `[extern]`/`[macro_inline]`).
     declaration_is_noncomputable: bool,
     // Set while the `unfold` tactic expands a selection. The pin's `unfold` rewrites by the
     // unfold equation, so an occurrence whose match is stuck becomes a `match`, which a
@@ -6054,14 +6056,15 @@ impl Context {
                                 tasks.push(Task::Visit(body, body_expected, true));
                             }
                             Task::MatrixAbstraction(abs) => {
+                                self.resolve_instances(false)?;
                                 self.flush(false)?;
                                 for (param_id, _, _, _) in &abs.params {
                                     if self.equations_mention(param_id)? {
                                         self.flush(true)?;
+                                        self.resolve_instances(false)?;
                                         break;
                                     }
                                 }
-                                self.resolve_instances(false)?;
                                 let mut body = values.pop().expect("matrix abstraction body");
                                 body.value = self.instantiate(&body.value)?;
                                 body.type_ = self.instantiate(&body.type_)?;
