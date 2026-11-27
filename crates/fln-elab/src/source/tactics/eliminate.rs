@@ -1086,11 +1086,18 @@ impl Context {
         for local in goal.lctx.decls() {
             if !removed.contains(&local.id) {
                 add_local(&mut retained, local);
-            } else if local.id == major.id
+            } else if (local.id == major.id || index_ids.contains(&local.id))
                 && let EliminationSyntax::SplitMatch { original, .. } = input
             {
                 let mut original_local = local.clone();
-                original_local.user_name = original.clone();
+                original_local.user_name = if local.id == major.id {
+                    original.clone()
+                } else {
+                    // The retained original discriminant still has its original
+                    // indexed type. Keep that telescope in scope while the motive
+                    // substitutes the constructor's indices in the branch goals.
+                    self.fresh_inaccessible(&local.user_name)?
+                };
                 add_local(&mut retained, &original_local);
             } else if rec.num_motives > 1 && (local.id == major.id || index_ids.contains(&local.id))
             {

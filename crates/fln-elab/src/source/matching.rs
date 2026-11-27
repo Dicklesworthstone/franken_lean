@@ -982,8 +982,7 @@ impl Context {
             order,
             split_info,
         } = self.match_patterns(parts, name, &family.ctors, &family_type)?;
-        let split_info =
-            split_info.filter(|_| !recursive && family.num_indices == 0 && rec.num_motives == 1);
+        let split_info = split_info.filter(|_| !recursive && rec.num_motives == 1);
         let fallback_position = order.len();
         let positions: HashMap<_, _> = order
             .into_iter()
@@ -1744,6 +1743,9 @@ impl Context {
                     )?;
                 }
             }
+            if let Some(info) = &state.split_info {
+                result.value = Expr::mdata(info.clone(), result.value);
+            }
             if let Some(obligation) = &state.motive_obligation {
                 result.value = Expr::let_e(
                     Name::anonymous(),
@@ -1752,9 +1754,6 @@ impl Context {
                     result.value,
                     false,
                 );
-            }
-            if let Some(info) = &state.split_info {
-                result.value = Expr::mdata(info.clone(), result.value);
             }
             return Ok(MatchStep::Complete(
                 self.finish_term(result, Some(&state.target))?,

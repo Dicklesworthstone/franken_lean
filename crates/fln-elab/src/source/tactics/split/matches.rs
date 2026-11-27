@@ -66,8 +66,7 @@ impl Context {
             || family.is_unsafe
             || family.num_nested != 0
             || rec.num_motives != 1
-            || rec.num_indices != 0
-            || family.num_indices != 0
+            || rec.num_indices != family.num_indices
             || rec.num_params != family.num_params
             || rec.all != family.all
             || rec.num_minors as usize != family.ctors.len()
@@ -100,6 +99,7 @@ impl Context {
             .ok()
             .and_then(|parameters| parameters.checked_add(1))
             .and_then(|prefix| prefix.checked_add(rec.num_minors as usize))
+            .and_then(|prefix| prefix.checked_add(rec.num_indices as usize))
             .ok_or_else(unsupported)?;
         let discriminant = self.instantiate(arguments.get(position).ok_or_else(unsupported)?)?;
         if discriminant.has_loose_bvars() {
@@ -113,6 +113,37 @@ impl Context {
             return Err(unsupported());
         }
         let type_ = self.known_type(&discriminant)?.ok_or_else(unsupported)?;
+        if rec.num_indices != 0 {
+            // Ordinary elimination can specialize independent local indices directly.
+            // A fixed/repeated index or a computed major needs the splitter's index
+            // equations, whose refinement may close constructors and reorder its work.
+            // Do not treat such a problem as one obligation per constructor.
+            if !matches!(discriminant.node(), ExprNode::FVar { .. }) {
+                return Err(unsupported());
+            }
+            let values = self.elimination_result_indices(
+                &type_,
+                family_name,
+                family.num_params as usize,
+                family.num_indices as usize,
+            )?;
+            let indices = match self.elimination_index_locals(&values) {
+                Ok(indices) => indices,
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
+                    matching::MatchError::UnrefinedIndices,
+                ))) => return Err(unsupported()),
+                Err(error) => return Err(error),
+            };
+            let index_ids = indices
+                .iter()
+                .map(|index| index.id.clone())
+                .collect::<HashSet<_>>();
+            for parameter in &arguments[..rec.num_params as usize] {
+                if !self.elimination_reads(parameter)?.is_disjoint(&index_ids) {
+                    return Err(unsupported());
+                }
+            }
+        }
         let prefix = arguments[..position]
             .iter()
             .cloned()
@@ -192,7 +223,7 @@ impl Context {
             Some(&major.id),
             None,
         )?;
-        // Nonindexed ordinary elimination emits one close followed by its constructor goals,
+        // Independent-index elimination emits one close followed by its constructor goals,
         // in reverse worklist order. Reordering the goals never reorders recursor arguments.
         let mut generated = proof.work.split_off(start);
         if generated.len() != plan.constructors.len() + 1 {
