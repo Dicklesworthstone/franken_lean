@@ -596,6 +596,10 @@ enum IntrinsicImplementation {
     DbgTrace,
     Float(floats::Intrinsic),
     StringInternal(strings::Intrinsic),
+    BoolToSmallWord(&'static str),
+    BoolToWideWord(&'static str),
+    StrictAnd,
+    StrictOr,
     BaseIoAsTask,
     BaseIoBindTask,
     BaseIoMapTask,
@@ -967,6 +971,18 @@ impl IntrinsicImplementation {
         match row {
             "extern:panicCore" => Self::PanicCore,
             "extern:dbgTrace" => Self::DbgTrace,
+            "extern:Bool.toUInt8" => Self::BoolToSmallWord("Bool.toUInt8"),
+            "extern:Bool.toUInt16" => Self::BoolToSmallWord("Bool.toUInt16"),
+            "extern:Bool.toUInt32" => Self::BoolToSmallWord("Bool.toUInt32"),
+            "extern:Bool.toInt8" => Self::BoolToSmallWord("Bool.toInt8"),
+            "extern:Bool.toInt16" => Self::BoolToSmallWord("Bool.toInt16"),
+            "extern:Bool.toInt32" => Self::BoolToSmallWord("Bool.toInt32"),
+            "extern:Bool.toUInt64" => Self::BoolToWideWord("Bool.toUInt64"),
+            "extern:Bool.toUSize" => Self::BoolToWideWord("Bool.toUSize"),
+            "extern:Bool.toInt64" => Self::BoolToWideWord("Bool.toInt64"),
+            "extern:Bool.toISize" => Self::BoolToWideWord("Bool.toISize"),
+            "extern:strictAnd" => Self::StrictAnd,
+            "extern:strictOr" => Self::StrictOr,
             "extern:BaseIO.asTask" => Self::BaseIoAsTask,
             "extern:BaseIO.bindTask" => Self::BaseIoBindTask,
             "extern:BaseIO.mapTask" => Self::BaseIoMapTask,
@@ -4889,7 +4905,11 @@ fn finish_intrinsic_result(
             .is_some_and(float_arrays::Intrinsic::has_wide_result)
         || matches!(
             row,
-            "extern:ByteArray.hash"
+            "extern:Bool.toUInt64"
+                | "extern:Bool.toUSize"
+                | "extern:Bool.toInt64"
+                | "extern:Bool.toISize"
+                | "extern:ByteArray.hash"
                 | "extern:ByteArray.usize"
                 | "extern:Array.usize"
                 | "extern:Lean.Expr.data"
@@ -5356,6 +5376,38 @@ fn dispatch_intrinsic(
         IntrinsicImplementation::Float(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::StringInternal(intrinsic) => {
             intrinsic.invoke(row, args, max_nat_magnitude_bytes)
+        }
+        IntrinsicImplementation::BoolToSmallWord(operation)
+        | IntrinsicImplementation::BoolToWideWord(operation) => {
+            expect_arity(row, args, 1)?;
+            let value = bool_value(&args[0], operation, 0)?;
+            // The pin's conversions all preserve 0/1. The VM carrier follows
+            // the destination's scalar ABI, including boxed 64-bit words.
+            Ok(
+                if matches!(implementation, IntrinsicImplementation::BoolToWideWord(_)) {
+                    uint64_result(u64::from(value))
+                } else {
+                    uint8_result(u8::from(value))
+                },
+            )
+        }
+        IntrinsicImplementation::StrictAnd | IntrinsicImplementation::StrictOr => {
+            expect_arity(row, args, 2)?;
+            let operation = if implementation == IntrinsicImplementation::StrictAnd {
+                "strictAnd"
+            } else {
+                "strictOr"
+            };
+            // Both arguments must satisfy Bool even when the left operand
+            // determines the result.
+            let left = bool_value(&args[0], operation, 0)?;
+            let right = bool_value(&args[1], operation, 1)?;
+            let value = if implementation == IntrinsicImplementation::StrictAnd {
+                left && right
+            } else {
+                left || right
+            };
+            Ok(uint8_result(u8::from(value)))
         }
         IntrinsicImplementation::NatAdd => {
             expect_arity(row, args, 2)?;
@@ -8168,7 +8220,11 @@ fn closure_intrinsic_application(
                 trace: None,
             })
         }
-        IntrinsicImplementation::NatAdd
+        IntrinsicImplementation::BoolToSmallWord(_)
+        | IntrinsicImplementation::BoolToWideWord(_)
+        | IntrinsicImplementation::StrictAnd
+        | IntrinsicImplementation::StrictOr
+        | IntrinsicImplementation::NatAdd
         | IntrinsicImplementation::NatBeq
         | IntrinsicImplementation::NatBle
         | IntrinsicImplementation::NatSub
