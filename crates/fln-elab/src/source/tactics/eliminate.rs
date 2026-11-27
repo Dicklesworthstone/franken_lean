@@ -38,11 +38,12 @@ pub(super) enum EliminationSyntax<'a> {
     EmptyMatrix(HashMap<Name, Vec<Name>>),
     /// Recursive tactic patterns retain the ordinary cases removal semantics.
     RCases(HashMap<Name, Vec<Name>>),
-    /// A source match's splitter keeps an inaccessible copy of the original input, while
-    /// the target and its dependency cone are specialized at each constructor.
+    /// A source match's splitter keeps inaccessible copies of the original dependency
+    /// telescope. Its specialized locals are inaccessible too, except the selected hypothesis.
     SplitMatch {
         fields: HashMap<Name, Vec<Name>>,
         original: Name,
+        hypothesis: Option<FVarId>,
     },
 }
 
@@ -1063,7 +1064,7 @@ impl Context {
             }
             preceding_indices.insert(index.id.clone());
         }
-        let reverted: Vec<_> = goal
+        let mut reverted: Vec<_> = goal
             .lctx
             .decls()
             .iter()
@@ -1082,23 +1083,36 @@ impl Context {
                 local
             })
             .collect();
+        if let EliminationSyntax::SplitMatch { hypothesis, .. } = input {
+            for local in &mut reverted {
+                if hypothesis.as_ref() != Some(&local.id) {
+                    local.user_name = self.fresh_inaccessible(&local.user_name)?;
+                }
+            }
+        }
         let mut retained = LocalContext::new();
         for local in goal.lctx.decls() {
             if !removed.contains(&local.id) {
                 add_local(&mut retained, local);
-            } else if (local.id == major.id || index_ids.contains(&local.id))
-                && let EliminationSyntax::SplitMatch { original, .. } = input
+            } else if let EliminationSyntax::SplitMatch {
+                original,
+                hypothesis,
+                ..
+            } = input
             {
-                let mut original_local = local.clone();
-                original_local.user_name = if local.id == major.id {
+                // The original input keeps its original type and dependency telescope.
+                // The pin hides both original and specialized dependent locals; only a
+                // selected `split at h` hypothesis is replaced under its visible name.
+                if hypothesis.as_ref() == Some(&local.id) {
+                    continue;
+                }
+                let mut hidden = local.clone();
+                hidden.user_name = if local.id == major.id {
                     original.clone()
                 } else {
-                    // The retained original discriminant still has its original
-                    // indexed type. Keep that telescope in scope while the motive
-                    // substitutes the constructor's indices in the branch goals.
                     self.fresh_inaccessible(&local.user_name)?
                 };
-                add_local(&mut retained, &original_local);
+                add_local(&mut retained, &hidden);
             } else if rec.num_motives > 1 && (local.id == major.id || index_ids.contains(&local.id))
             {
                 // Sibling motives may mention the original input in R -> R.

@@ -104,7 +104,7 @@ fn indexed_split_specializes_indices_and_preserves_source_alternative_order() {
 fn indexed_split_transports_dependent_hypotheses_and_splits_hypothesis_types() {
     let environment = environment();
     for source in [
-        "theorem dependent (A : Type) (n : Nat) (xs : Vec A n) (P : (k : Nat) -> Vec A k -> Prop) (h : P n xs) : match xs with | .nil => P 0 Vec.nil | .cons k a tail => P (Nat.succ k) (Vec.cons k a tail) := by split <;> exact h",
+        "theorem dependent (A : Type) (n : Nat) (xs : Vec A n) (P : (k : Nat) -> Vec A k -> Prop) (h : P n xs) : match xs with | .nil => P 0 Vec.nil | .cons k a tail => P (Nat.succ k) (Vec.cons k a tail) := by split <;> assumption",
         "theorem atHypothesis (A : Type) (n : Nat) (xs : Vec A n) (Q : Prop) (h : match xs with | .nil => False | .cons k a tail => Q) : Q := by\n  split at h\n  next => exact False.elim h\n  next k a tail => exact h",
         "theorem atWildcard (A : Type) (n : Nat) (xs : Vec A n) (h : match xs with | .nil => False | .cons k a tail => True) : True := by\n  split at *\n  next => exact False.elim h\n  next k a tail => exact h",
     ] {
@@ -127,4 +127,30 @@ fn indexed_split_keeps_false_and_unfinished_constructor_branches() {
             "the negative control must reach real constructor goals: {source}\n{error:?}"
         );
     }
+}
+
+#[test]
+fn indexed_split_hides_nonselected_dependent_hypotheses() {
+    let environment = environment();
+    let source = "theorem hiddenDependent (A : Type) (n : Nat) (xs : Vec A n) (P : (k : Nat) -> Vec A k -> Prop) (h : P n xs) : match xs with | .nil => P 0 Vec.nil | .cons k a tail => P (Nat.succ k) (Vec.cons k a tail) := by split <;> exact h";
+    let error = check_definition_source(source.as_bytes(), &environment, budget())
+        .expect_err("the pin makes the generalized hypothesis inaccessible after split");
+    assert!(
+        format!("{error:?}").contains("UnknownConstant"),
+        "the hidden source name must not resolve: {source}\n{error:?}"
+    );
+}
+
+#[test]
+fn indexed_split_refuses_forward_dependencies_on_the_selected_hypothesis() {
+    let environment = environment();
+    // The pin preserves q and leaves h's specialized match unsimplified. Until that
+    // congruence is supported, refuse before omitting the original h from the context.
+    let source = "theorem dependentSelected (A : Type) (n : Nat) (xs : Vec A n) (h : match xs with | .nil => False | .cons k a tail => True) (q : h = h) : True := by split at h <;> exact True.intro";
+    let error = check_definition_source(source.as_bytes(), &environment, budget())
+        .expect_err("forward dependencies must be refused before constructing split branches");
+    assert!(
+        format!("{error:?}").contains("SplitMatchUnsupported"),
+        "the dependent context must retain its typed refusal: {source}\n{error:?}"
+    );
 }

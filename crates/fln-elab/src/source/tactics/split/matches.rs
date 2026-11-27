@@ -213,12 +213,26 @@ impl Context {
         }
         let (goal, major) = self.split_match_discriminant(proof, goal, subject, &plan)?;
         let original = self.fresh_inaccessible(&major.user_name)?;
+        let hypothesis = match subject {
+            Subject::Target => None,
+            Subject::Hypothesis(local) => Some(
+                goal.lctx
+                    .find_by_user_name(&local.user_name)
+                    .ok_or_else(unsupported)?
+                    .id
+                    .clone(),
+            ),
+        };
         self.txn.lctx = goal.lctx.clone();
         let start = proof.work.len();
         self.eliminate_proof_goal_with_indices(
             proof,
             goal.clone(),
-            &eliminate::EliminationSyntax::SplitMatch { fields, original },
+            &eliminate::EliminationSyntax::SplitMatch {
+                fields,
+                original,
+                hypothesis,
+            },
             false,
             Some(&major.id),
             None,
