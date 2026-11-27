@@ -2515,7 +2515,7 @@ impl FileGrammar {
             && parts.as_slice() == ["Lean", "Parser", "Command", "macro"]
             && !self.runtime_macro_kinds.is_empty()
         {
-            let name = self.syntax_name(&declaration)?;
+            let name = self.syntax_name(&declaration);
             let full_name = self.top().namespace.append_core(&name);
             let kind = if declaration.attr_kind == AttrKind::Local {
                 private_name(
@@ -2733,16 +2733,18 @@ impl FileGrammar {
     }
 
     /// `elabSyntax` (`Lean/Elab/Syntax.lean`).
-    fn syntax_name(&self, declaration: &Declaration) -> Result<Name, &'static str> {
+    fn syntax_name(&self, declaration: &Declaration) -> Name {
         let namespace = self.top().namespace.clone();
-        Ok(match &declaration.name {
+        match &declaration.name {
             Some(name) => name.clone(),
             None => {
-                let base = format!(
-                    "{}{}",
-                    simple(&declaration.category).ok_or("a dotted category")?,
-                    name_from_items(&declaration.items)
-                );
+                // mkNameFromParserSyntax prefixes the last string component. The
+                // descriptor still points at the complete category name.
+                let prefix = match declaration.category.leaf_view() {
+                    LeafView::Str(suffix) => suffix,
+                    _ => "",
+                };
+                let base = format!("{prefix}{}", name_from_items(&declaration.items));
                 let mut name = Name::str(Name::anonymous(), base.as_str());
                 let mut index = 1;
                 while self.constants.contains(&namespace.append_core(&name)) {
@@ -2751,7 +2753,7 @@ impl FileGrammar {
                 }
                 name
             }
-        })
+        }
     }
 
     fn elab_syntax(&mut self, declaration: Declaration) -> Result<Arc<SyntaxDecl>, &'static str> {
@@ -2767,7 +2769,7 @@ impl FileGrammar {
             }
         });
         let namespace = self.top().namespace.clone();
-        let name = self.syntax_name(&declaration)?;
+        let name = self.syntax_name(&declaration);
         let context = Context {
             category: declaration.category.clone(),
             first: true,
