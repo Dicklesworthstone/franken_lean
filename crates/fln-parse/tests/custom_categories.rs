@@ -293,3 +293,26 @@ fn unnamed_productions_use_the_last_component_of_a_qualified_category() {
         "itemOther"
     ));
 }
+
+#[test]
+fn category_redeclarations_preserve_the_active_grammar_and_exports() {
+    let library = grammar(&["declare_syntax_cat importedItem"]);
+    let mut consumer = grammar(&[
+        "declare_syntax_cat localItem",
+        "syntax (name := localValue) \"vv\" : localItem",
+        "syntax \"readLocal \" \"[\" localItem \"]\" : term",
+    ]);
+    consumer
+        .import_native(&library.export_native().unwrap())
+        .unwrap();
+    let before = consumer.export_native().unwrap();
+    for category in ["«term»", "importedItem", "localItem"] {
+        let declaration = parse(&consumer, &format!("declare_syntax_cat {category}")).unwrap();
+        assert!(consumer.declare(&declaration).is_err(), "{category}");
+        assert_eq!(consumer.export_native().unwrap(), before);
+    }
+    assert!(contains(
+        &parse(&consumer, "#check readLocal [vv]").unwrap(),
+        "localValue"
+    ));
+}

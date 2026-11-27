@@ -1504,6 +1504,19 @@ impl FileScope {
     }
 }
 
+/// A parser declaration is invalid, or uses syntax the native grammar cannot translate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrammarDeclarationError {
+    DuplicateCategory(Name),
+    Unsupported(&'static str),
+}
+
+impl From<&'static str> for GrammarDeclarationError {
+    fn from(feature: &'static str) -> Self {
+        Self::Unsupported(feature)
+    }
+}
+
 /// One file's syntax state: what its imports declare, what it has declared so far, and which
 /// scoped namespaces its commands have activated.
 pub struct FileGrammar {
@@ -2249,6 +2262,19 @@ impl FileGrammar {
         command: &Syntax,
         is_pure: &dyn Fn(&Name) -> bool,
     ) -> Result<Option<Arc<SyntaxDecl>>, &'static str> {
+        self.try_declare_with_macro_pure(command, is_pure)
+            .map_err(|error| match error {
+                GrammarDeclarationError::DuplicateCategory(_) => "parser category already defined",
+                GrammarDeclarationError::Unsupported(feature) => feature,
+            })
+    }
+
+    /// Register a declaration while preserving semantic errors for the source driver.
+    pub fn try_declare_with_macro_pure(
+        &mut self,
+        command: &Syntax,
+        is_pure: &dyn Fn(&Name) -> bool,
+    ) -> Result<Option<Arc<SyntaxDecl>>, GrammarDeclarationError> {
         let Syntax::Node { kind, args, .. } = command else {
             return Ok(None);
         };
@@ -2267,7 +2293,7 @@ impl FileGrammar {
             // The pin elaborates generated parser-description definitions. Their
             // numeric priorities, tokens and helper references also see atom
             // macros; installing our direct descriptor would bypass that code.
-            return Err("syntax declarations under active atomic macro rules");
+            return Err("syntax declarations under active atomic macro rules".into());
         }
         let mut rule = None;
         let declaration = match parts.as_slice() {
@@ -2285,7 +2311,7 @@ impl FileGrammar {
                     category,
                 ] = args.as_slice()
                 else {
-                    return Err("a syntax command's shape");
+                    return Err("a syntax command's shape".into());
                 };
                 let items = null_args(items).ok_or("syntax items")?;
                 let items = items.iter().map(stx_item).collect::<Result<Vec<_>, _>>()?;
@@ -2301,7 +2327,7 @@ impl FileGrammar {
             }
             ["Lean", "Parser", "Command", "syntaxAbbrev"] => {
                 self.generation += 1;
-                return self.declare_abbreviation(args).map(Some);
+                return Ok(Some(self.declare_abbreviation(args)?));
             }
             ["Lean", "Parser", "Command", "syntaxCat"] => {
                 self.declare_category(args)?;
@@ -2321,7 +2347,7 @@ impl FileGrammar {
                     rhs,
                 ] = args.as_slice()
                 else {
-                    return Err("a notation command's shape");
+                    return Err("a notation command's shape".into());
                 };
                 let items = null_args(items).ok_or("notation items")?;
                 // `elabNotation`'s `macro_rules`: each `identPrec` item is the variable its child
@@ -2374,13 +2400,13 @@ impl FileGrammar {
                     function,
                 ] = args.as_slice()
                 else {
-                    return Err("a mixfix command's shape");
+                    return Err("a mixfix command's shape".into());
                 };
                 let fixity = match fixity {
                     Syntax::Node { kind, .. } => {
                         components(kind).last().cloned().unwrap_or_default()
                     }
-                    _ => return Err("a mixfix keyword"),
+                    _ => return Err("a mixfix keyword".into()),
                 };
                 let prec = precedence_value(precedence).ok_or("a mixfix precedence")?;
                 let op = notation_item(op)?;
@@ -2392,7 +2418,7 @@ impl FileGrammar {
                     "infixr" => vec![operand(prec + 1), op, operand(prec)],
                     "prefix" => vec![op, operand(prec)],
                     "postfix" => vec![operand(prec), op],
-                    _ => return Err("a mixfix keyword"),
+                    _ => return Err("a mixfix keyword".into()),
                 };
                 // `expandMixfix`'s notation: `f lhs rhs` (or `f arg`) over the operand children,
                 // its variables the macro's own hygienic names.
@@ -2442,7 +2468,7 @@ impl FileGrammar {
                     tail,
                 ] = args.as_slice()
                 else {
-                    return Err("a macro command's shape");
+                    return Err("a macro command's shape".into());
                 };
                 // `elabMacro`: the `syntax` its arguments spell, and a `macro_rules` whose pattern
                 // binds each named argument's child.
@@ -2454,7 +2480,7 @@ impl FileGrammar {
                     .enumerate()
                 {
                     let Some([binder, item]) = node_args(argument) else {
-                        return Err("a macro argument");
+                        return Err("a macro argument".into());
                     };
                     let named = if let Some([variable, _]) = null_args(binder) {
                         let variable = ident_name(variable).ok_or("a macro variable")?;
@@ -2466,7 +2492,7 @@ impl FileGrammar {
                     items.push(macro_item(stx_item(item)?, named));
                 }
                 let Some([_, category, _, rhs]) = node_args(tail) else {
-                    return Err("a macro's tail");
+                    return Err("a macro's tail".into());
                 };
                 let category = ident_name(category).ok_or("a macro category")?;
                 let template = node_args(rhs)
@@ -2483,7 +2509,7 @@ impl FileGrammar {
                 });
                 let translated = match translated {
                     Err(reason) if quotation::capture_kinds::registration_error(reason) => {
-                        return Err(reason);
+                        return Err(reason.into());
                     }
                     translated => translated,
                 };
@@ -2528,7 +2554,9 @@ impl FileGrammar {
                 full_name
             };
             if self.runtime_macro_kinds.contains(&kind) {
-                return Err("an unsupported macro declaration for an imported runtime syntax kind");
+                return Err(
+                    "an unsupported macro declaration for an imported runtime syntax kind".into(),
+                );
             }
         }
         self.generation += 1;
@@ -2659,9 +2687,9 @@ impl FileGrammar {
     /// `elabDeclareSyntaxCat`: the category, under the name as written, with its identifier
     /// behavior; its quotation parser `` `(cat| … ) `` (`declareSyntaxCatQuotParser`) brings the
     /// opener's token.
-    fn declare_category(&mut self, args: &[Syntax]) -> Result<(), &'static str> {
+    fn declare_category(&mut self, args: &[Syntax]) -> Result<(), GrammarDeclarationError> {
         let [_, _, name, behavior] = args else {
-            return Err("a declare_syntax_cat command's shape");
+            return Err("a declare_syntax_cat command's shape".into());
         };
         let name = ident_name(name).ok_or("a category name")?;
         let behavior = match null_args(behavior) {
@@ -2676,12 +2704,16 @@ impl FileGrammar {
             {
                 IdentBehavior::Symbol
             }
-            _ => return Err("a category behavior"),
+            _ => return Err("a category behavior".into()),
         };
         let suffix = match name.leaf_view() {
             LeafView::Str(suffix) => suffix.to_string(),
-            _ => return Err("a category name"),
+            _ => return Err("a category name".into()),
         };
+        // Lean.Parser.addParserCategoryCore checks the full visible category table.
+        if self.categories.contains_key(&name) {
+            return Err(GrammarDeclarationError::DuplicateCategory(name));
+        }
         self.declared_categories.insert(name.clone(), behavior);
         self.categories.insert(name, behavior);
         self.declared_tokens.insert(format!("`({suffix}|"));

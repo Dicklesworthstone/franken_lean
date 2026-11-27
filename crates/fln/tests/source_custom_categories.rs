@@ -150,3 +150,25 @@ fn category_registrations_and_captures_survive_import_and_journal_reentry() {
         assert_eq!(completed, accepted, "{source}");
     }
 }
+
+#[test]
+fn duplicate_parser_categories_are_source_errors() {
+    for (source, category) in [
+        ("declare_syntax_cat «term»", "term"),
+        (
+            "declare_syntax_cat parcel\ndeclare_syntax_cat parcel",
+            "parcel",
+        ),
+    ] {
+        let Err(error) = engine().check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(admission()),
+        ) else {
+            panic!("duplicate category must be rejected");
+        };
+        assert_eq!(error.disposition(), ("input", false, 1));
+        let expected = format!("parser category `{category}` has already been defined");
+        assert!(error.to_string().contains(&expected), "{error}");
+    }
+}
