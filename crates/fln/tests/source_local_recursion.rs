@@ -693,3 +693,113 @@ fn local_course_candidates_reject_nondecreasing_calls_and_invalid_proofs() {
         assert!(!base.environment().contains(&Name::from_components(["bad"])));
     }
 }
+
+const INFERRED_EQUATION_DATA: &str = r#"
+inductive Chain (A : Type) where
+  | nil : Chain A
+  | cons (head : A) (tail : Chain A) : Chain A
+structure Buffer where
+  count : Nat
+def Buffer.push (r : Buffer) (n : Nat) : Buffer := ⟨r.count + n⟩
+"#;
+
+#[test]
+fn inferred_equation_local_recursion_preserves_record_accumulators() {
+    execute(
+        &format!(
+            r#"{INFERRED_EQUATION_DATA}
+def collect (xs : Chain Nat) : Buffer :=
+  let rec loop
+    | Chain.nil, r => r
+    | Chain.cons n tail, r => loop tail (r.push n)
+  loop xs ⟨0⟩
+theorem computed : (collect (Chain.cons 2 (Chain.cons 3 Chain.nil))).count = 5 := by rfl
+#eval (collect (Chain.cons 2 (Chain.cons 3 Chain.nil))).count
+"#
+        ),
+        "5",
+    );
+}
+
+#[test]
+fn inferred_equation_local_recursion_preserves_nat_accumulators() {
+    execute(
+        r#"
+def sumTo (n : Nat) : Nat :=
+  let rec loop
+    | Nat.zero, r => r
+    | Nat.succ k, r => loop k (r + k + 1)
+  loop n 0
+theorem computed : sumTo 3 = 6 := by rfl
+#eval sumTo 3
+"#,
+        "6",
+    );
+}
+
+#[test]
+fn inferred_equation_local_recursion_rejects_nondecreasing_calls_and_wrong_fields() {
+    let base = checked(&engine(), INFERRED_EQUATION_DATA);
+    let before = base.logical_root(&KVMap::new());
+    for (source, recursive) in [
+        (
+            r#"
+def bad (xs : Chain Nat) : Buffer :=
+  let rec loop
+    | Chain.nil, r => r
+    | Chain.cons n tail, r => loop (Chain.cons n tail) (r.push n)
+  loop xs ⟨0⟩
+"#,
+            true,
+        ),
+        (
+            r#"
+def bad (xs : Chain Nat) : Buffer :=
+  let rec loop
+    | Chain.nil, r => r
+    | Chain.cons _ tail, r => loop tail (r.push "wrong")
+  loop xs ⟨0⟩
+"#,
+            false,
+        ),
+        (
+            r#"
+def bad (xs : Chain Nat) : Nat :=
+  let rec loop
+    | Chain.nil => 0
+    | Chain.cons _ tail => loop tail
+  let first := loop xs
+  let second := loop (Chain.cons true Chain.nil)
+  first + second
+"#,
+            false,
+        ),
+    ] {
+        let problem = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err(source);
+        assert_eq!(
+            problem.disposition(),
+            ("elaboration", false, 1),
+            "{source}: {problem:?}"
+        );
+        let diagnostic = format!("{problem:?}");
+        if recursive {
+            assert!(
+                diagnostic.contains("Recursion(NotDecreasing)"),
+                "{source}: {diagnostic}"
+            );
+        } else {
+            assert!(
+                diagnostic.contains("TypeMismatch") || diagnostic.contains("ConversionRefused"),
+                "{source}: {diagnostic}"
+            );
+        }
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+        assert!(!base.environment().contains(&Name::from_components(["bad"])));
+    }
+}

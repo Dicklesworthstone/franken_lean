@@ -13,6 +13,7 @@ use fln_env::constants::ConstantInfo;
 use fln_env::constants::ConstructorVal;
 use std::collections::{HashMap, HashSet};
 mod conditional_order;
+mod infer_family;
 mod mutual;
 mod nomatch;
 pub(in crate::source) mod split_info;
@@ -616,6 +617,7 @@ impl Context {
         } else {
             expected
         };
+        self.infer_match_family(&parts, &major.type_)?;
         // A match as written is refused where the pin refuses its patterns' types; the lowering
         // below would solve index equations the pin leaves alone (`pattern_typing`).
         if parts.written && parts.equation.is_none() && parts.conditional.is_none() {
