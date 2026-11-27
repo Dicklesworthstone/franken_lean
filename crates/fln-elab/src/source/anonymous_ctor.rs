@@ -177,7 +177,7 @@ pub(super) fn nest_fields(elements: &[Syntax], explicit: usize) -> Syntax {
 /// The number of explicit binders among a constructor's fields: the binders after its
 /// parameters (`forallTelescopeReducing cinfo.type`, counting `isExplicit` from `numParams`).
 /// A constructor type is a syntactic telescope of exactly `num_params + num_fields` binders.
-fn explicit_fields(info: &ConstructorVal) -> Result<usize, NatDefinitionElabError> {
+pub(super) fn explicit_fields(info: &ConstructorVal) -> Result<usize, NatDefinitionElabError> {
     let mut type_ = &info.base.type_;
     let mut explicit = 0;
     for index in 0..(info.num_params as usize + info.num_fields as usize) {

@@ -22,6 +22,18 @@ pub(super) fn default_value(domain: &Expr) -> Option<&Expr> {
     .then_some(value)
 }
 
+/// `Expr.isAutoParam` is syntactic, matching `default_value` and `App.lean:472`.
+pub(super) fn is_auto_param(domain: &Expr) -> bool {
+    let ExprNode::App { f, .. } = domain.node() else {
+        return false;
+    };
+    let ExprNode::App { f, .. } = f.node() else {
+        return false;
+    };
+    matches!(f.node(), ExprNode::Const { name, .. }
+        if name == &Name::from_components(["autoParam"]))
+}
+
 impl Context {
     /// Expand one already-rebuilt binder, using the ordinary application
     /// worklist to check both its type and its default. The global qualification

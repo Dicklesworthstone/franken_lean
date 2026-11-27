@@ -152,6 +152,12 @@ pub const ROWS: &[Row] = &[
         Honored,
     ),
     row(
+        "backward.inferInstanceAs.wrap",
+        Bool(true),
+        "Lean/Meta/WrapInstance.lean:70",
+        Honored,
+    ),
+    row(
         "bootstrap.genMatcherCode",
         Bool(true),
         "Lean/Meta/Match/Match.lean:1069",
@@ -1014,7 +1020,9 @@ mod tests {
                 Nat(value) => ("Nat", value.to_string()),
             };
             assert_eq!(
-                declaration.first().map(|first| first.trim_end()),
+                declaration
+                    .first()
+                    .map(|first| first.trim_end().trim_start_matches("public ")),
                 Some(
                     format!(
                         "register_builtin_option {} : {expected_type} := {{",
@@ -1101,6 +1109,8 @@ mod tests {
             [
                 "genCtorIdx",
                 "bootstrap.inductiveCheckResultingUniverse",
+                "backward.match.rowMajor",
+                "backward.inferInstanceAs.wrap",
                 "checkBinderAnnotations",
                 "allowUnsafeReducibility",
                 "simprocs",

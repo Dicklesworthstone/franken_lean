@@ -212,7 +212,9 @@ fn complex(syntax: &Syntax, environment: &Environment) -> bool {
 }
 
 /// The element patterns of `⟨p, …⟩`, if `syntax` is one.
-fn anonymous_elements(syntax: &Syntax) -> Result<Option<Vec<&Syntax>>, NatDefinitionElabError> {
+pub(super) fn anonymous_elements(
+    syntax: &Syntax,
+) -> Result<Option<Vec<&Syntax>>, NatDefinitionElabError> {
     let kind = parser_kind(&["Term", "anonymousCtor"]);
     if syntax.kind() != Some(&kind) {
         return Ok(None);

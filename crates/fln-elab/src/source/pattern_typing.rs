@@ -1330,7 +1330,38 @@ impl Model<'_> {
                 };
                 Expr::forall_e(binder_name.clone(), binder_type, body, *binder_info)
             }
-            // A metavariable under a `let`, metadata or a projection is outside the model.
+            ExprNode::LetE {
+                decl_name,
+                type_,
+                value,
+                body,
+                non_dep,
+            } => {
+                let (Some(type_), Some(value), Some(body)) = (
+                    self.inst(type_, depth + 1)?,
+                    self.inst(value, depth + 1)?,
+                    self.inst(body, depth + 1)?,
+                ) else {
+                    return Ok(None);
+                };
+                Expr::let_e(decl_name.clone(), type_, value, body, *non_dep)
+            }
+            ExprNode::MData { data, expr } => {
+                let Some(expr) = self.inst(expr, depth + 1)? else {
+                    return Ok(None);
+                };
+                Expr::mdata(data.clone(), expr)
+            }
+            ExprNode::Proj {
+                struct_name,
+                idx,
+                expr,
+            } => {
+                let Some(expr) = self.inst(expr, depth + 1)? else {
+                    return Ok(None);
+                };
+                Expr::proj(struct_name.clone(), *idx, expr)
+            }
             _ => return Ok(None),
         }))
     }
@@ -1588,6 +1619,43 @@ impl Model<'_> {
             return self.application(
                 (&constructor, false),
                 &arguments,
+                &expected,
+                ensure,
+                variables,
+                depth,
+            );
+        }
+        if let Some(elements) = patterns::anonymous_elements(syntax)? {
+            let Some(expected) = self.inst(expected, 0)? else {
+                return Ok(Err(Stop::Unknown));
+            };
+            let expected = self.reduce_head(&expected)?;
+            let (head, _) = spine(&expected);
+            let Some(family) = const_name(head) else {
+                return Ok(Err(Stop::Unknown));
+            };
+            let Some(info) = self.inductive(family) else {
+                return Ok(Err(Stop::Unknown));
+            };
+            let [constructor] = info.ctors.as_slice() else {
+                return Ok(Err(Stop::Unknown));
+            };
+            let constructor = constructor.clone();
+            let Some(ctor_info) = self.constructor(&constructor) else {
+                return Ok(Err(Stop::Unknown));
+            };
+            let explicit = anonymous_ctor::explicit_fields(&ctor_info)?;
+            if elements.len() > explicit && explicit >= 1 {
+                let Syntax::Node { args, .. } = syntax else {
+                    return Ok(Err(Stop::Unknown));
+                };
+                let items = expect_null_args(&args[1], "anonymous constructor fields")?;
+                let nested = anonymous_ctor::nest_fields(items, explicit);
+                return self.pattern(&nested, &expected, ensure, variables, depth + 1);
+            }
+            return self.application(
+                (&constructor, false),
+                &elements,
                 &expected,
                 ensure,
                 variables,
@@ -1971,37 +2039,51 @@ impl Model<'_> {
             }
             let mut trial = self.cx.clone();
             let result: Result<(), NatDefinitionElabError> = (|| {
-                for (local, type_, value) in &locals {
+                let mut pending: Vec<_> = locals
+                    .iter()
+                    .map(|(local, type_, value)| (*local, type_.clone(), value.clone()))
+                    .collect();
+                while !pending.is_empty() {
                     trial.tick()?;
-                    if trial
-                        .elimination_reads(type_)?
-                        .iter()
-                        .any(|id| !trial.txn.lctx.contains(id))
-                    {
+                    let mut deferred = Vec::new();
+                    let mut progressed = false;
+                    for (local, type_, value) in pending {
+                        trial.tick()?;
+                        let type_ready = !trial
+                            .elimination_reads(&type_)?
+                            .iter()
+                            .any(|id| !trial.txn.lctx.contains(id));
+                        let is_param = value == Expr::fvar(local.id.clone());
+                        let value_ready = is_param
+                            || !trial
+                                .elimination_reads(&value)?
+                                .iter()
+                                .any(|id| !trial.txn.lctx.contains(id));
+                        if !type_ready || !value_ready {
+                            deferred.push((local, type_, value));
+                            continue;
+                        }
+                        if is_param {
+                            trial.txn.lctx.add_param(
+                                local.id.clone(),
+                                local.name.clone(),
+                                type_,
+                                BinderInfo::Default,
+                            );
+                        } else {
+                            trial.txn.lctx.add_let(
+                                local.id.clone(),
+                                local.name.clone(),
+                                type_,
+                                value,
+                            );
+                        }
+                        progressed = true;
+                    }
+                    if !progressed {
                         return Err(unsupported());
                     }
-                    if *value == Expr::fvar(local.id.clone()) {
-                        trial.txn.lctx.add_param(
-                            local.id.clone(),
-                            local.name.clone(),
-                            type_.clone(),
-                            BinderInfo::Default,
-                        );
-                    } else {
-                        if trial
-                            .elimination_reads(value)?
-                            .iter()
-                            .any(|id| !trial.txn.lctx.contains(id))
-                        {
-                            return Err(unsupported());
-                        }
-                        trial.txn.lctx.add_let(
-                            local.id.clone(),
-                            local.name.clone(),
-                            type_.clone(),
-                            value.clone(),
-                        );
-                    }
+                    pending = deferred;
                 }
                 if trial
                     .elimination_reads(&expected)?
@@ -2670,6 +2752,22 @@ impl Model<'_> {
                 };
                 Expr::app(f, a)
             }
+            ExprNode::MData { data, expr } => {
+                let Some(expr) = self.abstract_term(expr, index, placeholder, depth + 1)? else {
+                    return Ok(None);
+                };
+                Expr::mdata(data.clone(), expr)
+            }
+            ExprNode::Proj {
+                struct_name,
+                idx,
+                expr,
+            } => {
+                let Some(expr) = self.abstract_term(expr, index, placeholder, depth + 1)? else {
+                    return Ok(None);
+                };
+                Expr::proj(struct_name.clone(), *idx, expr)
+            }
             ExprNode::FVar { .. }
             | ExprNode::Const { .. }
             | ExprNode::Lit { .. }
@@ -2774,6 +2872,14 @@ fn occurs(id: &Name, expr: &Expr, depth: usize) -> Option<bool> {
         | ExprNode::ForallE {
             binder_type, body, ..
         } => Some(occurs(id, binder_type, depth + 1)? || occurs(id, body, depth + 1)?),
+        ExprNode::LetE {
+            type_, value, body, ..
+        } => Some(
+            occurs(id, type_, depth + 1)?
+                || occurs(id, value, depth + 1)?
+                || occurs(id, body, depth + 1)?,
+        ),
+        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => occurs(id, expr, depth + 1),
         _ => None,
     }
 }
@@ -2832,6 +2938,16 @@ fn collect_fvars(expr: &Expr, seen: &mut Vec<FVarId>, depth: usize) {
         } => {
             collect_fvars(binder_type, seen, depth + 1);
             collect_fvars(body, seen, depth + 1);
+        }
+        ExprNode::LetE {
+            type_, value, body, ..
+        } => {
+            collect_fvars(type_, seen, depth + 1);
+            collect_fvars(value, seen, depth + 1);
+            collect_fvars(body, seen, depth + 1);
+        }
+        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+            collect_fvars(expr, seen, depth + 1);
         }
         _ => {}
     }

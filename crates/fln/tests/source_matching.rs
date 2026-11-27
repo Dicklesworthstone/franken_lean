@@ -1143,3 +1143,105 @@ theorem decReduces : pick 0 (myDec (0 : Nat)) = 0 :=
 "#,
     );
 }
+
+#[test]
+fn fin_projection_pattern_typing_dite_expected_propagation_and_infer_instance_as() {
+    // 1. Anonymous constructor + structure projection pattern typing with
+    //    `@[match_pattern]` definition (`Fin.eq_of_val_eq` at Prelude:2324).
+    let fin_def = r#"
+@[match_pattern] def myRfl {α : Sort u} {a : α} : Eq a a := Eq.refl a
+inductive MyLt (n : Nat) : Nat -> Prop where
+  | base : MyLt n (Nat.succ n)
+  | step {m : Nat} : MyLt n m -> MyLt n (Nat.succ m)
+structure MyFin (n : Nat) where
+  val : Nat
+  isLt : MyLt val n
+"#;
+    check(&format!(
+        "{fin_def}
+theorem finEqHoles {{n}} : ∀ {{i j : MyFin n}}, Eq i.val j.val → Eq i j
+  | ⟨_, _⟩, ⟨_, _⟩, myRfl => rfl
+theorem finEqFirstNamed {{n}} : ∀ {{i j : MyFin n}}, Eq i.val j.val → Eq i j
+  | ⟨a, _⟩, ⟨_, _⟩, myRfl => rfl
+theorem finEqSecondNamed {{n}} : ∀ {{i j : MyFin n}}, Eq i.val j.val → Eq i j
+  | ⟨_, _⟩, ⟨b, _⟩, myRfl => rfl"
+    ));
+    for bad in [
+        format!(
+            "{fin_def}
+theorem bad {{n}} : ∀ {{i j : MyFin n}}, Eq i.val j.val → Eq i j
+  | ⟨a, _⟩, ⟨b, _⟩, myRfl => rfl"
+        ),
+        format!(
+            "{fin_def}
+theorem bad {{n}} : ∀ {{i j : MyFin n}}, Eq i.val j.val → Eq i j
+  | ⟨0, _⟩, ⟨1, _⟩, myRfl => rfl"
+        ),
+    ] {
+        let e = engine();
+        let root = e.logical_root(&KVMap::new());
+        assert!(
+            e.check_source_files(
+                &[bad.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .is_err(),
+            "must refuse invalid projection rfl pattern: {bad}"
+        );
+        assert_eq!(e.logical_root(&KVMap::new()), root);
+    }
+
+    // 2. Early expected-type propagation across multi-arg `dite` (`BitVec.decEq`
+    //    at Prelude:2375) and `inferInstanceAs` / `inferInstanceAs <| ...`
+    //    (`BitVec` / `UInt8` / `UInt32` decidable order instances).
+    check(
+        r#"
+structure Box (w : Nat) where
+  ofVal ::
+  toVal : Nat
+def Box.decEq {w : Nat} (x y : Box w) : Decidable (Eq x y) :=
+  match x, y with
+  | ⟨n⟩, ⟨m⟩ =>
+    dite (Eq n m)
+      (fun h => Decidable.isTrue (h ▸ rfl))
+      (fun h => Decidable.isFalse (fun h' => h (match h' with | Eq.refl _ => rfl)))
+
+class MyPred (α : Type) where
+  holds : α -> α -> Prop
+instance : MyPred Nat where
+  holds a b := Eq a b
+instance (a b : Nat) : Decidable (MyPred.holds a b) :=
+  inferInstanceAs (Decidable (Eq a b))
+instance (w : Nat) : MyPred (Box w) where
+  holds a b := MyPred.holds a.toVal b.toVal
+instance (w : Nat) (a b : Box w) : Decidable (MyPred.holds a b) :=
+  inferInstanceAs (Decidable (MyPred.holds a.toVal b.toVal))
+def viaPipe (w : Nat) (a b : Box w) : Decidable (MyPred.holds a b) :=
+  inferInstanceAs <| Decidable (MyPred.holds a.toVal b.toVal)
+set_option backward.inferInstanceAs.wrap false in
+def withoutExpected := inferInstanceAs (Decidable (Eq (0 : Nat) 0))
+"#,
+    );
+
+    // Negative controls for `inferInstanceAs` matching pinned Lean 4.32.0:
+    // missing expected type (when wrap=true), non-defeq type, missing instance.
+    for bad in [
+        "def bad := inferInstanceAs (Decidable (Eq (0 : Nat) 0))",
+        "def bad : Decidable (Eq (0 : Nat) 1) := inferInstanceAs (Decidable (Eq (0 : Nat) 0))",
+        "class EmptyClass (α : Type) where\n  x : α\ndef bad : EmptyClass Nat := inferInstanceAs (EmptyClass Nat)",
+    ] {
+        let e = engine();
+        let root = e.logical_root(&KVMap::new());
+        assert!(
+            e.check_source_files(
+                &[bad.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .is_err(),
+            "must refuse invalid inferInstanceAs: {bad}"
+        );
+        assert_eq!(e.logical_root(&KVMap::new()), root);
+    }
+}

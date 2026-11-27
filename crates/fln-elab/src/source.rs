@@ -2259,17 +2259,114 @@ impl Context {
         Ok(term)
     }
 
-    /// The result of `type_` after `count` more binders, when it depends on none of them. As
-    /// the pin's `getForallBody`, the binders are read as written.
-    fn independent_result(type_: &Expr, count: usize) -> Option<Expr> {
-        let mut result = type_;
-        for _ in 0..count {
-            let ExprNode::ForallE { body, .. } = result.node() else {
-                return None;
+    /// The result of `type_` after consuming `count` remaining positional
+    /// arguments (skipping intervening implicit/instance binders when
+    /// `!explicit`, mirroring `getResultingTypeCore?`,
+    /// `Lean/Elab/App.lean:449-505`), when it depends on none of them.
+    pub(super) fn independent_result(
+        &mut self,
+        type_: &Expr,
+        count: usize,
+        explicit: bool,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let mut remaining = count;
+        let mut current = type_.clone();
+        loop {
+            self.tick()?;
+            let reduced = if matches!(current.node(), ExprNode::ForallE { .. })
+                || current.has_loose_bvars()
+            {
+                current.clone()
+            } else {
+                self.whnf(&current)?
             };
-            result = body;
+            if let ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } = reduced.node()
+            {
+                if !explicit && *binder_info == BinderInfo::StrictImplicit && remaining == 0 {
+                    break;
+                }
+                if !explicit && *binder_info != BinderInfo::Default {
+                    current = body.clone();
+                    continue;
+                }
+                if remaining > 0 {
+                    remaining -= 1;
+                    current = body.clone();
+                    continue;
+                }
+                if !explicit
+                    && (optional::default_value(binder_type).is_some()
+                        || optional::is_auto_param(binder_type))
+                {
+                    current = body.clone();
+                    continue;
+                }
+                if reduced.has_loose_bvars() {
+                    return Ok(None);
+                }
+                if !explicit && self.has_optional_parameter(&reduced)? {
+                    return Ok(None);
+                }
+                break;
+            }
+            if remaining > 0 {
+                return Ok(None);
+            }
+            break;
         }
-        (!result.has_loose_bvars()).then(|| result.clone())
+        Ok((!current.has_loose_bvars()).then_some(current))
+    }
+
+    /// `Term.inferInstanceAs` (`Lean/Elab/BuiltinTerm.lean:371-399`):
+    /// `inferInstanceAs T` and `inferInstanceAs <| T`.
+    fn elaborate_infer_instance_as(
+        &mut self,
+        args: &[Syntax],
+        expected: Option<&Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let type_syntax = match args {
+            [keyword, type_syntax] => {
+                expect_atom(keyword, "inferInstanceAs", "inferInstanceAs")?;
+                type_syntax
+            }
+            [keyword, pipe, type_syntax] => {
+                expect_atom(keyword, "inferInstanceAs", "inferInstanceAs")?;
+                expect_atom(pipe, "<|", "inferInstanceAs")?;
+                type_syntax
+            }
+            _ => return Err(failure(SourceInferenceError::Scope)),
+        };
+        let wrap = self.txn.options.get_bool(
+            &Name::from_components(["backward", "inferInstanceAs", "wrap"]),
+            true,
+        );
+        let expected_type = if wrap {
+            let expected = expected.ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+            let expected = self.instantiate(expected)?;
+            if expected.has_expr_mvar() {
+                return Err(failure(SourceInferenceError::ExpectedType));
+            }
+            Some(expected)
+        } else {
+            None
+        };
+        let type_term = self.term(type_syntax, None)?;
+        let _ = self.sort_level(&type_term)?;
+        if let Some(expected_type) = &expected_type {
+            self.constrain_result_hint(&type_term.value, expected_type)?;
+        }
+        self.flush(false)?;
+        self.resolve_instances(false)?;
+        let type_ = self.instantiate(&type_term.value)?;
+        let hole = self.instance_hole(type_.clone())?;
+        self.resolve_instances(false)?;
+        let value = self.instantiate(&hole)?;
+        Ok(Typed { value, type_ })
     }
 
     /// Explicit application is a property of this syntactic head, not of a
@@ -3492,6 +3589,16 @@ impl Context {
                                     }
                                     if kind == &parser_kind(&["Term", "subst"]) {
                                         let term = self.substitution(args, expected.as_ref())?;
+                                        values.push(if finish {
+                                            self.finish_term(term, expected.as_ref())?
+                                        } else {
+                                            term
+                                        });
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "inferInstanceAs"]) {
+                                        let term = self
+                                            .elaborate_infer_instance_as(args, expected.as_ref())?;
                                         values.push(if finish {
                                             self.finish_term(term, expected.as_ref())?
                                         } else {
@@ -5191,28 +5298,33 @@ impl Context {
                                     let instance = *binder_info == BinderInfo::InstImplicit;
                                     let domain = self.projection_domain(binder_type.clone())?;
                                     let codomain = body.clone();
-                                    // Under `@`, a hole, `?x` or `by` never carries the expected
-                                    // result into the telescope (`shouldPropagateExpectedTypeFor`).
-                                    let propagates = !explicit
-                                        || ![
-                                            ["Term", "hole"],
-                                            ["Term", "syntheticHole"],
-                                            ["Term", "byTactic"],
-                                        ]
-                                        .iter()
-                                        .any(|kind| first.kind() == Some(&parser_kind(kind)));
-                                    // Under `@`, the pin propagates the expected result before
-                                    // every other written argument until it unifies, once the
-                                    // result depends on none of the arguments left
-                                    // (`propagateExpectedType`, vendored Lean/Elab/App.lean:563). So
-                                    // `@GetElem.getElem _ _ _ _ _ xs i h` fixes its output before
-                                    // `xs`, ahead of the instance its holes leave pending.
-                                    if explicit
-                                        && propagates
+                                    // `shouldPropagateExpectedTypeFor` (vendored
+                                    // Lean/Elab/App.lean:516-523): a hole, `?x` or `by` never
+                                    // triggers early expected-type propagation.
+                                    let propagates_early = ![
+                                        ["Term", "hole"],
+                                        ["Term", "syntheticHole"],
+                                        ["Term", "byTactic"],
+                                    ]
+                                    .iter()
+                                    .any(|kind| first.kind() == Some(&parser_kind(kind)));
+                                    let propagates = !explicit || propagates_early;
+                                    // Propagate the expected result before earlier written
+                                    // arguments once the result depends on none of the arguments
+                                    // left (`propagateExpectedType`, vendored
+                                    // Lean/Elab/App.lean:563-603), skipping `Prop` and out-param
+                                    // results (`resultIsOutParamSupport`).
+                                    if propagates_early
                                         && !rest.is_empty()
                                         && let Some(expected) = &expected
-                                        && let Some(result) =
-                                            Self::independent_result(&codomain, rest.len())
+                                        && self
+                                            .application_result_out_param(&function, explicit)?
+                                            .is_none()
+                                        && let Some(result) = self.independent_result(
+                                            &codomain,
+                                            rest.len(),
+                                            explicit,
+                                        )?
                                         && self.instantiate(expected)? != Expr::sort(Level::zero())
                                     {
                                         self.constrain_result_hint(&result, expected)?;

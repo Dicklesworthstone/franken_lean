@@ -272,6 +272,17 @@ impl Context {
                 state.positional.pop_front()
             };
             if let Some(value) = value {
+                let propagates_early = matches!(
+                    &value,
+                    ApplicationValue::Syntax(syntax)
+                        if ![
+                            ["Term", "hole"],
+                            ["Term", "syntheticHole"],
+                            ["Term", "byTactic"],
+                        ]
+                        .iter()
+                        .any(|kind| syntax.kind() == Some(&parser_kind(kind)))
+                );
                 if state.positional.is_empty()
                     && state.named.is_empty()
                     && !state.ellipsis
@@ -283,6 +294,20 @@ impl Context {
                 {
                     self.do_operation_result_hint(&state.function, &codomain, expected)?;
                     self.constrain_result_hint(&codomain, expected)?;
+                } else if propagates_early
+                    && !state.positional.is_empty()
+                    && state.named.is_empty()
+                    && !state.ellipsis
+                    && state.eta.is_empty()
+                    && let Some(expected) = &state.result_expected
+                    && self
+                        .application_result_out_param(&state.function, state.explicit)?
+                        .is_none()
+                    && let Some(result) =
+                        self.independent_result(&codomain, state.positional.len(), state.explicit)?
+                    && self.instantiate(expected)? != Expr::sort(Level::zero())
+                {
+                    self.constrain_result_hint(&result, expected)?;
                 }
                 return Ok(Some(Argument {
                     value,
