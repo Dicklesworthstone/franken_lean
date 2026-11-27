@@ -1338,6 +1338,13 @@ impl Context {
     /// pin supplies before choosing tactic alternatives. Only a reference in
     /// the surviving term selects recursion: a failed or ill-typed alternative
     /// can discard it without turning the definition into a recursive one.
+    pub(super) fn declared_binder_name(&self, local: &LocalDecl) -> Name {
+        self.declared_binder_names
+            .get(&local.id)
+            .cloned()
+            .unwrap_or_else(|| local.user_name.clone())
+    }
+
     fn bind_predefinition(
         &mut self,
         name: &Name,
@@ -1348,7 +1355,7 @@ impl Context {
         for parameter in parameters.iter().rev() {
             self.tick()?;
             type_ = Expr::forall_e(
-                parameter.user_name.clone(),
+                self.declared_binder_name(parameter),
                 self.instantiate(&parameter.type_)?,
                 type_
                     .abstract_fvar(&parameter.id, 0)
@@ -1876,7 +1883,7 @@ impl Context {
                 .abstract_fvar(&local.id, 0)
                 .map_err(|_| failure(SourceInferenceError::Scope))?;
             full_type = Expr::forall_e(
-                local.user_name.clone(),
+                self.declared_binder_name(local),
                 self.instantiate(&local.type_)?,
                 full_type,
                 local.binder_info,

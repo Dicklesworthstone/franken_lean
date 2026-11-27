@@ -389,7 +389,7 @@ impl Context {
                 .abstract_fvar(&parameter.id, 0)
                 .map_err(|_| failure(SourceInferenceError::Scope))?;
             type_ = Expr::forall_e(
-                parameter.user_name.clone(),
+                self.declared_binder_name(parameter),
                 self.instantiate(&parameter.type_)?,
                 type_,
                 parameter.binder_info,

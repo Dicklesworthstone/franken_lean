@@ -444,6 +444,8 @@ impl Context {
             self.txn
                 .lctx
                 .add_param(id.clone(), name, binder_type.clone(), *binder_info);
+            self.declared_binder_names
+                .insert(id.clone(), binder_name.clone());
             state.locals.push(
                 self.txn
                     .lctx
@@ -565,11 +567,18 @@ impl Context {
                 .as_ref()
                 .map(|ty| self.whnf(ty))
                 .transpose()?;
-            let (hint, codomain) = match expected.as_ref().map(Expr::node) {
+            let (declared_name, hint, codomain) = match expected.as_ref().map(Expr::node) {
                 Some(ExprNode::ForallE {
-                    binder_type, body, ..
-                }) => (Some(binder_type.clone()), Some(body.clone())),
-                _ => (None, None),
+                    binder_name,
+                    binder_type,
+                    body,
+                    ..
+                }) => (
+                    Some(binder_name.clone()),
+                    Some(binder_type.clone()),
+                    Some(body.clone()),
+                ),
+                _ => (None, None, None),
             };
             let (domain, level) = if let Some((domain, level)) = &annotated {
                 if let Some(hint) = &hint {
@@ -604,6 +613,11 @@ impl Context {
             self.txn
                 .lctx
                 .add_param(id.clone(), name, domain, group.style);
+            if state.lambda
+                && let Some(declared_name) = declared_name
+            {
+                self.declared_binder_names.insert(id.clone(), declared_name);
+            }
             state.locals.push(
                 self.txn
                     .lctx

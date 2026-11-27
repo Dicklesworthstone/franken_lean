@@ -959,7 +959,7 @@ impl Context {
         for local in parameters.iter().rev() {
             self.tick()?;
             reference_type = Expr::forall_e(
-                local.user_name.clone(),
+                self.declared_binder_name(local),
                 self.instantiate(&local.type_)?,
                 reference_type
                     .abstract_fvar(&local.id, 0)

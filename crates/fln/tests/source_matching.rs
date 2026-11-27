@@ -1040,3 +1040,106 @@ fn field_index_refinement_does_not_make_arbitrary_functions_injective() {
     );
     assert_eq!(e.logical_root(&KVMap::new()), root);
 }
+
+#[test]
+fn row_major_match_and_impossible_omitted_branches_match_pinned_rules() {
+    let le_def = "\
+inductive Le (n : Nat) : Nat -> Prop where
+  | refl : Le n n
+  | step {m : Nat} : Le n m -> Le n (Nat.succ m)
+def myPred : Nat -> Nat
+  | 0 => 0
+  | Nat.succ n => n
+def leTrans {a b c : Nat} (h1 : Le a b) (h2 : Le b c) : Le a c :=
+  match h2 with
+  | Le.refl => h1
+  | Le.step h => Le.step (leTrans h1 h)
+def leSucc (n : Nat) : Le n (Nat.succ n) := Le.step Le.refl
+";
+    // Row-major selection splits on the refutable 3rd column (`Le`) before
+    // splitting wildcard columns, matching pinned `Nat.pred_le_pred`.
+    check(&format!(
+        "{le_def}
+theorem predLePred : {{n m : Nat}} -> Le n m -> Le (myPred n) (myPred m)
+  | _, _, Le.refl => Le.refl
+  | 0, Nat.succ _, Le.step h => h
+  | Nat.succ _, Nat.succ _, Le.step h => leTrans (leSucc _) h"
+    ));
+
+    // Omitted constructor branches are discharged when branch-introduced or
+    // generalized dependent hypotheses prove the branch empty (Nat.le_of_ble_eq_true
+    // and Nat.div/Nat.modCore fuel patterns).
+    check(&format!(
+        "{le_def}
+def ble : Nat -> Nat -> Bool
+  | 0, _ => true
+  | Nat.succ _, 0 => false
+  | Nat.succ n, Nat.succ m => ble n m
+def zeroLe : (n : Nat) -> Le 0 n
+  | 0 => Le.refl
+  | Nat.succ n => Le.step (zeroLe n)
+def succLeSucc {{n m : Nat}} (h : Le n m) : Le (Nat.succ n) (Nat.succ m) :=
+  match h with
+  | Le.refl => Le.refl
+  | Le.step h => Le.step (succLeSucc h)
+theorem leOfBle {{n m : Nat}} (h : ble n m = true) : Le n m :=
+  match n, m with
+  | 0, _ => zeroLe _
+  | Nat.succ _, Nat.succ _ => succLeSucc (leOfBle h)
+def fuelStep (x fuel : Nat) (h : Le (Nat.succ x) fuel) : Nat :=
+  match fuel with
+  | Nat.succ _ => 0"
+    ));
+
+    // Negative controls: un-generalized ambient contradictions, explicit
+    // `generalizing := false`, non-variable constructor discriminants, user
+    // `let` bindings, and recursor IHs must NEVER discharge an omitted branch.
+    for bad in [
+        "def bad (h : False) (n : Nat) : Nat := match n with | Nat.succ k => k".to_string(),
+        "def bad (h : false = true) (n : Nat) : Nat := match n with | Nat.succ k => k".to_string(),
+        format!(
+            "{le_def}def bad (x fuel : Nat) (h : Le (Nat.succ x) fuel) : Nat := \
+             match (generalizing := false) fuel with | Nat.succ _ => 0"
+        ),
+        "def bad (k : Nat) : Nat := match Nat.succ k with | Nat.succ n => n".to_string(),
+        "def bad (k : Nat) : Nat := let m := Nat.succ k; match m with | Nat.succ n => n"
+            .to_string(),
+        "def bogus (e : False) : Nat -> False | 0 => e".to_string(),
+    ] {
+        let e = engine();
+        let root = e.logical_root(&KVMap::new());
+        assert!(
+            e.check_source_files(
+                &[bad.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .is_err(),
+            "must refuse omitted branch: {bad}"
+        );
+        assert_eq!(e.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
+fn match_motive_kabstract_sees_through_transparent_borrowed_numeral_mdata() {
+    // Mirrors `Nat.modCore_lt` (`Init/Prelude.lean:2219`): `myDec` takes `@& Nat`,
+    // leaving a `borrowed` `MData` wrapper on `0`'s type argument in the
+    // discriminant that differs structurally from `0 : Nat` in the target.
+    check(
+        r#"
+inductive Dec (p : Prop) where
+  | isFalse (h : p -> False) : Dec p
+  | isTrue (h : p) : Dec p
+def myDec (n : @& Nat) : Dec (n = n) := Dec.isTrue rfl
+def pick (n : Nat) (d : Dec (n = n)) : Nat :=
+  match d with
+  | Dec.isTrue _ => 0
+  | Dec.isFalse _ => 1
+theorem decReduces : pick 0 (myDec (0 : Nat)) = 0 :=
+  match myDec 0 with
+  | Dec.isTrue _ => rfl
+  | Dec.isFalse h => False.elim (h rfl)
+"#,
+    );
+}

@@ -374,6 +374,7 @@ impl Context {
         context: &EliminationContext<'_>,
         alternative: Option<&Alternative<'_>>,
         hypotheses: &mut Vec<(Name, Name)>,
+        induction_hypotheses: &mut HashSet<FVarId>,
     ) -> Result<(ProofGoal, Option<CaseBranch>), NatDefinitionElabError> {
         let &EliminationContext {
             parameters,
@@ -448,7 +449,8 @@ impl Context {
                 name = self.fresh_name()?;
                 hypotheses.push((name.clone(), public));
             }
-            self.elimination_binder(&mut branch, name, induction)?;
+            let ih = self.elimination_binder(&mut branch, name, induction)?;
+            induction_hypotheses.insert(ih.id);
         }
         if names.len() > used {
             return Err(error(TacticError::EliminationArity));
@@ -612,7 +614,7 @@ impl Context {
         };
         let refined = if parts.equation.is_none()
             && (recursive
-                || parts.generated
+                || (parts.generated || parts.generalizing)
                     && !parts.is_conditional()
                     && matches!(major.value.node(), ExprNode::FVar { .. }))
         {
@@ -749,6 +751,38 @@ impl Context {
         // compiler; ordinary source locals still follow the pin's motive/dependency rule.
         let shared = parts.generated && self.matrix_shared_columns.contains(&local.user_name);
         Ok((generalized || motive || shared).then_some(local))
+    }
+
+    /// Whether `major` is a generated matrix subject whose value was directly
+    /// specialized to a constructor of `family` by an earlier branch substitution
+    /// (not a user `let`, whose alias remains an `FVar`), matching pinned
+    /// `!isNextVar` / `processNonVariable` (`Lean/Meta/Match/Match.lean:1022`).
+    fn is_matrix_specialized_constructor(
+        &self,
+        major: &LocalDecl,
+        family: &fln_env::constants::InductiveVal,
+    ) -> bool {
+        let Some(mut value) = major.value.as_ref() else {
+            return false;
+        };
+        let is_matrix_subject = |local: &LocalDecl| {
+            matches!(
+                local.user_name.leaf_view(),
+                fln_core::name::LeafView::Num(_)
+            ) && local.user_name.parent().is_anonymous()
+        };
+        if major.user_name.is_anonymous()
+            && let ExprNode::FVar { id } = value.node()
+            && let Some(alias) = self.txn.lctx.find(id)
+            && is_matrix_subject(alias)
+            && let Some(alias_value) = alias.value.as_ref()
+        {
+            value = alias_value;
+        } else if !is_matrix_subject(major) {
+            return false;
+        }
+        let (head, _) = operators::spine(value);
+        matches!(head.node(), ExprNode::Const { name, .. } if family.ctors.contains(name))
     }
 
     /// Whether `target` certainly lives outside `Prop`: its sort is a successor level.
@@ -951,6 +985,25 @@ impl Context {
         };
         let index_ids: HashSet<_> = indices.iter().map(|local| local.id.clone()).collect();
         if equations.is_none() {
+            if let EliminationSyntax::Match(parts) = input
+                && parts.generated
+                && self.is_matrix_specialized_constructor(&major, &family)
+            {
+                let patterns = self.match_patterns(*parts, name, &family.ctors, &family_type)?;
+                if patterns.fallback.is_none() && patterns.constructors.len() < family.ctors.len() {
+                    return self.eliminate_constrained_indices(
+                        proof,
+                        goal,
+                        input,
+                        induction,
+                        &major,
+                        &family,
+                        levels,
+                        &parameters,
+                        &index_values,
+                    );
+                }
+            }
             if matches!(
                 input,
                 EliminationSyntax::Match(_) | EliminationSyntax::EmptyMatrix(_)
@@ -1309,7 +1362,12 @@ impl Context {
                 }
             }
         }
+        let is_source_match = matches!(
+            input,
+            EliminationSyntax::Match(_) | EliminationSyntax::RecursiveMatch(_)
+        );
         if scoped
+            && !is_source_match
             && pre_tactic.is_none()
             && equations.is_none()
             && fallback.is_none()
@@ -1376,6 +1434,7 @@ impl Context {
                 fallback_used = true;
             }
             let mut hypotheses = Vec::new();
+            let mut induction_hypotheses = HashSet::new();
             let (branch, mut tracked) = self.elimination_branch(
                 branch,
                 &constructor,
@@ -1407,6 +1466,7 @@ impl Context {
                 },
                 alternative,
                 &mut hypotheses,
+                &mut induction_hypotheses,
             )?;
             let work_start = proof.work.len();
             let (branch, substitutions) = if let Some(equations) = equations {
@@ -1415,6 +1475,15 @@ impl Context {
                 (Some(branch), Vec::new())
             };
             if let Some(mut branch) = branch {
+                for step in &substitutions {
+                    for (old, new) in &step.replacements {
+                        if induction_hypotheses.contains(old)
+                            && let ExprNode::FVar { id } = new.node()
+                        {
+                            induction_hypotheses.insert(id.clone());
+                        }
+                    }
+                }
                 if let Some(mut tracked) = tracked.take() {
                     tracked.substitutions.extend(substitutions);
                     tracked_branches.insert(branch.id.clone(), tracked);
@@ -1429,17 +1498,40 @@ impl Context {
                             .names,
                     )?;
                 } else if let Some(equations) = equations {
-                    for (internal, public) in hypotheses {
+                    for (internal, public) in &hypotheses {
                         self.specialize_index_hypothesis(
                             &mut branch,
-                            &internal,
-                            public,
+                            internal,
+                            public.clone(),
                             &reverted,
                             equations,
                         )?;
                     }
                 }
                 if scoped && pre_tactic.is_none() && alternative.is_none() {
+                    if is_source_match {
+                        let excluded_names: HashSet<Name> = hypotheses
+                            .iter()
+                            .flat_map(|(internal, public)| [internal.clone(), public.clone()])
+                            .collect();
+                        if self.try_close_impossible_match_branch(
+                            branch,
+                            &retained,
+                            &induction_hypotheses,
+                            &excluded_names,
+                        )? {
+                            branches.push(proof.work.split_off(work_start));
+                            self.txn.lctx = retained.clone();
+                            recursor = self.match_apply(
+                                recursor,
+                                Typed {
+                                    value: hole,
+                                    type_: minor.clone(),
+                                },
+                            )?;
+                            continue;
+                        }
+                    }
                     return Err(error(TacticError::EliminationCoverage));
                 }
                 if script.is_none() && fallback.is_some() {

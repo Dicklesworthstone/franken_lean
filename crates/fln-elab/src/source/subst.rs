@@ -92,16 +92,7 @@ impl Context {
         expression: &Expr,
         pattern: &Expr,
     ) -> Result<Expr, NatDefinitionElabError> {
-        if matches!(pattern.node(), ExprNode::FVar { .. }) {
-            return self.kabstract(expression, pattern);
-        }
-        let key = self.rewrite_head_key(pattern)?;
-        self.kabstract_matching(expression, pattern, |context, candidate, pattern| {
-            if context.rewrite_head_key(candidate)? != key {
-                return Ok(false);
-            }
-            context.coercion_eq(candidate, pattern)
-        })
+        self.kabstract_defeq(expression, pattern)
     }
 
     /// `Term.subst`'s arguments: `h`, `"▸"`, and the one-element operand list.

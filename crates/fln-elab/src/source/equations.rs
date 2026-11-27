@@ -80,10 +80,10 @@ impl Context {
             self.tick()?;
             let ty = self.whnf(&result_type)?;
             let ExprNode::ForallE {
+                binder_name,
                 binder_type,
                 body,
                 binder_info,
-                ..
             } = ty.node()
             else {
                 return Err(failure(SourceInferenceError::ExpectedFunction));
@@ -97,6 +97,8 @@ impl Context {
             self.txn
                 .lctx
                 .add_param(id.clone(), name.clone(), binder_type.clone(), *binder_info);
+            self.declared_binder_names
+                .insert(id.clone(), binder_name.clone());
             parameters.push(
                 self.txn
                     .lctx

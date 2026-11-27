@@ -230,3 +230,73 @@ fn catch_all_equations_bind_abstract_values_without_an_inductive_recursion_rule(
     );
     reject("def bad {A : Type} : A -> Nat | x => 0 | y => let unused : String := 1; 0");
 }
+
+#[test]
+fn recursive_calls_preserve_declared_binder_names_and_defer_implicit_mvars() {
+    // Named self-calls on equation columns, explicit `fun` bodies, combined
+    // header+type binders, `let rec` equation bindings, and type aliases.
+    check(
+        r#"
+def countdown : {n : Nat} -> Nat
+  | 0 => 0
+  | Nat.succ k => countdown (n := k)
+theorem countdown_ok : countdown (n := 3) = 0 := by rfl
+
+def byDecl : (x : Nat) -> Nat := fun y =>
+  match y with
+  | 0 => 0
+  | Nat.succ k => byDecl (x := k)
+
+def headerAndType (a : Nat) : {b : Nat} -> Nat
+  | 0 => a
+  | Nat.succ k => headerAndType (a := a) (b := k)
+theorem header_and_type_ok : headerAndType (a := 7) (b := 2) = 7 := by rfl
+
+def localEq : Nat :=
+  let rec go : {n : Nat} -> Nat
+    | 0 => 0
+    | Nat.succ k => go (n := k)
+  go (n := 2)
+theorem local_eq_ok : localEq = 0 := by rfl
+
+abbrev Fn := {n : Nat} -> Nat
+def viaAlias : Fn
+  | 0 => 0
+  | Nat.succ k => viaAlias (n := k)
+"#,
+    );
+
+    // Implicit decreasing argument solved only by the enclosing application
+    // unifying with the branch goal (mirrors `Nat.pow_pos` at Prelude:2057).
+    check(
+        r#"
+inductive Tag : Nat -> Prop where
+  | base : Tag 0
+  | mk {n : Nat} : Tag n -> Tag (Nat.succ n)
+theorem build : {n : Nat} -> Bool -> Tag n
+  | 0, _ => Tag.base
+  | Nat.succ _, u => Tag.mk (build u)
+theorem buildNested : {n : Nat} -> Bool -> Tag n
+  | 0, _ => Tag.base
+  | Nat.succ _, true => Tag.mk (buildNested true)
+  | Nat.succ _, false => Tag.mk (buildNested false)
+"#,
+    );
+
+    // Negative controls matching pinned Lean 4 v4.32.0:
+    // 1. Equation-column binder names stay inaccessible as locals in the body.
+    reject("def bad : (x : Nat) -> Nat | 0 => x | _ => 0");
+    // 2. Body `fun` binder name does not override declared Pi binder name.
+    reject(
+        "def bad : (x : Nat) -> Nat := fun y => match y with | 0 => 0 | Nat.succ k => bad (y := k)",
+    );
+    // 3. Anonymous arrow `Nat -> Nat` has no named argument `y`.
+    reject("def bad : Nat -> Nat := fun y => match y with | 0 => 0 | Nat.succ k => bad (y := k)");
+    // 4. Local `let rec` outer caller must use declared binder name, not body `fun` binder.
+    reject(
+        "def bad : Nat := let rec go : (x : Nat) -> Nat := fun y => \
+         match y with | 0 => 0 | Nat.succ k => go (x := k); go (y := 2)",
+    );
+    // 5. Genuinely unconstrained implicit decreasing argument stays rejected.
+    reject("def bad : {n : Nat} -> Nat | 0 => 0 | Nat.succ _ => bad");
+}

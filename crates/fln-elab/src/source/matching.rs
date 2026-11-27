@@ -107,7 +107,7 @@ pub(super) struct MatchParts<'a> {
     /// A `match` as written in the source, not one a sugar or the compiler produced.
     written: bool,
     conditional: Option<ConditionalParts<'a>>,
-    generalizing: bool,
+    pub(in crate::source) generalizing: bool,
 }
 
 /// Read the canonical optional `Term.generalizingParam`. Omitting it has the
@@ -560,12 +560,12 @@ impl Context {
                 .abstract_fvar(id, 0)
                 .map_err(|_| failure(SourceInferenceError::Scope))?
         } else {
-            // The pin's motive abstracts the discriminant expression itself,
-            // including an application such as `inst a a` in Prelude's
-            // of_decide_eq_self_eq_true. Preserve the whole computed term as
-            // one binder; no local dependency or captured proof is rewritten.
+            // The pin's motive abstracts the discriminant expression itself via
+            // `Meta.kabstract` (head-keyed `isDefEq`), including applications
+            // such as `inst a a` or `Nat.decLt 0 y` where `@&` leaves `MData`
+            // on numeral types.
             let value = self.instantiate(&major.value)?;
-            self.kabstract(target, &value)?
+            self.kabstract_defeq(target, &value)?
         };
         let mut motive = Expr::lam(
             Name::anonymous(),
@@ -659,11 +659,21 @@ impl Context {
                 .map(MatchStart::Refined);
         }
         let saved = self.clone();
+        let has_explicit_motive = explicit_motive.is_some();
         match self.start_regular_match(parts, major.clone(), expected.clone(), explicit_motive) {
             Ok(build) => Ok(MatchStart::Regular(Box::new(build))),
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
                 MatchError::UnrefinedIndices | MatchError::UnrefinedIndexPattern,
             ))) if !well_founded => {
+                let spent = self.txn.budget.heartbeats_consumed;
+                *self = saved;
+                self.txn.budget.heartbeats_consumed = spent;
+                self.start_refined_match(parts, major, expected, recursive)
+                    .map(MatchStart::Refined)
+            }
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
+                MatchError::MissingConstructor,
+            ))) if !well_founded && !has_explicit_motive && parts.generalizing => {
                 let spent = self.txn.budget.heartbeats_consumed;
                 *self = saved;
                 self.txn.budget.heartbeats_consumed = spent;
@@ -2017,6 +2027,8 @@ impl Context {
         let mut value = self.instantiate(&branch.value)?;
         if state.recursive {
             value = self.lower_recursive_calls(&value, &binders.hypotheses)?;
+        } else {
+            value = self.lower_deferred_matrix_calls(&value)?;
         }
         for local in binders.locals.into_iter().rev() {
             self.tick()?;

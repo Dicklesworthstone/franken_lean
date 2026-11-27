@@ -298,6 +298,7 @@ impl Context {
         self.resolve_instances_with_defaults()?;
         self.flush(true)?;
         let mut value = self.instantiate(&term.value)?;
+        value = self.lower_deferred_matrix_calls(&value)?;
         if self.elimination_reads(&value)?.contains(&recursion.marker) {
             return Err(error(RecursionError::PartialApplication));
         }

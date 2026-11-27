@@ -131,6 +131,23 @@ fn invalid() -> NatDefinitionElabError {
         matching::MatchError::InvalidPattern,
     ))
 }
+/// Whether `pattern` in `arena` is refutable (`Constructor` or `Literal`,
+/// peeling through `Named` aliases), matching pinned `Pattern.isRefutable`
+/// (`Lean/Meta/Match/Match.lean:833-836`).
+fn is_refutable_pattern(mut index: usize, arena: &[Pattern<'_>]) -> bool {
+    let mut hops = 0usize;
+    while hops <= arena.len() {
+        match &arena[index] {
+            Pattern::Bind(_) => return false,
+            Pattern::Named { pattern, .. } => {
+                index = *pattern;
+                hops += 1;
+            }
+            Pattern::Constructor(_) | Pattern::Literal(_) => return true,
+        }
+    }
+    false
+}
 fn sequence(syntax: &Syntax) -> Result<Vec<&Syntax>, NatDefinitionElabError> {
     let elements = expect_null_args(syntax, "pattern matrix columns")?;
     if elements.is_empty() || elements.len() % 2 == 0 {
@@ -1416,6 +1433,32 @@ impl Context {
                         }
                         built.push(body);
                         continue;
+                    }
+                    // Pin (`Lean/Meta/Match/Match.lean:833-836, 985-1000`,
+                    // `backward.match.rowMajor := true`): outside a pinned structural-recursion
+                    // root, move the first refutable column of row 0 to the front while
+                    // preserving the relative order of the other columns; if row 0 is wholly
+                    // irrefutable, it shadows later rows in this submatrix.
+                    if !matrix.recursive_root {
+                        let first_refutable = matrix.rows[0]
+                            .patterns
+                            .iter()
+                            .position(|&pattern| is_refutable_pattern(pattern, &arena));
+                        match first_refutable {
+                            Some(column) if column > 0 => {
+                                let moved = matrix.subjects.remove(column);
+                                matrix.subjects.insert(0, moved);
+                                for row in &mut matrix.rows {
+                                    self.tick()?;
+                                    let moved = row.patterns.remove(column);
+                                    row.patterns.insert(0, moved);
+                                }
+                            }
+                            None if matrix.rows.len() > 1 => {
+                                matrix.rows.truncate(1);
+                            }
+                            _ => {}
+                        }
                     }
                     let subject = matrix.subjects.remove(0);
                     self.bind_named_matrix_column(&mut matrix, &subject, &arena)?;

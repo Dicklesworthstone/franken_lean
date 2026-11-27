@@ -449,4 +449,87 @@ impl Context {
         }
         Ok(())
     }
+
+    /// Discharge an omitted constructor branch of a source `match` using only
+    /// hypotheses introduced or specialized for this branch (never un-reverted
+    /// outer ambient hypotheses and never recursor induction hypotheses),
+    /// matching pinned `Match.processLeaf` (`Lean/Meta/Match/Match.lean:475-485`).
+    pub(super) fn try_close_impossible_match_branch(
+        &mut self,
+        goal: ProofGoal,
+        retained: &LocalContext,
+        excluded_ids: &HashSet<FVarId>,
+        excluded_names: &HashSet<Name>,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let evidence: Vec<Typed> = goal
+            .lctx
+            .decls()
+            .iter()
+            .filter(|local| {
+                local.value.is_none()
+                    && !self.is_matrix_hypothesis(local)
+                    && !excluded_ids.contains(&local.id)
+                    && (local.user_name.is_anonymous()
+                        || !excluded_names.contains(&local.user_name))
+                    && retained
+                        .find(&local.id)
+                        .is_none_or(|outer| outer.type_ != local.type_)
+            })
+            .map(|local| Typed {
+                value: Expr::fvar(local.id.clone()),
+                type_: local.type_.clone(),
+            })
+            .collect();
+        if evidence.is_empty() {
+            return Ok(false);
+        }
+        let saved = self.clone();
+        let attempt = (|| -> Result<bool, NatDefinitionElabError> {
+            self.txn.lctx = goal.lctx.clone();
+            match self.contradict_evidence_goal(goal.clone(), evidence.clone()) {
+                Ok(()) => return Ok(true),
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
+                    TacticError::NoContradiction,
+                ))) => {}
+                Err(problem) => return Err(problem),
+            }
+            self.txn.lctx = goal.lctx.clone();
+            let false_name = Name::from_components(["False"]);
+            if self.txn.env.contains(&false_name) {
+                let false_type = Expr::const_(false_name, Vec::new());
+                let (absurd, child) = self.proof_goal(false_type.clone())?;
+                if let Some(value) = self.empty_evidence(
+                    &Typed {
+                        value: absurd,
+                        type_: false_type,
+                    },
+                    &goal.target,
+                )? {
+                    if self.close_indexed_empty_leaf(child, &evidence)? {
+                        self.close_proof_goal(goal, value)?;
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+            }
+            self.txn.lctx = goal.lctx.clone();
+            self.close_indexed_empty_leaf(goal, &evidence)
+        })();
+        match attempt {
+            Ok(true) => Ok(true),
+            result => {
+                let consumed = self.txn.budget.heartbeats_consumed;
+                let aux_names = self.aux_names.take();
+                *self = saved;
+                self.txn.budget.heartbeats_consumed = consumed;
+                self.aux_names = aux_names;
+                match result {
+                    Ok(false) => Ok(false),
+                    Err(problem) if backtrack::recoverable(&problem) => Ok(false),
+                    Err(problem) => Err(problem),
+                    Ok(true) => unreachable!(),
+                }
+            }
+        }
+    }
 }

@@ -110,12 +110,28 @@ impl Context {
         else {
             return Ok(value.clone());
         };
+        arguments.reverse();
+        let mut instantiated = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            self.tick()?;
+            instantiated.push(self.instantiate(&argument)?);
+        }
+        // Implicit arguments up through the decreasing parameter (e.g.
+        // `Nat.mul_pos (Nat.pow_pos h) h`) may still be unsolved holes until
+        // the enclosing application unifies with the branch goal. Leave the
+        // marker intact for the branch's post-flush lowering pass rather than
+        // rejecting an unsolved hole as `NotDecreasing`.
+        if instantiated[..=recursion.decreasing]
+            .iter()
+            .any(Expr::has_expr_mvar)
+        {
+            return Ok(value.clone());
+        }
         let marker = recursion.marker.clone();
         if recursion.course_name.is_some() {
-            arguments.reverse();
             let active = self.recursion.replace(recursion);
             let result = self.defer_selected_recursive_lowering(value, |context| {
-                context.lower_course_call(&arguments)
+                context.lower_course_call(&instantiated)
             });
             self.recursion = active;
             return result;
@@ -138,11 +154,9 @@ impl Context {
         if hypotheses.is_empty() {
             return Ok(value.clone());
         }
-        arguments.reverse();
         let mut application = Expr::fvar(marker);
-        for argument in arguments {
+        for argument in instantiated {
             self.tick()?;
-            let argument = self.instantiate(&argument)?;
             application = Expr::app(application, self.recursive_alias_value(&argument)?);
         }
         // The enclosing recursion remains the owner of a call made in a local
@@ -152,5 +166,137 @@ impl Context {
         let result = self.lower_recursive_calls(&application, &hypotheses);
         self.recursion = active;
         result
+    }
+
+    /// Lower recursive calls that [`Self::lower_matrix_call`] deferred while
+    /// implicit arguments through the decreasing parameter still contained
+    /// metavariables, before an inner match closes its generalized hypotheses.
+    pub(in crate::source) fn lower_deferred_matrix_calls(
+        &mut self,
+        value: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        if !value.has_fvar()
+            || !self
+                .recursion
+                .iter()
+                .chain(self.enclosing_recursions.iter())
+                .any(|recursion| {
+                    !recursion.pending
+                        && (!recursion.matrix_hypotheses.is_empty()
+                            || recursion.course_name.is_some())
+                })
+        {
+            return Ok(value.clone());
+        }
+        enum Task<'a> {
+            Visit(&'a Expr),
+            Node(&'a Expr),
+            Call(&'a Expr, FVarId, Vec<&'a Expr>),
+        }
+        let mut done: HashMap<usize, Expr> = HashMap::new();
+        let mut tasks = vec![Task::Visit(value)];
+        while let Some(task) = tasks.pop() {
+            self.tick()?;
+            match task {
+                Task::Visit(expr) => {
+                    let key = expr.allocation_identity();
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    if !expr.has_fvar() {
+                        done.insert(key, expr.clone());
+                        continue;
+                    }
+                    let mut head = expr;
+                    let mut arguments = Vec::new();
+                    while let ExprNode::App { f, a } = head.node() {
+                        self.tick()?;
+                        arguments.push(a);
+                        head = f;
+                    }
+                    if let ExprNode::FVar { id } = head.node()
+                        && self
+                            .recursion
+                            .iter()
+                            .chain(self.enclosing_recursions.iter().rev())
+                            .any(|recursion| {
+                                &recursion.marker == id
+                                    && !recursion.pending
+                                    && (!recursion.matrix_hypotheses.is_empty()
+                                        || recursion.course_name.is_some())
+                                    && arguments.len() > recursion.decreasing
+                            })
+                    {
+                        arguments.reverse();
+                        tasks.push(Task::Call(expr, id.clone(), arguments.clone()));
+                        tasks.extend(arguments.into_iter().rev().map(Task::Visit));
+                    } else {
+                        tasks.push(Task::Node(expr));
+                        tasks.extend(children(expr).into_iter().flatten().map(Task::Visit));
+                    }
+                }
+                Task::Call(expr, marker, arguments) => {
+                    let mut rebuilt = Expr::fvar(marker);
+                    for argument in arguments {
+                        self.tick()?;
+                        rebuilt = Expr::app(rebuilt, done[&argument.allocation_identity()].clone());
+                    }
+                    let lowered = self.lower_matrix_call(&rebuilt)?;
+                    done.insert(expr.allocation_identity(), lowered);
+                }
+                Task::Node(expr) => {
+                    let child = |e: &Expr| done[&e.allocation_identity()].clone();
+                    let result = match expr.node() {
+                        ExprNode::App { f, a } => Expr::app(child(f), child(a)),
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => Expr::lam(
+                            binder_name.clone(),
+                            child(binder_type),
+                            child(body),
+                            *binder_info,
+                        ),
+                        ExprNode::ForallE {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => Expr::forall_e(
+                            binder_name.clone(),
+                            child(binder_type),
+                            child(body),
+                            *binder_info,
+                        ),
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            value,
+                            body,
+                            non_dep,
+                        } => Expr::let_e(
+                            decl_name.clone(),
+                            child(type_),
+                            child(value),
+                            child(body),
+                            *non_dep,
+                        ),
+                        ExprNode::MData { data, expr } => Expr::mdata(data.clone(), child(expr)),
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => Expr::proj(struct_name.clone(), *idx, child(expr)),
+                        _ => expr.clone(),
+                    };
+                    done.insert(expr.allocation_identity(), result);
+                }
+            }
+        }
+        Ok(done
+            .remove(&value.allocation_identity())
+            .expect("deferred matrix lowering finishes its root"))
     }
 }

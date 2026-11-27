@@ -807,6 +807,33 @@ impl Context {
         })
     }
 
+    /// Pin's `Meta.kabstract` (`Lean/Meta/KAbstract.lean:30-67`): abstract every
+    /// closed subterm sharing `pattern`'s syntactic `(toHeadIndex, headNumArgs)`
+    /// key that is definitionally equal to `pattern` (handling e.g. transparent
+    /// `@&` `MData` annotations on numerals in `Nat.decLt 0 y` vs `dite (LT.lt 0 y)`).
+    pub(super) fn kabstract_defeq(
+        &mut self,
+        expr: &Expr,
+        pattern: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let pattern = self.instantiate(pattern)?;
+        if matches!(pattern.node(), ExprNode::FVar { .. }) {
+            return self.kabstract(expr, &pattern);
+        }
+        let Some(key) = self.rewrite_head_key(&pattern)? else {
+            return self.kabstract(expr, &pattern);
+        };
+        self.kabstract_matching(expr, &pattern, |context, candidate, pattern| {
+            if candidate == pattern {
+                return Ok(true);
+            }
+            if context.rewrite_head_key(candidate)?.as_ref() != Some(&key) {
+                return Ok(false);
+            }
+            context.coercion_eq(candidate, pattern)
+        })
+    }
+
     /// Outside-in abstraction with the caller's occurrence policy. In
     /// particular, substitution may infer equality arguments while structural
     /// eliminator abstraction keeps its existing exact-match behavior.

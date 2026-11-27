@@ -727,6 +727,11 @@ struct Context {
     // reads leaves the term (and with it every use of the hypothesis it rewrote).
     discarded_lets: std::collections::HashSet<FVarId>,
     trace_local_names: std::collections::HashMap<FVarId, Name>,
+    // Declared Pi binder names for equation-column and opened-lambda locals whose
+    // `lctx` names are inaccessible or renamed (`| 0 => ...`, `fun y => ...`).
+    // Recursive self-references consult this table so named calls `(n := ...)`
+    // match the declared header type without exposing those names as locals.
+    declared_binder_names: std::collections::HashMap<FVarId, Name>,
     // Elimination fields no alternative named: the pin's inaccessible `n✝`, which
     // `rename_i`/`next`/`case` may name. Other anonymous locals are this engine's own.
     unnamed_fields: std::collections::HashSet<FVarId>,
@@ -1002,6 +1007,7 @@ impl Context {
             conv_goals: std::collections::HashSet::new(),
             discarded_lets: std::collections::HashSet::new(),
             trace_local_names: std::collections::HashMap::new(),
+            declared_binder_names: std::collections::HashMap::new(),
             unnamed_fields: std::collections::HashSet::new(),
             private_proof_body: None,
             generated_name_environment: None,

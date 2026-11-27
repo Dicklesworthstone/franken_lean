@@ -37,6 +37,9 @@ pub(super) struct Build<'a> {
     pub binding: Binding<'a>,
     pub expected: Option<Expr>,
     pub result_type: Option<Expr>,
+    /// Written `: T` annotation preserved before opening leading lambdas/equations,
+    /// so closing the local function keeps declared binder names and implicitness.
+    written_result_type: Option<Expr>,
     pub value_syntax: &'a Syntax,
     pub checkpoint: Option<usize>,
     pub lift_name: Option<Name>,
@@ -326,6 +329,7 @@ impl Context {
             binding,
             expected,
             result_type: None,
+            written_result_type: None,
             checkpoint: None,
             lift_name,
             outer_parent,
@@ -395,6 +399,7 @@ impl Context {
         self.local_function_lifting.parent = parent;
         build.marker = None;
         build.outer_recursion = None;
+        build.written_result_type = build.result_type.clone();
         build.value_syntax = body;
         build.result_type = Some(expected);
         build.lambdas = lambdas;
@@ -472,7 +477,7 @@ impl Context {
             for parameter in build.parameters.iter().rev() {
                 self.tick()?;
                 type_ = Expr::forall_e(
-                    parameter.user_name.clone(),
+                    self.declared_binder_name(parameter),
                     self.instantiate(&parameter.type_)?,
                     type_
                         .abstract_fvar(&parameter.id, 0)
@@ -556,6 +561,9 @@ impl Context {
             )));
         }
         value = self.close_recursive_lambdas(&build.lambdas, value)?;
+        if let Some(written) = &build.written_result_type {
+            value.type_ = self.instantiate(written)?;
+        }
         // Header parameters close here rather than through finish_telescope.
         // Goals solved by the continuation must keep their local dictionaries
         // and inferred domains underneath these binders.
@@ -627,6 +635,7 @@ mod tests {
             binding,
             expected: None,
             result_type: None,
+            written_result_type: None,
             value_syntax: &missing,
             checkpoint: None,
             lift_name: None,
