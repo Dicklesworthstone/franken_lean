@@ -865,13 +865,13 @@ impl Sources {
         Ok(())
     }
 
-    pub(super) fn destinations(
+    pub(super) fn destinations<'a>(
         &self,
-        artifacts: &BTreeMap<Name, ModuleArtifacts>,
+        modules: impl IntoIterator<Item = &'a Name>,
         owners: &ModuleOwners<'_>,
     ) -> Result<BTreeMap<Name, (PathBuf, PathBuf)>, Failure> {
-        artifacts
-            .keys()
+        modules
+            .into_iter()
             .map(|name| {
                 let (package, _) = self.resolve_build_package(name, owners)?.ok_or_else(|| {
                     Failure::new("internal-fault", "built module has no source owner")
@@ -1210,23 +1210,6 @@ mod tests {
         }
     }
 
-    fn artifacts(names: &[&str]) -> BTreeMap<Name, ModuleArtifacts> {
-        names
-            .iter()
-            .map(|name| {
-                (
-                    Name::from_components(name.split('.')),
-                    ModuleArtifacts {
-                        exported: Vec::new(),
-                        companions: None,
-                        ir: None,
-                        ilean: None,
-                    },
-                )
-            })
-            .collect()
-    }
-
     #[test]
     fn configurations_in_one_directory_keep_their_own_artifact_destinations() {
         for reverse in [false, true] {
@@ -1240,7 +1223,10 @@ mod tests {
             let sources = sources(packages);
             let destinations = sources
                 .destinations(
-                    &artifacts(&["LeanPart.Child", "TomlPart.Child"]),
+                    &[
+                        Name::from_components(["LeanPart", "Child"]),
+                        Name::from_components(["TomlPart", "Child"]),
+                    ],
                     &BTreeMap::new(),
                 )
                 .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
@@ -1275,7 +1261,7 @@ mod tests {
                 packages.reverse();
             }
             let destinations = sources(packages)
-                .destinations(&artifacts(&["Shared"]), &BTreeMap::new())
+                .destinations(&[Name::from_components(["Shared"])], &BTreeMap::new())
                 .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
             let root = PathBuf::from("/workspace/shared");
             assert_eq!(
@@ -1327,7 +1313,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
         let sources = sources(vec![lean, toml]);
         let error = sources
-            .destinations(&artifacts(&["Shared"]), &BTreeMap::new())
+            .destinations(&[Name::from_components(["Shared"])], &BTreeMap::new())
             .expect_err("different physical sources remain ambiguous");
         assert_eq!(error.class, "unsupported");
         assert!(error.detail.contains("belongs to multiple local packages"));

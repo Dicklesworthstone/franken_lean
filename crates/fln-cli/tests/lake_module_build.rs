@@ -256,7 +256,7 @@ fn unsupported_ilean_keeps_previous_artifacts_and_does_not_leave_stale_reference
     admission_only.write("Lib/Top.lean", &with_unobserved_control);
     success(&admission_only.build(&["+Lib.Top:olean"]));
     let error = failure(&package.build(&["+Lib.Top:olean"]));
-    assert!(error.contains("coordinated replacement"), "{error}");
+    assert!(error.contains("\"class\":\"capability\""), "{error}");
     assert!(error.contains(".ilean"), "{error}");
     for (path, previous) in paths.iter().zip(&before) {
         assert_eq!(std::fs::read(path).unwrap(), *previous);
@@ -989,6 +989,68 @@ fn source_file_ir_facets_use_the_same_tripartite_checked_artifact_pipeline() {
     assert!(warm.contains("\"modules_cached\":2"), "{warm}");
     for (module, original) in ["Lib.Base", "Lib.Top"].into_iter().zip(originals) {
         assert_eq!(family_bytes(&package, module), original);
+    }
+}
+
+#[test]
+fn switching_facets_rebuilds_installed_companions_across_source_edits() {
+    let package = module_library();
+    let base = package.artifact("Lib.Base");
+    let top = package.artifact("Lib.Top");
+    success(&package.build(&["+Lib.Top:ir"]));
+    let old_ir = std::fs::read(base.with_extension("ir")).unwrap();
+    let old_olean = std::fs::read(&base).unwrap();
+
+    // Query returns just the selected path while preserving both IR artifacts.
+    let query = success(&file_target_command(
+        &package,
+        &package.0,
+        "query",
+        &["+Lib.Top:ilean"],
+    ));
+    assert_eq!(
+        query.trim(),
+        format!("\"{}\"", top.with_extension("ilean").display())
+    );
+    assert_eq!(std::fs::read(base.with_extension("ir")).unwrap(), old_ir);
+
+    // A changed dependency introduces a new local import. The retained IR and
+    // metadata now need that module too, despite requesting only the root olean.
+    package.write(
+        "Lib/New.lean",
+        "module\nprelude\npublic theorem witness (P : Prop) (h : P) : P := h\n",
+    );
+    let changed = MODULE_BASE
+        .replace(
+            "module\nprelude\n",
+            "module\nprelude\npublic import Lib.New\n",
+        )
+        .replace("def identity", "def renamedIdentity");
+    package.write("Lib/Base.lean", changed);
+    let report = success(&package.build(&["+Lib.Top:olean"]));
+    assert!(report.contains("\"facet\":\"olean\""), "{report}");
+    assert!(report.contains("\"executable_modules\":3"), "{report}");
+    assert!(report.contains("\"metadata_modules\":3"), "{report}");
+    assert_ne!(std::fs::read(&base).unwrap(), old_olean);
+    let ir = std::fs::read(base.with_extension("ir")).unwrap();
+    assert_ne!(ir, old_ir);
+    let view = fln_olean::region::OleanView::parse(&ir).unwrap();
+    let blocks = view
+        .extension_payloads(Default::default(), 16 << 20)
+        .unwrap();
+    let decoded = fln_olean::ir::decode_ir(&blocks, Default::default()).unwrap();
+    assert!(
+        decoded
+            .decls
+            .iter()
+            .any(|decl| decl.name().to_display_string() == "renamedIdentity")
+    );
+    let bytes = std::fs::read(base.with_extension("ilean")).unwrap();
+    let metadata = fln::decode_ilean(&bytes, Default::default()).unwrap();
+    assert!(metadata.decls.contains_key("renamedIdentity"));
+    assert!(!metadata.decls.contains_key("identity"));
+    for suffix in ["ir", "ilean", "olean"] {
+        assert!(package.artifact("Lib.New").with_extension(suffix).is_file());
     }
 }
 
@@ -2133,8 +2195,11 @@ fn module_family_failures_preserve_all_previous_parts_and_ir() {
     package.write("Lib/Base.lean", MODULE_BASE);
     let ir = package.artifact("Lib.Base").with_extension("ir");
     std::fs::write(&ir, b"existing executable IR").unwrap();
-    assert!(failure(&package.build(&["+Lib.Top:olean"])).contains("coordinated replacement"));
-    assert_eq!(std::fs::read(ir).unwrap(), b"existing executable IR");
+    let rebuilt = success(&package.build(&["+Lib.Top:olean"]));
+    assert!(rebuilt.contains("\"executable_modules\":1"), "{rebuilt}");
+    let bytes = std::fs::read(ir).unwrap();
+    assert!(fln_olean::region::OleanView::parse(&bytes).is_ok());
+    assert!(!package.artifact("Lib.Top").with_extension("ir").exists());
     assert_eq!(family_bytes(&package, "Lib.Base"), base);
     assert_eq!(family_bytes(&package, "Lib.Top"), top);
 }
