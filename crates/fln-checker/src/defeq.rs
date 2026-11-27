@@ -3107,28 +3107,15 @@ fn eta_candidate(
                             true
                         } else {
                             let binder_idx = width as usize - 1 - index as usize;
-                            let unit_like = if let Some(&bt) = binder_types.get(binder_idx) {
-                                unit_like_inductive_for_binder(
-                                    bt, sources, context, control, cancelled,
+                            if let Some(&domain) = binder_types.get(binder_idx) {
+                                unit_like_argument_matches(
+                                    domain,
+                                    sources,
+                                    (argument, &result.term),
+                                    context,
+                                    control,
+                                    cancelled,
                                 )?
-                            } else {
-                                None
-                            };
-                            if let Some((_induct_name, ctor_name)) = unit_like {
-                                let mut arg_head = result.term.root();
-                                while let Some(node) = result.term.node(arg_head) {
-                                    match node {
-                                        ExprNode::Apply { function, .. } => arg_head = *function,
-                                        ExprNode::Metadata { expression, .. } => {
-                                            arg_head = *expression
-                                        }
-                                        _ => break,
-                                    }
-                                }
-                                matches!(
-                                    result.term.node(arg_head),
-                                    Some(ExprNode::Constant { name, .. }) if name == &ctor_name
-                                )
                             } else {
                                 false
                             }
@@ -3229,26 +3216,37 @@ fn exact_function_eta(
     }
 }
 
-fn is_non_rec_structure(
-    constants: &crate::environment::ConstantEnvironment,
-    name: &WireName,
-) -> bool {
-    let Some(decl) = constants.find(name) else {
-        return false;
-    };
-    let Some(induct) = decl.inductive_metadata() else {
-        return false;
-    };
-    induct.constructors().len() == 1 && induct.num_indices() == 0 && !induct.is_recursive()
-}
-
-fn unit_like_inductive_for_binder(
+/// A zero-field constructor may stand for this binder only at the same
+/// instantiated type (KR-315). The untyped shortcut handles nullary
+/// constructors; term parameters can depend on outer binders, so their
+/// comparison is left to typed conversion in the original local context.
+fn unit_like_argument_matches(
     binder: DefEqTerm,
     sources: TermSources<'_>,
+    (argument_ref, argument): (DefEqTerm, &WireExpr),
     context: &WhnfContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
-) -> Result<Option<(WireName, WireName)>, SlowHalt> {
+) -> Result<bool, SlowHalt> {
+    let Some(ExprNode::Constant {
+        name: ctor_name,
+        levels: ctor_levels,
+    }) = argument.node(argument.root())
+    else {
+        return Ok(false);
+    };
+    let Some(ctor_decl) = context.constants().find(ctor_name) else {
+        return Ok(false);
+    };
+    let Some(ctor) = ctor_decl.constructor_metadata() else {
+        return Ok(false);
+    };
+    if ctor.num_parameters() != 0
+        || ctor.num_fields() != 0
+        || ctor_decl.level_parameters().len() != ctor_levels.len()
+    {
+        return Ok(false);
+    }
     let budget = control.begin_normalization(cancelled)?;
     let term = sources.source(binder)?;
     let norm = match whnf_at_with(term, binder.root, context, budget, cancelled) {
@@ -3277,40 +3275,41 @@ fn unit_like_inductive_for_binder(
             }));
         }
     };
-    let mut head = norm.root();
-    while let Some(node) = norm.node(head) {
-        match node {
-            ExprNode::Metadata { expression, .. } => head = *expression,
-            ExprNode::Apply { function, .. } => head = *function,
-            _ => break,
-        }
-    }
-    let Some(ExprNode::Constant { name, .. }) = norm.node(head) else {
-        return Ok(None);
+    let Some(ExprNode::Constant { name, levels }) = norm.node(norm.root()) else {
+        return Ok(false);
     };
-    let constants = context.constants();
-    if !is_non_rec_structure(constants, name) {
-        return Ok(None);
+    if name != ctor.inductive() || levels.len() != ctor_levels.len() {
+        return Ok(false);
     }
-    let Some(decl) = constants.find(name) else {
-        return Ok(None);
+    let Some(decl) = context.constants().find(name) else {
+        return Ok(false);
     };
     let Some(induct) = decl.inductive_metadata() else {
-        return Ok(None);
+        return Ok(false);
     };
-    let Some(ctor_name) = induct.constructors().first() else {
-        return Ok(None);
-    };
-    let Some(ctor_decl) = constants.find(ctor_name) else {
-        return Ok(None);
-    };
-    let Some(ctor) = ctor_decl.constructor_metadata() else {
-        return Ok(None);
-    };
-    if ctor.num_fields() == 0 {
-        return Ok(Some((name.clone(), ctor_name.clone())));
+    if induct.constructors() != std::slice::from_ref(ctor_name)
+        || induct.is_recursive()
+        || induct.num_indices() != 0
+        || induct.num_parameters() != 0
+        || decl.level_parameters().len() != levels.len()
+    {
+        return Ok(false);
     }
-    Ok(None)
+    for (&domain_level, &ctor_level) in levels.iter().zip(ctor_levels) {
+        control.comparison(cancelled)?;
+        if !level_roots_equal(norm.levels(), domain_level, argument.levels(), ctor_level).map_err(
+            |error| {
+                SlowHalt::Fault(DefEqFault::Universe {
+                    left: binder.location(),
+                    right: argument_ref.location(),
+                    error,
+                })
+            },
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Recover a fully applied inductive head from the metered spine classification.

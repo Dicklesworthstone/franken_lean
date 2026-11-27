@@ -222,7 +222,10 @@ fn structure_eta_cannot_erase_a_phantom_parameter() {
         ),
         axiom(
             "family_for_all",
-            pi(box_type("first"), app(c("Family"), [Expr::bvar(0).unwrap()])),
+            pi(
+                box_type("first"),
+                app(c("Family"), [Expr::bvar(0).unwrap()]),
+            ),
         ),
     ]);
     let context = InferenceContext::empty(env.clone());
