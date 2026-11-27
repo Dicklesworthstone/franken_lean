@@ -4,7 +4,7 @@ use fln::{
     Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Name, SourceCheckLimits,
     VmExit,
 };
-use fln_env::constants::{ConstantInfo, DefinitionSafety};
+use fln_env::constants::{ConstantInfo, DefinitionSafety, ReducibilityHints};
 
 fn budget() -> Budget {
     Budget::for_stack_bytes(2 * 1024 * 1024)
@@ -360,4 +360,75 @@ fn guard_queries_do_not_gain_eval_permissions_for_unsafe_dictionaries() {
     .unwrap()
     .into_complete()
     .unwrap();
+}
+
+#[test]
+fn unsafe_opaques_keep_their_constant_kind_and_execute_checked_bodies() {
+    let base = checked(
+        &engine(),
+        "unsafe opaque opaqueValue : Nat := 41\nunsafe opaque opaqueBorrowed {α : Type u} (value : @& α) : α := value\nunsafe opaque opaqueDefault {α : Type u} [@& Inhabited α] (i : @& Nat) : α\nunsafe def opaqueConsumer : Nat := opaqueValue + 1",
+    );
+    for id in ["opaqueValue", "opaqueBorrowed", "opaqueDefault"] {
+        let name = Name::from_components([id]);
+        assert!(
+            matches!(base.environment().find(&name), Some(ConstantInfo::Opaque(value)) if value.is_unsafe),
+            "{id} must remain an unsafe opaque constant"
+        );
+        assert!(!base.environment().contains(&Name::str(name, "_unsafe_rec")));
+    }
+    run(&base, "#eval opaqueConsumer", "42");
+    run(&base, "#eval opaqueBorrowed 43", "43");
+    run(&base, "#eval (opaqueDefault 7 : Nat)", "0");
+}
+
+#[test]
+fn recursive_unsafe_opaques_use_unsafe_definitions_without_logical_companions() {
+    let base = checked(
+        &engine(),
+        "unsafe opaque opaqueCountdown (n : Nat) : Nat := if n == 0 then 7 else opaqueCountdown (n - 1)",
+    );
+    let name = Name::from_components(["opaqueCountdown"]);
+    assert!(
+        matches!(base.environment().find(&name), Some(ConstantInfo::Defn(value))
+            if value.safety == DefinitionSafety::Unsafe && value.hints == ReducibilityHints::Opaque)
+    );
+    assert!(!base.environment().contains(&Name::str(name, "_unsafe_rec")));
+    run(&base, "#eval opaqueCountdown 12", "7");
+}
+
+#[test]
+fn unsafe_opaques_preserve_safe_value_checking_and_reject_safe_consumers() {
+    let base = checked(
+        &engine(),
+        "unsafe def secret : Nat := 7\nunsafe opaque opaqueValue : Nat := 41\nunsafe opaque opaqueAbsurd : False := opaqueAbsurd",
+    );
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "unsafe opaque leak : Nat := secret",
+        "unsafe opaque leak : Nat := opaqueValue",
+        "def leak : Nat := opaqueValue",
+        "theorem leak : False := opaqueAbsurd",
+        "def leak : False := opaqueAbsurd",
+    ] {
+        let error = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(EngineAdmissionLimits::new(budget())),
+            )
+            .expect_err(source);
+        let diagnostic = format!("{error:?}");
+        assert!(
+            diagnostic.contains("SafetyViolation"),
+            "{source}: {diagnostic}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(
+            !base
+                .environment()
+                .contains(&Name::from_components(["leak"]))
+        );
+    }
+    checked(&base, "theorem valid : True := by constructor");
+    run(&base, "#eval opaqueValue", "41");
 }

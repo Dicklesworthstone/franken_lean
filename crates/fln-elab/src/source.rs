@@ -7730,14 +7730,13 @@ fn definition_elaboration(
         // partial declarations. An axiom uses only its header below; it must
         // not acquire the recursive-definition state used by unsafe bodies.
         if is_theorem
-            || is_opaque
             || context
                 .partial
                 .as_ref()
                 .is_some_and(|state| state.kind != partial::Kind::Unsafe)
         {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "unsafe axiom, def, abbrev, or data instance without partial",
+                expected: "unsafe axiom, def, abbrev, opaque, or data instance without partial",
             });
         }
         if !is_axiom {
@@ -8394,11 +8393,21 @@ fn definition_elaboration(
             value: term.value,
             all: vec![name.clone()],
         }))
-    } else if is_opaque {
+    } else if is_opaque
+        && !context
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.kind == partial::Kind::Unsafe && state.reference.is_some())
+    {
+        // `addPreDefinitions` sends a nonrecursive opaque to `addNonRecAux`,
+        // preserving its unsafe flag. Its value still passes the opaque
+        // declaration's ordinary safe checker. A surviving unsafe self-edge
+        // instead takes `addAndCompileUnsafe` below, retaining the executable
+        // recursive body as an unsafe definition with opaque hints.
         Ok(Declaration::Opaque(fln_env::constants::OpaqueVal {
             base,
             value: term.value,
-            is_unsafe: false,
+            is_unsafe,
             all: vec![name.clone()],
         }))
     } else if context
