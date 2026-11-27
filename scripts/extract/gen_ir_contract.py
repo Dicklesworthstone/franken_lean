@@ -36,8 +36,9 @@ EXTERN = "src/Lean/Compiler/ExternAttr.lean"
 COMPILER_M = "src/Lean/Compiler/IR/CompilerM.lean"
 LCNF_BASIC = "src/Lean/Compiler/LCNF/Basic.lean"
 LCNF_PHASE_EXT = "src/Lean/Compiler/LCNF/PhaseExt.lean"
+LCNF_TO_IMPURE_TYPE = "src/Lean/Compiler/LCNF/ToImpureType.lean"
 LEAN_EXPR = "src/Lean/Expr.lean"
-FILES = [BASIC, EXTERN, COMPILER_M, LCNF_BASIC, LCNF_PHASE_EXT, LEAN_EXPR]
+FILES = [BASIC, EXTERN, COMPILER_M, LCNF_BASIC, LCNF_PHASE_EXT, LCNF_TO_IMPURE_TYPE, LEAN_EXPR]
 
 # One-field structures the pin represents as the field itself, with that field's type.
 TRANSPARENT = {
@@ -52,7 +53,7 @@ POINTER = {
     "Nat", "Index", "Name", "FunId", "String", "VarId", "JoinPointId", "IRType", "Arg",
     "LitVal", "CtorInfo", "Expr", "FnBody", "Alt", "DeclInfo", "ExternAttrData",
     "Option Name", "Array IRType", "Array Arg", "Array Param", "Array Alt",
-    "List ExternEntry", "FVarId", "List Name", "Array (Param pu)",
+    "List ExternEntry", "FVarId", "List Name", "Array (Param pu)", "Array CtorFieldInfo",
 }
 # Field types stored as one scalar byte after the pointers.
 SCALAR = {"Bool"}
@@ -70,6 +71,8 @@ INDUCTIVES = [
                                 "case", "ret", "jmp", "unreachable"]),
     (BASIC, "Decl", "DECL", ["fdecl", "extern"]),
     (EXTERN, "ExternEntry", "EXTERN_ENTRY", ["adhoc", "inline", "standard", "opaque"]),
+    (LCNF_TO_IMPURE_TYPE, "CtorFieldInfo", "LCNF_CTOR_FIELD",
+     ["erased", "object", "usize", "scalar", "void"]),
 ]
 STRUCTURES = [
     (BASIC, "CtorInfo", "CTOR_INFO"),
@@ -78,6 +81,7 @@ STRUCTURES = [
     # header also refuses a drift to a relevant field or a different index.
     (LCNF_BASIC, "Param (pu : Purity)", "LCNF_PARAM"),
     (LCNF_BASIC, "Signature (pu : Purity)", "LCNF_SIGNATURE"),
+    (LCNF_TO_IMPURE_TYPE, "CtorLayout", "LCNF_CTOR_LAYOUT"),
 ]
 
 
@@ -105,7 +109,7 @@ def strip_comments(text):
 
 
 def declaration(text, kind, name):
-    found = re.search(r"^" + kind + r" " + re.escape(name) + r"\b[^\n]*\n", text, re.M)
+    found = re.search(r"^(?:public )?" + kind + r" " + re.escape(name) + r"\b[^\n]*\n", text, re.M)
     if found is None:
         raise ValueError(f"missing {kind} {name}")
     rest = text[found.end():]

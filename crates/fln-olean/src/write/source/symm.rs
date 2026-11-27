@@ -197,8 +197,9 @@ mod tests {
         assert_eq!(
             source_extensions::decode(&blocks, DecodeLimits::default())
                 .unwrap()
-                .symms,
-            [row.clone()]
+                .symms
+                .as_slice(),
+            std::slice::from_ref(&row)
         );
         for invalid in [
             SymmEntry {

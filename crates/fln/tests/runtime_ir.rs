@@ -184,6 +184,9 @@ const BOXED_DATA_HELPERS: &str = concat!(
     "structure IRNatWrapper where\n value : Nat\n",
     "structure IRStringWrapper where\n value : String\n",
     "structure IRScalarBox where\n number : Nat\n flag : Bool\n",
+    "structure IRInterleaved where\n first : Bool\n number : Nat\n second : Bool\n text : String\n",
+    "structure IRScalarReordered where\n number : Nat\n first : Bool\n text : String\n second : Bool\n",
+    "structure IRAllBools where\n first : Bool\n second : Bool\n third : Bool\n",
     "structure IRProofBox where\n number : Nat\n proof : True\n",
     "inductive IRRecursive where\n | empty\n | next (n : Nat) (tail : IRRecursive)\n",
     "inductive IRBoxedParam (A : Type) where\n | mk (value : A) (n : Nat)\n",
@@ -393,6 +396,141 @@ fn boxed_export_cases() -> Vec<BoxedExportCase> {
             parameters: vec![IrType::Object],
             result: IrType::Object,
             reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRScalarBox",
+            body: "IRScalarBox.mk 42 true",
+            application: "(compiled.number, compiled.flag)",
+            expected: "(42, true)",
+            parameters: vec![],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRScalarBox -> IRScalarBox",
+            body: "fun p => p",
+            application: "let p := IRScalarBox.mk large true; let q := compiled p; (q.number, q.flag, p.number, p.flag)",
+            expected: "(184467440737095516160, true, 184467440737095516160, true)",
+            parameters: vec![IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Nat -> Bool -> IRScalarBox",
+            body: "fun n b => IRScalarBox.mk n b",
+            application: "let p := compiled large false; let q := compiled large true; (p.number, p.flag, q.number, q.flag)",
+            expected: "(184467440737095516160, false, 184467440737095516160, true)",
+            parameters: vec![IrType::TObject, IrType::UInt8],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRScalarBox -> Bool",
+            body: "fun p => p.flag",
+            application: "(compiled (IRScalarBox.mk large false), compiled (IRScalarBox.mk large true))",
+            expected: "(false, true)",
+            parameters: vec![IrType::Object],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRInterleaved -> IRInterleaved",
+            body: "fun p => IRInterleaved.mk p.second p.number p.first p.text",
+            application: "let p := IRInterleaved.mk true large false heap; let q := compiled p; (q.first, q.second, q.number, q.text, p.number, p.text)",
+            expected: "(false, true, 184467440737095516160, \"boxed heap payload\", 184467440737095516160, \"boxed heap payload\")",
+            parameters: vec![IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Bool -> Bool -> Bool -> IRAllBools",
+            body: "fun a b c => IRAllBools.mk a b c",
+            application: "let p := compiled true false true; let q := compiled false true false; (p.first, p.second, p.third, q.first, q.second, q.third)",
+            expected: "(true, false, true, false, true, false)",
+            parameters: vec![IrType::UInt8, IrType::UInt8, IrType::UInt8],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRAllBools -> Bool",
+            body: "fun p => if p.first then p.third else p.second",
+            application: "(compiled (IRAllBools.mk true false true), compiled (IRAllBools.mk true true false), compiled (IRAllBools.mk false true false))",
+            expected: "(true, false, true)",
+            parameters: vec![IrType::Object],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Bool -> IRScalarPayload",
+            body: "fun b => IRScalarPayload.value b",
+            application: "((match compiled false with | .empty => true | .value b => b), (match compiled true with | .empty => false | .value b => b))",
+            expected: "(false, true)",
+            parameters: vec![IrType::UInt8],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRScalarPayload -> IRScalarPayload",
+            body: "fun p => p",
+            application: "((match compiled .empty with | .empty => true | _ => false), (match compiled (.value false) with | .empty => true | .value b => b), (match compiled (.value true) with | .empty => false | .value b => b))",
+            expected: "(true, false, true)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRScalarPayload -> Bool",
+            body: "fun p => match p with | .empty => false | .value b => b",
+            application: "(compiled .empty, compiled (.value false), compiled (.value true))",
+            expected: "(false, false, true)",
+            parameters: vec![IrType::TObject],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRInterleaved -> IRInterleaved) -> IRInterleaved -> IRInterleaved",
+            body: "fun f p => f p",
+            application: "let p := IRInterleaved.mk true large false heap; let q := compiled (fun x => IRInterleaved.mk x.second (x.number + 1) x.first (x.text ++ \"!\")) p; (q.first, q.second, q.number, q.text, p.number, p.text)",
+            expected: "(false, true, 184467440737095516161, \"boxed heap payload!\", 184467440737095516160, \"boxed heap payload\")",
+            parameters: vec![IrType::Object, IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRScalarBox -> Bool) -> Nat -> Bool",
+            body: "fun f n => f (IRScalarBox.mk n true)",
+            application: "compiled (fun p => p.flag && p.number == large) large",
+            expected: "true",
+            parameters: vec![IrType::Object, IrType::TObject],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRScalarPayload -> Nat) -> Nat",
+            body: "fun f => f IRScalarPayload.empty",
+            application: "compiled (fun p => match p with | .empty => 42 | .value b => if b then 1 else 0)",
+            expected: "42",
+            parameters: vec![IrType::Object],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRInterleaved -> Nat -> Nat",
+            body: "fun _ n => n",
+            application: "compiled (IRInterleaved.mk true large false heap) 42",
+            expected: "42",
+            parameters: vec![IrType::Object, IrType::TObject],
+            result: IrType::TObject,
+            reduced: Some(("Nat -> Nat", "compiled 42")),
+        },
+        BoxedExportCase {
+            ty: "IRAllBools -> Bool -> Bool",
+            body: "fun _ b => b",
+            application: "compiled (IRAllBools.mk true false true) true",
+            expected: "true",
+            parameters: vec![IrType::Object, IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: Some(("Bool -> Bool", "compiled true")),
         },
     ]
 }
@@ -1099,11 +1237,9 @@ fn fieldless_enum_exports_preserve_scalar_signatures_and_private_layouts() {
         assert_eq!(base.logical_root(&options), original);
     }
     for source in [
-        "def compiled (x : IRScalarPayload) : IRScalarPayload := x",
         "def compiled (x : IRParameterized Nat) : IRParameterized Nat := x",
         "def compiled (x : IRAlias) : IRAlias := x",
         "def compiled : True := True.intro",
-        "def compiled (f : IRScalarPayload -> Nat) : Nat := f IRScalarPayload.empty",
     ] {
         let (declaration, _) = checked_definition(&base, source);
         assert!(
@@ -1260,6 +1396,9 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
     // tables, in addition to their typed signature and runtime cases above.
     for source in [
         "def compiled (x : IRPayload) : IRPayload := x",
+        "def compiled (x : IRScalarBox) : IRScalarBox := x",
+        "def compiled (x : IRScalarPayload) : IRScalarPayload := x",
+        "def compiled (f : IRScalarPayload -> Nat) : Nat := f IRScalarPayload.empty",
         "def compiled (f : IRPayload -> Nat) : Nat := f IRPayload.empty",
         "def compiled (p : IRTextPair) : String := p.right",
         "def compiled (s : String) : IRTextPair := IRTextPair.mk s s",
@@ -1288,10 +1427,6 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
             "source export carrier",
         ),
         (
-            "def compiled (x : IRScalarBox) : IRScalarBox := x",
-            "source export carrier",
-        ),
-        (
             "def compiled (x : IRProofBox) : IRProofBox := x",
             "source export carrier",
         ),
@@ -1309,6 +1444,14 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
         ),
         (
             "def compiled (x : IRBoxedRecord) (_ : IRWideRecord) : IRBoxedRecord := x",
+            "conflicting source constructor layouts",
+        ),
+        (
+            "def compiled (x : IRScalarBox) (_ : IRBoxedRecord) : IRScalarBox := x",
+            "conflicting source constructor layouts",
+        ),
+        (
+            "def compiled (x : IRInterleaved) (_ : IRScalarReordered) : IRInterleaved := x",
             "conflicting source constructor layouts",
         ),
         (
@@ -2749,6 +2892,69 @@ fn the_pin_executes_boxed_data_exports_and_observes_payloads() {
                 &dir,
                 "changed-payload",
                 "(99, \"changed payload\")\n(99, \"changed payload\")",
+            );
+        }
+        if case.ty == "IRScalarBox" {
+            // Change only the Boolean payload. This consumer must read the
+            // packed byte from native IR, not the companion logical body.
+            let mut mutant = compiled.module.clone();
+            let IrDecl::Function { body, .. } = mutant
+                .decls
+                .iter_mut()
+                .find(|declaration| declaration.name() == &name("compiled"))
+                .unwrap()
+            else {
+                panic!("scalar source entry")
+            };
+            *body = IrBody {
+                stmts: vec![
+                    IrStmt::VDecl {
+                        x: 1,
+                        ty: IrType::TObject,
+                        expr: IrExpr::Lit(IrLit::Num(IrNat::Small(42))),
+                    },
+                    IrStmt::VDecl {
+                        x: 2,
+                        ty: IrType::UInt8,
+                        expr: IrExpr::Lit(IrLit::Num(IrNat::Small(0))),
+                    },
+                    IrStmt::VDecl {
+                        x: 3,
+                        ty: IrType::Object,
+                        expr: IrExpr::Ctor {
+                            info: fln_olean::ir::IrCtorInfo {
+                                name: name("IRScalarBox.mk"),
+                                cidx: 0,
+                                size: 1,
+                                usize: 0,
+                                ssize: 1,
+                            },
+                            args: vec![IrArg::Var(1)],
+                        },
+                    },
+                    IrStmt::SSet {
+                        x: 3,
+                        i: 1,
+                        offset: 0,
+                        y: 2,
+                        ty: IrType::UInt8,
+                    },
+                ],
+                terminal: Box::new(IrTerminal::Ret(IrArg::Var(3))),
+            };
+            std::fs::write(dir.join("NativeIrCase.ir"), encode(&mutant, &original)).unwrap();
+            assert_probe(
+                consume_boxed_ir(
+                    &lean,
+                    &dir,
+                    "changed-scalar",
+                    case.ty,
+                    case.application,
+                    "compiled",
+                ),
+                &dir,
+                "changed-scalar",
+                "(42, false)\n(42, false)",
             );
         }
     }

@@ -304,6 +304,7 @@ fn constructors() -> InternalConstructors {
     InternalConstructors {
         type_name: Name::from_components(["flow_data"]),
         layouts: (0..3).map(|tag| ((tag, 0), tag)).collect(),
+        packed: Default::default(),
         tags,
     }
 }
@@ -317,7 +318,7 @@ fn compile(program: &fir::ValidatedProgram) -> Result<()> {
         result: IrType::TObject,
         reduced: None,
         inferred_borrowing: false,
-        constructor_fields: vec![0; 3],
+        constructor_fields: vec![Vec::new(); 3],
     };
     let module = compile_module(
         program,
@@ -772,4 +773,81 @@ fn a_recursive_cycle_without_constructor_producers_stays_unconstrained() {
             what: "instruction outside the pure boxed subset",
         })
     ));
+}
+
+#[test]
+fn packed_public_slots_require_the_same_private_scalar_carrier() {
+    use fir::Operation as O;
+    use fir::ValueType::{Bool, Constructor, Nat, String as Text};
+    let value = fir::ValueId::new;
+    let constructor = fir::ConstructorId::new(0);
+    let entry = Name::from_components(["packed_collision"]);
+    let source = SourceSignature {
+        name: entry.clone(),
+        params: vec![],
+        result: IrType::Object,
+        reduced: None,
+        inferred_borrowing: false,
+        constructor_fields: vec![vec![IrType::TObject, IrType::UInt8]],
+    };
+    for is_bool in [true, false] {
+        let (ty, operation) = if is_bool {
+            (Bool, O::Bool(true))
+        } else {
+            (Text, O::String("must remain an object".into()))
+        };
+        let program = fir::Program::new(
+            fir::FunctionId::new(0),
+            vec![fir::ConstructorDecl {
+                id: constructor,
+                tag: 0,
+                fields: vec![Nat, ty],
+                static_scalar_bytes: vec![],
+            }],
+            vec![],
+            vec![],
+            vec![function(
+                0,
+                vec![],
+                Constructor,
+                vec![block(
+                    0,
+                    vec![
+                        binding(0, Nat, O::Nat(42)),
+                        binding(1, ty, operation),
+                        binding(
+                            2,
+                            Constructor,
+                            O::Ctor {
+                                constructor,
+                                fields: vec![value(0), value(1)],
+                            },
+                        ),
+                    ],
+                    fir::Terminator::Return { value: value(2) },
+                )],
+            )],
+        );
+        let program = fir::validate(program, fir::ValidationLimits::default()).unwrap();
+        let mut meter = Budget(64_000_000);
+        let module = compile_module(
+            &program,
+            &entry,
+            CompileLimits::default(),
+            Some(&source),
+            &mut meter,
+        );
+        if is_bool {
+            validate_module(&module.unwrap(), &meter).unwrap();
+        } else {
+            // A shared ordinal and source field count cannot authorize
+            // unboxing an unrelated private object's pointer as a Bool.
+            assert!(matches!(
+                module,
+                Err(CompileError::Unsupported {
+                    what: "conflicting source constructor layouts",
+                })
+            ));
+        }
+    }
 }

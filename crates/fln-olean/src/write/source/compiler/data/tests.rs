@@ -43,6 +43,19 @@ inductive WriterBinders where | empty | data {n : Nat} {{s : String}}
 inductive WriterWrapper where | mk (n : Nat)
 inductive WriterBorrowed where | mk (n : @& Nat) (s : String)
 inductive WriterScalar where | mk (b : Bool) (n : Nat)
+structure WriterInterleaved where
+  first : Bool
+  number : Nat
+  second : Bool
+  text : String
+structure WriterAllBools where
+  first : Bool
+  second : Bool
+  third : Bool
+inductive WriterScalarSum where | empty | value (b : Bool)
+inductive WriterScalarHeap where | bit (b : Bool) | text (s : String)
+inductive WriterBoolWrapper where | mk (b : Bool)
+inductive WriterWideScalar where | mk (b : UInt32) (n : Nat)
 inductive WriterProof where | mk (p : True) (n : Nat)
 inductive WriterParam (α : Type) where | mk (value : α)
 inductive WriterIndexed : Nat → Type where | zero : WriterIndexed 0
@@ -174,6 +187,19 @@ fn compiler_data_rejects_allocator_overflow_even_without_constructor_code() {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum FieldValue {
+    Object {
+        index: usize,
+        ty: Expr,
+    },
+    Scalar {
+        size: usize,
+        offset: usize,
+        ty: Expr,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum MapValue {
     Nontrivial,
     Type(Expr),
@@ -181,7 +207,8 @@ enum MapValue {
         name: Name,
         index: usize,
         size: usize,
-        fields: Vec<(usize, Expr)>,
+        scalar_bytes: usize,
+        fields: Vec<FieldValue>,
     },
 }
 
@@ -233,23 +260,55 @@ fn maps(blocks: &[OpaqueExtensionBlock], keep: &BTreeSet<Name>) -> Vec<BTreeMap<
                         assert_eq!(info.header().other, 5);
                         let ctor_name = conversion.project_name(&info.ctor_child(0)).unwrap();
                         assert_eq!(info.ctor_child(3).unbox(), 0, "no usize fields");
-                        assert_eq!(info.ctor_child(4).unbox(), 0, "no packed scalar bytes");
                         let array = value.ctor_child(1);
                         let fields = (0..array.array_view().0)
                             .map(|index| {
                                 let field = array.array_child(index);
-                                assert_eq!(field.obj_tag(), 1, "CtorFieldInfo.object");
-                                assert_eq!(field.header().other, 2);
-                                (
-                                    field.ctor_child(0).unbox(),
-                                    expression(&mut conversion, &mut heap, &field.ctor_child(1)),
-                                )
+                                match field.obj_tag() {
+                                    tag if tag == usize::from(ir::LCNF_CTOR_FIELD_OBJECT) => {
+                                        assert_eq!(
+                                            field.header().other as usize,
+                                            ir::LCNF_CTOR_FIELD_OBJECT_POINTERS
+                                        );
+                                        FieldValue::Object {
+                                            index: field
+                                                .ctor_child(ir::LCNF_CTOR_FIELD_OBJECT_I)
+                                                .unbox(),
+                                            ty: expression(
+                                                &mut conversion,
+                                                &mut heap,
+                                                &field.ctor_child(ir::LCNF_CTOR_FIELD_OBJECT_TYPE),
+                                            ),
+                                        }
+                                    }
+                                    tag if tag == usize::from(ir::LCNF_CTOR_FIELD_SCALAR) => {
+                                        assert_eq!(
+                                            field.header().other as usize,
+                                            ir::LCNF_CTOR_FIELD_SCALAR_POINTERS
+                                        );
+                                        FieldValue::Scalar {
+                                            size: field
+                                                .ctor_child(ir::LCNF_CTOR_FIELD_SCALAR_SZ)
+                                                .unbox(),
+                                            offset: field
+                                                .ctor_child(ir::LCNF_CTOR_FIELD_SCALAR_OFFSET)
+                                                .unbox(),
+                                            ty: expression(
+                                                &mut conversion,
+                                                &mut heap,
+                                                &field.ctor_child(ir::LCNF_CTOR_FIELD_SCALAR_TYPE),
+                                            ),
+                                        }
+                                    }
+                                    tag => panic!("unexpected compiler data field {tag}"),
+                                }
                             })
                             .collect();
                         MapValue::Constructor {
                             name: ctor_name,
                             index: info.ctor_child(1).unbox(),
                             size: info.ctor_child(2).unbox(),
+                            scalar_bytes: info.ctor_child(4).unbox(),
                             fields,
                         }
                     }
@@ -314,21 +373,35 @@ fn assert_live_readers(
 import WriterData
 open Lean Elab Command Compiler LCNF
 run_cmd liftCoreM do
-  for n in [``WriterEnum, ``WriterSingleton, ``WriterMixed, ``WriterRecord, ``WriterHeap, ``WriterBinders] do
+  for n in [``WriterEnum, ``WriterSingleton, ``WriterMixed, ``WriterRecord, ``WriterHeap, ``WriterBinders,
+      ``WriterScalar, ``WriterInterleaved, ``WriterAllBools, ``WriterScalarSum, ``WriterScalarHeap] do
     unless (← hasTrivialStructure? n).isNone do throwError "wrong mono trivial cache"
     unless (← hasTrivialImpureStructure? n).isNone do throwError "wrong impure trivial cache"
     unless (← getOtherDeclMonoType n) == mkConst `lcErased do throwError "wrong mono type"
     let ty ← nameToImpureType n
     let expected := if n == ``WriterEnum then `UInt8
       else if n == ``WriterSingleton then `tagged
-      else if n == ``WriterMixed || n == ``WriterBinders then `tobj else `obj
+      else if n == ``WriterMixed || n == ``WriterBinders || n == ``WriterScalarSum then `tobj else `obj
     unless ty == mkConst expected do throwError "wrong impure carrier"
     let .inductInfo iv ← getConstInfo n | throwError "missing type"
     for c in iv.ctors do
       let _ ← getOtherDeclMonoType c
       let layout ← getCtorLayout c
       unless layout.ctorInfo.name == c do throwError "wrong constructor owner"
-      unless layout.ctorInfo.size == layout.fieldInfo.size do throwError "wrong field count"
+      let mut objects := 0
+      let mut scalarBytes := 0
+      for field in layout.fieldInfo do
+        match field with
+        | .object i _ =>
+          unless i == objects do throwError "wrong object index"
+          objects := objects + 1
+        | .scalar size offset ty =>
+          unless size == 1 && offset == scalarBytes && ty == mkConst `UInt8 do
+            throwError "wrong packed Bool layout"
+          scalarBytes := scalarBytes + size
+        | _ => throwError "unexpected field representation"
+      unless layout.ctorInfo.size == objects && layout.ctorInfo.usize == 0
+          && layout.ctorInfo.ssize == scalarBytes do throwError "wrong field count"
   logInfo "native-data-caches-ok"
 "#;
     std::fs::write(directory.join("Reader.lean"), reader).unwrap();
@@ -418,6 +491,11 @@ fn compiler_data_maps_match_the_actual_pin_and_refuse_unsupported_layouts() {
         "WriterRecord",
         "WriterHeap",
         "WriterBinders",
+        "WriterScalar",
+        "WriterInterleaved",
+        "WriterAllBools",
+        "WriterScalarSum",
+        "WriterScalarHeap",
     ]
     .into_iter()
     .map(name)

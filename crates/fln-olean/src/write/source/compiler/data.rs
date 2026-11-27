@@ -7,12 +7,11 @@
 //!
 //! This projection follows `MonoTypes.lean`, `Irrelevant.lean` and
 //! `ToImpureType.lean` for nonrecursive, monomorphic Type0 families whose
-//! relevant fields are exactly Nat/String. Sole-field wrappers, erased fields,
-//! packed scalar fields, annotated field domains, aliases, dependencies and
-//! mutual families are excluded.
-//! Both trivial-structure caches are consequently `none`; every layout field
-//! is `CtorFieldInfo.object`. The generated ToImpureType.c independently gives
-//! the two-pointer CtorLayout and the tag-1/two-pointer object-field records.
+//! relevant fields are exactly Nat/String/Bool. Sole-field wrappers, erased
+//! fields, wider scalars, annotated field domains, aliases, dependencies and
+//! mutual families are excluded. Both trivial-structure caches are consequently
+//! `none`. Object fields precede the Bool scalar bytes; each group preserves
+//! source order. The layout records are extracted from `ToImpureType.lean`.
 
 use super::*;
 use fln_core::expr::BinderInfo;
@@ -52,8 +51,9 @@ impl CompilerData {
         &self.carrier
     }
 
-    /// Canonical constructor order and its object-field carriers. Consumers
-    /// can reserve these layouts without maintaining another shape classifier.
+    /// Canonical constructor order and its field carriers in source order.
+    /// Consumers can reserve these layouts without another shape classifier;
+    /// UInt8 fields occupy packed scalar bytes, not object slots.
     pub fn constructors(&self) -> impl ExactSizeIterator<Item = (&Name, &[IrType])> {
         self.constructors
             .iter()
@@ -99,10 +99,10 @@ impl CompilerData {
                 || ctor.num_params != 0
                 || ctor.is_unsafe
                 || !ctor.base.level_params.is_empty()
-                // lean_alloc_ctor stores the object count in its eight-bit
-                // header and requires num_objs < LEAN_MAX_CTOR_FIELDS. Apply
-                // this even if a caller only passes values through a closure
-                // and no constructor instruction reaches FIR validation.
+                // The internal all-boxed representation and lean_alloc_ctor
+                // require num_objs < LEAN_MAX_CTOR_FIELDS. Keep this total
+                // source-field bound even for packed public layouts, including
+                // callbacks without a constructor instruction for FIR to check.
                 || ctor.num_fields as usize >= fln_rt::abi::MAX_CTOR_FIELDS
             {
                 return Ok(None);
@@ -138,6 +138,11 @@ impl CompilerData {
                         if levels.is_empty() && name == &Name::from_components(["String"]) =>
                     {
                         IrType::Object
+                    }
+                    ExprNode::Const { name, levels }
+                        if levels.is_empty() && name == &Name::from_components(["Bool"]) =>
+                    {
+                        IrType::UInt8
                     }
                     _ => return Ok(None),
                 };
@@ -255,15 +260,41 @@ impl Encoder {
                 maps[2].push((ctor.name.clone(), self.expression(&ctor.mono_type)?));
                 self.source_array_bound(ctor.fields.len())?;
                 let mut fields = Vec::with_capacity(ctor.fields.len());
-                for (index, ty) in ctor.fields.iter().enumerate() {
-                    let index = self.nat_u64(index as u64)?;
-                    let ty = self.compiler_type(ty)?;
-                    // CtorFieldInfo.object (constructor ordinal 1): Nat, Expr.
-                    fields.push(self.ctor(1, vec![index, ty], &[])?);
+                let mut objects = 0_u64;
+                let mut scalar_bytes = 0_u64;
+                for ty in &ctor.fields {
+                    let field = match ty {
+                        IrType::Object | IrType::TObject => {
+                            let mut slots = (0..ir::LCNF_CTOR_FIELD_OBJECT_POINTERS)
+                                .map(|_| Obj::mk_nat(0))
+                                .collect::<Vec<_>>();
+                            slots[ir::LCNF_CTOR_FIELD_OBJECT_I] = self.nat_u64(objects)?;
+                            slots[ir::LCNF_CTOR_FIELD_OBJECT_TYPE] = self.compiler_type(ty)?;
+                            objects += 1;
+                            self.ctor(ir::LCNF_CTOR_FIELD_OBJECT, slots, &[])?
+                        }
+                        IrType::UInt8 => {
+                            let mut slots = (0..ir::LCNF_CTOR_FIELD_SCALAR_POINTERS)
+                                .map(|_| Obj::mk_nat(0))
+                                .collect::<Vec<_>>();
+                            slots[ir::LCNF_CTOR_FIELD_SCALAR_SZ] = Obj::mk_nat(1);
+                            slots[ir::LCNF_CTOR_FIELD_SCALAR_OFFSET] =
+                                self.nat_u64(scalar_bytes)?;
+                            slots[ir::LCNF_CTOR_FIELD_SCALAR_TYPE] = self.compiler_type(ty)?;
+                            scalar_bytes += 1;
+                            self.ctor(ir::LCNF_CTOR_FIELD_SCALAR, slots, &[])?
+                        }
+                        _ => {
+                            return Err(WriteError::Contract {
+                                what: "unsupported checked compiler data field",
+                            });
+                        }
+                    };
+                    fields.push(field);
                 }
                 let name = self.name(&ctor.name)?;
                 let index = self.nat_u64(index as u64)?;
-                let size = self.nat_u64(ctor.fields.len() as u64)?;
+                let size = self.nat_u64(objects)?;
                 // CtorInfo is shared with the independently extracted IR
                 // contract: name, cidx, object count, usize count, scalar bytes.
                 let mut info = (0..ir::CTOR_INFO_POINTERS)
@@ -272,9 +303,15 @@ impl Encoder {
                 info[ir::CTOR_INFO_NAME] = name;
                 info[ir::CTOR_INFO_CIDX] = index;
                 info[ir::CTOR_INFO_SIZE] = size;
+                info[ir::CTOR_INFO_SSIZE] = self.nat_u64(scalar_bytes)?;
                 let info = self.ctor(0, info, &[])?;
                 let fields = self.array(fields)?;
-                let layout = self.ctor(0, vec![info, fields], &[])?;
+                let mut slots = (0..ir::LCNF_CTOR_LAYOUT_POINTERS)
+                    .map(|_| Obj::mk_nat(0))
+                    .collect::<Vec<_>>();
+                slots[ir::LCNF_CTOR_LAYOUT_CTOR_INFO] = info;
+                slots[ir::LCNF_CTOR_LAYOUT_FIELD_INFO] = fields;
+                let layout = self.ctor(0, slots, &[])?;
                 maps[4].push((ctor.name.clone(), layout));
             }
         }

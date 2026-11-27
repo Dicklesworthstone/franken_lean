@@ -5,6 +5,7 @@
 //! src/Lean/Compiler/IR/CompilerM.lean: sha256 fa67405b0bc83900ffd0a7c88bb7934e9fcd2255761a89400a73847a85cc3235
 //! src/Lean/Compiler/LCNF/Basic.lean: sha256 58601e9868b1d38f6901bb6296fcf6172cf2417d6eaec0b57f95b61a07e9e3fc
 //! src/Lean/Compiler/LCNF/PhaseExt.lean: sha256 12612f44a6a76e7bdb3f4c208553b77bc15fb6025f6e8c9ab4fecd453a79cb9a
+//! src/Lean/Compiler/LCNF/ToImpureType.lean: sha256 dc2e7718cb3018a3772222ed31986bd4bf9971e9c6e04144f090b8598b72cae3
 //! src/Lean/Expr.lean: sha256 7d4418bf9fef6f72eac422db70613848f849f074573392e79fb86fe745e79f7e
 #![allow(dead_code)]
 
@@ -252,6 +253,26 @@ pub const EXTERN_ENTRY_STANDARD_SCALAR_BYTES: usize = 0;
 pub const EXTERN_ENTRY_OPAQUE: u8 = 3;
 pub const EXTERN_ENTRY_CONSTRUCTORS: u8 = 4;
 
+// CtorFieldInfo: a constructor without fields is the boxed tag.
+pub const LCNF_CTOR_FIELD_ERASED: u8 = 0;
+pub const LCNF_CTOR_FIELD_OBJECT: u8 = 1;
+pub const LCNF_CTOR_FIELD_OBJECT_I: usize = 0;
+pub const LCNF_CTOR_FIELD_OBJECT_TYPE: usize = 1;
+pub const LCNF_CTOR_FIELD_OBJECT_POINTERS: usize = 2;
+pub const LCNF_CTOR_FIELD_OBJECT_SCALAR_BYTES: usize = 0;
+pub const LCNF_CTOR_FIELD_USIZE: u8 = 2;
+pub const LCNF_CTOR_FIELD_USIZE_I: usize = 0;
+pub const LCNF_CTOR_FIELD_USIZE_POINTERS: usize = 1;
+pub const LCNF_CTOR_FIELD_USIZE_SCALAR_BYTES: usize = 0;
+pub const LCNF_CTOR_FIELD_SCALAR: u8 = 3;
+pub const LCNF_CTOR_FIELD_SCALAR_SZ: usize = 0;
+pub const LCNF_CTOR_FIELD_SCALAR_OFFSET: usize = 1;
+pub const LCNF_CTOR_FIELD_SCALAR_TYPE: usize = 2;
+pub const LCNF_CTOR_FIELD_SCALAR_POINTERS: usize = 3;
+pub const LCNF_CTOR_FIELD_SCALAR_SCALAR_BYTES: usize = 0;
+pub const LCNF_CTOR_FIELD_VOID: u8 = 4;
+pub const LCNF_CTOR_FIELD_CONSTRUCTORS: u8 = 5;
+
 pub const CTOR_INFO_NAME: usize = 0;
 pub const CTOR_INFO_CIDX: usize = 1;
 pub const CTOR_INFO_SIZE: usize = 2;
@@ -280,6 +301,11 @@ pub const LCNF_SIGNATURE_PARAMS: usize = 3;
 pub const LCNF_SIGNATURE_SAFE_SCALAR: usize = 0;
 pub const LCNF_SIGNATURE_POINTERS: usize = 4;
 pub const LCNF_SIGNATURE_SCALAR_BYTES: usize = 1;
+
+pub const LCNF_CTOR_LAYOUT_CTOR_INFO: usize = 0;
+pub const LCNF_CTOR_LAYOUT_FIELD_INFO: usize = 1;
+pub const LCNF_CTOR_LAYOUT_POINTERS: usize = 2;
+pub const LCNF_CTOR_LAYOUT_SCALAR_BYTES: usize = 0;
 
 pub const DECL_MAP_EXTENSION: &str = "Lean.IR.declMapExt";
 pub const LCNF_IMPURE_SIGNATURE_EXTENSION: &str = "Lean.Compiler.LCNF.impureSigExt";
