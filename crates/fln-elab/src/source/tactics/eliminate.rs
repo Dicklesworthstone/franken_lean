@@ -484,6 +484,17 @@ impl Context {
             } else {
                 old.user_name.clone()
             };
+            // A generated input bound to the eliminated family's index now
+            // denotes the constructor's actual result index. Carry that fact
+            // through later reversion, including a split on another column.
+            if source_match
+                && old.user_name.parent().is_anonymous()
+                && matches!(old.user_name.leaf_view(), LeafView::Num(_))
+                && (self.matrix_refined_indices.contains(&old.id)
+                    || matches!(old.value.as_ref().map(Expr::node), Some(ExprNode::FVar { id }) if indices.iter().any(|index| index.id == *id)))
+            {
+                self.matrix_refined_indices.insert(id.clone());
+            }
             let local = LocalDecl {
                 id: id.clone(),
                 user_name: name,

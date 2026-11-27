@@ -627,7 +627,7 @@ impl Context {
         if !parts.generalizing && (parts.generated || parts.equation.is_some()) {
             return Err(error(MatchError::UnsupportedGeneralization));
         }
-        if let Some(state) = self.repeated_matrix_field(parts, &major, expected.as_ref())? {
+        if let Some(state) = self.known_matrix_constructor(parts, &major, expected.as_ref())? {
             return Ok(MatchStart::Regular(Box::new(state)));
         }
         // Keep the existing direct/index-polymorphic path, including recursive
@@ -1058,12 +1058,11 @@ impl Context {
         })
     }
 
-    /// Different named/positional layouts can select one physical field. After the first
-    /// split, the ordinary eliminator reintroduces that field as its checked constructor.
-    /// Reuse that branch fact for a later generated alias, retaining checked lets and every
-    /// original row's matrixScope witness. This never evaluates an arbitrary discriminant or
-    /// supplies a missing source case: it is limited to aliases made by `match_patterns`.
-    fn repeated_matrix_field<'a>(
+    /// Reuse a checked constructor established by an earlier matrix split.
+    /// A repeated field from named/positional layouts and a column bound to a
+    /// refined family index both carry that fact in the local context. An
+    /// ordinary user-written constructor scrutinee still requires coverage.
+    fn known_matrix_constructor<'a>(
         &mut self,
         parts: MatchParts<'a>,
         major: &Typed,
@@ -1075,12 +1074,12 @@ impl Context {
         let Syntax::Ident { val, .. } = parts.discriminant else {
             return Ok(None);
         };
-        if !self.matrix_shared_columns.contains(val) {
-            return Ok(None);
-        }
         let ExprNode::FVar { id } = major.value.node() else {
             return Ok(None);
         };
+        if !self.matrix_shared_columns.contains(val) && !self.matrix_refined_indices.contains(id) {
+            return Ok(None);
+        }
         let Some(mut value) = self.txn.lctx.find(id).and_then(|local| local.value.clone()) else {
             return Ok(None);
         };

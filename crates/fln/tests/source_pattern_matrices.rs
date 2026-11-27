@@ -174,6 +174,32 @@ fn dependent_discriminants_refine_each_others_types() {
     ));
 }
 #[test]
+fn a_proof_constructor_refines_a_later_test_of_its_result_index() {
+    let family = "inductive Below (n : Nat) : Nat → Prop where
+      | refl : Below n n
+      | step {m : Nat} (h : Below n m) : Below n (Nat.succ m)";
+    // The predecessor is arbitrary. Only the outer successor is forced.
+    let cases = "theorem classified : {n m : Nat} → Below n m → 0 = 0
+      | _, _, Below.refl => rfl
+      | _, Nat.succ _, Below.step _ => rfl";
+    check(&format!("{family}\n{cases}"));
+    for invalid in [
+        cases.replace("Nat.succ _, Below.step", "Nat.zero, Below.step"),
+        cases.replace(
+            "Nat.succ _, Below.step",
+            "Nat.succ (Nat.succ _), Below.step",
+        ),
+        cases.replace("_, _, Below.refl", "_, Nat.succ _, Below.refl"),
+        cases.replace("0 = 0", "0 = 1"),
+    ] {
+        reject(&format!("{family}\n{invalid}"));
+    }
+    // A constructor supplied by the caller is not a branch refinement.
+    reject("def bad : Nat := match Nat.succ 0, true with | Nat.succ _, _ => 0");
+    reject("def bad : Nat := let n := Nat.succ 0; match n, true with | Nat.succ _, _ => 0");
+}
+
+#[test]
 fn a_prior_scalar_column_refines_a_later_indexed_column() {
     // The cons row's index field is `_`: named, `Vec (j + 1)` against `Vec (k + 1)` is a
     // mismatch of two pattern variables at the pin ("Type mismatch", 2026-10-10;

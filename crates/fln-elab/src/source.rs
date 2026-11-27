@@ -816,6 +816,10 @@ struct Context {
     matrix_record_projections: std::collections::HashMap<Name, Vec<(Name, Vec<Name>)>>,
     // Constructor columns shared by named/positional layouts, including their descendants.
     matrix_shared_columns: std::collections::HashSet<Name>,
+    // Local instances of generated columns specialized to a constructor result
+    // index by a checked outer elimination. Key by binder identity: a sibling
+    // branch can use the same private column name at a different index.
+    matrix_refined_indices: std::collections::HashSet<FVarId>,
     // A written match the pattern-matrix compiler lowered, by its last input's binder: the
     // inputs in order and the alternatives' patterns, typed as the pin types them once that
     // binder is in scope (`pattern_typing`).
@@ -1043,6 +1047,7 @@ impl Context {
             matrix_field_aliases: std::collections::HashMap::new(),
             matrix_record_projections: std::collections::HashMap::new(),
             matrix_shared_columns: std::collections::HashSet::new(),
+            matrix_refined_indices: std::collections::HashSet::new(),
             pattern_typing_checks: std::collections::HashMap::new(),
             registry_cache,
             alias_cache: crate::aliases::AliasCache::default(),
