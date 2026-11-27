@@ -390,10 +390,11 @@ impl Context {
 
     /// Check the candidate before later elaboration may refer to its constant.
     /// Final publication still requires the facade's independent checker seat.
-    pub(super) fn expose_auxiliary_declaration(
+    pub(in crate::source) fn admit_auxiliary_into_env(
         &mut self,
+        environment: &Environment,
         declaration: Declaration,
-    ) -> Result<(), NatDefinitionElabError> {
+    ) -> Result<Environment, NatDefinitionElabError> {
         use fln_core::outcome::InternalFault;
         use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
         use fln_env::pmap::CollisionBudget;
@@ -413,7 +414,7 @@ impl Context {
             .kernel
             .narrowed(self.kernel.steps.min(remaining), self.kernel.depth);
         let nonanswer = |outcome| failure(SourceInferenceError::TypeObligation(Box::new(outcome)));
-        let admitted = match admit(&self.txn.env, declaration.clone(), kernel) {
+        let admitted = match admit(environment, declaration, kernel) {
             Outcome::Complete(admitted) => admitted,
             Outcome::Inconclusive(reason) => return Err(nonanswer(Outcome::Inconclusive(reason))),
             Outcome::InternalFault(fault) => return Err(nonanswer(Outcome::InternalFault(fault))),
@@ -450,24 +451,29 @@ impl Context {
                 ))));
             }
         };
-        let environment = match checked.publish(
+        match checked.publish(
             DeclarationBudget::default(),
             CollisionBudget::default(),
             None,
         ) {
             Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
                 publication,
-            ))) => publication.environment,
-            Outcome::Complete(_) => {
-                return Err(nonanswer(Outcome::InternalFault(InternalFault::new(
-                    "FL-INV-02",
-                    "a fresh checked auxiliary declaration did not commit",
-                ))));
-            }
-            Outcome::Inconclusive(reason) => return Err(nonanswer(Outcome::Inconclusive(reason))),
-            Outcome::InternalFault(fault) => return Err(nonanswer(Outcome::InternalFault(fault))),
-        };
-        self.txn.env = environment;
+            ))) => Ok(publication.environment),
+            Outcome::Complete(_) => Err(nonanswer(Outcome::InternalFault(InternalFault::new(
+                "FL-INV-02",
+                "a fresh checked auxiliary declaration did not commit",
+            )))),
+            Outcome::Inconclusive(reason) => Err(nonanswer(Outcome::Inconclusive(reason))),
+            Outcome::InternalFault(fault) => Err(nonanswer(Outcome::InternalFault(fault))),
+        }
+    }
+
+    pub(super) fn expose_auxiliary_declaration(
+        &mut self,
+        declaration: Declaration,
+    ) -> Result<(), NatDefinitionElabError> {
+        let base = self.txn.env.clone();
+        self.txn.env = self.admit_auxiliary_into_env(&base, declaration.clone())?;
         self.auxiliary_declarations.push(declaration);
         Ok(())
     }

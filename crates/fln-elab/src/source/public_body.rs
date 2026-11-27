@@ -28,6 +28,7 @@ pub fn elaborate_public_definition(
     Ok(ElaboratedDeclaration {
         declaration,
         auxiliary_declarations: std::mem::take(&mut context.auxiliary_declarations),
+        auxiliary_visibility: std::mem::take(&mut context.auxiliary_visibility),
         equation_info: context.equation_info.take(),
         local_functions,
         irreducible: context.well_founded_definition,
@@ -77,6 +78,7 @@ impl Context {
         }
         let mut context = Self::scoped(worlds.public, kernel, &scope)?;
         context.generated_name_environment = Some(worlds.private.clone());
+        context.private_decl_world = Some((worlds.private.clone(), worlds.private_scope.clone()));
         if !scope.expose_definitions {
             context.private_proof_body =
                 Some((worlds.private.clone(), worlds.private_scope.clone()));

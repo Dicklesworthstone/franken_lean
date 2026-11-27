@@ -67,6 +67,7 @@ pub fn elaborate_definition(
         candidate: ElaboratedDeclaration {
             declaration,
             auxiliary_declarations: std::mem::take(&mut context.auxiliary_declarations),
+            auxiliary_visibility: std::mem::take(&mut context.auxiliary_visibility),
             equation_info: context.equation_info.take(),
             local_functions,
             irreducible: context.well_founded_definition,

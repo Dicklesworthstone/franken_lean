@@ -45,13 +45,18 @@ impl Engine {
     }
 
     /// Hidden bodies keep every auxiliary private. Exposed bodies first check
-    /// the complete auxiliary proofs in the public predecessor, then admit
-    /// their public interfaces as the pin's AddDecl.addDeclCore does. The
-    /// private successor always retains the actual independently checked proof.
+    /// ordinary auxiliary proofs in the public predecessor, then admit their
+    /// public interfaces as the pin's AddDecl.addDeclCore does. Explicit
+    /// `private_decl%` bridge auxiliaries are checked in full in the private
+    /// world first and expose only their checked public signature as an Axiom
+    /// in the public world (which rejects any leaked private type). Nested
+    /// auxiliaries created inside `private_decl%` remain strictly private.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn admit_public_auxiliaries(
         &self,
         public: &Engine,
         declarations: &[Declaration],
+        visibility: &fln_elab::source::AuxiliaryVisibility,
         hidden: bool,
         options: &KVMap,
         limits: EngineAdmissionLimits,
@@ -61,32 +66,96 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let mut interfaces = Vec::new();
+        let mut public_engine = public.clone();
+        let base_logical_root = public_engine.logical_root(options);
+        let mut public_admissions = Vec::new();
         if !hidden && !declarations.is_empty() {
-            let checked = match public.admit_declarations(declarations, options, limits)? {
-                Outcome::Complete(checked) => checked,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            };
-            for admitted in checked.admissions {
-                interfaces.push(match admitted.declaration {
-                    Declaration::Thm(theorem) => Declaration::Axiom(AxiomVal {
-                        base: theorem.base,
-                        is_unsafe: false,
-                    }),
-                    Declaration::Axiom(axiom) => Declaration::Axiom(axiom),
-                    _ => {
-                        return Err(EngineExecutionError::UnexpectedPublication {
-                            detail: "source proof auxiliaries must preserve theorem or native axiom kind",
-                        });
-                    }
+            if private.admissions.len() != declarations.len() {
+                return Err(EngineExecutionError::UnexpectedPublication {
+                    detail: "private auxiliary prefix admission count must match candidate count",
                 });
             }
+            for (candidate, admitted_private) in declarations.iter().zip(private.admissions.iter())
+            {
+                let name = match candidate {
+                    Declaration::Axiom(val) => Some(&val.base.name),
+                    Declaration::Defn(val) => Some(&val.base.name),
+                    Declaration::Thm(val) => Some(&val.base.name),
+                    Declaration::Opaque(val) => Some(&val.base.name),
+                    _ => None,
+                };
+                if name.is_some_and(|name| visibility.private_only.contains(name)) {
+                    continue;
+                }
+                let interface = if name.is_some_and(|name| visibility.private_bridge.contains(name))
+                {
+                    // Already checked in full by K1 + independent checker in `private`.
+                    // Expose only its checked signature in `public`; K1 + independent
+                    // checker below verify that the signature uses only public constants.
+                    match &admitted_private.declaration {
+                        Declaration::Thm(theorem) => Declaration::Axiom(AxiomVal {
+                            base: theorem.base.clone(),
+                            is_unsafe: false,
+                        }),
+                        Declaration::Defn(definition)
+                            if definition.safety == DefinitionSafety::Safe =>
+                        {
+                            Declaration::Axiom(AxiomVal {
+                                base: definition.base.clone(),
+                                is_unsafe: false,
+                            })
+                        }
+                        _ => {
+                            return Err(EngineExecutionError::UnexpectedPublication {
+                                detail: "private_decl% auxiliary must be a checked theorem or safe definition",
+                            });
+                        }
+                    }
+                } else {
+                    let checked = match public_engine.admit_declarations(
+                        std::slice::from_ref(candidate),
+                        options,
+                        limits,
+                    )? {
+                        Outcome::Complete(checked) => checked,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    let [admitted] = checked.admissions.as_slice() else {
+                        return Err(EngineExecutionError::UnexpectedPublication {
+                            detail: "ordinary source auxiliary must admit exactly one declaration",
+                        });
+                    };
+                    match &admitted.declaration {
+                        Declaration::Thm(theorem) => Declaration::Axiom(AxiomVal {
+                            base: theorem.base.clone(),
+                            is_unsafe: false,
+                        }),
+                        Declaration::Axiom(axiom) => Declaration::Axiom(axiom.clone()),
+                        _ => {
+                            return Err(EngineExecutionError::UnexpectedPublication {
+                                detail: "source proof auxiliaries must preserve theorem or native axiom kind",
+                            });
+                        }
+                    }
+                };
+                let step = match public_engine.admit_declarations(&[interface], options, limits)? {
+                    Outcome::Complete(checked) => checked,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                public_engine = step.engine;
+                public_admissions.extend(step.admissions);
+            }
         }
-        let public = match public.admit_auxiliary_prefix(&interfaces, options, limits)? {
-            Outcome::Complete(checked) => checked,
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        let result_logical_root = public_engine.logical_root(options);
+        let public = DeclarationBatchAdmission {
+            engine: public_engine,
+            base_logical_root,
+            result_logical_root,
+            admissions: public_admissions,
+            local_instance: None,
+            local_symm: Vec::new(),
         };
         Ok(Outcome::Complete(PublicAuxiliaries { public, private }))
     }
@@ -107,6 +176,7 @@ impl Engine {
         let auxiliaries = match self.admit_public_auxiliaries(
             public,
             &candidate.auxiliary_declarations,
+            &candidate.auxiliary_visibility,
             false,
             options,
             limits,
@@ -212,6 +282,7 @@ impl Engine {
                 fln_elab::source::ElaboratedDeclaration {
                     declaration: Declaration::Defn(definition.clone()),
                     auxiliary_declarations: Vec::new(),
+                    auxiliary_visibility: Default::default(),
                     equation_info: None,
                     local_functions: Vec::new(),
                     irreducible: false,

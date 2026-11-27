@@ -39,7 +39,7 @@ mod split;
 mod trace;
 mod trivial;
 mod unfold;
-pub(in crate::source) use auxiliary::AuxLemmaCache;
+pub(in crate::source) use auxiliary::{AuxLemmaCache, PrivateDeclState};
 pub(in crate::source) use decision::AuxNames;
 pub(in crate::source) use refine::RefinementFrame;
 pub(in crate::source) use rewrite::SimpKeyCache;

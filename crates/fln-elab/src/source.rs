@@ -739,6 +739,9 @@ struct Context {
     // before their bodies may see private imports. Both environments remain
     // untrusted elaborator inputs; complete bodies require ordinary admission.
     private_proof_body: Option<(Environment, SourceScope)>,
+    // Separate private module world retained for `private_decl%` inside exposed
+    // public declarations (`Lean/Elab/BuiltinTerm.lean:465-482`).
+    private_decl_world: Option<(Environment, SourceScope)>,
     // A public deriving command resolves and checks in the exported world,
     // while fresh generated names must also avoid its private predecessor.
     // This snapshot is consulted only by name generation.
@@ -905,6 +908,8 @@ struct Context {
     // A supported compiler refusal suppressed by a noncomputable section.
     // Only the successful declaration result can carry it to post-admission metadata.
     noncomputable_definition: bool,
+    // Whether the enclosing declaration itself carries an explicit `noncomputable` modifier.
+    declaration_is_noncomputable: bool,
     // Set while the `unfold` tactic expands a selection. The pin's `unfold` rewrites by the
     // unfold equation, so an occurrence whose match is stuck becomes a `match`, which a
     // compiled recursor application does not print as.
@@ -961,6 +966,7 @@ struct Context {
     // Ordered declarations added by successful proof elaboration. These are
     // candidates for independent engine admission, never publication receipts.
     auxiliary_declarations: Vec<Declaration>,
+    auxiliary_visibility: AuxiliaryVisibility,
     // Only entry points that return all ordered effects may create auxiliaries.
     allow_auxiliary_declarations: bool,
     // A public owner's hidden body creates private auxiliaries even though the
@@ -1014,6 +1020,7 @@ impl Context {
             declared_binder_names: std::collections::HashMap::new(),
             unnamed_fields: std::collections::HashSet::new(),
             private_proof_body: None,
+            private_decl_world: None,
             generated_name_environment: None,
             public_theorem_signature: None,
             private_definition_body: false,
@@ -1082,6 +1089,7 @@ impl Context {
             course_definitions: Vec::new(),
             partial: None,
             noncomputable_definition: false,
+            declaration_is_noncomputable: false,
             unfold_tactic: false,
             simp_unfold_partial_app: false,
             tactic_transparency: None,
@@ -1098,6 +1106,7 @@ impl Context {
             source_recursors: Vec::new(),
             native: None,
             auxiliary_declarations: Vec::new(),
+            auxiliary_visibility: AuxiliaryVisibility::default(),
             allow_auxiliary_declarations: false,
             private_auxiliary_declarations: false,
             aux_lemma_cache: Default::default(),
@@ -2713,6 +2722,7 @@ impl Context {
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>, LetKind),
             LetBody(LocalContext, FVarId, Name, Typed, LetKind),
             MatrixAbstraction(Box<MatrixAbstraction>),
+            PrivateDecl(Box<tactics::PrivateDeclState>),
             RewriteTerm(
                 tactics::ProofState<'a>,
                 tactics::ProofGoal,
@@ -2835,6 +2845,7 @@ impl Context {
                                     Task::BinderBody(..)
                                         | Task::LetBody(..)
                                         | Task::MatrixAbstraction(..)
+                                        | Task::PrivateDecl(..)
                                         | Task::LocalFunctionValue(..)
                                         | Task::MatchBranch(..)
                                         | Task::DoBindJoinBody(..)
@@ -2918,6 +2929,7 @@ impl Context {
                                 Task::BinderBody(..)
                                     | Task::LetBody(..)
                                     | Task::MatrixAbstraction(..)
+                                    | Task::PrivateDecl(..)
                                     | Task::LocalFunctionValue(..)
                                     | Task::MatchBranch(..)
                                     | Task::DoBindJoinBody(..)
@@ -3452,6 +3464,28 @@ impl Context {
                                                 expected,
                                                 false,
                                             ));
+                                        }
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "privateDecl"]) {
+                                        let [keyword, inner] = args.as_slice() else {
+                                            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                                                expected: "private_decl% followed by a term",
+                                            });
+                                        };
+                                        expect_atom(
+                                            keyword,
+                                            "private_decl%",
+                                            "private_decl% keyword",
+                                        )?;
+                                        if self.private_auxiliary_declarations
+                                            || self.private_decl_world.is_none()
+                                        {
+                                            tasks.push(Task::Visit(inner, expected, finish));
+                                        } else {
+                                            let state = self.enter_private_decl()?;
+                                            tasks.push(Task::PrivateDecl(Box::new(state)));
+                                            tasks.push(Task::Visit(inner, expected, true));
                                         }
                                         continue;
                                     }
@@ -6055,6 +6089,11 @@ impl Context {
                                 values.push(Typed { value, type_ });
                                 self.txn.lctx = abs.saved;
                             }
+                            Task::PrivateDecl(state) => {
+                                let term = values.pop().expect("private_decl% term visit");
+                                let bridged = self.finish_private_decl(*state, term)?;
+                                values.push(bridged);
+                            }
                             Task::LetBody(saved, id, name, value, binding_kind) => {
                                 if binding_kind.opaque() {
                                     // Do not postpone equations over the assertion past the
@@ -6825,6 +6864,7 @@ pub struct PublicInstance {
     pub declaration: Declaration,
     /// Checked predecessors of the instance, retained in its selected body world.
     pub auxiliary_declarations: Vec<Declaration>,
+    pub auxiliary_visibility: AuxiliaryVisibility,
     /// Independently checked local helpers, kept in the selected body world.
     pub local_functions: Vec<Declaration>,
     pub proof_valued: bool,
@@ -6849,6 +6889,7 @@ pub fn elaborate_public_instance(
     let local_functions = context.lift_local_functions(&declaration)?;
     Ok(PublicInstance {
         auxiliary_declarations: std::mem::take(&mut context.auxiliary_declarations),
+        auxiliary_visibility: std::mem::take(&mut context.auxiliary_visibility),
         local_functions,
         proof_valued: matches!(&declaration, Declaration::Thm(_)),
         hidden_body: context.private_instance_body,
@@ -6914,6 +6955,7 @@ pub fn elaborate_public_theorem(
     Ok(ElaboratedDeclaration {
         declaration,
         auxiliary_declarations: std::mem::take(&mut context.auxiliary_declarations),
+        auxiliary_visibility: std::mem::take(&mut context.auxiliary_visibility),
         equation_info: None,
         local_functions,
         irreducible: false,
@@ -6935,6 +6977,7 @@ impl Context {
         }
         let mut context = Self::scoped(worlds.public, kernel, &scope)?;
         context.generated_name_environment = Some(worlds.private.clone());
+        context.private_decl_world = Some((worlds.private.clone(), worlds.private_scope.clone()));
         context.private_proof_body = Some((worlds.private.clone(), worlds.private_scope.clone()));
         Ok(context)
     }
@@ -6952,6 +6995,7 @@ impl Context {
         }
         let mut context = Self::scoped(worlds.public, kernel, &scope)?;
         context.generated_name_environment = Some(worlds.private.clone());
+        context.private_decl_world = Some((worlds.private.clone(), worlds.private_scope.clone()));
         context.private_proof_body = Some((worlds.private.clone(), worlds.private_scope.clone()));
         Ok(context)
     }
@@ -7001,6 +7045,15 @@ impl Context {
         self.enter_private_proof()
     }
 
+    pub(in crate::source) fn clear_world_caches(&mut self) {
+        self.registry_cache = crate::instances::RegistryCache::default();
+        self.txn.registry_cache = self.registry_cache.clone();
+        self.alias_cache = crate::aliases::AliasCache::default();
+        self.protected_cache = crate::protected_names::ProtectedCache::default();
+        self.auxiliary_cache = crate::aux_recursors::AuxRecursorCache::default();
+        self.eliminator_tag_cache = crate::eliminator_tags::ElabAsElimCache::default();
+    }
+
     fn enter_private_proof(&mut self) -> Result<(), NatDefinitionElabError> {
         let (environment, scope) =
             self.private_proof_body
@@ -7026,12 +7079,7 @@ impl Context {
         if self.allow_auxiliary_declarations {
             self.native = scope.native;
         }
-        self.registry_cache = crate::instances::RegistryCache::default();
-        self.txn.registry_cache = self.registry_cache.clone();
-        self.alias_cache = crate::aliases::AliasCache::default();
-        self.protected_cache = crate::protected_names::ProtectedCache::default();
-        self.auxiliary_cache = crate::aux_recursors::AuxRecursorCache::default();
-        self.eliminator_tag_cache = crate::eliminator_tags::ElabAsElimCache::default();
+        self.clear_world_caches();
         Ok(())
     }
 }
@@ -7044,6 +7092,22 @@ pub(super) fn definition(
     definition_scoped(syntax, environment, kernel, &SourceScope::default())
 }
 
+/// Visibility overrides for auxiliary declarations produced inside a public
+/// declaration body (`private_decl%`). Ordinary auxiliaries belong to neither
+/// set and are checked in full in both public and private worlds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuxiliaryVisibility {
+    /// Auxiliaries synthesized by `private_decl%`: checked in full in the
+    /// private world and exposed only as checked public `Axiom` signatures.
+    pub private_bridge: std::collections::HashSet<Name>,
+    /// Data `private_decl%` auxiliaries already verified computable in the
+    /// private world before switching back to the public world's `Axiom` view.
+    pub computable_private_bridge: std::collections::HashSet<Name>,
+    /// Nested auxiliaries synthesized while elaborating inside `private_decl%`:
+    /// checked and retained strictly in the private world.
+    pub private_only: std::collections::HashSet<Name>,
+}
+
 /// An untrusted source candidate and the effects selected by its successful
 /// elaboration. Effects are installed only after ordinary declaration admission;
 /// neither this value nor its flags grant publication authority.
@@ -7054,6 +7118,7 @@ pub struct ElaboratedDeclaration {
     /// The owner cites them, so callers must admit each through both checkers
     /// before the owner, retaining the whole command as one atomic transition.
     pub auxiliary_declarations: Vec<Declaration>,
+    pub auxiliary_visibility: AuxiliaryVisibility,
     /// The root `match` of a definition by pattern matching, for its equation theorems: the
     /// caller records it with the admitted definition (`equation_theorems::journal::push`).
     pub equation_info: Option<equation_theorems::journal::Record>,
@@ -7107,6 +7172,7 @@ fn definition_scoped_elaboration(
     Ok(ElaboratedDeclaration {
         declaration,
         auxiliary_declarations: std::mem::take(&mut context.auxiliary_declarations),
+        auxiliary_visibility: std::mem::take(&mut context.auxiliary_visibility),
         equation_info: context.equation_info.take(),
         local_functions,
         irreducible: context.well_founded_definition,
@@ -7639,6 +7705,7 @@ fn definition_elaboration(
         }
     }
     noncomputable_registration(syntax)?;
+    context.declaration_is_noncomputable = is_noncomputable;
     if is_protected && generated_name.is_some() {
         return Err(NatDefinitionElabError::UnexpectedSyntax {
             expected: "a named protected declaration",
@@ -8268,7 +8335,8 @@ fn definition_elaboration(
                 .as_ref()
                 .map(|body| body.factory.clone());
             let executable = executable.map(|body| context.finish(body)).transpose()?;
-            context.noncomputable_definition = main_failed
+            context.noncomputable_definition = context.noncomputable_definition
+                || main_failed
                 || context.check_definition_codegen(executable.as_ref().unwrap_or(&term))?;
         } else {
             // The declared body remains fully typed and checked, but the pin

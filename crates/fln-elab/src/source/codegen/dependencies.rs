@@ -17,6 +17,7 @@ pub(super) struct Dependencies {
     implemented_by: ImplementedByTable,
     externs: ExternTable,
     macro_inline: BTreeSet<Name>,
+    computable_private_bridges: std::collections::HashSet<Name>,
     well_founded: well_founded::Cache,
 }
 
@@ -94,6 +95,10 @@ impl Dependencies {
             implemented_by,
             externs,
             macro_inline,
+            computable_private_bridges: context
+                .auxiliary_visibility
+                .computable_private_bridge
+                .clone(),
             well_founded: well_founded::Cache::default(),
         })
     }
@@ -202,13 +207,17 @@ impl Dependencies {
         }
         let unavailable = match self.environment.find(selected) {
             Some(ConstantInfo::Axiom(actual)) => {
-                // The bounded source seed represents some native intrinsics
-                // as axioms. Reuse its exact candidate, not a name or a type
-                // shape allowlist. Native ABI authorization still belongs to
-                // the existing runtime bridge, not this compiler check.
-                let candidate = crate::seed::source_intrinsic_seed_declaration(selected)
-                    .or_else(|| crate::seed::float_intrinsic_seed_declaration(selected));
-                !matches!(candidate, Some(Declaration::Axiom(expected)) if actual == &expected)
+                if self.computable_private_bridges.contains(selected) {
+                    false
+                } else {
+                    // The bounded source seed represents some native intrinsics
+                    // as axioms. Reuse its exact candidate, not a name or a type
+                    // shape allowlist. Native ABI authorization still belongs to
+                    // the existing runtime bridge, not this compiler check.
+                    let candidate = crate::seed::source_intrinsic_seed_declaration(selected)
+                        .or_else(|| crate::seed::float_intrinsic_seed_declaration(selected));
+                    !matches!(candidate, Some(Declaration::Axiom(expected)) if actual == &expected)
+                }
             }
             Some(ConstantInfo::Quot(value)) => !matches!(
                 value.kind,

@@ -677,6 +677,87 @@ fn invalid_executable_attributes_and_post_compilation_updates_are_refused_atomic
 }
 
 #[test]
+fn private_decl_bridges_private_proofs_without_leaking_private_types() {
+    let engine = Engine::builder().build_empty();
+    let root = engine.logical_root(&KVMap::new());
+
+    // Positive control: inside an `@[expose]` public definition in a `module`,
+    // `private_decl%` can call a private helper theorem (`isValidChar_UInt32`
+    // shape from `Init/Prelude.lean:2855`), exposing only a checked public
+    // auxiliary signature while retaining the checked private proof in the
+    // private artifact.
+    let built = build(
+        &engine,
+        &[(
+            "Main",
+            "module\n\
+             prelude\n\
+             public section\n\
+             inductive N : Type where | z : N | s : N -> N\n\
+             inductive P : N -> Prop where | ok (n : N) : P n\n\
+             inductive Q : N -> Prop where | ok (n : N) : Q n\n\
+             structure Box where\n\
+               val : N\n\
+               proof : Q val\n\
+             private theorem pToQ (n : N) (h : P n) : Q n := Q.ok n\n\
+             private def stepN (n : N) : N := N.s n\n\
+             private axiom privAx : N\n\
+             @[expose] def mkBox (n : N) (h : P n) : Box :=\n\
+               Box.mk n (private_decl% pToQ n h)\n\
+             @[expose] def pubStep (n : N) : N :=\n\
+               private_decl% stepN n\n\
+             @[expose] noncomputable def pubNoncomp : N :=\n\
+               private_decl% privAx\n\
+             private def nonExporting (n : N) (h : P n) : Q n :=\n\
+               private_decl% pToQ n h\n",
+        )],
+        OleanWriteBudget::default(),
+    )
+    .expect("private_decl% in exposed public definition succeeds")
+    .into_complete()
+    .expect("private_decl% build completes");
+    let receipt = imported(&built);
+    assert!(receipt.engine.environment().contains(&name("mkBox")));
+    assert!(
+        receipt
+            .engine
+            .environment()
+            .contains(&name("mkBox._private_1"))
+    );
+    assert!(receipt.engine.environment().contains(&name("pubStep")));
+    assert!(
+        receipt
+            .engine
+            .environment()
+            .contains(&name("pubStep._private_1"))
+    );
+
+    // Negative controls: `private_decl%` must never leak a private type into the
+    // exported public world, and must refuse noncomputable private data inside a
+    // computable exposed definition.
+    for bad in [
+        "module\n\
+         prelude\n\
+         public section\n\
+         private inductive Secret : Type where | mk : Secret\n\
+         private def secretVal : Secret := Secret.mk\n\
+         inductive UnitT : Type where | u : UnitT\n\
+         @[expose] def leak : UnitT :=\n\
+           (fun (_ : _) => UnitT.u) (private_decl% secretVal)\n",
+        "module\n\
+         prelude\n\
+         public section\n\
+         inductive N : Type where | z : N\n\
+         private axiom privAx : N\n\
+         @[expose] def badNoncomp : N := private_decl% privAx\n",
+    ] {
+        let err = build(&engine, &[("Main", bad)], OleanWriteBudget::default()).unwrap_err();
+        assert_eq!(err.disposition().2, 1, "{bad}: {err:?}");
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
 fn native_producer_replacements_execute_in_fresh_native_and_pinned_consumers() {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
         .map(std::path::PathBuf::from)

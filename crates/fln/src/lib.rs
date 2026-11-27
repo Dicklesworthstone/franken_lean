@@ -4859,6 +4859,7 @@ impl Engine {
                                 fln_elab::source::ElaboratedDeclaration {
                                     declaration: evaluation.declaration,
                                     auxiliary_declarations: Vec::new(),
+                                    auxiliary_visibility: Default::default(),
                                     equation_info: None,
                                     local_functions: Vec::new(),
                                     irreducible: false,
@@ -4951,6 +4952,7 @@ impl Engine {
                 let fln_elab::source::ElaboratedDeclaration {
                     declaration,
                     auxiliary_declarations,
+                    auxiliary_visibility: _,
                     equation_info,
                     local_functions,
                     irreducible,

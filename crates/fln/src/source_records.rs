@@ -637,6 +637,7 @@ impl Engine {
                         fln_elab::source::ElaboratedDeclaration {
                             declaration: instance.declaration,
                             auxiliary_declarations: instance.auxiliary_declarations,
+                            auxiliary_visibility: instance.auxiliary_visibility,
                             equation_info: None,
                             local_functions: instance.local_functions,
                             irreducible: false,
@@ -691,6 +692,7 @@ impl Engine {
         let auxiliaries = match self.admit_public_auxiliaries(
             public,
             &candidate.auxiliary_declarations,
+            &candidate.auxiliary_visibility,
             hidden_body,
             options,
             limits,
