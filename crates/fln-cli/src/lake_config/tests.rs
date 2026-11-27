@@ -64,6 +64,44 @@ fn native_lake_config_keeps_executable_roots_typed_and_defaults_to_the_target_na
 }
 
 #[test]
+fn explicit_module_roots_do_not_constrain_target_names() {
+    let source = r#"import Lake
+open Lake DSL
+package p
+@[default_target] lean_exe "my-tool" where
+  root := `Main
+lean_exe "tool.name" where
+  root := `Quoted
+lean_exe tool.name where
+  root := `Nested
+lean_lib "lib-name" where
+  roots := #[`Lib]
+"#;
+    let parsed = parse(source.as_bytes()).unwrap_or_else(|error| panic!("{}", error.detail));
+    assert_eq!(parsed.config.default_targets, ["«my-tool»"]);
+    let names: Vec<_> = parsed
+        .config
+        .targets
+        .iter()
+        .map(|target| target.name.as_str())
+        .collect();
+    assert_eq!(names, ["«my-tool»", "«tool.name»", "tool.name", "«lib-name»"]);
+
+    // A target without a root field still supplies its own module path.
+    for declaration in ["lean_exe \"my-tool\"", "lean_lib \"lib.name\""] {
+        let source = format!("import Lake\nopen Lake DSL\npackage p\n{declaration}\n");
+        let error = parse(source.as_bytes())
+            .err()
+            .expect("invalid implicit module root");
+        assert!(
+            error.detail.contains("unsupported quoted or special components"),
+            "{}",
+            error.detail
+        );
+    }
+}
+
+#[test]
 fn native_lake_config_keeps_driver_fields_typed_and_driver_tags_distinct() {
     let source = r#"import Lake
 open Lake DSL

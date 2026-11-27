@@ -748,8 +748,6 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                         "lakefile.lean: {keyword} precedes package"
                     )));
                 }
-                // The existing module planner accepts textual path components only.
-                name(&declaration)?;
                 if !declaration_names.insert(declaration_identity(&declaration_name)?) {
                     return Err(Failure::input(format!(
                         "lakefile.lean: target `{declaration}` is already declared"
@@ -790,7 +788,20 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
             };
             let declaration_column = tokens.column(0).min(tokens.column(head));
             let default_version_decoder = parsed.program.trim().is_empty();
-            for (field, expression) in fields(command, &tokens, head + 2, declaration_column)? {
+            let fields = fields(command, &tokens, head + 2, declaration_column)?;
+            if target.is_some() {
+                // Only the implicit module root inherits the target's name. An explicit
+                // root (or roots) is checked as a Lean.Name at configuration evaluation.
+                let root_field = if keyword == "lean_exe" {
+                    "root"
+                } else {
+                    "roots"
+                };
+                if !fields.iter().any(|(field, _)| field == root_field) {
+                    name(&declaration)?;
+                }
+            }
+            for (field, expression) in fields {
                 if target.is_none() && field == "version" {
                     if !default_version_decoder {
                         return Err(Failure::unsupported(

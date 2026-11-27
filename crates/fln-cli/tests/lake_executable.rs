@@ -345,6 +345,42 @@ fn checked_lean_configuration_computes_executable_roots_and_refuses_invalid_valu
 }
 
 #[test]
+fn quoted_executable_names_select_their_declared_modules() {
+    let _guard = serial_execution();
+    let Some(reference) = reference() else {
+        return;
+    };
+    let package = Package::with_configuration(
+        "lakefile.lean",
+        r#"import Lake
+open Lake DSL
+package demo where
+  version := v!"0.1.0"
+@[default_target] lean_exe "my-tool" where
+  root := `Main
+lean_exe "tool.name" where
+  root := `Quoted
+lean_exe tool.name where
+  root := `Nested
+"#,
+    );
+    for (selector, module) in [
+        ("my-tool", "Main"),
+        ("«tool.name»", "Quoted"),
+        ("tool.name", "Nested"),
+    ] {
+        package.write(
+            &format!("{module}.lean"),
+            &format!("def main : IO Unit := IO.println \"{module}\"\n"),
+        );
+        let output = package.run(&["exe", selector], Some(reference));
+        assert!(output.status.success(), "{selector}: {output:?}");
+        assert_eq!(text(&output.stdout), format!("{module}\n"));
+        assert!(output.stderr.is_empty(), "{selector}: {output:?}");
+    }
+}
+
+#[test]
 fn native_execution_rechecks_changed_library_source_and_preserves_nonzero_status() {
     let _guard = serial_execution();
     let Some(reference) = reference() else {
