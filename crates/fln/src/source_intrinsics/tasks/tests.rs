@@ -56,6 +56,7 @@ fn registered_except(
         Operation::Wait,
         Operation::MapTask,
         Operation::BindTask,
+        Operation::GetTaskState,
     ] {
         if omitted == Some(operation) {
             continue;
@@ -114,6 +115,7 @@ fn exact_task_models_require_their_family_externs_and_opaque_bodies() {
         Operation::Wait,
         Operation::MapTask,
         Operation::BindTask,
+        Operation::GetTaskState,
     ] {
         assert!(
             !operation_matches(&raw, operation, &mut None, &mut 0, IngressLimits::default(),)
@@ -181,6 +183,14 @@ fn exact_task_models_require_their_family_externs_and_opaque_bodies() {
         ("Task.get", Operation::BindTask),
         ("Task.Priority", Operation::MapTask),
         ("Task.Priority", Operation::BindTask),
+        ("IO.getTaskState", Operation::GetTaskState),
+        ("IO.TaskState", Operation::GetTaskState),
+        ("IO.TaskState.waiting", Operation::GetTaskState),
+        ("IO.TaskState.running", Operation::GetTaskState),
+        ("IO.TaskState.finished", Operation::GetTaskState),
+        ("IO.TaskState.rec", Operation::GetTaskState),
+        ("IO.instInhabitedTaskState", Operation::GetTaskState),
+        ("IO.instInhabitedTaskState.default", Operation::GetTaskState),
     ] {
         let changed = replace(&raw, &model::name(target), |info| match info {
             ConstantInfo::Induct(value) => value.is_unsafe = true,
@@ -243,6 +253,7 @@ fn exact_task_models_require_their_family_externs_and_opaque_bodies() {
         Operation::Wait,
         Operation::MapTask,
         Operation::BindTask,
+        Operation::GetTaskState,
     ] {
         assert!(matches!(
             operation_matches(
@@ -279,11 +290,15 @@ fn exact_task_models_require_their_family_externs_and_opaque_bodies() {
             })
         ));
     }
-    for operation in [Operation::MapTask, Operation::BindTask] {
+    for operation in [
+        Operation::MapTask,
+        Operation::BindTask,
+        Operation::GetTaskState,
+    ] {
         for mutation in 0..3 {
             let changed = replace(&raw, &model::name(operation.label()), |info| {
                 let ConstantInfo::Opaque(value) = info else {
-                    unreachable!("composition is an actual opaque declaration")
+                    unreachable!("selected operation is an actual opaque declaration")
                 };
                 match mutation {
                     0 => value.base.level_params.clear(),
@@ -303,5 +318,39 @@ fn exact_task_models_require_their_family_externs_and_opaque_bodies() {
                 Err(IngressError::UnsupportedNode { .. })
             ));
         }
+    }
+    for target in [
+        "IO.TaskState",
+        "IO.TaskState.waiting",
+        "IO.TaskState.running",
+        "IO.TaskState.finished",
+        "IO.TaskState.rec",
+        "IO.instInhabitedTaskState",
+        "IO.instInhabitedTaskState.default",
+    ] {
+        let foreign = fln_elab::externs::register(
+            &environment,
+            &model::name(target),
+            vec![fln_elab::externs::ExternEntry::Standard {
+                backend: model::name("all"),
+                symbol: "foreign_task_state".to_owned(),
+            }],
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                operation_matches(
+                    &foreign,
+                    Operation::GetTaskState,
+                    &mut None,
+                    &mut 0,
+                    IngressLimits::default(),
+                ),
+                Err(IngressError::UnsupportedNode {
+                    kind: "native extern attribute does not match the supported ABI"
+                })
+            ),
+            "{target}"
+        );
     }
 }

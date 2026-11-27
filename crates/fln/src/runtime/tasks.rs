@@ -13,21 +13,22 @@ use fln_comp::flbc::{ArgumentOwnership, ResultOwnership};
 
 const HANDLE: &str = "_fln_runtime_task_handle";
 const PAYLOAD: &str = "_fln_runtime_task_payload";
-const PRIMITIVES: [&str; 6] = [
+const PRIMITIVES: [&str; 7] = [
     "_fln_runtime_task_pure",
     "_fln_runtime_task_get",
     "_fln_runtime_task_as_task",
     "_fln_runtime_task_wait",
     "_fln_runtime_task_map_task",
     "_fln_runtime_task_bind_task",
+    "_fln_runtime_task_get_state",
 ];
 
 #[derive(Default)]
 pub(super) struct Store {
     family: Option<bool>,
-    operations: [bool; 6],
+    operations: [bool; 7],
     next: u64,
-    bindings: [Option<(IntrinsicBinding, Expr)>; 6],
+    bindings: [Option<(IntrinsicBinding, Expr)>; 7],
     payloads: std::collections::HashMap<Expr, Name>,
     recoveries: BTreeMap<Name, (Expr, ValueType)>,
 }
@@ -216,6 +217,14 @@ impl Preparation<'_> {
             Operation::Wait => ("opaque", "Init.System.IO", 0, 2, "lean_io_wait", "io"),
             Operation::MapTask => ("opaque", "Init.System.IO", 1, 6, "lean_io_map_task", "io"),
             Operation::BindTask => ("opaque", "Init.System.IO", 1, 6, "lean_io_bind_task", "io"),
+            Operation::GetTaskState => (
+                "opaque",
+                "Init.System.IO",
+                1,
+                2,
+                "lean_io_get_task_state",
+                "io",
+            ),
         };
         let row = fln_vm::extern_table_generated::EXTERN_ROWS
             .iter()
@@ -233,7 +242,9 @@ impl Preparation<'_> {
         }
         let (domains, result_type, result) = match operation {
             Operation::Pure => (vec![c(PAYLOAD)], c(HANDLE), ValueType::Task),
-            Operation::Get | Operation::Wait => (vec![c(HANDLE)], c(PAYLOAD), ValueType::Abi),
+            Operation::Get | Operation::Wait | Operation::GetTaskState => {
+                (vec![c(HANDLE)], c(PAYLOAD), ValueType::Abi)
+            }
             Operation::AsTask => (vec![c(PAYLOAD), c("Nat")], c(HANDLE), ValueType::Task),
             Operation::MapTask => (
                 vec![c(PAYLOAD), c(HANDLE), c("Nat"), c("Bool")],
@@ -289,7 +300,11 @@ impl Preparation<'_> {
                 result_ownership: ResultOwnership::Owned,
                 effect: if matches!(
                     operation,
-                    Operation::AsTask | Operation::Wait | Operation::MapTask | Operation::BindTask
+                    Operation::AsTask
+                        | Operation::Wait
+                        | Operation::MapTask
+                        | Operation::BindTask
+                        | Operation::GetTaskState
                 ) {
                     EffectClass::Io
                 } else {
@@ -440,7 +455,11 @@ impl Preparation<'_> {
                 let body = out(payload.clone(), value, b(0)?);
                 (vec![family, world], body, out_type(payload))
             }
-            Operation::Pure | Operation::Get | Operation::MapTask | Operation::BindTask => {
+            Operation::Pure
+            | Operation::Get
+            | Operation::MapTask
+            | Operation::BindTask
+            | Operation::GetTaskState => {
                 unreachable!("unary Task IO wrapper")
             }
         };
@@ -460,6 +479,57 @@ impl Preparation<'_> {
             type_ = function(domain, type_);
         }
         self.task_typed(wrapper, type_)
+    }
+
+    fn task_state_wrapper(&mut self, primitive: Expr, family: Expr) -> Result<Expr, IngressError> {
+        let world = self
+            .st_evaluation_world()?
+            .ok_or_else(|| unsupported("Task state checked IO world"))?;
+        let state = self.io_checked_shape(c("IO.TaskState"))?;
+        if state.constructors.len() != 3
+            || state
+                .constructors
+                .iter()
+                .enumerate()
+                .any(|(index, constructor)| {
+                    usize::from(constructor.tag) != index
+                        || !constructor.fields.is_empty()
+                        || !constructor.type_fields.is_empty()
+                })
+        {
+            return Err(unsupported("Task state checked enum layout"));
+        }
+        let constructor =
+            |index: usize| Expr::const_(state.constructors[index].name.clone(), vec![]);
+        // The native producer returns only ordinals 0..2. Rebuild the checked
+        // enum; its logical representation is not the raw ABI Nat payload.
+        let mut value = constructor(2);
+        for index in (0..2).rev() {
+            self.tick()?;
+            value = io_result::choose(
+                state.source.clone(),
+                apply(c("Nat.beq"), [b(0)?, nat::literal(index as u64)]),
+                value,
+                constructor(index),
+            );
+        }
+        let raw = self.task_recover(Expr::app(primitive, b(1)?), &c("Nat"))?;
+        let result_type = out_type(state.source.clone());
+        if self.value_type(&result_type)? != Some(ValueType::Constructor) {
+            return Err(unsupported("Task state checked IO result representation"));
+        }
+        // This let is under the world lambda: creating/reusing an action does
+        // not observe a task, and each invocation observes its state once.
+        let body = Expr::let_e(
+            self.task_name()?,
+            c("Nat"),
+            raw,
+            out(state.source, value, b(1)?),
+            false,
+        );
+        let body = Expr::lam(self.task_name()?, world.clone(), body, BinderInfo::Default);
+        let wrapper = Expr::lam(self.task_name()?, family.clone(), body, BinderInfo::Default);
+        self.task_typed(wrapper, function(family, function(world, result_type)))
     }
 
     fn task_composition_wrapper(
@@ -637,7 +707,10 @@ impl Preparation<'_> {
         if matches!(operation, Operation::MapTask | Operation::BindTask) {
             return self.task_composition_call(operation, levels, arguments);
         }
-        let expected_levels = usize::from(matches!(operation, Operation::Pure | Operation::Get));
+        let expected_levels = usize::from(matches!(
+            operation,
+            Operation::Pure | Operation::Get | Operation::GetTaskState
+        ));
         let [alpha, rest @ ..] = arguments else {
             return Ok(None);
         };
@@ -657,6 +730,7 @@ impl Preparation<'_> {
             Operation::AsTask | Operation::Wait => {
                 self.task_io_wrapper(operation, primitive, family, payload)?
             }
+            Operation::GetTaskState => self.task_state_wrapper(primitive, family)?,
             Operation::Pure | Operation::Get => {
                 let (domain, result, body) = if operation == Operation::Pure {
                     (payload, family, Expr::app(primitive, b(0)?))

@@ -192,6 +192,175 @@ fn priority() -> ConstantInfo {
     })
 }
 
+fn task_state(environment: &Environment) -> Option<Vec<ConstantInfo>> {
+    let recursor = environment.find(&name("IO.TaskState.rec"))?.constant_val();
+    let [parameter] = recursor.level_params.as_slice() else {
+        return None;
+    };
+    let state = c("IO.TaskState", vec![]);
+    let constructors = [
+        "IO.TaskState.waiting",
+        "IO.TaskState.running",
+        "IO.TaskState.finished",
+    ];
+    let motive = explicit(state.clone(), Expr::sort(Level::param(parameter.clone())));
+    let waiting = Expr::app(b(0), c(constructors[0], vec![]));
+    let running = Expr::app(b(1), c(constructors[1], vec![]));
+    let finished = Expr::app(b(2), c(constructors[2], vec![]));
+    let type_ = pi(
+        motive.clone(),
+        explicit(
+            waiting.clone(),
+            explicit(
+                running.clone(),
+                explicit(
+                    finished.clone(),
+                    explicit(state.clone(), Expr::app(b(4), b(0))),
+                ),
+            ),
+        ),
+        BinderInfo::Implicit,
+    );
+    let mut models = vec![ConstantInfo::Induct(InductiveVal {
+        base: base("IO.TaskState", &[], Expr::sort(Level::one())),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![name("IO.TaskState")],
+        ctors: constructors.map(name).to_vec(),
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    })];
+    let mut rules = Vec::new();
+    for (index, label) in constructors.into_iter().enumerate() {
+        models.push(ConstantInfo::Ctor(ConstructorVal {
+            base: base(label, &[], state.clone()),
+            induct: name("IO.TaskState"),
+            cidx: index as u32,
+            num_params: 0,
+            num_fields: 0,
+            is_unsafe: false,
+        }));
+        rules.push(RecursorRule {
+            ctor: name(label),
+            nfields: 0,
+            rhs: lam(
+                motive.clone(),
+                lam(
+                    waiting.clone(),
+                    lam(
+                        running.clone(),
+                        lam(finished.clone(), b(2 - index as u32), BinderInfo::Default),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+        });
+    }
+    models.push(ConstantInfo::Rec(RecursorVal {
+        base: base("IO.TaskState.rec", &recursor.level_params, type_),
+        all: vec![name("IO.TaskState")],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 1,
+        num_minors: 3,
+        rules,
+        k: false,
+        is_unsafe: false,
+    }));
+    Some(models)
+}
+
+fn state_default_matches(
+    environment: &Environment,
+    comparison: &mut Comparison<'_>,
+) -> Result<bool, IngressError> {
+    let state = c("IO.TaskState", vec![]);
+    let type_ = Expr::app(c("Inhabited", vec![Level::one()]), state.clone());
+    let value = app(
+        c("Inhabited.mk", vec![Level::one()]),
+        [
+            state.clone(),
+            c("IO.instInhabitedTaskState.default", vec![]),
+        ],
+    );
+    for (label, height, type_, value) in [
+        ("IO.instInhabitedTaskState", 2, type_, value),
+        (
+            "IO.instInhabitedTaskState.default",
+            1,
+            state,
+            c("IO.TaskState.waiting", vec![]),
+        ),
+    ] {
+        let expected = ConstantInfo::Defn(DefinitionVal {
+            base: base(label, &[], type_),
+            value,
+            hints: fln_env::constants::ReducibilityHints::Regular(height),
+            safety: DefinitionSafety::Safe,
+            all: vec![name(label)],
+        });
+        if !comparison.constant(environment, expected)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn get_task_state(environment: &Environment) -> Option<ConstantInfo> {
+    let actual = environment.find(&name("IO.getTaskState"))?.constant_val();
+    let [parameter] = actual.level_params.as_slice() else {
+        return None;
+    };
+    let u = Level::param(parameter.clone());
+    let sort_level = u.clone().succ().ok()?;
+    let sort = Expr::sort(sort_level.clone());
+    let task = family_type(&u, b(0));
+    let state = c("IO.TaskState", vec![]);
+    let action = base_io(state.clone());
+    let function = explicit(task.clone(), action.clone());
+    let action_inhabited = app(
+        c("instInhabitedOfMonad", vec![Level::zero(); 2]),
+        [
+            state,
+            c("BaseIO", vec![]),
+            c("instMonadBaseIO", vec![]),
+            c("IO.instInhabitedTaskState", vec![]),
+        ],
+    );
+    let inhabited = app(
+        c("Pi.instInhabited", vec![sort_level.clone(), Level::one()]),
+        [
+            task.clone(),
+            lam(task.clone(), action, BinderInfo::Default),
+            lam(task, action_inhabited, BinderInfo::Default),
+        ],
+    );
+    // The pin defaults the whole function after the colon, rather than
+    // introducing a task lambda around an action-level default.
+    let value = lam(
+        sort.clone(),
+        app(
+            c("Inhabited.default", vec![sort_level]),
+            [function.clone(), inhabited],
+        ),
+        BinderInfo::Implicit,
+    );
+    Some(ConstantInfo::Opaque(OpaqueVal {
+        base: base(
+            "IO.getTaskState",
+            &actual.level_params,
+            pi(sort, function, BinderInfo::Implicit),
+        ),
+        value,
+        is_unsafe: false,
+        all: vec![name("IO.getTaskState")],
+    }))
+}
+
 fn opaque(operation: Operation) -> ConstantInfo {
     let sort = Expr::sort(Level::one());
     let (type_, value) = match operation {
@@ -265,7 +434,11 @@ fn opaque(operation: Operation) -> ConstantInfo {
             );
             (type_, value)
         }
-        Operation::Pure | Operation::Get | Operation::MapTask | Operation::BindTask => {
+        Operation::Pure
+        | Operation::Get
+        | Operation::MapTask
+        | Operation::BindTask
+        | Operation::GetTaskState => {
             unreachable!("monomorphic opaque Task operation")
         }
     };
@@ -390,6 +563,20 @@ pub(super) fn operation_matches(
             Ok(getter_matches(environment, comparison)?
                 && comparison.constant(environment, priority())?
                 && comparison.constant(environment, expected)?)
+        }
+        Operation::GetTaskState => {
+            let (Some(states), Some(operation)) =
+                (task_state(environment), get_task_state(environment))
+            else {
+                return Ok(false);
+            };
+            for state in states {
+                if !comparison.constant(environment, state)? {
+                    return Ok(false);
+                }
+            }
+            Ok(state_default_matches(environment, comparison)?
+                && comparison.constant(environment, operation)?)
         }
     }
 }

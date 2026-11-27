@@ -151,6 +151,68 @@ def taskCompositionEffects : BaseIO Nat := fun world =>
 #eval taskCompositionEffects
 "#;
 
+const TASK_STATES: &str = r#"
+def taskStateCode (state : IO.TaskState) : Nat :=
+  match state with
+  | .waiting => 0
+  | .running => 1
+  | .finished => 2
+
+def inspectNatTask (task : Task Nat) : BaseIO Nat := fun world =>
+  match @IO.getTaskState Nat task world with
+  | .mk state next => @ST.Out.mk IO.RealWorld Nat (taskStateCode state) next
+#eval inspectNatTask (Task.pure 41)
+
+def finishedCallableTask : BaseIO Nat := fun world =>
+  let task := Task.pure (fun value : Nat => Nat.succ value)
+  match @IO.hasFinished (Nat → Nat) task world with
+  | .mk finished next =>
+    let value := match finished with | true => task.get 41 | false => 0
+    @ST.Out.mk IO.RealWorld Nat value next
+#eval finishedCallableTask
+
+structure RaisedTaskPayload : Type 1 where
+  value : Nat
+
+def raisedTaskState : BaseIO Nat := fun world =>
+  match @IO.getTaskState RaisedTaskPayload (Task.pure (RaisedTaskPayload.mk 41)) world with
+  | .mk state next => @ST.Out.mk IO.RealWorld Nat (taskStateCode state) next
+#eval raisedTaskState
+
+def taskStateEffects : BaseIO Nat := fun world =>
+  match ST.Prim.mkRef (σ := IO.RealWorld) (α := Nat) 0 world with
+  | .mk counter w1 =>
+    let action : BaseIO Nat :=
+      ST.bind (ST.Prim.Ref.get counter) (fun count =>
+        ST.bind (ST.Prim.Ref.set counter (Nat.succ count)) (fun _ => ST.pure 41))
+    let task := Task.pure action
+    let observe := @IO.getTaskState (BaseIO Nat) task
+    match ST.Prim.Ref.get counter w1 with
+    | .mk before w2 =>
+      match observe w2 with
+      | .mk first w3 =>
+        match observe w3 with
+        | .mk second w4 =>
+          match ST.Prim.Ref.get counter w4 with
+          | .mk afterObserve w5 =>
+            match @IO.wait (BaseIO Nat) task w5 with
+            | .mk retained w6 =>
+              match ST.Prim.Ref.get counter w6 with
+              | .mk afterWait w7 =>
+                match retained w7 with
+                | .mk value w8 =>
+                  match ST.Prim.Ref.get counter w8 with
+                  | .mk afterRun final =>
+                    let c0 := Nat.mul (taskStateCode first) 1000000
+                    let c1 := Nat.add c0 (Nat.mul (taskStateCode second) 100000)
+                    let c2 := Nat.add c1 (Nat.mul before 10000)
+                    let c3 := Nat.add c2 (Nat.mul afterObserve 1000)
+                    let c4 := Nat.add c3 (Nat.mul afterWait 100)
+                    let c5 := Nat.add c4 (Nat.mul afterRun 10)
+                    @ST.Out.mk IO.RealWorld Nat (Nat.add c5 value) final
+#eval taskStateEffects
+"#;
+
 fn name(label: &str) -> Name {
     Name::from_components(label.split('.'))
 }
@@ -178,6 +240,8 @@ fn fixture(test: impl FnOnce(&Engine, &Path) + Send + 'static) {
                 for module in [
                     "Init/Prelude",
                     "Init/Core",
+                    // IO.hasFinished's sparse matcher carries a Nat.hasNotBit proof.
+                    "Init/Data/Nat/Bitwise/Basic",
                     "Init/System/ST",
                     "Init/System/IOError",
                     "Init/System/IO",
@@ -202,6 +266,7 @@ fn fixture(test: impl FnOnce(&Engine, &Path) + Send + 'static) {
                 for target in [
                     "Nat.add",
                     "Nat.mul",
+                    "Nat.beq",
                     "Task.pure",
                     "Task.get",
                     "Task.spawn",
@@ -211,6 +276,7 @@ fn fixture(test: impl FnOnce(&Engine, &Path) + Send + 'static) {
                     "BaseIO.mapTask",
                     "BaseIO.bindTask",
                     "IO.wait",
+                    "IO.getTaskState",
                     "Void.mk",
                     "ST.Prim.mkRef",
                     "ST.Prim.Ref.get",
@@ -386,6 +452,18 @@ fn task_composition_actions_defer_effects_and_retain_completed_payloads() {
     });
 }
 
+#[test]
+fn checked_task_states_preserve_enum_layout_universes_and_retained_actions() {
+    fixture(|engine, compiler| {
+        // State observation returns the checked finished constructor for
+        // ordinary, callable, and higher-universe payloads. Reusing an action
+        // and waiting on its task leave the stored BaseIO payload unexecuted;
+        // only invoking that payload increments the reference exactly once.
+        reference(compiler, TASK_STATES, "2\n42\n2\n2200051\n");
+        run(engine, TASK_STATES, &[2, 42, 2, 2200051]);
+    });
+}
+
 fn task_contract_refusal(engine: &Engine, source: &str, expected: &'static str) {
     let mut error = match engine.execute_source_commands_with_checks(
         source.as_bytes(),
@@ -478,6 +556,7 @@ fn public_task_execution_authenticates_externs_and_checked_model_bodies() {
             "def taskContractProbe (task : Task Nat) : BaseIO Nat := @IO.wait Nat task\n";
         const MAP: &str = "def taskContractProbe (task : Task Nat) : BaseIO (Task Nat) := @BaseIO.mapTask Nat Nat (fun value world => @ST.Out.mk IO.RealWorld Nat value world) task 0 true\n";
         const BIND: &str = "def taskContractProbe (task : Task Nat) : BaseIO (Task Nat) := @BaseIO.bindTask Nat Nat task (fun value world => @ST.Out.mk IO.RealWorld (Task Nat) (Task.pure value) world) 0 true\n";
+        const STATE: &str = "def taskContractProbe (task : Task Nat) : BaseIO IO.TaskState := @IO.getTaskState Nat task\n";
         let operations = [
             ("Task.pure", PURE),
             ("Task.get", GET),
@@ -485,6 +564,7 @@ fn public_task_execution_authenticates_externs_and_checked_model_bodies() {
             ("IO.wait", WAIT),
             ("BaseIO.mapTask", MAP),
             ("BaseIO.bindTask", BIND),
+            ("IO.getTaskState", STATE),
         ];
         // Every unchanged source is admitted and compiled before its negative
         // case. Definitions return closures; no action or task callback runs.
@@ -513,6 +593,13 @@ fn public_task_execution_authenticates_externs_and_checked_model_bodies() {
             ("Task.get", WAIT),
             ("Task.get", MAP),
             ("Task.get", BIND),
+            ("IO.TaskState", STATE),
+            ("IO.TaskState.waiting", STATE),
+            ("IO.TaskState.running", STATE),
+            ("IO.TaskState.finished", STATE),
+            ("IO.TaskState.rec", STATE),
+            ("IO.instInhabitedTaskState", STATE),
+            ("IO.instInhabitedTaskState.default", STATE),
         ]) {
             let decorated = Engine::from_environment(
                 fln_elab::externs::register(
@@ -531,7 +618,13 @@ fn public_task_execution_authenticates_externs_and_checked_model_bodies() {
                 "native extern attribute does not match the supported ABI",
             );
         }
-        for (target, source) in [("BaseIO.mapTask", MAP), ("BaseIO.bindTask", BIND)] {
+        for (target, source) in [
+            ("BaseIO.mapTask", MAP),
+            ("BaseIO.bindTask", BIND),
+            ("IO.getTaskState", STATE),
+            ("IO.instInhabitedTaskState", STATE),
+            ("IO.instInhabitedTaskState.default", STATE),
+        ] {
             task_contract_refusal(
                 &changed_checked_task_body(engine, target),
                 source,
