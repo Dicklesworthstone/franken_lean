@@ -68,6 +68,11 @@ EOF
 LEAN_PATH="$PWD/.lake/build/lib/lean" fln check-source consumer/Use.lean
 ```
 
+The native loader validates a plain package version such as `v!"0.1.0"` in
+a declarative package header. This covers the generated Lean project templates.
+Interpolation, computed versions, and earlier Lean declarations that could
+change version decoding require the full version elaborator.
+
 A package configured with `lakefile.lean` can use checked Lean definitions and
 file-local notation to compute its source directories, build directory, and
 library module roots:
