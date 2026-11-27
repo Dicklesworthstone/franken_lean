@@ -620,11 +620,58 @@ fn invalid_executable_attributes_and_post_compilation_updates_are_refused_atomic
         "prelude\ndef target (A : Type) (x : A) : A := x\ndef f (A : Type) (x : A) : A := x\nattribute [implemented_by target] f",
         "prelude\naxiom f : Type\nattribute [extern \"symbol\"] f",
         "prelude\ndef target (A : Type) (x : A) : A := x\naxiom f : (A : Type) -> A -> A\nattribute [implemented_by target] f\nattribute [implemented_by target] f",
+        // Standalone `attribute [extern ...]` is allowed on constructors and
+        // non-theorem generated structure projections (`ExternAttr.lean:66-73`),
+        // never on ordinary definitions, theorem projections, or duplicates.
+        "prelude\ndef f (A : Type) (x : A) : A := x\nattribute [extern \"symbol\"] f",
+        "prelude\ninductive UnitP : Prop where | intro : UnitP\nstructure PropBox where\n  proof : UnitP\nattribute [extern \"symbol\"] PropBox.proof",
+        "prelude\ninductive N : Type where | z : N\nstructure Box where\n  mk ::\n  val : N\nattribute [extern \"first\"] Box.mk\nattribute [extern \"second\"] Box.mk",
     ] {
         let error = build(&engine, &[("Main", source)], OleanWriteBudget::default()).unwrap_err();
         assert_eq!(error.disposition().2, 1, "{source}: {error:?}");
         assert_eq!(engine.logical_root(&KVMap::new()), root);
     }
+
+    // Positive control: initial standalone `attribute [extern ...]` on a
+    // structure constructor and generated non-theorem projection succeeds and
+    // round-trips through exported .olean artifacts (`UInt8.ofBitVec` / `UInt8.toBitVec`).
+    let built = build(
+        &engine,
+        &[(
+            "Main",
+            "prelude\n\
+             inductive N : Type where | z : N\n\
+             structure Box where\n\
+               mk ::\n\
+               val : N\n\
+             attribute [extern \"box_mk\"] Box.mk\n\
+             attribute [extern \"box_val\"] Box.val\n",
+        )],
+        OleanWriteBudget::default(),
+    )
+    .expect("standalone extern on structure ctor and projection succeeds");
+    let receipt = imported(&built);
+    let externs = ExternTable::read(receipt.engine.environment()).unwrap();
+    assert_eq!(
+        externs.get(&name("Box.mk")),
+        Some(
+            [ExternEntry::Standard {
+                backend: name("all"),
+                symbol: "box_mk".into(),
+            }]
+            .as_slice()
+        )
+    );
+    assert_eq!(
+        externs.get(&name("Box.val")),
+        Some(
+            [ExternEntry::Standard {
+                backend: name("all"),
+                symbol: "box_val".into(),
+            }]
+            .as_slice()
+        )
+    );
 }
 
 #[test]

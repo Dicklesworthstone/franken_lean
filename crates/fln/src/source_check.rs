@@ -914,7 +914,10 @@ pub(crate) fn apply_module_control_command(
             )
         };
         let (rows, names) = executable::command(syntax).map_err(frontend)?;
-        if rows.iter().all(Attribute::is_tag) {
+        if rows
+            .iter()
+            .all(|row| row.is_tag() || matches!(row, Attribute::Extern(_)))
+        {
             let mut private_next = engine.clone();
             let mut public_next = public.engine().clone();
             for requested in names {

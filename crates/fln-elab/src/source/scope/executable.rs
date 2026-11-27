@@ -457,6 +457,31 @@ pub fn resolve(
         .map_err(|error| failure(SourceInferenceError::NameScope(error)))
 }
 
+/// Mirror pinned `Lean/Compiler/ExternAttr.lean:66-73`: standalone
+/// `attribute [extern ...]` runs `compileDecls` on constructors and
+/// non-theorem generated structure projections.
+fn is_standalone_extern_target(
+    environment: &Environment,
+    declaration: &Name,
+) -> Result<bool, NatDefinitionElabError> {
+    match environment.find(declaration) {
+        Some(ConstantInfo::Ctor(_)) => Ok(true),
+        Some(ConstantInfo::Defn(definition)) => {
+            let mut ticks = 0usize;
+            crate::records::projection::generated_projection(environment, definition, || {
+                ticks = ticks.saturating_add(1);
+                if ticks > MAX_ATTRIBUTE_ITEMS {
+                    Err(failure(SourceInferenceError::ResourceLimit))
+                } else {
+                    Ok(())
+                }
+            })
+            .map(|projection| projection.is_some())
+        }
+        _ => Ok(false),
+    }
+}
+
 pub fn apply(
     environment: &Environment,
     scope: &SourceScope,
@@ -464,24 +489,44 @@ pub fn apply(
     rows: &[Attribute],
     standalone: bool,
 ) -> Result<Environment, NatDefinitionElabError> {
-    if standalone
-        && rows.iter().any(|row| !row.is_tag())
-        && (!matches!(environment.find(declaration), Some(ConstantInfo::Axiom(_)))
-            || ExternTable::read(environment)
+    if standalone {
+        let non_tag_count = rows.iter().filter(|row| !row.is_tag()).count();
+        if non_tag_count > 0 {
+            let already_bound = ExternTable::read(environment)
                 .map_err(extern_error)?
                 .get(declaration)
                 .is_some()
-            || ImplementedByTable::read(environment)
-                .map_err(implemented_error)?
-                .get(declaration)
-                .is_some()
-            || rows.iter().any(|row| matches!(row, Attribute::Extern(_))))
-    {
-        // The pin has already generated a definition's IR before a standalone
-        // update; a final journal cannot reconstruct that time-dependent state.
-        return Err(refused(
-            "initial standalone implemented_by on a bodyless axiom without an executable binding",
-        ));
+                || ImplementedByTable::read(environment)
+                    .map_err(implemented_error)?
+                    .get(declaration)
+                    .is_some();
+            let valid_initial = non_tag_count == 1
+                && !already_bound
+                && rows
+                    .iter()
+                    .filter(|row| !row.is_tag())
+                    .all(|row| match row {
+                        Attribute::ImplementedBy(_) => {
+                            matches!(environment.find(declaration), Some(ConstantInfo::Axiom(_)))
+                        }
+                        Attribute::Extern(_) => false,
+                        _ => true,
+                    });
+            let valid_extern = non_tag_count == 1
+                && !already_bound
+                && rows
+                    .iter()
+                    .filter(|row| !row.is_tag())
+                    .all(|row| matches!(row, Attribute::Extern(_)))
+                && is_standalone_extern_target(environment, declaration)?;
+            if !valid_initial && !valid_extern {
+                // The pin has already generated a definition's IR before a standalone
+                // update; a final journal cannot reconstruct that time-dependent state.
+                return Err(refused(
+                    "initial standalone implemented_by on a bodyless axiom or extern on a constructor/projection without an executable binding",
+                ));
+            }
+        }
     }
     let mut result = environment.clone();
     for row in rows {
