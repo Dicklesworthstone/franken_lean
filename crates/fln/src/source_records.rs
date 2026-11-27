@@ -813,9 +813,15 @@ impl Engine {
         let result = self
             .admit_declarations(&[candidate], options, limits)
             .map_err(EngineExecutionError::from)?;
-        // Multi-family mutual blocks never contain classes (`mutual.rs`).
+        // Multi-family mutual blocks never contain classes (`mutual.rs`), but a
+        // single-member `mutual class inductive ... end` routes through this path.
+        let is_class = members.len() == 1
+            && fln_elab::source::class_inductive_registration(&members[0], scope)
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?
+                .is_some();
         let result =
-            self.finish_source_inductive_auxiliaries(result, options, limits, scope, false)?;
+            self.finish_source_inductive_auxiliaries(result, options, limits, scope, is_class)?;
         self.finish_source_data_attributes(result, members, options, scope)
     }
 
