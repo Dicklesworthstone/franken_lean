@@ -668,6 +668,39 @@ fn companion_modules(entries: &BTreeSet<Name>, modules: &BTreeMap<Name, Module>)
     executable
 }
 
+/// Regenerate installed companions from the checked sources even when the
+/// caller selects a different facet this time. Disk bytes are never compiler
+/// inputs. Publication checks again under the package locks, so a concurrently
+/// added companion cannot silently survive next to a different public root.
+fn required_companions(
+    requested: &BTreeSet<Name>,
+    suffix: &str,
+    destinations: &BTreeMap<Name, (PathBuf, PathBuf)>,
+    modules: &BTreeMap<Name, Module>,
+) -> Result<BTreeSet<Name>, Failure> {
+    let mut entries = requested.clone();
+    for (module, (root, directory)) in destinations {
+        let path = directory
+            .join(source_import_relative_path(module)?)
+            .with_extension(suffix);
+        check_path(root, &path, true)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(info) if info.is_file() => {
+                entries.insert(module.clone());
+            }
+            Ok(_) => {
+                return Err(Failure::input(format!(
+                    "output is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Failure::io(&path, error)),
+        }
+    }
+    Ok(companion_modules(&entries, modules))
+}
+
 fn compile(
     root: &Path,
     facets: CompileFacets<'_>,
@@ -1228,8 +1261,9 @@ fn build(
         sources.resolve_build(module, &plan.owners)
     })?;
     sources.validate_entry_imports(&plan.owners, &modules)?;
-    let executable = companion_modules(&plan.ir, &modules);
-    let metadata = companion_modules(&plan.ilean, &modules);
+    let destinations = sources.destinations(modules.keys(), &plan.owners)?;
+    let executable = required_companions(&plan.ir, "ir", &destinations, &modules)?;
+    let metadata = required_companions(&plan.ilean, "ilean", &destinations, &modules)?;
     let records = macro_config
         .is_none()
         .then(|| source_check::module_records(posture));
@@ -1268,7 +1302,6 @@ fn build(
     } else {
         MACRO_RECORDS_UNAVAILABLE
     };
-    let destinations = sources.destinations(&artifacts, &plan.owners)?;
     let queried = if matches!(command, BuildCommand::Query) {
         Some(query_results(&plan, &artifacts, &destinations, json)?)
     } else {
@@ -1310,9 +1343,9 @@ fn build(
         .values()
         .filter(|family| family.ilean.is_some())
         .count();
-    let facet = if executable_count != 0 {
+    let facet = if !plan.ir.is_empty() {
         "ir"
-    } else if metadata_count != 0 {
+    } else if !plan.ilean.is_empty() {
         "ilean"
     } else {
         "olean"
