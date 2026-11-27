@@ -1164,7 +1164,16 @@ theorem finEqHoles {{n}} : ∀ {{i j : MyFin n}}, Eq i.val j.val → Eq i j
 theorem finEqFirstNamed {{n}} : ∀ {{i j : MyFin n}}, Eq i.val j.val → Eq i j
   | ⟨a, _⟩, ⟨_, _⟩, myRfl => rfl
 theorem finEqSecondNamed {{n}} : ∀ {{i j : MyFin n}}, Eq i.val j.val → Eq i j
-  | ⟨_, _⟩, ⟨b, _⟩, myRfl => rfl"
+  | ⟨_, _⟩, ⟨b, _⟩, myRfl => rfl
+inductive MyEqN : Nat → Nat → Prop where | rfl (n : Nat) : MyEqN n n
+theorem eqNHoles : ∀ (a b : MyFin 1), MyEqN a.val b.val → Eq a.val b.val
+  | ⟨_, _⟩, ⟨_, _⟩, MyEqN.rfl _ => rfl
+axiom bitsConst : Nat
+axiom bitsEq : Or (Eq bitsConst 1) (Eq bitsConst 2)
+theorem constDiscrRfl : Or (Eq (Nat.succ bitsConst) 2) (Eq (Nat.succ bitsConst) 3) :=
+  match bitsConst, bitsEq with
+  | _, Or.inl myRfl => Or.inl rfl
+  | _, Or.inr myRfl => Or.inr rfl"
     ));
     for bad in [
         format!(
@@ -1192,6 +1201,15 @@ inductive EqN : Nat → Nat → Prop where | rfl (n : Nat) : EqN n n
 theorem bad : ∀ (a b : Box), EqN a.val b.val → Eq a b | ⟨x⟩, ⟨y⟩, EqN.rfl _ => rfl
 "#
         .to_string(),
+        format!(
+            "{fin_def}
+axiom bitsConst : Nat
+axiom bitsEq : Or (Eq bitsConst 1) (Eq bitsConst 2)
+theorem bad : Or (Eq bitsConst 1) (Eq bitsConst 2) :=
+  match bitsConst, bitsEq with
+  | 2, Or.inl myRfl => Or.inl rfl
+  | _, Or.inr myRfl => Or.inr rfl"
+        ),
     ] {
         let e = engine();
         let root = e.logical_root(&KVMap::new());

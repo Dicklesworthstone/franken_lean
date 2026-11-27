@@ -2626,6 +2626,10 @@ impl Context {
         // Keep large continuations indirect. Every task otherwise inherits the
         // largest state's size, including temporaries in this evaluator's
         // native stack frame when an owned macro expansion reenters it.
+        struct MatrixAbstraction {
+            saved: LocalContext,
+            params: Vec<(FVarId, Name, Expr, FVarId)>,
+        }
         enum Task<'a> {
             RestoreOptions(KVMap),
             RestoreMacroTerms(usize),
@@ -2708,6 +2712,7 @@ impl Context {
             LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>, LetKind),
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>, LetKind),
             LetBody(LocalContext, FVarId, Name, Typed, LetKind),
+            MatrixAbstraction(Box<MatrixAbstraction>),
             RewriteTerm(
                 tactics::ProofState<'a>,
                 tactics::ProofGoal,
@@ -2829,6 +2834,7 @@ impl Context {
                                 Some(
                                     Task::BinderBody(..)
                                         | Task::LetBody(..)
+                                        | Task::MatrixAbstraction(..)
                                         | Task::LocalFunctionValue(..)
                                         | Task::MatchBranch(..)
                                         | Task::DoBindJoinBody(..)
@@ -2911,6 +2917,7 @@ impl Context {
                                 &task,
                                 Task::BinderBody(..)
                                     | Task::LetBody(..)
+                                    | Task::MatrixAbstraction(..)
                                     | Task::LocalFunctionValue(..)
                                     | Task::MatchBranch(..)
                                     | Task::DoBindJoinBody(..)
@@ -5821,25 +5828,232 @@ impl Context {
                                     );
                                 }
                                 // Every input of a lowered written match is in scope now.
+                                let mut body_expected = expected;
+                                let mut matrix_abstraction = None;
                                 if let Some((inputs, alternatives)) =
                                     self.pattern_typing_checks.remove(&name)
                                 {
-                                    let discriminants = inputs
+                                    let input_decls = inputs
                                         .iter()
                                         .map(|input| {
                                             self.txn.lctx.find_by_user_name(input).and_then(
                                                 |decl| {
-                                                    Some((decl.value.clone()?, decl.type_.clone()))
+                                                    Some((
+                                                        decl.id.clone(),
+                                                        decl.user_name.clone(),
+                                                        decl.value.clone()?,
+                                                        decl.type_.clone(),
+                                                    ))
                                                 },
                                             )
                                         })
                                         .collect::<Option<Vec<_>>>();
-                                    if let Some(discriminants) = discriminants {
+                                    if let Some(input_decls) = input_decls {
+                                        let discriminants: Vec<_> = input_decls
+                                            .iter()
+                                            .map(|(_, _, val, ty)| (val.clone(), ty.clone()))
+                                            .collect();
                                         self.check_pattern_typing(&discriminants, &alternatives)?;
+                                        // When a multi-discriminant match has a non-local
+                                        // discriminant (e.g. `match System.Platform.numBits,
+                                        // System.Platform.numBits_eq`), abstract it out of
+                                        // dependent later discriminants and the expected target
+                                        // into local parameters, matching Lean 4's `match`
+                                        // motive construction.
+                                        if input_decls.len() >= 2
+                                            && let Some(expected_expr) = body_expected.as_ref()
+                                        {
+                                            let expected_inst = self.instantiate(expected_expr)?;
+                                            let mut resolved_decls =
+                                                Vec::with_capacity(input_decls.len());
+                                            let mut ok = !expected_inst.has_expr_mvar()
+                                                && !expected_inst.has_loose_bvars();
+                                            for (outer_id, user_name, val, ty) in input_decls {
+                                                let val = self.instantiate(&val)?;
+                                                let ty = self.instantiate(&ty)?;
+                                                if val.has_expr_mvar()
+                                                    || ty.has_expr_mvar()
+                                                    || ty.has_loose_bvars()
+                                                {
+                                                    ok = false;
+                                                    break;
+                                                }
+                                                resolved_decls.push((outer_id, user_name, val, ty));
+                                            }
+                                            if ok
+                                                && resolved_decls.iter().any(|(_, _, val, _)| {
+                                                    !matches!(val.node(), ExprNode::FVar { .. })
+                                                })
+                                            {
+                                                let saved_abs = self.txn.lctx.clone();
+                                                let mut abstracted =
+                                                    vec![false; resolved_decls.len()];
+                                                let mut param_ids: Vec<Option<(FVarId, Name)>> =
+                                                    vec![None; resolved_decls.len()];
+                                                let mut types: Vec<Expr> = resolved_decls
+                                                    .iter()
+                                                    .map(|(_, _, _, ty)| ty.clone())
+                                                    .collect();
+                                                let mut target = expected_inst.clone();
+                                                for i in 0..resolved_decls.len() {
+                                                    let val = &resolved_decls[i].2;
+                                                    if !abstracted[i]
+                                                        && matches!(
+                                                            val.node(),
+                                                            ExprNode::FVar { .. }
+                                                        )
+                                                    {
+                                                        continue;
+                                                    }
+                                                    let mut affects_later = false;
+                                                    for ty in &types[(i + 1)..] {
+                                                        let ab = self.kabstract_defeq(ty, val)?;
+                                                        if ab.has_loose_bvar(0) {
+                                                            affects_later = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    if !affects_later && !abstracted[i] {
+                                                        continue;
+                                                    }
+                                                    let param_id = FVarId(self.fresh_name()?);
+                                                    let param_name = self.fresh_name()?;
+                                                    let param_expr = Expr::fvar(param_id.clone());
+                                                    abstracted[i] = true;
+                                                    param_ids[i] = Some((param_id, param_name));
+                                                    for j in (i + 1)..resolved_decls.len() {
+                                                        let ab =
+                                                            self.kabstract_defeq(&types[j], val)?;
+                                                        if ab.has_loose_bvar(0) {
+                                                            types[j] =
+                                                                self.substitute(&ab, &param_expr)?;
+                                                            abstracted[j] = true;
+                                                        }
+                                                    }
+                                                    let ab_target =
+                                                        self.kabstract_defeq(&target, val)?;
+                                                    if ab_target.has_loose_bvar(0) {
+                                                        target = self
+                                                            .substitute(&ab_target, &param_expr)?;
+                                                    }
+                                                }
+                                                if abstracted.iter().any(|&flag| flag) {
+                                                    let mut params = Vec::new();
+                                                    for i in 0..resolved_decls.len() {
+                                                        if !abstracted[i] {
+                                                            continue;
+                                                        }
+                                                        let (param_id, param_name) =
+                                                            match param_ids[i].take() {
+                                                                Some(pair) => pair,
+                                                                None => (
+                                                                    FVarId(self.fresh_name()?),
+                                                                    self.fresh_name()?,
+                                                                ),
+                                                            };
+                                                        params.push((
+                                                            param_id,
+                                                            param_name,
+                                                            types[i].clone(),
+                                                            resolved_decls[i].0.clone(),
+                                                            resolved_decls[i].1.clone(),
+                                                        ));
+                                                    }
+                                                    let mut pi_type = target.clone();
+                                                    let mut pi_ok = true;
+                                                    for (param_id, param_name, param_ty, _, _) in
+                                                        params.iter().rev()
+                                                    {
+                                                        let Ok(body_pi) =
+                                                            pi_type.abstract_fvar(param_id, 0)
+                                                        else {
+                                                            pi_ok = false;
+                                                            break;
+                                                        };
+                                                        pi_type = Expr::forall_e(
+                                                            param_name.clone(),
+                                                            param_ty.clone(),
+                                                            body_pi,
+                                                            BinderInfo::Default,
+                                                        );
+                                                    }
+                                                    if pi_ok && self.known_type(&pi_type)?.is_some()
+                                                    {
+                                                        let mut kept_params = Vec::new();
+                                                        for (
+                                                            param_id,
+                                                            param_name,
+                                                            param_ty,
+                                                            outer_id,
+                                                            user_name,
+                                                        ) in params
+                                                        {
+                                                            self.txn.lctx.add_param(
+                                                                param_id.clone(),
+                                                                user_name,
+                                                                param_ty.clone(),
+                                                                BinderInfo::Default,
+                                                            );
+                                                            kept_params.push((
+                                                                param_id, param_name, param_ty,
+                                                                outer_id,
+                                                            ));
+                                                        }
+                                                        body_expected = Some(target);
+                                                        matrix_abstraction =
+                                                            Some(MatrixAbstraction {
+                                                                saved: saved_abs,
+                                                                params: kept_params,
+                                                            });
+                                                    } else {
+                                                        self.txn.lctx = saved_abs;
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 tasks.push(Task::LetBody(saved, id, name, value, binding_kind));
-                                tasks.push(Task::Visit(body, expected, true));
+                                if let Some(abstraction) = matrix_abstraction {
+                                    tasks.push(Task::MatrixAbstraction(Box::new(abstraction)));
+                                }
+                                tasks.push(Task::Visit(body, body_expected, true));
+                            }
+                            Task::MatrixAbstraction(abs) => {
+                                self.flush(false)?;
+                                for (param_id, _, _, _) in &abs.params {
+                                    if self.equations_mention(param_id)? {
+                                        self.flush(true)?;
+                                        break;
+                                    }
+                                }
+                                self.resolve_instances(false)?;
+                                let mut body = values.pop().expect("matrix abstraction body");
+                                body.value = self.instantiate(&body.value)?;
+                                body.type_ = self.instantiate(&body.type_)?;
+                                let mut value = body.value;
+                                let mut type_ = body.type_;
+                                for (param_id, param_name, param_ty, _) in abs.params.iter().rev() {
+                                    let param_ty = self.instantiate(param_ty)?;
+                                    value = Expr::lam(
+                                        param_name.clone(),
+                                        param_ty,
+                                        value
+                                            .abstract_fvar(param_id, 0)
+                                            .map_err(|_| failure(SourceInferenceError::Scope))?,
+                                        BinderInfo::Default,
+                                    );
+                                }
+                                for (param_id, _, _, outer_id) in &abs.params {
+                                    let outer_expr = Expr::fvar(outer_id.clone());
+                                    value = Expr::app(value, outer_expr.clone());
+                                    let abstract_ty = type_
+                                        .abstract_fvar(param_id, 0)
+                                        .map_err(|_| failure(SourceInferenceError::Scope))?;
+                                    type_ = self.substitute(&abstract_ty, &outer_expr)?;
+                                }
+                                values.push(Typed { value, type_ });
+                                self.txn.lctx = abs.saved;
                             }
                             Task::LetBody(saved, id, name, value, binding_kind) => {
                                 if binding_kind.opaque() {

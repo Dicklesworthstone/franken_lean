@@ -977,9 +977,10 @@ impl Model<'_> {
             if value.has_expr_mvar() || type_.has_expr_mvar() || type_.has_loose_bvars() {
                 return unknown();
             }
-            // Earlier discriminants are abstracted in this one's type. A local's occurrences are
-            // exact; anything else is matched up to definitional equality by `kabstract`, which
-            // the model does not replay unless its head occurs nowhere.
+            // Earlier discriminants are abstracted in this one's type: a local
+            // by exact fvar substitution, and a non-local term via `kabstract`
+            // (`abstract_term`) whenever its head appears in `slot` (e.g.
+            // `match System.Platform.numBits, System.Platform.numBits_eq`).
             let mut slot = type_.clone();
             for earlier in &discrs {
                 let Discriminant {
@@ -991,8 +992,11 @@ impl Model<'_> {
                     ExprNode::FVar { id } => {
                         replace_fvar(&slot, id, &Expr::fvar(placeholder.clone()))?
                     }
-                    _ if mentions_head(&slot, earlier_value) => return unknown(),
-                    _ => slot,
+                    _ if !mentions_head(&slot, earlier_value) => slot,
+                    _ => match self.abstract_term(&slot, earlier_value, placeholder, 0)? {
+                        Some(abstracted) => abstracted,
+                        None => return unknown(),
+                    },
                 };
             }
             let placeholder = self.fresh_id("d");
@@ -1858,7 +1862,6 @@ impl Model<'_> {
                 .next()
                 .ok_or_else(|| failure(SourceInferenceError::Scope))?;
             let parameter_hole = binder < parameters
-                && *binder_info != BinderInfo::Default
                 && syntax.is_some_and(|syntax| {
                     matches!(syntax.kind(), Some(kind)
                     if kind == &parser_kind(&["Term", "hole"])
