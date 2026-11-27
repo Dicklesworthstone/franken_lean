@@ -17,13 +17,14 @@ mod array_proofs;
 mod boxed;
 mod primitives;
 mod string_proofs;
+mod tasks;
 
 pub(super) use boxed::{BoxedNative, boxed_row};
 
 #[derive(Clone, Copy)]
 struct ErasedOperands {
     runtime: usize,
-    type_prefix: bool,
+    type_prefix: usize,
     proof_suffix: usize,
 }
 
@@ -51,7 +52,13 @@ pub(super) fn erase_type_arguments(
         let bridge = if let Some(runtime) = erased_type_runtime_arity(row)? {
             Some(ErasedOperands {
                 runtime,
-                type_prefix: true,
+                type_prefix: 1,
+                proof_suffix: 0,
+            })
+        } else if let Some(signature) = tasks::signature(row)? {
+            Some(ErasedOperands {
+                runtime: signature.parameters.len(),
+                type_prefix: signature.erased_prefix,
                 proof_suffix: 0,
             })
         } else {
@@ -95,9 +102,11 @@ pub(super) fn erase_type_arguments(
                         if args.len() == bridge.runtime {
                             continue;
                         }
-                        let erased = usize::from(bridge.type_prefix) + bridge.proof_suffix;
+                        let erased = bridge.type_prefix + bridge.proof_suffix;
                         if args.len() != bridge.runtime + erased
-                            || (bridge.type_prefix && args.first() != Some(&IrArg::Erased))
+                            || args[..bridge.type_prefix]
+                                .iter()
+                                .any(|argument| argument != &IrArg::Erased)
                             || args[args.len() - bridge.proof_suffix..]
                                 .iter()
                                 .any(|argument| argument != &IrArg::Erased)
@@ -105,15 +114,13 @@ pub(super) fn erase_type_arguments(
                             return Err(unsupported(name, "unreviewed native erased operand"));
                         }
                         args.truncate(args.len() - bridge.proof_suffix);
-                        if bridge.type_prefix {
-                            args.remove(0);
-                        }
+                        args.drain(..bridge.type_prefix).for_each(drop);
                     }
                     IrStmt::VDecl {
                         expr: IrExpr::Pap { function, args },
                         ..
                     } if bridges.get(function).is_some_and(|bridge| {
-                        (bridge.type_prefix && args.first() == Some(&IrArg::Erased))
+                        (bridge.type_prefix != 0 && args.first() == Some(&IrArg::Erased))
                             || (bridge.proof_suffix != 0
                                 && (args.len() > bridge.runtime || args.contains(&IrArg::Erased)))
                     }) =>
@@ -168,7 +175,7 @@ fn natural_division_operands(
     }
     Ok(Some(ErasedOperands {
         runtime: 2,
-        type_prefix: false,
+        type_prefix: 0,
         proof_suffix: 1,
     }))
 }
@@ -486,6 +493,7 @@ pub(super) fn validate_extern_signature(
     {
         return primitive.validate_extern(row, params, result);
     }
+    tasks::validate_native_signature(row, params, result)?;
     if row.id == "extern:Void.mk" && params.len() == 2 {
         erased_type_runtime_arity(row)?;
         if params[0].ty != IrType::Erased

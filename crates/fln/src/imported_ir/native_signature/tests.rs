@@ -55,6 +55,9 @@ mod expressions_reference;
 #[path = "tests/names_reference.rs"]
 mod names_reference;
 
+#[path = "tests/tasks.rs"]
+mod tasks;
+
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }

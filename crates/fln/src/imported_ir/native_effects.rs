@@ -9,6 +9,10 @@
 //! the occupant through its checked handle API and refuses a vacant or invalid
 //! cell; it never invokes the assertion-based raw ABI entry point. Its erased
 //! runtime arity is separately bound in native_signature.
+//!
+//! The four Task constructors/combinators use Golem's completed, managerless
+//! path. Their callbacks remain ordinary budgeted VM calls, and their Task
+//! effect is preserved. This grants no scheduler or additional host I/O.
 
 use super::{
     EntryArgument, GeneratedExternRow, IrExecutionError, IrExecutionLimits, Name, Native, fir,
@@ -130,6 +134,10 @@ pub(super) fn classify(
 ) -> Result<fir::EffectClass, IrExecutionError> {
     match (row.effect, row.id) {
         ("pure", _) => Ok(fir::EffectClass::Pure),
+        (
+            "task",
+            "extern:Task.pure" | "extern:Task.spawn" | "extern:Task.map" | "extern:Task.bind",
+        ) => Ok(fir::EffectClass::Task),
         (
             "state",
             "extern:ST.Prim.mkRef"

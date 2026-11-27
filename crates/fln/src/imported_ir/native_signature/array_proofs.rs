@@ -202,7 +202,7 @@ pub(super) fn erased_operands(
     }
     Ok(Some(ErasedOperands {
         runtime,
-        type_prefix,
+        type_prefix: usize::from(type_prefix),
         proof_suffix,
     }))
 }
