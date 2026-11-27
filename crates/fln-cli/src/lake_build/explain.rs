@@ -123,7 +123,9 @@ fn target_name<'a>(
                 .map(|module| (module, None, None));
         }
     }
-    if bare.contains('/') || bare.starts_with('@') || bare.ends_with(".lean") {
+    // A facet selects a Lake target, including its owner and named-target
+    // precedence. A plain module name can inspect any row in the snapshot.
+    if facet.is_some() || bare.contains('/') || bare.starts_with('@') || bare.ends_with(".lean") {
         module_target(sources, bare).map(|(module, owner)| (module, Some(owner), facet))
     } else {
         name(bare.strip_prefix('+').unwrap_or(bare)).map(|module| (module, None, facet))
