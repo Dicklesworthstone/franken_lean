@@ -1127,7 +1127,10 @@ fn split_facets_on_legacy_sources_never_return_stale_outputs_or_publish_other_ta
             &["+Lib.Other:olean", &format!("+Lib.Top:{suffix}")],
         );
         let error = failure(&error);
-        assert!(error.contains("has no") && error.contains(suffix), "{error}");
+        assert!(
+            error.contains("has no") && error.contains(suffix),
+            "{error}"
+        );
         assert_eq!(std::fs::read(stale).unwrap(), b"stale");
         assert!(!package.artifact("Lib.Other").exists());
         assert!(!package.artifact("Lib.Top").exists());
@@ -1154,7 +1157,10 @@ fn explain_distinguishes_unbuilt_facets_from_an_unchanged_legacy_module() {
         assert_eq!(output.status.code(), Some(5), "{output:?}");
         assert!(output.stdout.is_empty(), "{output:?}");
         let error = String::from_utf8(output.stderr).unwrap();
-        assert!(error.contains(&format!("has no {suffix} output")), "{error}");
+        assert!(
+            error.contains(&format!("has no {suffix} output")),
+            "{error}"
+        );
     }
     package.write("Lib/Top.lean", MODULE_BASE);
     let report = success(&explain(&package, "olean.private"));
@@ -1379,6 +1385,40 @@ fn source_file_targets_refuse_file_and_directory_symlinks_before_canonicalizing(
     assert!(package.artifact("Lib.Top").is_file());
 }
 
+/// An IR build adds the compiler's public signatures to the logical files so
+/// downstream Lean code can call the exports. Decode each part independently
+/// and compare all declarations and noncompiler extension entries across facets.
+fn assert_ir_preserves_logical_family(original: &[Vec<u8>], compiled: &[Vec<u8>]) {
+    use fln_olean::{decl::DeclDecoder, region::OleanView};
+
+    assert_eq!(original.len(), FAMILY_PARTS.len());
+    assert_eq!(compiled.len(), FAMILY_PARTS.len());
+    for index in 0..FAMILY_PARTS.len() {
+        let logical = |family: &[Vec<u8>], with_ir: bool| {
+            let dependencies: Vec<_> = family[..index].iter().map(Vec::as_slice).collect();
+            let view = OleanView::parse_with_dependencies(&family[index], &dependencies).unwrap();
+            let declarations = DeclDecoder::new(&view, Default::default())
+                .decode_module_constants()
+                .unwrap();
+            let data = view.module_data(Default::default()).unwrap();
+            let mut blocks = view
+                .extension_payloads(Default::default(), 16 << 20)
+                .unwrap();
+            for extension in ["Lean.IR.declMapExt", "Lean.Compiler.LCNF.impureSigExt"] {
+                let name = fln::Name::from_components(extension.split('.'));
+                let block = blocks.iter().find(|block| block.name == name);
+                assert_eq!(
+                    block.is_some_and(|block| !block.entries.is_empty()),
+                    with_ir
+                );
+                blocks.retain(|block| block.name != name);
+            }
+            (data.is_module, data.imports, declarations, blocks)
+        };
+        assert_eq!(logical(original, false), logical(compiled, true));
+    }
+}
+
 #[test]
 fn fieldless_enum_ir_facets_preserve_admission_and_replay_from_checked_cache() {
     // This exact two-constructor module used to refuse its executable facet.
@@ -1392,8 +1432,16 @@ fn fieldless_enum_ir_facets_preserve_admission_and_replay_from_checked_cache() {
     let report = success(&package.build(&["+Lib.Top:ir"]));
     assert!(report.contains("\"executable_modules\":2"), "{report}");
     let mut executables = Vec::new();
+    let mut compiled_families = Vec::new();
     for (name, original) in ["Lib.Base", "Lib.Top"].into_iter().zip(&previous) {
-        assert_eq!(&family_bytes(&package, name), original);
+        let compiled = family_bytes(&package, name);
+        if name == "Lib.Base" {
+            assert_ir_preserves_logical_family(original, &compiled);
+        } else {
+            // The proof-only module has no executable signature to add.
+            assert_eq!(&compiled, original);
+        }
+        compiled_families.push(compiled);
         let bytes = std::fs::read(package.artifact(name).with_extension("ir")).unwrap();
         if name == "Lib.Base" {
             let view = fln_olean::region::OleanView::parse(&bytes).unwrap();
@@ -1419,7 +1467,7 @@ fn fieldless_enum_ir_facets_preserve_admission_and_replay_from_checked_cache() {
     assert!(warm.contains("\"modules_cached\":2"), "{warm}");
     assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
     for (index, name) in ["Lib.Base", "Lib.Top"].into_iter().enumerate() {
-        assert_eq!(family_bytes(&package, name), previous[index]);
+        assert_eq!(family_bytes(&package, name), compiled_families[index]);
         assert_eq!(
             std::fs::read(package.artifact(name).with_extension("ir")).unwrap(),
             executables[index],
@@ -2325,7 +2373,7 @@ fn module_family_failures_preserve_all_previous_parts_and_ir() {
     let bytes = std::fs::read(ir).unwrap();
     assert!(fln_olean::region::OleanView::parse(&bytes).is_ok());
     assert!(!package.artifact("Lib.Top").with_extension("ir").exists());
-    assert_eq!(family_bytes(&package, "Lib.Base"), base);
+    assert_ir_preserves_logical_family(&base, &family_bytes(&package, "Lib.Base"));
     assert_eq!(family_bytes(&package, "Lib.Top"), top);
 }
 
