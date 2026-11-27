@@ -58,6 +58,25 @@ theorem let_ok : inLet = 17 := by rfl"#,
 }
 
 #[test]
+fn proposition_results_infer_boolean_projection_arguments_before_coercion() {
+    // Lean/Elab/App.lean disables early Prop propagation even at the last
+    // argument. Otherwise the projection fixes its carrier to Prop before
+    // seeing a container of Bool, and the later Bool-to-Prop coercion is lost.
+    checked(
+        &seed(),
+        r#"structure FlagBox (A : Type) where
+  value : A
+def projected (box : FlagBox Bool) : Prop := FlagBox.value box
+def namedProjected (get : {A : Type} -> (box : FlagBox A) -> A)
+    (box : FlagBox Bool) : Prop := get (box := box)
+def ordinaryProjected (get : {A : Type} -> FlagBox A -> A)
+    (box : FlagBox Bool) : Prop := get box
+theorem true_projection : projected (FlagBox.mk true) := by rfl
+theorem false_projection : projected (FlagBox.mk false) = (false = true) := by rfl"#,
+    );
+}
+
+#[test]
 fn function_coercions_apply_real_record_fields() {
     checked(
         &seed(),

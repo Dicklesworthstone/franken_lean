@@ -291,7 +291,10 @@ impl Context {
                     && self
                         .application_result_out_param(&state.function, state.explicit)?
                         .is_none()
+                    && self.instantiate(expected)? != Expr::sort(Level::zero())
                 {
+                    // Prop is also excluded at the last argument: first infer
+                    // a Boolean projection's carrier, then coerce its result.
                     self.do_operation_result_hint(&state.function, &codomain, expected)?;
                     self.constrain_result_hint(&codomain, expected)?;
                 } else if propagates_early

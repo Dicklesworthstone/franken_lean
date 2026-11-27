@@ -5384,7 +5384,8 @@ impl Context {
                                     // explicit argument when the codomain does not depend
                                     // on that argument (e.g. Inhabited.mk (fun x => ...)),
                                     // unless it is an instance's output, which the pin
-                                    // leaves to the instance (`resultIsOutParamSupport`).
+                                    // leaves to the instance (`resultIsOutParamSupport`),
+                                    // or Prop, which may need a Boolean result coercion.
                                     if rest.is_empty()
                                         && propagates
                                         && !codomain.has_loose_bvar(0)
@@ -5392,6 +5393,7 @@ impl Context {
                                         && self
                                             .application_result_out_param(&function, explicit)?
                                             .is_none()
+                                        && self.instantiate(expected)? != Expr::sort(Level::zero())
                                     {
                                         self.do_operation_result_hint(
                                             &function, &codomain, expected,
