@@ -8048,30 +8048,34 @@ fn task_composition_argument_ownership(
     program: &ValidatedProgram,
     closure: &Obj,
     payload: &Obj,
+    with_world: bool,
 ) -> Result<Vec<ArgumentOwnership>, VmRefusal> {
-    let plan = plan_apply(program, closure, 2, None, None)?;
+    let count = 1 + usize::from(with_world);
+    let plan = plan_apply(program, closure, count, None, None)?;
     let ownership = program
         .function(plan.function)
         .and_then(|function| function.parameter_ownership.get(plan.captures.len()..))
-        .and_then(|parameters| parameters.get(..2))
+        .and_then(|parameters| parameters.get(..count))
         .ok_or(VmRefusal::MalformedClosure {
-            reason: "task composition continuation requires payload and world parameters",
+            reason: "task composition continuation parameters are absent",
         })?;
-    // finished_task_value retained the payload, so this temporary can be
-    // borrowed or consumed by the callback. The original task may still own
-    // it: neither this retain nor the internally created world grants Unique.
-    // A Scalar parameter also requires the physical value to be tagged.
+    // finished_task_value retained the payload. Its owned handle is moved
+    // into the callback frame (or partial closure), including when the
+    // callback declares Borrowed access. Dropping the source task is safe.
+    // Another task may still own the payload, so this retain cannot grant
+    // Unique. A Scalar parameter also requires the physical value to be tagged.
+    let payload_ownership = if payload.is_scalar() {
+        ArgumentOwnership::Scalar
+    } else {
+        ArgumentOwnership::Owned
+    };
     for (argument, (expected, actual)) in ownership
         .iter()
         .copied()
-        .zip([
-            if payload.is_scalar() {
-                ArgumentOwnership::Scalar
-            } else {
-                ArgumentOwnership::Owned
-            },
-            ArgumentOwnership::Scalar,
-        ])
+        .zip(
+            std::iter::once(payload_ownership)
+                .chain(with_world.then_some(ArgumentOwnership::Scalar)),
+        )
         .enumerate()
     {
         if expected == ArgumentOwnership::Unique
@@ -8148,7 +8152,7 @@ fn closure_intrinsic_application(
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
             let argument_ownership =
-                task_composition_argument_ownership(program, &closure, &argument)?;
+                task_composition_argument_ownership(program, &closure, &argument, true)?;
             Ok(IntrinsicApplication {
                 row,
                 closure,
@@ -8174,7 +8178,7 @@ fn closure_intrinsic_application(
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
             let argument_ownership =
-                task_composition_argument_ownership(program, &closure, &argument)?;
+                task_composition_argument_ownership(program, &closure, &argument, true)?;
             Ok(IntrinsicApplication {
                 row,
                 closure,
@@ -8193,11 +8197,13 @@ fn closure_intrinsic_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
+            let argument_ownership =
+                task_composition_argument_ownership(program, &closure, &argument, false)?;
             Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument],
-                argument_ownership: vec![ArgumentOwnership::Owned],
+                argument_ownership,
                 completion: IntrinsicCompletion::WrapPure,
                 trace: None,
             })
@@ -8211,11 +8217,13 @@ fn closure_intrinsic_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
+            let argument_ownership =
+                task_composition_argument_ownership(program, &closure, &argument, false)?;
             Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument],
-                argument_ownership: vec![ArgumentOwnership::Owned],
+                argument_ownership,
                 completion: IntrinsicCompletion::RequireFinishedTask,
                 trace: None,
             })
