@@ -11,6 +11,7 @@ const MAX_ATTRIBUTE_ITEMS: usize = 4096;
 pub enum Attribute {
     ImplementedBy(Name),
     Extern(Vec<ExternEntry>),
+    TaggedReturn,
     Unbox,
     NeverExtract,
     AnonymousConstructor,
@@ -28,7 +29,8 @@ impl Attribute {
     pub fn is_tag(&self) -> bool {
         matches!(
             self,
-            Self::Unbox
+            Self::TaggedReturn
+                | Self::Unbox
                 | Self::NeverExtract
                 | Self::AnonymousConstructor
                 | Self::Coe
@@ -128,6 +130,9 @@ pub(in crate::source) fn attribute(
             if val == &Name::from_components(["unbox"]) {
                 expect_empty_null(argument, "unbox without arguments")?;
                 Attribute::Unbox
+            } else if val == &Name::from_components(["tagged_return"]) {
+                expect_empty_null(argument, "tagged_return without arguments")?;
+                Attribute::TaggedReturn
             } else if val == &Name::from_components(["never_extract"]) {
                 expect_empty_null(argument, "never_extract without arguments")?;
                 Attribute::NeverExtract
@@ -613,7 +618,8 @@ pub fn apply(
                     },
                 )?
             }
-            Attribute::WeakSpecialize
+            Attribute::TaggedReturn
+            | Attribute::WeakSpecialize
             | Attribute::NoSpecialize
             | Attribute::Export(_)
             | Attribute::SuggestFor(_) => {
@@ -638,6 +644,259 @@ pub fn apply(
     // Every registration validates its signature/payload, including overwritten
     // rows. Cycles concern the final map after applying the complete list.
     ImplementedByTable::read(&result).map_err(implemented_error)?;
-    ExternTable::read(&result).map_err(extern_error)?;
+    let externs = ExternTable::read(&result).map_err(extern_error)?;
+    if !standalone
+        && rows
+            .iter()
+            .any(|row| matches!(row, Attribute::TaggedReturn))
+        && matches!(
+            result.find(declaration),
+            Some(ConstantInfo::Defn(_) | ConstantInfo::Opaque(_))
+        )
+    {
+        let noncomputable = crate::noncomputable::read(&result).map_err(|error| match error {
+            crate::noncomputable::NoncomputableError::Limit => {
+                failure(SourceInferenceError::ResourceLimit)
+            }
+            error => failure(SourceInferenceError::NoncomputableJournal(error)),
+        })?;
+        if !noncomputable.contains(declaration) {
+            // Mirror pinned `Lean/Compiler/LCNF/ToImpure.lean:315-325`:
+            // during compilation of computable `def`/`opaque` declarations,
+            // `@[tagged_return]` requires `@[extern]` and a non-scalar lowered
+            // return type.
+            if externs.get(declaration).is_none() {
+                return Err(refused("tagged_return on an extern declaration"));
+            }
+            if is_scalar_return_type(&result, declaration)? {
+                return Err(refused("tagged_return on a non-scalar return type"));
+            }
+        }
+    }
     Ok(result)
+}
+
+fn is_prop_or_type_field(
+    environment: &Environment,
+    field: &Expr,
+) -> Result<bool, NatDefinitionElabError> {
+    let mut cursor = field;
+    let mut steps = 0usize;
+    loop {
+        if steps >= MAX_ATTRIBUTE_ITEMS {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        steps += 1;
+        match cursor.node() {
+            ExprNode::ForallE { body, .. } => cursor = body,
+            ExprNode::MData { expr, .. } => cursor = expr,
+            _ => break,
+        }
+    }
+    if matches!(cursor.node(), ExprNode::Sort { .. }) {
+        return Ok(true);
+    }
+    let mut head = cursor;
+    steps = 0;
+    loop {
+        if steps >= MAX_ATTRIBUTE_ITEMS {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        steps += 1;
+        match head.node() {
+            ExprNode::App { f, .. } => head = f,
+            ExprNode::MData { expr, .. } => head = expr,
+            _ => break,
+        }
+    }
+    let ExprNode::Const { name, .. } = head.node() else {
+        return Ok(false);
+    };
+    let Some(info) = environment.find(name) else {
+        return Ok(false);
+    };
+    let mut result = &info.constant_val().type_;
+    steps = 0;
+    loop {
+        if steps >= MAX_ATTRIBUTE_ITEMS {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        steps += 1;
+        match result.node() {
+            ExprNode::ForallE { body, .. } => result = body,
+            ExprNode::MData { expr, .. } => result = expr,
+            _ => break,
+        }
+    }
+    Ok(matches!(result.node(), ExprNode::Sort { level } if level.is_zero()))
+}
+
+fn is_scalar_return_type(
+    environment: &Environment,
+    declaration: &Name,
+) -> Result<bool, NatDefinitionElabError> {
+    const SCALAR_TYPES: &[&str] = &[
+        "UInt8", "UInt16", "UInt32", "UInt64", "USize", "Int8", "Int16", "Int32", "Int64", "ISize",
+        "Float", "Float32", "Bool", "Char",
+    ];
+    let Some(info) = environment.find(declaration) else {
+        return Ok(false);
+    };
+    let mut current = info.constant_val().type_.clone();
+    let mut steps = 0usize;
+    loop {
+        if steps >= MAX_ATTRIBUTE_ITEMS {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        steps += 1;
+        match current.node() {
+            ExprNode::ForallE { body, .. } => current = body.clone(),
+            ExprNode::MData { expr, .. } => current = expr.clone(),
+            _ => break,
+        }
+    }
+
+    let mut visited = std::collections::BTreeSet::new();
+    for _ in 0..64 {
+        let mut head = &current;
+        let mut args = Vec::new();
+        steps = 0;
+        loop {
+            if steps >= MAX_ATTRIBUTE_ITEMS {
+                return Err(failure(SourceInferenceError::ResourceLimit));
+            }
+            steps += 1;
+            match head.node() {
+                ExprNode::App { f, a } => {
+                    args.push(a.clone());
+                    head = f;
+                }
+                ExprNode::MData { expr, .. } => head = expr,
+                _ => break,
+            }
+        }
+        args.reverse();
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(false);
+        };
+        if SCALAR_TYPES
+            .iter()
+            .any(|scalar| *name == Name::from_components([*scalar]))
+        {
+            return Ok(true);
+        }
+        if !visited.insert(name.clone()) {
+            return Ok(false);
+        }
+        match environment.find(name) {
+            Some(ConstantInfo::Defn(defn)) => {
+                let mut body = &defn.value;
+                let mut lams = 0usize;
+                steps = 0;
+                loop {
+                    if steps >= MAX_ATTRIBUTE_ITEMS {
+                        return Err(failure(SourceInferenceError::ResourceLimit));
+                    }
+                    steps += 1;
+                    match body.node() {
+                        ExprNode::Lam { body: inner, .. } => {
+                            lams += 1;
+                            body = inner;
+                        }
+                        ExprNode::MData { expr, .. } => body = expr,
+                        _ => break,
+                    }
+                }
+                if let ExprNode::BVar { idx } = body.node()
+                    && let Ok(idx) = usize::try_from(*idx)
+                    && idx < lams
+                    && let Some(arg) = args.get(lams - 1 - idx)
+                {
+                    current = arg.clone();
+                    continue;
+                }
+                if !body.has_loose_bvars() {
+                    current = body.clone();
+                    continue;
+                }
+                return Ok(false);
+            }
+            Some(ConstantInfo::Induct(inductive)) => {
+                if inductive.num_params == 0
+                    && inductive.num_indices == 0
+                    && inductive.ctors.len() >= 2
+                    && inductive.ctors.len() <= u32::MAX as usize
+                    && inductive.ctors.iter().all(|ctor_name| {
+                        matches!(
+                            environment.find(ctor_name),
+                            Some(ConstantInfo::Ctor(ctor)) if ctor.num_fields == 0
+                        )
+                    })
+                {
+                    return Ok(true);
+                }
+                // Mirror `Lean/Compiler/LCNF/ToImpureType.lean:152-158`:
+                // a non-recursive 1-constructor structure with exactly one
+                // relevant (non-Prop, non-Sort) field lowers to that field's type.
+                if !inductive.is_rec
+                    && inductive.num_indices == 0
+                    && inductive.ctors.len() == 1
+                    && let Some(ConstantInfo::Ctor(ctor)) = environment.find(&inductive.ctors[0])
+                {
+                    let num_params = usize::try_from(inductive.num_params).unwrap_or(usize::MAX);
+                    let mut ctor_ty = &ctor.base.type_;
+                    let mut binder_idx = 0usize;
+                    let mut relevant_field: Option<(usize, Expr)> = None;
+                    let mut relevant_count = 0usize;
+                    steps = 0;
+                    loop {
+                        if steps >= MAX_ATTRIBUTE_ITEMS {
+                            return Err(failure(SourceInferenceError::ResourceLimit));
+                        }
+                        steps += 1;
+                        match ctor_ty.node() {
+                            ExprNode::MData { expr, .. } => ctor_ty = expr,
+                            ExprNode::ForallE {
+                                binder_type, body, ..
+                            } => {
+                                if binder_idx >= num_params
+                                    && !is_prop_or_type_field(environment, binder_type)?
+                                {
+                                    relevant_count += 1;
+                                    if relevant_count > 1 {
+                                        break;
+                                    }
+                                    relevant_field =
+                                        Some((binder_idx - num_params, binder_type.clone()));
+                                }
+                                binder_idx += 1;
+                                ctor_ty = body;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if relevant_count == 1
+                        && let Some((field_pos, field_ty)) = relevant_field
+                    {
+                        if let ExprNode::BVar { idx } = field_ty.node()
+                            && let Ok(idx) = usize::try_from(*idx)
+                            && idx >= field_pos
+                            && idx - field_pos < num_params
+                            && let Some(arg) = args.get(num_params - 1 - (idx - field_pos))
+                        {
+                            current = arg.clone();
+                            continue;
+                        }
+                        if !field_ty.has_loose_bvars() {
+                            current = field_ty;
+                            continue;
+                        }
+                    }
+                }
+                return Ok(false);
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(false)
 }

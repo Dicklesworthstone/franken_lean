@@ -829,6 +829,7 @@ pub(super) fn parse_executable(
                 Some(
                     "implemented_by"
                         | "extern"
+                        | "tagged_return"
                         | "unbox"
                         | "never_extract"
                         | "pp_using_anonymous_constructor"

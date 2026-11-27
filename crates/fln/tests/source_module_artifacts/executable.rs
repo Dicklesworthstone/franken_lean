@@ -708,6 +708,11 @@ fn private_decl_bridges_private_proofs_without_leaking_private_types() {
                private_decl% stepN n\n\
              @[expose] noncomputable def pubNoncomp : N :=\n\
                private_decl% privAx\n\
+             @[extern \"ext_pdecl\"] def nonExposeExtern : N :=\n\
+               private_decl% privAx\n\
+             theorem pubThm : P N.z :=\n\
+               let x := private_decl% privAx\n\
+               P.ok N.z\n\
              private def nonExporting (n : N) (h : P n) : Q n :=\n\
                private_decl% pToQ n h\n",
         )],
@@ -750,6 +755,110 @@ fn private_decl_bridges_private_proofs_without_leaking_private_types() {
          inductive N : Type where | z : N\n\
          private axiom privAx : N\n\
          @[expose] def badNoncomp : N := private_decl% privAx\n",
+        "module\n\
+         prelude\n\
+         public section\n\
+         inductive N : Type where | z : N\n\
+         private axiom privAx : N\n\
+         @[expose, extern \"ext_bad\"] def badExposeExtern : N := private_decl% privAx\n",
+        "module\n\
+         prelude\n\
+         public section\n\
+         inductive N : Type where | z : N\n\
+         inductive P : N -> Prop where | ok (n : N) : P n\n\
+         private axiom privAx : N\n\
+         class PropCls : Prop where ok : P N.z\n\
+         @[expose] instance : PropCls := let x := private_decl% privAx; PropCls.mk (P.ok N.z)\n",
+    ] {
+        let err = build(&engine, &[("Main", bad)], OleanWriteBudget::default()).unwrap_err();
+        assert_eq!(err.disposition().2, 1, "{bad}: {err:?}");
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
+fn tagged_return_requires_extern_and_non_scalar_return_type() {
+    let engine = Engine::builder().build_empty();
+    let root = engine.logical_root(&KVMap::new());
+
+    let built = build(
+        &engine,
+        &[(
+            "Main",
+            "prelude\n\
+             inductive Tr : Prop where | ok : Tr\n\
+             inductive N : Type where | z : N | s : N -> N\n\
+             inductive One : Type where | unit : One\n\
+             structure UInt8 where val : N\n\
+             structure PairU8 where\n  a : UInt8\n  b : UInt8\n\
+             @[extern \"tr_after\", tagged_return] def trAfter (n : N) : N := n\n\
+             @[tagged_return, extern \"tr_before\"] def trBefore (n : N) : N := n\n\
+             @[extern \"tr_opaque\", tagged_return] opaque trOpaque (n : N) : N := N.z\n\
+             @[extern \"tr_standalone\"] def trStandalone (n : N) : N := n\n\
+             attribute [tagged_return] trStandalone\n\
+             def nonExternStandalone (n : N) : N := n\n\
+             attribute [tagged_return] nonExternStandalone\n\
+             @[tagged_return] theorem thmNoExtern : Tr := Tr.ok\n\
+             @[tagged_return] noncomputable def noncompNoExtern (n : N) : N := n\n\
+             @[extern \"tr_one\", tagged_return] def trOne (x : One) : One := x\n\
+             @[extern \"tr_pair\", tagged_return] def trPair (x : PairU8) : PairU8 := x\n",
+        )],
+        OleanWriteBudget::default(),
+    )
+    .expect("valid @[tagged_return] declarations succeed")
+    .into_complete()
+    .expect("tagged_return build completes");
+    let receipt = imported(&built);
+    for decl in [
+        "trAfter",
+        "trBefore",
+        "trOpaque",
+        "trStandalone",
+        "nonExternStandalone",
+        "thmNoExtern",
+        "noncompNoExtern",
+        "trOne",
+        "trPair",
+    ] {
+        assert!(
+            receipt.engine.environment().contains(&name(decl)),
+            "missing {decl}"
+        );
+    }
+
+    for bad in [
+        "prelude\n\
+         inductive N : Type where | z : N | s : N -> N\n\
+         @[tagged_return] def nonExtern (n : N) : N := n\n",
+        "prelude\n\
+         inductive N : Type where | z : N | s : N -> N\n\
+         @[tagged_return] opaque nonExternOpaque (n : N) : N := N.z\n",
+        "prelude\n\
+         inductive N : Type where | z : N | s : N -> N\n\
+         @[extern \"tr_loc\"] def f (n : N) : N := n\n\
+         attribute [local tagged_return] f\n",
+        "prelude\n\
+         inductive Two : Type where | a : Two | b : Two\n\
+         @[extern \"tr_enum\", tagged_return] def scalarEnum (x : Two) : Two := x\n",
+        "prelude\n\
+         inductive N : Type where | z : N\n\
+         structure UInt8 where val : N\n\
+         @[extern \"tr_u8\", tagged_return] def scalarU8 (x : UInt8) : UInt8 := x\n",
+        "prelude\n\
+         inductive N : Type where | z : N\n\
+         structure Int8 where val : N\n\
+         @[extern \"tr_i8\", tagged_return] def scalarI8 (x : Int8) : Int8 := x\n",
+        "prelude\n\
+         inductive N : Type where | z : N\n\
+         structure UInt8 where val : N\n\
+         abbrev MyU8 := UInt8\n\
+         @[extern \"tr_abbrev\", tagged_return] def scalarAbbrev (x : MyU8) : MyU8 := x\n",
+        "prelude\n\
+         inductive Tr : Prop where | ok : Tr\n\
+         inductive N : Type where | z : N\n\
+         structure UInt8 where val : N\n\
+         structure WrapU8 where\n  val : UInt8\n  h : Tr\n\
+         @[extern \"tr_wrap\", tagged_return] def scalarWrap (x : WrapU8) : WrapU8 := x\n",
     ] {
         let err = build(&engine, &[("Main", bad)], OleanWriteBudget::default()).unwrap_err();
         assert_eq!(err.disposition().2, 1, "{bad}: {err:?}");
