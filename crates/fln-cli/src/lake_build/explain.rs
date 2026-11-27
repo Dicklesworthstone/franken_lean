@@ -89,22 +89,122 @@ struct Report {
 /// path. A package qualifier is checked against the recorded build's owner.
 fn target_name<'a>(
     sources: &'a local_dependencies::Sources,
+    root: &Path,
     text: &str,
-) -> std::result::Result<(Name, Option<&'a local_dependencies::Package>), Failure> {
-    if let Some(path) = text.strip_suffix(".lean") {
-        return name(&path.trim_start_matches("./").replace(['/', '\\'], "."))
-            .map(|module| (module, None));
+) -> std::result::Result<
+    (
+        Name,
+        Option<&'a local_dependencies::Package>,
+        Option<ModuleFacet>,
+    ),
+    Failure,
+> {
+    let (bare, facet) = text
+        .rsplit_once(':')
+        .and_then(|(target, facet)| ModuleFacet::parse(facet).map(|facet| (target, Some(facet))))
+        .unwrap_or((text, None));
+    if let Some(stem) = bare.strip_suffix(".lean")
+        && !bare.starts_with(['+', '@'])
+    {
+        // Prefer a file selected from the caller's directory, as lake build
+        // does. Also accept a path relative to the chosen workspace (--dir).
+        if let Some((module, owner)) = source_file_target(sources, bare)? {
+            return Ok((module, Some(owner), facet));
+        }
+        let from_root = root.join(bare);
+        if let Some(path) = from_root.to_str()
+            && let Some((module, owner)) = source_file_target(sources, path)?
+        {
+            return Ok((module, Some(owner), facet));
+        }
+        // Preserve the logical-path spelling used to explain a deleted source.
+        if facet.is_none() {
+            return name(&stem.trim_start_matches("./").replace(['/', '\\'], "."))
+                .map(|module| (module, None, None));
+        }
     }
-    let bare = text
-        .strip_suffix(":olean")
-        .or_else(|| text.strip_suffix(":ir"))
-        .or_else(|| text.strip_suffix(":ilean"))
-        .unwrap_or(text);
-    if bare.contains('/') || bare.starts_with('@') {
-        module_target(sources, bare).map(|(module, owner)| (module, Some(owner)))
+    // A facet selects a Lake target, including its owner and named-target
+    // precedence. A plain module name can inspect any row in the snapshot.
+    if facet.is_some() || bare.contains('/') || bare.starts_with('@') || bare.ends_with(".lean") {
+        module_target(sources, bare).map(|(module, owner)| (module, Some(owner), facet))
     } else {
-        name(bare.strip_prefix('+').unwrap_or(bare)).map(|module| (module, None))
+        name(bare.strip_prefix('+').unwrap_or(bare)).map(|module| (module, None, facet))
     }
+}
+
+/// Legacy snapshots stored the caller's source-file argument without its
+/// working directory. Match it only against recorded source identities and
+/// ask the current package configuration to confirm the original owner.
+fn recorded_target(
+    root: &Path,
+    sources: &local_dependencies::Sources,
+    snapshot: &Snapshot,
+    target: &str,
+) -> std::result::Result<String, Refusal> {
+    let Some((selector, facet)) = source_facet(target) else {
+        return Ok(target.to_owned());
+    };
+    let input = Path::new(selector);
+    let mut suffix = PathBuf::new();
+    for component in input.components() {
+        match component {
+            Component::ParentDir => {
+                suffix.pop();
+            }
+            Component::CurDir => {}
+            component => suffix.push(component.as_os_str()),
+        }
+    }
+    let unavailable = || {
+        Refusal::Unavailable(format!(
+            "cannot recover the recorded source target `{target}` and its package; rebuild to refresh the snapshot"
+        ))
+    };
+    let mut rows = snapshot.modules.iter().filter(|row| {
+        let recorded = root.join(&row.source);
+        if input.is_absolute() {
+            recorded == suffix
+        } else {
+            recorded.ends_with(&suffix)
+        }
+    });
+    let Some(row) = rows.next() else {
+        // A module name ending in ".lean" can also be a named selector.
+        if snapshot.modules.iter().any(|row| row.name == selector) {
+            return Ok(format!("+{selector}:{facet}"));
+        }
+        return Err(unavailable());
+    };
+    if rows.next().is_some() {
+        return Err(unavailable());
+    }
+    let module = name(&row.name)?;
+    let source = root.join(&row.source);
+    let mut owners = Vec::new();
+    for package in &sources.packages {
+        if package.target_path(&module)?.as_ref() == Some(&source) {
+            owners.push(package);
+        }
+    }
+    if owners.len() > 1 {
+        // Multiple aliases can share a source while using separate buildDirs.
+        let artifact = root.join(&row.artifact);
+        let relative = source_import_relative_path(&module)
+            .map_err(Failure::from)?
+            .with_extension("olean");
+        owners.retain(|package| {
+            package
+                .root
+                .join(&package.config.build_dir)
+                .join("lib/lean")
+                .join(&relative)
+                == artifact
+        });
+    }
+    let [owner] = owners.as_slice() else {
+        return Err(unavailable());
+    };
+    Ok(format!("@{}/+{}:{facet}", owner.identity, row.name))
 }
 
 fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result<Report, Refusal> {
@@ -181,11 +281,22 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
             (old != new).then(|| (path, old.map(str::to_owned), new.map(str::to_owned)))
         })
         .collect();
-    let recorded_plan = plan_modules(&sources, &recorded.targets)?;
+    if recorded.targets.len() > MAX_MODULES || recorded.modules.len() > MAX_MODULES {
+        return Err(
+            Failure::new("resource", "recorded build exceeds 256 targets or modules").into(),
+        );
+    }
+    let targets = recorded
+        .targets
+        .iter()
+        .map(|target| recorded_target(&root, &sources, &recorded, target))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let recorded_plan = plan_modules(&sources, &targets)?;
     let resolve = |module: &Name| sources.resolve_build_package(module, &recorded_plan.owners);
+    let mut selected_facet = None;
     let entries = match target {
         Some(text) => {
-            let (module, requested_owner) = target_name(&sources, text)?;
+            let (module, requested_owner, facet) = target_name(&sources, &root, text)?;
             let display = module.to_display_string();
             if !recorded.modules.iter().any(|row| row.name == display) {
                 return Err(Failure::input(format!(
@@ -194,6 +305,7 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
                 ))
                 .into());
             }
+            selected_facet = facet.map(|facet| (module.clone(), facet));
             let Some((owner, _)) = resolve(&module)? else {
                 return Err(Refusal::Unavailable(format!(
                     "recorded module `{display}` no longer belongs to a selected local package"
@@ -455,6 +567,41 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
             }
         }
         if let Some(row) = row {
+            if let Some((selected, facet)) = &selected_facet
+                && selected == &module
+            {
+                let produced = match facet {
+                    ModuleFacet::Olean => true,
+                    ModuleFacet::OleanServer | ModuleFacet::OleanPrivate => {
+                        row.companions.is_some()
+                    }
+                    ModuleFacet::Ir => row.ir_digest.is_some(),
+                    ModuleFacet::Ilean => row.ilean_digest.is_some(),
+                };
+                if !produced {
+                    // Every checked module-system file yields both split oleans.
+                    // Only an unchanged source establishes the recorded legacy
+                    // form still applies. An edit requires a fresh build.
+                    if matches!(facet, ModuleFacet::OleanServer | ModuleFacet::OleanPrivate)
+                        && now
+                            .digest
+                            .as_ref()
+                            .is_ok_and(|digest| digest == &row.source_digest)
+                    {
+                        return Err(Refusal::Unavailable(format!(
+                            "the recorded source for module `{display}` has no {} output; this facet requires the module system",
+                            facet.extension()
+                        )));
+                    }
+                    if rebuild.is_empty() {
+                        output_only = true;
+                    }
+                    rebuild.push(format!(
+                        "{} facet was not part of the recorded build",
+                        facet.extension()
+                    ));
+                }
+            }
             let destination = relative(&now.artifact);
             if row.artifact != destination {
                 if rebuild.is_empty() {

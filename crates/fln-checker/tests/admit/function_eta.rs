@@ -204,3 +204,134 @@ fn eta_never_equates_a_function_with_a_different_one() {
         );
     }
 }
+
+fn check_unit_like_function_eta(tagged: bool) {
+    use fln_checker::defeq::{DefEqOutcome, def_eq};
+    use fln_checker::infer::{InferenceContext, InferenceMode, InferenceOutcome, infer};
+
+    // Both Token.{u} and Token.{u} tag have one inhabitant per instantiation.
+    let apply_tag = |head: Expr, tag: Expr| if tagged { Expr::app(head, tag) } else { head };
+    let tag_binder = |body| if tagged { pi(c("Tag"), body) } else { body };
+    let token = |tag, level| apply_tag(Expr::const_(primary_name("Token"), vec![level]), c(tag));
+    let token_mk = |tag, level| {
+        apply_tag(
+            Expr::const_(Name::from_components(["Token", "mk"]), vec![level]),
+            c(tag),
+        )
+    };
+    let level = Level::param(primary_name("u"));
+    let codomain = apply_tag(
+        Expr::const_(primary_name("Token"), vec![level.clone()]),
+        bvar(0),
+    );
+    let env = environment_of(vec![
+        axiom("Tag", ty()),
+        axiom("first", c("Tag")),
+        axiom("second", c("Tag")),
+        axiom("Data", ty()),
+        ConstantEntry::new(
+            checker_name("Token"),
+            ConstantDeclaration::inductive(
+                vec![checker_name("u")],
+                decoded(&tag_binder(Expr::sort(
+                    level.succ().expect("small universe"),
+                ))),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    u32::from(tagged),
+                    0,
+                    vec![checker_name("Token")],
+                    vec![checker_qualified(&["Token", "mk"])],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Token", "mk"]),
+            ConstantDeclaration::constructor(
+                vec![checker_name("u")],
+                decoded(&tag_binder(codomain)),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(checker_name("Token"), 0, u32::from(tagged), 0),
+            ),
+        ),
+        axiom("f", pi(token("first", Level::zero()), c("Data"))),
+        axiom(
+            "Family",
+            pi(pi(token("first", Level::zero()), c("Data")), ty()),
+        ),
+        axiom("witness", app(c("Family"), [c("f")])),
+    ]);
+    let context = InferenceContext::empty(env.clone());
+    let f = decoded(&c("f"));
+    for (tag, level) in [
+        ("second", Level::zero()),
+        ("first", Level::one()),
+        ("first", Level::zero()),
+    ] {
+        if !tagged && tag == "second" {
+            continue;
+        }
+        let function_type = pi(token(tag, level.clone()), c("Data"));
+        let constant_function = lam(
+            token(tag, level.clone()),
+            app(c("f"), [token_mk("first", Level::zero())]),
+        );
+        let function = decoded(&constant_function);
+        let result = infer(
+            &function,
+            &context,
+            InferenceMode::Checking {
+                declaration_safety: DefinitionSafety::Safe,
+            },
+            InferenceBudget::unlimited(),
+        );
+        let InferenceOutcome::Complete(result) = result else {
+            panic!("eta input must type-check: {result:?}");
+        };
+        assert!(matches!(
+            def_eq(
+                &result.type_,
+                &decoded(&function_type),
+                context.reduction(),
+                DefEqBudget::unlimited()
+            ),
+            DefEqOutcome::Equal(_)
+        ));
+        if tag == "first" && level == Level::zero() {
+            if !tagged {
+                assert!(matches!(
+                    def_eq(&function, &f, context.reduction(), DefEqBudget::unlimited()),
+                    DefEqOutcome::Equal(_)
+                ));
+            }
+            let claim = definition(
+                "same_instantiation",
+                decoded(&app(c("Family"), [constant_function])),
+                decoded(&c("witness")),
+            );
+            let verdict = admit(&env, &claim, AdmissionBudget::unlimited());
+            assert!(matches!(verdict, Verdict::Admitted(_)), "{verdict:?}");
+        } else {
+            for (left, right) in [(&function, &f), (&f, &function)] {
+                let answer = def_eq(left, right, context.reduction(), DefEqBudget::unlimited());
+                assert!(
+                    matches!(answer, DefEqOutcome::Deferred { .. }),
+                    "wrong function domain: {answer:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unit_like_function_eta_preserves_phantom_tags() {
+    check_unit_like_function_eta(true);
+}
+
+#[test]
+fn unit_like_function_eta_requires_equal_universe_instantiations() {
+    check_unit_like_function_eta(false);
+}

@@ -73,6 +73,45 @@ fn overlapping_wildcards_follow_source_priority() {
     );
 }
 #[test]
+fn the_first_refutable_pattern_controls_open_term_reduction() {
+    let equations = "def choose : Bool → Bool → Bool
+      | _, true => true
+      | false, false => true
+      | true, false => false";
+    check(&format!(
+        "{equations}
+        theorem openColumn (a : Bool) : choose a true = true := by rfl
+        theorem tt : choose false false = true := by rfl
+        theorem ff : choose true false = false := by rfl"
+    ));
+    // The left-to-right setting really scrutinizes the unknown first
+    // argument, so the same equation is no longer definitional.
+    let column_major = format!("set_option backward.match.rowMajor false in\n{equations}");
+    check(&format!(
+        "{column_major}\ntheorem closedColumn : choose false true = true := by rfl"
+    ));
+    reject(&format!(
+        "{column_major}\ntheorem openColumn (a : Bool) : choose a true = true := by rfl"
+    ));
+}
+
+#[test]
+fn upstream_five_column_match_reduces_after_each_right_to_left_split() {
+    let fixture = include_str!("../../../vendor/lean4-src/tests/elab/issue10749.lean");
+    let start = fixture.find("def test4' :").expect("pinned declaration");
+    let (definition, _) = fixture[start..]
+        .split_once("\n/--")
+        .expect("pinned matcher expectation");
+    check(&format!(
+        "{definition}
+        theorem fifth (a b c d : Bool) : test4' a b c d true = true := by rfl
+        theorem fourth (a b c : Bool) : test4' a b c true false = true := by rfl
+        theorem middle (a b : Bool) : test4' a b true false false = true := by rfl
+        theorem allFalse : test4' false false false false false = false := by rfl"
+    ));
+}
+
+#[test]
 fn variable_columns_bind_values_without_erasing_discriminants() {
     check(
         "def copy (n : Nat) (b : Bool) : Nat := match n, b with
@@ -134,6 +173,32 @@ fn dependent_discriminants_refine_each_others_types() {
       theorem heads : sumHeads 1 (Vec.cons 0 7 Vec.nil) (Vec.cons 0 9 Vec.nil) = 16 := by rfl"
     ));
 }
+#[test]
+fn a_proof_constructor_refines_a_later_test_of_its_result_index() {
+    let family = "inductive Below (n : Nat) : Nat → Prop where
+      | refl : Below n n
+      | step {m : Nat} (h : Below n m) : Below n (Nat.succ m)";
+    // The predecessor is arbitrary. Only the outer successor is forced.
+    let cases = "theorem classified : {n m : Nat} → Below n m → 0 = 0
+      | _, _, Below.refl => rfl
+      | _, Nat.succ _, Below.step _ => rfl";
+    check(&format!("{family}\n{cases}"));
+    for invalid in [
+        cases.replace("Nat.succ _, Below.step", "Nat.zero, Below.step"),
+        cases.replace(
+            "Nat.succ _, Below.step",
+            "Nat.succ (Nat.succ _), Below.step",
+        ),
+        cases.replace("_, _, Below.refl", "_, Nat.succ _, Below.refl"),
+        cases.replace("0 = 0", "0 = 1"),
+    ] {
+        reject(&format!("{family}\n{invalid}"));
+    }
+    // A constructor supplied by the caller is not a branch refinement.
+    reject("def bad : Nat := match Nat.succ 0, true with | Nat.succ _, _ => 0");
+    reject("def bad : Nat := let n := Nat.succ 0; match n, true with | Nat.succ _, _ => 0");
+}
+
 #[test]
 fn a_prior_scalar_column_refines_a_later_indexed_column() {
     // The cons row's index field is `_`: named, `Vec (j + 1)` against `Vec (k + 1)` is a

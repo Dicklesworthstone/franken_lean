@@ -1,6 +1,6 @@
 //! Native `.ilean` metadata from checked source and actual identifier resolution.
 //! Original source bytes own positions; imported checked entries own module names.
-use super::symbols::{SourceOriginBudget, source_error};
+use super::symbols::{SourceOriginBudget, node_args, null_args, source_error};
 use super::*;
 use crate::{Ilean, IleanDeclInfo, IleanImport, IleanLocation, IleanRefIdent, IleanRefInfo};
 use fln_parse::command_scope::ScopeCommand;
@@ -187,10 +187,11 @@ impl SourceModuleSession {
                     ".ilean references for this declaration or term syntax",
                 ));
             }
-            let Some(origin) = own_origins.iter().find(|origin| {
+            let mut origins = own_origins.iter().filter(|origin| {
                 origin.symbol.selection_range.start >= base
                     && origin.symbol.selection_range.end <= base + command.len()
-            }) else {
+            });
+            let Some(origin) = origins.next() else {
                 return Err(unsupported(
                     entry,
                     index,
@@ -198,6 +199,63 @@ impl SourceModuleSession {
                     ".ilean references for anonymous or generated declarations",
                 ));
             };
+            if let Some(inductive) = node_args(parsed.syntax(), "declaration")
+                .and_then(|args| args.get(1))
+                .and_then(|body| node_args(body, "inductive"))
+            {
+                let unsupported_shape = || {
+                    unsupported(
+                        entry,
+                        index,
+                        base,
+                        ".ilean references for inductive signatures, fields or generated declarations",
+                    )
+                };
+                let count = fieldless_constructor_count(inductive).ok_or_else(unsupported_shape)?;
+                let Some(fln_env::constants::ConstantInfo::Induct(info)) =
+                    environment.find(&origin.name)
+                else {
+                    return Err(unsupported_shape());
+                };
+                if info.ctors.len() != count {
+                    return Err(unsupported_shape());
+                }
+                references_left = references_left
+                    .checked_sub(count + 1)
+                    .ok_or_else(|| limit("ilean references", limits.max_references))?;
+                // The pin's addTermInfoViews registers the type and every named
+                // constructor under withDeclName(type). Only the type therefore
+                // contributes a parent declaration range, even for many ctors.
+                let parent = names.render(&origin.name)?;
+                let mut binders = std::iter::once(origin).chain(origins);
+                for expected in std::iter::once(&origin.name).chain(&info.ctors) {
+                    let binder = binders
+                        .next()
+                        .filter(|binder| &binder.name == expected)
+                        .ok_or_else(unsupported_shape)?;
+                    let definition = location(
+                        &mut positions,
+                        binder.symbol.selection_range.clone(),
+                        Some(names.copy(&parent)?),
+                        entry,
+                    )?;
+                    result.references.insert(
+                        IleanRefIdent::Const {
+                            module: names.copy(&result.module)?,
+                            name: names.render(expected)?,
+                        },
+                        IleanRefInfo {
+                            definition: Some(definition),
+                            usages: Vec::new(),
+                        },
+                    );
+                }
+                result.decls.insert(
+                    parent,
+                    declaration_range(&mut positions, &origin.symbol, entry)?,
+                );
+                continue;
+            }
             let mut scope = prefix
                 .checked
                 .checked
@@ -303,25 +361,9 @@ impl SourceModuleSession {
                 },
             );
             if is_axiom || !references.is_empty() {
-                let range = location(&mut positions, origin.symbol.range.clone(), None, entry)?;
-                let selection = location(
-                    &mut positions,
-                    origin.symbol.selection_range.clone(),
-                    None,
-                    entry,
-                )?;
                 result.decls.insert(
                     names.copy(&parent)?,
-                    IleanDeclInfo {
-                        range_start_line: range.start_line,
-                        range_start_character: range.start_character,
-                        range_end_line: range.end_line,
-                        range_end_character: range.end_character,
-                        selection_start_line: selection.start_line,
-                        selection_start_character: selection.start_character,
-                        selection_end_line: selection.end_line,
-                        selection_end_character: selection.end_character,
-                    },
+                    declaration_range(&mut positions, &origin.symbol, entry)?,
                 );
             }
             for reference in references {
@@ -362,6 +404,57 @@ impl SourceModuleSession {
         }
         Ok(Outcome::Complete(result))
     }
+}
+
+fn declaration_range(
+    positions: &mut Positions<'_>,
+    symbol: &SourceDocumentSymbol,
+    entry: &Name,
+) -> Result<IleanDeclInfo, SourceModuleCheckError> {
+    let range = location(positions, symbol.range.clone(), None, entry)?;
+    let selection = location(positions, symbol.selection_range.clone(), None, entry)?;
+    Ok(IleanDeclInfo {
+        range_start_line: range.start_line,
+        range_start_character: range.start_character,
+        range_end_line: range.end_line,
+        range_end_character: range.end_character,
+        selection_start_line: selection.start_line,
+        selection_start_character: selection.start_character,
+        selection_end_line: selection.end_line,
+        selection_end_character: selection.end_character,
+    })
+}
+
+fn empty(syntax: &Syntax) -> bool {
+    null_args(syntax).is_some_and(<[Syntax]>::is_empty)
+}
+
+/// A constructor or type signature with terms needs its own observations;
+/// inferring the same checked type is insufficient to recover their positions.
+fn fieldless_constructor_count(args: &[Syntax]) -> Option<usize> {
+    let [_, id, signature, _, constructors, fields, deriving] = args else {
+        return None;
+    };
+    let no_signature = |syntax: &Syntax| {
+        node_args(syntax, "optDeclSig").is_some_and(
+            |args| matches!(args, [binders, result] if empty(binders) && empty(result)),
+        )
+    };
+    if !matches!(node_args(id, "declId")?, [_, levels] if empty(levels))
+        || !no_signature(signature)
+        || !empty(fields)
+        || !matches!(node_args(deriving, "optDeriving"), Some([clause]) if empty(clause))
+    {
+        return None;
+    }
+    let ctors = null_args(constructors)?;
+    ctors
+        .iter()
+        .all(|ctor| {
+            matches!(node_args(ctor, "ctor"),
+        Some([_, _, _, _, sig]) if no_signature(sig))
+        })
+        .then_some(ctors.len())
 }
 
 fn limit(resource: &'static str, limit: usize) -> SourceModuleCheckError {
@@ -532,6 +625,9 @@ fn supported_syntax(
                             kind,
                             "declaration"
                                 | "declModifiers"
+                                | "inductive"
+                                | "ctor"
+                                | "optDeriving"
                                 | "definition"
                                 | "theorem"
                                 | "abbrev"
@@ -552,7 +648,10 @@ fn supported_syntax(
                 || kind.strip_prefix("Lean.Parser.Term.").is_some_and(|kind| {
                     matches!(
                         kind,
-                        "app"
+                        "attributes"
+                            | "attrInstance"
+                            | "attrKind"
+                            | "app"
                             | "paren"
                             | "hygienicLParen"
                             | "explicit"
@@ -604,6 +703,10 @@ fn supported_syntax(
                                 | "tacticTry_"
                         )
                     })
+                || (kind == "Lean.Parser.Attr.simple"
+                    && matches!(args.as_slice(), [Syntax::Ident { val, .. }, argument]
+                        if (val == &Name::from_components(["expose"]) || val == &Name::from_components(["no_expose"]))
+                            && empty(argument)))
                 || kind.strip_prefix("Lean.Parser.Level.").is_some()
                 || kind == "Lean.Parser.Termination.suffix"
                 || matches!(

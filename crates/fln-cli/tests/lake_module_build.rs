@@ -1055,6 +1055,137 @@ fn switching_facets_rebuilds_installed_companions_across_source_edits() {
 }
 
 #[test]
+fn split_olean_selectors_build_and_query_the_checked_family() {
+    let package = module_library();
+    let report = success(&package.build(&["+Lib.Top:olean.private"]));
+    assert!(report.contains("\"facet\":\"olean.private\""), "{report}");
+    let targets = [
+        "+Lib.Base:olean.server",
+        "@/+Lib.Top:olean.private",
+        "+Lib.Base:olean.server",
+    ];
+    let query = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .arg("--dir")
+        .arg(&package.0)
+        .arg("query")
+        .args(targets)
+        .env("LEAN_PATH", package.0.join("no-imports"))
+        .env("FLN_IMPORT_REUSE_DIR", package.0.join(".records"))
+        .output()
+        .unwrap();
+    let server = package
+        .artifact("Lib.Base")
+        .with_extension("olean.server")
+        .canonicalize()
+        .unwrap();
+    let private = package
+        .artifact("Lib.Top")
+        .with_extension("olean.private")
+        .canonicalize()
+        .unwrap();
+    assert_eq!(
+        success(&query).lines().map(Path::new).collect::<Vec<_>>(),
+        [server.as_path(), private.as_path(), server.as_path()]
+    );
+    let explain = || {
+        success(
+            &Command::new(env!("CARGO_BIN_EXE_fln"))
+                .args(["build", "explain", "--json", "--dir"])
+                .arg(&package.0)
+                .arg("+Lib.Top:olean.private")
+                .env("LEAN_PATH", package.0.join("no-imports"))
+                .output()
+                .unwrap(),
+        )
+    };
+    let report = explain();
+    assert!(
+        report.contains("\"reference_decision\":\"up-to-date\""),
+        "{report}"
+    );
+    std::fs::remove_file(&private).unwrap();
+    let report = explain();
+    assert!(
+        report.contains("\"reference_decision\":\"rebuild\""),
+        "{report}"
+    );
+    assert!(report.contains("Top.olean.private"), "{report}");
+}
+
+#[test]
+fn split_facets_on_legacy_sources_never_return_stale_outputs_or_publish_other_targets() {
+    let package = library();
+    package.write("Lib/Other.lean", MODULE_BASE);
+    for (command, suffix) in [("build", "olean.server"), ("query", "olean.private")] {
+        let stale = package.artifact("Lib.Top").with_extension(suffix);
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"stale").unwrap();
+        let error = file_target_command(
+            &package,
+            &package.0,
+            command,
+            &["+Lib.Other:olean", &format!("+Lib.Top:{suffix}")],
+        );
+        let error = failure(&error);
+        assert!(
+            error.contains("has no") && error.contains(suffix),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(stale).unwrap(), b"stale");
+        assert!(!package.artifact("Lib.Other").exists());
+        assert!(!package.artifact("Lib.Top").exists());
+        assert!(!package.0.join(".lake/build/fln-build.snapshot").exists());
+    }
+}
+
+#[test]
+fn explain_distinguishes_unbuilt_facets_from_an_unchanged_legacy_module() {
+    let explain = |package: &Package, suffix| {
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["build", "explain", "--json", "--dir"])
+            .arg(&package.0)
+            .arg(format!("+Lib.Top:{suffix}"))
+            .env("LEAN_PATH", package.0.join("no-imports"))
+            .output()
+            .unwrap()
+    };
+    let package = library();
+    success(&package.build(&["+Lib.Top:olean"]));
+    for suffix in ["olean.server", "olean.private"] {
+        std::fs::write(package.artifact("Lib.Top").with_extension(suffix), b"stale").unwrap();
+        let output = explain(&package, suffix);
+        assert_eq!(output.status.code(), Some(5), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.contains(&format!("has no {suffix} output")),
+            "{error}"
+        );
+    }
+    package.write("Lib/Top.lean", MODULE_BASE);
+    let report = success(&explain(&package, "olean.private"));
+    assert!(
+        report.contains("\"reference_decision\":\"rebuild\""),
+        "{report}"
+    );
+
+    let package = module_library();
+    success(&package.build(&["+Lib.Top:olean"]));
+    for suffix in ["ir", "ilean"] {
+        std::fs::write(package.artifact("Lib.Top").with_extension(suffix), b"stale").unwrap();
+        let report = success(&explain(&package, suffix));
+        assert!(
+            report.contains("\"reference_decision\":\"rebuild\""),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("{suffix} facet was not part")),
+            "{report}"
+        );
+    }
+}
+
+#[test]
 fn source_file_targets_keep_dependency_package_output_ownership() {
     let package = Package::new(concat!(
         "name = \"root\"\nsrcDir = \"src\"\nbuildDir = \"root-out\"\n",
@@ -1254,6 +1385,40 @@ fn source_file_targets_refuse_file_and_directory_symlinks_before_canonicalizing(
     assert!(package.artifact("Lib.Top").is_file());
 }
 
+/// An IR build adds the compiler's public signatures to the logical files so
+/// downstream Lean code can call the exports. Decode each part independently
+/// and compare all declarations and noncompiler extension entries across facets.
+fn assert_ir_preserves_logical_family(original: &[Vec<u8>], compiled: &[Vec<u8>]) {
+    use fln_olean::{decl::DeclDecoder, region::OleanView};
+
+    assert_eq!(original.len(), FAMILY_PARTS.len());
+    assert_eq!(compiled.len(), FAMILY_PARTS.len());
+    for index in 0..FAMILY_PARTS.len() {
+        let logical = |family: &[Vec<u8>], with_ir: bool| {
+            let dependencies: Vec<_> = family[..index].iter().map(Vec::as_slice).collect();
+            let view = OleanView::parse_with_dependencies(&family[index], &dependencies).unwrap();
+            let declarations = DeclDecoder::new(&view, Default::default())
+                .decode_module_constants()
+                .unwrap();
+            let data = view.module_data(Default::default()).unwrap();
+            let mut blocks = view
+                .extension_payloads(Default::default(), 16 << 20)
+                .unwrap();
+            for extension in ["Lean.IR.declMapExt", "Lean.Compiler.LCNF.impureSigExt"] {
+                let name = fln::Name::from_components(extension.split('.'));
+                let block = blocks.iter().find(|block| block.name == name);
+                assert_eq!(
+                    block.is_some_and(|block| !block.entries.is_empty()),
+                    with_ir
+                );
+                blocks.retain(|block| block.name != name);
+            }
+            (data.is_module, data.imports, declarations, blocks)
+        };
+        assert_eq!(logical(original, false), logical(compiled, true));
+    }
+}
+
 #[test]
 fn fieldless_enum_ir_facets_preserve_admission_and_replay_from_checked_cache() {
     // This exact two-constructor module used to refuse its executable facet.
@@ -1267,8 +1432,16 @@ fn fieldless_enum_ir_facets_preserve_admission_and_replay_from_checked_cache() {
     let report = success(&package.build(&["+Lib.Top:ir"]));
     assert!(report.contains("\"executable_modules\":2"), "{report}");
     let mut executables = Vec::new();
+    let mut compiled_families = Vec::new();
     for (name, original) in ["Lib.Base", "Lib.Top"].into_iter().zip(&previous) {
-        assert_eq!(&family_bytes(&package, name), original);
+        let compiled = family_bytes(&package, name);
+        if name == "Lib.Base" {
+            assert_ir_preserves_logical_family(original, &compiled);
+        } else {
+            // The proof-only module has no executable signature to add.
+            assert_eq!(&compiled, original);
+        }
+        compiled_families.push(compiled);
         let bytes = std::fs::read(package.artifact(name).with_extension("ir")).unwrap();
         if name == "Lib.Base" {
             let view = fln_olean::region::OleanView::parse(&bytes).unwrap();
@@ -1294,7 +1467,7 @@ fn fieldless_enum_ir_facets_preserve_admission_and_replay_from_checked_cache() {
     assert!(warm.contains("\"modules_cached\":2"), "{warm}");
     assert!(warm.contains("\"module_elaborations\":0"), "{warm}");
     for (index, name) in ["Lib.Base", "Lib.Top"].into_iter().enumerate() {
-        assert_eq!(family_bytes(&package, name), previous[index]);
+        assert_eq!(family_bytes(&package, name), compiled_families[index]);
         assert_eq!(
             std::fs::read(package.artifact(name).with_extension("ir")).unwrap(),
             executables[index],
@@ -2200,7 +2373,7 @@ fn module_family_failures_preserve_all_previous_parts_and_ir() {
     let bytes = std::fs::read(ir).unwrap();
     assert!(fln_olean::region::OleanView::parse(&bytes).is_ok());
     assert!(!package.artifact("Lib.Top").with_extension("ir").exists());
-    assert_eq!(family_bytes(&package, "Lib.Base"), base);
+    assert_ir_preserves_logical_family(&base, &family_bytes(&package, "Lib.Base"));
     assert_eq!(family_bytes(&package, "Lib.Top"), top);
 }
 

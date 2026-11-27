@@ -3107,28 +3107,15 @@ fn eta_candidate(
                             true
                         } else {
                             let binder_idx = width as usize - 1 - index as usize;
-                            let unit_like = if let Some(&bt) = binder_types.get(binder_idx) {
-                                unit_like_inductive_for_binder(
-                                    bt, sources, context, control, cancelled,
+                            if let Some(&domain) = binder_types.get(binder_idx) {
+                                unit_like_argument_matches(
+                                    domain,
+                                    sources,
+                                    (argument, &result.term),
+                                    context,
+                                    control,
+                                    cancelled,
                                 )?
-                            } else {
-                                None
-                            };
-                            if let Some((_induct_name, ctor_name)) = unit_like {
-                                let mut arg_head = result.term.root();
-                                while let Some(node) = result.term.node(arg_head) {
-                                    match node {
-                                        ExprNode::Apply { function, .. } => arg_head = *function,
-                                        ExprNode::Metadata { expression, .. } => {
-                                            arg_head = *expression
-                                        }
-                                        _ => break,
-                                    }
-                                }
-                                matches!(
-                                    result.term.node(arg_head),
-                                    Some(ExprNode::Constant { name, .. }) if name == &ctor_name
-                                )
                             } else {
                                 false
                             }
@@ -3229,26 +3216,37 @@ fn exact_function_eta(
     }
 }
 
-fn is_non_rec_structure(
-    constants: &crate::environment::ConstantEnvironment,
-    name: &WireName,
-) -> bool {
-    let Some(decl) = constants.find(name) else {
-        return false;
-    };
-    let Some(induct) = decl.inductive_metadata() else {
-        return false;
-    };
-    induct.constructors().len() == 1 && induct.num_indices() == 0 && !induct.is_recursive()
-}
-
-fn unit_like_inductive_for_binder(
+/// A zero-field constructor may stand for this binder only at the same
+/// instantiated type (KR-315). The untyped shortcut handles nullary
+/// constructors; term parameters can depend on outer binders, so their
+/// comparison is left to typed conversion in the original local context.
+fn unit_like_argument_matches(
     binder: DefEqTerm,
     sources: TermSources<'_>,
+    (argument_ref, argument): (DefEqTerm, &WireExpr),
     context: &WhnfContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
-) -> Result<Option<(WireName, WireName)>, SlowHalt> {
+) -> Result<bool, SlowHalt> {
+    let Some(ExprNode::Constant {
+        name: ctor_name,
+        levels: ctor_levels,
+    }) = argument.node(argument.root())
+    else {
+        return Ok(false);
+    };
+    let Some(ctor_decl) = context.constants().find(ctor_name) else {
+        return Ok(false);
+    };
+    let Some(ctor) = ctor_decl.constructor_metadata() else {
+        return Ok(false);
+    };
+    if ctor.num_parameters() != 0
+        || ctor.num_fields() != 0
+        || ctor_decl.level_parameters().len() != ctor_levels.len()
+    {
+        return Ok(false);
+    }
     let budget = control.begin_normalization(cancelled)?;
     let term = sources.source(binder)?;
     let norm = match whnf_at_with(term, binder.root, context, budget, cancelled) {
@@ -3277,40 +3275,41 @@ fn unit_like_inductive_for_binder(
             }));
         }
     };
-    let mut head = norm.root();
-    while let Some(node) = norm.node(head) {
-        match node {
-            ExprNode::Metadata { expression, .. } => head = *expression,
-            ExprNode::Apply { function, .. } => head = *function,
-            _ => break,
-        }
-    }
-    let Some(ExprNode::Constant { name, .. }) = norm.node(head) else {
-        return Ok(None);
+    let Some(ExprNode::Constant { name, levels }) = norm.node(norm.root()) else {
+        return Ok(false);
     };
-    let constants = context.constants();
-    if !is_non_rec_structure(constants, name) {
-        return Ok(None);
+    if name != ctor.inductive() || levels.len() != ctor_levels.len() {
+        return Ok(false);
     }
-    let Some(decl) = constants.find(name) else {
-        return Ok(None);
+    let Some(decl) = context.constants().find(name) else {
+        return Ok(false);
     };
     let Some(induct) = decl.inductive_metadata() else {
-        return Ok(None);
+        return Ok(false);
     };
-    let Some(ctor_name) = induct.constructors().first() else {
-        return Ok(None);
-    };
-    let Some(ctor_decl) = constants.find(ctor_name) else {
-        return Ok(None);
-    };
-    let Some(ctor) = ctor_decl.constructor_metadata() else {
-        return Ok(None);
-    };
-    if ctor.num_fields() == 0 {
-        return Ok(Some((name.clone(), ctor_name.clone())));
+    if induct.constructors() != std::slice::from_ref(ctor_name)
+        || induct.is_recursive()
+        || induct.num_indices() != 0
+        || induct.num_parameters() != 0
+        || decl.level_parameters().len() != levels.len()
+    {
+        return Ok(false);
     }
-    Ok(None)
+    for (&domain_level, &ctor_level) in levels.iter().zip(ctor_levels) {
+        control.comparison(cancelled)?;
+        if !level_roots_equal(norm.levels(), domain_level, argument.levels(), ctor_level).map_err(
+            |error| {
+                SlowHalt::Fault(DefEqFault::Universe {
+                    left: binder.location(),
+                    right: argument_ref.location(),
+                    error,
+                })
+            },
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Recover a fully applied inductive head from the metered spine classification.
@@ -3372,185 +3371,6 @@ fn collect_constructor_spine(
     }
     args.reverse();
     Ok((cur, args))
-}
-
-struct StructureEtaMatch {
-    s_on_left: bool,
-    fields: Vec<(DefEqTerm, WireExpr)>,
-}
-
-struct ConstructorCandidate {
-    induct_name: WireName,
-    num_params: usize,
-    num_fields: usize,
-}
-
-fn candidate_constructor(
-    term: DefEqTerm,
-    sources: TermSources<'_>,
-    context: &WhnfContext,
-) -> Result<Option<ConstructorCandidate>, SlowHalt> {
-    let mut cur = term;
-    loop {
-        let arena = sources.source(cur)?;
-        let node = arena
-            .node(cur.root)
-            .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
-                location: cur.location(),
-            }))?;
-        match node {
-            ExprNode::Apply { function, .. } => {
-                cur = child(cur, *function)?;
-            }
-            ExprNode::Metadata { expression, .. } => {
-                cur = child(cur, *expression)?;
-            }
-            ExprNode::Constant {
-                name: ctor_name, ..
-            } => {
-                let Some(decl) = context.constants().find(ctor_name) else {
-                    return Ok(None);
-                };
-                let Some(ctor) = decl.constructor_metadata() else {
-                    return Ok(None);
-                };
-                let induct_name = ctor.inductive().clone();
-                let num_params = match usize::try_from(ctor.num_parameters()) {
-                    Ok(n) => n,
-                    Err(_) => return Ok(None),
-                };
-                let num_fields = match usize::try_from(ctor.num_fields()) {
-                    Ok(n) => n,
-                    Err(_) => return Ok(None),
-                };
-                if num_fields == 0 {
-                    return Ok(None);
-                }
-                if !is_non_rec_structure(context.constants(), &induct_name) {
-                    return Ok(None);
-                }
-                return Ok(Some(ConstructorCandidate {
-                    induct_name,
-                    num_params,
-                    num_fields,
-                }));
-            }
-            _ => return Ok(None),
-        }
-    }
-}
-
-fn try_structure_eta_candidate(
-    s: DefEqTerm,
-    t: DefEqTerm,
-    s_on_left: bool,
-    sources: TermSources<'_>,
-    context: &WhnfContext,
-    control: &mut SlowControl,
-    cancelled: &mut dyn FnMut() -> bool,
-) -> Result<Option<StructureEtaMatch>, SlowHalt> {
-    let Some(candidate) = candidate_constructor(s, sources, context)? else {
-        return Ok(None);
-    };
-    let (_head, spine_args) = collect_constructor_spine(s, sources, control, cancelled)?;
-    let expected_args = match candidate.num_params.checked_add(candidate.num_fields) {
-        Some(sum) => sum,
-        None => return Ok(None),
-    };
-    if spine_args.len() != expected_args {
-        return Ok(None);
-    }
-
-    let t_visible = eta_visible(t, sources, control, cancelled)?;
-    let t_arena = sources.source(t_visible)?;
-    let copied_t = match copy_compact_subterm_with(
-        t_arena,
-        t_visible.root,
-        TermBudget::unlimited(),
-        cancelled,
-    ) {
-        TermOutcome::Complete(term) => term,
-        TermOutcome::Inconclusive(stop) => {
-            return Err(SlowHalt::Stop(Box::new(match stop {
-                TermStop::Cancelled { polls, .. } => DefEqStop::Cancelled {
-                    polls: control.polls.saturating_add(polls),
-                    progress: control.progress,
-                },
-                TermStop::Resource {
-                    allowed, observed, ..
-                } => DefEqStop::Resource {
-                    limit: DefEqLimit::MaterializedArenaNodes,
-                    allowed,
-                    observed,
-                    progress: control.progress,
-                },
-            })));
-        }
-        TermOutcome::InternalFault(_) => {
-            return Err(SlowHalt::Fault(DefEqFault::MissingExpression {
-                location: t.location(),
-            }));
-        }
-    };
-
-    let mut fields = Vec::with_capacity(candidate.num_fields);
-    for i in 0..candidate.num_fields {
-        let s_field = spine_args[candidate.num_params + i];
-        let mut nodes = copied_t.nodes().to_vec();
-        let proj_root = ExprId::from_index(nodes.len()).ok_or(SlowHalt::Fault(
-            DefEqFault::MissingExpression {
-                location: t.location(),
-            },
-        ))?;
-        nodes.push(ExprNode::Projection {
-            structure_name: candidate.induct_name.clone(),
-            index: i as u64,
-            expression: copied_t.root(),
-        });
-        let proj_expr = WireExpr::from_parts(nodes, copied_t.levels().to_vec(), proj_root);
-        let arena_nodes = proj_expr.nodes().len() as u64;
-        let owned_units = proj_expr
-            .nodes()
-            .iter()
-            .map(expression_owned_units)
-            .chain(proj_expr.levels().iter().map(level_owned_units))
-            .sum::<u64>();
-        let admission =
-            control.prepare_offset_materialization(arena_nodes, owned_units, cancelled)?;
-        control.commit_offset_materialization(admission);
-        fields.push((s_field, proj_expr));
-    }
-    Ok(Some(StructureEtaMatch { s_on_left, fields }))
-}
-
-fn exact_structure_eta(
-    left_reference: DefEqTerm,
-    right_reference: DefEqTerm,
-    sources: TermSources<'_>,
-    context: &WhnfContext,
-    control: &mut SlowControl,
-    cancelled: &mut dyn FnMut() -> bool,
-) -> Result<Option<StructureEtaMatch>, SlowHalt> {
-    if let Some(matched) = try_structure_eta_candidate(
-        left_reference,
-        right_reference,
-        true,
-        sources,
-        context,
-        control,
-        cancelled,
-    )? {
-        return Ok(Some(matched));
-    }
-    try_structure_eta_candidate(
-        right_reference,
-        left_reference,
-        false,
-        sources,
-        context,
-        control,
-        cancelled,
-    )
 }
 
 fn retain_generated(generated: &mut GeneratedPool, side: DefEqSide, term: WireExpr) -> DefEqTerm {
@@ -4409,37 +4229,10 @@ fn run_slow(
                         )? {
                             continue;
                         }
-                        if let Some(matched) = exact_structure_eta(
-                            left_reference,
-                            right_reference,
-                            TermSources::new(left, right, &generated),
-                            context,
-                            &mut control,
-                            cancelled,
-                        )? {
-                            let projected_side = if matched.s_on_left {
-                                DefEqSide::Right
-                            } else {
-                                DefEqSide::Left
-                            };
-                            for (s_field, proj_expr) in matched.fields.into_iter().rev() {
-                                let proj_term =
-                                    retain_generated(&mut generated, projected_side, proj_expr);
-                                let (next_left, next_right) = if matched.s_on_left {
-                                    (s_field, proj_term)
-                                } else {
-                                    (proj_term, s_field)
-                                };
-                                pending.push((
-                                    next_left,
-                                    next_right,
-                                    offset_context,
-                                    StringComparisonContext::Ordinary,
-                                    true,
-                                ));
-                            }
-                            continue;
-                        }
+                        // Structure eta (KR-312) first requires equal inferred
+                        // types (pin type_checker.cpp:820). Identical projections
+                        // do not establish that a record's parameters or universe
+                        // levels agree. Leave this rule to the typed converter.
                         // A negative answer from a child compared by congruence does
                         // not decide its parents: their function might erase it.
                         if !decomposed {

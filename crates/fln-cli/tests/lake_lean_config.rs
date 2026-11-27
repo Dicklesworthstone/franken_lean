@@ -208,6 +208,11 @@ fn checked_lean_configuration_builds_real_modules_and_refuses_atomically() {
     let Some(reference) = reference_lib() else {
         return;
     };
+    let scaffold = Package::new(reference.clone());
+    success(scaffold.lake(&["init", "demo", "lib.lean"]));
+    let defaults = success(scaffold.lake(&["check-build"]));
+    assert!(defaults.contains("\"targets\":[\"Demo\"]"), "{defaults}");
+
     let package = Package::new(reference);
     package.write("lakefile.lean", CONFIG);
     package.write("lean-toolchain", "leanprover/lean4:v4.32.0\n");

@@ -548,6 +548,67 @@ fn an_unreadable_input_makes_the_decision_unknown_with_exit_5() {
 }
 
 #[test]
+fn file_target_snapshots_keep_the_module_owner_across_working_directories() {
+    let package = Package::new("\"Lib\"");
+    package.write(
+        "lakefile.toml",
+        "name = \"explained\"\nsrcDir = \"src\"\n[[lean_lib]]\nname = \"Library\"\nroots = [\"Lib\"]\n",
+    );
+    package.write("src/Lib/Base.lean", BASE);
+    let source_dir = package.0.join("src");
+    let output = package.logged(
+        Command::new(env!("CARGO_BIN_EXE_lake"))
+            .current_dir(&source_dir)
+            .arg("--dir")
+            .arg(&package.0)
+            .args(["--json", "build", "Lib/Base.lean:olean"])
+            .env("LEAN_PATH", package.0.join("no-imports")),
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let snapshot = package.0.join(".lake/build/fln-build.snapshot");
+    let stable = std::fs::read_to_string(&snapshot).unwrap();
+    let selector = "target\t@explained/+Lib.Base:olean\n";
+    assert!(stable.contains(selector), "{stable}");
+    // A current-directory lookalike is not part of this package.
+    let unrelated = Package::new("\"Elsewhere\"");
+    unrelated.write("Lib/Base.lean", "not the original source");
+    let explain = |args: &[&str]| {
+        let output = package.logged(
+            Command::new(env!("CARGO_BIN_EXE_fln"))
+                .current_dir(&unrelated.0)
+                .args(["build", "explain", "--json", "--dir"])
+                .arg(&package.0)
+                .args(args)
+                .env("LEAN_PATH", package.0.join("no-imports")),
+        );
+        assert!(output.status.success(), "{output:?}");
+        Explanation(String::from_utf8(output.stdout).unwrap())
+    };
+    let absolute = source_dir.join("Lib/Base.lean");
+    for target in ["src/Lib/Base.lean", absolute.to_str().unwrap()] {
+        let report = explain(&[target]);
+        assert_eq!(report.field("target"), "Lib.Base");
+        assert_eq!(report.field("reference_decision"), "up-to-date");
+    }
+    assert_eq!(explain(&[]).field("reference_decision"), "up-to-date");
+
+    // Earlier writers kept the CLI spelling and no invocation directory.
+    std::fs::write(
+        &snapshot,
+        stable.replace(selector, "target\tLib/Base.lean:olean\n"),
+    )
+    .unwrap();
+    assert_eq!(explain(&[]).field("reference_decision"), "up-to-date");
+    package.write("src/Lib/Base.lean", format!("{BASE}\n-- source edit\n"));
+    assert_eq!(explain(&[]).field("reference_decision"), "rebuild");
+
+    // The final colon separates the facet, including on drive-qualified paths.
+    package.built(&format!("{}:olean", absolute.display()), None);
+    assert_eq!(explain(&[]).field("reference_decision"), "up-to-date");
+}
+
+#[test]
 fn a_failed_build_leaves_the_last_successful_snapshot_and_unknown_targets_are_refused() {
     let package = Package::diamond();
     package.built("+Lib.Top:olean", None);

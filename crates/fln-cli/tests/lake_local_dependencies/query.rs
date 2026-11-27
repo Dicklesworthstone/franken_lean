@@ -63,6 +63,71 @@ fn query_builds_ordered_results_and_reuses_checked_records() {
 }
 
 #[test]
+fn explain_facet_selectors_match_build_and_query_for_colliding_targets_and_owners() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "root/lakefile.toml",
+        concat!(
+            "name = \"root\"\n[[require]]\nname = \"dependency\"\npath = \"../right\"\n",
+            "[[lean_lib]]\nname = \"Demo\"\n",
+        ),
+    );
+    workspace.write(
+        "right/lakefile.toml",
+        "name = \"dependency\"\n[[lean_lib]]\nname = \"Other\"\nroots = [\"Demo\"]\n",
+    );
+    for path in ["root/Demo.lean", "right/Demo.lean"] {
+        workspace.write(
+            path,
+            "module\nprelude\npublic theorem Demo.keep (P : Prop) (h : P) : P := h\n",
+        );
+    }
+    let selected = "@root/+Demo:olean.private";
+    build_success(workspace.run(&["--json", "build", selected], None));
+    let explain = |target: &str| {
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["build", "explain", "--json", "--dir"])
+            .arg(workspace.0.join("root"))
+            .arg(target)
+            .env("LEAN_PATH", workspace.0.join("absent-imports"))
+            .output()
+            .unwrap()
+    };
+    for target in ["Demo", selected] {
+        let report = build_success(explain(target));
+        assert!(
+            report.contains("\"reference_decision\":\"up-to-date\""),
+            "{report}"
+        );
+    }
+    for (target, detail) in [
+        ("Demo:olean.server", "select the module explicitly"),
+        ("+Demo:olean.private", "multiple local packages"),
+    ] {
+        for command in ["build", "query"] {
+            refusal(
+                workspace.run(&["--json", command, target], None),
+                "unsupported",
+                detail,
+            );
+        }
+        let report = explain(target);
+        assert_eq!(report.status.code(), Some(1), "{report:?}");
+        assert!(
+            String::from_utf8_lossy(&report.stderr).contains(detail),
+            "{report:?}"
+        );
+    }
+    let other = explain("@dependency/+Demo:olean.private");
+    assert_eq!(other.status.code(), Some(1), "{other:?}");
+    assert!(
+        String::from_utf8_lossy(&other.stderr)
+            .contains("different package from the recorded build"),
+        "{other:?}",
+    );
+}
+
+#[test]
 fn query_failure_emits_no_result_and_preserves_every_previous_product() {
     let workspace = artifact_workspace();
     let arguments = ["--json", "query", "+Feature.Left:olean", "+App.Top:olean"];

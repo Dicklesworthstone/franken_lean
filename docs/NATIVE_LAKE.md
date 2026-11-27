@@ -68,6 +68,11 @@ EOF
 LEAN_PATH="$PWD/.lake/build/lib/lean" fln check-source consumer/Use.lean
 ```
 
+The native loader validates a plain package version such as `v!"0.1.0"` in
+a declarative package header. This covers the generated Lean project templates.
+Interpolation, computed versions, and earlier Lean declarations that could
+change version decoding require the full version elaborator.
+
 A package configured with `lakefile.lean` can use checked Lean definitions and
 file-local notation to compute its source directories, build directory, and
 library module roots:
@@ -533,7 +538,10 @@ current tree and reports why each module of the recorded build (or of `MODULE`'s
 closure) would rebuild. It elaborates and admits nothing, so this command still
 requires a TOML configuration and explicitly refuses `lakefile.lean`. It resolves
 the current selected packages and their source and output owners again; recorded
-paths never authorize reading arbitrary artifacts. It writes no artifacts,
+paths never authorize reading arbitrary artifacts. A build requested by source path records
+its resolved package and module, so the explanation works from another directory.
+For an older snapshot with an ambiguous relative source path, a fresh build
+records the missing identity. It writes no artifacts,
 manifests, or snapshots. `+Module:olean`, `+Module:ilean`, and `+Module:ir` can
 select the recorded module's closure.
 
@@ -587,12 +595,13 @@ outside the package on a configuration's say-so. A package configured only by
 evaluating it; again nothing is removed.
 
 `lake new NAME [TEMPLATE]` and `lake init [NAME] [TEMPLATE]` write the pin's
-`std` template with a TOML configuration. When the pinned toolchain is
-installed, `lake_new_writes_the_tree_the_pinned_lake_writes` in
+`std`, `lib`, and `exe` templates. The CLI writes a TOML configuration by default.
+Use `.lean`, `lib.lean`, or `exe.lean` for a Lean configuration, for example
+`lake new demo lib.lean`. When the pinned toolchain is installed,
+`lake_new_writes_the_tree_the_pinned_lake_writes` in
 `crates/fln-cli/tests/cli_personalities_and_verbs.rs` compares the tree with the
 one the pinned `lake new` writes, byte for byte, apart from `lean-toolchain` and
-`.git`. Another template or configuration language the pin knows (`exe`, `lib`,
-`math-lax`, `math`; `.lean`) is refused with exit 5 before anything is created.
+`.git`. The `math-lax` and `math` templates are refused with exit 5 before anything is created.
 An unknown one gets the pin's own error and exit 1. Two things the pin does are
 not done: no git repository is initialized, because git is spawned only to fetch
 dependencies, and an existing `lean-toolchain` is left as it is.

@@ -2102,6 +2102,21 @@ fn lake_new_writes_the_tree_the_pinned_lake_writes() {
         "import Demo\n\ndef main : IO Unit :=\n  IO.println s!\"Hello, {hello}!\"\n"
     );
 
+    // Explicit language selection goes through the installed init command too.
+    let existing = root.join("existing");
+    std::fs::create_dir(&existing).unwrap();
+    let init = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .arg("--dir")
+        .arg(&existing)
+        .args(["init", "exampleLibrary", "lib.lean"])
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    let config = std::fs::read_to_string(existing.join("lakefile.lean")).unwrap();
+    assert!(config.contains("@[default_target]\nlean_lib «ExampleLibrary» where\n"));
+    assert!(!existing.join("lakefile.toml").exists());
+    assert!(!existing.join("Main.lean").exists());
+
     // A template the pin has and this does not write: said so, and nothing made.
     // It used to exit 0 and write the default project whatever was asked for.
     let math = lake(&["new", "mathy", "math"]);
@@ -2167,24 +2182,30 @@ fn lake_new_writes_the_tree_the_pinned_lake_writes() {
     };
     let pin_parent = root.join("pin");
     std::fs::create_dir_all(&pin_parent).unwrap();
-    let theirs = Command::new(&pinned)
-        .args(["new", "demo"])
-        .current_dir(&pin_parent)
-        .output()
-        .expect("run the pinned lake new");
-    assert!(theirs.status.success(), "{theirs:?}");
-    let theirs = scaffold_tree(&pin_parent.join("demo"));
-    assert_eq!(
-        ours.keys().collect::<Vec<_>>(),
-        theirs.keys().collect::<Vec<_>>(),
-        "the two scaffolds hold different files"
-    );
-    for (path, bytes) in &theirs {
-        assert!(
-            &ours[path] == bytes,
-            "{path} differs from the pin's:\nours: {:?}\npin:  {:?}",
-            String::from_utf8_lossy(&ours[path]),
-            String::from_utf8_lossy(bytes)
+    for (package, template) in [
+        ("demo", None),
+        ("myLib", Some("lib")),
+        ("my-tool", Some("exe.toml")),
+        ("stdLean", Some(".lean")),
+        ("libLean", Some("LIB.LEAN")),
+        ("exeLean", Some("exe.lean")),
+    ] {
+        let mut args = vec!["new", package];
+        if let Some(template) = template {
+            args.push(template);
+            let created = lake(&args);
+            assert!(created.status.success(), "{created:?}");
+        }
+        let theirs = Command::new(&pinned)
+            .args(&args)
+            .current_dir(&pin_parent)
+            .output()
+            .expect("run the pinned lake new");
+        assert!(theirs.status.success(), "{theirs:?}");
+        assert_eq!(
+            scaffold_tree(&ours_parent.join(package)),
+            scaffold_tree(&pin_parent.join(package)),
+            "scaffold differs for {args:?}",
         );
     }
 }

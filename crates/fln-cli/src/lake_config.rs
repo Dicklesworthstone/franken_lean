@@ -379,6 +379,53 @@ fn fields<'a>(
     Ok(result)
 }
 
+/// The build plan does not consume package versions, but accepting the field
+/// still requires the default Lake.StdVer decoder to accept its value. Work on
+/// the decimal digits directly: Lean's version components are unbounded Nats.
+fn check_version_literal(expression: &[u8], table: &TokenTable) -> Result<(), Failure> {
+    let tokens = Tokens::read(expression, table)?;
+    let unsupported = || {
+        Failure::unsupported("lakefile.lean: package version requires a plain v! string literal")
+    };
+    let [prefix, value] = tokens.tokens.as_slice() else {
+        return Err(unsupported());
+    };
+    if tokens.spelling(0) != Some("v!")
+        || prefix.extent.end() != value.extent.start()
+        || !matches!(value.kind, TokenKind::Literal(LiteralKind::Str))
+    {
+        return Err(unsupported());
+    }
+    let literal = tokens.spelling(1).ok_or_else(unsupported)?;
+    // The pin expands v! through an interpolated string. Never treat a
+    // substitution (or an escape affecting its spelling) as literal text.
+    if literal.contains(['{', '}', '\\']) {
+        return Err(unsupported());
+    }
+    let version = decode_string(literal).ok_or_else(unsupported)?;
+    let (core, suffix) = match version.split_once('-') {
+        Some((core, suffix)) => (core, Some(suffix)),
+        None => (version.as_str(), None),
+    };
+    let mut components = core.split('.');
+    for part in ["major", "minor", "patch"] {
+        let number = components.next().unwrap_or("");
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(Failure::input(format!(
+                "lakefile.lean: invalid {part} component in package version `{version}`"
+            )));
+        }
+    }
+    if components.next().is_some()
+        || suffix.is_some_and(|text| text.is_empty() || text.contains([' ', '\t', '\r', '\n']))
+    {
+        return Err(Failure::input(format!(
+            "lakefile.lean: invalid package version `{version}`"
+        )));
+    }
+    Ok(())
+}
+
 fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
     if source.len() > MAX_CONFIG_BYTES {
         return Err(Failure::new("resource", "lakefile.lean exceeds 64 KiB"));
@@ -701,8 +748,6 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                         "lakefile.lean: {keyword} precedes package"
                     )));
                 }
-                // The existing module planner accepts textual path components only.
-                name(&declaration)?;
                 if !declaration_names.insert(declaration_identity(&declaration_name)?) {
                     return Err(Failure::input(format!(
                         "lakefile.lean: target `{declaration}` is already declared"
@@ -742,7 +787,30 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                 Some(index)
             };
             let declaration_column = tokens.column(0).min(tokens.column(head));
-            for (field, expression) in fields(command, &tokens, head + 2, declaration_column)? {
+            let default_version_decoder = parsed.program.trim().is_empty();
+            let fields = fields(command, &tokens, head + 2, declaration_column)?;
+            if target.is_some() {
+                // Only the implicit module root inherits the target's name. An explicit
+                // root (or roots) is checked as a Lean.Name at configuration evaluation.
+                let root_field = if keyword == "lean_exe" {
+                    "root"
+                } else {
+                    "roots"
+                };
+                if !fields.iter().any(|(field, _)| field == root_field) {
+                    name(&declaration)?;
+                }
+            }
+            for (field, expression) in fields {
+                if target.is_none() && field == "version" {
+                    if !default_version_decoder {
+                        return Err(Failure::unsupported(
+                            "lakefile.lean: version after user declarations requires checked DecodeVersion resolution",
+                        ));
+                    }
+                    check_version_literal(expression, active.table())?;
+                    continue;
+                }
                 let slot = match (target, field.as_str()) {
                     (None, "srcDir") => ConfigSlot::Source,
                     (None, "buildDir") => ConfigSlot::Build,

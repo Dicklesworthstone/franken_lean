@@ -271,3 +271,48 @@ fn category_recursion_exhaustion_cannot_choose_a_cheaper_alternative() {
     ]);
     assert!(parse(&safe, "#check inspectItem [42]").is_ok());
 }
+
+#[test]
+fn unnamed_productions_use_the_last_component_of_a_qualified_category() {
+    let grammar = grammar(&[
+        "declare_syntax_cat Left.item",
+        "declare_syntax_cat Right.item",
+        "syntax \"v\" : Left.item",
+        "syntax \"v\" : Right.item",
+        "syntax \"other\" : Right.item",
+        "syntax \"inspectLeft \" \"[\" Left.item \"]\" : term",
+        "syntax \"inspectRight \" \"[\" Right.item \"]\" : term",
+    ]);
+    let left = parse(&grammar, "#check inspectLeft [v]").unwrap();
+    let right = parse(&grammar, "#check inspectRight [v]").unwrap();
+    assert!(contains(&left, "itemV"));
+    assert!(contains(&right, "itemV_1"));
+    assert!(parse(&grammar, "#check inspectLeft [other]").is_err());
+    assert!(contains(
+        &parse(&grammar, "#check inspectRight [other]").unwrap(),
+        "itemOther"
+    ));
+}
+
+#[test]
+fn category_redeclarations_preserve_the_active_grammar_and_exports() {
+    let library = grammar(&["declare_syntax_cat importedItem"]);
+    let mut consumer = grammar(&[
+        "declare_syntax_cat localItem",
+        "syntax (name := localValue) \"vv\" : localItem",
+        "syntax \"readLocal \" \"[\" localItem \"]\" : term",
+    ]);
+    consumer
+        .import_native(&library.export_native().unwrap())
+        .unwrap();
+    let before = consumer.export_native().unwrap();
+    for category in ["«term»", "importedItem", "localItem"] {
+        let declaration = parse(&consumer, &format!("declare_syntax_cat {category}")).unwrap();
+        assert!(consumer.declare(&declaration).is_err(), "{category}");
+        assert_eq!(consumer.export_native().unwrap(), before);
+    }
+    assert!(contains(
+        &parse(&consumer, "#check readLocal [vv]").unwrap(),
+        "localValue"
+    ));
+}

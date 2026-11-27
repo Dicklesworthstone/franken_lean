@@ -131,23 +131,6 @@ fn invalid() -> NatDefinitionElabError {
         matching::MatchError::InvalidPattern,
     ))
 }
-/// Whether `pattern` in `arena` is refutable (`Constructor` or `Literal`,
-/// peeling through `Named` aliases), matching pinned `Pattern.isRefutable`
-/// (`Lean/Meta/Match/Match.lean:833-836`).
-fn is_refutable_pattern(mut index: usize, arena: &[Pattern<'_>]) -> bool {
-    let mut hops = 0usize;
-    while hops <= arena.len() {
-        match &arena[index] {
-            Pattern::Bind(_) => return false,
-            Pattern::Named { pattern, .. } => {
-                index = *pattern;
-                hops += 1;
-            }
-            Pattern::Constructor(_) | Pattern::Literal(_) => return true,
-        }
-    }
-    false
-}
 fn sequence(syntax: &Syntax) -> Result<Vec<&Syntax>, NatDefinitionElabError> {
     let elements = expect_null_args(syntax, "pattern matrix columns")?;
     if elements.is_empty() || elements.len() % 2 == 0 {
@@ -1090,6 +1073,41 @@ impl Context {
         self.compile_pattern_matrix_recording(syntax, required, recursive_column, None)
     }
 
+    // Lean.Meta.Match.firstRefutablePattern picks a column from the first
+    // surviving row. Moving the entire column keeps row priority and all
+    // other columns' relative order. This matters even for nondependent
+    // matches: splitting an unknown variable can block definitional reduction.
+    fn select_row_major_column(
+        &mut self,
+        matrix: &mut Matrix<'_>,
+        arena: &[Pattern<'_>],
+    ) -> Result<(), NatDefinitionElabError> {
+        for (index, &root) in matrix.rows[0].patterns.iter().enumerate() {
+            self.tick()?;
+            let mut pattern = root;
+            while let Pattern::Named { pattern: inner, .. } = &arena[pattern] {
+                self.tick()?;
+                pattern = *inner;
+            }
+            if matches!(&arena[pattern], Pattern::Bind(_)) {
+                continue;
+            }
+            if index != 0 {
+                matrix.subjects[..=index].rotate_right(1);
+                for row in &mut matrix.rows {
+                    self.tick()?;
+                    row.patterns[..=index].rotate_right(1);
+                }
+            }
+            return Ok(());
+        }
+        // No refutable pattern is left in the winning row. Remaining rows
+        // cannot win this branch; their independent source witnesses remain
+        // required by matrixScope across the whole decision tree.
+        matrix.rows.truncate(1);
+        Ok(())
+    }
+
     fn compile_pattern_matrix_recording(
         &mut self,
         syntax: &Syntax,
@@ -1302,6 +1320,10 @@ impl Context {
                 row.patterns.swap(0, root_column);
             }
         }
+        let row_major = self.txn.options.get_bool(
+            &Name::from_components(["backward", "match", "rowMajor"]),
+            true,
+        );
         enum Task<'a> {
             Build(Matrix<'a>),
             Finish(Name, Vec<Alternative>, usize, bool),
@@ -1434,31 +1456,8 @@ impl Context {
                         built.push(body);
                         continue;
                     }
-                    // Pin (`Lean/Meta/Match/Match.lean:833-836, 985-1000`,
-                    // `backward.match.rowMajor := true`): outside a pinned structural-recursion
-                    // root, move the first refutable column of row 0 to the front while
-                    // preserving the relative order of the other columns; if row 0 is wholly
-                    // irrefutable, it shadows later rows in this submatrix.
-                    if !matrix.recursive_root {
-                        let first_refutable = matrix.rows[0]
-                            .patterns
-                            .iter()
-                            .position(|&pattern| is_refutable_pattern(pattern, &arena));
-                        match first_refutable {
-                            Some(column) if column > 0 => {
-                                let moved = matrix.subjects.remove(column);
-                                matrix.subjects.insert(0, moved);
-                                for row in &mut matrix.rows {
-                                    self.tick()?;
-                                    let moved = row.patterns.remove(column);
-                                    row.patterns.insert(0, moved);
-                                }
-                            }
-                            None if matrix.rows.len() > 1 => {
-                                matrix.rows.truncate(1);
-                            }
-                            _ => {}
-                        }
+                    if row_major && !matrix.recursive_root {
+                        self.select_row_major_column(&mut matrix, &arena)?;
                     }
                     let subject = matrix.subjects.remove(0);
                     self.bind_named_matrix_column(&mut matrix, &subject, &arena)?;

@@ -288,14 +288,30 @@ struct BuildPlan<'a> {
 #[derive(Clone, Copy)]
 enum ModuleFacet {
     Olean,
+    OleanServer,
+    OleanPrivate,
     Ir,
     Ilean,
 }
 
 impl ModuleFacet {
+    fn parse(facet: &str) -> Option<Self> {
+        [
+            Self::Olean,
+            Self::OleanServer,
+            Self::OleanPrivate,
+            Self::Ir,
+            Self::Ilean,
+        ]
+        .into_iter()
+        .find(|candidate| candidate.extension() == facet)
+    }
+
     fn extension(self) -> &'static str {
         match self {
             Self::Olean => "olean",
+            Self::OleanServer => "olean.server",
+            Self::OleanPrivate => "olean.private",
             Self::Ir => "ir",
             Self::Ilean => "ilean",
         }
@@ -449,6 +465,15 @@ fn module_target<'a>(
     Ok((module, owner))
 }
 
+/// Explicit source-file selectors have a .lean path before the facet.
+fn source_facet(target: &str) -> Option<(&str, &str)> {
+    let (selector, facet) = target.rsplit_once(':')?;
+    if selector.starts_with(['+', '@']) || selector.contains("/+") || !selector.ends_with(".lean") {
+        return None;
+    }
+    Some((selector, facet))
+}
+
 fn plan_modules<'a>(
     sources: &'a local_dependencies::Sources,
     targets: &[String],
@@ -469,21 +494,16 @@ fn plan_modules<'a>(
         requests: Vec::new(),
     };
     for target in targets {
-        let Some((module, facet)) = target.split_once(':') else {
+        let Some((module, facet)) = target.rsplit_once(':') else {
             return Err(Failure::unsupported(format!(
                 "default target `{target}` requires Lean artifacts or executable linking that are unavailable; request +Module:olean for a declared library module"
             )));
         };
-        let facet = match facet {
-            "olean" => ModuleFacet::Olean,
-            "ir" => ModuleFacet::Ir,
-            "ilean" => ModuleFacet::Ilean,
-            _ => {
-                return Err(Failure::unsupported(format!(
-                    "facet `{facet}` is unavailable; supported module facets: +Module:olean, +Module:ir, +Module:ilean"
-                )));
-            }
-        };
+        let facet = ModuleFacet::parse(facet).ok_or_else(|| {
+            Failure::unsupported(format!(
+                "facet `{facet}` is unavailable; supported module facets: +Module:olean, +Module:olean.server, +Module:olean.private, +Module:ir, +Module:ilean"
+            ))
+        })?;
         let (module, owner) = module_target(sources, module)?;
         if let Some(previous) = plan.owners.get(&module) {
             if !std::ptr::eq(*previous, owner) {
@@ -504,42 +524,56 @@ fn plan_modules<'a>(
             ModuleFacet::Ilean => {
                 plan.ilean.insert(module);
             }
-            ModuleFacet::Olean => {}
+            ModuleFacet::Olean | ModuleFacet::OleanServer | ModuleFacet::OleanPrivate => {}
         }
     }
     Ok(plan)
 }
 
-/// Lake prints one target result per line, including repeated requests. The
-/// result is selected from this compilation's actual artifact family; an old
-/// output on disk can never supply a missing query result.
-fn query_results(
+/// Resolve build and query selectors against the outputs of this compilation
+/// before publishing anything. Legacy modules have no split olean companions.
+fn requested_outputs(
     plan: &BuildPlan<'_>,
     artifacts: &BTreeMap<Name, ModuleArtifacts>,
     destinations: &BTreeMap<Name, (PathBuf, PathBuf)>,
-    json: bool,
-) -> Result<String, Failure> {
-    let mut output = String::new();
+) -> Result<Vec<PathBuf>, Failure> {
+    let mut paths = Vec::with_capacity(plan.requests.len());
     for (module, facet) in &plan.requests {
         let family = artifacts
             .get(module)
-            .ok_or_else(|| Failure::new("internal-fault", "queried module was not built"))?;
+            .ok_or_else(|| Failure::new("internal-fault", "requested module was not built"))?;
         let extension = facet.extension();
         if !family.parts().any(|(part, _)| part == extension) {
+            if matches!(facet, ModuleFacet::OleanServer | ModuleFacet::OleanPrivate) {
+                return Err(Failure::input(format!(
+                    "module `{}` has no {extension} output; this facet requires the module system",
+                    module.to_display_string(),
+                )));
+            }
             return Err(Failure::new(
                 "internal-fault",
                 format!(
-                    "queried module `{}` did not produce its {extension} facet",
+                    "module `{}` did not produce its {extension} facet",
                     module.to_display_string(),
                 ),
             ));
         }
-        let (_, directory) = destinations
-            .get(module)
-            .ok_or_else(|| Failure::new("internal-fault", "queried module has no output owner"))?;
-        let mut relative = source_import_relative_path(module)?;
-        relative.set_extension(extension);
-        let path = directory.join(relative).display().to_string();
+        let (_, directory) = destinations.get(module).ok_or_else(|| {
+            Failure::new("internal-fault", "requested module has no output owner")
+        })?;
+        let path = directory
+            .join(source_import_relative_path(module)?)
+            .with_extension(extension);
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+/// Lake prints one target result per line, including repeated requests.
+fn query_results(paths: &[PathBuf], json: bool) -> String {
+    let mut output = String::new();
+    for path in paths {
+        let path = path.display().to_string();
         if json {
             output.push_str(&json_string(&path));
         } else {
@@ -547,7 +581,7 @@ fn query_results(
         }
         output.push('\n');
     }
-    Ok(output)
+    output
 }
 
 fn load_sources_with(
@@ -1302,11 +1336,7 @@ fn build(
     } else {
         MACRO_RECORDS_UNAVAILABLE
     };
-    let queried = if matches!(command, BuildCommand::Query) {
-        Some(query_results(&plan, &artifacts, &destinations, json)?)
-    } else {
-        None
-    };
+    let requested = requested_outputs(&plan, &artifacts, &destinations)?;
     sources.verify_configurations()?;
     let paths = publish_locations_with(&artifacts, &destinations, fln::publish_file_atomic)?;
     let snapshot = record_snapshot(
@@ -1314,7 +1344,7 @@ fn build(
         &config,
         &sources,
         &targets,
-        &plan.owners,
+        &plan,
         &modules,
         &artifacts,
         &destinations,
@@ -1322,7 +1352,8 @@ fn build(
         posture,
         records_state,
     );
-    if let Some(stdout) = queried {
+    if matches!(command, BuildCommand::Query) {
+        let stdout = query_results(&requested, json);
         // Publication has succeeded before any result is exposed. Preserve a
         // failed provenance write as a diagnostic without mixing it into the
         // pin-compatible query result stream.
@@ -1348,7 +1379,11 @@ fn build(
     } else if !plan.ilean.is_empty() {
         "ilean"
     } else {
-        "olean"
+        plan.requests
+            .first()
+            .expect("a build has at least one request")
+            .1
+            .extension()
     };
     let output = if json {
         let paths = paths
@@ -1480,7 +1515,7 @@ fn record_snapshot(
     config: &LakeConfig,
     sources: &local_dependencies::Sources,
     targets: &[String],
-    owners: &ModuleOwners<'_>,
+    plan: &BuildPlan<'_>,
     modules: &BTreeMap<Name, Module>,
     artifacts: &BTreeMap<Name, ModuleArtifacts>,
     destinations: &BTreeMap<Name, (PathBuf, PathBuf)>,
@@ -1501,7 +1536,7 @@ fn record_snapshot(
             .get(name)
             .ok_or("an artifact has no source module")?;
         let source = sources
-            .resolve_build(name, owners)
+            .resolve_build(name, &plan.owners)
             .map_err(|failure| failure.detail)?
             .ok_or("a built module has no source owner")?;
         let (owner, output_dir) = destinations
@@ -1557,7 +1592,26 @@ fn record_snapshot(
     let text = snapshot::Snapshot {
         posture: posture.as_str().to_owned(),
         records: records.to_owned(),
-        targets: targets.to_vec(),
+        // A source path is relative to the build process, even with --dir.
+        // Persist its resolved package and module so explain can replay the
+        // selection after a change of directory or a workspace relocation.
+        targets: targets
+            .iter()
+            .zip(&plan.requests)
+            .map(|(target, (module, facet))| {
+                if source_facet(target).is_some() {
+                    let owner = plan.owners[module];
+                    format!(
+                        "@{}/+{}:{}",
+                        owner.identity,
+                        module.to_display_string(),
+                        facet.extension()
+                    )
+                } else {
+                    target.clone()
+                }
+            })
+            .collect(),
         configurations: sources.configuration_rows(root),
         modules: rows,
         externals,

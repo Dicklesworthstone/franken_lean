@@ -486,6 +486,17 @@ impl Context {
             } else {
                 old.user_name.clone()
             };
+            // A generated input bound to the eliminated family's index now
+            // denotes the constructor's actual result index. Carry that fact
+            // through later reversion, including a split on another column.
+            if source_match
+                && old.user_name.parent().is_anonymous()
+                && matches!(old.user_name.leaf_view(), LeafView::Num(_))
+                && (self.matrix_refined_indices.contains(&old.id)
+                    || matches!(old.value.as_ref().map(Expr::node), Some(ExprNode::FVar { id }) if indices.iter().any(|index| index.id == *id)))
+            {
+                self.matrix_refined_indices.insert(id.clone());
+            }
             let local = LocalDecl {
                 id: id.clone(),
                 user_name: name,
@@ -753,38 +764,6 @@ impl Context {
         Ok((generalized || motive || shared).then_some(local))
     }
 
-    /// Whether `major` is a generated matrix subject whose value was directly
-    /// specialized to a constructor of `family` by an earlier branch substitution
-    /// (not a user `let`, whose alias remains an `FVar`), matching pinned
-    /// `!isNextVar` / `processNonVariable` (`Lean/Meta/Match/Match.lean:1022`).
-    fn is_matrix_specialized_constructor(
-        &self,
-        major: &LocalDecl,
-        family: &fln_env::constants::InductiveVal,
-    ) -> bool {
-        let Some(mut value) = major.value.as_ref() else {
-            return false;
-        };
-        let is_matrix_subject = |local: &LocalDecl| {
-            matches!(
-                local.user_name.leaf_view(),
-                fln_core::name::LeafView::Num(_)
-            ) && local.user_name.parent().is_anonymous()
-        };
-        if major.user_name.is_anonymous()
-            && let ExprNode::FVar { id } = value.node()
-            && let Some(alias) = self.txn.lctx.find(id)
-            && is_matrix_subject(alias)
-            && let Some(alias_value) = alias.value.as_ref()
-        {
-            value = alias_value;
-        } else if !is_matrix_subject(major) {
-            return false;
-        }
-        let (head, _) = operators::spine(value);
-        matches!(head.node(), ExprNode::Const { name, .. } if family.ctors.contains(name))
-    }
-
     /// Whether `target` certainly lives outside `Prop`: its sort is a successor level.
     /// An unknown type or an unresolved level is not judged, so this never refuses
     /// a goal that might still be a proposition.
@@ -985,25 +964,6 @@ impl Context {
         };
         let index_ids: HashSet<_> = indices.iter().map(|local| local.id.clone()).collect();
         if equations.is_none() {
-            if let EliminationSyntax::Match(parts) = input
-                && parts.generated
-                && self.is_matrix_specialized_constructor(&major, &family)
-            {
-                let patterns = self.match_patterns(*parts, name, &family.ctors, &family_type)?;
-                if patterns.fallback.is_none() && patterns.constructors.len() < family.ctors.len() {
-                    return self.eliminate_constrained_indices(
-                        proof,
-                        goal,
-                        input,
-                        induction,
-                        &major,
-                        &family,
-                        levels,
-                        &parameters,
-                        &index_values,
-                    );
-                }
-            }
             if matches!(
                 input,
                 EliminationSyntax::Match(_) | EliminationSyntax::EmptyMatrix(_)

@@ -48,7 +48,9 @@ use crate::Environment;
 use fln_core::name::Name;
 use fln_elab::source::scope::SourceScope;
 use fln_parse::command_scope::ScopeCommand;
-use fln_parse::extensions::{FileGrammar, NotationRule, TemplateSnapshot, with_grammar};
+use fln_parse::extensions::{
+    FileGrammar, GrammarDeclarationError, NotationRule, TemplateSnapshot, with_grammar,
+};
 use fln_syntax::tree::Syntax;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -420,14 +422,26 @@ impl SourceGrammar {
             prerequisites.clone()?;
         }
         self.file
-            .declare_with_macro_pure(syntax, &|name| match resolve(name) {
+            .try_declare_with_macro_pure(syntax, &|name| match resolve(name) {
                 Resolution::Global(resolved) => resolved == Name::from_components(["Pure", "pure"]),
                 Resolution::Unchecked => ["pure", "Pure.pure", "_root_.Pure.pure"]
                     .into_iter()
                     .any(|candidate| *name == Name::from_components(candidate.split('.'))),
                 _ => false,
             })
-            .map_err(|feature| EngineExecutionError::NotImplemented { feature })?;
+            .map_err(|error| match error {
+                GrammarDeclarationError::DuplicateCategory(name) => {
+                    EngineExecutionError::ScopeTransition {
+                        message: format!(
+                            "parser category `{}` has already been defined",
+                            name.to_display_string()
+                        ),
+                    }
+                }
+                GrammarDeclarationError::Unsupported(feature) => {
+                    EngineExecutionError::NotImplemented { feature }
+                }
+            })?;
         if self.module_system {
             // Local registrations must leave no exported activation, including
             // rules on inherited kinds. The generated private meta declarations

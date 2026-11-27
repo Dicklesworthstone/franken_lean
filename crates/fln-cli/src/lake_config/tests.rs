@@ -64,6 +64,49 @@ fn native_lake_config_keeps_executable_roots_typed_and_defaults_to_the_target_na
 }
 
 #[test]
+fn explicit_module_roots_do_not_constrain_target_names() {
+    let source = r#"import Lake
+open Lake DSL
+package p
+@[default_target] lean_exe "my-tool" where
+  root := `Main
+lean_exe "tool.name" where
+  root := `Quoted
+lean_exe tool.name where
+  root := `Nested
+lean_lib "lib-name" where
+  roots := #[`Lib]
+"#;
+    let parsed = parse(source.as_bytes()).unwrap_or_else(|error| panic!("{}", error.detail));
+    assert_eq!(parsed.config.default_targets, ["«my-tool»"]);
+    let names: Vec<_> = parsed
+        .config
+        .targets
+        .iter()
+        .map(|target| target.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["«my-tool»", "«tool.name»", "tool.name", "«lib-name»"]
+    );
+
+    // A target without a root field still supplies its own module path.
+    for declaration in ["lean_exe \"my-tool\"", "lean_lib \"lib.name\""] {
+        let source = format!("import Lake\nopen Lake DSL\npackage p\n{declaration}\n");
+        let error = parse(source.as_bytes())
+            .err()
+            .expect("invalid implicit module root");
+        assert!(
+            error
+                .detail
+                .contains("unsupported quoted or special components"),
+            "{}",
+            error.detail
+        );
+    }
+}
+
+#[test]
 fn native_lake_config_keeps_driver_fields_typed_and_driver_tags_distinct() {
     let source = r#"import Lake
 open Lake DSL
@@ -433,4 +476,46 @@ fn git_requirement_delimiters_do_not_split_nested_terms_or_accept_options() {
             format!("import Lake\nopen Lake DSL\npackage p\nrequire dep from {expression}\n");
         assert!(parse(source.as_bytes()).is_err(), "{expression}");
     }
+}
+
+#[test]
+fn package_version_accepts_plain_stdver_literals_with_the_default_decoder() {
+    let config = |before: &str, version: &str| {
+        format!(
+            "import Lake\nopen Lake DSL\n{before}package demo where\n  version := {version}\n@[default_target] lean_lib Demo\n"
+        )
+    };
+    for version in [
+        r#"v!"0.1.0""#,
+        r#"v!"0001.2.999999999999999999999999999-rc.1+build""#,
+    ] {
+        let parsed = parse(config("", version).as_bytes()).unwrap_or_else(|error| {
+            panic!("{version}: {}", error.detail);
+        });
+        assert_eq!(parsed.config.default_targets, ["Demo"]);
+    }
+    for version in [
+        r#"v!"1.2""#,
+        r#"v!"1.two.3""#,
+        r#"v!"1.2.3-""#,
+        r#"v!"1.2.3+build""#,
+    ] {
+        assert_eq!(
+            parse(config("", version).as_bytes()).unwrap_err().class,
+            "input",
+            "{version}"
+        );
+    }
+    for version in [r#"v! "1.2.3""#, r#"v!"1.2.{0}""#, r#""1.2.3""#] {
+        assert_eq!(
+            parse(config("", version).as_bytes()).unwrap_err().class,
+            "unsupported",
+            "{version}"
+        );
+    }
+    let custom_world = config("def earlier := 1\n", r#"v!"0.1.0""#);
+    assert_eq!(
+        parse(custom_world.as_bytes()).unwrap_err().class,
+        "unsupported"
+    );
 }
