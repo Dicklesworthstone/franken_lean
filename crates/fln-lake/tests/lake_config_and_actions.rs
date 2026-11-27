@@ -626,14 +626,82 @@ fn the_std_scaffold_is_the_pins_template_byte_for_byte() {
 }
 
 #[test]
+fn lib_and_exe_scaffolds_have_the_pinned_files_contents_and_targets() {
+    let parent = fresh_temp_dir("lib-exe-scaffolds");
+    let std = tree(&new_package(&parent, "demo", None, LakeConfigFormat::Toml).unwrap());
+    for (template, root, config) in [
+        (
+            "LIB.toml",
+            "Demo",
+            "name = \"demo\"\nversion = \"0.1.0\"\ndefaultTargets = [\"Demo\"]\n\n[[lean_lib]]\nname = \"Demo\"\n",
+        ),
+        (
+            "exe",
+            "demo",
+            "name = \"demo\"\nversion = \"0.1.0\"\ndefaultTargets = [\"demo\"]\n\n[[lean_exe]]\nname = \"demo\"\nroot = \"Main\"\n",
+        ),
+    ] {
+        let dir = parent.join(template);
+        init_package(&dir, "demo", Some(template), LakeConfigFormat::Toml).unwrap();
+        let mut expected = std.clone();
+        expected.insert("lakefile.toml".to_owned(), config.to_owned());
+        if template == "exe" {
+            expected.remove("Demo.lean");
+            expected.remove("Demo/Basic.lean");
+            expected.insert(
+                "Main.lean".to_owned(),
+                "def main : IO Unit :=\n  IO.println s!\"Hello, world!\"\n".to_owned(),
+            );
+            expected.insert(
+                "demo.lean".to_owned(),
+                "-- This module serves as the root of the `demo` library.\n-- Import modules here that should be built as part of the library.\nimport demo.Basic\n".to_owned(),
+            );
+            expected.insert("demo/Basic.lean".to_owned(), "def hello := \"world\"\n".to_owned());
+        } else {
+            expected.remove("Main.lean");
+        }
+        assert_eq!(tree(&dir), expected, "{template}");
+        let config = LakeConfig::discover(&dir).unwrap();
+        assert_eq!(config.default_targets, [root]);
+        assert_eq!(config.targets.len(), 1);
+    }
+}
+
+#[test]
+fn init_uses_existing_root_and_new_resolves_hierarchical_names() {
+    let parent = fresh_temp_dir("scaffold-roots");
+    let dir = parent.join("existing");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("demo.lean"), "def keep := 1\n").unwrap();
+    init_package(&dir, "demo", Some("lib"), LakeConfigFormat::Toml).unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("demo.lean")).unwrap(), "def keep := 1\n");
+    assert!(dir.join("demo/Basic.lean").is_file());
+    assert!(!dir.join("Demo.lean").exists());
+    assert_eq!(LakeConfig::discover(&dir).unwrap().default_targets, ["demo"]);
+
+    let dir = new_package(&parent, "myTools.library", Some("lib"), LakeConfigFormat::Toml).unwrap();
+    assert_eq!(dir, parent.join("myTools-library"));
+    assert!(dir.join("MyTools/Library/Basic.lean").is_file());
+    assert_eq!(LakeConfig::discover(&dir).unwrap().default_targets, ["MyTools.Library"]);
+
+    let dir = new_package(&parent, "my-tool", Some("exe"), LakeConfigFormat::Toml).unwrap();
+    assert!(tree(&dir)["my-tool.lean"].contains("import «my-tool».Basic\n"));
+
+    for name in ["«..».outside", "-..-"] {
+        let err = new_package(&parent, name, Some("lib"), LakeConfigFormat::Toml).unwrap_err();
+        assert!(matches!(err, LakeInitError::IllegalName(_)));
+    }
+}
+
+#[test]
 fn a_template_this_does_not_write_creates_nothing() {
     let parent = fresh_temp_dir("templates");
-    // The pin has these; only `std` with a TOML configuration is written here.
+    // These known templates and configuration languages are still unavailable.
     for spec in [
         "math",
         "math-lax",
-        "lib",
-        "exe",
+        "lib.lean",
+        "exe.lean",
         "std.lean",
         ".lean",
         "MATH.toml",

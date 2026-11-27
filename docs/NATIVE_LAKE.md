@@ -590,12 +590,12 @@ outside the package on a configuration's say-so. A package configured only by
 evaluating it; again nothing is removed.
 
 `lake new NAME [TEMPLATE]` and `lake init [NAME] [TEMPLATE]` write the pin's
-`std` template with a TOML configuration. When the pinned toolchain is
+`std`, `lib`, and `exe` templates with a TOML configuration. When the pinned toolchain is
 installed, `lake_new_writes_the_tree_the_pinned_lake_writes` in
 `crates/fln-cli/tests/cli_personalities_and_verbs.rs` compares the tree with the
 one the pinned `lake new` writes, byte for byte, apart from `lean-toolchain` and
-`.git`. Another template or configuration language the pin knows (`exe`, `lib`,
-`math-lax`, `math`; `.lean`) is refused with exit 5 before anything is created.
+`.git`. The `math-lax` and `math` templates and `.lean` configurations are
+refused with exit 5 before anything is created.
 An unknown one gets the pin's own error and exit 1. Two things the pin does are
 not done: no git repository is initialized, because git is spawned only to fetch
 dependencies, and an existing `lean-toolchain` is left as it is.

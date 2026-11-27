@@ -478,7 +478,7 @@ pub enum LakeInitError {
     /// The configuration language is not one of the pin's.
     UnknownConfigLanguage(String),
     /// The pin has this template and language; this implementation writes
-    /// only `std` in TOML. Nothing was created.
+    /// the standard, library and executable TOML templates. Nothing was created.
     TemplateUnavailable { template: String, language: String },
     /// The directory already holds a package configuration.
     AlreadyInitialized,
@@ -512,7 +512,7 @@ impl fmt::Display for LakeInitError {
             }
             Self::TemplateUnavailable { template, language } => write!(
                 f,
-                "the `{template}` template with a `{language}` configuration is not written here, only `std` with `toml`; nothing was created"
+                "the `{template}` template with a `{language}` configuration is not written here; supported templates are `std`, `lib` and `exe` with `toml`; nothing was created"
             ),
             Self::AlreadyInitialized => write!(f, "error: package already initialized"),
         }
@@ -1189,6 +1189,33 @@ fn init_template_spec(
     Ok((template, language))
 }
 
+// Lake's stringToLegalOrSimpleName preserves dots inside escaped components.
+fn scaffold_name_parts(name: &str) -> Result<Vec<String>, LakeInitError> {
+    let mut parts = Vec::new();
+    let mut numeric = false;
+    if name == "[anonymous]"
+        || parse_manifest_name_with(name, |part, is_numeric| {
+            parts.push(part.to_owned());
+            numeric |= is_numeric;
+        })
+        .is_err()
+    {
+        parts = vec![name.to_owned()];
+        numeric = false;
+    }
+    // Lean.modToFilePath accepts only string components. Each must stay a
+    // single filesystem component, including when the input uses «…».
+    if numeric || !parts.iter().all(|part| is_module_path_component(part)) {
+        return Err(LakeInitError::IllegalName(name.to_owned()));
+    }
+    Ok(parts)
+}
+
+fn is_module_path_component(part: &str) -> bool {
+    let mut path = Path::new(part).components();
+    matches!(path.next(), Some(std::path::Component::Normal(_))) && path.next().is_none()
+}
+
 fn write_new(path: &Path, contents: &str) -> Result<(), LakeInitError> {
     if path.exists() {
         return Ok(());
@@ -1196,12 +1223,9 @@ fn write_new(path: &Path, contents: &str) -> Result<(), LakeInitError> {
     fs::write(path, contents).map_err(|e| LakeInitError::Io(e.to_string()))
 }
 
-/// Initialize a Lake package in `dir` from the pin's `std` template with a
-/// TOML configuration: the files `Lake.initPkg` writes, with the same bytes.
-///
-/// `template` is the pin's `[template][.language]` argument. Only `std` in
-/// TOML is written; another known template or language is refused before
-/// anything is created, and an unknown one is the pin's own error.
+/// Initialize a standard, library or executable Lake package with a TOML configuration.
+/// `template` is the pin's `[template][.language]` argument. Unsupported combinations
+/// are refused before creating any files.
 ///
 /// Two things the pin does here are not done: no git repository is
 /// initialized (D2: git is spawned only to fetch dependencies), and an
@@ -1214,7 +1238,7 @@ pub fn init_package(
 ) -> Result<(), LakeInitError> {
     validate_package_name(name)?;
     let (template, language) = init_template_spec(template, format)?;
-    if template != "std" || language != "toml" {
+    if !matches!(template.as_str(), "std" | "lib" | "exe") || language != "toml" {
         return Err(LakeInitError::TemplateUnavailable { template, language });
     }
     let config_file = dir.join("lakefile.toml");
@@ -1222,10 +1246,36 @@ pub fn init_package(
         return Err(LakeInitError::AlreadyInitialized);
     }
     let io = |e: std::io::Error| LakeInitError::Io(e.to_string());
-    fs::create_dir_all(dir).map_err(io)?;
-
-    let lib_name = capitalize_ident(name);
-    let exe_name = name.to_ascii_lowercase();
+    let parts = scaffold_name_parts(name)?;
+    let pkg_name = parts.join("-").replace('.', "-");
+    let exe_name = pkg_name.to_ascii_lowercase();
+    // Lake uses the package's original module for an exe, and for a library
+    // whose explicitly named root file already exists. Otherwise it camel-cases
+    // each module component. Keep source paths independent of Lean's «…» spelling.
+    let root_path = |parts: &[String]| dir.join(parts.iter().map(String::as_str).collect::<PathBuf>());
+    let root_file = |base: &Path| {
+        let mut file = base.as_os_str().to_os_string();
+        file.push(".lean");
+        PathBuf::from(file)
+    };
+    let use_original_root = template == "exe" || root_file(&root_path(&parts)).exists();
+    let root_parts = if use_original_root {
+        parts
+    } else {
+        parts.iter().map(|part| capitalize_ident(part)).collect()
+    };
+    if !root_parts.iter().all(|part| is_module_path_component(part)) {
+        return Err(LakeInitError::IllegalName(name.to_owned()));
+    }
+    let module_dir = root_path(&root_parts);
+    let lib_name = fln_core::name::identifier::to_identifier_string(
+        &Name::from_components(root_parts.iter().map(String::as_str)),
+        usize::MAX,
+    )
+    .map_err(|_| LakeInitError::IllegalName(name.to_owned()))?;
+    let write_lib = template != "exe";
+    let write_exe = template != "lib";
+    let default_target = if write_exe { &exe_name } else { &lib_name };
 
     let workflows = dir.join(".github").join("workflows");
     fs::create_dir_all(&workflows).map_err(io)?;
@@ -1247,55 +1297,53 @@ pub fn init_package(
          \x20     - uses: leanprover/lean-action@v1\n",
     )?;
 
-    fs::write(
-        &config_file,
-        format!(
-            "name = \"{name}\"\n\
-             version = \"0.1.0\"\n\
-             defaultTargets = [\"{exe_name}\"]\n\
-             \n\
-             [[lean_lib]]\n\
-             name = \"{lib_name}\"\n\
-             \n\
-             [[lean_exe]]\n\
-             name = \"{exe_name}\"\n\
-             root = \"Main\"\n"
-        ),
-    )
-    .map_err(io)?;
+    let mut config = format!(
+        "name = {}\nversion = \"0.1.0\"\ndefaultTargets = [{}]\n",
+        manifest_quote(&pkg_name),
+        manifest_quote(default_target),
+    );
+    if write_lib {
+        config.push_str(&format!(
+            "\n[[lean_lib]]\nname = {}\n",
+            manifest_quote(&lib_name),
+        ));
+    }
+    if write_exe {
+        config.push_str(&format!(
+            "\n[[lean_exe]]\nname = {}\nroot = \"Main\"\n",
+            manifest_quote(&exe_name),
+        ));
+    }
+    fs::write(&config_file, config).map_err(io)?;
 
-    // The library root and its first module, unless the root is already there.
-    let root_file = dir.join(format!("{lib_name}.lean"));
-    if !root_file.exists() {
-        let lib_dir = dir.join(&lib_name);
-        fs::create_dir_all(&lib_dir).map_err(io)?;
-        write_new(&lib_dir.join("Basic.lean"), "def hello := \"world\"\n")?;
-        fs::write(
+    // Lake creates the root module and Basic even in an exe-only project.
+    let root_file = root_file(&module_dir);
+    if use_original_root || !root_file.exists() {
+        fs::create_dir_all(&module_dir).map_err(io)?;
+        write_new(&module_dir.join("Basic.lean"), "def hello := \"world\"\n")?;
+        write_new(
             &root_file,
-            format!(
+            &format!(
                 "-- This module serves as the root of the `{lib_name}` library.\n\
                  -- Import modules here that should be built as part of the library.\n\
                  import {lib_name}.Basic\n"
             ),
-        )
-        .map_err(io)?;
+        )?;
     }
 
-    write_new(
-        &dir.join("Main.lean"),
-        &format!(
-            "import {lib_name}\n\
-             \n\
-             def main : IO Unit :=\n\
-             \x20 IO.println s!\"Hello, {{hello}}!\"\n"
-        ),
-    )?;
+    if write_exe {
+        let main = if write_lib {
+            format!(
+                "import {lib_name}\n\ndef main : IO Unit :=\n  IO.println s!\"Hello, {{hello}}!\"\n"
+            )
+        } else {
+            "def main : IO Unit :=\n  IO.println s!\"Hello, world!\"\n".to_owned()
+        };
+        write_new(&dir.join("Main.lean"), &main)?;
+    }
 
     // The pin's README has no final newline, and a dotted name is written with dashes.
-    write_new(
-        &dir.join("README.md"),
-        &format!("# {}", name.replace('.', "-")),
-    )?;
+    write_new(&dir.join("README.md"), &format!("# {pkg_name}"))?;
 
     // The pin appends its entry whether or not the file is there.
     let gitignore = dir.join(".gitignore");
@@ -1319,7 +1367,8 @@ pub fn new_package(
     format: LakeConfigFormat,
 ) -> Result<PathBuf, LakeInitError> {
     validate_package_name(name)?;
-    let target_dir = parent_dir.join(name);
+    let directory = scaffold_name_parts(name)?.join("-").replace('.', "-");
+    let target_dir = parent_dir.join(directory);
     if target_dir.exists() {
         return Err(LakeInitError::AlreadyExists(target_dir));
     }
@@ -1711,6 +1760,10 @@ fn manifest_name(
 }
 
 fn parse_manifest_name(text: &str) -> Result<String, ()> {
+    parse_manifest_name_with(text, |_, _| {})
+}
+
+fn parse_manifest_name_with(text: &str, mut component: impl FnMut(&str, bool)) -> Result<String, ()> {
     use fln_core::name::identifier::{is_id_first, is_id_rest};
     if text == "[anonymous]" {
         return Ok(text.to_owned());
@@ -1719,29 +1772,30 @@ fn parse_manifest_name(text: &str) -> Result<String, ()> {
     let mut result = String::new();
     loop {
         let first = rest.chars().next().ok_or(())?;
-        let (component, after) = if let Some(quoted) = rest.strip_prefix('«') {
+        let (rendered, after) = if let Some(quoted) = rest.strip_prefix('«') {
             let end = quoted.find('»').ok_or(())?;
-            let component = &quoted[..end];
-            let mut chars = component.chars();
+            let raw = &quoted[..end];
+            component(raw, false);
+            let mut chars = raw.chars();
             let plain = chars.next().is_some_and(is_id_first) && chars.all(is_id_rest);
             let rendered = if plain {
-                component.to_owned()
+                raw.to_owned()
             } else {
-                format!("«{component}»")
+                format!("«{raw}»")
             };
             (rendered, &quoted[end + '»'.len_utf8()..])
         } else if first.is_ascii_digit() {
             let end = rest.bytes().take_while(u8::is_ascii_digit).count();
             let digits = rest[..end].trim_start_matches('0');
-            (
-                if digits.is_empty() { "0" } else { digits }.to_owned(),
-                &rest[end..],
-            )
+            let digits = if digits.is_empty() { "0" } else { digits };
+            component(digits, true);
+            (digits.to_owned(), &rest[end..])
         } else if is_id_first(first) {
             let end = rest
                 .char_indices()
                 .find(|(_, character)| !is_id_rest(*character))
                 .map_or(rest.len(), |(index, _)| index);
+            component(&rest[..end], false);
             (rest[..end].to_owned(), &rest[end..])
         } else {
             return Err(());
@@ -1749,7 +1803,7 @@ fn parse_manifest_name(text: &str) -> Result<String, ()> {
         if !result.is_empty() {
             result.push('.');
         }
-        result.push_str(&component);
+        result.push_str(&rendered);
         if after.is_empty() {
             return Ok(result);
         }
