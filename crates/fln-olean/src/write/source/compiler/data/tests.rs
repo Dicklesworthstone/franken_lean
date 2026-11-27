@@ -705,13 +705,56 @@ run_cmd liftCoreM do
       unless layout.ctorInfo.size == objects && layout.ctorInfo.usize == 0
           && layout.ctorInfo.ssize == scalarBytes do throwError "wrong field count"
   logInfo "native-data-caches-ok"
-def unwrapWriterNat (value : WriterWrapper) : Nat :=
+"#;
+    let consumer = r#"import WriterData
+@[noinline] def unwrapWriterNat (value : WriterWrapper) : Nat :=
   match value with | .mk n => n
-def unwrapWriterString (value : WriterStringWrapper) : String :=
+@[noinline] def unwrapWriterString (value : WriterStringWrapper) : String :=
   match value with | .mk s => s
-def unwrapWriterBool (value : WriterBoolWrapper) : Bool :=
+@[noinline] def unwrapWriterBool (value : WriterBoolWrapper) : Bool :=
   match value with | .mk b => b
+
+@[noinline] def recursiveDepth : WriterRecursive → Nat
+  | .stop => 0
+  | .next tail => recursiveDepth tail + 1
+
+@[noinline] def recursiveTail (value : WriterRecursive) : WriterRecursive :=
+  match value with
+  | .stop => .stop
+  | .next tail => tail
+
+@[noinline] def heapSummary : WriterRecursiveHeap → Nat × Nat
+  | .leaf n s => (n, s.length)
+  | .node left flag right =>
+    let left := heapSummary left
+    let right := heapSummary right
+    (left.1 + right.1 + (if flag then 1 else 0), left.2 + right.2)
+
+@[noinline] def heapFlagAfter (f : WriterRecursiveHeap → WriterRecursiveHeap)
+    (value : WriterRecursiveHeap) : Bool :=
+  match f value with
+  | .leaf _ _ => false
+  | .node _ flag _ => flag
+
+@[noinline] def firstDepth : WriterRecursiveFirst → Nat
+  | .next tail _ _ => firstDepth tail + 1
+  | .stop => 0
+
+@[noinline] def firstPayload (value : WriterRecursiveFirst) : Nat :=
+  match value with
+  | .next _ flag n => if flag then n else 0
+  | .stop => 0
+
 #eval (unwrapWriterNat (.mk 37), unwrapWriterString (.mk "native wrapper"), unwrapWriterBool (.mk true))
+#eval
+  let list := WriterRecursive.next (.next .stop)
+  let leaf := WriterRecursiveHeap.leaf 18446744073709551616 "shared"
+  let tree := WriterRecursiveHeap.node leaf true (.node leaf false leaf)
+  let first := WriterRecursiveFirst.next .stop true 18446744073709551616
+  let second := WriterRecursiveFirst.next first false 7
+  ((recursiveDepth list, recursiveDepth (recursiveTail list), recursiveDepth .stop),
+    (heapSummary tree, heapFlagAfter (fun t => .node t true t) leaf, heapSummary leaf),
+    (firstDepth .stop, firstDepth second, firstPayload first, firstPayload second))
 "#;
     std::fs::write(directory.join("Reader.lean"), reader).unwrap();
     let run = |bytes: Vec<u8>| {
@@ -730,8 +773,32 @@ def unwrapWriterBool (value : WriterBoolWrapper) : Bool :=
         String::from_utf8_lossy(&positive.stdout),
         String::from_utf8_lossy(&positive.stderr)
     );
-    assert!(String::from_utf8_lossy(&positive.stdout).contains("native-data-caches-ok"));
-    assert!(String::from_utf8_lossy(&positive.stdout).contains("(37, \"native wrapper\", true)"));
+    assert_eq!(
+        String::from_utf8_lossy(&positive.stdout).trim(),
+        "native-data-caches-ok"
+    );
+    // Compile ordinary downstream code in its own process and import context.
+    // The producer supplies logical declarations and native metadata only;
+    // the pin compiles this consumer, including its recursive function bodies.
+    assert!(!directory.join("WriterData.ir").exists());
+    std::fs::write(directory.join("Consumer.lean"), consumer).unwrap();
+    let consumed = Command::new(lean)
+        .current_dir(directory)
+        .env("LEAN_PATH", directory)
+        .args(["-j", "1", "Consumer.lean"])
+        .output()
+        .unwrap();
+    assert!(
+        consumed.status.success(),
+        "native compiler-data consumer: {}\n{}",
+        String::from_utf8_lossy(&consumed.stdout),
+        String::from_utf8_lossy(&consumed.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&consumed.stdout).trim(),
+        "(37, \"native wrapper\", true)\n((2, 1, 0), ((55340232221128654849, 18), true, 18446744073709551616, 6), 0, 2, 18446744073709551616, 0)",
+        "fresh pin consumer must construct, fold and project the native wrapper and recursive layouts"
+    );
     // Rebuild a coherent graph without WriterMixed's cache rows. Do not build
     // then discard encoded objects: the writer's complete region audit must
     // still account for every allocation in these counterfactual artifacts.

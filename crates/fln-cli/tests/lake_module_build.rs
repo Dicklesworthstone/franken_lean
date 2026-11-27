@@ -1712,7 +1712,7 @@ fn unsupported_ir_facet_preserves_the_previous_admission_artifacts() {
     let package = module_library();
     package.write(
         "Lib/Base.lean",
-        MODULE_BASE.replace(" | right\n", " | right (previous : Token)\n"),
+        MODULE_BASE.replace(" | right\n", " | right (previous : Prop -> Token)\n"),
     );
     success(&package.build(&["+Lib.Top:olean"]));
     let previous: Vec<_> = ["Lib.Base", "Lib.Top"]
