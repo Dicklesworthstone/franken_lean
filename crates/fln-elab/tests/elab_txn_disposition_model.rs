@@ -367,3 +367,32 @@ fn planted_leaked_assignment_mutant_is_caught_by_audit_and_refused_before_commit
     assert!(!parent.mvars.is_declared(&child_hole));
     assert_eq!(parent, snapshot_with_leak);
 }
+
+// MANDATED MUTANT (AGENTS testing policy: "leaked transaction assignment")
+#[test]
+fn rollback_never_leaks_child_mvar_assignments() {
+    let mut parent = base_txn();
+    let cp = parent.checkpoint();
+    let (child, hole) = dirty_child(&parent, "rollback_mandated", 3);
+    assert!(
+        child.mvars.is_assigned(&hole),
+        "control precondition: child holds a live metavariable assignment"
+    );
+    let resolved = parent
+        .resolve_child_outcome(
+            &cp,
+            child,
+            Outcome::complete(TxnDispositionV1::rollback("failed_branch")),
+            ChildTaskDrain::NONE,
+        )
+        .into_complete()
+        .expect("Rollback completes");
+    assert_eq!(resolved.disposition_name, "rollback");
+    assert!(
+        !parent.mvars.is_declared(&hole) && parent.mvars.assignment_revision() == 0,
+        "leaked child mvar assignment survived transaction rollback"
+    );
+    parent
+        .verify_no_state_leaks(&cp)
+        .expect("zero state or diagnostic leak on Rollback");
+}
