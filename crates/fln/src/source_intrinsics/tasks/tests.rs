@@ -15,6 +15,7 @@ fn raw_pin_environment() -> Option<Environment> {
     for module in [
         "Init/Prelude",
         "Init/Core",
+        "Init/GetElem",
         "Init/System/ST",
         "Init/System/IOError",
         "Init/System/IO",
@@ -57,6 +58,7 @@ fn registered_except(
         Operation::MapTask,
         Operation::BindTask,
         Operation::GetTaskState,
+        Operation::WaitAny,
     ] {
         if omitted == Some(operation) {
             continue;
@@ -116,6 +118,7 @@ fn exact_task_models_require_their_family_externs_and_opaque_bodies() {
         Operation::MapTask,
         Operation::BindTask,
         Operation::GetTaskState,
+        Operation::WaitAny,
     ] {
         assert!(
             !operation_matches(&raw, operation, &mut None, &mut 0, IngressLimits::default(),)
@@ -191,6 +194,8 @@ fn exact_task_models_require_their_family_externs_and_opaque_bodies() {
         ("IO.TaskState.rec", Operation::GetTaskState),
         ("IO.instInhabitedTaskState", Operation::GetTaskState),
         ("IO.instInhabitedTaskState.default", Operation::GetTaskState),
+        ("IO.waitAny", Operation::WaitAny),
+        ("Task.get", Operation::WaitAny),
     ] {
         let changed = replace(&raw, &model::name(target), |info| match info {
             ConstantInfo::Induct(value) => value.is_unsafe = true,
@@ -254,6 +259,7 @@ fn exact_task_models_require_their_family_externs_and_opaque_bodies() {
         Operation::MapTask,
         Operation::BindTask,
         Operation::GetTaskState,
+        Operation::WaitAny,
     ] {
         assert!(matches!(
             operation_matches(
@@ -266,7 +272,12 @@ fn exact_task_models_require_their_family_externs_and_opaque_bodies() {
             Err(IngressError::UnsupportedNode { .. })
         ));
     }
-    for operation in [Operation::Wait, Operation::MapTask, Operation::BindTask] {
+    for operation in [
+        Operation::Wait,
+        Operation::WaitAny,
+        Operation::MapTask,
+        Operation::BindTask,
+    ] {
         assert!(
             operation_matches(
                 &registered_except(&raw, None, Some(Operation::Get)),

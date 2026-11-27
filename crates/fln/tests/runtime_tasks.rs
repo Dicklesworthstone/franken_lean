@@ -213,6 +213,54 @@ def taskStateEffects : BaseIO Nat := fun world =>
 #eval taskStateEffects
 "#;
 
+const WAIT_ANY_DEFAULT: &str = "#eval IO.waitAny [Task.pure 41, Task.pure 99]\n";
+
+const WAIT_ANY: &str = r#"
+def sharedWaitAny : BaseIO Nat := fun world =>
+  let tasks := [Task.pure 41, Task.pure 99]
+  let wait : tasks.length > 0 → BaseIO Nat := @IO.waitAny Nat tasks
+  match wait (Nat.zero_lt_succ _) world with
+  | .mk first next =>
+    match wait (Nat.zero_lt_succ _) next with
+    | .mk second final => @ST.Out.mk IO.RealWorld Nat (Nat.add first second) final
+#eval sharedWaitAny
+
+def callableWaitAny : BaseIO Nat := fun world =>
+  let tasks := [Task.pure (fun value : Nat => Nat.succ value),
+    Task.pure (fun value : Nat => Nat.add value 100)]
+  match @IO.waitAny (Nat → Nat) tasks (Nat.zero_lt_succ _) world with
+  | .mk first next => @ST.Out.mk IO.RealWorld Nat (Nat.add (first 20) (first 21)) next
+#eval callableWaitAny
+
+def waitAnyRetainedEffects : BaseIO Nat := fun world =>
+  match ST.Prim.mkRef (σ := IO.RealWorld) (α := Nat) 0 world with
+  | .mk counter w1 =>
+    let bump := fun amount : Nat =>
+      ST.bind (ST.Prim.Ref.get counter) (fun count =>
+        ST.bind (ST.Prim.Ref.set counter (Nat.add count amount)) (fun _ => ST.pure 41))
+    let tasks := [Task.pure (bump 1), Task.pure (bump 100)]
+    let wait := @IO.waitAny (BaseIO Nat) tasks (Nat.zero_lt_succ _)
+    match ST.Prim.Ref.get counter w1 with
+    | .mk before w2 =>
+      match wait w2 with
+      | .mk first w3 =>
+        match wait w3 with
+        | .mk again w4 =>
+          match ST.Prim.Ref.get counter w4 with
+          | .mk afterWait w5 =>
+            match first w5 with
+            | .mk value w6 =>
+              match again w6 with
+              | .mk second w7 =>
+                match ST.Prim.Ref.get counter w7 with
+                | .mk afterRun final =>
+                  let c0 := Nat.mul before 10000
+                  let c1 := Nat.add c0 (Nat.mul afterWait 1000)
+                  let c2 := Nat.add c1 (Nat.mul afterRun 100)
+                  @ST.Out.mk IO.RealWorld Nat (Nat.add c2 (Nat.add value second)) final
+#eval waitAnyRetainedEffects
+"#;
+
 fn name(label: &str) -> Name {
     Name::from_components(label.split('.'))
 }
@@ -240,8 +288,11 @@ fn fixture(test: impl FnOnce(&Engine, &Path) + Send + 'static) {
                 for module in [
                     "Init/Prelude",
                     "Init/Core",
+                    // waitAny's checked proof domain uses the autoParam abbreviation.
+                    "Init/Tactics",
                     // IO.hasFinished's sparse matcher carries a Nat.hasNotBit proof.
                     "Init/Data/Nat/Bitwise/Basic",
+                    "Init/GetElem",
                     "Init/System/ST",
                     "Init/System/IOError",
                     "Init/System/IO",
@@ -263,10 +314,26 @@ fn fixture(test: impl FnOnce(&Engine, &Path) + Send + 'static) {
                         }
                     }
                 }
+                // The waitAny proof telescope uses source LT and OfNat syntax;
+                // retain those actual pinned instance registrations as well.
+                for (class, instance) in [("LT", "instLTNat"), ("OfNat", "instOfNatNat")] {
+                    environment =
+                        fln_elab::instances::register_class(&environment, &name(class)).unwrap();
+                    environment =
+                        fln_elab::instances::register_instance(&environment, &name(instance), 1000)
+                            .unwrap();
+                }
+                environment = fln_elab::instances::defaults::register(
+                    &environment,
+                    &name("instOfNatNat"),
+                    100,
+                )
+                .unwrap();
                 for target in [
                     "Nat.add",
                     "Nat.mul",
                     "Nat.beq",
+                    "Nat.pred",
                     "Task.pure",
                     "Task.get",
                     "Task.spawn",
@@ -277,6 +344,7 @@ fn fixture(test: impl FnOnce(&Engine, &Path) + Send + 'static) {
                     "BaseIO.bindTask",
                     "IO.wait",
                     "IO.getTaskState",
+                    "IO.waitAny",
                     "Void.mk",
                     "ST.Prim.mkRef",
                     "ST.Prim.Ref.get",
@@ -351,8 +419,9 @@ fn run(engine: &Engine, source: &str, expected: &[usize]) {
             None => &execution.exit,
             Some(other) => panic!("the BaseIO action must return: {other:?}"),
         };
+        let observed = fln::closed_vm_value(exit).unwrap();
         assert_eq!(
-            fln::closed_vm_value(exit).unwrap(),
+            observed,
             Some(ClosedVmValue::Scalar(*expected)),
             "{source}\nevaluation {index}"
         );
@@ -464,6 +533,52 @@ fn checked_task_states_preserve_enum_layout_universes_and_retained_actions() {
     });
 }
 
+#[test]
+fn checked_wait_any_synthesizes_its_imported_nonempty_proof() {
+    fixture(|engine, compiler| {
+        reference(compiler, WAIT_ANY_DEFAULT, "41\n");
+        run(engine, WAIT_ANY_DEFAULT, &[41]);
+    });
+}
+
+#[test]
+fn checked_wait_any_selects_the_first_finished_task_and_retains_shared_payloads() {
+    fixture(|engine, compiler| {
+        reference(compiler, WAIT_ANY, "82\n43\n282\n");
+        run(engine, WAIT_ANY, &[82, 43, 282]);
+        let mut error = engine
+            .execute_source_commands_with_checks(
+                b"def impossibleWaitAny : BaseIO Nat := @IO.waitAny Nat [] (Nat.zero_lt_succ 0)\n",
+                &KVMap::new(),
+                EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            )
+            .unwrap_err();
+        while let EngineExecutionError::BatchCommand { error: inner, .. } = error {
+            error = *inner;
+        }
+        let rejected_proof = match &error {
+            EngineExecutionError::Frontend(fln::NatDefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::TypeMismatch { .. },
+                ),
+            )) => true,
+            EngineExecutionError::Frontend(fln::NatDefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::ConversionRefused(verdict),
+                ),
+            )) => matches!(
+                verdict.as_ref(),
+                fln_kernel::verdict::Verdict::Rejected {
+                    class: fln_kernel::verdict::RejectClass::NotDefEq,
+                    ..
+                }
+            ),
+            _ => false,
+        };
+        assert!(rejected_proof, "{error:?}");
+    });
+}
+
 fn task_contract_refusal(engine: &Engine, source: &str, expected: &'static str) {
     let mut error = match engine.execute_source_commands_with_checks(
         source.as_bytes(),
@@ -557,6 +672,7 @@ fn public_task_execution_authenticates_externs_and_checked_model_bodies() {
         const MAP: &str = "def taskContractProbe (task : Task Nat) : BaseIO (Task Nat) := @BaseIO.mapTask Nat Nat (fun value world => @ST.Out.mk IO.RealWorld Nat value world) task 0 true\n";
         const BIND: &str = "def taskContractProbe (task : Task Nat) : BaseIO (Task Nat) := @BaseIO.bindTask Nat Nat task (fun value world => @ST.Out.mk IO.RealWorld (Task Nat) (Task.pure value) world) 0 true\n";
         const STATE: &str = "def taskContractProbe (task : Task Nat) : BaseIO IO.TaskState := @IO.getTaskState Nat task\n";
+        const WAIT_ANY: &str = "def taskContractProbe (tasks : List (Task Nat)) (h : tasks.length > 0) : BaseIO Nat := @IO.waitAny Nat tasks h\n";
         let operations = [
             ("Task.pure", PURE),
             ("Task.get", GET),
@@ -565,6 +681,7 @@ fn public_task_execution_authenticates_externs_and_checked_model_bodies() {
             ("BaseIO.mapTask", MAP),
             ("BaseIO.bindTask", BIND),
             ("IO.getTaskState", STATE),
+            ("IO.waitAny", WAIT_ANY),
         ];
         // Every unchanged source is admitted and compiled before its negative
         // case. Definitions return closures; no action or task callback runs.
@@ -600,6 +717,16 @@ fn public_task_execution_authenticates_externs_and_checked_model_bodies() {
             ("IO.TaskState.rec", STATE),
             ("IO.instInhabitedTaskState", STATE),
             ("IO.instInhabitedTaskState.default", STATE),
+            ("Task.get", WAIT_ANY),
+            ("List", WAIT_ANY),
+            ("List.nil", WAIT_ANY),
+            ("List.cons", WAIT_ANY),
+            ("List.rec", WAIT_ANY),
+            ("List.length", WAIT_ANY),
+            ("List.get", WAIT_ANY),
+            ("List.instGetElemNatLtLength", WAIT_ANY),
+            ("GetElem.getElem", WAIT_ANY),
+            ("GT.gt", WAIT_ANY),
         ]) {
             let decorated = Engine::from_environment(
                 fln_elab::externs::register(
@@ -622,6 +749,7 @@ fn public_task_execution_authenticates_externs_and_checked_model_bodies() {
             ("BaseIO.mapTask", MAP),
             ("BaseIO.bindTask", BIND),
             ("IO.getTaskState", STATE),
+            ("IO.waitAny", WAIT_ANY),
             ("IO.instInhabitedTaskState", STATE),
             ("IO.instInhabitedTaskState.default", STATE),
         ] {
@@ -632,11 +760,24 @@ fn public_task_execution_authenticates_externs_and_checked_model_bodies() {
             );
         }
         let getter = changed_checked_task_body(engine, "Task.get");
-        for source in [GET, WAIT, MAP, BIND] {
+        for source in [GET, WAIT, WAIT_ANY, MAP, BIND] {
             task_contract_refusal(
                 &getter,
                 source,
                 "native Task differs from its complete checked logical contract",
+            );
+        }
+        for target in [
+            "List.length",
+            "List.get",
+            "List.instGetElemNatLtLength",
+            "GetElem.getElem",
+            "GT.gt",
+        ] {
+            task_contract_refusal(
+                &changed_checked_task_body(engine, target),
+                WAIT_ANY,
+                "native List lookup differs from its complete pinned logical and execution contract",
             );
         }
     });

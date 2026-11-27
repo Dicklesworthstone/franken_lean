@@ -16,6 +16,7 @@ pub(crate) enum Operation {
     MapTask,
     BindTask,
     GetTaskState,
+    WaitAny,
 }
 
 impl Operation {
@@ -28,6 +29,7 @@ impl Operation {
             Self::MapTask,
             Self::BindTask,
             Self::GetTaskState,
+            Self::WaitAny,
         ]
         .into_iter()
         .find(|operation| requested == &model::name(operation.label()))
@@ -42,6 +44,7 @@ impl Operation {
             Self::MapTask => "BaseIO.mapTask",
             Self::BindTask => "BaseIO.bindTask",
             Self::GetTaskState => "IO.getTaskState",
+            Self::WaitAny => "IO.waitAny",
         }
     }
 }
@@ -107,6 +110,7 @@ pub(crate) fn operation_matches(
             | Operation::MapTask
             | Operation::BindTask
             | Operation::GetTaskState
+            | Operation::WaitAny
     ) && !io::io_world_contract_matches(environment, externs, visited, limits)?
     {
         return Err(unsupported());
@@ -132,7 +136,7 @@ pub(crate) fn operation_matches(
     }
     if matches!(
         operation,
-        Operation::Wait | Operation::MapTask | Operation::BindTask
+        Operation::Wait | Operation::WaitAny | Operation::MapTask | Operation::BindTask
     ) {
         // The opaque model references this exact getter. The continuation's
         // native operation reads the task payload directly, so an absent

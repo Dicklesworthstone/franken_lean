@@ -175,6 +175,40 @@ fn base_io(alpha: Expr) -> Expr {
     Expr::app(c("BaseIO", vec![]), alpha)
 }
 
+fn task_list(alpha: Expr) -> Expr {
+    Expr::app(
+        c("List", vec![Level::zero()]),
+        family_type(&Level::zero(), alpha),
+    )
+}
+
+fn nat_zero() -> Expr {
+    let zero = Expr::lit(Literal::Nat(NatLit::from_u64(0)));
+    app(
+        c("OfNat.ofNat", vec![Level::zero()]),
+        [
+            c("Nat", vec![]),
+            zero.clone(),
+            Expr::app(c("instOfNatNat", vec![]), zero),
+        ],
+    )
+}
+
+fn nonempty_tasks(alpha: Expr, tasks: Expr) -> Expr {
+    app(
+        c("GT.gt", vec![Level::zero()]),
+        [
+            c("Nat", vec![]),
+            c("instLTNat", vec![]),
+            app(
+                c("List.length", vec![Level::zero()]),
+                [family_type(&Level::zero(), alpha), tasks],
+            ),
+            nat_zero(),
+        ],
+    )
+}
+
 fn applicative() -> Expr {
     app(
         c("Monad.toApplicative", vec![Level::zero(); 2]),
@@ -434,6 +468,78 @@ fn opaque(operation: Operation) -> ConstantInfo {
             );
             (type_, value)
         }
+        Operation::WaitAny => {
+            let list = task_list(b(0));
+            let nonempty = nonempty_tasks(b(1), b(0));
+            let proof = app(
+                c("autoParam", vec![Level::zero()]),
+                [nonempty.clone(), c("IO.waitAny._auto_1", vec![])],
+            );
+            let type_ = pi(
+                sort.clone(),
+                explicit(list.clone(), explicit(proof, base_io(b(2)))),
+                BinderInfo::Implicit,
+            );
+            let valid = lam(
+                task_list(b(2)),
+                lam(
+                    c("Nat", vec![]),
+                    app(
+                        c("LT.lt", vec![Level::zero()]),
+                        [
+                            c("Nat", vec![]),
+                            c("instLTNat", vec![]),
+                            b(0),
+                            app(
+                                c("List.length", vec![Level::zero()]),
+                                [family_type(&Level::zero(), b(4)), b(1)],
+                            ),
+                        ],
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            );
+            let first = app(
+                c("GetElem.getElem", vec![Level::zero(); 3]),
+                [
+                    task_list(b(2)),
+                    c("Nat", vec![]),
+                    family_type(&Level::zero(), b(2)),
+                    valid,
+                    Expr::app(
+                        c("List.instGetElemNatLtLength", vec![Level::zero()]),
+                        family_type(&Level::zero(), b(2)),
+                    ),
+                    b(1),
+                    nat_zero(),
+                    b(0),
+                ],
+            );
+            let pure = app(
+                c("Applicative.toPure", vec![Level::zero(); 2]),
+                [c("BaseIO", vec![]), applicative()],
+            );
+            let value = app(
+                c("Pure.pure", vec![Level::zero(); 2]),
+                [
+                    c("BaseIO", vec![]),
+                    pure,
+                    b(2),
+                    app(c("Task.get", vec![Level::zero()]), [b(2), first]),
+                ],
+            );
+            let value = lam(
+                sort,
+                lam(
+                    list,
+                    lam(nonempty, value, BinderInfo::Default),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Implicit,
+            );
+            (type_, value)
+        }
         Operation::Pure
         | Operation::Get
         | Operation::MapTask
@@ -554,7 +660,7 @@ pub(super) fn operation_matches(
         Operation::Get => getter_matches(environment, comparison),
         Operation::AsTask => Ok(comparison.constant(environment, priority())?
             && comparison.constant(environment, opaque(operation))?),
-        Operation::Wait => Ok(getter_matches(environment, comparison)?
+        Operation::Wait | Operation::WaitAny => Ok(getter_matches(environment, comparison)?
             && comparison.constant(environment, opaque(operation))?),
         Operation::MapTask | Operation::BindTask => {
             let Some(expected) = composition(environment, operation) else {

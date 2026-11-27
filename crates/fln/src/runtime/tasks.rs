@@ -13,7 +13,7 @@ use fln_comp::flbc::{ArgumentOwnership, ResultOwnership};
 
 const HANDLE: &str = "_fln_runtime_task_handle";
 const PAYLOAD: &str = "_fln_runtime_task_payload";
-const PRIMITIVES: [&str; 7] = [
+const PRIMITIVES: [&str; 8] = [
     "_fln_runtime_task_pure",
     "_fln_runtime_task_get",
     "_fln_runtime_task_as_task",
@@ -21,14 +21,15 @@ const PRIMITIVES: [&str; 7] = [
     "_fln_runtime_task_map_task",
     "_fln_runtime_task_bind_task",
     "_fln_runtime_task_get_state",
+    "_fln_runtime_task_wait_any",
 ];
 
 #[derive(Default)]
 pub(super) struct Store {
     family: Option<bool>,
-    operations: [bool; 7],
+    operations: [bool; 8],
     next: u64,
-    bindings: [Option<(IntrinsicBinding, Expr)>; 7],
+    bindings: [Option<(IntrinsicBinding, Expr)>; 8],
     payloads: std::collections::HashMap<Expr, Name>,
     recoveries: BTreeMap<Name, (Expr, ValueType)>,
 }
@@ -200,6 +201,19 @@ impl Preparation<'_> {
             )? {
                 return Ok(None);
             }
+            if operation == Operation::WaitAny {
+                self.implementations()?;
+                source_intrinsics::arrays::list_lookup_matches(
+                    self.environment,
+                    self.implementations
+                        .as_ref()
+                        .expect("checked implementation journal"),
+                    self.runtime_initializers,
+                    &mut self.externs,
+                    &mut self.visited,
+                    self.limits,
+                )?;
+            }
             self.tasks.operations[index] = true;
             self.tasks.family = Some(true);
         }
@@ -225,6 +239,7 @@ impl Preparation<'_> {
                 "lean_io_get_task_state",
                 "io",
             ),
+            Operation::WaitAny => ("opaque", "Init.System.IO", 0, 3, "lean_io_wait_any", "io"),
         };
         let row = fln_vm::extern_table_generated::EXTERN_ROWS
             .iter()
@@ -245,6 +260,7 @@ impl Preparation<'_> {
             Operation::Get | Operation::Wait | Operation::GetTaskState => {
                 (vec![c(HANDLE)], c(PAYLOAD), ValueType::Abi)
             }
+            Operation::WaitAny => (vec![c(PAYLOAD)], c(PAYLOAD), ValueType::Abi),
             Operation::AsTask => (vec![c(PAYLOAD), c("Nat")], c(HANDLE), ValueType::Task),
             Operation::MapTask => (
                 vec![c(PAYLOAD), c(HANDLE), c("Nat"), c("Bool")],
@@ -305,6 +321,7 @@ impl Preparation<'_> {
                         | Operation::MapTask
                         | Operation::BindTask
                         | Operation::GetTaskState
+                        | Operation::WaitAny
                 ) {
                     EffectClass::Io
                 } else {
@@ -454,6 +471,36 @@ impl Preparation<'_> {
                 let value = self.task_recover(Expr::app(primitive, b(1)?), &payload)?;
                 let body = out(payload.clone(), value, b(0)?);
                 (vec![family, world], body, out_type(payload))
+            }
+            Operation::WaitAny => {
+                let list = Expr::app(
+                    Expr::const_(name("List"), vec![Level::zero()]),
+                    family.clone(),
+                );
+                let shape = self.io_checked_shape(list.clone())?;
+                let [nil, cons] = shape.constructors.as_slice() else {
+                    return Err(unsupported("Task wait-any checked List constructors"));
+                };
+                if nil.tag != 0
+                    || !nil.fields.is_empty()
+                    || cons.tag != 1
+                    || cons.fields.len() != 2
+                    || cons.type_fields != [false, false]
+                    || cons.fields[0] != family
+                    || cons.fields[1] != list
+                {
+                    return Err(unsupported("Task wait-any checked List layout"));
+                }
+                // The proof was checked before ingress and is erased here.
+                // Preserve its source argument slot while borrowing the list
+                // only when the returned BaseIO action receives its world.
+                let value = self.task_recover(Expr::app(primitive, b(2)?), &payload)?;
+                let body = out(payload.clone(), value, b(0)?);
+                (
+                    vec![list, proofs::erased_type(), world],
+                    body,
+                    out_type(payload),
+                )
             }
             Operation::Pure
             | Operation::Get
@@ -727,7 +774,7 @@ impl Preparation<'_> {
             return Err(unsupported("Task runtime family"));
         }
         let wrapper = match operation {
-            Operation::AsTask | Operation::Wait => {
+            Operation::AsTask | Operation::Wait | Operation::WaitAny => {
                 self.task_io_wrapper(operation, primitive, family, payload)?
             }
             Operation::GetTaskState => self.task_state_wrapper(primitive, family)?,
