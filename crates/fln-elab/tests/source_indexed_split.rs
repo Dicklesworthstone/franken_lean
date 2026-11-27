@@ -87,10 +87,12 @@ fn accepted(environment: &Environment, source: &str) {
 #[test]
 fn indexed_split_specializes_indices_and_preserves_source_alternative_order() {
     let environment = environment();
+    // Reconstruction supplies the dependent result type: without that annotation,
+    // result inference fails before either `split` or ordinary `cases` can run.
     for source in [
         "theorem length (A : Type) (n : Nat) (xs : Vec A n) : (match xs with | .nil => 0 | .cons k a tail => Nat.succ k) = n := by split <;> rfl",
         "theorem reordered (A : Type) (n : Nat) (xs : Vec A n) : match xs with | .cons k a tail => Nat.succ k = Nat.succ k | .nil => True := by\n  split\n  next k a tail => rfl\n  next => exact True.intro",
-        "theorem reconstruct (A : Type) (n : Nat) (xs : Vec A n) : (match xs with | .nil => Vec.nil | .cons k a tail => Vec.cons k a tail) = xs := by split <;> rfl",
+        "theorem reconstruct (A : Type) (n : Nat) (xs : Vec A n) : ((match xs with | .nil => Vec.nil | .cons k a tail => Vec.cons k a tail) : Vec A n) = xs := by split <;> rfl",
         "theorem underBinder (A : Type) (n : Nat) (xs : Vec A n) : ∀ z : Nat, (match xs with | .nil => 0 | .cons k a tail => Nat.succ k) = n := by split <;> intro z <;> rfl",
         "theorem twoIndices (n m : Nat) (grid : Grid n m) : (match grid with | .origin => 0 | .step a b rest => Nat.succ a) = n := by split <;> rfl",
     ] {

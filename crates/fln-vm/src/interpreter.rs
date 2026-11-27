@@ -11305,7 +11305,10 @@ mod tests {
                 );
                 assert!(matches!(
                     invoke(of_nat, std::slice::from_ref(&negative)),
-                    Err(VmRefusal::TypeMismatch { expected: "Nat", .. })
+                    Err(VmRefusal::TypeMismatch {
+                        expected: "Nat",
+                        ..
+                    })
                 ));
             }
             for value in [

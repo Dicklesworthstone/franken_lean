@@ -231,11 +231,11 @@ fn native_expr_order_preserves_universe_depth_kind_and_list_order() {
         for use_hash in [false, true] {
             assert!(
                 super::super::order::level_less_than(&left, &right, use_hash, &mut budget(100))
-                    .unwrap()
+                    .unwrap_or_else(|_| panic!("bounded universe comparison refused"))
             );
             assert!(
                 !super::super::order::level_less_than(&right, &left, use_hash, &mut budget(100))
-                    .unwrap()
+                    .unwrap_or_else(|_| panic!("bounded reverse universe comparison refused"))
             );
         }
         assert!(ordered(ROWS[0], &Expr::sort(left), &Expr::sort(right)));
@@ -293,10 +293,12 @@ fn native_expr_quick_order_uses_hash_then_structural_collision_fallback() {
         let hash_order = left.hash() < right.hash();
         universe_opposite |= !hash_order;
         assert!(
-            super::super::order::level_less_than(&left, &right, false, &mut budget(100)).unwrap()
+            super::super::order::level_less_than(&left, &right, false, &mut budget(100))
+                .unwrap_or_else(|_| panic!("bounded structural universe comparison refused"))
         );
         assert_eq!(
-            super::super::order::level_less_than(&left, &right, true, &mut budget(100)).unwrap(),
+            super::super::order::level_less_than(&left, &right, true, &mut budget(100))
+                .unwrap_or_else(|_| panic!("bounded hash-first universe comparison refused")),
             hash_order
         );
     }
@@ -414,7 +416,10 @@ fn native_expr_order_is_iterative_and_bounds_comparison_work() {
         left = Expr::app(bvar(0), left);
         right = Expr::app(bvar(0), right);
     }
-    assert!(super::super::order::less_than(&left, &right, false, &mut budget(10_000)).unwrap());
+    assert!(
+        super::super::order::less_than(&left, &right, false, &mut budget(10_000))
+            .unwrap_or_else(|_| panic!("bounded deep expression comparison refused"))
+    );
     assert!(matches!(
         super::super::order::less_than(&left, &right, false, &mut budget(100)),
         Err(IntrinsicFailure::MirrorResource { .. })
@@ -435,5 +440,8 @@ fn native_expr_order_is_iterative_and_bounds_comparison_work() {
         super::super::order::less_than(&left, &right, false, &mut budget(10)),
         Err(IntrinsicFailure::MirrorResource { .. })
     ));
-    assert!(super::super::order::less_than(&left, &right, false, &mut budget(100)).unwrap());
+    assert!(
+        super::super::order::less_than(&left, &right, false, &mut budget(100))
+            .unwrap_or_else(|_| panic!("bounded shared expression comparison refused"))
+    );
 }

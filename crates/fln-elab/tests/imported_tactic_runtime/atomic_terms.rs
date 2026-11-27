@@ -846,12 +846,14 @@ fn publish_captured_equations(
 ) -> Environment {
     use fln_elab::source::equation_theorems::{self, Request, journal};
     assert!(result.auxiliary_declarations.is_empty());
-    assert!(result.local_functions.is_empty());
     let record = result
         .equation_info
         .expect("successful macro bodies must retain their equation information");
     assert_eq!(record.alternatives.len(), alternatives);
-    let environment = publish(environment, result.declaration);
+    let mut environment = publish(environment, result.declaration);
+    for helper in result.local_functions {
+        environment = publish(&environment, helper);
+    }
     let mut environment = journal::push(&environment, &record).unwrap();
     let equations = equation_theorems::realize(
         &environment,
@@ -964,14 +966,16 @@ fn equation_capture_preserves_failed_tactic_attempts_without_reexecuting_them() 
 
 #[test]
 fn equation_capture_retains_pattern_locals_and_structural_recursive_calls() {
-    for (source, successor) in [
+    for (source, successor, has_unfolding_helper) in [
         (
             "def stateful (n : Nat) : Nat := match n with | .zero => equationTick | .succ k => equationTick + k",
             "theorem observedSucc (k : Nat) : Eq (stateful (Nat.succ k)) (8 + k) := stateful.eq_2 k",
+            false,
         ),
         (
             "def stateful (n : Nat) : Nat := match n with | .zero => equationTick | .succ k => stateful k + equationTick",
             "theorem observedSucc (k : Nat) : Eq (stateful (Nat.succ k)) (stateful k + 8) := stateful.eq_2 k",
+            true,
         ),
     ] {
         let environment = environment();
@@ -983,6 +987,11 @@ fn equation_capture_retains_pattern_locals_and_structural_recursive_calls() {
             "{source}"
         );
         let environment = publish_captured_equations(&environment, result, 2);
+        assert_eq!(
+            environment.contains(&Name::from_components(["stateful", "_sunfold"])),
+            has_unfolding_helper,
+            "recursive equation proofs retain their checked unfolding helper: {source}"
+        );
         for proof in [
             "theorem observedZero : Eq (stateful Nat.zero) 7 := stateful.eq_1",
             successor,

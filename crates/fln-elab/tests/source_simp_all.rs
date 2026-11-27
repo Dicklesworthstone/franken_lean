@@ -74,7 +74,7 @@ fn simp_all_selects_local_proofs_with_and_without_defaults() {
         "simp_all",
         "simp_all only",
         "simp_all only []",
-        "simp_all only [*, *]",
+        "simp_all only [h, h]",
     ] {
         accepted(&format!("theorem t (P : Prop) (h : P) : P := by {tactic}"));
     }
@@ -131,6 +131,7 @@ fn simp_all_does_not_accept_false_or_unfinished_proofs() {
         "theorem t : 1 = 2 := by simp_all only",
         "theorem t (P Q : Prop) (h : P) : Q := by simp_all only",
         "theorem t : 0 = 0 := by simp_all only [missing]",
+        "theorem t (P : Prop) (h : P) : P := by simp_all only [*, *]",
         "theorem t (x y : Nat) (h : x = y) (k : y = x) : x = x := by simp_all only [h, k]",
     ] {
         refused(source);

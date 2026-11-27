@@ -322,8 +322,8 @@ fn data_value_cmp(
         (DataValue::OfBool(a), DataValue::OfBool(b)) => a.cmp(b),
         (DataValue::OfName(a), DataValue::OfName(b)) => name_cmp(a, b, budget)?,
         (DataValue::OfNat(a), DataValue::OfNat(b)) => a.cmp(b),
-        // The pin explicitly leaves equal-tag Int/Syntax ordering undefined
-        // and returns false in both directions. list_ref continues to the
+        // The pin has no less-than case for equal-tag Int/Syntax and returns
+        // false in both directions. list_ref continues to the
         // next entry even if those payloads are structurally unequal.
         (DataValue::OfInt(_), DataValue::OfInt(_))
         | (DataValue::OfSyntax(_), DataValue::OfSyntax(_)) => Ordering::Equal,
