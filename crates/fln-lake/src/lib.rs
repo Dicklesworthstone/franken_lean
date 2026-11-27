@@ -478,7 +478,7 @@ pub enum LakeInitError {
     /// The configuration language is not one of the pin's.
     UnknownConfigLanguage(String),
     /// The pin has this template and language; this implementation writes
-    /// the standard, library and executable TOML templates. Nothing was created.
+    /// the standard, library and executable templates. Nothing was created.
     TemplateUnavailable { template: String, language: String },
     /// The directory already holds a package configuration.
     AlreadyInitialized,
@@ -512,7 +512,7 @@ impl fmt::Display for LakeInitError {
             }
             Self::TemplateUnavailable { template, language } => write!(
                 f,
-                "the `{template}` template with a `{language}` configuration is not written here; supported templates are `std`, `lib` and `exe` with `toml`; nothing was created"
+                "the `{template}` template with a `{language}` configuration is not written here; supported templates are `std`, `lib` and `exe`; nothing was created"
             ),
             Self::AlreadyInitialized => write!(f, "error: package already initialized"),
         }
@@ -1216,6 +1216,89 @@ fn is_module_path_component(part: &str) -> bool {
     matches!(path.next(), Some(std::path::Component::Normal(_))) && path.next().is_none()
 }
 
+/// Lean's String.quote, used by Lake's configuration templates for package and executable names.
+fn lean_string_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if u32::from(c) <= 31 || c == '\x7f' => {
+                out.push_str(&format!("\\x{:02x}", u32::from(c)));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn lean_scaffold_config(
+    package: &str,
+    exe: &str,
+    root: &[String],
+    write_lib: bool,
+    write_exe: bool,
+) -> String {
+    let mut config = format!(
+        "import Lake\nopen Lake DSL\n\npackage {} where\n  version := v!\"0.1.0\"\n",
+        lean_string_literal(package),
+    );
+    if write_lib {
+        // Lake's escapeName! quotes every component, even ordinary identifiers.
+        let root = root
+            .iter()
+            .map(|part| format!("«{part}»"))
+            .collect::<Vec<_>>()
+            .join(".");
+        config.push('\n');
+        if !write_exe {
+            config.push_str("@[default_target]\n");
+        }
+        config.push_str(&format!(
+            "lean_lib {root} where\n  -- add library configuration options here\n"
+        ));
+    }
+    if write_exe {
+        config.push_str(&format!(
+            "\n@[default_target]\nlean_exe {} where\n  root := `Main\n",
+            lean_string_literal(exe),
+        ));
+    }
+    config
+}
+
+fn toml_scaffold_config(
+    package: &str,
+    exe: &str,
+    lib: &str,
+    write_lib: bool,
+    write_exe: bool,
+) -> String {
+    let default_target = if write_exe { exe } else { lib };
+    let mut config = format!(
+        "name = {}\nversion = \"0.1.0\"\ndefaultTargets = [{}]\n",
+        manifest_quote(package),
+        manifest_quote(default_target),
+    );
+    if write_lib {
+        config.push_str(&format!(
+            "\n[[lean_lib]]\nname = {}\n",
+            manifest_quote(lib),
+        ));
+    }
+    if write_exe {
+        config.push_str(&format!(
+            "\n[[lean_exe]]\nname = {}\nroot = \"Main\"\n",
+            manifest_quote(exe),
+        ));
+    }
+    config
+}
+
 fn write_new(path: &Path, contents: &str) -> Result<(), LakeInitError> {
     if path.exists() {
         return Ok(());
@@ -1223,7 +1306,7 @@ fn write_new(path: &Path, contents: &str) -> Result<(), LakeInitError> {
     fs::write(path, contents).map_err(|e| LakeInitError::Io(e.to_string()))
 }
 
-/// Initialize a standard, library or executable Lake package with a TOML configuration.
+/// Initialize a standard, library or executable Lake package with a TOML or Lean configuration.
 /// `template` is the pin's `[template][.language]` argument. Unsupported combinations
 /// are refused before creating any files.
 ///
@@ -1238,10 +1321,10 @@ pub fn init_package(
 ) -> Result<(), LakeInitError> {
     validate_package_name(name)?;
     let (template, language) = init_template_spec(template, format)?;
-    if !matches!(template.as_str(), "std" | "lib" | "exe") || language != "toml" {
+    if !matches!(template.as_str(), "std" | "lib" | "exe") {
         return Err(LakeInitError::TemplateUnavailable { template, language });
     }
-    let config_file = dir.join("lakefile.toml");
+    let config_file = dir.join(format!("lakefile.{language}"));
     if config_file.exists() {
         return Err(LakeInitError::AlreadyInitialized);
     }
@@ -1275,7 +1358,6 @@ pub fn init_package(
     .map_err(|_| LakeInitError::IllegalName(name.to_owned()))?;
     let write_lib = template != "exe";
     let write_exe = template != "lib";
-    let default_target = if write_exe { &exe_name } else { &lib_name };
 
     let workflows = dir.join(".github").join("workflows");
     fs::create_dir_all(&workflows).map_err(io)?;
@@ -1297,23 +1379,11 @@ pub fn init_package(
          \x20     - uses: leanprover/lean-action@v1\n",
     )?;
 
-    let mut config = format!(
-        "name = {}\nversion = \"0.1.0\"\ndefaultTargets = [{}]\n",
-        manifest_quote(&pkg_name),
-        manifest_quote(default_target),
-    );
-    if write_lib {
-        config.push_str(&format!(
-            "\n[[lean_lib]]\nname = {}\n",
-            manifest_quote(&lib_name),
-        ));
-    }
-    if write_exe {
-        config.push_str(&format!(
-            "\n[[lean_exe]]\nname = {}\nroot = \"Main\"\n",
-            manifest_quote(&exe_name),
-        ));
-    }
+    let config = if language == "lean" {
+        lean_scaffold_config(&pkg_name, &exe_name, &root_parts, write_lib, write_exe)
+    } else {
+        toml_scaffold_config(&pkg_name, &exe_name, &lib_name, write_lib, write_exe)
+    };
     fs::write(&config_file, config).map_err(io)?;
 
     // Lake creates the root module and Basic even in an exe-only project.
