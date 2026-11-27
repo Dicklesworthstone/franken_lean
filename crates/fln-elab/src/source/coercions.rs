@@ -315,7 +315,11 @@ impl Context {
         ) {
             return Ok(());
         }
-        if self.contextual_result_hint(actual, expected)? {
+        // App.propagateExpectedType compares the expected type first
+        // (vendored Lean/Elab/App.lean:595). With two unknown carriers,
+        // that orientation leaves the application's carrier unassigned
+        // for its remaining arguments to determine.
+        if self.contextual_result_hint(expected, actual)? {
             return Ok(());
         }
         if !self.has_coercion_class("CoeT")?
@@ -340,7 +344,7 @@ impl Context {
                 || actual.has_level_mvar()
                 || expected.has_level_mvar()
             {
-                match self.unify_pending_batch(&[(actual, expected)], true, false)? {
+                match self.unify_pending_batch(&[(expected, actual)], true, false)? {
                     Ok(()) => return Ok(()),
                     Err(error) => {
                         let wrapped = failure(SourceInferenceError::Unification(Box::new(error)));
@@ -350,7 +354,7 @@ impl Context {
                     }
                 }
             }
-        } else if self.coercion_eq(actual, expected)? {
+        } else if self.coercion_eq(expected, actual)? {
             return Ok(());
         }
         self.first_order_result_hint(actual, expected).map(|_| ())
