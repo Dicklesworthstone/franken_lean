@@ -867,6 +867,69 @@ fn tagged_return_requires_extern_and_non_scalar_return_type() {
 }
 
 #[test]
+fn unsafe_opaque_declarations_follow_pinned_safety_and_visibility_rules() {
+    let engine = Engine::builder().build_empty();
+    let root = engine.logical_root(&KVMap::new());
+
+    let built = build(
+        &engine,
+        &[(
+            "Main",
+            "module\n\
+             prelude\n\
+             public section\n\
+             inductive N : Type where | z : N | s : N -> N\n\
+             class Inhabited (α : Type) where default : α\n\
+             export Inhabited (default)\n\
+             instance : Inhabited N where default := N.z\n\
+             @[extern \"uo_body\"] unsafe opaque withBody (n : N) : N := n\n\
+             @[extern \"uo_default\"] unsafe opaque withDefault {α : Type} [@&Inhabited α] (n : N) : α\n\
+             unsafe opaque recOpaque (n : N) : N := recOpaque n\n\
+             noncomputable unsafe opaque noncompOpaque (n : N) : N := n\n\
+             unsafe def caller (n : N) : N := withBody (withDefault n)\n",
+        )],
+        OleanWriteBudget::default(),
+    )
+    .expect("valid unsafe opaque declarations succeed")
+    .into_complete()
+    .expect("unsafe opaque build completes");
+    let receipt = imported(&built);
+    for decl in [
+        "withBody",
+        "withDefault",
+        "recOpaque",
+        "noncompOpaque",
+        "caller",
+    ] {
+        assert!(
+            receipt.engine.environment().contains(&name(decl)),
+            "missing {decl}"
+        );
+    }
+
+    for bad in [
+        // Safe def cannot reference an unsafe opaque.
+        "prelude\n\
+         inductive N : Type where | z : N\n\
+         unsafe opaque u : N := N.z\n\
+         def safeCaller : N := u\n",
+        // Pinned kernel `add_opaque` checks unsafe opaque bodies in safe mode.
+        "prelude\n\
+         inductive N : Type where | z : N\n\
+         unsafe axiom uAx : N\n\
+         unsafe opaque badBody : N := uAx\n",
+        // `partial` + `unsafe` remains refused.
+        "prelude\n\
+         inductive N : Type where | z : N\n\
+         unsafe partial opaque badMod (n : N) : N := n\n",
+    ] {
+        let err = build(&engine, &[("Main", bad)], OleanWriteBudget::default()).unwrap_err();
+        assert_eq!(err.disposition().2, 1, "{bad}: {err:?}");
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
 fn native_producer_replacements_execute_in_fresh_native_and_pinned_consumers() {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
         .map(std::path::PathBuf::from)

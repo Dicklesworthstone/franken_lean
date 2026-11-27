@@ -1286,16 +1286,32 @@ def withoutExpected := inferInstanceAs (Decidable (Eq (0 : Nat) 0))
 #[test]
 fn advisory_result_hints_and_specialized_nonrec_empty_branches() {
     // 1. Recursive `List.hasDecEq` pattern (`Init/Prelude.lean:2971`) with 4
-    //    `noConfusion rfl (heq_of_eq h)` calls before `CoeT` exists: advisory
-    //    expected-type propagation must not leave stuck equations in `self.equations`.
+    //    `noConfusion` calls before `CoeT` exists: advisory expected-type
+    //    propagation must not leave stuck equations in `self.equations`.
     // 2. `List.get` pattern (`Init/Prelude.lean:3059`): omitting the `nil` arm when
     //    a branch-specialized non-recursive structure (`MyFin MyList.nil.len`) exposes
     //    an empty indexed proof field (`Le (Nat.succ val) 0`).
+    // 3. `Array.appendCore`/`Array.extract` pattern (`Init/Prelude.lean:3347`):
+    //    course-of-values (`brecOn`) structural recursion when `match` on the
+    //    decreasing parameter sits inside `dite` / a binder, for both `let rec`
+    //    and top-level `def`.
     check(
         r#"
 inductive MyList (α : Type) where
   | nil : MyList α
   | cons (head : α) (tail : MyList α) : MyList α
+
+def myNoConfType (P : Sort u) {α : Type} (v1 v2 : MyList α) : Sort u :=
+  MyList.casesOn v1
+    (MyList.casesOn v2 (P -> P) (fun _ _ => P))
+    (fun a1 as1 => MyList.casesOn v2 P (fun a2 as2 => (Eq a1 a2 -> Eq as1 as2 -> P) -> P))
+
+def myNoConf {P : Sort u} {α : Type} {v1 v2 : MyList α} (h : Eq v1 v2) : myNoConfType P v1 v2 :=
+  Eq.rec (motive := fun x _ => myNoConfType P v1 x)
+    (MyList.casesOn (motive := fun x => myNoConfType P x x) v1
+      (fun k => k)
+      (fun _ _ k => k rfl rfl))
+    h
 
 inductive Dec (p : Prop) where
   | isFalse (h : p -> False) : Dec p
@@ -1304,23 +1320,17 @@ inductive Dec (p : Prop) where
 class MyDecEq (α : Type) where
   dec : (a b : α) -> Dec (Eq a b)
 
-theorem heqOfEq {α : Type} {a b : α} (h : Eq a b) : HEq a b :=
-  Eq.rec (motive := fun x _ => HEq a x) HEq.refl h
-
-theorem eqOfHeq {α : Type} {a b : α} (h : HEq a b) : Eq a b :=
-  HEq.rec (motive := fun b _ => Eq a b) rfl h
-
 def MyList.hasDecEq {α : Type} [MyDecEq α] : (a b : MyList α) -> Dec (Eq a b)
   | MyList.nil, MyList.nil => Dec.isTrue rfl
-  | MyList.cons _ _, MyList.nil => Dec.isFalse (fun h => MyList.noConfusion rfl (heqOfEq h))
-  | MyList.nil, MyList.cons _ _ => Dec.isFalse (fun h => MyList.noConfusion rfl (heqOfEq h))
+  | MyList.cons _ _, MyList.nil => Dec.isFalse (fun h => myNoConf h)
+  | MyList.nil, MyList.cons _ _ => Dec.isFalse (fun h => myNoConf h)
   | MyList.cons a as, MyList.cons b bs =>
     match MyDecEq.dec a b with
     | Dec.isTrue hab =>
       match MyList.hasDecEq as bs with
       | Dec.isTrue habs => Dec.isTrue (hab ▸ habs ▸ rfl)
-      | Dec.isFalse nabs => Dec.isFalse (fun h => MyList.noConfusion rfl (heqOfEq h) (fun _ habs => nabs (eqOfHeq habs)))
-    | Dec.isFalse nab => Dec.isFalse (fun h => MyList.noConfusion rfl (heqOfEq h) (fun hab _ => nab (eqOfHeq hab)))
+      | Dec.isFalse nabs => Dec.isFalse (fun h => myNoConf h (fun _ habs => nabs habs))
+    | Dec.isFalse nab => Dec.isFalse (fun h => myNoConf h (fun hab _ => nab hab))
 
 inductive Le (n : Nat) : Nat -> Prop where
   | refl : Le n n
@@ -1347,12 +1357,32 @@ def MyList.len {α : Type} : MyList α -> Nat
 def MyList.get {α : Type} : (as : MyList α) -> MyFin (MyList.len as) -> α
   | MyList.cons a _, ⟨0, _⟩ => a
   | MyList.cons _ as, ⟨Nat.succ i, h⟩ => MyList.get as ⟨i, leOfSuccLeSucc h⟩
+
+def diteLetRec (k : Nat) (x : Nat) : Nat :=
+  let rec loop (i : Nat) (j : Nat) (acc : Nat) : Nat :=
+    dite (Eq j k)
+      (fun _ =>
+        match i with
+        | 0 => acc
+        | Nat.succ i' => loop i' (Nat.succ j) (Nat.succ acc))
+      (fun _ => acc)
+  loop k 0 x
+
+def diteTopDef (k : Nat) (i : Nat) (j : Nat) (acc : Nat) : Nat :=
+  dite (Eq j k)
+    (fun _ =>
+      match i with
+      | 0 => acc
+      | Nat.succ i' => diteTopDef k i' (Nat.succ j) (Nat.succ acc))
+    (fun _ => acc)
 "#,
     );
 
-    // Negative control: omitting `nil` when the specialized non-recursive structure
-    // is still inhabited must remain refused.
-    let bad = r#"
+    // Negative controls:
+    // 1. Omitting `nil` when the specialized non-recursive structure is still inhabited.
+    // 2. Non-decreasing `let rec` inside `dite` (`loop i` instead of `loop i'`).
+    for bad in [
+        r#"
 inductive MyList (α : Type) where
   | nil : MyList α
   | cons (head : α) (tail : MyList α) : MyList α
@@ -1364,17 +1394,30 @@ structure Wrap (n : Nat) where
 def badGet {α : Type} : (as : MyList α) -> Wrap (MyList.len as) -> α
   | MyList.cons a _, ⟨true⟩ => a
   | MyList.cons a _, ⟨false⟩ => a
-"#;
-    let e = engine();
-    let root = e.logical_root(&KVMap::new());
-    assert!(
-        e.check_source_files(
-            &[bad.as_bytes()],
-            &KVMap::new(),
-            SourceCheckLimits::new(limits()),
-        )
-        .is_err(),
-        "must refuse omitted branch when specialized structure is inhabited"
-    );
-    assert_eq!(e.logical_root(&KVMap::new()), root);
+"#,
+        r#"
+def badDiteLetRec (k : Nat) (x : Nat) : Nat :=
+  let rec loop (i : Nat) (j : Nat) (acc : Nat) : Nat :=
+    dite (Eq j k)
+      (fun _ =>
+        match i with
+        | 0 => acc
+        | Nat.succ _ => loop i (Nat.succ j) (Nat.succ acc))
+      (fun _ => acc)
+  loop k 0 x
+"#,
+    ] {
+        let e = engine();
+        let root = e.logical_root(&KVMap::new());
+        assert!(
+            e.check_source_files(
+                &[bad.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .is_err(),
+            "must refuse invalid match/recursion: {bad}"
+        );
+        assert_eq!(e.logical_root(&KVMap::new()), root);
+    }
 }

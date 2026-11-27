@@ -2718,7 +2718,7 @@ impl Context {
             BinderDomain(binders::Telescope<'a>),
             BinderBody(binders::Telescope<'a>),
             LocalFunctionAnnotation(Box<local_functions::Build<'a>>),
-            LocalFunctionStart(Box<local_functions::Build<'a>>, Option<usize>),
+            LocalFunctionStart(Box<local_functions::Build<'a>>, local_functions::Candidate),
             LocalFunctionValue(Box<local_functions::Build<'a>>, usize),
             LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>, LetKind),
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>, LetKind),
@@ -5659,16 +5659,35 @@ impl Context {
                                     tasks.push(Task::Visit(value, Some(annotation.value), true));
                                 }
                             }
-                            Task::LocalFunctionStart(mut build, column) => {
-                                self.start_local_function_value(&mut build, column)?;
-                                let value = build.value_syntax;
-                                let expected = build.result_type.clone();
-                                tasks.push(Task::LocalFunctionValue(
-                                    build,
-                                    self.postponed_application_errors.len(),
-                                ));
-                                tasks.push(Task::Visit(value, expected, true));
-                            }
+                            Task::LocalFunctionStart(mut build, candidate) => match candidate {
+                                local_functions::Candidate::Course { decreasing } => {
+                                    let postponed_start = self.postponed_application_errors.len();
+                                    let value =
+                                        self.run_local_function_course(&mut build, decreasing)?;
+                                    values.push(value);
+                                    tasks.push(Task::LocalFunctionValue(build, postponed_start));
+                                }
+                                local_functions::Candidate::NonRecursive => {
+                                    self.start_local_function_value(&mut build, None)?;
+                                    let value = build.value_syntax;
+                                    let expected = build.result_type.clone();
+                                    tasks.push(Task::LocalFunctionValue(
+                                        build,
+                                        self.postponed_application_errors.len(),
+                                    ));
+                                    tasks.push(Task::Visit(value, expected, true));
+                                }
+                                local_functions::Candidate::MatchColumn { column, .. } => {
+                                    self.start_local_function_value(&mut build, Some(column))?;
+                                    let value = build.value_syntax;
+                                    let expected = build.result_type.clone();
+                                    tasks.push(Task::LocalFunctionValue(
+                                        build,
+                                        self.postponed_application_errors.len(),
+                                    ));
+                                    tasks.push(Task::Visit(value, expected, true));
+                                }
+                            },
                             Task::LocalFunctionValue(build, postponed_start) => {
                                 if build.checkpoint.is_some() {
                                     // Completed local bodies hand selected errors
@@ -7728,14 +7747,13 @@ fn definition_elaboration(
         // partial declarations. An axiom uses only its header below; it must
         // not acquire the recursive-definition state used by unsafe bodies.
         if is_theorem
-            || is_opaque
             || context
                 .partial
                 .as_ref()
                 .is_some_and(|state| state.kind != partial::Kind::Unsafe)
         {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "unsafe axiom, def, abbrev, or data instance without partial",
+                expected: "unsafe axiom, def, abbrev, opaque, or data instance without partial",
             });
         }
         if !is_axiom {
@@ -8392,11 +8410,16 @@ fn definition_elaboration(
             value: term.value,
             all: vec![name.clone()],
         }))
-    } else if is_opaque {
+    } else if is_opaque
+        && !context.partial.as_ref().is_some_and(|state| {
+            state.kind == partial::Kind::Unsafe
+                && (state.reference.is_some() || state.group.is_some())
+        })
+    {
         Ok(Declaration::Opaque(fln_env::constants::OpaqueVal {
             base,
             value: term.value,
-            is_unsafe: false,
+            is_unsafe,
             all: vec![name.clone()],
         }))
     } else if context

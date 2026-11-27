@@ -2171,13 +2171,13 @@ fn opaque_module_ir_preserves_opacity_and_executes_in_the_pinned_reference() {
         );
     }
 
-    // Unsafe opaque syntax is currently refused by the frontend. A supported
-    // unsafe definition reaches the separate IR safety boundary. Neither
-    // refusal may replace the last-good safe opaque artifact family.
+    // Unsafe opaque and unsafe def declarations both reach the separate IR
+    // safety boundary (`ir.rs`). Neither refusal may replace the last-good
+    // safe opaque artifact family.
     for (declaration, diagnostic) in [
         (
             "public unsafe opaque Lib.unsafeValue : Nat := 9",
-            "expected unsafe axiom, def, abbrev, or data instance without partial",
+            "unsafe or partial source export",
         ),
         (
             "public unsafe def Lib.unsafeValue : Nat := 9",

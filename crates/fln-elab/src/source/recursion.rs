@@ -1647,125 +1647,206 @@ impl Context {
         hinted_parameter: Option<usize>,
     ) -> Result<Typed, NatDefinitionElabError> {
         let snapshot = self.clone();
-        let (selected, context) = self.contextual_recursive_match(parameters, syntax)?;
-        let columns = self.recursion_columns(parameters, selected)?;
-        let matched: Vec<_> = columns.iter().map(|(_, position)| *position).collect();
+        let matched_root = match self.contextual_recursive_match(parameters, syntax) {
+            Ok(pair) => Some(pair),
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
+                RecursionError::RootMatchRequired,
+            ))) => None,
+            Err(problem) => return Err(problem),
+        };
         let mut first_error = None;
-        for (column, decreasing) in columns {
-            if hinted_parameter.is_some_and(|position| position != decreasing) {
-                continue;
-            }
-            let mut generalized = HashSet::new();
-            let mut course = false;
-            loop {
-                let spent = self.txn.budget.heartbeats_consumed;
-                *self = snapshot.clone();
-                self.txn.budget.heartbeats_consumed = spent;
-                let result = self
-                    .prepare_recursion(
-                        name,
-                        parameters,
-                        selected,
-                        expected.as_ref(),
-                        column,
-                        &matched,
-                    )
-                    .and_then(|()| {
-                        self.recursion
-                            .as_mut()
-                            .expect("prepared structural candidate")
-                            .generalized_parameters = generalized.clone();
-                        if course {
-                            self.course_of_values_body(syntax, expected.clone())
-                        } else if context.is_empty() {
-                            let obligation =
-                                self.original_recursive_body_obligation(syntax, expected.clone())?;
-                            let mut value = self.term(syntax, expected.clone())?;
-                            value.value = Expr::let_e(
-                                structural_obligation_name(parameters.len()),
-                                obligation.type_,
-                                obligation.value,
-                                value.value,
-                                false,
-                            );
-                            Ok(value)
-                        } else {
-                            let build = self.prepare_contextual_recursion(
-                                syntax,
-                                &context,
-                                expected.clone(),
-                            )?;
-                            let body =
-                                self.distribute_recursive_context(selected, column, &build)?;
-                            let mut value = self.term(&body, expected.clone())?;
-                            value.value = value
-                                .value
-                                .abstract_fvar(&build.helper.id, 0)
-                                .map_err(|_| failure(SourceInferenceError::Scope))?;
-                            value.value = Expr::let_e(
-                                Name::anonymous(),
-                                build.helper.type_,
-                                build.helper.value.expect("typed context helper"),
-                                value.value,
-                                false,
-                            );
-                            value.value = Expr::let_e(
-                                structural_obligation_name(parameters.len()),
-                                build.obligation.type_,
-                                build.obligation.value,
-                                value.value,
-                                false,
-                            );
-                            Ok(value)
-                        }
-                    })
-                    .or_else(|problem| {
-                        // A failed synthetic argument can leave holes whose later
-                        // assignment reports a scope error. The selected body's
-                        // earlier termination diagnostic still belongs to this
-                        // candidate. Explicit tactic rollback restores that list;
-                        // internal faults and resource stops keep their own outcome.
-                        if tactics::backtrack::recoverable(&problem) {
+        if let Some((selected, context)) = matched_root {
+            let columns = self.recursion_columns(parameters, selected)?;
+            let matched: Vec<_> = columns.iter().map(|(_, position)| *position).collect();
+            for (column, decreasing) in columns {
+                if hinted_parameter.is_some_and(|position| position != decreasing) {
+                    continue;
+                }
+                let mut generalized = HashSet::new();
+                let mut course = false;
+                loop {
+                    let spent = self.txn.budget.heartbeats_consumed;
+                    *self = snapshot.clone();
+                    self.txn.budget.heartbeats_consumed = spent;
+                    let result = self
+                        .prepare_recursion(
+                            name,
+                            parameters,
+                            selected,
+                            expected.as_ref(),
+                            column,
+                            &matched,
+                        )
+                        .and_then(|()| {
+                            self.recursion
+                                .as_mut()
+                                .expect("prepared structural candidate")
+                                .generalized_parameters = generalized.clone();
+                            if course {
+                                self.course_of_values_body(syntax, expected.clone())
+                            } else if context.is_empty() {
+                                let obligation = self
+                                    .original_recursive_body_obligation(syntax, expected.clone())?;
+                                let mut value = self.term(syntax, expected.clone())?;
+                                value.value = Expr::let_e(
+                                    structural_obligation_name(parameters.len()),
+                                    obligation.type_,
+                                    obligation.value,
+                                    value.value,
+                                    false,
+                                );
+                                Ok(value)
+                            } else {
+                                let build = self.prepare_contextual_recursion(
+                                    syntax,
+                                    &context,
+                                    expected.clone(),
+                                )?;
+                                let body =
+                                    self.distribute_recursive_context(selected, column, &build)?;
+                                let mut value = self.term(&body, expected.clone())?;
+                                value.value = value
+                                    .value
+                                    .abstract_fvar(&build.helper.id, 0)
+                                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                                value.value = Expr::let_e(
+                                    Name::anonymous(),
+                                    build.helper.type_,
+                                    build.helper.value.expect("typed context helper"),
+                                    value.value,
+                                    false,
+                                );
+                                value.value = Expr::let_e(
+                                    structural_obligation_name(parameters.len()),
+                                    build.obligation.type_,
+                                    build.obligation.value,
+                                    value.value,
+                                    false,
+                                );
+                                Ok(value)
+                            }
+                        })
+                        .or_else(|problem| {
+                            // A failed synthetic argument can leave holes whose later
+                            // assignment reports a scope error. The selected body's
+                            // earlier termination diagnostic still belongs to this
+                            // candidate. Explicit tactic rollback restores that list;
+                            // internal faults and resource stops keep their own outcome.
+                            if tactics::backtrack::recoverable(&problem) {
+                                self.require_no_postponed_recursion_since(
+                                    snapshot.postponed_application_errors.len(),
+                                )?;
+                            }
+                            Err(problem)
+                        })
+                        .and_then(|value| {
                             self.require_no_postponed_recursion_since(
                                 snapshot.postponed_application_errors.len(),
                             )?;
-                        }
-                        Err(problem)
-                    })
-                    .and_then(|value| {
-                        self.require_no_postponed_recursion_since(
-                            snapshot.postponed_application_errors.len(),
-                        )?;
-                        Ok(value)
-                    });
-                match result {
-                    Ok(value) => return Ok(value),
-                    Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
-                        RecursionError::NotDecreasing,
-                    ))) if !course => course = true,
-                    Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
-                        RecursionError::GeneralizeParameter { owner, position },
-                    ))) if owner == parameters[decreasing].id
-                        && position < decreasing
-                        && generalized.insert(position) => {}
-                    Err(
-                        problem @ NatDefinitionElabError::Inference(
-                            SourceInferenceError::Recursion(
-                                RecursionError::NotDecreasing
-                                | RecursionError::ChangedParameter
-                                | RecursionError::ChangedIndex
-                                | RecursionError::RootMatchRequired
-                                | RecursionError::ExplicitParameterRequired
-                                | RecursionError::PartialApplication,
+                            Ok(value)
+                        });
+                    match result {
+                        Ok(value) => return Ok(value),
+                        Err(NatDefinitionElabError::Inference(
+                            SourceInferenceError::Recursion(RecursionError::NotDecreasing),
+                        )) if !course => course = true,
+                        Err(NatDefinitionElabError::Inference(
+                            SourceInferenceError::Recursion(RecursionError::GeneralizeParameter {
+                                owner,
+                                position,
+                            }),
+                        )) if owner == parameters[decreasing].id
+                            && position < decreasing
+                            && generalized.insert(position) => {}
+                        Err(
+                            problem @ NatDefinitionElabError::Inference(
+                                SourceInferenceError::Recursion(
+                                    RecursionError::NotDecreasing
+                                    | RecursionError::ChangedParameter
+                                    | RecursionError::ChangedIndex
+                                    | RecursionError::RootMatchRequired
+                                    | RecursionError::ExplicitParameterRequired
+                                    | RecursionError::PartialApplication,
+                                ),
                             ),
-                        ),
-                    ) => {
-                        first_error.get_or_insert(problem);
-                        break;
+                        ) => {
+                            first_error.get_or_insert(problem);
+                            break;
+                        }
+                        Err(problem) => {
+                            self.restore_recursion_error(snapshot, &problem);
+                            return Err(problem);
+                        }
                     }
-                    Err(problem) => {
-                        self.restore_recursion_error(snapshot, &problem);
-                        return Err(problem);
+                }
+            }
+        } else {
+            // A structural match may sit under a binder such as `dite` or `let`
+            // (e.g. `Array.appendCore`/`Array.extract`). Course-of-values
+            // (`brecOn`) does not require a root-level match: `below` is
+            // generalized by ordinary dependent matching wherever `match` runs.
+            let candidates = self.course_candidate_parameters(parameters)?;
+            for decreasing in candidates {
+                if hinted_parameter.is_some_and(|position| position != decreasing) {
+                    continue;
+                }
+                let mut generalized = HashSet::new();
+                loop {
+                    let spent = self.txn.budget.heartbeats_consumed;
+                    *self = snapshot.clone();
+                    self.txn.budget.heartbeats_consumed = spent;
+                    let result = self
+                        .prepare_course_recursion(name, parameters, decreasing, expected.as_ref())
+                        .and_then(|()| {
+                            self.recursion
+                                .as_mut()
+                                .expect("prepared course candidate")
+                                .generalized_parameters = generalized.clone();
+                            self.course_of_values_body(syntax, expected.clone())
+                        })
+                        .or_else(|problem| {
+                            if tactics::backtrack::recoverable(&problem) {
+                                self.require_no_postponed_recursion_since(
+                                    snapshot.postponed_application_errors.len(),
+                                )?;
+                            }
+                            Err(problem)
+                        })
+                        .and_then(|value| {
+                            self.require_no_postponed_recursion_since(
+                                snapshot.postponed_application_errors.len(),
+                            )?;
+                            Ok(value)
+                        });
+                    match result {
+                        Ok(value) => return Ok(value),
+                        Err(NatDefinitionElabError::Inference(
+                            SourceInferenceError::Recursion(RecursionError::GeneralizeParameter {
+                                owner,
+                                position,
+                            }),
+                        )) if owner == parameters[decreasing].id
+                            && position < decreasing
+                            && generalized.insert(position) => {}
+                        Err(
+                            problem @ NatDefinitionElabError::Inference(
+                                SourceInferenceError::Recursion(
+                                    RecursionError::NotDecreasing
+                                    | RecursionError::ChangedParameter
+                                    | RecursionError::ChangedIndex
+                                    | RecursionError::RootMatchRequired
+                                    | RecursionError::ExplicitParameterRequired
+                                    | RecursionError::PartialApplication,
+                                ),
+                            ),
+                        ) => {
+                            first_error.get_or_insert(problem);
+                            break;
+                        }
+                        Err(problem) => {
+                            self.restore_recursion_error(snapshot, &problem);
+                            return Err(problem);
+                        }
                     }
                 }
             }
@@ -1833,6 +1914,49 @@ impl Context {
         Ok(columns)
     }
 
+    pub(super) fn course_candidate_parameters(
+        &mut self,
+        parameters: &[LocalDecl],
+    ) -> Result<Vec<usize>, NatDefinitionElabError> {
+        let mut candidates = Vec::new();
+        for (index, parameter) in parameters.iter().enumerate() {
+            self.tick()?;
+            let family_type = self.whnf(&parameter.type_)?;
+            let (head, _) = self.course_spine(&family_type)?;
+            let ExprNode::Const { name, .. } = head.node() else {
+                continue;
+            };
+            let Some(ConstantInfo::Induct(family)) = self.txn.env.find(name) else {
+                continue;
+            };
+            if family.all.len() != 1 {
+                continue;
+            }
+            let brec = Name::str(name.clone(), "brecOn");
+            if !self.is_auxiliary_recursor(&brec)? {
+                continue;
+            }
+            if matches!(
+                self.txn.env.find(&brec),
+                Some(ConstantInfo::Defn(definition))
+                    if definition.safety == fln_env::constants::DefinitionSafety::Safe
+            ) {
+                candidates.push(index);
+            }
+        }
+        Ok(candidates)
+    }
+
+    pub(super) fn prepare_course_recursion(
+        &mut self,
+        name: &Name,
+        parameters: &[LocalDecl],
+        decreasing: usize,
+        expected: Option<&Expr>,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.prepare_recursion_for_parameter(name, parameters, expected, 0, decreasing, &[])
+    }
+
     pub(super) fn prepare_recursion(
         &mut self,
         name: &Name,
@@ -1842,7 +1966,6 @@ impl Context {
         column: usize,
         matched: &[usize],
     ) -> Result<(), NatDefinitionElabError> {
-        let expected = expected.ok_or_else(|| error(RecursionError::ResultTypeRequired))?;
         while let Some(inner) = parenthesized_inner(syntax)? {
             self.tick()?;
             syntax = inner;
@@ -1875,6 +1998,21 @@ impl Context {
             .iter()
             .rposition(|local| &local.user_name == val)
             .ok_or_else(|| error(RecursionError::RootMatchRequired))?;
+        self.prepare_recursion_for_parameter(
+            name, parameters, expected, column, decreasing, matched,
+        )
+    }
+
+    fn prepare_recursion_for_parameter(
+        &mut self,
+        name: &Name,
+        parameters: &[LocalDecl],
+        expected: Option<&Expr>,
+        column: usize,
+        decreasing: usize,
+        matched: &[usize],
+    ) -> Result<(), NatDefinitionElabError> {
+        let expected = expected.ok_or_else(|| error(RecursionError::ResultTypeRequired))?;
         let reference = self.reference_result(expected);
         let mut full_type = self.instantiate(&reference)?;
         for local in parameters.iter().rev() {

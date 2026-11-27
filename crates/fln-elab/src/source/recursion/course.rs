@@ -113,7 +113,7 @@ impl Context {
         self.match_apply(function, Typed { value, type_ })
     }
 
-    pub(super) fn course_of_values_body(
+    pub(in crate::source) fn course_of_values_body(
         &mut self,
         syntax: &Syntax,
         expected: Option<Expr>,

@@ -2022,8 +2022,8 @@ pub(crate) fn tag_noncomputable(
         Declaration::Defn(value) => &value.base.name,
         Declaration::Thm(value) => &value.base.name,
         Declaration::Opaque(value) => &value.base.name,
-        // Public proof/opaque interfaces retain the checked declaration's exact name.
-        Declaration::Axiom(value) if !value.is_unsafe => &value.base.name,
+        // Public proof, opaque, and hidden unsafe interfaces retain the checked declaration's exact name.
+        Declaration::Axiom(value) => &value.base.name,
         _ => {
             return Err(EngineExecutionError::UnexpectedPublication {
                 detail: "noncomputable metadata requires one checked declaration",

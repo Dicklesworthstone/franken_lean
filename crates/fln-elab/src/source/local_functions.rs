@@ -55,6 +55,14 @@ pub(super) struct Build<'a> {
     pub omitted: Option<recursion::OmittedResult>,
 }
 
+/// Candidate lowering tried for a recursive local function (`let rec`).
+#[derive(Clone, Copy)]
+pub(super) enum Candidate {
+    NonRecursive,
+    MatchColumn { column: usize, decreasing: usize },
+    Course { decreasing: usize },
+}
+
 /// Like tactic choices, structural candidates live on the driver's flat stack.
 /// Restoring a candidate restores semantic state, never spent work. The first
 /// candidate is an ordinary (possibly nonrecursive) local function; only an
@@ -62,7 +70,7 @@ pub(super) struct Build<'a> {
 pub(super) struct Checkpoint<'a> {
     context: Box<Context>,
     build: Build<'a>,
-    candidates: Vec<Option<(usize, usize)>>,
+    candidates: Vec<Candidate>,
     next: usize,
     generalized_parameters: HashSet<usize>,
     pub tasks: usize,
@@ -103,14 +111,27 @@ impl<'a> Checkpoint<'a> {
         values: usize,
     ) -> Result<Self, NatDefinitionElabError> {
         context.open_local_recursive_lambdas(&mut build)?;
-        let mut candidates = vec![None];
+        let mut candidates = vec![Candidate::NonRecursive];
         let body = original(context, build.value_syntax)?;
         match context.recursion_columns(&build.parameters, body) {
-            Ok(columns) => candidates.extend(columns.into_iter().map(Some)),
+            Ok(columns) => {
+                candidates.extend(
+                    columns
+                        .into_iter()
+                        .map(|(column, decreasing)| Candidate::MatchColumn { column, decreasing }),
+                );
+            }
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
                 recursion::RecursionError::RootMatchRequired,
             ))) => {}
             Err(problem) => return Err(problem),
+        }
+        // Course-of-values (`brecOn`) handles structural matches nested inside
+        // binders/conditionals (e.g. `dite ... (fun hlt => match i with ...)` in
+        // `Array.appendCore`/`Array.extract`) as well as multi-step structural
+        // descent after root-match candidates are exhausted.
+        for decreasing in context.course_candidate_parameters(&build.parameters)? {
+            candidates.push(Candidate::Course { decreasing });
         }
         Ok(Self {
             context: Box::new(context.clone()),
@@ -122,13 +143,13 @@ impl<'a> Checkpoint<'a> {
             values,
         })
     }
-    pub fn begin(&mut self, index: usize) -> (Build<'a>, Option<usize>) {
+    pub fn begin(&mut self, index: usize) -> (Build<'a>, Candidate) {
         let candidate = self.candidates[self.next];
         self.next += 1;
         let mut build = self.build.clone();
         build.checkpoint = Some(index);
         build.generalized_parameters = self.generalized_parameters.clone();
-        (build, candidate.map(|(column, _)| column))
+        (build, candidate)
     }
     pub fn restore(&self, context: &mut Context) {
         let spent = context.txn.budget.heartbeats_consumed;
@@ -140,7 +161,9 @@ impl<'a> Checkpoint<'a> {
             recursion::RecursionError::GeneralizeParameter { owner, position },
         )) = problem
         {
-            if let Some(Some((_, decreasing))) = self
+            if let Some(
+                Candidate::MatchColumn { decreasing, .. } | Candidate::Course { decreasing },
+            ) = self
                 .next
                 .checked_sub(1)
                 .and_then(|index| self.candidates.get(index))
@@ -509,6 +532,16 @@ impl Context {
         let ExprNode::FVar { id } = marker.value.node() else {
             return Err(failure(SourceInferenceError::Scope));
         };
+        self.install_local_recursive_context(build, id.clone(), marker.type_)?;
+        Ok(())
+    }
+
+    fn install_local_recursive_context(
+        &mut self,
+        build: &mut Build<'_>,
+        id: FVarId,
+        marker_type: Expr,
+    ) -> Result<(), NatDefinitionElabError> {
         build.marker = Some(id.clone());
         // Put the self binder BEFORE the parameters: self shadows an outer
         // local/global, but a parameter with the same source name shadows self.
@@ -531,9 +564,9 @@ impl Context {
             tactics::eliminate::add_local(&mut context, &local);
         }
         context.add_param(
-            id.clone(),
+            id,
             build.binding.name.clone(),
-            marker.type_,
+            marker_type,
             BinderInfo::Default,
         );
         for parameter in &build.parameters {
@@ -542,6 +575,70 @@ impl Context {
         }
         self.txn.lctx = context;
         Ok(())
+    }
+
+    pub(super) fn run_local_function_course(
+        &mut self,
+        build: &mut Build<'_>,
+        decreasing: usize,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        if !build.binding.recursive {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        if let Some(hint) = &build.binding.termination {
+            let parameter =
+                self.structural_hint_parameter(hint, &build.parameters, build.header_parameters)?;
+            if decreasing != parameter {
+                return Err(failure(SourceInferenceError::Recursion(
+                    recursion::RecursionError::NotDecreasing,
+                )));
+            }
+        }
+        self.local_function_lifting.parent = build.lift_name.clone();
+        build.outer_recursion = self.recursion.take();
+        if let Some(outer) = &build.outer_recursion {
+            self.enclosing_recursions.push(outer.clone());
+        }
+        let expected = build
+            .result_type
+            .clone()
+            .expect("recursive result annotation");
+        let mut body = original(self, build.value_syntax)?;
+        while let Some(inner) = parenthesized_inner(body)? {
+            self.tick()?;
+            body = inner;
+        }
+        self.prepare_course_recursion(
+            &build.binding.name,
+            &build.parameters,
+            decreasing,
+            Some(&expected),
+        )?;
+        self.recursion
+            .as_mut()
+            .expect("local course candidate")
+            .generalized_parameters = build.generalized_parameters.clone();
+        let marker = self
+            .recursion
+            .as_ref()
+            .expect("local course candidate")
+            .reference
+            .clone();
+        let ExprNode::FVar { id } = marker.value.node() else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        self.install_local_recursive_context(build, id.clone(), marker.type_)?;
+        let saved_course_len = self.course_definitions.len();
+        let value = self.course_of_values_body(body, Some(expected))?;
+        // Avoid recording an unqualified local binding name (e.g. `loop`) as a
+        // top-level course definition; associate with the lifted name if any.
+        self.course_definitions.truncate(saved_course_len);
+        if let Some(lift_name) = &build.lift_name
+            && !self.course_definitions.contains(lift_name)
+        {
+            self.course_definitions.push(lift_name.clone());
+        }
+        Ok(value)
     }
 
     pub(super) fn close_local_function(
