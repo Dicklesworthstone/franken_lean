@@ -768,6 +768,9 @@ struct Context {
     simp_discharge_depth: usize,
     // Host-owned generated trees nest only while their evaluator is alive.
     tactic_macro_depth: usize,
+    // Owned imported autoParam tactic trees may enter nested term evaluators.
+    // Keep this host nesting bounded independently of each proof worklist.
+    auto_param_depth: usize,
     // Term macro dispatch is active inside by proofs, including native tactics.
     tactic_macro_terms: usize,
     // Rejection-model checks observe actual macro expansions without executing
@@ -1035,6 +1038,7 @@ impl Context {
             attempt_depth: 0,
             simp_discharge_depth: 0,
             tactic_macro_depth: 0,
+            auto_param_depth: 0,
             tactic_macro_terms: 0,
             application_syntax: pattern_typing::ApplicationSyntax::default(),
             opaque_locals: std::collections::HashSet::new(),

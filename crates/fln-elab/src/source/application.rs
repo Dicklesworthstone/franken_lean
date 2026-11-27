@@ -29,6 +29,7 @@ pub(super) struct NamedApplication<'a> {
     result_expected: Option<Expr>,
     saved: LocalContext,
     eta: Vec<(Name, FVarId, Expr)>,
+    auto: Vec<optional::AutoParameter>,
 }
 
 impl NamedApplication<'_> {
@@ -182,6 +183,7 @@ impl Context {
             expected,
             saved: self.txn.lctx.clone(),
             eta: Vec::new(),
+            auto: Vec::new(),
         })
     }
 
@@ -327,6 +329,13 @@ impl Context {
                 && let Some(value) = optional::default_value(&domain)
             {
                 value.clone()
+            } else if !state.explicit
+                && let Some(tactic) = optional::auto_tactic(&domain)
+            {
+                let automatic = self.defer_auto_parameter(tactic, argument_domain)?;
+                let value = automatic.value();
+                state.auto.push(automatic);
+                value
             } else if state.ellipsis
                 || self.named_argument_depends_on_current(&state.function.type_, &state.named)?
             {
@@ -390,6 +399,7 @@ impl Context {
                 self.settle_result_out_param(&state.function, state.explicit)?;
                 self.finish_application_implicits(state.function, state.result_expected.as_ref())?
             };
+            self.finish_auto_parameters(state.auto)?;
             term.value = self.instantiate(&term.value)?;
             term.type_ = self.instantiate(&term.type_)?;
             for (name, id, domain) in state.eta.into_iter().rev() {
