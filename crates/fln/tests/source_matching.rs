@@ -1282,3 +1282,99 @@ def withoutExpected := inferInstanceAs (Decidable (Eq (0 : Nat) 0))
         assert_eq!(e.logical_root(&KVMap::new()), root);
     }
 }
+
+#[test]
+fn advisory_result_hints_and_specialized_nonrec_empty_branches() {
+    // 1. Recursive `List.hasDecEq` pattern (`Init/Prelude.lean:2971`) with 4
+    //    `noConfusion rfl (heq_of_eq h)` calls before `CoeT` exists: advisory
+    //    expected-type propagation must not leave stuck equations in `self.equations`.
+    // 2. `List.get` pattern (`Init/Prelude.lean:3059`): omitting the `nil` arm when
+    //    a branch-specialized non-recursive structure (`MyFin MyList.nil.len`) exposes
+    //    an empty indexed proof field (`Le (Nat.succ val) 0`).
+    check(
+        r#"
+inductive MyList (α : Type) where
+  | nil : MyList α
+  | cons (head : α) (tail : MyList α) : MyList α
+
+inductive Dec (p : Prop) where
+  | isFalse (h : p -> False) : Dec p
+  | isTrue (h : p) : Dec p
+
+class MyDecEq (α : Type) where
+  dec : (a b : α) -> Dec (Eq a b)
+
+theorem heqOfEq {α : Type} {a b : α} (h : Eq a b) : HEq a b :=
+  Eq.rec (motive := fun x _ => HEq a x) HEq.refl h
+
+theorem eqOfHeq {α : Type} {a b : α} (h : HEq a b) : Eq a b :=
+  HEq.rec (motive := fun b _ => Eq a b) rfl h
+
+def MyList.hasDecEq {α : Type} [MyDecEq α] : (a b : MyList α) -> Dec (Eq a b)
+  | MyList.nil, MyList.nil => Dec.isTrue rfl
+  | MyList.cons _ _, MyList.nil => Dec.isFalse (fun h => MyList.noConfusion rfl (heqOfEq h))
+  | MyList.nil, MyList.cons _ _ => Dec.isFalse (fun h => MyList.noConfusion rfl (heqOfEq h))
+  | MyList.cons a as, MyList.cons b bs =>
+    match MyDecEq.dec a b with
+    | Dec.isTrue hab =>
+      match MyList.hasDecEq as bs with
+      | Dec.isTrue habs => Dec.isTrue (hab ▸ habs ▸ rfl)
+      | Dec.isFalse nabs => Dec.isFalse (fun h => MyList.noConfusion rfl (heqOfEq h) (fun _ habs => nabs (eqOfHeq habs)))
+    | Dec.isFalse nab => Dec.isFalse (fun h => MyList.noConfusion rfl (heqOfEq h) (fun hab _ => nab (eqOfHeq hab)))
+
+inductive Le (n : Nat) : Nat -> Prop where
+  | refl : Le n n
+  | step {m : Nat} : Le n m -> Le n (Nat.succ m)
+
+def leOfSuccLeSucc {n m : Nat} (h : Le (Nat.succ n) (Nat.succ m)) : Le n m :=
+  match h with
+  | Le.refl => Le.refl
+  | Le.step h' =>
+    let rec go {k : Nat} (hk : Le (Nat.succ n) k) : Le n k :=
+      match hk with
+      | Le.refl => Le.step Le.refl
+      | Le.step h'' => Le.step (go h'')
+    go h'
+
+structure MyFin (n : Nat) where
+  val : Nat
+  isLt : Le (Nat.succ val) n
+
+def MyList.len {α : Type} : MyList α -> Nat
+  | MyList.nil => 0
+  | MyList.cons _ as => Nat.succ (MyList.len as)
+
+def MyList.get {α : Type} : (as : MyList α) -> MyFin (MyList.len as) -> α
+  | MyList.cons a _, ⟨0, _⟩ => a
+  | MyList.cons _ as, ⟨Nat.succ i, h⟩ => MyList.get as ⟨i, leOfSuccLeSucc h⟩
+"#,
+    );
+
+    // Negative control: omitting `nil` when the specialized non-recursive structure
+    // is still inhabited must remain refused.
+    let bad = r#"
+inductive MyList (α : Type) where
+  | nil : MyList α
+  | cons (head : α) (tail : MyList α) : MyList α
+def MyList.len {α : Type} : MyList α -> Nat
+  | MyList.nil => 0
+  | MyList.cons _ as => Nat.succ (MyList.len as)
+structure Wrap (n : Nat) where
+  flag : Bool
+def badGet {α : Type} : (as : MyList α) -> Wrap (MyList.len as) -> α
+  | MyList.cons a _, ⟨true⟩ => a
+  | MyList.cons a _, ⟨false⟩ => a
+"#;
+    let e = engine();
+    let root = e.logical_root(&KVMap::new());
+    assert!(
+        e.check_source_files(
+            &[bad.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .is_err(),
+        "must refuse omitted branch when specialized structure is inhabited"
+    );
+    assert_eq!(e.logical_root(&KVMap::new()), root);
+}

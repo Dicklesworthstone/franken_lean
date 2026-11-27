@@ -305,10 +305,22 @@ impl Context {
                 &goal.target,
             )?
             .ok_or_else(|| error(TacticError::UnsupportedEliminator))?;
-        let mut pending = vec![
-            EmptyTask::Close(goal, value),
-            EmptyTask::Split(child, columns.iter().cloned().collect(), columns.to_vec()),
-        ];
+        self.solve_empty_false_goal(proof, child, columns, None)?;
+        self.close_proof_goal(goal, value)
+    }
+
+    fn solve_empty_false_goal<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        child: ProofGoal,
+        columns: &[Name],
+        mut remaining_splits: Option<u8>,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut pending = vec![EmptyTask::Split(
+            child,
+            columns.iter().cloned().collect(),
+            columns.to_vec(),
+        )];
         while let Some(task) = pending.pop() {
             self.tick()?;
             let (goal, mut remaining, evidence) = match task {
@@ -381,6 +393,12 @@ impl Context {
                 pending.push(EmptyTask::Split(goal, remaining, evidence));
                 continue;
             };
+            if let Some(splits) = &mut remaining_splits {
+                if *splits == 0 {
+                    return Err(error(TacticError::EliminationCoverage));
+                }
+                *splits -= 1;
+            }
             let fields = self.empty_field_names(&family)?;
             let mut ordered_fields = Vec::new();
             for constructor in &family.ctors {
@@ -505,7 +523,53 @@ impl Context {
                     },
                     &goal.target,
                 )? {
-                    if self.close_indexed_empty_leaf(child, &evidence)? {
+                    if self.close_indexed_empty_leaf(child.clone(), &evidence)? {
+                        self.close_proof_goal(goal, value)?;
+                        return Ok(true);
+                    }
+                    // Destructure branch-specialized non-recursive inductives (e.g.
+                    // `Fin List.nil.length` -> `val` + `isLt : val < 0` in `List.get`),
+                    // mirroring `Match.lean`'s constructor transitions when `alts` is empty.
+                    self.txn.lctx = child.lctx.clone();
+                    let mut has_nonrec_inductive = false;
+                    for item in &evidence {
+                        self.tick()?;
+                        let type_ = self.whnf(&item.type_)?;
+                        let (head, _) = operators::spine(&type_);
+                        if let ExprNode::Const { name, .. } = head.node()
+                            && let Some(ConstantInfo::Induct(family)) = self.txn.env.find(name)
+                            && !family.is_rec
+                            && !family.ctors.is_empty()
+                        {
+                            has_nonrec_inductive = true;
+                            break;
+                        }
+                    }
+                    if has_nonrec_inductive {
+                        let mut matrix_child = child;
+                        let mut columns = Vec::with_capacity(evidence.len());
+                        self.txn.lctx = matrix_child.lctx.clone();
+                        for item in &evidence {
+                            self.tick()?;
+                            let name = self.fresh_name()?;
+                            let local = LocalDecl {
+                                id: FVarId(name.clone()),
+                                user_name: name.clone(),
+                                type_: item.type_.clone(),
+                                value: Some(item.value.clone()),
+                                binder_info: BinderInfo::Default,
+                                index: self.txn.lctx.len(),
+                            };
+                            eliminate::add_local(&mut self.txn.lctx, &local);
+                            matrix_child.introduced.push(local);
+                            columns.push(name);
+                        }
+                        matrix_child.lctx = self.txn.lctx.clone();
+                        let mut proof = self.empty_proof_state(
+                            matrix_child.target.clone(),
+                            Expr::mvar(matrix_child.id.clone()),
+                        );
+                        self.solve_empty_false_goal(&mut proof, matrix_child, &columns, Some(16))?;
                         self.close_proof_goal(goal, value)?;
                         return Ok(true);
                     }

@@ -323,25 +323,33 @@ impl Context {
             && !self.has_coercion_class("MonadLiftT")?
             && !self.has_coercion_class("Monad")?
         {
-            // Keep the written applications for ordinary unification. Reducing
-            // `Id ?A` first exposes its hole and can assign the entire expected
-            // `Id Nat` to it, changing later numeral/instance selection. The
-            // original equation chooses `?A := Nat` before any delta retry.
-            //
-            // A result HINT runs before the remaining argument elaborates, so a
-            // concrete refutation here must stay advisory: making it fatal
-            // masked the argument's own diagnostic — `Nat.succ ·` reported a
-            // NotDefEq conversion instead of the pin's "invalid occurrence of
-            // `·` notation" (fln-ffce comment 3297) — and the coercion branch
-            // below already drops a false equality. The equation is still
-            // checked for real where the application completes and at the
-            // declaration's ordinary K1 admission.
-            match self.constrain(actual, expected) {
-                Err(NatDefinitionElabError::Inference(
-                    SourceInferenceError::ConversionRefused(_),
-                )) => Ok(()),
-                other => other,
-            }?;
+            // Keep the written applications for ordinary unification: try
+            // `Abbreviations` before `Default` so `Id ?A =?= Id Nat` chooses
+            // `?A := Nat` without unfolding `Id`. As in the pin's
+            // `propagateExpectedType` (`Lean/Elab/App.lean:599-607`), a result
+            // hint is strictly advisory: if the isolated probe defers or
+            // mismatches before later arguments determine its holes (e.g.
+            // `List.noConfusionType ?P ?α ?v1 ?α ?v2 =?= False`), do not push
+            // a stuck hint onto `self.equations` to be re-unfolded on every
+            // subsequent `flush`. The real obligation runs when the application
+            // completes and at declaration admission.
+            let actual = self.instantiate(actual)?;
+            let expected = self.instantiate(expected)?;
+            if actual.has_expr_mvar()
+                || expected.has_expr_mvar()
+                || actual.has_level_mvar()
+                || expected.has_level_mvar()
+            {
+                match self.unify_pending_batch(&[(actual, expected)], true, false)? {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        let wrapped = failure(SourceInferenceError::Unification(Box::new(error)));
+                        if !nonmatch(&wrapped) {
+                            return Err(wrapped);
+                        }
+                    }
+                }
+            }
         } else if self.coercion_eq(actual, expected)? {
             return Ok(());
         }
