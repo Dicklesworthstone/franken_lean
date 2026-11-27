@@ -33,6 +33,8 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Provision the locked suite dependency
+        run: bash scripts/ci/checkout_asupersync.sh
       - name: Check native coverage, recursion, row priority and pattern binders
         run: |
           cargo test --locked -p fln --test source_matrix_coverage --test source_matrix_recursion --test source_pattern_matrices --test source_pattern_binders --test source_named_match_hints --no-fail-fast

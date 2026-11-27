@@ -96,6 +96,22 @@ fn the_first_refutable_pattern_controls_open_term_reduction() {
 }
 
 #[test]
+fn upstream_five_column_match_reduces_after_each_right_to_left_split() {
+    let fixture = include_str!("../../../vendor/lean4-src/tests/elab/issue10749.lean");
+    let start = fixture.find("def test4' :").expect("pinned declaration");
+    let (definition, _) = fixture[start..]
+        .split_once("\n/--")
+        .expect("pinned matcher expectation");
+    check(&format!(
+        "{definition}
+        theorem fifth (a b c d : Bool) : test4' a b c d true = true := by rfl
+        theorem fourth (a b c : Bool) : test4' a b c true false = true := by rfl
+        theorem middle (a b : Bool) : test4' a b true false false = true := by rfl
+        theorem allFalse : test4' false false false false false = false := by rfl"
+    ));
+}
+
+#[test]
 fn variable_columns_bind_values_without_erasing_discriminants() {
     check(
         "def copy (n : Nat) (b : Bool) : Nat := match n, b with
