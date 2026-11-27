@@ -535,6 +535,162 @@ fn boxed_export_cases() -> Vec<BoxedExportCase> {
             result: IrType::UInt8,
             reduced: Some(("Bool -> Bool", "compiled true")),
         },
+        BoxedExportCase {
+            ty: "IRNatWrapper",
+            body: "IRNatWrapper.mk 42",
+            application: "compiled.value",
+            expected: "42",
+            parameters: vec![],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Nat -> IRNatWrapper",
+            body: "fun n => IRNatWrapper.mk n",
+            application: "((compiled 42).value, (compiled large).value, large)",
+            expected: "(42, 184467440737095516160, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRNatWrapper -> IRNatWrapper",
+            body: "fun p => p",
+            application: "let p := IRNatWrapper.mk large; let q := compiled p; ((compiled (IRNatWrapper.mk 42)).value, q.value, p.value)",
+            expected: "(42, 184467440737095516160, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRNatWrapper -> Nat",
+            body: "fun p => match p with | .mk n => n",
+            application: "let p := IRNatWrapper.mk large; (compiled p, p.value)",
+            expected: "(184467440737095516160, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "String -> IRStringWrapper",
+            body: "fun s => IRStringWrapper.mk s",
+            application: "let p := compiled heap; (p.value, heap)",
+            expected: "(\"boxed heap payload\", \"boxed heap payload\")",
+            parameters: vec![IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRStringWrapper -> IRStringWrapper",
+            body: "fun p => IRStringWrapper.mk (p.value ++ p.value)",
+            application: "let p := IRStringWrapper.mk heap; let q := compiled p; (q.value, p.value)",
+            expected: "(\"boxed heap payloadboxed heap payload\", \"boxed heap payload\")",
+            parameters: vec![IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRStringWrapper -> String",
+            body: "fun p => p.value",
+            application: "let p := IRStringWrapper.mk heap; (compiled p, p.value)",
+            expected: "(\"boxed heap payload\", \"boxed heap payload\")",
+            parameters: vec![IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Bool -> IRBoolBox",
+            body: "fun b => IRBoolBox.mk b",
+            application: "((compiled false).value, (compiled true).value)",
+            expected: "(false, true)",
+            parameters: vec![IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRBoolBox -> Bool",
+            body: "fun p => p.value",
+            application: "(compiled (IRBoolBox.mk false), compiled (IRBoolBox.mk true))",
+            expected: "(false, true)",
+            parameters: vec![IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRBoolBox -> IRBoolBox",
+            body: "fun p => match p with | .mk b => IRBoolBox.mk b",
+            application: "((compiled (IRBoolBox.mk false)).value, (compiled (IRBoolBox.mk true)).value)",
+            expected: "(false, true)",
+            parameters: vec![IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRNatWrapper -> IRNatWrapper) -> IRNatWrapper -> IRNatWrapper",
+            body: "fun f p => f p",
+            application: "let p := IRNatWrapper.mk large; let q := compiled (fun x => IRNatWrapper.mk (x.value + 1)) p; (q.value, p.value)",
+            expected: "(184467440737095516161, 184467440737095516160)",
+            parameters: vec![IrType::Object, IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRBoolBox -> IRBoolBox) -> IRBoolBox -> IRBoolBox",
+            body: "fun f p => f p",
+            application: "let f := fun p : IRBoolBox => IRBoolBox.mk (if p.value then false else true); ((compiled f (IRBoolBox.mk false)).value, (compiled f (IRBoolBox.mk true)).value)",
+            expected: "(true, false)",
+            parameters: vec![IrType::Object, IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRStringWrapper -> String) -> String -> String",
+            body: "fun f s => f (IRStringWrapper.mk s)",
+            application: "(compiled (fun p => p.value ++ \"!\") heap, heap)",
+            expected: "(\"boxed heap payload!\", \"boxed heap payload\")",
+            parameters: vec![IrType::Object, IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "((Nat -> IRStringWrapper) -> IRStringWrapper) -> String -> IRStringWrapper",
+            body: "fun use s => use (fun _ => IRStringWrapper.mk s)",
+            application: "let p := compiled (fun f => f 42) heap; (p.value, heap)",
+            expected: "(\"boxed heap payload\", \"boxed heap payload\")",
+            parameters: vec![IrType::Object, IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRNatWrapper -> IRStringWrapper -> IRStringWrapper",
+            body: "fun _ p => p",
+            application: "let p := IRStringWrapper.mk heap; let q := compiled (IRNatWrapper.mk large) p; (q.value, p.value)",
+            expected: "(\"boxed heap payload\", \"boxed heap payload\")",
+            parameters: vec![IrType::TObject, IrType::Object],
+            result: IrType::Object,
+            reduced: Some((
+                "IRStringWrapper -> IRStringWrapper",
+                "let p := IRStringWrapper.mk heap; let q := compiled p; (q.value, p.value)",
+            )),
+        },
+        BoxedExportCase {
+            ty: "IRStringWrapper -> Nat -> Nat",
+            body: "fun _ n => n",
+            application: "compiled (IRStringWrapper.mk heap) 42",
+            expected: "42",
+            parameters: vec![IrType::Object, IrType::TObject],
+            result: IrType::TObject,
+            reduced: Some(("Nat -> Nat", "compiled 42")),
+        },
+        BoxedExportCase {
+            ty: "IRBoolBox -> Nat -> Nat",
+            body: "fun _ n => n",
+            application: "compiled (IRBoolBox.mk true) 42",
+            expected: "42",
+            parameters: vec![IrType::UInt8, IrType::TObject],
+            result: IrType::TObject,
+            reduced: Some(("Nat -> Nat", "compiled 42")),
+        },
     ]
 }
 
@@ -1174,25 +1330,67 @@ fn checked_definition(base: &Engine, source: &str) -> (fln::Declaration, Engine)
     let fln::ConstantInfo::Defn(definition) = environment.find(&name("compiled")).unwrap() else {
         panic!("source definition")
     };
-    let declaration = fln::Declaration::Defn(definition.clone());
-    // The source frontend also records equationInfo journals for matches.
-    // compile_source_definition accepts this exact raw declaration, so its
-    // independent expected successor must use the same admission boundary.
-    let admitted = base
+    (fln::Declaration::Defn(definition.clone()), checked.engine)
+}
+
+fn assert_definition_admission(
+    base: &Engine,
+    checked: &Engine,
+    compiled: &ir::DefinitionCompilation,
+    options: &KVMap,
+) {
+    // Source checking also records equation information for matches. The IR
+    // API receives only the Declaration, so its receipt must instead equal an
+    // independent admission of that exact declaration. Keep the full source
+    // snapshot as the execution oracle, and compare every logical declaration
+    // in both directions before checking the separate admission roots.
+    let fln::Declaration::Defn(definition) = &compiled.admission.declaration else {
+        panic!("compiled source definition")
+    };
+    let Some(fln::ConstantInfo::Defn(source)) = checked.environment().find(&definition.base.name)
+    else {
+        panic!("source definition identity")
+    };
+    assert_eq!(
+        definition, source,
+        "compiler must admit the unchanged source body"
+    );
+    let admitted = compiled.admission.engine.environment();
+    for (name, value) in checked.environment().constants() {
+        assert_eq!(
+            admitted.find(name),
+            Some(value),
+            "source declaration {name:?}"
+        );
+    }
+    for (name, value) in admitted.constants() {
+        assert_eq!(
+            checked.environment().find(name),
+            Some(value),
+            "unexpected compiler declaration {name:?}",
+        );
+    }
+    let original = base.logical_root(options);
+    let expected = base
         .admit_declaration(
-            declaration.clone(),
-            &KVMap::new(),
+            compiled.admission.declaration.clone(),
+            options,
             EngineAdmissionLimits::new(limits().kernel),
         )
         .unwrap()
         .into_complete()
         .unwrap();
+    assert_eq!(compiled.admission.base_logical_root, original);
+    assert_eq!(compiled.admission.admissions.len(), 1);
     assert_eq!(
-        admitted.engine.environment().find(&name("compiled")),
-        environment.find(&name("compiled")),
-        "raw admission changed the source declaration: {source}",
+        compiled.admission.result_logical_root,
+        expected.result_logical_root
     );
-    (declaration, admitted.engine)
+    assert_eq!(
+        compiled.admission.engine.logical_root(options),
+        expected.engine.logical_root(options),
+    );
+    assert_eq!(base.logical_root(options), original);
 }
 
 #[test]
@@ -1311,10 +1509,7 @@ fn fieldless_enum_exports_preserve_scalar_signatures_and_private_layouts() {
         .unwrap_or_else(|error| panic!("{source}: {error:?}"))
         .into_complete()
         .unwrap();
-        assert_eq!(
-            compiled.admission.result_logical_root,
-            checked.logical_root(&options)
-        );
+        assert_definition_admission(&base, &checked, &compiled, &options);
         let IrDecl::Function { params, result, .. } = compiled
             .module
             .decls
@@ -1439,10 +1634,7 @@ partial def resetIRChoice (n : Nat) (value : IRChoice) : IRChoice :=
             [IrType::TObject]
         );
         assert_eq!(*result, IrType::UInt8);
-        assert_eq!(
-            compiled.admission.result_logical_root,
-            checked.logical_root(&options)
-        );
+        assert_definition_admission(&base, &checked, &compiled, &options);
         assert_eq!(base.logical_root(&options), original);
     }
 }
@@ -1470,11 +1662,7 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
         .unwrap_or_else(|error| panic!("{source}: {error:?}"))
         .into_complete()
         .unwrap();
-        assert_eq!(
-            compiled.admission.result_logical_root,
-            checked.logical_root(&options),
-            "{source}",
-        );
+        assert_definition_admission(&base, &checked, &compiled, &options);
         let IrDecl::Function { params, result, .. } = compiled
             .module
             .decls
@@ -1506,6 +1694,13 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
             let (constructors, projections) = private_data_operations(&compiled.module);
             assert!(constructors > 0 && projections > 0);
         }
+        if case.ty.contains("Wrapper") || case.ty.contains("IRBoolBox") {
+            assert_eq!(
+                private_data_operations(&compiled.module),
+                (0, 0),
+                "single-field wrappers must not allocate or project a constructor: {source}",
+            );
+        }
         assert!(matches!(
             ir::compile_source_definition(
                 &base,
@@ -1534,6 +1729,10 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
         "def compiled (p : IRTextPair) : String := p.right",
         "def compiled (s : String) : IRTextPair := IRTextPair.mk s s",
         "def compiled (f : IRTextPair -> String) : String := f (IRTextPair.mk \"a\" \"b\")",
+        "def compiled (x : IRNatWrapper) : IRNatWrapper := x",
+        "def compiled (x : IRStringWrapper) : IRStringWrapper := x",
+        "def compiled (p : IRBoolBox) : Bool := p.value",
+        "def compiled (f : IRBoolBox -> Nat) : Nat := f (IRBoolBox.mk true)",
     ] {
         let (declaration, _) = checked_definition(&base, source);
         ir::compile_source_definition(
@@ -1549,14 +1748,6 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
         assert_eq!(base.logical_root(&options), original);
     }
     for (source, expected) in [
-        (
-            "def compiled (x : IRNatWrapper) : IRNatWrapper := x",
-            "source export carrier",
-        ),
-        (
-            "def compiled (x : IRStringWrapper) : IRStringWrapper := x",
-            "source export carrier",
-        ),
         (
             "def compiled (x : IRProofBox) : IRProofBox := x",
             "source export carrier",
@@ -1587,6 +1778,14 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
         ),
         (
             "def compiled (x : IRInterleaved) (_ : IRScalarReordered) : IRInterleaved := x",
+            "conflicting source constructor layouts",
+        ),
+        (
+            "def compiled (x : IRNatWrapper) (_ : IRBoxedRecord) : IRNatWrapper := x",
+            "conflicting source constructor layouts",
+        ),
+        (
+            "def compiled (x : IRNatWrapper) (_ : IRScalarPayload) : IRNatWrapper := x",
             "conflicting source constructor layouts",
         ),
         (
@@ -1642,10 +1841,7 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
                 "the private-data case must construct and project at runtime: {source}"
             );
         }
-        assert_eq!(
-            compiled.admission.result_logical_root,
-            checked.logical_root(&options)
-        );
+        assert_definition_admission(&base, &checked, &compiled, &options);
         let public = compiled
             .module
             .decls
@@ -1763,10 +1959,7 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
     .unwrap()
     .into_complete()
     .unwrap();
-    assert_eq!(
-        compiled.admission.result_logical_root,
-        checked.logical_root(&options)
-    );
+    assert_definition_admission(&base, &checked, &compiled, &options);
     assert_eq!(base.logical_root(&options), original);
     for source in [
         "def compiled {A : Type} (x : A) : A := x",
@@ -1777,9 +1970,7 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
         "def compiled : (Nat -> Nat) -> Nat -> Nat := invoke",
         "def compiled (x y : Nat) : Nat := keep x",
         "def compiled (f : Nat -> Nat) (x : Nat) : Nat := x",
-        "def compiled (p : IRBoolBox) : Bool := p.value",
         "def compiled (s : String) : IRNested := IRNested.mk (IRTextPair.mk s s)",
-        "def compiled (f : IRBoolBox -> Nat) : Nat := f (IRBoolBox.mk true)",
     ] {
         let (declaration, _) = checked_definition(&base, source);
         assert!(
@@ -2875,8 +3066,10 @@ fn consume_boxed_ir(
     // Heap fields come from IO, so retaining the caller's original value after
     // each call checks ownership of allocated payloads rather than literals.
     // Dynamic lookup also prevents logical bodies from replacing native IR.
+    // Validate both inputs even for constant cases, keeping the fixture checks
+    // meaningful and avoiding unused-binding warnings in the runtime stdout.
     let source = format!(
-        "import Lean\nimport NativeIrCase\nset_option linter.unusedVariables false\nunsafe def main : IO Unit := do\n  let heap ← IO.FS.readFile \"heap-input.txt\"\n  let digits ← IO.FS.readFile \"heap-nat.txt\"\n  let large := digits.toNat!\n  Lean.enableInitializersExecution\n  let env ← Lean.importModules #[{{ module := `NativeIrCase, isMeta := true }}] {{}} (loadExts := true)\n  match env.evalConst ({ty}) {{}} `{entry} (checkMeta := false) with\n  | .error message => throw (IO.userError message)\n  | .ok compiled => do\n    IO.println (reprStr ({application}))\n    IO.println (reprStr ({application}))\n",
+        "import Lean\nimport NativeIrCase\nunsafe def main : IO Unit := do\n  let heap ← IO.FS.readFile \"heap-input.txt\"\n  let digits ← IO.FS.readFile \"heap-nat.txt\"\n  let large := digits.toNat!\n  unless heap == \"boxed heap payload\" do throw (IO.userError \"wrong heap String fixture\")\n  unless large == 184467440737095516160 do throw (IO.userError \"wrong heap Nat fixture\")\n  Lean.enableInitializersExecution\n  let env ← Lean.importModules #[{{ module := `NativeIrCase, isMeta := true }}] {{}} (loadExts := true)\n  match env.evalConst ({ty}) {{}} `{entry} (checkMeta := false) with\n  | .error message => throw (IO.userError message)\n  | .ok compiled => do\n    IO.println (reprStr ({application}))\n    IO.println (reprStr ({application}))\n",
     );
     let filename = format!("BoxedRuntime-{label}.lean");
     std::fs::write(dir.join(&filename), source).unwrap();
@@ -3094,6 +3287,42 @@ fn the_pin_executes_boxed_data_exports_and_observes_payloads() {
                 &dir,
                 "changed-scalar",
                 "(42, false)\n(42, false)",
+            );
+        }
+        if case.ty == "IRNatWrapper" {
+            // A wrapper is the underlying Nat, not a one-slot allocation.
+            // Alter only native IR so the pin must observe this representation
+            // instead of evaluating the unchanged logical constructor body.
+            let mut mutant = compiled.module.clone();
+            let IrDecl::Function { body, .. } = mutant
+                .decls
+                .iter_mut()
+                .find(|declaration| declaration.name() == &name("compiled"))
+                .unwrap()
+            else {
+                panic!("unboxed wrapper source entry")
+            };
+            *body = IrBody {
+                stmts: vec![IrStmt::VDecl {
+                    x: 1,
+                    ty: IrType::TObject,
+                    expr: IrExpr::Lit(IrLit::Num(IrNat::Small(99))),
+                }],
+                terminal: Box::new(IrTerminal::Ret(IrArg::Var(1))),
+            };
+            std::fs::write(dir.join("NativeIrCase.ir"), encode(&mutant, &original)).unwrap();
+            assert_probe(
+                consume_boxed_ir(
+                    &lean,
+                    &dir,
+                    "changed-wrapper",
+                    case.ty,
+                    case.application,
+                    "compiled",
+                ),
+                &dir,
+                "changed-wrapper",
+                "99\n99",
             );
         }
     }
@@ -3404,10 +3633,7 @@ fn the_pin_executes_multiargument_calls_and_reduced_let_exports() {
                 .unwrap_or_else(|error| panic!("{source}: {error:?}"))
                 .into_complete()
                 .unwrap();
-                assert_eq!(
-                    compiled.admission.result_logical_root,
-                    checked.logical_root(&options)
-                );
+                assert_definition_admission(&base, &checked, &compiled, &options);
                 assert_eq!(base.logical_root(&options), original_root);
                 let unique = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -3705,7 +3931,7 @@ fn check_pin_string_exports(consuming_predicates: bool) {
                 .unwrap_or_else(|error| panic!("{source}: {error:?}"))
                 .into_complete()
                 .unwrap();
-                assert_eq!(compiled.admission.result_logical_root, checked.logical_root(&options));
+                assert_definition_admission(&base, &checked, &compiled, &options);
                 assert_eq!(base.logical_root(&options), original_root);
                 let native = name(case.native);
                 assert!(compiled.module.decls.iter().any(|declaration| {
@@ -3845,10 +4071,7 @@ fn check_pin_source_exports(case_indices: std::ops::Range<usize>) {
         .unwrap_or_else(|e| panic!("{source}: {e:?}"))
         .into_complete()
         .unwrap();
-        assert_eq!(
-            compiled.admission.result_logical_root,
-            checked.logical_root(&options)
-        );
+        assert_definition_admission(&base, &checked, &compiled, &options);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

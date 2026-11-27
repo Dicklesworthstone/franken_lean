@@ -1,5 +1,7 @@
 //! Proved constructor domains must not hide actual unmatched runtime values.
-use super::super::{CompileLimits, SourceSignature, compile_module, validate_module};
+use super::super::{
+    CompileLimits, SourceConstructor, SourceSignature, compile_module, validate_module,
+};
 use super::*;
 use fln_comp::flbc::{ArgumentOwnership as Ownership, CallableResultOwnership as ResultOwnership};
 use fln_core::name::Name;
@@ -305,6 +307,7 @@ fn constructors() -> InternalConstructors {
         type_name: Name::from_components(["flow_data"]),
         layouts: (0..3).map(|tag| ((tag, 0), tag)).collect(),
         packed: Default::default(),
+        unboxed: false,
         tags,
     }
 }
@@ -318,7 +321,7 @@ fn compile(program: &fir::ValidatedProgram) -> Result<()> {
         result: IrType::TObject,
         reduced: None,
         inferred_borrowing: false,
-        constructor_fields: vec![Vec::new(); 3],
+        constructor_fields: vec![SourceConstructor::Standard(Vec::new()); 3],
     };
     let module = compile_module(
         program,
@@ -788,7 +791,10 @@ fn packed_public_slots_require_the_same_private_scalar_carrier() {
         result: IrType::Object,
         reduced: None,
         inferred_borrowing: false,
-        constructor_fields: vec![vec![IrType::TObject, IrType::UInt8]],
+        constructor_fields: vec![SourceConstructor::Standard(vec![
+            IrType::TObject,
+            IrType::UInt8,
+        ])],
     };
     for is_bool in [true, false] {
         let (ty, operation) = if is_bool {
@@ -848,6 +854,122 @@ fn packed_public_slots_require_the_same_private_scalar_carrier() {
                     what: "conflicting source constructor layouts",
                 })
             ));
+        }
+    }
+}
+
+#[test]
+fn unboxed_wrappers_erase_all_header_operations_and_refuse_other_shapes() {
+    use fir::Operation as O;
+    use fir::ValueType::{Bool, Constructor, Nat};
+    use fln_olean::ir::{IrDecl, IrExpr, IrStmt, IrTerminal};
+    let value = fir::ValueId::new;
+    let constructor = fir::ConstructorId::new(0);
+    let projection = fir::ProjectionId::new(0);
+    let entry = Name::from_components(["unboxed_wrapper"]);
+    let source = SourceSignature {
+        name: entry.clone(),
+        params: vec![],
+        result: IrType::TObject,
+        reduced: None,
+        inferred_borrowing: false,
+        constructor_fields: vec![SourceConstructor::Unboxed(IrType::TObject)],
+    };
+    for other_shape in [false, true] {
+        let mut constructors = vec![fir::ConstructorDecl {
+            id: constructor,
+            tag: 0,
+            fields: vec![Nat],
+            static_scalar_bytes: vec![],
+        }];
+        if other_shape {
+            constructors.push(fir::ConstructorDecl {
+                id: fir::ConstructorId::new(1),
+                tag: 1,
+                fields: vec![],
+                static_scalar_bytes: vec![],
+            });
+        }
+        let program = fir::Program::new(
+            fir::FunctionId::new(0),
+            constructors,
+            vec![fir::ProjectionDecl {
+                id: projection,
+                constructor,
+                field: 0,
+            }],
+            vec![],
+            vec![function(
+                0,
+                vec![],
+                Nat,
+                vec![block(
+                    0,
+                    vec![
+                        binding(0, Nat, O::Nat(42)),
+                        binding(
+                            1,
+                            Constructor,
+                            O::Ctor {
+                                constructor,
+                                fields: vec![value(0)],
+                            },
+                        ),
+                        binding(
+                            2,
+                            Bool,
+                            O::CtorTest {
+                                constructor,
+                                value: value(1),
+                            },
+                        ),
+                        binding(
+                            3,
+                            Nat,
+                            O::Project {
+                                projection,
+                                value: value(1),
+                            },
+                        ),
+                    ],
+                    fir::Terminator::Return { value: value(3) },
+                )],
+            )],
+        );
+        let program = fir::validate(program, fir::ValidationLimits::default()).unwrap();
+        let mut meter = Budget(64_000_000);
+        let result = compile_module(
+            &program,
+            &entry,
+            CompileLimits::default(),
+            Some(&source),
+            &mut meter,
+        );
+        if other_shape {
+            assert!(matches!(
+                result,
+                Err(CompileError::Unsupported {
+                    what: "unboxed source constructor layouts",
+                })
+            ));
+        } else {
+            let module = result.unwrap();
+            validate_module(&module, &meter).unwrap();
+            for declaration in &module.decls {
+                let IrDecl::Function { body, .. } = declaration else {
+                    panic!("wrapper function")
+                };
+                assert!(matches!(body.terminal.as_ref(), IrTerminal::Ret(_)));
+                for statement in &body.stmts {
+                    assert!(!matches!(
+                        statement,
+                        IrStmt::VDecl {
+                            expr: IrExpr::Ctor { .. } | IrExpr::Proj { .. } | IrExpr::SProj { .. },
+                            ..
+                        }
+                    ));
+                }
+            }
         }
     }
 }

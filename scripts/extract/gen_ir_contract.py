@@ -37,8 +37,10 @@ COMPILER_M = "src/Lean/Compiler/IR/CompilerM.lean"
 LCNF_BASIC = "src/Lean/Compiler/LCNF/Basic.lean"
 LCNF_PHASE_EXT = "src/Lean/Compiler/LCNF/PhaseExt.lean"
 LCNF_TO_IMPURE_TYPE = "src/Lean/Compiler/LCNF/ToImpureType.lean"
+LCNF_IRRELEVANT = "src/Lean/Compiler/LCNF/Irrelevant.lean"
 LEAN_EXPR = "src/Lean/Expr.lean"
-FILES = [BASIC, EXTERN, COMPILER_M, LCNF_BASIC, LCNF_PHASE_EXT, LCNF_TO_IMPURE_TYPE, LEAN_EXPR]
+FILES = [BASIC, EXTERN, COMPILER_M, LCNF_BASIC, LCNF_PHASE_EXT, LCNF_TO_IMPURE_TYPE,
+         LCNF_IRRELEVANT, LEAN_EXPR]
 
 # One-field structures the pin represents as the field itself, with that field's type.
 TRANSPARENT = {
@@ -82,6 +84,7 @@ STRUCTURES = [
     (LCNF_BASIC, "Param (pu : Purity)", "LCNF_PARAM"),
     (LCNF_BASIC, "Signature (pu : Purity)", "LCNF_SIGNATURE"),
     (LCNF_TO_IMPURE_TYPE, "CtorLayout", "LCNF_CTOR_LAYOUT"),
+    (LCNF_IRRELEVANT, "TrivialStructureInfo", "LCNF_TRIVIAL_STRUCTURE_INFO"),
 ]
 
 

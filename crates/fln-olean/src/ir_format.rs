@@ -6,6 +6,7 @@
 //! src/Lean/Compiler/LCNF/Basic.lean: sha256 58601e9868b1d38f6901bb6296fcf6172cf2417d6eaec0b57f95b61a07e9e3fc
 //! src/Lean/Compiler/LCNF/PhaseExt.lean: sha256 12612f44a6a76e7bdb3f4c208553b77bc15fb6025f6e8c9ab4fecd453a79cb9a
 //! src/Lean/Compiler/LCNF/ToImpureType.lean: sha256 dc2e7718cb3018a3772222ed31986bd4bf9971e9c6e04144f090b8598b72cae3
+//! src/Lean/Compiler/LCNF/Irrelevant.lean: sha256 303bd733dfeee5f50c0a539e7b359a2746837d7386082fa73826db3395988162
 //! src/Lean/Expr.lean: sha256 7d4418bf9fef6f72eac422db70613848f849f074573392e79fb86fe745e79f7e
 #![allow(dead_code)]
 
@@ -306,6 +307,12 @@ pub const LCNF_CTOR_LAYOUT_CTOR_INFO: usize = 0;
 pub const LCNF_CTOR_LAYOUT_FIELD_INFO: usize = 1;
 pub const LCNF_CTOR_LAYOUT_POINTERS: usize = 2;
 pub const LCNF_CTOR_LAYOUT_SCALAR_BYTES: usize = 0;
+
+pub const LCNF_TRIVIAL_STRUCTURE_INFO_CTOR_NAME: usize = 0;
+pub const LCNF_TRIVIAL_STRUCTURE_INFO_NUM_PARAMS: usize = 1;
+pub const LCNF_TRIVIAL_STRUCTURE_INFO_FIELD_IDX: usize = 2;
+pub const LCNF_TRIVIAL_STRUCTURE_INFO_POINTERS: usize = 3;
+pub const LCNF_TRIVIAL_STRUCTURE_INFO_SCALAR_BYTES: usize = 0;
 
 pub const DECL_MAP_EXTENSION: &str = "Lean.IR.declMapExt";
 pub const LCNF_IMPURE_SIGNATURE_EXTENSION: &str = "Lean.Compiler.LCNF.impureSigExt";

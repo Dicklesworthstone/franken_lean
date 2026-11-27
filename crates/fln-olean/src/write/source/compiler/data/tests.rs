@@ -41,6 +41,8 @@ structure WriterRecord where
 inductive WriterHeap where | text (s : String) | number (n : Nat)
 inductive WriterBinders where | empty | data {n : Nat} {{s : String}}
 inductive WriterWrapper where | mk (n : Nat)
+structure WriterStringWrapper where
+  value : String
 inductive WriterBorrowed where | mk (n : @& Nat) (s : String)
 inductive WriterScalar where | mk (b : Bool) (n : Nat)
 structure WriterInterleaved where
@@ -262,6 +264,7 @@ fn recursive_data_uses_the_complete_family_carrier_in_every_self_field() {
         let (inductive, constructors) = closed_family(family, true, fields);
         let projected = project_closed(&inductive, &constructors).unwrap();
         assert!(projected.is_recursive(), "{family}");
+        assert!(projected.unboxed_field().is_none(), "{family}");
         assert_eq!(projected.carrier(), &carrier, "{family}");
         assert_eq!(
             projected
@@ -271,6 +274,15 @@ fn recursive_data_uses_the_complete_family_carrier_in_every_self_field() {
             expected,
             "{family}",
         );
+        // Even the one-constructor, one-self-field family is recursive and
+        // cannot acquire the primitive wrapper's reduced constructor result.
+        for constructor in &projected.constructors {
+            let mut result = &constructor.mono_type;
+            while let ExprNode::ForallE { body, .. } = result.node() {
+                result = body;
+            }
+            assert_eq!(result, &constant(family), "{family}");
+        }
         // This also walks and encodes the recursive mono types: the projection
         // must not need a recursive object graph or an already compiled cache.
         encode(
@@ -433,6 +445,11 @@ enum FieldValue {
 #[derive(Debug, PartialEq, Eq)]
 enum MapValue {
     Nontrivial,
+    Trivial {
+        constructor: Name,
+        parameters: usize,
+        field: usize,
+    },
     Type(Expr),
     Constructor {
         name: Name,
@@ -478,9 +495,32 @@ fn maps(blocks: &[OpaqueExtensionBlock], keep: &BTreeSet<Name>) -> Vec<BTreeMap<
                 let value = entry.ctor_child(1);
                 let value = match index {
                     0 | 1 => {
-                        assert!(value.is_scalar());
-                        assert_eq!(value.unbox(), 0, "present map entry with Option.none");
-                        MapValue::Nontrivial
+                        if value.is_scalar() {
+                            assert_eq!(value.unbox(), layout::OPTION_NONE);
+                            MapValue::Nontrivial
+                        } else {
+                            assert_eq!(value.obj_tag(), usize::from(layout::OPTION_SOME));
+                            assert_eq!(value.header().other as usize, layout::OPTION_SOME_POINTERS);
+                            let info = value.ctor_child(layout::OPTION_SOME_VAL);
+                            assert_eq!(info.obj_tag(), 0);
+                            assert_eq!(
+                                info.header().other as usize,
+                                ir::LCNF_TRIVIAL_STRUCTURE_INFO_POINTERS
+                            );
+                            MapValue::Trivial {
+                                constructor: conversion
+                                    .project_name(
+                                        &info.ctor_child(ir::LCNF_TRIVIAL_STRUCTURE_INFO_CTOR_NAME),
+                                    )
+                                    .unwrap(),
+                                parameters: info
+                                    .ctor_child(ir::LCNF_TRIVIAL_STRUCTURE_INFO_NUM_PARAMS)
+                                    .unbox(),
+                                field: info
+                                    .ctor_child(ir::LCNF_TRIVIAL_STRUCTURE_INFO_FIELD_IDX)
+                                    .unbox(),
+                            }
+                        }
                     }
                     2 | 3 => MapValue::Type(expression(&mut conversion, &mut heap, &value)),
                     4 => {
@@ -556,6 +596,7 @@ fn native_module(
     constants: &[ConstantInfo],
     imports: &[crate::region::ModuleImport],
     data: &[CompilerData],
+    aux_recursors: &[Name],
 ) -> Vec<u8> {
     let header = OleanWriteHeader {
         version: 2,
@@ -565,7 +606,18 @@ fn native_module(
         base_addr: 2 * format::REGION_ALIGN as u64,
     };
     let mut encoder = Encoder::new(WriteBudget::default(), header.version).unwrap();
-    let blocks = encoder.compiler_data_blocks(data).unwrap();
+    // The five compiler data maps are rebuilt below. Retain the independent
+    // auxiliary-recursor tags of these logical declarations: the pin recognizes
+    // an imported `.casesOn` by its tag as well as its name. Without the tag it
+    // incorrectly reaches ordinary-call lowering in this stripped fixture and
+    // asks for an executable signature that primitive cases do not need.
+    let blocks = encoder
+        .source_blocks(&SourceMetadata {
+            compiler_data: data.to_vec(),
+            aux_recursors: aux_recursors.to_vec(),
+            ..SourceMetadata::default()
+        })
+        .unwrap();
     let entries = encoder.array(blocks).unwrap();
     let root = encoder
         .module_root_with_entries(
@@ -595,6 +647,7 @@ fn assert_live_readers(
     constants: &[ConstantInfo],
     imports: &[crate::region::ModuleImport],
     data: &[CompilerData],
+    aux_recursors: &[Name],
 ) {
     // These are the actual strict pin readers, not a second Rust decoder.
     // No cached state is shared between invocations. The fixture's logical
@@ -606,9 +659,15 @@ open Lean Elab Command Compiler LCNF
 run_cmd liftCoreM do
   for n in [``WriterEnum, ``WriterSingleton, ``WriterMixed, ``WriterRecord, ``WriterHeap, ``WriterBinders,
       ``WriterScalar, ``WriterInterleaved, ``WriterAllBools, ``WriterScalarSum, ``WriterScalarHeap,
-      ``WriterRecursive, ``WriterRecursiveHeap, ``WriterRecursiveFirst, ``WriterRecursiveOnly] do
-    unless (← hasTrivialStructure? n).isNone do throwError "wrong mono trivial cache"
-    unless (← hasTrivialImpureStructure? n).isNone do throwError "wrong impure trivial cache"
+      ``WriterRecursive, ``WriterRecursiveHeap, ``WriterRecursiveFirst, ``WriterRecursiveOnly,
+      ``WriterWrapper, ``WriterStringWrapper, ``WriterBoolWrapper] do
+    let wrapper := n == ``WriterWrapper || n == ``WriterStringWrapper || n == ``WriterBoolWrapper
+    for info? in [(← hasTrivialStructure? n), (← hasTrivialImpureStructure? n)] do
+      match info? with
+      | none => if wrapper then throwError "missing trivial wrapper cache"
+      | some info =>
+        unless wrapper && info.ctorName == Name.str n "mk" && info.numParams == 0 && info.fieldIdx == 0 do
+          throwError "wrong trivial wrapper cache"
     unless (← getOtherDeclMonoType n) == mkConst `lcErased do throwError "wrong mono type"
     let ty ← nameToImpureType n
     let expected := if n == ``WriterEnum then `UInt8
@@ -616,9 +675,19 @@ run_cmd liftCoreM do
       else if n == ``WriterMixed || n == ``WriterBinders || n == ``WriterScalarSum ||
           n == ``WriterRecursive || n == ``WriterRecursiveFirst then `tobj else `obj
     unless ty == mkConst expected do throwError "wrong impure carrier"
+    let publicExpected := if n == ``WriterWrapper then `tobj
+      else if n == ``WriterStringWrapper then `obj
+      else if n == ``WriterBoolWrapper then `UInt8 else expected
+    unless (← toImpureType (mkConst n)) == mkConst publicExpected do
+      throwError "wrong public wrapper carrier"
     let .inductInfo iv ← getConstInfo n | throwError "missing type"
     for c in iv.ctors do
-      let _ ← getOtherDeclMonoType c
+      let mono ← getOtherDeclMonoType c
+      if wrapper then
+        let fieldType := mkConst <| if n == ``WriterWrapper then `Nat
+          else if n == ``WriterStringWrapper then `String else `Bool
+        let .forallE _ domain result _ := mono | throwError "wrong wrapper constructor mono type"
+        unless domain == fieldType && result == fieldType do throwError "unreduced wrapper mono result"
       let layout ← getCtorLayout c
       unless layout.ctorInfo.name == c do throwError "wrong constructor owner"
       let mut objects := 0
@@ -636,6 +705,13 @@ run_cmd liftCoreM do
       unless layout.ctorInfo.size == objects && layout.ctorInfo.usize == 0
           && layout.ctorInfo.ssize == scalarBytes do throwError "wrong field count"
   logInfo "native-data-caches-ok"
+def unwrapWriterNat (value : WriterWrapper) : Nat :=
+  match value with | .mk n => n
+def unwrapWriterString (value : WriterStringWrapper) : String :=
+  match value with | .mk s => s
+def unwrapWriterBool (value : WriterBoolWrapper) : Bool :=
+  match value with | .mk b => b
+#eval (unwrapWriterNat (.mk 37), unwrapWriterString (.mk "native wrapper"), unwrapWriterBool (.mk true))
 "#;
     std::fs::write(directory.join("Reader.lean"), reader).unwrap();
     let run = |bytes: Vec<u8>| {
@@ -647,7 +723,7 @@ run_cmd liftCoreM do
             .output()
             .unwrap()
     };
-    let positive = run(native_module(constants, imports, data));
+    let positive = run(native_module(constants, imports, data, aux_recursors));
     assert!(
         positive.status.success(),
         "native compiler-cache reader: {}\n{}",
@@ -655,6 +731,7 @@ run_cmd liftCoreM do
         String::from_utf8_lossy(&positive.stderr)
     );
     assert!(String::from_utf8_lossy(&positive.stdout).contains("native-data-caches-ok"));
+    assert!(String::from_utf8_lossy(&positive.stdout).contains("(37, \"native wrapper\", true)"));
     // Rebuild a coherent graph without WriterMixed's cache rows. Do not build
     // then discard encoded objects: the writer's complete region audit must
     // still account for every allocation in these counterfactual artifacts.
@@ -663,7 +740,7 @@ run_cmd liftCoreM do
         .filter(|row| row.name != name("WriterMixed"))
         .cloned()
         .collect();
-    let missing_bytes = native_module(constants, imports, &absent);
+    let missing_bytes = native_module(constants, imports, &absent, aux_recursors);
     for (index, query) in [
         "hasTrivialStructure? ``WriterMixed",
         "hasTrivialImpureStructure? ``WriterMixed",
@@ -696,7 +773,7 @@ run_cmd liftCoreM do
         .unwrap()
         .carrier = IrType::UInt8;
     std::fs::write(directory.join("Reader.lean"), reader).unwrap();
-    let altered = run(native_module(constants, imports, &altered));
+    let altered = run(native_module(constants, imports, &altered, aux_recursors));
     assert!(!altered.status.success());
     assert!(
         String::from_utf8_lossy(&altered.stdout).contains("wrong impure carrier"),
@@ -733,6 +810,9 @@ fn compiler_data_maps_match_the_actual_pin_and_refuse_unsupported_layouts() {
         "WriterRecursiveHeap",
         "WriterRecursiveFirst",
         "WriterRecursiveOnly",
+        "WriterWrapper",
+        "WriterStringWrapper",
+        "WriterBoolWrapper",
     ]
     .into_iter()
     .map(name)
@@ -763,7 +843,30 @@ fn compiler_data_maps_match_the_actual_pin_and_refuse_unsupported_layouts() {
         !module.is_module,
         "this wire fixture is a standalone logical module"
     );
-    assert_live_readers(&lean, &directory, &constants, &module.imports, &data);
+    let auxiliary_tags = actual
+        .iter()
+        .find(|block| block.name == name(layout::AUX_RECURSOR_EXTENSION))
+        .unwrap();
+    let source_metadata = crate::source_extensions::decode(
+        std::slice::from_ref(auxiliary_tags),
+        crate::source_extensions::DecodeLimits::default(),
+    )
+    .unwrap();
+    for wrapper in ["WriterWrapper", "WriterStringWrapper", "WriterBoolWrapper"] {
+        assert!(
+            source_metadata
+                .aux_recursors
+                .contains(&Name::str(name(wrapper), "casesOn"))
+        );
+    }
+    assert_live_readers(
+        &lean,
+        &directory,
+        &constants,
+        &module.imports,
+        &data,
+        &source_metadata.aux_recursors,
+    );
     let ConstantInfo::Induct(inductive) = constants
         .iter()
         .find(|constant| constant.name() == &name("WriterMixed"))

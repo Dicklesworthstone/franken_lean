@@ -8,12 +8,12 @@
 //! This projection follows `MonoTypes.lean`, `Irrelevant.lean` and
 //! `ToImpureType.lean` for monomorphic Type0 families whose relevant fields
 //! are exactly Nat/String/Bool or a direct recursive occurrence of the family.
-//! Nonrecursive sole-field wrappers, erased fields, wider scalars, annotated
+//! Nonrecursive single-field wrappers use their underlying field's carrier and
+//! persist both trivial-structure caches. Erased fields, wider scalars, annotated
 //! field domains, aliases, dependencies and mutual families are excluded.
 //! Runtime builtin families and Name's computed-field layout are also excluded.
-//! Both trivial-structure caches are consequently `none`. Object fields precede
-//! the Bool scalar bytes; each group preserves source order. The layout records
-//! are extracted from `ToImpureType.lean`.
+//! Object fields precede Bool scalar bytes; each group preserves source order.
+//! The layout records are extracted from `ToImpureType.lean` and `Irrelevant.lean`.
 
 use super::*;
 use fln_core::expr::BinderInfo;
@@ -83,6 +83,24 @@ impl CompilerData {
     /// The pin's source-facing carrier for this checked layout.
     pub fn carrier(&self) -> &IrType {
         &self.carrier
+    }
+
+    /// The sole relevant field when the pin erases this constructor wrapper.
+    /// Its persisted constructor layout still describes the source field;
+    /// consumers must distinguish that cache from the actual value carrier.
+    pub fn unboxed_field(&self) -> Option<&IrType> {
+        // A recursive singleton retains its constructor allocation. Only a
+        // nonrecursive primitive field can erase the enclosing family here.
+        if self.recursive {
+            return None;
+        }
+        let [constructor] = self.constructors.as_slice() else {
+            return None;
+        };
+        let [field] = constructor.fields.as_slice() else {
+            return None;
+        };
+        Some(field)
     }
 
     /// Canonical constructor order and its field carriers in source order.
@@ -205,36 +223,48 @@ impl CompilerData {
             {
                 return Ok(None);
             }
-            let mono_type = binders.into_iter().rev().fold(
-                Expr::const_(name.clone(), Vec::new()),
-                |body, (name, ty, info)| Expr::forall_e(name, ty, body, info),
-            );
+            // MonoTypes.toMonoType recursively removes a trivial wrapper
+            // from the constructor result as well as from its uses. Recursive
+            // singletons are not trivial structures and keep the family result.
+            let result_type =
+                if !inductive.is_rec && inductive.ctors.len() == 1 && binders.len() == 1 {
+                    binders[0].1.clone()
+                } else {
+                    Expr::const_(name.clone(), Vec::new())
+                };
+            let mono_type = binders
+                .into_iter()
+                .rev()
+                .fold(result_type, |body, (name, ty, info)| {
+                    Expr::forall_e(name, ty, body, info)
+                });
             constructors.push(DataConstructor {
                 name: ctor_name.clone(),
                 mono_type,
                 fields,
             });
         }
-        if inductive.is_rec != !recursive_fields.is_empty()
-            || (!inductive.is_rec && constructors.len() == 1 && constructors[0].fields.len() == 1)
-        {
+        if inductive.is_rec != !recursive_fields.is_empty() {
             return Ok(None);
         }
         let nullary = constructors
             .iter()
             .filter(|ctor| ctor.fields.is_empty())
             .count();
-        let carrier = if nullary == constructors.len() {
-            if constructors.len() == 1 {
-                IrType::Tagged
+        let carrier =
+            if !inductive.is_rec && constructors.len() == 1 && constructors[0].fields.len() == 1 {
+                constructors[0].fields[0].clone()
+            } else if nullary == constructors.len() {
+                if constructors.len() == 1 {
+                    IrType::Tagged
+                } else {
+                    IrType::UInt8
+                }
+            } else if nullary == 0 {
+                IrType::Object
             } else {
-                IrType::UInt8
-            }
-        } else if nullary == 0 {
-            IrType::Object
-        } else {
-            IrType::TObject
-        };
+                IrType::TObject
+            };
         for (constructor, field) in recursive_fields {
             charge(1)?;
             constructors[constructor].fields[field] = carrier.clone();
@@ -272,6 +302,25 @@ fn extension_names() -> [Name; 5] {
 }
 
 impl Encoder {
+    fn compiler_data_trivial(&mut self, row: &CompilerData) -> WResult<Obj> {
+        if row.unboxed_field().is_none() {
+            return Ok(Obj::mk_nat(layout::OPTION_NONE));
+        }
+        let mut fields = (0..ir::LCNF_TRIVIAL_STRUCTURE_INFO_POINTERS)
+            .map(|_| Obj::mk_nat(0))
+            .collect::<Vec<_>>();
+        fields[ir::LCNF_TRIVIAL_STRUCTURE_INFO_CTOR_NAME] = self.name(&row.constructors[0].name)?;
+        // This exact profile has no parameters and one relevant field at zero.
+        fields[ir::LCNF_TRIVIAL_STRUCTURE_INFO_NUM_PARAMS] = Obj::mk_nat(0);
+        fields[ir::LCNF_TRIVIAL_STRUCTURE_INFO_FIELD_IDX] = Obj::mk_nat(0);
+        let info = self.ctor(0, fields, &[])?;
+        let mut fields = (0..layout::OPTION_SOME_POINTERS)
+            .map(|_| Obj::mk_nat(0))
+            .collect::<Vec<_>>();
+        fields[layout::OPTION_SOME_VAL] = info;
+        self.ctor(layout::OPTION_SOME, fields, &[])
+    }
+
     fn compiler_data_map(&mut self, key: &Name, mut entries: Vec<(Name, Obj)>) -> WResult<Obj> {
         self.source_array_bound(entries.len())?;
         entries.sort_by(|left, right| left.0.quick_cmp(&right.0));
@@ -304,10 +353,18 @@ impl Encoder {
         self.source_array_bound(data.len())?;
         let mut maps: [Vec<(Name, Obj)>; 5] = std::array::from_fn(|_| Vec::new());
         for row in data {
-            maps[0].push((row.name.clone(), Obj::mk_nat(0)));
-            maps[1].push((row.name.clone(), Obj::mk_nat(0)));
+            maps[0].push((row.name.clone(), self.compiler_data_trivial(row)?));
+            maps[1].push((row.name.clone(), self.compiler_data_trivial(row)?));
             maps[2].push((row.name.clone(), self.compiler_type(&IrType::Erased)?));
-            maps[3].push((row.name.clone(), self.compiler_type(&row.carrier)?));
+            // computeImpureType caches the inductive's relevant-constructor
+            // shape, even for a trivial wrapper. toImpureType consults the
+            // separate trivial cache to obtain its underlying public carrier.
+            let cached_carrier = if row.unboxed_field().is_some() {
+                &IrType::Object
+            } else {
+                &row.carrier
+            };
+            maps[3].push((row.name.clone(), self.compiler_type(cached_carrier)?));
             self.source_array_bound(row.constructors.len())?;
             for (index, ctor) in row.constructors.iter().enumerate() {
                 maps[2].push((ctor.name.clone(), self.expression(&ctor.mono_type)?));
