@@ -219,8 +219,8 @@ fn structure_theorem_and_execution_share_one_atomic_source_stream() {
     assert_eq!(batch.source_evaluation_indices, [1]);
     assert_eq!(batch.source_admissions.len(), 2);
     assert_eq!(batch.source_admissions[0].command_index, 0);
-    // The structure, its two projections, the flat constructor, and the auxiliary
-    // recursors the pin also generates for every inductive (`recOn`, `casesOn`).
+    // The structure, its two projections, the flat constructor, the auxiliary
+    // recursors, and the constructor index the pin generates for this inductive.
     let admitted: Vec<String> = batch.source_admissions[0]
         .admission
         .admissions
@@ -239,7 +239,8 @@ fn structure_theorem_and_execution_share_one_atomic_source_stream() {
             "Point.y",
             "Point.mk._flat_ctor",
             "Point.recOn",
-            "Point.casesOn"
+            "Point.casesOn",
+            "Point.ctorIdx"
         ]
     );
     assert_eq!(batch.source_admissions[1].command_index, 2);

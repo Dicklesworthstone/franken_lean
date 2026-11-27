@@ -500,7 +500,7 @@ fn live_pinned_task_ir_preserves_native_prototypes_partial_calls_and_universes()
         .filter(|declaration| matches!(declaration, IrDecl::Function { .. }))
         .map(|declaration| declaration.name().clone())
         .collect();
-    let partials: BTreeSet<_> = module
+    let partials: Vec<_> = module
         .decls
         .iter()
         .flat_map(|declaration| match declaration {
@@ -510,16 +510,78 @@ fn live_pinned_task_ir_preserves_native_prototypes_partial_calls_and_universes()
         .flat_map(|body| &body.stmts)
         .filter_map(|statement| match statement {
             IrStmt::VDecl {
-                expr: IrExpr::Pap { function, .. },
+                expr: IrExpr::Pap { function, args },
                 ..
-            } => Some(function.clone()),
+            } => Some((function.clone(), args.clone())),
             _ => None,
         })
         .collect();
-    for target in TASKS {
+    for (target, erased_types) in [("Task.spawn", 1), ("Task.map", 2), ("Task.bind", 2)] {
         let boxed = Name::str(name(target), "_boxed");
-        assert!(partials.contains(&boxed), "{boxed:?} optimized away");
+        assert!(
+            partials.contains(&(boxed.clone(), vec![IrArg::Erased; erased_types])),
+            "{boxed:?} erased-type partial application optimized away"
+        );
     }
+    // The pin eta-expands pure/get instead of producing native boxed PAPs.
+    // Require both the higher-order closures and their exact native calls so
+    // these two operations cannot silently disappear from partial-call coverage.
+    for (wrapper, target, input, output) in [
+        (
+            "taskPure._lam_0",
+            "Task.pure",
+            IrType::TObject,
+            IrType::Object,
+        ),
+        (
+            "taskGet._lam_0",
+            "Task.get",
+            IrType::Object,
+            IrType::TObject,
+        ),
+    ] {
+        assert!(
+            partials.contains(&(name(wrapper), Vec::new())),
+            "{wrapper} higher-order closure optimized away"
+        );
+        let expected = function(
+            wrapper,
+            &[input],
+            output.clone(),
+            vec![typed(
+                2,
+                output,
+                IrExpr::Fap {
+                    function: name(target),
+                    args: vec![IrArg::Erased, var(1)],
+                },
+            )],
+            2,
+        );
+        assert!(
+            module.decls.contains(&expected),
+            "{wrapper} native call changed"
+        );
+    }
+    let shared = module
+        .decls
+        .iter()
+        .find(|declaration| declaration.name() == &name("taskShared._closed_0"))
+        .expect("shared callback closure");
+    let IrDecl::Function { body, .. } = shared else {
+        panic!("shared callback closure must have a body");
+    };
+    assert!(
+        body.stmts.iter().any(|statement| matches!(
+            statement,
+            IrStmt::VDecl {
+                expr: IrExpr::Pap { function, args },
+                ..
+            } if function == &name("Task.map._boxed")
+                && matches!(args.as_slice(), [IrArg::Erased, IrArg::Erased, IrArg::Var(_)])
+        )),
+        "shared map must capture both erased types and its callback"
+    );
 
     let library = std::env::var_os("FLN_REFERENCE_LIB")
         .map(PathBuf::from)
