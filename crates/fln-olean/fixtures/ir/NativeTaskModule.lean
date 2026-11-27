@@ -36,7 +36,7 @@ def taskGet (n : Nat) : Nat := useTaskGet Task.get n
 def taskSpawn (n : Nat) : Nat := useTaskSpawn (@Task.spawn Nat) n
 def taskMap (n : Nat) : Nat := useTaskMap (@Task.map Nat Nat) n
 def taskBind (n : Nat) : Nat := useTaskBind (@Task.bind Nat Nat) n
-def taskShared (n : Nat) : Nat := useTaskMapTail (Task.map (fun x => x + 1)) n
+def taskShared (n : Nat) : Nat := useTaskMapTail (@Task.map Nat Nat (fun x => x + 1)) n
 
 def taskPipeline (n : Nat) : Nat :=
   let start := Task.spawn (fun _ => n) 0

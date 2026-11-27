@@ -4963,6 +4963,31 @@ impl Engine {
                         detail: "a noncomputable section declaration escaped its admission-only route",
                     });
                 }
+                // Header types may refer to checked auxiliary data. Stage the
+                // actual dual-admitted predecessor before classifying the owner
+                // or compiling it; retain its receipts only after success.
+                let source_auxiliaries = if !is_evaluation && !auxiliary_declarations.is_empty() {
+                    match engine
+                        .admit_declarations(&auxiliary_declarations, options, limits.admission())
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error.into()),
+                            at: Some(original_offset),
+                        })? {
+                        Outcome::Complete(admission) => Some(admission),
+                        Outcome::Inconclusive(reason) => {
+                            return Ok(Outcome::Inconclusive(reason));
+                        }
+                        Outcome::InternalFault(fault) => {
+                            return Ok(Outcome::InternalFault(fault));
+                        }
+                    }
+                } else {
+                    None
+                };
+                let source_predecessor = source_auxiliaries
+                    .as_ref()
+                    .map_or(&engine, |batch| &batch.engine);
                 let evaluation_base = evaluation_deriving
                     .as_ref()
                     .map_or(&engine, |deriving| &deriving.engine);
@@ -5045,7 +5070,7 @@ impl Engine {
                     Declaration::Defn(definition) if !is_evaluation => {
                         runtime::is_template(definition)
                             || runtime::is_record_template(
-                                engine.environment(),
+                                source_predecessor.environment(),
                                 definition,
                                 limits.ingress,
                             )
@@ -5065,7 +5090,7 @@ impl Engine {
                 let is_proof_definition = match &declaration {
                     Declaration::Defn(definition) if !is_evaluation && !is_template => {
                         match source_records::declaration_is_proposition(
-                            engine.environment(),
+                            source_predecessor.environment(),
                             &definition.base,
                             definition.safety == DefinitionSafety::Unsafe,
                             limits.kernel,
@@ -5117,29 +5142,30 @@ impl Engine {
                 {
                     // Ordered auxiliary declarations cross both checkers before
                     // the owner that cites them; no receipt is inferred or merged.
-                    let auxiliaries = if auxiliary_declarations.is_empty() {
-                        None
-                    } else {
-                        match engine
-                            .admit_declarations(
-                                &auxiliary_declarations,
-                                options,
-                                limits.admission(),
-                            )
-                            .map_err(|error| EngineExecutionError::BatchCommand {
-                                index: command_index,
-                                error: Box::new(error.into()),
-                                at: Some(original_offset),
-                            })? {
-                            Outcome::Complete(admission) => Some(admission),
-                            Outcome::Inconclusive(reason) => {
-                                return Ok(Outcome::Inconclusive(reason));
+                    let auxiliaries =
+                        if source_auxiliaries.is_some() || auxiliary_declarations.is_empty() {
+                            source_auxiliaries
+                        } else {
+                            match engine
+                                .admit_declarations(
+                                    &auxiliary_declarations,
+                                    options,
+                                    limits.admission(),
+                                )
+                                .map_err(|error| EngineExecutionError::BatchCommand {
+                                    index: command_index,
+                                    error: Box::new(error.into()),
+                                    at: Some(original_offset),
+                                })? {
+                                Outcome::Complete(admission) => Some(admission),
+                                Outcome::Inconclusive(reason) => {
+                                    return Ok(Outcome::Inconclusive(reason));
+                                }
+                                Outcome::InternalFault(fault) => {
+                                    return Ok(Outcome::InternalFault(fault));
+                                }
                             }
-                            Outcome::InternalFault(fault) => {
-                                return Ok(Outcome::InternalFault(fault));
-                            }
-                        }
-                    };
+                        };
                     let base = auxiliaries.as_ref().map_or(&engine, |batch| &batch.engine);
                     let mut admission = match base
                         .admit_declarations(&[declaration], options, limits.admission())
@@ -5261,8 +5287,9 @@ impl Engine {
                     );
                     continue;
                 }
-                if !auxiliary_declarations.is_empty() {
-                    // An executed definition's record has no predecessor receipt slot.
+                if is_evaluation && !auxiliary_declarations.is_empty() {
+                    // Scratch evaluations do not retain source-declaration
+                    // predecessor receipts in the published command stream.
                     return Err(EngineExecutionError::BatchCommand {
                         index: command_index,
                         error: Box::new(EngineExecutionError::NotImplemented {
@@ -5342,7 +5369,10 @@ impl Engine {
                 } else {
                     None
                 };
-                let invoked = evaluation_base.execute_definition_entry_with_helpers(
+                let execution_base = source_auxiliaries
+                    .as_ref()
+                    .map_or(evaluation_base, |batch| &batch.engine);
+                let invoked = execution_base.execute_definition_entry_with_helpers(
                     declaration,
                     &local_functions,
                     scoped_options.as_ref().unwrap_or(options),
@@ -5470,6 +5500,20 @@ impl Engine {
                     execution.result_logical_root = execution
                         .engine
                         .logical_root(scoped_options.as_ref().unwrap_or(options));
+                }
+                if let Some(auxiliaries) = source_auxiliaries {
+                    scopes
+                        .admitted_batch(&auxiliaries, auxiliaries.engine.environment(), None)
+                        .map_err(|error| {
+                            scope_error(command_index, original_offset, error.message())
+                        })?;
+                    source_records::push_command_admission(
+                        &mut source_admissions,
+                        SourceCommandAdmission {
+                            command_index,
+                            admission: auxiliaries,
+                        },
+                    );
                 }
                 if !is_evaluation {
                     scopes.admitted(&execution.declaration);
@@ -9601,15 +9645,15 @@ pub struct DefinitionBatchExecution {
     /// lowered through checked generated definitions. Empty for
     /// already-elaborated and definition-only batches.
     pub source_evaluation_indices: Vec<usize>,
-    /// Checked source commands that publish declarations but do not execute:
-    /// structures, inductives, and theorems. Includes every generated declaration.
+    /// Checked admission-only declarations and checked predecessors of executed
+    /// source commands. Includes generated structures, equations, and auxiliaries.
     pub source_admissions: Vec<SourceCommandAdmission>,
     /// Original source command index for each execution, including gaps for
     /// admission-only commands and scratch checks. Empty for raw declaration batches.
     pub source_execution_command_indices: Vec<usize>,
 }
 
-/// One source command's complete, dual-checked admission without VM execution.
+/// A source command's dual-checked admission or checked execution predecessors.
 #[derive(Debug)]
 pub struct SourceCommandAdmission {
     pub command_index: usize,

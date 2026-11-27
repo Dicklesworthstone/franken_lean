@@ -150,12 +150,12 @@ impl Context {
         syntax: &Syntax,
     ) -> Result<Vec<Syntax>, NatDefinitionElabError> {
         let binder = self.copy_pattern_syntax(syntax)?;
-        let grouped = self.expand_grouped_tactic_binders(null(vec![binder]))?;
-        let Syntax::Node { args, .. } = grouped else {
+        let mut grouped = self.expand_grouped_tactic_binders(null(vec![binder]))?;
+        let Syntax::Node { args, .. } = &mut grouped else {
             unreachable!("constructed null binder telescope");
         };
         let mut views = Vec::with_capacity(args.len());
-        for binder in args {
+        for binder in std::mem::take(args) {
             views.push(self.expand_optional_binder_node(binder, false, true)?);
         }
         Ok(views)

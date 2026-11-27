@@ -548,13 +548,20 @@ theorem source_explicit_proof (proof : Nat.zero = Nat.succ Nat.zero) :
         theorem(&engine, "source_explicit_proof");
         let root = engine.logical_root(&KVMap::new());
         let rejected = error(&engine, "def sourceFalseUse : Nat := sourceBadDefault\n");
-        assert!(
-            matches!(
-                rejected,
-                NatDefinitionElabError::Inference(SourceInferenceError::Tactic(_))
-            ),
-            "{rejected:?}"
-        );
+        let refused = match &rejected {
+            NatDefinitionElabError::Inference(SourceInferenceError::Tactic(_)) => true,
+            NatDefinitionElabError::Inference(SourceInferenceError::ConversionRefused(verdict)) => {
+                matches!(
+                    verdict.as_ref(),
+                    fln_kernel::verdict::Verdict::Rejected {
+                        class: fln::RejectClass::NotDefEq,
+                        ..
+                    }
+                )
+            }
+            _ => false,
+        };
+        assert!(refused, "{rejected:?}");
         assert!(
             engine
                 .check_source_files(
@@ -597,6 +604,31 @@ def sourceProofChoice (value : Nat) (_proof : value = value := by rfl) : Nat := 
             .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
             .into_complete()
             .unwrap();
+        let prefix = report
+            .batch
+            .source_admissions
+            .iter()
+            .find(|row| row.command_index == 0)
+            .expect("the quotation has a checked declaration predecessor receipt");
+        let owner = report
+            .batch
+            .executions
+            .iter()
+            .find(|execution| {
+                matches!(&execution.declaration, fln::Declaration::Defn(definition)
+                    if definition.base.name == name("sourceChoice"))
+            })
+            .expect("the owning definition was executed through the public path");
+        assert_eq!(prefix.admission.admissions.len(), 1);
+        checked_quote(&prefix.admission.engine, "sourceChoice._auto_1");
+        assert_eq!(
+            prefix.admission.base_logical_root,
+            engine.logical_root(&KVMap::new())
+        );
+        assert_eq!(
+            prefix.admission.result_logical_root,
+            owner.base_logical_root
+        );
         assert_eq!(report.batch.source_evaluation_indices.len(), 3);
         for (index, expected) in report.batch.source_evaluation_indices.iter().zip([1, 2, 1]) {
             assert_eq!(

@@ -45,7 +45,7 @@ fn compile_tasks(decls: Vec<IrDecl>) -> Result<CompiledIr, IrExecutionError> {
         .iter()
         .filter(|declaration| {
             declaration.name() == &name("Arity.main")
-                || declaration.name().to_string().starts_with("TaskIR.")
+                || declaration.name().parent() == name("TaskIR")
         })
         .map(|declaration| declaration.name().clone())
         .collect();
@@ -185,7 +185,7 @@ fn imported_tasks_execute_direct_boxed_and_partial_native_calls() {
         );
         assert_eq!(compiled.reference_functions().len(), 4);
         assert!(compiled.reference_functions().iter().all(|function| {
-            function.name == name("Arity.main") || function.name.to_string().starts_with("TaskIR.")
+            function.name == name("Arity.main") || function.name.parent() == name("TaskIR")
         }));
     }
 }
@@ -518,7 +518,7 @@ fn live_pinned_task_ir_preserves_native_prototypes_partial_calls_and_universes()
         .collect();
     for target in TASKS {
         let boxed = Name::str(name(target), "_boxed");
-        assert!(partials.contains(&boxed), "{boxed} optimized away");
+        assert!(partials.contains(&boxed), "{boxed:?} optimized away");
     }
 
     let library = std::env::var_os("FLN_REFERENCE_LIB")
