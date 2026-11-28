@@ -58,6 +58,107 @@ pub(super) fn command_parts(syntax: &Syntax) -> Result<(bool, &[Syntax]), NatDef
     Ok((is_class, parts))
 }
 
+/// Constructor modifiers have their own visibility rules. Only the existing
+/// documentation slots and `protected` are supported here; in particular a
+/// constructor's public/private modifier cannot silently affect its whole family.
+fn constructor_header(syntax: &Syntax) -> Result<(&[Syntax], bool), NatDefinitionElabError> {
+    let parts = expect_node(
+        syntax,
+        &parser_kind(&["Command", "ctor"]),
+        5,
+        "inductive constructor",
+    )?;
+    doc_comment_slot(&parts[0])?;
+    expect_atom(&parts[1], "|", "constructor separator")?;
+    let modifiers = expect_node(
+        &parts[2],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "constructor modifiers",
+    )?;
+    doc_comment_slot(&modifiers[0])?;
+    if !expect_null_args(&parts[0], "constructor documentation")?.is_empty()
+        && !expect_null_args(&modifiers[0], "constructor documentation")?.is_empty()
+    {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "one constructor doc comment",
+        });
+    }
+    expect_empty_null(&modifiers[1], "constructor without attributes")?;
+    expect_empty_null(
+        &modifiers[2],
+        "constructor without public or private visibility",
+    )?;
+    let protected = protected_slot(&modifiers[3])?;
+    for modifier in &modifiers[4..] {
+        expect_empty_null(modifier, "constructor without unsupported modifiers")?;
+    }
+    Ok((parts, protected))
+}
+
+fn explicitly_private(modifiers: &Syntax) -> Result<bool, NatDefinitionElabError> {
+    let modifiers = expect_node(
+        modifiers,
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "inductive modifiers",
+    )?;
+    Ok(scope::visibility::modifier(&modifiers[2])? == Some(false))
+}
+
+fn private_constructor_refusal() -> NatDefinitionElabError {
+    NatDefinitionElabError::UnexpectedSyntax {
+        expected: "protected constructors outside an explicitly private inductive",
+    }
+}
+
+/// Fully resolved names requested by constructor `protected` modifiers. The
+/// caller registers them only after the complete data bundle has passed normal
+/// admission. The existing protected journal then controls lookup and export.
+pub fn protected_constructor_registrations(
+    syntax: &Syntax,
+    scope: &SourceScope,
+) -> Result<Vec<Name>, NatDefinitionElabError> {
+    if !is_inductive(syntax) {
+        return Ok(Vec::new());
+    }
+    let root = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "inductive declaration",
+    )?;
+    let (_, parts) = command_parts(&root[1])?;
+    let id = expect_node(
+        &parts[1],
+        &parser_kind(&["Command", "declId"]),
+        2,
+        "inductive name",
+    )?;
+    let Syntax::Ident { val: family, .. } = &id[0] else {
+        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    };
+    let family = scope
+        .for_declaration(syntax)?
+        .declaration_name(family)
+        .map_err(|error| failure(SourceInferenceError::NameScope(error)))?;
+    let private = explicitly_private(&root[0])?;
+    let mut protected = Vec::new();
+    for ctor in expect_null_args(&parts[4], "constructors")? {
+        let (parts, requested) = constructor_header(ctor)?;
+        if requested {
+            if private {
+                return Err(private_constructor_refusal());
+            }
+            let Syntax::Ident { val: name, .. } = &parts[3] else {
+                return Err(NatDefinitionElabError::AnonymousDeclarationName);
+            };
+            protected.push(family.append_core(name));
+        }
+    }
+    Ok(protected)
+}
+
 /// Resolve the class tag requested by a source inductive. The caller must
 /// register it only after the whole inductive bundle has passed admission.
 pub fn class_inductive_registration(
@@ -583,6 +684,16 @@ fn header<'a>(
     if ctors.len() > budget.max_binders {
         return Err(failure(SourceInferenceError::ResourceLimit));
     }
+    // The pin distinguishes an explicit `private` modifier from a module's
+    // inherited private default (`Lean/Elab/Inductive.lean`). Only the former
+    // forbids a protected constructor. No constructor visibility is broadened.
+    if explicitly_private(&root[0])? {
+        for ctor in ctors {
+            if constructor_header(ctor)?.1 {
+                return Err(private_constructor_refusal());
+            }
+        }
+    }
     let mut context = Context::scoped(env, kernel, &scope)?;
     if is_protected {
         context.check_protected_declaration_name(name)?;
@@ -1003,40 +1114,7 @@ fn bodies(
     for ctor in ctors {
         context.tick()?;
         context.txn.lctx = base.clone();
-        let parts = expect_node(
-            ctor,
-            &parser_kind(&["Command", "ctor"]),
-            5,
-            "inductive constructor",
-        )?;
-        // A constructor's doc comment has no meaning the kernel sees.
-        match expect_null_args(&parts[0], "constructor documentation")? {
-            [] => {}
-            [doc] => {
-                let doc = expect_node(
-                    doc,
-                    &parser_kind(&["Command", "docComment"]),
-                    2,
-                    "constructor doc comment",
-                )?;
-                expect_atom(&doc[0], "/--", "constructor doc comment opener")?;
-            }
-            _ => {
-                return Err(NatDefinitionElabError::UnexpectedSyntax {
-                    expected: "one constructor doc comment",
-                });
-            }
-        }
-        expect_atom(&parts[1], "|", "constructor separator")?;
-        let modifiers = expect_node(
-            &parts[2],
-            &parser_kind(&["Command", "declModifiers"]),
-            7,
-            "constructor modifiers",
-        )?;
-        for part in modifiers {
-            expect_empty_null(part, "absent constructor modifier")?;
-        }
+        let (parts, _) = constructor_header(ctor)?;
         let Syntax::Ident { val: ctor_name, .. } = &parts[3] else {
             return Err(invalid());
         };

@@ -938,6 +938,12 @@ impl Engine {
                     })?;
                 batch.engine.environment = tag_protected(&batch.engine, &resolved)?;
             }
+            let constructors = fln_elab::source::protected_constructor_registrations(syntax, scope)
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?;
+            for constructor in constructors {
+                batch.engine.environment = tag_protected(&batch.engine, &constructor)?;
+            }
         }
         batch.result_logical_root = batch.engine.logical_root(options);
         Ok(Outcome::Complete(batch))
