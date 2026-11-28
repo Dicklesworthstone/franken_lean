@@ -1161,8 +1161,13 @@ impl Engine<'_> {
                 .universes
                 .instantiate_with_limit(&right, remaining)
                 .map_err(UnificationError::Universe)?;
-            let left = simplify_level(&left, &mut self.meter)?;
-            let right = simplify_level(&right, &mut self.meter)?;
+            // Solver normal forms prove conversion, but need not be the
+            // kernel's observable normal forms. Retain the instantiated
+            // operands when choosing a value for a direct universe hole.
+            let original_left = left;
+            let original_right = right;
+            let left = simplify_level(&original_left, &mut self.meter)?;
+            let right = simplify_level(&original_right, &mut self.meter)?;
             self.scan(&Expr::sort(left.clone()))?;
             self.scan(&Expr::sort(right.clone()))?;
             if same_levels(&left, &right, &mut self.meter)? {
@@ -1172,44 +1177,65 @@ impl Engine<'_> {
                 (LevelView::MVar(_), _) | (_, LevelView::MVar(_)) => {
                     // If one side belongs to an enclosing scope, the other
                     // side may still be a fresh hole that can point to it.
-                    let (id, value) = match (left.view(), right.view()) {
-                        (LevelView::MVar(id), _)
-                            if self.work.universes.assignment_permitted(id) =>
-                        {
-                            (id, &right)
-                        }
-                        (_, LevelView::MVar(id))
-                            if self.work.universes.assignment_permitted(id) =>
-                        {
-                            (id, &left)
-                        }
-                        (LevelView::MVar(id), _) | (_, LevelView::MVar(id)) => {
-                            return Err(UnificationError::Deferred(
-                                UnificationDeferred::ReadOnlyUniverse(id.clone()),
-                            ));
-                        }
-                        _ => unreachable!("a universe metavariable was matched"),
-                    };
-                    let mut todo = vec![value];
-                    let mut visited = HashSet::new();
-                    while let Some(level) = todo.pop() {
-                        if !visited.insert(std::ptr::from_ref(level)) {
-                            continue;
-                        }
-                        self.meter.node()?;
-                        match level.view() {
-                            LevelView::MVar(found) if found == id => {
+                    let (id, normalized, original_target, original_value) =
+                        match (left.view(), right.view()) {
+                            (LevelView::MVar(id), _)
+                                if self.work.universes.assignment_permitted(id) =>
+                            {
+                                (id, &right, &original_left, &original_right)
+                            }
+                            (_, LevelView::MVar(id))
+                                if self.work.universes.assignment_permitted(id) =>
+                            {
+                                (id, &left, &original_right, &original_left)
+                            }
+                            (LevelView::MVar(id), _) | (_, LevelView::MVar(id)) => {
                                 return Err(UnificationError::Deferred(
-                                    UnificationDeferred::CyclicUniverse(id.clone()),
+                                    UnificationDeferred::ReadOnlyUniverse(id.clone()),
                                 ));
                             }
-                            LevelView::Succ(inner) => todo.push(inner),
-                            LevelView::Max(a, b) | LevelView::IMax(a, b) => {
-                                todo.push(b);
-                                todo.push(a);
+                            _ => unreachable!("a universe metavariable was matched"),
+                        };
+                    let mut value = if matches!(original_target.view(), LevelView::MVar(found) if found == id)
+                    {
+                        original_value
+                    } else {
+                        normalized
+                    };
+                    loop {
+                        let mut todo = vec![value];
+                        let mut visited = HashSet::new();
+                        let mut cyclic = false;
+                        while let Some(level) = todo.pop() {
+                            if !visited.insert(std::ptr::from_ref(level)) {
+                                continue;
                             }
-                            _ => {}
+                            self.meter.node()?;
+                            match level.view() {
+                                LevelView::MVar(found) if found == id => {
+                                    cyclic = true;
+                                    break;
+                                }
+                                LevelView::Succ(inner) => todo.push(inner),
+                                LevelView::Max(a, b) | LevelView::IMax(a, b) => {
+                                    todo.push(b);
+                                    todo.push(a);
+                                }
+                                _ => {}
+                            }
                         }
+                        if !cyclic {
+                            break;
+                        }
+                        // Normalization can erase a syntactic self occurrence,
+                        // for example ?u = imax ?u 0. Keep that forced solution
+                        // without ever storing a cyclic raw assignment.
+                        if std::ptr::eq(value, normalized) {
+                            return Err(UnificationError::Deferred(
+                                UnificationDeferred::CyclicUniverse(id.clone()),
+                            ));
+                        }
+                        value = normalized;
                     }
                     self.assignment_slot()?;
                     self.work

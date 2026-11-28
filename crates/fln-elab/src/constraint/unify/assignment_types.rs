@@ -320,7 +320,12 @@ impl Engine<'_> {
                         // codomain universe to zero.
                         let level = Level::try_smart_imax(domain_level, level.clone())
                             .map_err(|_| UnificationError::ExpressionScope)?;
-                        inferred = Expr::sort(simplify_level(&level, &mut self.meter)?);
+                        // Preserve the kernel's nested IMax construction in
+                        // the inferred type. Solver-only distribution is valid
+                        // for conversion but can change the type's kernel
+                        // normal form when an unresolved guard later becomes
+                        // the domain universe (including Prop).
+                        inferred = Expr::sort(level);
                         context.truncate(checkpoint);
                     }
                     TypeFrame::Let {

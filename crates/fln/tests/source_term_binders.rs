@@ -111,6 +111,40 @@ fn anonymous_universes_in_lambda_domains_generalize() {
         "def id := fun (A : Sort _) (x : A) => x\ndef low : Nat := id Nat 7\ndef high : Type := id (Type) Nat",
     );
 }
+
+#[test]
+fn inferred_dependent_lambdas_preserve_rigid_and_propositional_universes() {
+    let result = checked(
+        "universe u\n\
+         def inferred := fun (A : Sort u) (x : A) => x\n\
+         def low : Nat := inferred Nat 37\n\
+         def high : Type := inferred Type Nat\n\
+         theorem low_value : low = 37 := rfl\n\
+         theorem prop_value : inferred True True.intro = True.intro := rfl",
+    );
+    assert_eq!(
+        result
+            .environment()
+            .find(&n("inferred"))
+            .unwrap()
+            .constant_val()
+            .level_params,
+        [n("u")]
+    );
+
+    // The solver's semantic normal form does not replace an authored kernel
+    // type. The reference rejects this distinct explicit sort annotation.
+    let base = engine();
+    let before = base.logical_root(&KVMap::new());
+    let invalid = b"universe u\ndef prefix : Nat := 7\ndef wrong : Sort (max (imax (u+1) u) u) := (A : Sort u) -> A -> A";
+    assert!(
+        base.check_source_files(&[invalid], &KVMap::new(), SourceCheckLimits::new(limits()))
+            .is_err()
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+    assert!(!base.environment().contains(&n("prefix")));
+    assert!(!base.environment().contains(&n("wrong")));
+}
 #[test]
 fn lambda_scope_is_restored_before_elaborating_siblings() {
     checked(

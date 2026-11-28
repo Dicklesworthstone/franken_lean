@@ -125,6 +125,46 @@ fn a_later_assignment_reopens_an_imax_conversion() {
 }
 
 #[test]
+fn direct_universe_assignments_preserve_kernel_conversion_after_a_guard_specializes() {
+    for reversed in [false, true] {
+        let mut tx = txn();
+        let result = LMVarId(name("result"));
+        let guard = LMVarId(name("laterGuard"));
+        let hole = Level::mvar(result.clone());
+        let expected = imax(s(p("u")), imax(p("u"), Level::mvar(guard.clone())));
+        let (left, right) = pair(hole.clone(), expected.clone());
+        let (left, right) = if reversed {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        let report = tx.unify(&left, &right, budget()).unwrap();
+        assert_eq!(report.universe_assignments, std::slice::from_ref(&result));
+        assert_eq!(tx.universes.get_assignment(&result), Some(&expected));
+        assert!(!tx.universes.is_assigned(&guard));
+
+        // Solver-only distribution would retain an extra max(u, ...), which
+        // the kernel does not identify with this dependent Pi's inferred sort.
+        let (left, right) = pair(Level::mvar(guard), p("u"));
+        tx.unify(&left, &right, budget()).unwrap();
+        let actual = tx.universes.instantiate_with_limit(&hole, 1024).unwrap();
+        let inferred = imax(s(p("u")), p("u"));
+        assert!(actual.is_equiv(&inferred));
+        assert!(!max(inferred.clone(), p("u")).is_equiv(&inferred));
+    }
+}
+
+#[test]
+fn an_erased_universe_self_occurrence_uses_the_forced_acyclic_solution() {
+    let mut tx = txn();
+    let id = LMVarId(name("erasedSelf"));
+    let hole = Level::mvar(id.clone());
+    let (left, right) = pair(hole.clone(), imax(hole, Level::zero()));
+    tx.unify(&left, &right, budget()).unwrap();
+    assert_eq!(tx.universes.get_assignment(&id), Some(&Level::zero()));
+}
+
+#[test]
 fn equivalent_maxima_do_not_force_unrelated_metavariables() {
     let mut tx = txn();
     let id = LMVarId(name("unknown"));
