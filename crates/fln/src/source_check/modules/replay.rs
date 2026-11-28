@@ -120,7 +120,11 @@ impl Export {
             return Err(extension_error(
                 module,
                 &suffix.descriptor.name,
-                "the pinned .olean writer cannot yet serialize this module's environment extension",
+                if fln_elab::computed_fields::supports(&suffix.descriptor) {
+                    "computed-field artifacts require generated implementation compiler layouts and attribute metadata"
+                } else {
+                    "the pinned .olean writer cannot yet serialize this module's environment extension"
+                },
             ));
         }
         if let Some(private) = &self.private {

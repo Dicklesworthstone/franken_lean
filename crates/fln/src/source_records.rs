@@ -4,6 +4,7 @@ use super::*;
 use fln_kernel::verdict::Verdict;
 
 mod auxiliaries;
+mod computed_fields;
 mod elaboration;
 mod equation_theorems;
 pub(crate) use equation_theorems::{may_name_equation_theorems, push_command_admission};
@@ -531,6 +532,44 @@ impl Engine {
         let mut private_scope = private_scope.clone();
         private_scope.computability = self.computability_provider();
         let private_scope = &private_scope;
+        // Computed getters have hidden logical bodies in a public section,
+        // while their cached representation and executable overrides remain
+        // exported. The complete pair must be staged before either is visible.
+        match &parsed {
+            ScopedCommandSyntax::Definition(parsed)
+                if fln_elab::source::is_inductive(parsed.syntax()) =>
+            {
+                if let Some(computed) =
+                    fln_elab::source::computed_fields::prepare(parsed.syntax(), private_scope)
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?
+                {
+                    return self.admit_public_computed_inductive(
+                        public,
+                        &computed,
+                        options,
+                        limits,
+                        public_scope,
+                    );
+                }
+            }
+            ScopedCommandSyntax::Mutual(members) if members.len() == 1 => {
+                if let Some(computed) =
+                    fln_elab::source::computed_fields::prepare(&members[0], private_scope)
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?
+                {
+                    return self.admit_public_computed_inductive(
+                        public,
+                        &computed,
+                        options,
+                        limits,
+                        public_scope,
+                    );
+                }
+            }
+            _ => {}
+        }
         let parsed = match parsed {
             ScopedCommandSyntax::Deriving(syntax) => {
                 // Resolve in the complete predecessor before entering the
@@ -790,9 +829,21 @@ impl Engine {
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let computed = if members.len() == 1 {
+            fln_elab::source::computed_fields::prepare(&members[0], scope)
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?
+        } else {
+            // The raw mutual elaborator continues to refuse computed fields;
+            // no member may publish a logical-only version of a cached family.
+            None
+        };
+        let family_members = computed
+            .as_ref()
+            .map_or(members, |computed| std::slice::from_ref(&computed.syntax));
         let candidate = elaboration_outcome(if members.len() == 1 {
             fln_elab::source::scope::elaborate_inductive_with_effects(
-                &members[0],
+                &family_members[0],
                 self.environment(),
                 limits.kernel,
                 fln_elab::records::RecordBudget::default(),
@@ -800,7 +851,7 @@ impl Engine {
             )
         } else {
             fln_elab::source::scope::elaborate_mutual_inductives_with_effects(
-                members,
+                family_members,
                 self.environment(),
                 limits.kernel,
                 fln_elab::records::RecordBudget::default(),
@@ -824,6 +875,8 @@ impl Engine {
                 .is_some();
         let result =
             self.finish_source_inductive_auxiliaries(result, options, limits, scope, is_class)?;
+        let result =
+            self.finish_source_computed_fields(result, computed.as_ref(), options, limits)?;
         self.finish_source_data_attributes(result, members, options, scope)
     }
 
@@ -1371,9 +1424,15 @@ impl Engine {
             .as_ref()
             .map_or_else(|| parsed.syntax(), |request| &request.syntax);
         if fln_elab::source::is_inductive(syntax) {
+            let computed = fln_elab::source::computed_fields::prepare(syntax, scope)
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?;
+            let family_syntax = computed
+                .as_ref()
+                .map_or(syntax, |computed| &computed.syntax);
             let candidate = match elaboration_outcome(
                 fln_elab::source::scope::elaborate_inductive_with_effects(
-                    syntax,
+                    family_syntax,
                     self.environment(),
                     limits.kernel,
                     fln_elab::records::RecordBudget::default(),
@@ -1393,6 +1452,8 @@ impl Engine {
                 .is_some();
             let result =
                 self.finish_source_inductive_auxiliaries(result, options, limits, scope, is_class)?;
+            let result =
+                self.finish_source_computed_fields(result, computed.as_ref(), options, limits)?;
             let result = self.finish_source_data_attributes(
                 result,
                 std::slice::from_ref(syntax),

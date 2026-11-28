@@ -4,6 +4,7 @@
 use super::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
 mod ordinary;
+pub(in crate::source) use ordinary::{elaborate_computed_group, elaborate_computed_headers};
 pub use ordinary::{elaborate_ordinary_group, is_ordinary_group_member};
 
 #[derive(Clone, Default)]

@@ -212,7 +212,47 @@ pub fn inductive_declaration(
     spec: &InductiveSpec,
     budget: RecordBudget,
 ) -> Result<Declaration, InductiveError> {
-    build_inductive(spec, budget, None, None)
+    build_inductive(spec, budget, None, None, None)
+}
+
+/// Computed-field implementation types keep constructor names below the
+/// original logical constructors, outside the generated family's namespace.
+/// This changes names only; both checking engines still reconstruct the block.
+pub(crate) fn inductive_with_external_constructor_names(
+    spec: &InductiveSpec,
+    names: &[Name],
+    budget: RecordBudget,
+) -> Result<Declaration, InductiveError> {
+    if names.len() != spec.constructors.len() {
+        return Err(InductiveError::InvalidName);
+    }
+    let mut remaining = budget.max_nodes;
+    let mut unique = HashSet::new();
+    for name in names {
+        if name.is_anonymous() || !unique.insert(name.clone()) {
+            return Err(InductiveError::InvalidName);
+        }
+        let mut parent = name.clone();
+        while !parent.is_anonymous() {
+            remaining = remaining
+                .checked_sub(1)
+                .ok_or(InductiveError::ResourceLimit)?;
+            if parent == spec.name {
+                return Err(InductiveError::InvalidName);
+            }
+            parent = parent.parent();
+        }
+    }
+    build_inductive(
+        spec,
+        RecordBudget {
+            max_nodes: remaining,
+            ..budget
+        },
+        None,
+        None,
+        Some(names),
+    )
 }
 
 /// Field universes inform candidate generation only. Both admission engines
@@ -223,7 +263,7 @@ pub(crate) fn inductive_with_field_universes(
     budget: RecordBudget,
     field_universes: &[Vec<Level>],
 ) -> Result<Declaration, InductiveError> {
-    build_inductive(spec, budget, Some(field_universes), None)
+    build_inductive(spec, budget, Some(field_universes), None, None)
 }
 
 /// [`inductive_with_field_universes`] for a family whose trailing parameters
@@ -239,7 +279,7 @@ pub(crate) fn inductive_with_promoted_parameters(
     field_universes: &[Vec<Level>],
     promoted: &[Vec<LocalDecl>],
 ) -> Result<Declaration, InductiveError> {
-    build_inductive(spec, budget, Some(field_universes), Some(promoted))
+    build_inductive(spec, budget, Some(field_universes), Some(promoted), None)
 }
 
 fn build_inductive(
@@ -247,6 +287,7 @@ fn build_inductive(
     budget: RecordBudget,
     field_universes: Option<&[Vec<Level>]>,
     promoted: Option<&[Vec<LocalDecl>]>,
+    external_constructor_names: Option<&[Name]>,
 ) -> Result<Declaration, InductiveError> {
     if spec.name.is_anonymous() {
         return Err(InductiveError::InvalidName);
@@ -441,11 +482,15 @@ fn build_inductive(
     )?;
     let motive_type = builder.close(&rec_indices, motive_type, false, false)?;
     let motive = fresh(&mut used, "motive", motive_type, BinderInfo::Default);
-    let ctor_names: Vec<_> = spec
-        .constructors
-        .iter()
-        .map(|c| spec.name.append_core(&c.name))
-        .collect();
+    let ctor_names: Vec<_> = external_constructor_names.map_or_else(
+        || {
+            spec.constructors
+                .iter()
+                .map(|c| spec.name.append_core(&c.name))
+                .collect()
+        },
+        <[Name]>::to_vec,
+    );
     let mut minors = Vec::new();
     let mut constructors = Vec::new();
     for (index, ctor) in spec.constructors.iter().enumerate() {
@@ -472,7 +517,11 @@ fn build_inductive(
         let body = builder.close(&ihs, body, false, false)?;
         let minor_type = builder.close(&rec_fields[index], body, false, false)?;
         let mut minor = fresh(&mut used, "minor", minor_type, BinderInfo::Default);
-        minor.user_name = ctor.name.clone();
+        minor.user_name = if external_constructor_names.is_some() {
+            ctor_names[index].clone()
+        } else {
+            ctor.name.clone()
+        };
         minors.push(minor);
         let result = app(family_prefix.clone(), ctor.result_indices.iter().cloned());
         let type_ = builder.close(&ctor.fields, result, false, false)?;

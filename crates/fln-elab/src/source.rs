@@ -15,6 +15,7 @@ mod character;
 mod codegen;
 mod coercions;
 mod collections;
+pub mod computed_fields;
 mod deprecated;
 pub use deprecated::{
     DeprecatedAttribute, deprecated_registration, deprecation_entry, reducibly_same_type,
@@ -237,6 +238,7 @@ pub enum SourceInferenceError {
     NoncomputableJournal(crate::noncomputable::NoncomputableError),
     ExternJournal(crate::externs::ExternError),
     ImplementedByJournal(crate::implemented_by::ImplementedByError),
+    ComputedField(crate::computed_fields::ComputedFieldError),
     MacroInlineJournal(crate::macro_inline::MacroInlineError),
     InvalidMacroInlineProvenance,
     InvalidInstanceBinder,
@@ -560,6 +562,7 @@ impl std::fmt::Display for SourceInferenceError {
             Self::NoncomputableJournal(error) => write!(f, "{error}"),
             Self::ExternJournal(error) => write!(f, "{error}"),
             Self::ImplementedByJournal(error) => write!(f, "{error}"),
+            Self::ComputedField(error) => write!(f, "{error}"),
             Self::MacroInlineJournal(error) => write!(f, "{error}"),
             Self::InvalidMacroInlineProvenance => {
                 f.write_str("malformed native macro-inline recursor provenance")

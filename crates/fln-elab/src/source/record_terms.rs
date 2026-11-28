@@ -1120,6 +1120,22 @@ impl Context {
                     base,
                 });
             }
+            // Dotted calls to mutually declared getters see the same typed
+            // predefinition as a fully qualified identifier. `constant` first
+            // selects the active structural/WF recursive reference, then the
+            // private header local used by the group's dependency pass.
+            if self
+                .partial
+                .as_ref()
+                .and_then(|state| state.group.as_ref())
+                .is_some_and(|group| group.names.contains(&method))
+            {
+                return Ok(FieldResolution::Method {
+                    function: self.constant(&method)?,
+                    receiver,
+                    base,
+                });
+            }
             // Before the recursion context exists, a reference to the declaration being
             // defined is reported as the unknown constant it still is, exactly as a direct
             // `T.size l` is: `definition_body` retries such a failure with the structural

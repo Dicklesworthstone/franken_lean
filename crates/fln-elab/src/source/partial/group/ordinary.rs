@@ -82,7 +82,7 @@ pub fn is_ordinary_group_member(syntax: &Syntax) -> bool {
         && !is_unsafe_definition(syntax)
 }
 
-fn member(syntax: &Syntax) -> Result<(&Syntax, bool), NatDefinitionElabError> {
+fn member(syntax: &Syntax, computed: bool) -> Result<(&Syntax, bool), NatDefinitionElabError> {
     let declaration = expect_node(
         syntax,
         &parser_kind(&["Command", "declaration"]),
@@ -96,13 +96,31 @@ fn member(syntax: &Syntax) -> Result<(&Syntax, bool), NatDefinitionElabError> {
         "mutual declaration modifiers",
     )?;
     doc_comment_slot(&modifiers[0])?;
-    // Visibility and attribute publication are effects, not permission to drop
-    // syntax. Keep unsupported effects outside this atomic aperture.
-    for modifier in &modifiers[1..] {
+    if computed {
+        // Only the computed-field source adapter enters here. It retains every
+        // attribute for transactional registration and supplies one effective
+        // visibility scope for the whole group.
         expect_empty_null(
-            modifier,
-            "ordinary mutual declaration without attributes or modifiers",
+            &modifiers[1],
+            "externally retained computed-field attributes",
         )?;
+        scope::visibility::modifier(&modifiers[2])?;
+        protected_slot(&modifiers[PROTECTED_SLOT])?;
+        if !noncomputable_slot(&modifiers[NONCOMPUTABLE_SLOT])? {
+            return Err(refusal("explicitly noncomputable computed-field getter"));
+        }
+        for modifier in &modifiers[5..] {
+            expect_empty_null(modifier, "safe computed-field getter without partial")?;
+        }
+    } else {
+        // Visibility and attribute publication are effects, not permission to drop
+        // syntax. Keep unsupported effects outside this atomic aperture.
+        for modifier in &modifiers[1..] {
+            expect_empty_null(
+                modifier,
+                "ordinary mutual declaration without attributes or modifiers",
+            )?;
+        }
     }
     let theorem = declaration[1].kind() == Some(&parser_kind(&["Command", "theorem"]));
     let abbrev = declaration[1].kind() == Some(&parser_kind(&["Command", "abbrev"]));
@@ -138,7 +156,87 @@ pub fn elaborate_ordinary_group(
         kernel,
         scope,
         Context::scoped(environment, kernel, scope)?,
+        false,
     )
+}
+
+/// Internal entry for a fully read computed-field block. Logical bodies use
+/// the ordinary SCC/termination pipeline, but explicitly noncomputable fields
+/// must not acquire executable `_unsafe_rec` companions before caching exists.
+pub(in crate::source) fn elaborate_computed_group(
+    members: &[Syntax],
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<ElaboratedPartial, NatDefinitionElabError> {
+    elaborate_with_meter(
+        members,
+        environment,
+        kernel,
+        scope,
+        Context::scoped(environment, kernel, scope)?,
+        true,
+    )
+}
+
+/// Public computed-field signatures are elaborated in their exported
+/// predecessor before the private body group. A private definition cannot
+/// supply an otherwise unavailable public type through body inference.
+pub(in crate::source) fn elaborate_computed_headers(
+    members: &[Syntax],
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<Vec<Declaration>, NatDefinitionElabError> {
+    if members.is_empty() || members.len() > 8 {
+        return Err(refusal("one to eight computed fields"));
+    }
+    let mut meter = Context::scoped(environment, kernel, scope)?;
+    let mut names = Vec::new();
+    for syntax in members {
+        meter.tick()?;
+        let (id, theorem) = member(syntax, true)?;
+        if theorem {
+            return Err(refusal("a computed-field definition"));
+        }
+        let id = expect_node(
+            id,
+            &parser_kind(&["Command", "declId"]),
+            2,
+            "computed-field name",
+        )?;
+        let Syntax::Ident { val, .. } = &id[0] else {
+            return Err(refusal("a named computed field"));
+        };
+        let name = scope
+            .declaration_name(val)
+            .map_err(|error| failure(SourceInferenceError::NameScope(error)))?;
+        if environment.contains(&name) || names.contains(&name) {
+            return Err(refusal("fresh distinct computed-field names"));
+        }
+        names.push(name);
+    }
+    let group = Group {
+        names,
+        header_only: true,
+        ..Group::default()
+    };
+    let mut headers = Vec::new();
+    for syntax in members {
+        let mut context = fork_scoped_with_caches(&meter, environment, kernel, scope)?;
+        context.partial = Some(State {
+            kind: Kind::Unsafe,
+            group: Some(group.clone()),
+            ..State::default()
+        });
+        let header = definition_in_context(syntax, &mut context)?;
+        if !matches!(&header, Declaration::Axiom(header) if !header.is_unsafe) {
+            return Err(refusal("a safe computed-field signature"));
+        }
+        absorb_child_caches(&mut meter, &context);
+        headers.push(header);
+    }
+    Ok(headers)
 }
 
 fn elaborate_with_meter(
@@ -147,11 +245,12 @@ fn elaborate_with_meter(
     kernel: Budget,
     scope: &SourceScope,
     mut meter: Context,
+    computed: bool,
 ) -> Result<ElaboratedPartial, NatDefinitionElabError> {
     if members.is_empty() || members.len() > 8 {
         return Err(refusal("one to eight ordinary mutual declarations"));
     }
-    if scope.private_module.is_some() {
+    if scope.private_module.is_some() && !computed {
         return Err(refusal(
             "ordinary mutual group outside module visibility projection",
         ));
@@ -173,7 +272,7 @@ fn elaborate_with_meter(
     let mut level_names: Option<Vec<Name>> = None;
     for syntax in members {
         meter.tick()?;
-        let (id, theorem) = member(syntax)?;
+        let (id, theorem) = member(syntax, computed)?;
         if proof_group.is_some_and(|previous| previous != theorem) {
             return Err(refusal("mutual group cannot mix theorems and definitions"));
         }
@@ -430,7 +529,9 @@ fn elaborate_with_meter(
                     }
                 }
             }
-            declarations.push(Declaration::Mutual(executable));
+            if !computed {
+                declarations.push(Declaration::Mutual(executable));
+            }
             for &index in &component {
                 remaining[index] = false;
             }
@@ -1440,7 +1541,7 @@ mod tests {
         for allowed in [1, used / 4, used / 2, used - 1] {
             let mut meter = Context::scoped(&env, kernel, &scope).unwrap();
             meter.txn.budget.max_heartbeats = allowed;
-            let stopped = elaborate_with_meter(&members, &env, kernel, &scope, meter);
+            let stopped = elaborate_with_meter(&members, &env, kernel, &scope, meter, false);
             let exhausted = match stopped.as_ref().err() {
                 Some(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)) => {
                     true

@@ -174,6 +174,58 @@ impl ArtifactData {
         checked: &Environment,
         meter: &mut Meter,
     ) -> Result<Self, SourceModuleCheckError> {
+        // Computed fields require `_impl` compiler layouts and the generated
+        // replacement/attribute inventory as one package. Until this writer
+        // emits that complete package, refuse new provenance before projecting
+        // ordinary inductive caches; a successful artifact must never silently
+        // lose its cache-bearing runtime representation.
+        if let Some(journal) = checked.extension(&fln_elab::computed_fields::journal_name()) {
+            let inherited = base.extension(&fln_elab::computed_fields::journal_name());
+            let mut unchanged = inherited.is_some_and(|previous| previous.len() == journal.len());
+            let mut prior = inherited
+                .into_iter()
+                .flat_map(|previous| previous.entries());
+            for entry in journal.entries() {
+                meter.work(1)?;
+                meter.bytes(entry.payload.len())?;
+                unchanged &= prior.next() == Some(entry);
+            }
+            if !unchanged {
+                let remaining = meter.limits.max_work.saturating_sub(meter.work);
+                let allowance = (remaining / 2).min(100_000);
+                meter.work(allowance)?;
+                let families = fln_elab::computed_fields::families(
+                    checked,
+                    fln_elab::records::RecordBudget {
+                        max_binders: allowance,
+                        max_nodes: allowance,
+                    },
+                )
+                .map_err(|error| match error {
+                    fln_elab::computed_fields::ComputedFieldError::ResourceLimit => {
+                        SourceModuleCheckError::Limit {
+                            resource: "module work",
+                            limit: meter.limits.max_work,
+                        }
+                    }
+                    _ => SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::computed_fields::journal_name(),
+                        reason: "invalid computed-field generation provenance",
+                    },
+                })?;
+                for family in families {
+                    meter.work(1)?;
+                    if !base.contains(&family) || !base.contains(&Name::str(family, "_impl")) {
+                        return Err(SourceModuleCheckError::Extension {
+                            module: name.clone(),
+                            extension: fln_elab::computed_fields::journal_name(),
+                            reason: "computed-field artifacts require generated implementation compiler layouts and attribute metadata",
+                        });
+                    }
+                }
+            }
+        }
         // Default equation policies and realization provenance are local
         // compilation facts: the pin reconstructs their result from the actual
         // checked equation declarations. Nondefault definition-time options

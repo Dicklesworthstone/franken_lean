@@ -238,6 +238,9 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
             | SourceInferenceError::EquationTheorem(_)
             | SourceInferenceError::UnsupportedFinLiteralPattern(_)
             | SourceInferenceError::UnsupportedRecordConstructor(_)
+            | SourceInferenceError::ComputedField(
+                fln_elab::computed_fields::ComputedFieldError::Unsupported(_),
+            )
             | SourceInferenceError::EliminatorTags(
                 fln_elab::eliminator_tags::EliminatorTagError::UnsupportedEliminator(_),
             )

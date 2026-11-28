@@ -24,6 +24,7 @@
 pub mod aliases;
 pub mod arithmetic;
 pub mod aux_recursors;
+pub mod computed_fields;
 pub mod constraint;
 pub mod dataflow;
 pub mod decision;
