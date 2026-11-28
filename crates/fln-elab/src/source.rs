@@ -46,6 +46,7 @@ pub use level_syntax::LevelSyntaxError;
 pub mod inspect;
 mod matching;
 mod numeric;
+mod opaque;
 mod operators;
 mod optional;
 mod overload;
@@ -1376,6 +1377,9 @@ impl Context {
             return Ok(literal);
         }
         if let Syntax::Node { kind, args, .. } = syntax {
+            if kind == &parser_kind(&["Term", "defaultOrOfNonempty"]) {
+                return self.default_or_of_nonempty(args, expected);
+            }
             if kind == &parser_kind(&["Term", "dotIdent"]) {
                 return self.dotted_identifier(args, expected);
             }
@@ -8171,7 +8175,7 @@ fn definition_elaboration(
             "opaque",
         )?;
         if expect_null_args(&parts[3], "opaque value")?.is_empty() {
-            return opaque_without_value(declaration, parts, context, generated_name);
+            return opaque_without_value(declaration, parts, context, generated_name, is_unsafe);
         }
     }
     let instance_parts;
@@ -8962,18 +8966,16 @@ fn axiom_from_header(
     }))
 }
 
-/// `opaque c : T` with no value takes the pin's `default_or_ofNonempty%` (vendored
-/// `Lean/Elab/BuiltinNotation.lean`): `default` through an `Inhabited` instance, elaborated as
-/// the written value would be. Its other half, `Classical.ofNonempty` through a `Nonempty`
-/// instance, is noncomputable, and the pin's compiler refuses it for an `opaque` that is not
-/// `noncomputable`, `@[extern]` or `@[implemented_by]` ("failed to compile definition … depends
-/// on 'Classical.ofNonempty'", measured 2026-10-11). None of those is modelled here, so a type
-/// without an `Inhabited` instance is refused, as the pin refuses it.
+/// The pin's `mkDefViewOfOpaque` (`Lean/Elab/DefView.lean:190–202`) inserts a
+/// `default_or_ofNonempty%` term. Elaborate the header once, then synthesize the
+/// logical witness in that binder context. Ordinary code eligibility and the
+/// checked executable attributes still govern the completed opaque value.
 fn opaque_without_value(
     declaration: &[Syntax],
     parts: &[Syntax],
     context: &mut Context,
     generated_name: Option<Name>,
+    is_unsafe: bool,
 ) -> Result<Declaration, NatDefinitionElabError> {
     let value = |term: Syntax| {
         let null = || Syntax::node(Name::from_components(["null"]), Vec::new());
@@ -9003,13 +9005,24 @@ fn opaque_without_value(
             vec![declaration[0].clone(), opaque],
         )
     };
-    let identifier = |components: &[&str]| Syntax::Ident {
-        info: fln_syntax::source::SourceInfo::None,
-        raw_val: fln_syntax::source::ByteSpan::default().into(),
-        val: Name::from_components(components.iter().copied()),
-        preresolved: Vec::new(),
-    };
-    definition_in_context_named(&value(identifier(&["default"])), context, generated_name)
+    let term = Syntax::node(
+        parser_kind(&["Term", "defaultOrOfNonempty"]),
+        vec![
+            Syntax::atom(
+                fln_syntax::source::SourceInfo::None,
+                "default_or_ofNonempty%",
+            ),
+            Syntax::node(
+                Name::from_components(["null"]),
+                if is_unsafe {
+                    vec![Syntax::atom(fln_syntax::source::SourceInfo::None, "unsafe")]
+                } else {
+                    Vec::new()
+                },
+            ),
+        ],
+    );
+    definition_in_context_named(&value(term), context, generated_name)
 }
 
 pub(super) fn query(
