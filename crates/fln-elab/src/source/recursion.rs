@@ -1527,7 +1527,7 @@ impl Context {
         let mut parameters = parameters.to_vec();
         let result = (|| {
             let (body, expected, lambdas) =
-                self.open_recursive_lambdas(syntax, expected, &mut parameters)?;
+                self.open_recursive_lambdas(syntax, expected, &mut parameters, None)?;
             let expected = match expected {
                 Some(expected) => Some(expected),
                 None => {

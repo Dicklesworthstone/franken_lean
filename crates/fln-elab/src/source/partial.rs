@@ -369,7 +369,7 @@ impl Context {
         // do not move lambdas through lets, applications, or effects.
         let mut recursive_parameters = parameters.to_vec();
         let (syntax, expected, lambdas) = if expected.is_none() {
-            self.open_recursive_lambdas(syntax, expected, &mut recursive_parameters)?
+            self.open_recursive_lambdas(syntax, expected, &mut recursive_parameters, None)?
         } else {
             (syntax, expected, Vec::new())
         };

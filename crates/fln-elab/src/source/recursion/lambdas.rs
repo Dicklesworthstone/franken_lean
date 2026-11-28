@@ -76,6 +76,7 @@ impl Context {
         mut syntax: &'a Syntax,
         mut expected: Option<Expr>,
         parameters: &mut Vec<LocalDecl>,
+        signature_self: Option<&FVarId>,
     ) -> Result<(&'a Syntax, Option<Expr>, Vec<binders::Telescope<'a>>), NatDefinitionElabError>
     {
         let mut lambdas = Vec::new();
@@ -98,6 +99,7 @@ impl Context {
                 break;
             }
             let mut lambda = self.start_telescope(syntax, expected, true)?;
+            lambda.set_signature_self(signature_self);
             while let Some(annotation) = self.next_telescope_domain(&mut lambda)? {
                 let type_expected = self.type_expected()?;
                 let domain = self.term(annotation, Some(type_expected))?;

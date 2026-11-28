@@ -838,7 +838,7 @@ impl Context {
             plan.member_family(member.index).ok_or_else(scope)?;
         let mut parameters = parameters.to_vec();
         let (body, expected, lambdas) =
-            self.open_recursive_lambdas(syntax, expected, &mut parameters)?;
+            self.open_recursive_lambdas(syntax, expected, &mut parameters, None)?;
         // Captures are implicit in source peer references, but explicit fixed
         // arguments of the shared recursor. Keep their original identities;
         // a written parameter can shadow the same section variable's name.

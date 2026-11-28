@@ -282,6 +282,23 @@ fn local_recursive_names_shadow_outer_locals_and_globals_only_in_the_value() {
 }
 
 #[test]
+fn inferred_local_domains_do_not_hide_self_from_written_annotations() {
+    let base = checked(&engine(), "def loop : Type := Nat");
+    let before = base.logical_root(&KVMap::new());
+    let source = "def bad : Nat := let rec loop : Nat -> Nat := fun (n : loop) => n; loop 0";
+    let problem = base
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err("the written domain must see the recursive function, not the outer type");
+    assert_eq!(problem.disposition(), ("elaboration", false, 1));
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+    assert!(!base.environment().contains(&Name::from_components(["bad"])));
+}
+
+#[test]
 fn captured_functions_and_implicit_local_parameters_preserve_scope() {
     checked(
         &engine(),
@@ -803,3 +820,4 @@ def bad (xs : Chain Nat) : Nat :=
         assert!(!base.environment().contains(&Name::from_components(["bad"])));
     }
 }
+

@@ -419,6 +419,7 @@ impl Context {
             build.value_syntax,
             build.result_type.clone(),
             &mut build.parameters,
+            Some(&marker),
         )?;
         let expected = expected.ok_or_else(|| failure(SourceInferenceError::ExpectedFunction))?;
         // A recursive call in a domain precedes the structural match, so no

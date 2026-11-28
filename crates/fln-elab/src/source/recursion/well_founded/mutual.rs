@@ -588,7 +588,7 @@ impl Context {
             });
         }
         let mut parameters = parameters.to_vec();
-        self.open_recursive_lambdas(syntax, expected, &mut parameters)?;
+        self.open_recursive_lambdas(syntax, expected, &mut parameters, None)?;
         let measure = self.well_founded_measure(hint, &parameters, header_parameters)?;
         let value = self.instantiate(&measure.value)?;
         let mut value = self.instantiate(&value)?;
@@ -1575,7 +1575,7 @@ impl Context {
         };
         let mut parameters = parameters.to_vec();
         let (body, expected, lambdas) =
-            self.open_recursive_lambdas(syntax, expected, &mut parameters)?;
+            self.open_recursive_lambdas(syntax, expected, &mut parameters, None)?;
         let header_parameters = header_parameters
             .checked_add(member.captures.len())
             .ok_or_else(scope)?;
