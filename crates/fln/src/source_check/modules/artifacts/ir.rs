@@ -375,9 +375,10 @@ impl SourceModuleArtifact {
     /// signatures. Legacy files require IR embedded in their `.olean`, so a
     /// standalone companion is refused. Unsupported executable definitions refuse
     /// the entire facet. Safe opaque bodies use their checked implementation
-    /// without changing the logical declaration. Theorems, declaration-only
-    /// constants, tagged auxiliary recursors and exactly reconstructed logical
-    /// inductive auxiliaries need no standalone executable entries; explicit
+    /// without changing the logical declaration. Proofs, type formers,
+    /// declaration-only constants, tagged auxiliary recursors and exactly
+    /// reconstructed logical inductive auxiliaries need no standalone
+    /// executable entries; explicit
     /// `noncomputable` definitions are omitted as at the pin.
     /// Ordinary `.olean` compilation does not require this facet.
     pub fn compile_ir(
@@ -438,6 +439,7 @@ impl SourceModuleArtifact {
         let local_names: BTreeSet<_> = input.constants.iter().map(ConstantInfo::name).collect();
         let mut public_signatures = Vec::new();
         for constant in &input.constants {
+            let mut compiler_limits = limits.compiler;
             // The pin's generated auxiliary recursors are logical definitions
             // unfolded into callers, not separately scheduled source exports.
             // Only validated generator/importer tags grant this exemption; a
@@ -447,7 +449,37 @@ impl SourceModuleArtifact {
             {
                 continue;
             }
-            if logical_inductive_auxiliary(input, constant, limits.compiler).map_err(|error| {
+            if matches!(constant, ConstantInfo::Defn(_) | ConstantInfo::Opaque(_)) {
+                let mut ingress = limits.execution.ingress;
+                ingress.max_nodes = ingress
+                    .max_nodes
+                    .min(usize::try_from(compiler_limits.max_work).unwrap_or(usize::MAX));
+                let (irrelevant, work) =
+                    crate::runtime::Preparation::computationally_irrelevant_header(
+                        input.engine.environment(),
+                        &constant.constant_val().type_,
+                        ingress,
+                    )
+                    .map_err(|error| SourceModuleIrError::Compile {
+                        module: input.name.clone(),
+                        declaration: constant.name().clone(),
+                        error: Box::new(DefinitionCompileError::Engine(
+                            crate::EngineExecutionError::Ingress(error),
+                        )),
+                    })?;
+                compiler_limits.max_work = compiler_limits
+                    .max_work
+                    .checked_sub(u64::try_from(work).unwrap_or(u64::MAX))
+                    .ok_or_else(|| limit("source header classification"))?;
+                // LCNF.shouldGenerateCode omits proof-valued definitions and
+                // type formers, including opaque declarations. Their original
+                // checked declarations stay in every logical companion; only
+                // executable scheduling is affected by this type-only query.
+                if irrelevant {
+                    continue;
+                }
+            }
+            if logical_inductive_auxiliary(input, constant, compiler_limits).map_err(|error| {
                 SourceModuleIrError::Compile {
                     module: input.name.clone(),
                     declaration: constant.name().clone(),
@@ -465,7 +497,7 @@ impl SourceModuleArtifact {
                     &input.engine,
                     constant.name(),
                     limits.execution,
-                    limits.compiler,
+                    compiler_limits,
                 )
                 .map_err(|error| SourceModuleIrError::Compile {
                     module: input.name.clone(),
@@ -492,7 +524,7 @@ impl SourceModuleArtifact {
                 constant.name(),
                 &input.options,
                 limits.execution,
-                limits.compiler,
+                compiler_limits,
             )
             .map_err(|error| SourceModuleIrError::Compile {
                 module: input.name.clone(),

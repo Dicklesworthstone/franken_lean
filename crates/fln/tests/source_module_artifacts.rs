@@ -11,6 +11,8 @@ use fln::{
 
 #[path = "source_module_artifacts/classes.rs"]
 mod classes;
+#[path = "source_module_artifacts/irrelevant.rs"]
+mod irrelevant;
 #[path = "source_module_artifacts/recursive_data.rs"]
 mod recursive_data;
 
