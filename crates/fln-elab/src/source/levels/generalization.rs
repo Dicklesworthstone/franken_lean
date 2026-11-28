@@ -26,6 +26,11 @@ impl Context {
         for pending in &self.deferred_local_functions {
             holes.remove(&pending.id);
         }
+        if let Some(state) = &self.partial {
+            for pending in state.locals.obligations() {
+                holes.remove(pending);
+            }
+        }
         if holes.is_empty() {
             Ok(())
         } else {

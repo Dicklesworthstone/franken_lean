@@ -235,6 +235,53 @@ pub fn elaborate_group(
         close_shared_captures(&mut meter, &headers, &mut bodies, &universes, &fixed_levels)?;
     }
 
+    finish_components(
+        meter,
+        Components {
+            names,
+            bodies,
+            failed_codegen,
+            kind,
+            scopes,
+        },
+        environment,
+        kernel,
+        scope,
+    )
+}
+
+/// Close a complete collection of typed predefinitions by its actual call
+/// graph. Source mutual commands and lifted partial locals share this gate.
+pub(super) struct Components {
+    pub names: Vec<Name>,
+    pub bodies: Vec<DefinitionVal>,
+    pub failed_codegen: Vec<bool>,
+    pub kind: Kind,
+    pub scopes: Vec<SourceScope>,
+}
+
+pub(super) fn finish_components(
+    mut meter: Context,
+    components: Components,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<ElaboratedPartial, NatDefinitionElabError> {
+    let Components {
+        names,
+        bodies,
+        failed_codegen,
+        kind,
+        scopes,
+    } = components;
+    if names.is_empty()
+        || names.len() != bodies.len()
+        || names.len() != failed_codegen.len()
+        || names.len() != scopes.len()
+    {
+        return Err(failure(SourceInferenceError::Scope));
+    }
+
     let executable: Vec<_> = names
         .iter()
         .map(|name| {
@@ -373,6 +420,7 @@ pub fn elaborate_group(
         }
     }
     Ok(ElaboratedPartial {
+        owner: None,
         declarations,
         noncomputable,
         irreducible: BTreeSet::new(),
@@ -590,7 +638,7 @@ fn close_shared_captures(
     Ok(shared)
 }
 
-fn children(expr: &Expr) -> Vec<&Expr> {
+pub(super) fn children(expr: &Expr) -> Vec<&Expr> {
     match expr.node() {
         ExprNode::App { f, a } => vec![f, a],
         ExprNode::Lam {
@@ -609,13 +657,33 @@ fn children(expr: &Expr) -> Vec<&Expr> {
 
 /// Iterative, DAG-preserving leaf replacement. The original root pins every
 /// address key throughout the walk; all visits, including memo hits, cost work.
-fn map(
+pub(super) fn map(
     context: &mut Context,
     root: &Expr,
     replace: &impl Fn(&mut Context, &Expr) -> Result<Option<Expr>, NatDefinitionElabError>,
 ) -> Result<Expr, NatDefinitionElabError> {
+    map_inner(context, root, replace, false)
+}
+
+/// Closure substitution contracts only beta redexes introduced by replacing
+/// private local-function placeholders, without unfolding a global definition.
+pub(super) fn map_beta(
+    context: &mut Context,
+    root: &Expr,
+    replace: &impl Fn(&mut Context, &Expr) -> Result<Option<Expr>, NatDefinitionElabError>,
+) -> Result<Expr, NatDefinitionElabError> {
+    map_inner(context, root, replace, true)
+}
+
+fn map_inner(
+    context: &mut Context,
+    root: &Expr,
+    replace: &impl Fn(&mut Context, &Expr) -> Result<Option<Expr>, NatDefinitionElabError>,
+    beta: bool,
+) -> Result<Expr, NatDefinitionElabError> {
     let mut pending = vec![(root, false)];
     let mut done = HashMap::new();
+    let mut introduced_lambdas = HashSet::new();
     while let Some((expr, build)) = pending.pop() {
         context.tick()?;
         let key = expr.allocation_identity();
@@ -623,6 +691,9 @@ fn map(
             continue;
         }
         if let Some(value) = replace(context, expr)? {
+            if beta && matches!(value.node(), ExprNode::Lam { .. }) {
+                introduced_lambdas.insert(key);
+            }
             done.insert(key, value);
             continue;
         }
@@ -637,7 +708,20 @@ fn map(
                 .clone()
         };
         let value = match expr.node() {
-            ExprNode::App { f, a } => Expr::app(child(f), child(a)),
+            ExprNode::App { f, a } => {
+                let introduced = introduced_lambdas.contains(&f.allocation_identity());
+                let f = child(f);
+                let a = child(a);
+                if introduced && let ExprNode::Lam { body, .. } = f.node() {
+                    let value = context.substitute(body, &a)?;
+                    if matches!(value.node(), ExprNode::Lam { .. }) {
+                        introduced_lambdas.insert(key);
+                    }
+                    value
+                } else {
+                    Expr::app(f, a)
+                }
+            }
             ExprNode::Lam {
                 binder_name,
                 binder_type,

@@ -14,10 +14,11 @@ pub(super) mod lifting;
 #[derive(Clone)]
 pub(super) struct Deferred {
     pub id: MVarId,
-    value: Typed,
-    captures: Vec<LocalDecl>,
-    lift_name: Option<Name>,
-    lift_context: LocalContext,
+    pub value: Typed,
+    pub captures: Vec<LocalDecl>,
+    pub lift_name: Option<Name>,
+    pub lift_context: LocalContext,
+    pub partial_marker: Option<FVarId>,
 }
 
 #[derive(Clone)]
@@ -49,7 +50,8 @@ pub(super) struct Build<'a> {
     lambdas: Vec<binders::Telescope<'a>>,
     saved: LocalContext,
     outer_recursion: Option<recursion::Recursion>,
-    marker: Option<FVarId>,
+    pub marker: Option<FVarId>,
+    pub partial: bool,
     generalized_parameters: HashSet<usize>,
     /// A whole-body below/brecOn candidate, with no selected source match.
     pub course_parameter: Option<usize>,
@@ -122,6 +124,22 @@ impl<'a> Checkpoint<'a> {
     ) -> Result<Self, NatDefinitionElabError> {
         context.open_local_recursive_lambdas(&mut build)?;
         let mut candidates = vec![Candidate::Nonrecursive];
+        if build.partial {
+            if build.binding.termination.is_some() {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "no termination hint on a partial local function",
+                });
+            }
+            return Ok(Self {
+                context: Box::new(context.clone()),
+                build,
+                candidates,
+                next: 0,
+                generalized_parameters: HashSet::new(),
+                tasks,
+                values,
+            });
+        }
         let body = original(context, build.value_syntax)?;
         let prepared = prepared(context, build.value_syntax)?;
         match context.recursion_columns(&build.parameters, body) {
@@ -243,6 +261,7 @@ impl Context {
         &mut self,
         value: Typed,
         lift_name: Option<Name>,
+        partial_marker: Option<FVarId>,
     ) -> Result<Typed, NatDefinitionElabError> {
         let locals = self.txn.lctx.decls().to_vec();
         let mut reads = self.elimination_reads(&value.value)?;
@@ -250,7 +269,7 @@ impl Context {
         let mut captures = Vec::new();
         for local in locals.iter().rev() {
             self.tick()?;
-            if reads.contains(&local.id) {
+            if partial_marker.is_some() || reads.contains(&local.id) {
                 reads.extend(self.elimination_reads(&local.type_)?);
                 if let Some(value) = &local.value {
                     reads.extend(self.elimination_reads(value)?);
@@ -294,6 +313,7 @@ impl Context {
             captures,
             lift_name,
             lift_context: self.txn.lctx.clone(),
+            partial_marker,
         });
         Ok(Typed {
             value: reference,
@@ -315,6 +335,13 @@ impl Context {
         let deferred = std::mem::take(&mut self.deferred_local_functions);
         for pending in deferred {
             self.tick()?;
+            if pending.partial_marker.is_some() {
+                // The parent and every helper close together, after all
+                // delayed body constraints have settled. Inlining here would
+                // erase the dependency graph or expose a recursive proof.
+                self.deferred_local_functions.push(pending);
+                continue;
+            }
             let mut value = self.instantiate(&pending.value.value)?;
             for local in pending.captures.iter().rev() {
                 self.tick()?;
@@ -374,6 +401,7 @@ impl Context {
             None
         };
         let outer_parent = self.local_function_lifting.parent.clone();
+        let partial = binding.recursive && self.collect_partial_locals();
         let saved = self.txn.lctx.clone();
         let parameters = self.bind_parameters(binding.parameters)?;
         let header_parameters = parameters.len();
@@ -403,6 +431,7 @@ impl Context {
             saved,
             outer_recursion: None,
             marker: None,
+            partial,
             generalized_parameters: HashSet::new(),
             course_parameter: None,
             omitted,
@@ -600,6 +629,15 @@ impl Context {
             return Err(failure(SourceInferenceError::Scope));
         };
         build.marker = Some(id.clone());
+        if build.partial && build.checkpoint.is_some() {
+            self.register_partial_local(
+                build
+                    .lift_name
+                    .as_ref()
+                    .ok_or_else(|| failure(SourceInferenceError::Scope))?,
+                id,
+            )?;
+        }
         // Put the self binder BEFORE the parameters: self shadows an outer
         // local/global, but a parameter with the same source name shadows self.
         let mut context = LocalContext::new();
@@ -643,7 +681,7 @@ impl Context {
         value.value = self.instantiate(&value.value)?;
         value.type_ = self.instantiate(build.result_type.as_ref().unwrap_or(&value.type_))?;
         if let Some(marker) = &build.marker
-            && (self.elimination_reads(&value.value)?.contains(marker)
+            && ((!build.partial && self.elimination_reads(&value.value)?.contains(marker))
                 || self.elimination_reads(&value.type_)?.contains(marker))
         {
             return Err(failure(SourceInferenceError::Recursion(
@@ -825,6 +863,7 @@ mod tests {
             saved: LocalContext::new(),
             outer_recursion: None,
             marker: None,
+            partial: false,
             generalized_parameters: HashSet::new(),
             course_parameter: None,
             omitted: None,

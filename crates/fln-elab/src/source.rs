@@ -5748,7 +5748,11 @@ impl Context {
                                     }
                                 }
                                 let value = if build.binding.recursive {
-                                    self.defer_local_function(value, build.lift_name)?
+                                    self.defer_local_function(
+                                        value,
+                                        build.lift_name,
+                                        build.partial.then_some(build.marker).flatten(),
+                                    )?
                                 } else {
                                     value
                                 };
@@ -5897,6 +5901,9 @@ impl Context {
                                 }
                                 let saved = self.txn.lctx.clone();
                                 let id = FVarId(self.fresh_name()?);
+                                if matches!(binding_kind, LetKind::LetRec) {
+                                    self.register_partial_local_alias(&id, &value.value)?;
+                                }
                                 if binding_kind.opaque() {
                                     // A `have` witness is checked, but cannot unfold in
                                     // the continuation's elaboration context.
@@ -6176,6 +6183,16 @@ impl Context {
                                 let type_ = self.substitute(&abstract_type, &value.value)?;
                                 let value = if binding_kind.inline() {
                                     // `letI`/`haveI`: the value replaces the variable.
+                                    self.substitute(&abstract_body, &value.value)?
+                                } else if matches!(binding_kind, LetKind::LetRec)
+                                    && self.collect_partial_locals()
+                                {
+                                    // Only this compiler-created binder is
+                                    // substituted. Its value is still opaque,
+                                    // and even an unused helper remains an
+                                    // independently checked predefinition.
+                                    // Retaining an unused argument here would
+                                    // invent an owner-to-helper SCC edge.
                                     self.substitute(&abstract_body, &value.value)?
                                 } else if matches!(binding_kind, LetKind::LetRec) {
                                     Expr::app(
@@ -7277,6 +7294,56 @@ fn auto_bound_name(name: &Name, options: &KVMap) -> bool {
 }
 
 impl Context {
+    /// `throwUnknownIdWithSuggestions` checks the complete module world before
+    /// auto-binding an unknown name in an exported header (Lean/Elab/App.lean:
+    /// 1961-1965). A unique private resolution is a scope error, not a new
+    /// implicit parameter. Keep the current namespace/open policy; a private
+    /// declaration with the same short name elsewhere is not enough, and an
+    /// ambiguous private lookup does not trigger the pin's singleton guard.
+    fn auto_bound_name_is_private(&mut self, name: &Name) -> Result<bool, NatDefinitionElabError> {
+        if !self.source_scope.exports_declaration() {
+            return Ok(false);
+        }
+        let Some((environment, _)) = self.private_decl_world.as_ref() else {
+            return Ok(false);
+        };
+        let environment = environment.clone();
+        for _ in 0..self
+            .source_scope
+            .opened
+            .len()
+            .saturating_add(
+                scope::components(&self.source_scope.namespace)
+                    .map_err(|error| failure(SourceInferenceError::NameScope(error)))?
+                    .len(),
+            )
+            .saturating_add(1)
+        {
+            self.tick()?;
+        }
+        let aliases = self
+            .alias_cache
+            .read(&environment)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        let protected = self
+            .protected_cache
+            .read(&environment)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        match self.source_scope.resolve_with_aliases(
+            name,
+            |candidate| {
+                environment.contains(candidate)
+                    || equation_theorems::target(&environment, candidate).is_some()
+            },
+            &aliases,
+            &protected,
+        ) {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) | Err(scope::ScopeError::Ambiguous(..)) => Ok(false),
+            Err(error) => Err(failure(SourceInferenceError::NameScope(error))),
+        }
+    }
+
     /// The pin's `withAutoBoundImplicit` (Lean/Elab/Term/TermElabM.lean:1932-1955) around a header's
     /// binders and type: an unknown name `auto_bound_name` admits, other than `own_names`, restores
     /// the state from before the attempt, becomes an implicit local of a fresh type, and `elaborate`
@@ -7298,6 +7365,9 @@ impl Context {
                     && !autos.iter().any(|auto| auto.user_name == found)
                     && auto_bound_name(&found, &self.txn.options) =>
                 {
+                    if self.auto_bound_name_is_private(&found)? {
+                        return Err(failure(SourceInferenceError::UnknownConstant(found)));
+                    }
                     let spent = self.txn.budget.heartbeats_consumed;
                     *self = state;
                     self.txn.budget.heartbeats_consumed = spent;
@@ -8301,6 +8371,7 @@ fn definition_elaboration(
     context.resume_postponed_eliminators(true)?;
     context.flush(true)?;
     context.complete_local_functions()?;
+    context.complete_partial_local_functions(&mut term, &parameters)?;
     context.close_partial_group_references(&mut term)?;
     let section_parameters = if let Some(selected) = theorem_section_parameters {
         selected
@@ -8342,7 +8413,9 @@ fn definition_elaboration(
         ]);
     }
     universe_roots.extend(context.local_function_lifting.roots());
+    universe_roots.extend(context.partial_local_roots());
     context.generalize_declaration_universes(&universe_roots)?;
+    context.close_partial_local_references(&mut term, &parameters, &partial_captures)?;
     let mut term = context.finish(term)?;
     context.close_partial_reference(&mut term, &parameters, &partial_captures)?;
     // Preserve the source's actual lambda stages. Eta-expanding a computed

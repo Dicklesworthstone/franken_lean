@@ -179,7 +179,10 @@ impl Context {
 
     /// Strip only this module's exact private prefix. Hygiene and generated
     /// suffixes may contain numeric components, which must remain unchanged.
-    fn auxiliary_user_name(&mut self, name: &Name) -> Result<Name, NatDefinitionElabError> {
+    pub(in crate::source) fn auxiliary_user_name(
+        &mut self,
+        name: &Name,
+    ) -> Result<Name, NatDefinitionElabError> {
         let Some(module) = self.source_scope.private_identity().cloned() else {
             return Ok(name.clone());
         };

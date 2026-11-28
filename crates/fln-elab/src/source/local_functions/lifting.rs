@@ -50,7 +50,11 @@ impl Context {
         if self.local_function_lifting.names.len() >= MAX_LIFTED_FUNCTIONS {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
-        let name = parent.append_core(short);
+        let mut name = parent.append_core(short);
+        if self.collect_partial_locals() && self.auxiliary_declarations_are_private() {
+            let user = self.auxiliary_user_name(&name)?;
+            name = self.source_scope.private_name(&user);
+        }
         if self.txn.env.contains(&name) || !self.local_function_lifting.names.insert(name.clone()) {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "a fresh local recursive declaration name",

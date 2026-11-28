@@ -7,6 +7,7 @@ use fln_env::constants::ConstantInfo;
 use std::collections::BTreeSet;
 mod group;
 mod inhabitant;
+mod local;
 pub(in crate::source) use group::{elaborate_computed_group, elaborate_computed_headers};
 pub use group::{elaborate_group, elaborate_ordinary_group, is_ordinary_group_member};
 #[cfg(test)]
@@ -16,6 +17,7 @@ mod codegen_tests;
 /// The declarations are untrusted candidates until the caller's whole council
 /// batch succeeds. Compilation metadata is recorded only on that successor.
 pub struct ElaboratedPartial {
+    owner: Option<Name>,
     declarations: Vec<Declaration>,
     noncomputable: BTreeSet<Name>,
     /// Members of a mutual well-founded group, which the pin marks
@@ -28,6 +30,12 @@ pub struct ElaboratedPartial {
 }
 
 impl ElaboratedPartial {
+    /// The requested declaration of a single command. Lifted helpers may
+    /// precede it in dependency order; explicit mutual commands have no owner.
+    pub fn owner_name(&self) -> Option<&Name> {
+        self.owner.as_ref()
+    }
+
     /// The entire atomic admission batch, including logical interfaces.
     pub fn declarations(&self) -> &[Declaration] {
         &self.declarations
@@ -144,6 +152,7 @@ pub(super) struct State {
     /// The termination hint of the member elaborated in this context, as the
     /// ordinary group's body pass found it.
     pub member_hint: Option<recursion::MemberHint>,
+    pub locals: local::Locals,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -272,6 +281,9 @@ fn elaborate_in_context(
     // synthesis must use that world's instance and reducibility history while
     // retaining the declaration's already fixed public name and signature.
     let scope = context.source_scope.clone();
+    if context.has_partial_local_closures() {
+        return local::finish(context, candidate, inhabitant_environment, kernel, &scope);
+    }
     let Declaration::Mutual(ref definitions) = candidate else {
         // The pin uses its nonrecursive path when no self-reference survives.
         let mut noncomputable = BTreeSet::new();
@@ -282,6 +294,10 @@ fn elaborate_in_context(
             noncomputable.insert(definition.base.name.clone());
         }
         return Ok(ElaboratedPartial {
+            owner: Some(match &candidate {
+                Declaration::Defn(definition) => definition.base.name.clone(),
+                _ => return Err(failure(SourceInferenceError::Scope)),
+            }),
             declarations: vec![candidate],
             noncomputable,
             irreducible: BTreeSet::new(),
@@ -317,9 +333,10 @@ fn elaborate_in_context(
         },
         value: inhabitant,
         is_unsafe: false,
-        all: vec![name],
+        all: vec![name.clone()],
     });
     Ok(ElaboratedPartial {
+        owner: Some(name),
         declarations: vec![logical, candidate],
         noncomputable,
         irreducible: BTreeSet::new(),
@@ -419,11 +436,12 @@ impl Context {
         let body = self.close_recursive_lambdas(&lambdas, body)?;
         // A failed tactic alternative can discard its recursive reference.
         // Judge the surviving checked term, not whether a trial mentioned self.
-        if !body
-            .value
-            .abstract_fvar(&marker, 0)
-            .map_err(|_| failure(SourceInferenceError::Scope))?
-            .has_loose_bvar(0)
+        if !self.has_partial_local_headers()
+            && !body
+                .value
+                .abstract_fvar(&marker, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?
+                .has_loose_bvar(0)
         {
             self.partial
                 .as_mut()
@@ -437,6 +455,7 @@ impl Context {
             .partial
             .as_ref()
             .is_some_and(|state| state.kind == Kind::Partial)
+            && !self.has_partial_local_headers()
             && !matches!(self.whnf(&type_)?.node(), ExprNode::ForallE { .. })
         {
             return Err(NatDefinitionElabError::UnexpectedSyntax {

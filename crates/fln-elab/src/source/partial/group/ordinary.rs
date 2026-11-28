@@ -553,6 +553,7 @@ fn elaborate_with_meter(
         remaining[index] = false;
     }
     Ok(ElaboratedPartial {
+        owner: None,
         declarations,
         noncomputable: BTreeSet::new(),
         irreducible,

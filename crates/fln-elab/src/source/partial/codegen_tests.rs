@@ -37,6 +37,7 @@ fn fixture() -> (ElaboratedPartial, Environment) {
     }
     (
         ElaboratedPartial {
+            owner: None,
             declarations,
             noncomputable: BTreeSet::from([n("provider")]),
             irreducible: BTreeSet::new(),

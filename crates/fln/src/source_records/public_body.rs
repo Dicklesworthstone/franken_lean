@@ -315,6 +315,11 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        let owner = candidate
+            .owner_name()
+            .ok_or(EngineExecutionError::UnexpectedPublication {
+                detail: "a single public partial command must retain its source owner",
+            })?;
         if let [Declaration::Defn(definition)] = candidate.declarations() {
             // A partial command with no surviving self reference is an ordinary
             // safe definition. Keep the existing hidden-body publication path,
@@ -337,34 +342,49 @@ impl Engine {
                 worlds.public_scope,
             );
         }
-        if !matches!(
-            candidate.declarations(),
-            [Declaration::Opaque(_), Declaration::Mutual(_)]
-        ) {
-            return Err(EngineExecutionError::UnexpectedPublication {
-                detail: "a recursive public partial definition must retain both checked halves",
-            });
-        }
-        // Both candidates cross the ordinary council together. A bad executable
-        // companion cannot publish a successful logical default or signature.
+        // Lifted local functions form ordinary dependency-ordered components.
+        // A helper can precede its owner, and a helper-only recursive component
+        // can leave the owner a safe definition. Check the complete batch before
+        // selecting the source owner's interface; no helper is a public API.
         let private_implementation = match self.admit_partial_result(&candidate, options, limits)? {
             Outcome::Complete(checked) => checked,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let Some(admitted) = private_implementation.admissions.first() else {
-            return Err(EngineExecutionError::UnexpectedPublication {
-                detail: "a public partial definition must admit its logical interface",
-            });
-        };
-        let Declaration::Opaque(logical) = &admitted.declaration else {
-            return Err(EngineExecutionError::UnexpectedPublication {
-                detail: "a public partial definition must preserve its checked opaque interface",
-            });
-        };
+        let logical = private_implementation
+            .admissions
+            .iter()
+            .find_map(|admitted| match &admitted.declaration {
+                Declaration::Defn(definition)
+                    if &definition.base.name == owner
+                        && definition.safety == DefinitionSafety::Safe =>
+                {
+                    Some(&definition.base)
+                }
+                Declaration::Opaque(opaque) if &opaque.base.name == owner && !opaque.is_unsafe => {
+                    Some(&opaque.base)
+                }
+                _ => None,
+            })
+            .ok_or(EngineExecutionError::UnexpectedPublication {
+                detail: "a public partial definition must retain its checked safe logical owner",
+            })?;
+        // Codegen failure can propagate from a helper SCC into an ordinary
+        // owner. Read the completed private result, not only the initial set of
+        // failed candidates. Recursive opaque witnesses remain untagged.
+        let noncomputable =
+            fln_elab::noncomputable::read(private_implementation.engine.environment())
+                .map_err(|error| {
+                    EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                        fln_elab::NatDefinitionElabError::Inference(
+                            fln_elab::source::SourceInferenceError::NoncomputableJournal(error),
+                        ),
+                    ))
+                })?
+                .contains(owner);
         let interface = Declaration::Axiom(AxiomVal {
-            base: logical.base.clone(),
-            is_unsafe: logical.is_unsafe,
+            base: logical.clone(),
+            is_unsafe: false,
         });
         Ok(
             match public.admit_scoped_candidate(
@@ -372,7 +392,7 @@ impl Engine {
                 interface,
                 false,
                 None,
-                false,
+                noncomputable,
                 Vec::new(),
                 options,
                 limits,
@@ -381,7 +401,10 @@ impl Engine {
                 Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
                     public,
                     private_implementation: Some(private_implementation),
-                    metadata_complete: false,
+                    // Partial syntax admits no independent attributes. Both
+                    // worlds now contain the complete owner codegen effects;
+                    // replaying them would duplicate a failed safe owner's tag.
+                    metadata_complete: true,
                 }),
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),

@@ -209,3 +209,134 @@ fn cancellation_at_group_and_module_publication_boundaries_returns_no_prefix() {
         .into_complete()
         .unwrap();
 }
+
+#[test]
+fn local_partial_closures_preserve_complete_groups_across_olean_import() {
+    let source = r#"prelude
+universe u
+class Inhabited (α : Sort u) where
+  default : α
+def default {α : Sort u} [inst : Inhabited α] : α := Inhabited.default
+inductive Flag where | stop | again
+partial def walk (answer flag : Flag) : Flag :=
+  match flag with
+  | Flag.stop => Flag.again
+  | Flag.again =>
+    let rec loop (cursor : Flag) : Flag :=
+      match cursor with
+      | Flag.stop => walk answer Flag.stop
+      | Flag.again => loop Flag.stop
+    loop flag
+partial def localOnly (answer flag : Flag) : Flag :=
+  let rec loop (cursor : Flag) : Flag :=
+    match cursor with
+    | Flag.stop => match answer with
+      | Flag.stop => Flag.again
+      | Flag.again => Flag.stop
+    | Flag.again => loop Flag.stop
+  loop flag
+"#;
+    let base = Engine::builder().build_empty();
+    let lib = n("LocalClosures");
+    let build = base
+        .compile_source_modules(
+            &[SourceModuleInput {
+                name: &lib,
+                source: source.as_bytes(),
+            }],
+            &lib,
+            &KVMap::new(),
+            limits(),
+            OleanWriteBudget::default(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let [artifact] = build.artifacts.as_slice() else {
+        panic!("one complete module artifact")
+    };
+    let imported = base
+        .import_olean_modules_for_source(
+            &[OleanModuleInput {
+                name: &lib,
+                artifact: &artifact.bytes,
+                server_artifact: None,
+                private_artifact: None,
+            }],
+            std::slice::from_ref(&lib),
+            &KVMap::new(),
+            SourceOleanImportLimits::new(OleanCheckLimits::new(4 * 1024 * 1024, budget())),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let original = build.checked.checked.engine.environment();
+    assert_eq!(original.len(), imported.environment().len());
+    for (name, value) in original.constants() {
+        assert_eq!(imported.environment().find(name), Some(value), "{name:?}");
+    }
+    for name in [n("walk"), n("walk.loop")] {
+        let Some(ConstantInfo::Opaque(logical)) = imported.environment().find(&name) else {
+            panic!("the owner/helper cycle needs an opaque logical interface: {name:?}")
+        };
+        assert!(!logical.is_unsafe);
+        assert_eq!(logical.all.len(), 2);
+        assert!(logical.all.contains(&n("walk")));
+        assert!(logical.all.contains(&n("walk.loop")));
+        let Some(ConstantInfo::Defn(executable)) =
+            imported.environment().find(&Name::str(name, "_unsafe_rec"))
+        else {
+            panic!("the complete checked companion group must survive import")
+        };
+        assert_eq!(executable.safety, DefinitionSafety::Partial);
+        assert_eq!(
+            executable.all,
+            logical
+                .all
+                .iter()
+                .map(|name| Name::str(name.clone(), "_unsafe_rec"))
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(matches!(
+        imported.environment().find(&n("localOnly")),
+        Some(ConstantInfo::Defn(value)) if value.safety == DefinitionSafety::Safe
+    ));
+    assert!(matches!(
+        imported.environment().find(&n("localOnly.loop")),
+        Some(ConstantInfo::Opaque(value)) if !value.is_unsafe && value.all == [n("localOnly.loop")]
+    ));
+    assert!(!imported.environment().contains(&n("localOnly._unsafe_rec")));
+
+    // These results differ from the closure's captured-parameter inhabitants.
+    // The repeated localOnly calls must also keep independent captured values.
+    let execution = imported
+        .execute_source_definitions(
+            &[b"#eval walk Flag.stop Flag.again\n#eval localOnly Flag.stop Flag.again\n#eval localOnly Flag.again Flag.again"],
+            &KVMap::new(),
+            EngineExecutionLimits::new(budget()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let values: Vec<_> = execution
+        .executions
+        .iter()
+        .map(|execution| {
+            let fln::VmExit::Returned(value) = &execution.exit else {
+                panic!("the imported executable companion must return: {execution:?}")
+            };
+            fln::vm_value_kind(&value.value)
+        })
+        .collect();
+    assert_eq!(
+        values,
+        [
+            fln_vm::interpreter::ValueKind::Ctor(1),
+            fln_vm::interpreter::ValueKind::Ctor(1),
+            fln_vm::interpreter::ValueKind::Ctor(0),
+        ]
+    );
+    assert!(base.environment().is_empty());
+}

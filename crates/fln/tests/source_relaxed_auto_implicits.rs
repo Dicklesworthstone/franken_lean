@@ -71,6 +71,48 @@ def explicitStrictUniverse (A : Sort DeclaredLevel) (value : A) : A := value
 // Noncomputable declarations need no compiler marker constants from Prelude.
 const EMPTY_PRELUDE: &str = "prelude\nnoncomputable def keepUnit (value : Unit) : Unit := value\nnoncomputable def keepIO (value : IO) : IO := value\n";
 
+// Exported headers distinguish unknown names from uniquely resolved private
+// declarations before trying automatic binders. `None` is a scope refusal;
+// `Some` names the implicit carrier the pin and native engine must infer.
+const MODULE_HEADERS: &[(&str, Option<&str>)] = &[
+    (
+        "public partial def keep (value : Missing) : Missing := keep value\n",
+        Some("Missing"),
+    ),
+    (
+        "namespace A\ninductive Hidden where | token\nend A\n\
+         public partial def keep (value : Hidden) : Hidden := keep value\n",
+        Some("Hidden"),
+    ),
+    (
+        "namespace A\ninductive Hidden where | token\nend A\n\
+         namespace B\ninductive Hidden where | token\nend B\nopen A B\n\
+         public partial def keep (value : Hidden) : Hidden := keep value\n",
+        Some("Hidden"),
+    ),
+    (
+        "inductive Hidden where | token\n\
+         public def keep (value : Hidden) : Hidden := value\n",
+        None,
+    ),
+    (
+        "inductive Hidden where | token\n\
+         instance : Inhabited Hidden where default := Hidden.token\n\
+         public partial def keep (value : Hidden) : Hidden := keep value\n",
+        None,
+    ),
+    (
+        "namespace A\ninductive Hidden where | token\nend A\nopen A\n\
+         public partial def keep (value : Hidden) : Hidden := keep value\n",
+        None,
+    ),
+    (
+        "namespace A\ninductive Hidden where | token\n\
+         public def keep (value : Hidden) : Hidden := value\nend A\n",
+        None,
+    ),
+];
+
 const REFUSED: &[&str] = &[
     "set_option autoImplicit false in\ndef disabled (value : longCarrier) : longCarrier := value\n",
     "set_option relaxedAutoImplicit false in\ndef strict (value : longCarrier) : longCarrier := value\n",
@@ -270,6 +312,40 @@ fn empty_world_headers_use_the_same_relaxed_policy_without_assumed_init_names() 
 }
 
 #[test]
+fn public_headers_do_not_auto_bind_unique_private_resolutions() {
+    on_stack(|| {
+        let base = seed();
+        let root = base.logical_root(&KVMap::new());
+        let module = name("HeaderScope");
+        for (body, binder) in MODULE_HEADERS {
+            let source = format!("module\nprelude\n{body}");
+            let result = base.check_source_modules(
+                &[SourceModuleInput {
+                    name: &module,
+                    source: source.as_bytes(),
+                }],
+                &module,
+                &KVMap::new(),
+                SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+            );
+            if let Some(binder) = binder {
+                let checked = result
+                    .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+                    .into_complete()
+                    .unwrap();
+                let (actual, style, type_) = first_binder(&checked.checked.engine, "keep");
+                assert_eq!(actual, name(binder), "{source}");
+                assert_eq!(style, BinderInfo::Implicit, "{source}");
+                assert!(matches!(type_.node(), ExprNode::Sort { .. }), "{source}");
+            } else {
+                assert!(result.is_err(), "accepted {source}");
+            }
+            assert_eq!(base.logical_root(&KVMap::new()), root);
+        }
+    });
+}
+
+#[test]
 fn unknown_bodies_qualified_names_hygiene_and_invalid_headers_remain_refused() {
     on_stack(|| {
         let base = seed();
@@ -332,10 +408,17 @@ fn exact_pin_agrees_on_relaxed_header_option_and_unknown_name_cases() {
         .into_iter()
         .map(|source| (source, true))
         .chain(REFUSED.iter().map(|source| (*source, false)))
+        .map(|(source, accepted)| (source.to_owned(), accepted))
+        .chain(MODULE_HEADERS.iter().map(|(body, binder)| {
+            (
+                format!("module\npublic import Init\n{body}"),
+                binder.is_some(),
+            )
+        }))
         .enumerate()
     {
         let file = root.join(format!("case-{index}.lean"));
-        std::fs::write(&file, source).unwrap();
+        std::fs::write(&file, &source).unwrap();
         let output = Command::new(&reference)
             .current_dir(&root)
             .env_remove("LEAN_PATH")
