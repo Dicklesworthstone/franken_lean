@@ -32,6 +32,14 @@ impl Context {
         self.declare_auto_tactic_with_name(syntax, None)
     }
 
+    pub(in crate::source) fn declare_named_auto_tactic(
+        &mut self,
+        syntax: &Syntax,
+        name: Name,
+    ) -> Result<Name, NatDefinitionElabError> {
+        self.declare_auto_tactic_with_name(syntax, Some(name))
+    }
+
     fn declare_auto_tactic_with_name(
         &mut self,
         syntax: &Syntax,

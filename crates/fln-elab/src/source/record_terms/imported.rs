@@ -52,6 +52,7 @@ struct Field<'a> {
     // syntax or by an update source, even after another parent has been tried.
     allowed_parent: bool,
     instance: bool,
+    automatic: bool,
 }
 
 pub(super) struct ImportedRecord<'a> {
@@ -60,6 +61,7 @@ pub(super) struct ImportedRecord<'a> {
     fields: Vec<Field<'a>>,
     cursor: usize,
     defaults_done: bool,
+    auto_parameters: Vec<optional::AutoParameter>,
 }
 
 struct DefaultValue {
@@ -349,6 +351,7 @@ impl Context {
                 input,
                 allowed_parent,
                 instance: false,
+                automatic: false,
             });
         }
         if !frame.fields.is_empty() {
@@ -362,6 +365,7 @@ impl Context {
             fields,
             cursor: 0,
             defaults_done: false,
+            auto_parameters: Vec::new(),
         };
         self.infer_imported_parent_fields(&mut state)?;
         Ok(state)
@@ -425,6 +429,12 @@ impl Context {
                         let instance = self.instance_hole(field.type_.clone())?;
                         self.constrain(&field.hole, &instance)?;
                         field.instance = true;
+                    } else if let Some(tactic) = optional::auto_tactic(&field.type_).cloned() {
+                        let domain = self.projection_domain(field.type_.clone())?;
+                        let parameter = self.defer_auto_parameter(&tactic, domain)?;
+                        self.constrain(&field.hole, &parameter.value())?;
+                        field.automatic = true;
+                        state.auto_parameters.push(parameter);
                     }
                     state.cursor += 1;
                 }
@@ -440,6 +450,7 @@ impl Context {
                 return Ok(RecordStep::Continue);
             }
             self.synthesize_imported_record_defaults(state)?;
+            self.finish_auto_parameters(std::mem::take(&mut state.auto_parameters))?;
             state.defaults_done = true;
             // Field defaults can unblock provided arguments as well. Resume
             // them before closing the checked update-source let context.
@@ -935,7 +946,7 @@ impl Context {
         let mut names = BTreeSet::new();
         for (index, field) in state.fields.iter().enumerate() {
             self.tick()?;
-            if !matches!(field.input, Input::Missing) {
+            if !matches!(field.input, Input::Missing) || field.automatic {
                 continue;
             }
             let unresolved = matches!(self.instantiate(&field.hole)?.node(), ExprNode::MVar { .. });

@@ -366,6 +366,7 @@ impl Context {
         for (index, (field, domain)) in fields.into_iter().enumerate() {
             self.tick()?;
             let domain = self.instantiate_params(&domain, &ctor.base.level_params, levels)?;
+            let domain = self.projection_domain(domain)?;
             let field_type = domain
                 .subst_loose(
                     0,

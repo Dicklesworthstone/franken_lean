@@ -90,6 +90,7 @@ struct RecordFrame<'a> {
     saved_lctx: LocalContext,
     defaults: Vec<Option<Name>>,
     levels: Vec<Level>,
+    auto_parameters: Vec<optional::AutoParameter>,
 }
 pub(super) enum RecordTarget {
     Constructor(Expr),
@@ -1730,6 +1731,7 @@ impl Context {
             saved_lctx,
             defaults,
             levels,
+            auto_parameters: Vec::new(),
         })
     }
 
@@ -1940,6 +1942,7 @@ impl Context {
             if !state.fields.is_empty() {
                 return Err(failure(SourceInferenceError::Scope));
             }
+            self.finish_auto_parameters(std::mem::take(&mut state.auto_parameters))?;
             let mut term = self.finish_term(state.constructor.clone(), Some(&state.expected))?;
             term.value = self.instantiate(&term.value)?;
             term.type_ = self.instantiate(&term.type_)?;
@@ -1975,7 +1978,7 @@ impl Context {
             binder_name,
             binder_type,
             body,
-            ..
+            binder_info,
         } = type_.node()
         else {
             return Err(failure(SourceInferenceError::Scope));
@@ -1998,6 +2001,21 @@ impl Context {
                     ))) => {}
                     Err(error) => return Err(error),
                 }
+            }
+            if *binder_info != BinderInfo::InstImplicit
+                && let Some(tactic) = optional::auto_tactic(binder_type)
+            {
+                let domain = self.projection_domain(binder_type.clone())?;
+                let parameter = self.defer_auto_parameter(tactic, domain.clone())?;
+                let value = Typed {
+                    value: parameter.value(),
+                    type_: domain,
+                };
+                state.auto_parameters.push(parameter);
+                return Ok(RecordStep::Copy {
+                    value,
+                    target: RecordTarget::Constructor(body.clone()),
+                });
             }
             let index = state
                 .defaults

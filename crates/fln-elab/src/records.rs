@@ -545,7 +545,7 @@ pub fn record_declarations_with_constructor(
     let projection_parameters = Builder::projection_parameters(&spec.parameters, spec.is_class);
     for (index, field) in spec.fields.iter().enumerate() {
         builder.tick()?;
-        let mut domain = field.type_.clone();
+        let mut domain = builder.recursor_type(&field.type_)?;
         // As in the pin's mkProjections, later domains retain named projections
         // of the same receiver. Raw Expr::proj belongs in the projection body:
         // putting it here loses the named type expression that instance

@@ -13,7 +13,8 @@ use crate::records::{RecordBudget, RecordSpec, record_declarations_with_construc
 pub struct SourceRecord {
     pub name: Name,
     pub is_class: bool,
-    /// The inductive block followed by each projection, all still untrusted.
+    /// Checked local quotation predecessors, then the untrusted inductive block
+    /// and its projections. The caller rechecks the complete ordered batch.
     pub declarations: Vec<Declaration>,
     /// References only: the caller registers these after admitting the full batch.
     pub defaults: Vec<RecordDefault>,
@@ -153,7 +154,33 @@ struct DefaultOverride {
     tactic: bool,
 }
 
+struct RecordFlatConstructor {
+    declarations: Vec<Declaration>,
+    auto_parameters: std::collections::BTreeMap<Name, Expr>,
+}
+
 impl Context {
+    fn record_auto_parameter_type(
+        &mut self,
+        domain: Expr,
+        tactic: Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let type_ = self
+            .known_type(&domain)?
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        let sort = self.whnf(&type_)?;
+        let ExprNode::Sort { level } = sort.node() else {
+            return Err(failure(SourceInferenceError::ExpectedType));
+        };
+        Ok(Expr::app(
+            Expr::app(
+                Expr::const_(Name::from_components(["autoParam"]), vec![level.clone()]),
+                domain,
+            ),
+            tactic,
+        ))
+    }
+
     /// Whether every field's type is a proposition.
     fn record_fields_are_proofs(
         &mut self,
@@ -257,6 +284,9 @@ pub(super) fn elaborate_record_scoped(
         .user_declaration_name(name)
         .map_err(|error| failure(SourceInferenceError::NameScope(error)))?;
     let name = &context.enter_declaration(name)?;
+    context.allow_auxiliary_declarations = true;
+    context.diagnostic_declaration = Some(name.clone());
+    context.aux_names = Some(tactics::AuxNames::new(name.clone(), false));
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
     // Auto-bound implicits become leading parameters, as at the pin (`@Box : {α : Sort u_1} → α →
@@ -387,6 +417,8 @@ pub(super) fn elaborate_record_scoped(
     // The pin elaborates every field's type before any default value, so a default's
     // deprecated constants are reported after all the types' (`deprecated.rs`).
     let mut default_uses = Vec::new();
+    let mut auto_parameters = std::collections::BTreeMap::new();
+    let mut pending_auto_parameters = Vec::new();
     let mut written_fields = std::collections::HashSet::new();
     let mut overrides = Vec::new();
     let mut protected_projections = std::mem::take(&mut inheritance.protected_fields);
@@ -402,10 +434,9 @@ pub(super) fn elaborate_record_scoped(
             "named structure field",
         )?;
         let field_protected = field_modifiers(&parts[0], &root[0])?;
-        // `h : P := by tac` is the pin's `binderTactic`, an `autoParam` field: an omitted field
-        // is filled by running its tactic. It is read as a default proved by that tactic, as the
-        // checker read the field before its tree was the pin's: the constructor then takes `P`,
-        // where the pin's takes `autoParam P _` (`autoParam` is a reducible `P`).
+        // The pin quotes a binder tactic after all field types are available.
+        // It is not a proof of this generic field: the selected constructor or
+        // record application runs it with that application's actual arguments.
         let tactic_default;
         let mut is_tactic_default = false;
         let default = match expect_null_args(&parts[3], "field default")? {
@@ -522,7 +553,15 @@ pub(super) fn elaborate_record_scoped(
                 argument.type_ = context.instantiate(&argument.type_)?;
             }
         }
-        if let Some(syntax) = default {
+        if is_tactic_default {
+            let tactic = expect_node(
+                default.ok_or_else(|| failure(SourceInferenceError::Scope))?,
+                &parser_kind(&["Term", "byTactic"]),
+                2,
+                "field tactic term",
+            )?;
+            pending_auto_parameters.push((user_name.clone(), tactic[1].clone()));
+        } else if let Some(syntax) = default {
             let recorded = context.deprecated_uses.len();
             context.infer_level_params = false;
             let term = context.term(syntax, Some(domain.clone()))?;
@@ -630,6 +669,12 @@ pub(super) fn elaborate_record_scoped(
                 .clone(),
         );
     }
+    for (field, tactic) in pending_auto_parameters {
+        context.tick()?;
+        let quote = Name::str(name.append_core(&field), "_autoParam");
+        let quote = context.declare_named_auto_tactic(&tactic, quote)?;
+        auto_parameters.insert(field, Expr::const_(quote, Vec::new()));
+    }
     context.deprecated_uses.append(&mut default_uses);
     let inferred_result_level = explicit.is_none();
     let result_level = match explicit {
@@ -682,6 +727,7 @@ pub(super) fn elaborate_record_scoped(
             &constructor_name,
             &inheritance,
             &overrides,
+            &mut auto_parameters,
             budget,
         );
         context.txn.lctx = saved;
@@ -826,16 +872,31 @@ pub(super) fn elaborate_record_scoped(
         &mut defaults,
         budget,
     )?;
-    let mut declarations = record_declarations_with_constructor(&spec, &constructor, budget)
-        .map_err(|e| failure(SourceInferenceError::Record(e)))?;
     let flat_constructor = Name::str(constructor_name.clone(), "_flat_ctor");
-    let flat_declarations = context.record_flat_constructor(
+    let RecordFlatConstructor {
+        declarations: flat_declarations,
+        auto_parameters: resolved_auto_parameters,
+    } = context.record_flat_constructor(
         &spec,
         &constructor_name,
         &inheritance,
         &declared_defaults,
+        &auto_parameters,
         budget,
     )?;
+    // Constructor annotations are separate from the plain field context used
+    // to elaborate projections and ordinary default-value helpers.
+    let mut constructor_spec = spec.clone();
+    for field in &mut constructor_spec.fields {
+        context.tick()?;
+        if let Some(tactic) = resolved_auto_parameters.get(&field.user_name) {
+            field.type_ =
+                context.record_auto_parameter_type(field.type_.clone(), tactic.clone())?;
+        }
+    }
+    let mut declarations =
+        record_declarations_with_constructor(&constructor_spec, &constructor, budget)
+            .map_err(|e| failure(SourceInferenceError::Record(e)))?;
     let mut default_helpers = Vec::new();
     for helper in &helpers {
         context.tick()?;
@@ -860,6 +921,18 @@ pub(super) fn elaborate_record_scoped(
     )?;
     declarations.extend(copied);
     declarations.extend(helpers);
+    // These names are data helpers, not field projections. Keep their opaque
+    // hints and ordinary default transparency through the facade's classifier.
+    default_helpers.extend(
+        context
+            .auxiliary_visibility
+            .header_quotations
+            .iter()
+            .cloned(),
+    );
+    let mut predecessors = std::mem::take(&mut context.auxiliary_declarations);
+    predecessors.append(&mut declarations);
+    declarations = predecessors;
     let subobjects: std::collections::BTreeMap<_, _> = inheritance
         .parents
         .iter()

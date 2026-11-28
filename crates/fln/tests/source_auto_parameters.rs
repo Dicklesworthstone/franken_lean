@@ -752,3 +752,357 @@ theorem source_safe_override : sourceSafeOverride = Nat.succ Nat.zero := rfl
         assert_eq!(root, engine.logical_root(&KVMap::new()));
     });
 }
+
+const RECORD_AUTO_FIXTURE: &str = r#"
+structure RecordPositive where
+  n : Nat
+  h : n = Nat.succ Nat.zero := by rfl
+def recordPositive : RecordPositive := { n := 1 }
+theorem record_positive : recordPositive.n = 1 := rfl
+theorem record_constructor : RecordPositive.mk 1 = @RecordPositive.mk 1 (by rfl) := rfl
+
+structure RecordMethod where
+  proof (n : Nat) : n = n := by intro n; rfl
+def recordMethod : RecordMethod := {}
+theorem record_method (n : Nat) : n = n := recordMethod.proof n
+
+class RecordChoice where
+  value : Nat := by assumption
+def recordChoice (wanted : Nat) (distractor : Bool) : RecordChoice := {}
+theorem record_choice (wanted : Nat) (distractor : Bool) :
+  (recordChoice wanted distractor).value = wanted := rfl
+
+structure RecordLater (α : Type) where
+  value : α := by assumption
+  witness : α
+def recordLater (wanted : Nat) (distractor : Bool) := { witness := Nat.zero : RecordLater _ }
+theorem record_later (wanted : Nat) (distractor : Bool) :
+  (recordLater wanted distractor).value = wanted := rfl
+
+structure RecordParent where
+  n : Nat
+  h : n = Nat.zero := by rfl
+structure RecordChild extends RecordParent where
+  extra : Nat := by exact 8
+def recordChild : RecordChild := { n := 0 }
+theorem record_child : recordChild.extra = 8 := rfl
+structure RecordOverride extends RecordParent where
+  h := by assumption
+def recordOverride (h : 1 = 0) : RecordOverride := { n := 1 }
+
+structure RecordFirst where
+  value : Nat := by exact 1
+structure RecordValue extends RecordFirst where
+  value := 2
+structure RecordTactic extends RecordFirst where
+  value := by exact 3
+structure RecordLeft extends RecordValue, RecordTactic
+structure RecordRight extends RecordTactic, RecordValue
+def recordLeft : RecordLeft := {}
+def recordRight : RecordRight := {}
+theorem record_left : recordLeft.value = 2 := rfl
+theorem record_right : recordRight.value = 3 := rfl
+
+structure RecordOpt where
+  value : optParam Nat (Nat.succ Nat.zero)
+structure RecordOptValue where
+  value : optParam Nat (Nat.succ Nat.zero) := Nat.zero
+structure RecordOptTactic where
+  value : optParam Nat (Nat.succ Nat.zero) := by exact Nat.zero
+structure RecordOut where
+  value : outParam Nat
+structure RecordOutValue where
+  value : outParam Nat := Nat.zero
+structure RecordOutTactic where
+  value : outParam Nat := by exact Nat.zero
+structure RecordSemi where
+  value : semiOutParam Nat
+structure RecordSemiValue where
+  value : semiOutParam Nat := Nat.zero
+structure RecordSemiTactic where
+  value : semiOutParam Nat := by exact Nat.zero
+structure RecordAuthored where
+  value : autoParam Nat Lean.Syntax.missing
+structure RecordAuthoredValue where
+  value : autoParam Nat Lean.Syntax.missing := Nat.zero
+structure RecordAuthoredTactic where
+  value : autoParam Nat Lean.Syntax.missing := by exact Nat.zero
+structure RecordWrappedChild extends RecordOptTactic
+structure RecordWrappedValue extends RecordOptTactic where
+  value := Nat.succ Nat.zero
+structure RecordWrappedTactic extends RecordOptTactic where
+  value := by exact Nat.zero
+structure RecordAuthoredSelected where
+  value : autoParam Nat RecordFirst.value._autoParam := Nat.succ (Nat.succ Nat.zero)
+structure RecordAuthoredInherited extends RecordAuthoredSelected
+def recordAuthoredSelected : RecordAuthoredSelected := {}
+def recordAuthoredConstructor : RecordAuthoredSelected := RecordAuthoredSelected.mk
+def recordAuthoredInherited : RecordAuthoredInherited := {}
+def recordAuthoredExplicit : RecordAuthoredSelected := { value := 7 }
+theorem record_authored_selected : recordAuthoredSelected.value = 1 := rfl
+theorem record_authored_constructor : recordAuthoredConstructor.value = 1 := rfl
+theorem record_authored_inherited : recordAuthoredInherited.value = 2 := rfl
+theorem record_authored_explicit : recordAuthoredExplicit.value = 7 := rfl
+"#;
+
+#[test]
+fn record_and_class_tactic_fields_match_the_pin_and_wait_for_actual_arguments() {
+    fixture(|engine| {
+        let library = PathBuf::from(std::env::var_os("FLN_REFERENCE_LIB").unwrap());
+        let compiler = library.parent().unwrap().parent().unwrap().join("bin/lean");
+        let root = std::env::temp_dir().join(format!(
+            "fln-record-auto-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("RecordAuto.lean");
+        let artifact = root.join("RecordAuto.olean");
+        std::fs::write(
+            &source,
+            format!("prelude\nimport Init.Core\n{RECORD_AUTO_FIXTURE}"),
+        )
+        .unwrap();
+        let output = std::process::Command::new(&compiler)
+            .current_dir(&root)
+            .arg("-j1")
+            .arg("-o")
+            .arg(&artifact)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let public = std::fs::read(&artifact).unwrap();
+        // This fixture is a legacy (non-`module`) source file; its complete
+        // declarations are in the one artifact, without modern companions.
+        let pinned = fln::decode_olean_artifact(&public, OleanDecodeLimits::new(STACK)).unwrap();
+
+        let engine = check(engine, RECORD_AUTO_FIXTURE);
+        let mut compared = vec![
+            "RecordPositive.mk",
+            "RecordPositive.rec",
+            "RecordPositive.n",
+            "RecordPositive.h",
+            "RecordPositive.mk._flat_ctor",
+            "RecordMethod.mk",
+            "RecordMethod.proof",
+            "RecordChoice.mk",
+            "RecordChoice.value",
+            "RecordChoice.mk._flat_ctor",
+            "RecordLater.mk",
+            "RecordLater.mk._flat_ctor",
+            "RecordChild.mk._flat_ctor",
+            "RecordOverride.mk._flat_ctor",
+            "RecordLeft.mk._flat_ctor",
+            "RecordRight.mk._flat_ctor",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        for owner in [
+            "RecordOpt",
+            "RecordOptValue",
+            "RecordOptTactic",
+            "RecordOut",
+            "RecordOutValue",
+            "RecordOutTactic",
+            "RecordSemi",
+            "RecordSemiValue",
+            "RecordSemiTactic",
+            "RecordAuthored",
+            "RecordAuthoredValue",
+            "RecordAuthoredTactic",
+            "RecordAuthoredSelected",
+        ] {
+            for suffix in ["mk", "mk._flat_ctor", "value"] {
+                compared.push(format!("{owner}.{suffix}"));
+            }
+        }
+        for owner in [
+            "RecordWrappedChild",
+            "RecordWrappedValue",
+            "RecordWrappedTactic",
+            "RecordAuthoredInherited",
+        ] {
+            compared.push(format!("{owner}.mk._flat_ctor"));
+        }
+        for label in compared {
+            let key = name(&label);
+            let native = engine.environment().find(&key).unwrap();
+            let reference = pinned
+                .constants
+                .iter()
+                .find(|info| info.name() == &key)
+                .unwrap();
+            assert_eq!(
+                native.kind_name(),
+                reference.kind_name(),
+                "declaration kind: {label}"
+            );
+            assert_eq!(
+                native.constant_val(),
+                reference.constant_val(),
+                "field telescope: {label}"
+            );
+        }
+        for label in [
+            "RecordPositive.h._autoParam",
+            "RecordMethod.proof._autoParam",
+            "RecordChoice.value._autoParam",
+            "RecordLater.value._autoParam",
+            "RecordParent.h._autoParam",
+            "RecordChild.extra._autoParam",
+            "RecordOverride.h._autoParam",
+            "RecordFirst.value._autoParam",
+            "RecordTactic.value._autoParam",
+            "RecordOptTactic.value._autoParam",
+            "RecordOutTactic.value._autoParam",
+            "RecordSemiTactic.value._autoParam",
+            "RecordAuthoredTactic.value._autoParam",
+            "RecordWrappedTactic.value._autoParam",
+        ] {
+            checked_quote(&engine, label);
+        }
+        assert!(
+            !engine
+                .environment()
+                .contains(&name("RecordPositive.h._default"))
+        );
+        assert!(
+            !engine
+                .environment()
+                .contains(&name("RecordOverride.h._default"))
+        );
+        let report = engine.execute_source_commands_with_checks(
+            b"#eval recordPositive.n\n#eval recordChild.extra\n#eval recordLeft.value\n#eval recordRight.value\n\
+              #eval recordAuthoredSelected.value\n#eval recordAuthoredConstructor.value\n\
+              #eval recordAuthoredInherited.value\n#eval recordAuthoredExplicit.value\n",
+            &KVMap::new(), fln::EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+        ).unwrap().into_complete().unwrap();
+        for (index, expected) in report
+            .batch
+            .source_evaluation_indices
+            .iter()
+            .zip([1, 8, 2, 3, 1, 1, 2, 7])
+        {
+            assert_eq!(
+                fln::closed_vm_value(&report.batch.executions[*index].exit).unwrap(),
+                Some(fln::ClosedVmValue::Scalar(expected))
+            );
+        }
+        assert_eq!(report.batch.source_evaluation_indices.len(), 8);
+    });
+}
+
+#[test]
+fn record_tactics_are_selected_at_use_and_do_not_bypass_proof_or_safety_checks() {
+    fixture(|engine| {
+        let engine = check(
+            engine,
+            r#"
+structure BT3 where
+  x : Nat
+  h : x = x := by rfl
+def b3 : BT3 := { x := 1 }
+structure BT4 where
+  x : Nat
+  h : x = x + 1 := by rfl
+structure RecordDeferred where
+  n : Nat
+  h : n = 0 := by rfl
+def recordZero : RecordDeferred := { n := 0 }
+def recordExplicit (h : 1 = 0) : RecordDeferred := { n := 1, h := h }
+def recordRaw : (n : Nat) → n = 0 → RecordDeferred := @RecordDeferred.mk
+unsafe def recordUnsafeValue : Nat := Nat.zero
+structure RecordUnsafe where
+  value : Nat := by exact recordUnsafeValue
+unsafe def recordUnsafeCaller : RecordUnsafe := {}
+def recordSafeOverride : RecordUnsafe := { value := Nat.succ Nat.zero }
+theorem record_safe_override : recordSafeOverride.value = Nat.succ Nat.zero := rfl
+"#,
+        );
+        let root = engine.logical_root(&KVMap::new());
+        let rejected = error(&engine, "def recordFalse : RecordDeferred := { n := 1 }\n");
+        assert!(
+            matches!(&rejected,
+            NatDefinitionElabError::Inference(SourceInferenceError::ConversionRefused(verdict))
+            if matches!(verdict.as_ref(), fln_kernel::verdict::Verdict::Rejected {
+                class: fln::RejectClass::NotDefEq, ..
+            })),
+            "{rejected:?}"
+        );
+        let original_negative = error(&engine, "def b4 : BT4 := { x := 1 }\n");
+        assert!(
+            matches!(&original_negative,
+            NatDefinitionElabError::Inference(SourceInferenceError::ConversionRefused(verdict))
+            if matches!(verdict.as_ref(), fln_kernel::verdict::Verdict::Rejected {
+                class: fln::RejectClass::NotDefEq, ..
+            })),
+            "{original_negative:?}"
+        );
+        assert!(
+            engine
+                .check_source_files(
+                    &[b"def recordUnsafeLeak : RecordUnsafe := {}\n"],
+                    &KVMap::new(),
+                    limits()
+                )
+                .is_err()
+        );
+        assert!(!engine.environment().contains(&name("recordFalse")));
+        assert!(!engine.environment().contains(&name("recordUnsafeLeak")));
+        assert_eq!(root, engine.logical_root(&KVMap::new()));
+        theorem(&engine, "record_safe_override");
+    });
+}
+
+#[test]
+fn public_record_tactic_fields_keep_their_quotations_and_flat_defaults_after_import() {
+    fixture(|engine| {
+        let producer = name("RecordAutoModule");
+        let consumer = name("RecordAutoConsumer");
+        let inputs = [
+            fln::SourceModuleInput { name: &producer, source: b"module\nprelude\n\
+                public structure PublicRecordAuto where\n  value : Nat := by exact 7\n\
+                public structure PublicRecordProof where\n  n : Nat\n  h : n = 0 := by rfl\n" },
+            fln::SourceModuleInput { name: &consumer, source: b"module\nprelude\npublic import RecordAutoModule\n\
+                public def importedRecordAuto : PublicRecordAuto := {}\n\
+                public theorem imported_record_value : importedRecordAuto.value = 7 := rfl\n\
+                public def importedRecordProof : PublicRecordProof := { n := 0 }\n\
+                public theorem imported_record_proof : importedRecordProof.n = 0 := importedRecordProof.h\n" },
+        ];
+        let checked = engine
+            .check_source_modules(
+                &inputs,
+                &consumer,
+                &KVMap::new(),
+                fln::source_check::modules::SourceModuleCheckLimits::new(limits()),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let imported = &checked.checked.engine;
+        checked_quote(imported, "PublicRecordAuto.value._autoParam");
+        checked_quote(imported, "PublicRecordProof.h._autoParam");
+        theorem(imported, "imported_record_value");
+        theorem(imported, "imported_record_proof");
+        let report = imported
+            .execute_source_commands_with_checks(
+                b"#eval ({} : PublicRecordAuto).value\n",
+                &KVMap::new(),
+                fln::EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(report.batch.source_evaluation_indices.len(), 1);
+        let index = report.batch.source_evaluation_indices[0];
+        assert_eq!(
+            fln::closed_vm_value(&report.batch.executions[index].exit).unwrap(),
+            Some(fln::ClosedVmValue::Scalar(7))
+        );
+    });
+}

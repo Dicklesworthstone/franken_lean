@@ -17,6 +17,11 @@ struct Frame {
     fields: u32,
 }
 
+struct DeclaredDefaults<'a> {
+    values: &'a [Name],
+    tactics: &'a std::collections::BTreeMap<Name, Expr>,
+}
+
 fn problem(error: crate::records::RecordError) -> NatDefinitionElabError {
     failure(SourceInferenceError::Record(error))
 }
@@ -169,7 +174,12 @@ impl Context {
                 return Err(problem(crate::records::RecordError::ResourceLimit));
             }
             let id = FVarId(self.fresh_name()?);
-            let domain = self.reduce_record_projections(binder_type)?;
+            let mut domain = self.reduce_record_projections(binder_type)?;
+            if frame.record != spec.name {
+                // Inherited fields enter the structure's plain field context.
+                // Their effective defaults are selected in C3 order below.
+                domain = self.projection_domain(domain)?;
+            }
             let local = self
                 .txn
                 .lctx
@@ -214,6 +224,7 @@ impl Context {
         constructor_name: &Name,
         inheritance: &Inheritance,
         overrides: &[DefaultOverride],
+        auto_parameters: &mut std::collections::BTreeMap<Name, Expr>,
         budget: RecordBudget,
     ) -> Result<Vec<Declaration>, NatDefinitionElabError> {
         let structures = ImportedStructures::read(&self.txn.env).map_err(problem)?;
@@ -320,6 +331,18 @@ impl Context {
                 return Err(NatDefinitionElabError::UnexpectedSyntax {
                     expected: "a copied field default without a new type or binders",
                 });
+            }
+            if view.tactic {
+                let tactic = expect_node(
+                    &view.value,
+                    &parser_kind(&["Term", "byTactic"]),
+                    2,
+                    "inherited field tactic",
+                )?;
+                let name = Name::str(spec.name.append_core(&field.user_name), "_autoParam");
+                let name = self.declare_named_auto_tactic(&tactic[1], name)?;
+                auto_parameters.insert(field.user_name.clone(), Expr::const_(name, Vec::new()));
+                continue;
             }
             let mut syntax = view.value.clone();
             if let Some(annotation) = annotation {
@@ -633,11 +656,12 @@ impl Context {
         constructor_name: &Name,
         inheritance: &Inheritance,
         declared_defaults: &[Name],
+        auto_parameters: &std::collections::BTreeMap<Name, Expr>,
         budget: RecordBudget,
-    ) -> Result<Vec<Declaration>, NatDefinitionElabError> {
+    ) -> Result<RecordFlatConstructor, NatDefinitionElabError> {
         let saved = self.txn.lctx.clone();
         let result = (|| {
-            let (fields, value) =
+            let (mut fields, value) =
                 self.record_flat_fields(spec, constructor_name, inheritance, budget)?;
             let mut closer = crate::records::Builder {
                 remaining: budget.max_nodes,
@@ -653,11 +677,17 @@ impl Context {
                 ),
                 |target, parameter| Expr::app(target, Expr::fvar(parameter.id.clone())),
             );
-            let mut declarations = self.record_flat_inherited_defaults(
+            let RecordFlatConstructor {
+                mut declarations,
+                auto_parameters,
+            } = self.record_flat_inherited_defaults(
                 spec,
                 inheritance,
-                declared_defaults,
-                &fields,
+                DeclaredDefaults {
+                    values: declared_defaults,
+                    tactics: auto_parameters,
+                },
+                &mut fields,
                 &value,
                 &mut closer,
             )?;
@@ -686,7 +716,10 @@ impl Context {
                     all: vec![name],
                 }),
             );
-            Ok(declarations)
+            Ok(RecordFlatConstructor {
+                declarations,
+                auto_parameters,
+            })
         })();
         self.txn.lctx = saved;
         result
@@ -698,13 +731,29 @@ impl Context {
         &mut self,
         spec: &RecordSpec,
         inheritance: &Inheritance,
-        declared_defaults: &[Name],
-        fields: &[LocalDecl],
+        defaults: DeclaredDefaults<'_>,
+        fields: &mut [LocalDecl],
         constructor: &Expr,
         closer: &mut crate::records::Builder,
-    ) -> Result<Vec<Declaration>, NatDefinitionElabError> {
+    ) -> Result<RecordFlatConstructor, NatDefinitionElabError> {
+        let plain_fields = fields.to_vec();
+        // Track generated defaults separately from authored type annotations.
+        // A new tactic wraps a root field's complete authored domain; inherited
+        // domains have already had their parent's annotations consumed.
+        let mut auto_parameters = std::collections::BTreeMap::new();
+        for field in fields.iter_mut() {
+            self.tick()?;
+            if let Some(tactic) = defaults.tactics.get(&field.user_name) {
+                field.type_ =
+                    self.record_auto_parameter_type(field.type_.clone(), tactic.clone())?;
+                auto_parameters.insert(field.user_name.clone(), tactic.clone());
+            }
+        }
         if inheritance.direct.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RecordFlatConstructor {
+                declarations: Vec::new(),
+                auto_parameters,
+            });
         }
         let structures = ImportedStructures::read(&self.txn.env).map_err(problem)?;
         let direct: Vec<_> = inheritance
@@ -722,7 +771,10 @@ impl Context {
                 continue;
             }
             let Some(entry) = structures.get(&parent) else {
-                return Ok(Vec::new());
+                return Ok(RecordFlatConstructor {
+                    declarations: Vec::new(),
+                    auto_parameters,
+                });
             };
             pending.extend(entry.parents.iter().map(|parent| parent.name.clone()));
         }
@@ -782,26 +834,46 @@ impl Context {
             .map(|field| (field.user_name.clone(), Expr::fvar(field.id.clone())))
             .collect();
         let mut declarations = Vec::new();
-        for field in fields {
+        for index in 0..fields.len() {
             self.tick()?;
+            let field = fields[index].clone();
             let declared = helper_name(&spec.name, &field.user_name);
-            if declared_defaults.contains(&declared) {
+            if defaults.values.contains(&declared)
+                || defaults.tactics.contains_key(&field.user_name)
+            {
                 continue;
             }
             let mut selected = None;
+            let mut selected_auto = None;
             for owner in order.iter().skip(1) {
                 self.tick()?;
-                let helper = helper_name(owner, &field.user_name);
-                if !self.txn.env.contains(&helper)
-                    || !self.record_has_flat_field(&structures, owner, &field.user_name)?
-                {
+                if !self.record_has_flat_field(&structures, owner, &field.user_name)? {
                     continue;
                 }
-                let receiver = self.source_record_parent_view(&structures, &parents, owner)?;
-                selected = self.instantiate_record_default(&helper, &receiver, &arguments)?;
-                if selected.is_some() {
+                let helper = helper_name(owner, &field.user_name);
+                if self.txn.env.contains(&helper) {
+                    let receiver = self.source_record_parent_view(&structures, &parents, owner)?;
+                    selected = self.instantiate_record_default(&helper, &receiver, &arguments)?;
+                    if selected.is_some() {
+                        break;
+                    }
+                }
+                let projection = structures
+                    .get(owner)
+                    .and_then(|row| row.fields.iter().find(|row| row.name == field.user_name))
+                    .map(|row| row.projection.clone())
+                    .unwrap_or_else(|| owner.append_core(&field.user_name));
+                let quote = Name::str(projection, "_autoParam");
+                if self.txn.env.contains(&quote) {
+                    selected_auto = Some(Expr::const_(quote, Vec::new()));
                     break;
                 }
+            }
+            if let Some(tactic) = selected_auto {
+                fields[index].type_ =
+                    self.record_auto_parameter_type(field.type_, tactic.clone())?;
+                auto_parameters.insert(field.user_name, tactic);
+                continue;
             }
             let Some(selected) = selected else {
                 continue;
@@ -813,9 +885,17 @@ impl Context {
                 spec.name.append_core(&field.user_name),
                 "_inherited_default",
             );
-            declarations
-                .push(self.close_record_flat_default(spec, fields, selected, name, closer)?);
+            declarations.push(self.close_record_flat_default(
+                spec,
+                &plain_fields,
+                selected,
+                name,
+                closer,
+            )?);
         }
-        Ok(declarations)
+        Ok(RecordFlatConstructor {
+            declarations,
+            auto_parameters,
+        })
     }
 }

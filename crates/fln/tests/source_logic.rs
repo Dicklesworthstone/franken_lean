@@ -807,25 +807,44 @@ fn shared_match_alternatives_cover_every_group() {
     );
 }
 
-/// `h : P := by tac` is the pin's `binderTactic` (an `autoParam` field): an omitted field is filled
-/// by running its tactic, as the checker read it before its tree was the pin's, and a field whose
-/// tactic cannot prove it is refused.
+/// The small logic seed has no Lean.Syntax declarations. A field tactic must
+/// retain its real quotation predecessor, never become an eagerly proved value
+/// to make this seed accept it. Actual-Init positives and false-proof controls
+/// live in source_auto_parameters.
 #[test]
-fn tactic_fields_are_filled_by_their_tactic() {
-    check("structure BT3 where\n  x : Nat\n  h : x = x := by rfl\ndef b3 : BT3 := { x := 1 }\n");
+fn tactic_fields_require_the_actual_quotation_declarations() {
     let (engine, limits) = engine();
-    let source =
-        "structure BT4 where\n  x : Nat\n  h : x = x + 1 := by rfl\ndef b4 : BT4 := { x := 1 }\n";
-    assert!(
-        !matches!(
-            engine.check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits),
-            ),
-            Ok(fln::Outcome::Complete(_))
+    let before = engine.logical_root(&KVMap::new());
+    let refused = engine.check_source_files(
+        &[b"structure BT3 where\n  x : Nat\n  h : x = x := by rfl\ndef b3 : BT3 := { x := 1 }\n"],
+        &KVMap::new(), SourceCheckLimits::new(limits),
+    ).unwrap_err();
+    let fln::SourceCheckError::Command { error, .. } = &refused else {
+        panic!("expected the missing quotation declaration: {refused:?}");
+    };
+    let fln::EngineExecutionError::Frontend(fln::NatDefinitionFrontendError::Elaborate(
+        fln_elab::NatDefinitionElabError::Inference(
+            fln_elab::source::SourceInferenceError::TypeObligation(verdict),
         ),
-        "{source}"
+    )) = error.as_ref()
+    else {
+        panic!("expected ordinary quotation admission failure: {refused:?}");
+    };
+    assert!(
+        matches!(
+            verdict.as_ref(),
+            fln::Outcome::Complete(fln_kernel::verdict::Verdict::Rejected {
+                class: fln::RejectClass::UnknownConstant,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(before, engine.logical_root(&KVMap::new()));
+    assert!(
+        !engine
+            .environment()
+            .contains(&Name::from_components(["BT3"]))
     );
 }
 
