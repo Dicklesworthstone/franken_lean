@@ -361,7 +361,7 @@ impl Context {
             let scope = std::mem::replace(&mut self.source_scope, record.scope.clone());
             let recursion = record.recursion.as_ref().map(|(active, enclosing)| {
                 (
-                    std::mem::replace(&mut self.recursion, Some(active.clone())),
+                    self.recursion.replace(active.clone()),
                     std::mem::replace(&mut self.enclosing_recursions, enclosing.clone()),
                 )
             });

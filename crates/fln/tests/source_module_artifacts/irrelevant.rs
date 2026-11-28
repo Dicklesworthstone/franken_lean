@@ -162,11 +162,13 @@ fn irrelevant_definitions_preserve_logical_artifacts_and_live_executable_entries
         .into_complete()
         .unwrap();
 
+    let partition_path = std::env::var_os("FLN_BUILTIN_PARTITION")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            fln_core::checked_workspace_root!().join("contracts/builtin_partition.tsv")
+        });
     let partition = fln::imported_ir::VerifiedPartition::from_pinned_tsv(
-        &std::fs::read_to_string(
-            fln_core::checked_workspace_root!().join("contracts/builtin_partition.tsv"),
-        )
-        .unwrap(),
+        &std::fs::read_to_string(partition_path).unwrap(),
     )
     .unwrap();
     let users = module
@@ -210,10 +212,9 @@ fn irrelevant_headers_do_not_hide_unsupported_runtime_definitions() {
             "public def Lib.unsupported (_f : Lib.Value -> Lib.Value) (x : Lib.Value) : Lib.Value := x\n",
             "unused higher-order source parameter",
         ),
-        // Omitting a type alias's own executable entry does not extend the
-        // separately checked representation of ordinary runtime signatures.
+        // Transparent aliases do not expose an opaque type's representation.
         (
-            "public def Lib.unsupported (x : Lib.Alias) : Lib.Alias := x\n",
+            "public def Lib.unsupported (x : Lib.opaqueType) : Lib.opaqueType := x\n",
             "source export carrier",
         ),
     ] {

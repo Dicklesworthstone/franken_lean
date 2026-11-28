@@ -71,6 +71,12 @@ impl Preparation<'_> {
         value: &Expr,
         type_: &Expr,
     ) -> Result<Option<(Expr, Expr)>, IngressError> {
+        // A transparent type alias can expose the source telescope itself.
+        // Inspect that equivalent type before preserving static argument slots;
+        // otherwise the exported ABI would retain slots this view never saw.
+        // The original declaration still crosses admission unchanged.
+        let normalized_type = self.normalize_type(type_)?;
+        let type_ = &normalized_type;
         let mut slots = Vec::new();
         let mut current = type_;
         loop {

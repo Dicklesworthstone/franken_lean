@@ -426,9 +426,12 @@ impl Analysis<'_, '_> {
         }
         self.checks.meter.charge(1)?;
         let expression = source_without_metadata(expression, self.checks.meter)?;
-        if let Some([condition, no, yes]) =
-            source_boolean_case(expression, self.checks.environment, self.checks.meter)?
-        {
+        if let Some([condition, no, yes]) = source_boolean_case(
+            expression,
+            self.checks.environment,
+            self.checks.ingress,
+            self.checks.meter,
+        )? {
             let condition = self.value(condition, locals, depth + 1)?;
             if named(&condition, "Bool.false") {
                 return self.value(no, locals, depth + 1);

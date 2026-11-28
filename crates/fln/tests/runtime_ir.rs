@@ -1,6 +1,9 @@
 //! Native compilation, including actual Reference interpretation of the output.
 #![forbid(unsafe_code)]
 
+#[path = "runtime_ir/aliases.rs"]
+mod aliases;
+
 use fln::ir::{self, CompileLimits};
 use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, VmExit};
 use fln_core::{name::Name, options::KVMap};
@@ -34,6 +37,7 @@ const ENUM_DATA_HELPERS: &str = concat!(
     "inductive IRScalarPayload where\n | empty\n | value (b : Bool)\n",
     "inductive IRParameterized (A : Type) where\n | first\n | second\n",
     "abbrev IRAlias := IRChoice\n",
+    "opaque IROpaqueAlias : Type := IRChoice\n",
 );
 
 struct EnumExportCase {
@@ -60,6 +64,16 @@ fn enum_export_cases() -> Vec<EnumExportCase> {
         EnumExportCase {
             ty: "IRChoice -> IRChoice",
             body: "fun c => c",
+            application: "match compiled IRChoice.east with | .north => 0 | .east => 1 | .west => 2",
+            expected: "1",
+            parameters: vec![IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        EnumExportCase {
+            // Keep the exact former alias refusal as a positive source ABI case.
+            ty: "IRAlias -> IRAlias",
+            body: "fun x => x",
             application: "match compiled IRChoice.east with | .north => 0 | .east => 1 | .west => 2",
             expected: "1",
             parameters: vec![IrType::UInt8],
@@ -194,6 +208,7 @@ const BOXED_DATA_HELPERS: &str = concat!(
     "inductive IRRecursiveLoop where\n | next (tail : IRRecursiveLoop)\n",
     "inductive IRBoxedParam (A : Type) where\n | mk (value : A) (n : Nat)\n",
     "abbrev IRBoxedAlias := IRBoxedRecord\n",
+    "opaque IROpaqueBoxedAlias : Type := IRBoxedRecord\n",
 );
 
 struct BoxedExportCase {
@@ -220,6 +235,16 @@ fn boxed_export_cases() -> Vec<BoxedExportCase> {
         BoxedExportCase {
             ty: "IRBoxedRecord -> IRBoxedRecord",
             body: "fun p => p",
+            application: "let p := IRBoxedRecord.mk large heap; let q := compiled p; (q.number, q.text, p.number, p.text)",
+            expected: "(184467440737095516160, \"boxed heap payload\", 184467440737095516160, \"boxed heap payload\")",
+            parameters: vec![IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            // The exact former boxed alias refusal now retains its field ABI.
+            ty: "IRBoxedAlias -> IRBoxedAlias",
+            body: "fun x => x",
             application: "let p := IRBoxedRecord.mk large heap; let q := compiled p; (q.number, q.text, p.number, p.text)",
             expected: "(184467440737095516160, \"boxed heap payload\", 184467440737095516160, \"boxed heap payload\")",
             parameters: vec![IrType::Object],
@@ -1579,7 +1604,7 @@ fn fieldless_enum_exports_preserve_scalar_signatures_and_private_layouts() {
     }
     for source in [
         "def compiled (x : IRParameterized Nat) : IRParameterized Nat := x",
-        "def compiled (x : IRAlias) : IRAlias := x",
+        "def compiled (x : IROpaqueAlias) : IROpaqueAlias := x",
         "def compiled : True := True.intro",
     ] {
         let (declaration, _) = checked_definition(&base, source);
@@ -1794,7 +1819,7 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
             "source export carrier",
         ),
         (
-            "def compiled (x : IRBoxedAlias) : IRBoxedAlias := x",
+            "def compiled (x : IROpaqueBoxedAlias) : IROpaqueBoxedAlias := x",
             "source export carrier",
         ),
         (
@@ -2836,6 +2861,8 @@ struct RuntimeProbe<'a> {
     heap_call: Option<&'a str>,
 }
 
+const POLYMORPHIC_EVAL_CONST: &str = "universe u\nprivate unsafe def evalConstAt :\n    (α : Type u) -> Lean.Environment -> Lean.Options -> Lean.Name -> Bool -> Except String α :=\n  unsafeCast (@Lean.Environment.evalConst)\n";
+
 fn consume_ir(
     lean: &Path,
     dir: &Path,
@@ -2855,7 +2882,7 @@ fn consume_ir(
     // positive below must pass through this same adapter before native IR.
     let (adapter, evaluation) = if probe.higher_universe {
         (
-            "universe u\nprivate unsafe def evalConstAt :\n    (α : Type u) -> Lean.Environment -> Lean.Options -> Lean.Name -> Bool -> Except String α :=\n  unsafeCast (@Lean.Environment.evalConst)\n",
+            POLYMORPHIC_EVAL_CONST,
             format!(
                 "evalConstAt ({}) env {{}} `{} {}",
                 probe.ty, probe.entry, probe.check_meta,

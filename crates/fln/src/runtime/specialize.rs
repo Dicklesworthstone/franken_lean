@@ -452,6 +452,18 @@ impl Preparation<'_> {
             }
         }
     }
+    /// Normalize a source export's type without changing its checked
+    /// declaration. Report the actual bounded work so the IR compiler can
+    /// account for this prerequisite in its own remaining budget.
+    pub(crate) fn normalize_source_signature(
+        &mut self,
+        input: &Expr,
+    ) -> Result<(Expr, usize), IngressError> {
+        let before = self.visited;
+        let normalized = self.normalize_type(input)?;
+        Ok((normalized, self.visited - before))
+    }
+
     /// Normalize only type expressions; executable values do not pass through
     /// this delta/beta/zeta reducer. The memo table owns its expression keys.
     pub(crate) fn normalize_type(&mut self, input: &Expr) -> Result<Expr, IngressError> {

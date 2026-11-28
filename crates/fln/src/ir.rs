@@ -300,7 +300,7 @@ struct PackedConstructor {
 impl PackedConstructor {
     fn from_fields(fields: &[IrType], meter: &mut Budget) -> Result<Option<Self>> {
         meter.charge(fields.len())?;
-        if !fields.iter().any(|ty| *ty == IrType::UInt8) {
+        if !fields.contains(&IrType::UInt8) {
             return Ok(None);
         }
         let mut layout = Self {
@@ -1498,6 +1498,31 @@ fn source_without_metadata<'a>(
     Ok(expression)
 }
 
+/// Resolve transparent aliases only in the type plane. The ordinary runtime
+/// normalizer preserves opaque, unsafe and partial declaration barriers; no
+/// executable body or logical declaration is replaced by this projection.
+fn normalized_source_type(
+    ty: &fln_core::expr::Expr,
+    environment: &crate::Environment,
+    mut ingress: fln_comp::ingress::IngressLimits,
+    meter: &mut Budget,
+) -> Result<fln_core::expr::Expr> {
+    ingress.max_nodes = ingress
+        .max_nodes
+        .min(usize::try_from(meter.0).unwrap_or(usize::MAX));
+    let (normalized, work) = crate::runtime::Preparation::new(environment, ingress)
+        .normalize_source_signature(ty)
+        .map_err(|error| {
+            if error.is_resource_exhaustion() {
+                CompileError::Limit
+            } else {
+                unsupported("source export type normalization")
+            }
+        })?;
+    meter.charge(work)?;
+    Ok(normalized)
+}
+
 fn source_spine<'a, const N: usize>(
     expression: &'a fln_core::expr::Expr,
     meter: &mut Budget,
@@ -1527,6 +1552,7 @@ fn source_spine<'a, const N: usize>(
 fn source_boolean_case<'a>(
     expression: &'a fln_core::expr::Expr,
     environment: &crate::Environment,
+    ingress: fln_comp::ingress::IngressLimits,
     meter: &mut Budget,
 ) -> Result<Option<[&'a fln_core::expr::Expr; 3]>> {
     use fln_core::expr::ExprNode;
@@ -1538,7 +1564,8 @@ fn source_boolean_case<'a>(
         let ExprNode::Lam { body, .. } = motive.node() else {
             return Err(unsupported("source Boolean case motive"));
         };
-        source_carrier(body, environment, &mut constructor_fields, meter)?;
+        let result = normalized_source_type(body, environment, ingress, meter)?;
+        source_carrier(&result, environment, &mut constructor_fields, meter)?;
         return Ok(Some([condition, no, yes]));
     }
     let Some((head, [ty, proposition, decision, yes, no])) = source_spine::<5>(expression, meter)?
@@ -1550,7 +1577,8 @@ fn source_boolean_case<'a>(
     {
         return Ok(None);
     }
-    source_carrier(ty, environment, &mut constructor_fields, meter)?;
+    let result = normalized_source_type(ty, environment, ingress, meter)?;
+    source_carrier(&result, environment, &mut constructor_fields, meter)?;
     let Some((equality, [boolean, condition, truth])) = source_spine::<3>(proposition, meter)?
     else {
         return Ok(None);
@@ -1584,6 +1612,7 @@ fn simple_source_parameter_uses(
     value: &fln_core::expr::Expr,
     arity: usize,
     environment: &crate::Environment,
+    ingress: fln_comp::ingress::IngressLimits,
     meter: &mut Budget,
 ) -> Result<Vec<bool>> {
     use fln_core::expr::ExprNode;
@@ -1642,7 +1671,9 @@ fn simple_source_parameter_uses(
                 }
             }
             ExprNode::App { f, a } => {
-                if let Some([condition, no, yes]) = source_boolean_case(expr, environment, meter)? {
+                if let Some([condition, no, yes]) =
+                    source_boolean_case(expr, environment, ingress, meter)?
+                {
                     // A literal scrutinee can erase an arm before the pin
                     // chooses its reduced entry. Leave that optimization out
                     // of multiargument source exports until it is modeled.
@@ -2382,7 +2413,7 @@ fn source_parameter_uses(
     ingress: fln_comp::ingress::IngressLimits,
     meter: &mut Budget,
 ) -> Result<Vec<bool>> {
-    match simple_source_parameter_uses(value, arity, environment, meter) {
+    match simple_source_parameter_uses(value, arity, environment, ingress, meter) {
         Err(CompileError::Unsupported {
             what: "specializable source call" | "parameter-dependent source initializer",
         }) => SourceUses {
@@ -2587,6 +2618,7 @@ fn source_carrier(
 
 fn source_signature(
     definition: &fln_env::constants::DefinitionVal,
+    normalized_type: &fln_core::expr::Expr,
     erasures: &[bool],
     recursive_parameters: Option<&recursive_signatures::Parameters>,
     environment: &crate::Environment,
@@ -2598,7 +2630,7 @@ fn source_signature(
     let mut function_parameters = Vec::new();
     let mut parameter_types = Vec::new();
     let mut constructor_fields = Vec::new();
-    let mut ty = &definition.base.type_;
+    let mut ty = normalized_type;
     let result = loop {
         meter.charge(1)?;
         match ty.node() {
@@ -3022,6 +3054,8 @@ pub fn compile_definition(
 /// Export a checked definition under its source name and source argument count.
 /// Runtime types are closed arrows over Nat/String/Bool and checked closed data
 /// (including higher-order arguments), using the pin's object/scalar parameters.
+/// Transparent type aliases may expose those same carriers and telescopes;
+/// opaque types and unsupported normalized representations remain refused.
 /// Data has 1..=244 constructors with Nat/String/Bool or direct self fields and
 /// no parameters or indices. Nonrecursive single-field wrappers erase to their
 /// primitive field when all runtime constructors share that singleton shape.
@@ -3117,6 +3151,7 @@ pub(crate) fn is_checked_recursive_companion(
 /// The ordinary source exporter owns boxing and the result ABI.
 fn recursive_source_wrapper(
     definition: &mut fln_env::constants::DefinitionVal,
+    normalized_type: &fln_core::expr::Expr,
     environment: &crate::Environment,
     meter: &mut Budget,
 ) -> Result<usize> {
@@ -3146,7 +3181,7 @@ fn recursive_source_wrapper(
         return Err(unsupported(SIGNATURE));
     }
     let mut telescope = Vec::new();
-    let mut ty = &definition.base.type_;
+    let mut ty = normalized_type;
     loop {
         meter.charge(1)?;
         ty = source_without_metadata(ty, meter)?;
@@ -3299,6 +3334,13 @@ pub(crate) fn compile_checked_source_definition(
             "source export with an executable replacement or extern",
         )));
     }
+    let normalized_type = normalized_source_type(
+        &definition.base.type_,
+        engine.environment(),
+        engine_limits.ingress,
+        &mut meter,
+    )
+    .map_err(DefinitionCompileError::Ir)?;
     let mut recursive_parameters = None;
     if let Some((companion, executable_environment)) =
         checked_recursive_companion(engine, name, engine_limits, &mut meter)?
@@ -3315,8 +3357,13 @@ pub(crate) fn compile_checked_source_definition(
                 "recursive source companion with an executable replacement or extern",
             )));
         }
-        let arity = recursive_source_wrapper(definition.to_mut(), engine.environment(), &mut meter)
-            .map_err(DefinitionCompileError::Ir)?;
+        let arity = recursive_source_wrapper(
+            definition.to_mut(),
+            &normalized_type,
+            engine.environment(),
+            &mut meter,
+        )
+        .map_err(DefinitionCompileError::Ir)?;
         // A unary function has no smaller nonempty calling convention. With
         // several slots, the wrapper's syntactic uses are not the companion's:
         // unchanged self-call arguments are ignored by the pin's ReduceArity.
@@ -3339,13 +3386,14 @@ pub(crate) fn compile_checked_source_definition(
         .max_nodes
         .min(usize::try_from(meter.0).unwrap_or(usize::MAX));
     let (erasures, work) = crate::runtime::Preparation::new(engine.environment(), ingress)
-        .source_parameter_erasures(&definition.base.type_)
+        .source_parameter_erasures(&normalized_type)
         .map_err(|error| {
             DefinitionCompileError::Engine(crate::EngineExecutionError::Ingress(error))
         })?;
     meter.charge(work).map_err(DefinitionCompileError::Ir)?;
     let signature = source_signature(
         &definition,
+        &normalized_type,
         &erasures,
         recursive_parameters.as_ref(),
         engine.environment(),
@@ -3411,12 +3459,19 @@ fn compile_definition_impl(
     meter.charge(1).map_err(DefinitionCompileError::Ir)?;
     let signature = match (&declaration, entry) {
         (crate::Declaration::Defn(definition), None) => {
+            let normalized_type = normalized_source_type(
+                &definition.base.type_,
+                engine.environment(),
+                engine_limits.ingress,
+                &mut meter,
+            )
+            .map_err(DefinitionCompileError::Ir)?;
             let mut ingress = engine_limits.ingress;
             ingress.max_nodes = ingress
                 .max_nodes
                 .min(usize::try_from(meter.0).unwrap_or(usize::MAX));
             let (erasures, work) = crate::runtime::Preparation::new(engine.environment(), ingress)
-                .source_parameter_erasures(&definition.base.type_)
+                .source_parameter_erasures(&normalized_type)
                 .map_err(|error| {
                     DefinitionCompileError::Engine(crate::EngineExecutionError::Ingress(error))
                 })?;
@@ -3424,6 +3479,7 @@ fn compile_definition_impl(
             Some(
                 source_signature(
                     definition,
+                    &normalized_type,
                     &erasures,
                     None,
                     engine.environment(),
