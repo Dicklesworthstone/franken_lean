@@ -144,6 +144,21 @@ struct DeferredFieldApplication {
     finish: bool,
 }
 
+#[derive(Clone)]
+enum PostponedFieldKind {
+    Receiver {
+        receiver: Typed,
+        path: Name,
+        at: Option<Syntax>,
+        application: Option<DeferredFieldApplication>,
+    },
+    ExpectedNotation {
+        syntax: Syntax,
+        finish: bool,
+        problem: NatDefinitionElabError,
+    },
+}
+
 /// A field application's receiver and its field path, with the syntax the path is spelled at
 /// the end of (the field, or the whole dotted identifier), where a deprecated method is reported.
 pub(super) enum FieldReceiver<'a> {
@@ -151,8 +166,8 @@ pub(super) enum FieldReceiver<'a> {
     Elaborated(Typed, Name, &'a Syntax),
 }
 
-/// A projection whose receiver's carrier will be determined by later source
-/// constraints. Both the value and its result type explicitly apply their
+/// A field whose receiver or expected carrier will be determined by later
+/// source constraints. Both the value and its result type explicitly apply their
 /// captured parameters. The type hole excludes lexical lets, so an unrelated
 /// let cannot add a cyclic type dependency. The value hole also captures let
 /// slots, preserving their strict initialization and shared runtime objects.
@@ -161,14 +176,19 @@ pub(super) enum FieldReceiver<'a> {
 pub(super) struct PostponedField {
     id: MVarId,
     expected: Expr,
-    receiver: Typed,
-    path: Name,
-    at: Option<Syntax>,
-    application: Option<DeferredFieldApplication>,
+    kind: PostponedFieldKind,
     locals: Vec<LocalDecl>,
     lctx: LocalContext,
     options: KVMap,
     scope: SourceScope,
+    /// Nested local functions belong to the source occurrence's enclosing
+    /// helper and compiler row, even after that scope has finished elaborating.
+    local_parent: Option<Name>,
+    matrix_row: Option<Name>,
+    local_self: Option<FVarId>,
+    /// An ordinary local candidate suspends its outer recursion. Preserve
+    /// that explicit `None` too, rather than replay in the caller's mode.
+    local_recursion: Option<(Option<recursion::Recursion>, Vec<recursion::Recursion>)>,
     /// A selected structural self is not an ordinary closure parameter. Its
     /// original branch still governs checked recursive calls during replay.
     recursion: Option<(recursion::Recursion, Vec<recursion::Recursion>)>,
@@ -218,7 +238,12 @@ impl Context {
         let fields: Vec<_> = self
             .postponed_fields
             .iter()
-            .map(|field| (field.expected.clone(), field.receiver.type_.clone()))
+            .filter_map(|field| match &field.kind {
+                PostponedFieldKind::Receiver { receiver, .. } => {
+                    Some((field.expected.clone(), receiver.type_.clone()))
+                }
+                PostponedFieldKind::ExpectedNotation { .. } => None,
+            })
             .collect();
         for (expected, receiver) in fields {
             self.tick()?;
@@ -261,7 +286,65 @@ impl Context {
         at: Option<&Syntax>,
         application: Option<DeferredFieldApplication>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        self.postpone_field_kind(
+            PostponedFieldKind::Receiver {
+                receiver,
+                path: path.clone(),
+                at: at.cloned(),
+                application,
+            },
+            None,
+        )
+    }
+
+    /// `.ctor` waits for its expected carrier at the pin, including when no
+    /// expected type was supplied (`resolveDottedIdentFn`). Keep the complete
+    /// original application: none of its arguments have been elaborated yet.
+    pub(super) fn postpone_expected_notation(
+        &mut self,
+        syntax: &Syntax,
+        expected: Option<&Expr>,
+        finish: bool,
+        problem: &NatDefinitionElabError,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        if !matches!(
+            problem,
+            NatDefinitionElabError::Inference(SourceInferenceError::DottedIdent(
+                dotted_ident::DottedIdentError::ExpectedTypeUnknown { .. }
+            ))
+        ) || (expected.is_some() && self.notation_type_unavailable(problem, expected)?.is_none())
+        {
+            return Ok(None);
+        }
+        let syntax = self.copy_pattern_syntax(syntax)?;
+        self.postpone_field_kind(
+            PostponedFieldKind::ExpectedNotation {
+                syntax,
+                finish,
+                problem: problem.clone(),
+            },
+            expected,
+        )
+        .map(Some)
+    }
+
+    fn postpone_field_kind(
+        &mut self,
+        kind: PostponedFieldKind,
+        supplied_expected: Option<&Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
         let mut captured = self.txn.lctx.decls().to_vec();
+        let local_self = self.local_function_lifting.active_local_self.clone();
+        let mut local_recursion = None;
+        if let Some(marker) = &local_self {
+            // This compiler-issued ordinary let-rec marker was introduced
+            // after its result header. Capturing it would make that header
+            // depend on itself even when the deferred syntax never reads self.
+            // Omission creates a permanent independence obligation below; an
+            // actual or aliased recursive use must still be refused on replay.
+            captured.retain(|local| &local.id != marker);
+            local_recursion = Some((self.recursion.clone(), self.enclosing_recursions.clone()));
+        }
         let recursion = self
             .recursion
             .as_ref()
@@ -338,6 +421,13 @@ impl Context {
             self.tick()?;
             expected = Expr::app(expected, Expr::fvar(local.id.clone()));
         }
+        if let Some(supplied) = supplied_expected {
+            // Keep this equation in the original lexical context. Either side
+            // can remain blocked until the continuation constrains the type;
+            // an old hole's hidden dependencies are never closed by copying it
+            // directly into the new placeholder's telescope.
+            self.constrain_type(&expected, supplied)?;
+        }
         let type_ = self.forall_captured(&locals, expected.clone())?;
         let name = self.fresh_name()?;
         let id = MVarId(name.clone());
@@ -358,14 +448,15 @@ impl Context {
         self.postponed_fields.push(PostponedField {
             id,
             expected: expected.clone(),
-            receiver,
-            path: path.clone(),
-            at: at.cloned(),
-            application,
+            kind,
             locals,
             lctx: self.txn.lctx.clone(),
             options: self.txn.options.clone(),
             scope: self.source_scope.clone(),
+            local_parent: self.local_function_lifting.parent.clone(),
+            matrix_row: self.local_function_lifting.active_matrix_row.clone(),
+            local_self,
+            local_recursion,
             recursion,
             replayed: None,
         });
@@ -388,70 +479,129 @@ impl Context {
             let saved = std::mem::replace(&mut self.txn.lctx, record.lctx.clone());
             let options = std::mem::replace(&mut self.txn.options, record.options.clone());
             let scope = std::mem::replace(&mut self.source_scope, record.scope.clone());
-            let recursion = record.recursion.as_ref().map(|(active, enclosing)| {
-                (
-                    self.recursion.replace(active.clone()),
+            let local_parent = std::mem::replace(
+                &mut self.local_function_lifting.parent,
+                record.local_parent.clone(),
+            );
+            let matrix_row = std::mem::replace(
+                &mut self.local_function_lifting.active_matrix_row,
+                record.matrix_row.clone(),
+            );
+            let local_self = std::mem::replace(
+                &mut self.local_function_lifting.active_local_self,
+                record.local_self.clone(),
+            );
+            let recursion = if let Some((active, enclosing)) = &record.local_recursion {
+                Some((
+                    std::mem::replace(&mut self.recursion, active.clone()),
                     std::mem::replace(&mut self.enclosing_recursions, enclosing.clone()),
-                )
-            });
+                ))
+            } else {
+                record.recursion.as_ref().map(|(active, enclosing)| {
+                    (
+                        self.recursion.replace(active.clone()),
+                        std::mem::replace(&mut self.enclosing_recursions, enclosing.clone()),
+                    )
+                })
+            };
             let mut elaborated = false;
             let result = (|| {
-                if record.replayed.is_none()
-                    && self
-                        .application_type_unavailable(&record.receiver.type_)?
-                        .is_some()
-                {
-                    return Ok(false);
+                if record.replayed.is_none() {
+                    let blocked = match &record.kind {
+                        PostponedFieldKind::Receiver { receiver, .. } => {
+                            self.application_type_unavailable(&receiver.type_)?
+                        }
+                        PostponedFieldKind::ExpectedNotation { problem, .. } => {
+                            self.notation_type_unavailable(problem, Some(&record.expected))?
+                        }
+                    };
+                    if blocked.is_some() {
+                        return Ok(false);
+                    }
                 }
                 let mut term = if let Some(term) = record.replayed.take() {
                     term
-                } else if let Some(application) = &record.application {
-                    elaborated = true;
-                    let at = record
-                        .at
-                        .as_ref()
-                        .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-                    let term = self.term_prepared_with_field(
-                        at,
-                        Some(record.expected.clone()),
-                        Some(FieldApplication {
-                            receiver: record.receiver.clone(),
-                            path: record.path.clone(),
-                            arguments: &application.arguments,
-                            explicit: application.explicit,
-                            finish: application.finish,
-                        }),
-                    )?;
-                    if !application.finish {
-                        // An unfinished projection is a callee, so keep its
-                        // implicit telescope while assigning the result type.
-                        self.constrain_type(&term.type_, &record.expected)?;
-                    }
-                    term
                 } else {
-                    let from_ident = matches!(
-                        record.at.as_ref(),
-                        Some(Syntax::Ident { val, .. }) if !val.parent().is_anonymous()
-                    );
-                    let field = self.resolve_field_path(
-                        record.receiver.clone(),
-                        &record.path,
-                        false,
-                        record.at.as_ref(),
-                        from_ident,
-                    )?;
-                    if matches!(&field, FieldResolution::Blocked { .. }) {
-                        return Ok(false);
+                    match &record.kind {
+                        PostponedFieldKind::Receiver {
+                            receiver,
+                            path,
+                            at,
+                            application: Some(application),
+                        } => {
+                            elaborated = true;
+                            let at = at
+                                .as_ref()
+                                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                            let term = self.term_prepared_with_field(
+                                at,
+                                Some(record.expected.clone()),
+                                Some(FieldApplication {
+                                    receiver: receiver.clone(),
+                                    path: path.clone(),
+                                    arguments: &application.arguments,
+                                    explicit: application.explicit,
+                                    finish: application.finish,
+                                }),
+                                true,
+                            )?;
+                            if !application.finish {
+                                // Preserve an unfinished callee's implicit telescope.
+                                self.constrain_type(&term.type_, &record.expected)?;
+                            }
+                            term
+                        }
+                        PostponedFieldKind::Receiver {
+                            receiver,
+                            path,
+                            at,
+                            application: None,
+                        } => {
+                            let from_ident = matches!(
+                                at.as_ref(),
+                                Some(Syntax::Ident { val, .. }) if !val.parent().is_anonymous()
+                            );
+                            let field = self.resolve_field_path(
+                                receiver.clone(),
+                                path,
+                                false,
+                                at.as_ref(),
+                                from_ident,
+                            )?;
+                            if matches!(&field, FieldResolution::Blocked { .. }) {
+                                return Ok(false);
+                            }
+                            elaborated = true;
+                            self.field_value(field, Some(&record.expected))?
+                        }
+                        PostponedFieldKind::ExpectedNotation { syntax, finish, .. } => {
+                            elaborated = true;
+                            let term = self.term_prepared_with_field(
+                                syntax,
+                                Some(record.expected.clone()),
+                                None,
+                                *finish,
+                            )?;
+                            if !finish {
+                                self.constrain_type(&term.type_, &record.expected)?;
+                            }
+                            term
+                        }
                     }
-                    elaborated = true;
-                    self.field_value(field, Some(&record.expected))?
                 };
                 let type_ = self.instantiate(&term.type_)?;
                 term.type_ = self.zeta_locals(&type_)?;
                 // A replayed application has already used its original
                 // finishing policy. In particular, do not insert implicits
                 // into an explicit application or an unfinished callee.
-                let mut term = if elaborated && record.application.is_none() {
+                let mut term = if elaborated
+                    && matches!(
+                        &record.kind,
+                        PostponedFieldKind::Receiver {
+                            application: None,
+                            ..
+                        }
+                    ) {
                     self.finish_optional_term(term, Some(&record.expected))?
                 } else {
                     term
@@ -468,6 +618,18 @@ impl Context {
                     // A hole may later become independent of self. Retain the
                     // actual replay and its obligation rather than rejecting
                     // uncertainty or assigning an unchecked closed lambda.
+                    record.replayed = Some(term);
+                    return Ok(false);
+                }
+                if let Some(marker) = &record.local_self
+                    && !self.postponed_field_scope_ready(
+                        marker,
+                        &term,
+                        &record.expected,
+                        &record.locals,
+                        &record.lctx,
+                    )?
+                {
                     record.replayed = Some(term);
                     return Ok(false);
                 }
@@ -512,6 +674,9 @@ impl Context {
             self.txn.lctx = saved;
             self.txn.options = options;
             self.source_scope = scope;
+            self.local_function_lifting.parent = local_parent;
+            self.local_function_lifting.active_matrix_row = matrix_row;
+            self.local_function_lifting.active_local_self = local_self;
             if let Some((active, enclosing)) = recursion {
                 self.recursion = active;
                 self.enclosing_recursions = enclosing;
@@ -606,6 +771,35 @@ impl Context {
                     if let Some(value) = self.txn.mvars.get_assigned_expr(id) {
                         tasks.push((value.clone(), inner, latent));
                     } else {
+                        let mut deferred = None;
+                        for index in 0..self.deferred_local_functions.len() {
+                            self.tick()?;
+                            let candidate = &self.deferred_local_functions[index];
+                            if &candidate.id == id && candidate.partial_marker.is_none() {
+                                deferred = Some(candidate.clone());
+                                break;
+                            }
+                        }
+                        if let Some(deferred) = deferred {
+                            // Inspect the registered future closure only for
+                            // independence. Do not assign its opaque hole or
+                            // make its body reducible before normal completion.
+                            // Actual application arguments are still walked
+                            // separately, and both checkers still check the
+                            // completed declaration after all obligations settle.
+                            let inner = contexts.len();
+                            contexts.push(deferred.lift_context);
+                            tasks.push((deferred.value.value, inner, latent));
+                            tasks.push((deferred.value.type_, inner, latent));
+                            for capture in deferred.captures {
+                                self.tick()?;
+                                tasks.push((capture.type_, inner, latent));
+                                if let Some(value) = capture.value {
+                                    tasks.push((value, inner, latent));
+                                }
+                            }
+                            continue;
+                        }
                         waiting = true;
                         for local in declaration.lctx.decls() {
                             self.tick()?;
@@ -645,13 +839,16 @@ impl Context {
     pub(super) fn finish_postponed_fields(&self) -> Result<(), NatDefinitionElabError> {
         match self.postponed_fields.first() {
             None => Ok(()),
-            Some(record) => Err(error(
-                if matches!(record.path.leaf_view(), LeafView::Num(_)) {
-                    RecordTermError::ProjectionNotStructure
-                } else {
-                    RecordTermError::ExpectedRecordType
-                },
-            )),
+            Some(record) => match &record.kind {
+                PostponedFieldKind::Receiver { path, .. } => {
+                    Err(error(if matches!(path.leaf_view(), LeafView::Num(_)) {
+                        RecordTermError::ProjectionNotStructure
+                    } else {
+                        RecordTermError::ExpectedRecordType
+                    }))
+                }
+                PostponedFieldKind::ExpectedNotation { problem, .. } => Err(problem.clone()),
+            },
         }
     }
 

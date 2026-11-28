@@ -48,6 +48,7 @@ pub(super) struct Build<'a> {
     pub checkpoint: Option<usize>,
     pub lift_name: Option<Name>,
     outer_parent: Option<Name>,
+    outer_local_self: Option<FVarId>,
     parameters: Vec<LocalDecl>,
     header_parameters: usize,
     lambdas: Vec<binders::Telescope<'a>>,
@@ -429,6 +430,7 @@ impl Context {
             None
         };
         let outer_parent = self.local_function_lifting.parent.clone();
+        let outer_local_self = self.local_function_lifting.active_local_self.clone();
         let partial = binding.recursive && self.collect_partial_locals();
         let saved = self.txn.lctx.clone();
         let parameters = self.bind_parameters(binding.parameters)?;
@@ -453,6 +455,7 @@ impl Context {
             checkpoint: None,
             lift_name,
             outer_parent,
+            outer_local_self,
             parameters,
             header_parameters,
             lambdas: Vec::new(),
@@ -482,6 +485,7 @@ impl Context {
         let outer = self.recursion.clone();
         let enclosing = self.enclosing_recursions.len();
         let parent = self.local_function_lifting.parent.clone();
+        let local_self = self.local_function_lifting.active_local_self.clone();
         self.start_local_function_value(build, None)?;
         let marker = build
             .marker
@@ -520,6 +524,7 @@ impl Context {
         self.recursion = outer;
         self.enclosing_recursions.truncate(enclosing);
         self.local_function_lifting.parent = parent;
+        self.local_function_lifting.active_local_self = local_self;
         build.marker = None;
         build.outer_recursion = None;
         build.written_result_type = build.result_type.clone();
@@ -697,6 +702,13 @@ impl Context {
             tactics::eliminate::add_local(&mut context, parameter);
         }
         self.txn.lctx = context;
+        // Only the first ordinary candidate has a provisional self whose
+        // eventual absence can prove that no recursion lowering is needed.
+        // Selected structural/course and partial candidates retain their
+        // existing recursive-call and closure obligations.
+        self.local_function_lifting.active_local_self =
+            (!build.partial && column.is_none() && build.course_parameter.is_none())
+                .then(|| id.clone());
         Ok(())
     }
 
@@ -758,6 +770,7 @@ impl Context {
         self.txn.lctx = build.saved.clone();
         if build.binding.recursive {
             self.local_function_lifting.parent = build.outer_parent.clone();
+            self.local_function_lifting.active_local_self = build.outer_local_self.clone();
             self.recursion = build.outer_recursion.clone();
             if build.outer_recursion.is_some() {
                 self.enclosing_recursions.pop();
@@ -886,6 +899,7 @@ mod tests {
             checkpoint: None,
             lift_name: None,
             outer_parent: None,
+            outer_local_self: None,
             parameters: Vec::new(),
             header_parameters: 0,
             lambdas: Vec::new(),
@@ -905,6 +919,8 @@ mod tests {
             .equations
             .push(SourceEquation::inference(hole.clone(), hole));
         context.attempt_depth = 12;
+        context.local_function_lifting.active_local_self =
+            Some(FVarId(Name::from_components(["speculativeSelf"])));
         let spent = context.txn.budget.heartbeats_consumed;
         assert!(spent > checkpoint.context.txn.budget.heartbeats_consumed);
         checkpoint.restore(&mut context);
@@ -912,6 +928,7 @@ mod tests {
         assert_eq!(context.next, initial_next);
         assert_eq!(context.txn.mvars, initial_mvars);
         assert_eq!(context.attempt_depth, 0);
+        assert!(context.local_function_lifting.active_local_self.is_none());
         assert!(context.equations.is_empty());
         context.txn.budget.max_heartbeats = spent;
         assert!(matches!(

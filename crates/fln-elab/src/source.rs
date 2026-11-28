@@ -2496,7 +2496,7 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
-        self.term_prepared_with_field(syntax, expected, None)
+        self.term_prepared_with_field(syntax, expected, None, true)
     }
 
     /// Deferred field applications reenter the same worklist as ordinary
@@ -2506,6 +2506,7 @@ impl Context {
         syntax: &'a Syntax,
         expected: Option<Expr>,
         initial_field: Option<record_terms::FieldApplication<'a>>,
+        finish: bool,
     ) -> Result<Typed, NatDefinitionElabError> {
         // Scoped term and tactic options are dynamically restored even when a
         // failed elaboration leaves its worklist before the closing frame.
@@ -2514,7 +2515,7 @@ impl Context {
         let pending_source_arguments = self.pending_source_arguments;
         let blocked = self.no_implicit_lambda_types.len();
         let macro_terms = self.tactic_macro_terms;
-        let result = self.term_prepared_scoped(syntax, expected, None, initial_field, true);
+        let result = self.term_prepared_scoped(syntax, expected, None, initial_field, finish);
         self.txn.options = options;
         self.pending_source_arguments = pending_source_arguments;
         self.no_implicit_lambda_types.truncate(blocked);
@@ -2710,7 +2711,7 @@ impl Context {
             RestoreImplicitLambda(usize),
             Observe(&'a Syntax, LocalContext),
             Function(&'a [Syntax], Option<Expr>, bool),
-            StartApplication(&'a Syntax, &'a [Syntax], Option<Expr>, bool),
+            StartApplication(&'a Syntax, &'a Syntax, &'a [Syntax], Option<Expr>, bool),
             NamedNext(application::NamedApplication<'a>),
             NamedArgument(application::NamedApplication<'a>, Expr),
             CheckArgument(&'a Syntax, Expr, bool),
@@ -2830,6 +2831,52 @@ impl Context {
                 postponed::Queue<'a>,
             ),
             Argument(Box<postponed::Checkpoint<'a>>),
+        }
+        fn local_inference_owns(
+            context: &mut Context,
+            attempts: &[Attempt<'_>],
+            blocker: Option<&MVarId>,
+        ) -> Result<bool, NatDefinitionElabError> {
+            let Some(blocker) = blocker else {
+                return Ok(false);
+            };
+            for attempt in attempts.iter().rev() {
+                context.tick()?;
+                if let Attempt::LocalInference(checkpoint, _) = attempt
+                    && checkpoint.owns(context, blocker)?
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        // Without a checkpoint that can replay this receiver, constructor
+        // patterns may still constrain its closed scope hole normally.
+        fn match_receiver_is_owned(
+            context: &mut Context,
+            attempts: &[Attempt<'_>],
+            blocker: &MVarId,
+        ) -> Result<bool, NatDefinitionElabError> {
+            let blockers = [postponed::Blocker {
+                id: blocker.clone(),
+                problem: failure(SourceInferenceError::Match(
+                    matching::MatchError::ExpectedInductive,
+                )),
+            }];
+            for attempt in attempts.iter().rev() {
+                context.tick()?;
+                let owned = match attempt {
+                    Attempt::LocalInference(checkpoint, _) => checkpoint.owns(context, blocker)?,
+                    Attempt::Argument(checkpoint) => {
+                        checkpoint.owned_blocker(context, &blockers)?.is_some()
+                    }
+                    _ => false,
+                };
+                if owned {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         }
         // A generated descendant can reenter this evaluator. Return from the
         // large native task dispatcher before calling either macro boundary;
@@ -3280,7 +3327,13 @@ impl Context {
                                 }
                                 let (head, explicit) = self.explicit_application_head(syntax)?;
                                 if explicit {
-                                    tasks.push(Task::StartApplication(head, &[], expected, true));
+                                    tasks.push(Task::StartApplication(
+                                        syntax,
+                                        head,
+                                        &[],
+                                        expected,
+                                        true,
+                                    ));
                                     continue;
                                 }
                                 if let Syntax::Node { kind, args, .. } = syntax {
@@ -4198,7 +4251,7 @@ impl Context {
                                         // that boundary when no explicit `@` was found.
                                         let head = if explicit { head } else { &parts[0] };
                                         tasks.push(Task::StartApplication(
-                                            head, arguments, expected, explicit,
+                                            syntax, head, arguments, expected, explicit,
                                         ));
                                         continue;
                                     }
@@ -4232,6 +4285,7 @@ impl Context {
                                             self.explicit_application_head(&parts[function])?;
                                         let head = if explicit { head } else { &parts[function] };
                                         tasks.push(Task::StartApplication(
+                                            syntax,
                                             head,
                                             std::slice::from_ref(&parts[argument]),
                                             expected,
@@ -4282,8 +4336,30 @@ impl Context {
                                             )?);
                                             continue;
                                         }
-                                        blocked_application = self
+                                        // Argument and owning local checkpoints replay the
+                                        // whole selected value, preserving tactic choices.
+                                        // Other result delays use a closed placeholder.
+                                        let blocker = self
                                             .notation_type_unavailable(&error, expected.as_ref())?;
+                                        if !attempts
+                                            .iter()
+                                            .any(|attempt| matches!(attempt, Attempt::Argument(_)))
+                                            && !local_inference_owns(
+                                                self,
+                                                &attempts,
+                                                blocker.as_ref(),
+                                            )?
+                                            && let Some(term) = self.postpone_expected_notation(
+                                                syntax,
+                                                expected.as_ref(),
+                                                finish,
+                                                &error,
+                                            )?
+                                        {
+                                            values.push(term);
+                                            continue;
+                                        }
+                                        blocked_application = blocker;
                                         return Err(error);
                                     }
                                 };
@@ -4413,6 +4489,7 @@ impl Context {
                                 let major = values.pop().expect("match discriminant visit");
                                 if let Some(blocker) =
                                     self.postponed_field_type_blocker(&major.type_)?
+                                    && match_receiver_is_owned(self, &attempts, &blocker)?
                                 {
                                     blocked_application = Some(blocker);
                                     return Err(failure(SourceInferenceError::Match(
@@ -5046,7 +5123,7 @@ impl Context {
                                 }
                                 tasks.push(Task::Proof(proof));
                             }
-                            Task::StartApplication(head, arguments, expected, explicit) => {
+                            Task::StartApplication(syntax, head, arguments, expected, explicit) => {
                                 if let Some(alternatives) = overload::syntax_alternatives(head) {
                                     // Each reading must see the entire application:
                                     // its arguments and expected result can distinguish
@@ -5169,11 +5246,28 @@ impl Context {
                                                         )?);
                                                         continue;
                                                     }
-                                                    blocked_application = self
-                                                        .notation_type_unavailable(
-                                                            &problem,
+                                                    let blocker = self.notation_type_unavailable(
+                                                        &problem,
+                                                        expected.as_ref(),
+                                                    )?;
+                                                    if !attempts.iter().any(|attempt| {
+                                                        matches!(attempt, Attempt::Argument(_))
+                                                    }) && !local_inference_owns(
+                                                        self,
+                                                        &attempts,
+                                                        blocker.as_ref(),
+                                                    )? && let Some(term) = self
+                                                        .postpone_expected_notation(
+                                                            syntax,
                                                             expected.as_ref(),
-                                                        )?;
+                                                            true,
+                                                            &problem,
+                                                        )?
+                                                    {
+                                                        values.push(term);
+                                                        continue;
+                                                    }
+                                                    blocked_application = blocker;
                                                     return Err(problem);
                                                 }
                                             };
@@ -6040,6 +6134,9 @@ impl Context {
                                         for (_, type_) in &discriminants {
                                             if let Some(blocker) =
                                                 self.postponed_field_type_blocker(type_)?
+                                                && match_receiver_is_owned(
+                                                    self, &attempts, &blocker,
+                                                )?
                                             {
                                                 blocked_application = Some(blocker);
                                                 return Err(failure(SourceInferenceError::Match(

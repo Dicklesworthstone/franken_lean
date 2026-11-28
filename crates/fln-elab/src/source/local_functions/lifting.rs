@@ -18,6 +18,10 @@ struct Origin {
 #[derive(Clone, Default)]
 pub(in crate::source) struct Lifting {
     pub parent: Option<Name>,
+    /// The typed self of the initial ordinary let-rec candidate. Delayed
+    /// notation may omit this provisional capture only while retaining an
+    /// independent obligation that its eventual value does not read it.
+    pub active_local_self: Option<FVarId>,
     names: HashSet<Name>,
     origins: HashMap<Name, Origin>,
     matrix_rows: HashSet<Name>,

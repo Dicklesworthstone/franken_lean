@@ -156,6 +156,14 @@ impl Context {
         if matches!(binder, Syntax::Ident { .. })
             || binder.kind() == Some(&parser_kind(&["Term", "hole"]))
         {
+            if let Syntax::Ident { val, .. } = &binder {
+                // `ensureAtomicBinderName` checks the original binder after
+                // removing macro scopes, before it can bind a local name.
+                let unscoped = val.erase_macro_scopes();
+                if unscoped.is_anonymous() || !unscoped.parent().is_anonymous() {
+                    return Err(failure(SourceInferenceError::Scope));
+                }
+            }
             binder = Syntax::node(
                 parser_kind(&["Term", "explicitBinder"]),
                 vec![

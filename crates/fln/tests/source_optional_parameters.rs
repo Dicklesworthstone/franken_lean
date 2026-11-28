@@ -5,8 +5,8 @@
 
 use fln::source_check::modules::imported::SourceOleanImportLimits;
 use fln::{
-    Budget, Engine, EngineAdmissionLimits, Environment, KVMap, Name, OleanCheckLimits,
-    OleanModuleInput, Outcome, SourceCheckLimits,
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, Environment, KVMap, Name,
+    OleanCheckLimits, OleanModuleInput, Outcome, SourceCheckLimits, VmExit,
 };
 use fln_core::expr::{Expr, ExprNode};
 use fln_env::constants::ConstantInfo;
@@ -187,12 +187,45 @@ fn field_receivers_consume_defaults_before_resolving_methods_or_projections() {
 }
 
 #[test]
+fn unknown_default_values_follow_automatic_implicit_policy() {
+    // The pin elaborates the expanded optParam in the declaration header, so
+    // its default may introduce an ordinary inferred implicit parameter.
+    let engine = checked(
+        "def unknownDefault (n : Nat := noSuchValue) : Nat := n\n\
+         def boundDefault {noSuchValue : Nat} (n : Nat := noSuchValue) : Nat := n\n",
+    );
+    same(&engine, "unknownDefault", "boundDefault");
+    let batch = engine
+        .execute_source_definitions(
+            &[b"#eval unknownDefault (noSuchValue := 7)\n\
+                #eval unknownDefault (noSuchValue := 42)\n\
+                #eval unknownDefault (noSuchValue := 7) (n := 19)\n"],
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().admission.kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .expect("automatic implicit defaults execute natively");
+    let values: Vec<_> = batch
+        .source_evaluation_indices
+        .iter()
+        .map(|&index| {
+            let VmExit::Returned(value) = &batch.executions[index].exit else {
+                panic!("expected returned Nat: {:?}", batch.executions[index]);
+            };
+            fln_vm::interpreter::nat_decimal(&value.value).expect("Nat result")
+        })
+        .collect();
+    assert_eq!(values, ["7", "42", "19"]);
+}
+
+#[test]
 fn defaults_are_checked_and_failures_leave_the_predecessor_usable() {
     let engine = checked("def chosen (n : Nat := 42) : Nat := n\n");
     let root = engine.logical_root(&KVMap::new());
     for source in [
         "def wrongType (n : Nat := true) : Nat := n\n",
-        "def unknownDefault (n : Nat := noSuchValue) : Nat := n\n",
+        "def unknownDefault (n : Nat := _root_.noSuchValue) : Nat := n\n",
         "def falseDefault (h : 0 = 1 := (by rfl)) : Nat := 0\n",
         "def unfinishedDefault (n : Nat := _) : Nat := n\n",
         "def automaticTactic (h : 0 = 0 := by rfl) : Nat := 0\n",

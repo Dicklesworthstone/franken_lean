@@ -17,13 +17,64 @@ impl Context {
             return Ok(());
         }
         let type_ = self.whnf(discriminant_type)?;
-        let ExprNode::MVar { id } = type_.node() else {
+        let mut head = &type_;
+        let mut arguments = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.tick()?;
+            arguments.push(a.clone());
+            head = f;
+        }
+        let ExprNode::MVar { id } = head.node() else {
             return Ok(());
         };
-        let Some(declaration) = self.txn.mvars.get_decl(id) else {
+        let Some(declaration) = self.txn.mvars.get_decl(id).cloned() else {
             return Ok(());
         };
-        let inference_context = declaration.lctx.clone();
+        let mut inference_context = declaration.lctx.clone();
+        let mut captures = Vec::new();
+        if !arguments.is_empty() {
+            // A deferred field's type is a closed hole applied to its original
+            // lexical scope. Use only that declared scope, never the later
+            // discriminant or branch locals present at this match. Other
+            // higher-order applications remain ordinary unification problems.
+            if declaration.kind != MetavarKind::Natural
+                || declaration.scope_args != Some(arguments.len())
+            {
+                return Ok(());
+            }
+            let mut distinct = HashSet::new();
+            let mut telescope = declaration.type_.clone();
+            for argument in arguments.iter().rev() {
+                self.tick()?;
+                let ExprNode::FVar { id } = argument.node() else {
+                    return Ok(());
+                };
+                if inference_context.contains(id) || !distinct.insert(id.clone()) {
+                    return Ok(());
+                }
+                let Some(mut local) = self.txn.lctx.find(id).cloned() else {
+                    return Ok(());
+                };
+                if local.is_let() {
+                    return Ok(());
+                }
+                let type_ = self.whnf(&telescope)?;
+                let ExprNode::ForallE {
+                    binder_type,
+                    body,
+                    binder_info,
+                    ..
+                } = type_.node()
+                else {
+                    return Ok(());
+                };
+                local.type_ = binder_type.clone();
+                local.binder_info = *binder_info;
+                telescope = self.substitute(body, argument)?;
+                tactics::eliminate::add_local(&mut inference_context, &local);
+                captures.push(local);
+            }
+        }
         for alternative in parts.alternatives {
             self.tick()?;
             let alternative = expect_node(
@@ -99,14 +150,22 @@ impl Context {
                 else {
                     return Err(error(MatchError::UnsupportedFamily));
                 };
-                // This domain hole predates its discriminant binder. A fresh
-                // family parameter must have that same scope, rather than
-                // capture the discriminant or later equation arguments. The
-                // assignment checker deliberately refuses such residuals.
+                // Fresh parameters have only the type hole's original scope.
+                // An applied scope hole can legitimately depend on a captured
+                // carrier, e.g. Option A, but not on later pattern variables.
                 let saved = std::mem::replace(&mut self.txn.lctx, inference_context.clone());
                 let parameter = self.hole(binder_type.clone());
                 self.txn.lctx = saved;
-                let parameter = parameter?;
+                let mut parameter = Typed {
+                    value: parameter?,
+                    type_: binder_type.clone(),
+                };
+                // Close the parameter holes through the same explicit spine
+                // before placing them in a solution of the closed type hole.
+                // Otherwise their latent local context could escape even
+                // though their visible type contains no free variables.
+                self.capture_bound_metavars(&captures, &declaration.lctx, &mut parameter)?;
+                let parameter = parameter.value;
                 application.value = Expr::app(application.value, parameter.clone());
                 application.type_ = self.substitute(body, &parameter)?;
             }
