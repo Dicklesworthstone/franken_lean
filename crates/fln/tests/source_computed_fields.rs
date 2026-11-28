@@ -667,7 +667,7 @@ fn generated_inventory_refuses_changed_override_and_constructor_layout() {
 }
 
 #[test]
-fn module_export_refuses_until_cached_layout_metadata_is_complete() {
+fn module_export_publishes_complete_supported_layouts_and_refuses_unsupported_payloads() {
     with_fixture(|fixture| {
         let module = name("Computed");
         let source =
@@ -678,7 +678,7 @@ fn module_export_refuses_until_cached_layout_metadata_is_complete() {
         }];
         let options = KVMap::new();
         let before = fixture.imported.engine.logical_root(&options);
-        let error = fixture
+        let built = fixture
             .imported
             .compile_source_modules(
                 &files,
@@ -687,13 +687,117 @@ fn module_export_refuses_until_cached_layout_metadata_is_complete() {
                 SourceModuleCheckLimits::new(check_limits()),
                 OleanWriteBudget::default(),
             )
-            .expect_err("computed-field module artifacts require complete implementation metadata");
+            .expect("supported computed-field artifacts include their complete metadata")
+            .into_complete()
+            .unwrap();
+        assert_eq!(built.artifacts.len(), 1);
+        let blocks = fln_olean::region::OleanView::parse(&built.artifacts[0].bytes)
+            .unwrap()
+            .extension_payloads(fln::OleanWalkBudget::default(), IMPORT_STACK)
+            .unwrap();
+        let metadata = fln_olean::source_extensions::decode(&blocks, Default::default()).unwrap();
+        assert_eq!(metadata.computed_fields, [name("Cache.total")]);
+        assert!(metadata.noncomputable.contains(&name("Cache.total")));
+        assert!(
+            metadata
+                .aux_recursors
+                .contains(&name("Cache._impl.casesOn"))
+        );
+        for original in ["Cache.empty", "Cache.add", "Cache.casesOn", "Cache.total"] {
+            assert!(metadata.implemented_by.iter().any(|edge| {
+                edge.declaration == name(original)
+                    && edge.implementation == name(&format!("{original}._override"))
+            }));
+        }
+        let private_extension = |module: &str, leaf: &str| {
+            ["Lean", "Compiler", "LCNF", leaf].into_iter().fold(
+                Name::num(name(&format!("_private.Lean.Compiler.LCNF.{module}")), 0),
+                Name::str,
+            )
+        };
+        let families = [name("Cache"), name("Cache._impl")];
+        let constructors = [
+            name("Cache.empty"),
+            name("Cache.add"),
+            name("Cache.empty._impl"),
+            name("Cache.add._impl"),
+        ];
+        for (extension, expected) in [
+            (
+                private_extension("MonoTypes", "trivialStructureInfoExt"),
+                families.to_vec(),
+            ),
+            (
+                private_extension("ToImpureType", "impureTrivialStructureInfoExt"),
+                families.to_vec(),
+            ),
+            (
+                name("Lean.Compiler.LCNF.monoTypeExt"),
+                families.iter().chain(&constructors).cloned().collect(),
+            ),
+            (
+                private_extension("ToImpureType", "impureTypeExt"),
+                families.to_vec(),
+            ),
+            (
+                private_extension("ToImpureType", "ctorLayoutExt"),
+                constructors.to_vec(),
+            ),
+        ] {
+            let block = blocks.iter().find(|block| block.name == extension).unwrap();
+            let mut conversion = fln_rt::convert::Conversion::new();
+            let actual = block
+                .entries
+                .iter()
+                .map(|bytes| {
+                    let entry = fln_rt::region::materialize(bytes, 0).unwrap();
+                    conversion.project_name(&entry.ctor_child(0)).unwrap()
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                actual,
+                expected.into_iter().collect(),
+                "compiler cache {extension:?}"
+            );
+        }
+        assert_eq!(fixture.imported.engine.logical_root(&options), before);
+
+        // USize is valid in a logical constructor and the checked cache
+        // generator, but its separate machine-word layout is not projected by
+        // this artifact profile. Refuse the whole publication at that boundary.
+        let unsupported = SINGLE
+            .replace("Cache", "UnsupportedCache")
+            .replace("(n : Nat)", "(n : USize)")
+            .replace("Nat.add n tail.total", "Nat.add 1 tail.total")
+            .replace("| .add n tail =>", "| .add _ tail =>");
+        reference(&fixture.compiler, &unsupported, Some(""));
+        let admitted = checked(&fixture.imported.engine, &unsupported);
+        assert!(
+            admitted
+                .environment()
+                .contains(&name("UnsupportedCache.add._impl"))
+        );
+        let source =
+            format!("module\nprelude\npublic import Init.Prelude\npublic section\n{unsupported}");
+        let error = fixture
+            .imported
+            .compile_source_modules(
+                &[SourceModuleInput {
+                    name: &module,
+                    source: source.as_bytes(),
+                }],
+                &module,
+                &options,
+                SourceModuleCheckLimits::new(check_limits()),
+                OleanWriteBudget::default(),
+            )
+            .expect_err("unsupported computed payloads cannot publish partial artifacts");
         assert!(
             matches!(error,
                 SourceModuleBuildError::Check(SourceModuleCheckError::Extension { module: ref failed, ref extension, reason })
                     if failed == &module
                     && extension == &fln_elab::computed_fields::journal_name()
-                    && reason == "computed-field artifacts require generated implementation compiler layouts and attribute metadata"
+                    && reason == "computed-field artifacts require supported logical and implementation compiler layouts"
             ),
             "unexpected computed-field artifact refusal: {error:?}"
         );

@@ -46,6 +46,19 @@ fn codec(error: InstanceRegistryError) -> ComputedFieldError {
     }
 }
 
+fn tag_error(error: crate::NatDefinitionElabError) -> ComputedFieldError {
+    if matches!(
+        error,
+        crate::NatDefinitionElabError::Inference(
+            crate::source::SourceInferenceError::ResourceLimit
+        )
+    ) {
+        ComputedFieldError::ResourceLimit
+    } else {
+        ComputedFieldError::InvalidInventory
+    }
+}
+
 fn shape(entry: &ComputedFieldEntry) -> Result<(), ComputedFieldError> {
     if entry.fields.len() > MAX_FIELDS || entry.inline_fields.len() > MAX_FIELDS {
         return Err(ComputedFieldError::ResourceLimit);
@@ -261,7 +274,8 @@ pub fn register(
             .collect(),
         ..entry
     };
-    append(env, entry, budget)
+    let registered = append(env, entry, budget)?;
+    super::tags::register_generated(&registered, env, fields).map_err(tag_error)
 }
 
 pub fn validated_family(
@@ -387,5 +401,6 @@ pub fn register_projected(
             .collect(),
         ..entry
     };
-    append(public_env, entry, budget)
+    let registered = append(public_env, entry, budget)?;
+    super::tags::register_generated(&registered, private_checked_env, fields).map_err(tag_error)
 }

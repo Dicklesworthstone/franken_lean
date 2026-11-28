@@ -164,6 +164,8 @@ pub struct SourceMetadataReport {
     pub unbox: usize,
     /// Owned declarations inhibiting closed-call extraction and CSE.
     pub never_extract: usize,
+    /// Owned logical definitions tagged as computed fields.
+    pub computed_fields: usize,
     /// Owned exposed definitions carrying the pin's `[match_pattern]` tag.
     pub match_patterns: usize,
     /// Ordered symmetry registrations, including dormant scoped rows.
@@ -1134,6 +1136,7 @@ fn prepare_source_metadata_view(
             Name::from_components(metadata::COE_EXTENSION.split('.')),
             Name::from_components(metadata::GRIND_EXTENSION.split('.')),
             Name::from_components(metadata::NEVER_EXTRACT_EXTENSION.split('.')),
+            Name::from_components(metadata::COMPUTED_FIELD_EXTENSION.split('.')),
         ])
         .collect();
     let mut blocks: Vec<_> = selected
@@ -1205,6 +1208,7 @@ fn prepare_source_metadata_view(
             noncomputable: 0,
             unbox: 0,
             never_extract: 0,
+            computed_fields: 0,
             match_patterns: 0,
             symms: 0,
             grind_entries: 0,
@@ -1315,6 +1319,7 @@ fn prepare_source_metadata_view(
                     28 => report.coercions = entries.len(),
                     29 => report.grind_entries = entries.len(),
                     30 => report.never_extract = entries.len(),
+                    31 => report.computed_fields = entries.len(),
                     _ => {
                         return Err(SourceOleanImportError::Internal(
                             "unknown selected metadata kind",
@@ -1514,6 +1519,7 @@ impl Engine {
         let mut noncomputable = decoded.noncomputable.into_iter();
         let mut unbox = decoded.unbox.into_iter();
         let mut never_extract = decoded.never_extract.into_iter();
+        let mut computed_fields = decoded.computed_fields.into_iter();
         let mut match_patterns = decoded.match_patterns.into_iter();
         let mut symm_scopes =
             symm::Scopes::new(&checked, &decoded.symms, limits.metadata.max_objects)?;
@@ -1975,6 +1981,27 @@ impl Engine {
                         .map_err(|error| never_extract_error(&report.module, error))?;
                 }
             }
+            if report.computed_fields != 0 {
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.computed_fields,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..report.computed_fields {
+                    cancelled!("source-olean/computed-field");
+                    let declaration =
+                        computed_fields
+                            .next()
+                            .ok_or(SourceOleanImportError::Internal(
+                                "computed-field count changed during decode",
+                            ))?;
+                    owners.validate(activation.environment(), &report.module, &declaration)?;
+                    activation = activation
+                        .register_computed_field(&declaration)
+                        .map_err(|error| computed_field_error(&report.module, error))?;
+                }
+            }
             if report.match_patterns != 0 {
                 let mut owners = AttributeOwners::new(
                     &checked.modules[index].decoded.constants,
@@ -2395,6 +2422,9 @@ impl Engine {
         fln_elab::never_extract::read(&engine.environment).map_err(|error| {
             never_extract_error(&roots.first().cloned().unwrap_or_default(), error)
         })?;
+        fln_elab::computed_fields::tags::read_tags(&engine.environment).map_err(|error| {
+            computed_field_error(&roots.first().cloned().unwrap_or_default(), error)
+        })?;
         fln_elab::match_pattern::read(&engine.environment).map_err(|error| {
             match_pattern_error(&roots.first().cloned().unwrap_or_default(), error)
         })?;
@@ -2454,6 +2484,7 @@ impl Engine {
             || noncomputable.next().is_some()
             || unbox.next().is_some()
             || never_extract.next().is_some()
+            || computed_fields.next().is_some()
             || match_patterns.next().is_some()
             || symms.next().is_some()
             || defeq.next().is_some()
@@ -2768,6 +2799,10 @@ trait Registrar: Sized {
         self,
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::never_extract::NeverExtractError>;
+    fn register_computed_field(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::NatDefinitionElabError>;
     fn register_match_pattern(
         self,
         declaration: &Name,
@@ -2913,6 +2948,12 @@ impl Registrar for instances::imported::ImportActivation {
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::never_extract::NeverExtractError> {
         self.register_never_extract(declaration)
+    }
+    fn register_computed_field(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::NatDefinitionElabError> {
+        self.register_computed_field(declaration)
     }
     fn register_match_pattern(
         self,
@@ -3283,6 +3324,25 @@ fn never_extract_error(
         module: module.clone(),
         declaration,
         reason,
+    }
+}
+
+fn computed_field_error(
+    module: &Name,
+    error: fln_elab::NatDefinitionElabError,
+) -> SourceOleanImportError {
+    if matches!(
+        error,
+        fln_elab::NatDefinitionElabError::Inference(
+            fln_elab::source::SourceInferenceError::ResourceLimit
+        )
+    ) {
+        return SourceOleanImportError::Limit("computed-field journal");
+    }
+    SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration: module.clone(),
+        reason: "a computed-field tag requires an admitted safe definition and a valid journal",
     }
 }
 
@@ -4948,6 +5008,12 @@ pub(super) mod tests {
             declaration: &Name,
         ) -> std::result::Result<Self, fln_elab::never_extract::NeverExtractError> {
             fln_elab::never_extract::register(&self.0, declaration).map(Sequential)
+        }
+        fn register_computed_field(
+            self,
+            declaration: &Name,
+        ) -> std::result::Result<Self, fln_elab::NatDefinitionElabError> {
+            fln_elab::computed_fields::tags::register_imported(&self.0, declaration).map(Sequential)
         }
         fn register_match_pattern(
             self,

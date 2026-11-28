@@ -74,6 +74,10 @@ inductive WriterProp : Prop where | intro
 "#;
 
 fn fixture() -> Option<(PathBuf, PathBuf, Vec<u8>)> {
+    fixture_for(SOURCE)
+}
+
+fn fixture_for(source: &str) -> Option<(PathBuf, PathBuf, Vec<u8>)> {
     let Some(lean) = std::env::var_os("FLN_REFERENCE_LEAN")
         .or_else(|| std::env::var_os("FLN_REFERENCE_BIN"))
         .map(PathBuf::from)
@@ -100,7 +104,7 @@ fn fixture() -> Option<(PathBuf, PathBuf, Vec<u8>)> {
     let directory =
         std::env::temp_dir().join(format!("fln-compiler-data-{}-{nonce}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
-    std::fs::write(directory.join("WriterData.lean"), SOURCE).unwrap();
+    std::fs::write(directory.join("WriterData.lean"), source).unwrap();
     let output = Command::new(&lean)
         .current_dir(&directory)
         .args(["-j", "1", "-o", "WriterData.olean", "WriterData.lean"])
@@ -968,4 +972,254 @@ fn compiler_data_maps_match_the_actual_pin_and_refuse_unsupported_layouts() {
         ),
         Err(WriteError::Budget { .. })
     ));
+}
+
+const COMPUTED_SOURCE: &str = r#"import Init.Core
+inductive WriterComputed where
+  | empty
+  | node (number : Nat) (text : String) (small : UInt16) (word : UInt32)
+      (tail : WriterComputed)
+with
+  @[computed_field] flag : WriterComputed → Bool
+    | .empty => false
+    | .node _ _ _ _ _ => true
+  @[computed_field] hash : WriterComputed → UInt64
+    | .empty => 0
+    | .node number _ _ _ _ => UInt64.ofNat number
+  @[computed_field] memo : WriterComputed → String
+    | .empty => ""
+    | .node _ text _ _ _ => text
+
+inductive WriterComputedFunction where
+  | empty
+  | node (callback : Nat → Nat)
+with
+  @[computed_field] size : WriterComputedFunction → Nat
+    | .empty => 0
+    | .node _ => 1
+"#;
+
+fn computed_projection(constants: &[ConstantInfo], family: &str) -> Vec<CompilerData> {
+    let logical_name = name(family);
+    let ConstantInfo::Induct(logical) = constants
+        .iter()
+        .find(|info| info.name() == &logical_name)
+        .unwrap()
+    else {
+        panic!("missing computed logical family {family}");
+    };
+    [logical_name.clone(), Name::str(logical_name, "_impl")]
+        .into_iter()
+        .filter_map(|key| {
+            let ConstantInfo::Induct(inductive) =
+                constants.iter().find(|info| info.name() == &key).unwrap()
+            else {
+                panic!("missing computed family {key:?}");
+            };
+            CompilerData::from_computed_inductive(
+                inductive,
+                logical,
+                |key| constants.iter().find(|info| info.name() == key),
+                |_| Ok::<_, ()>(()),
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+fn assert_exact_computed_maps(
+    bytes: &[u8],
+    family: &str,
+) -> (Vec<ConstantInfo>, Vec<CompilerData>) {
+    let view = OleanView::parse(bytes).unwrap();
+    let constants = DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap();
+    let data = computed_projection(&constants, family);
+    assert_eq!(data.len(), 2, "both logical and implementation caches");
+    let keep = data
+        .iter()
+        .flat_map(|row| {
+            std::iter::once(row.name.clone())
+                .chain(row.constructors.iter().map(|ctor| ctor.name.clone()))
+        })
+        .collect();
+    let native = encode(
+        &SourceMetadata {
+            compiler_data: data.clone(),
+            ..SourceMetadata::default()
+        },
+        WriteBudget::default(),
+    )
+    .unwrap();
+    let native = OleanView::parse(&native.bytes)
+        .unwrap()
+        .extension_payloads(WalkBudget::default(), 16 << 20)
+        .unwrap();
+    let actual = view
+        .extension_payloads(WalkBudget::default(), 16 << 20)
+        .unwrap();
+    assert_eq!(maps(&native, &keep), maps(&actual, &keep), "{family}");
+    (constants, data)
+}
+
+#[test]
+fn computed_compiler_data_matches_pin_and_fresh_recursive_scalar_consumers() {
+    let Some((lean, directory, bytes)) = fixture_for(COMPUTED_SOURCE) else {
+        return;
+    };
+    let (constants, data) = assert_exact_computed_maps(&bytes, "WriterComputed");
+    assert!(computed_projection(&constants, "WriterComputedFunction").is_empty());
+    // Metadata support must not widen the native runtime ABI classifier.
+    for row in &data {
+        let ConstantInfo::Induct(inductive) = constants
+            .iter()
+            .find(|info| info.name() == row.name())
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        assert!(
+            CompilerData::from_inductive(
+                inductive,
+                |key| constants.iter().find(|info| info.name() == key),
+                |_| Ok::<_, ()>(()),
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+    let ConstantInfo::Induct(logical) = constants
+        .iter()
+        .find(|info| info.name() == &name("WriterComputed"))
+        .unwrap()
+    else {
+        unreachable!();
+    };
+    assert!(
+        CompilerData::from_computed_inductive(
+            logical,
+            logical,
+            |key| constants.iter().find(|info| info.name() == key),
+            |_| Err("work limit"),
+        )
+        .is_err(),
+        "resource exhaustion must not become an absent layout"
+    );
+    // Lean.Name follows the same logical/implementation split but is purposely
+    // excluded from the ordinary runtime classifier. Compare its real Prelude
+    // metadata too, including both recursive object carriers and UInt64 caches.
+    let prelude = lean
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("lib/lean/Init/Prelude.olean");
+    assert_exact_computed_maps(&std::fs::read(prelude).unwrap(), "Lean.Name");
+
+    let view = OleanView::parse(&bytes).unwrap();
+    let module = view.module_data(WalkBudget::default()).unwrap();
+    let blocks = view
+        .extension_payloads(WalkBudget::default(), 16 << 20)
+        .unwrap();
+    let auxiliary_tags = blocks
+        .iter()
+        .find(|block| block.name == name(layout::AUX_RECURSOR_EXTENSION))
+        .unwrap();
+    let metadata =
+        crate::source_extensions::decode(std::slice::from_ref(auxiliary_tags), Default::default())
+            .unwrap();
+    let reader = r#"import Lean
+import WriterData
+open Lean Elab Command Compiler LCNF
+run_cmd liftCoreM do
+  for n in [``WriterComputed, ``WriterComputed._impl] do
+    unless (← hasTrivialStructure? n).isNone && (← hasTrivialImpureStructure? n).isNone do
+      throwError "unexpected trivial computed family"
+    unless (← getOtherDeclMonoType n) == mkConst `lcErased do
+      throwError "wrong computed mono type"
+    unless (← nameToImpureType n) == mkConst `tobj do
+      throwError "wrong computed family carrier"
+  let layout ← getCtorLayout ``WriterComputed.node._impl
+  unless layout.ctorInfo.size == 4 && layout.ctorInfo.usize == 0 && layout.ctorInfo.ssize == 15 do
+    throwError "wrong computed allocation size"
+  match layout.fieldInfo.toList with
+  | [.scalar 1 14 b, .scalar 8 0 h, .object 0 memo, .object 1 n,
+      .object 2 text, .scalar 2 12 small, .scalar 4 8 word, .object 3 tail] =>
+    unless b == mkConst `UInt8 && h == mkConst `UInt64 && memo == mkConst `obj &&
+        n == mkConst `tobj && text == mkConst `obj && small == mkConst `UInt16 &&
+        word == mkConst `UInt32 && tail == mkConst `tobj do
+      throwError "wrong computed field carriers"
+  | _ => throwError "wrong computed scalar offsets"
+  logInfo "computed-native-caches-ok"
+"#;
+    let run = |source: &str, rows: &[CompilerData]| {
+        std::fs::write(directory.join("Reader.lean"), source).unwrap();
+        std::fs::write(
+            directory.join("WriterData.olean"),
+            native_module(&constants, &module.imports, rows, &metadata.aux_recursors),
+        )
+        .unwrap();
+        Command::new(&lean)
+            .current_dir(&directory)
+            .env("LEAN_PATH", &directory)
+            .args(["-j", "1", "Reader.lean"])
+            .output()
+            .unwrap()
+    };
+    let positive = run(reader, &data);
+    assert!(positive.status.success(), "{positive:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&positive.stdout).trim(),
+        "computed-native-caches-ok"
+    );
+    assert!(!directory.join("WriterData.ir").exists());
+    // Fresh downstream code allocates and matches the implementation directly.
+    // This isolates compiler-cache interoperability from executable replacement
+    // IR, which this metadata-only fixture deliberately does not supply.
+    let consumer = r#"import WriterData
+@[noinline] def originalNumber (value : WriterComputed) : Nat :=
+  match value with
+  | WriterComputed.empty => 0
+  | WriterComputed.node number _ _ _ _ => number
+@[noinline] def inspectCache (value : WriterComputed._impl) :
+    Bool × Nat × String × Nat × String × Nat × Nat × Nat :=
+  match value with
+  | WriterComputed.empty._impl => (false, 0, "", 0, "", 0, 0, 0)
+  | WriterComputed.node._impl flag hash memo number text small word tail =>
+      (flag, hash.toNat, memo, number, text, small.toNat, word.toNat, originalNumber tail)
+#eval
+  let tail := WriterComputed.node 18446744073709551616 "tail" 512 70000 .empty
+  inspectCache (WriterComputed.node._impl true 1234567890123456789 "cache"
+    18446744073709551616 "payload" 513 70001 tail)
+#eval inspectCache (WriterComputed.node._impl false 7 "other" 11 "second" 9 10 .empty)
+"#;
+    let consumed = run(consumer, &data);
+    assert!(consumed.status.success(), "{consumed:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&consumed.stdout).trim(),
+        "(true, 1234567890123456789, \"cache\", 18446744073709551616, \"payload\", 513, 70001, 18446744073709551616)\n(false, 7, \"other\", 11, \"second\", 9, 10, 0)"
+    );
+    let missing: Vec<_> = data
+        .iter()
+        .filter(|row| row.name() != &name("WriterComputed._impl"))
+        .cloned()
+        .collect();
+    let absent = run(reader, &missing);
+    assert!(
+        !absent.status.success(),
+        "missing implementation caches accepted"
+    );
+    assert!(String::from_utf8_lossy(&absent.stdout).contains("was not compiled"));
+    let mut altered = data.clone();
+    altered
+        .iter_mut()
+        .find(|row| row.name() == &name("WriterComputed._impl"))
+        .unwrap()
+        .constructors[1]
+        .fields
+        .swap(0, 1);
+    let mutant = run(reader, &altered);
+    assert!(!mutant.status.success(), "reordered scalar caches accepted");
+    assert!(String::from_utf8_lossy(&mutant.stdout).contains("wrong computed scalar offsets"));
 }

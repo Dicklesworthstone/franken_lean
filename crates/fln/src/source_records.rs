@@ -24,6 +24,9 @@ pub(crate) use elaboration::{
 pub(crate) struct PublicSourceAdmission {
     pub(crate) public: DeclarationBatchAdmission,
     pub(crate) private_implementation: Option<DeclarationBatchAdmission>,
+    /// Both checked successors already contain this command's complete
+    /// metadata. Ordinary hidden-body admissions instead replay public effects.
+    pub(crate) metadata_complete: bool,
 }
 
 /// Classify a closed declaration header without changing its declaration kind
@@ -602,6 +605,7 @@ impl Engine {
                         Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
                             public,
                             private_implementation: None,
+                            metadata_complete: false,
                         }),
                         Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                         Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -649,6 +653,7 @@ impl Engine {
                         Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
                             public,
                             private_implementation: None,
+                            metadata_complete: false,
                         }),
                         Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                         Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -815,6 +820,7 @@ impl Engine {
                 Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
                     public: public_body::prepend_auxiliaries(public, auxiliaries.public),
                     private_implementation: Some(private_implementation),
+                    metadata_complete: false,
                 }),
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),

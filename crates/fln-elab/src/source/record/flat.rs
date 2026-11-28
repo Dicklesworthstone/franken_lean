@@ -834,9 +834,9 @@ impl Context {
             .map(|field| (field.user_name.clone(), Expr::fvar(field.id.clone())))
             .collect();
         let mut declarations = Vec::new();
-        for index in 0..fields.len() {
+        for target in fields.iter_mut() {
             self.tick()?;
-            let field = fields[index].clone();
+            let field = target.clone();
             let declared = helper_name(&spec.name, &field.user_name);
             if defaults.values.contains(&declared)
                 || defaults.tactics.contains_key(&field.user_name)
@@ -870,8 +870,7 @@ impl Context {
                 }
             }
             if let Some(tactic) = selected_auto {
-                fields[index].type_ =
-                    self.record_auto_parameter_type(field.type_, tactic.clone())?;
+                target.type_ = self.record_auto_parameter_type(field.type_, tactic.clone())?;
                 auto_parameters.insert(field.user_name, tactic);
                 continue;
             }

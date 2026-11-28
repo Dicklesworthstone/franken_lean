@@ -420,6 +420,7 @@ impl Engine {
                 private.batch,
                 private_prefix,
             )),
+            metadata_complete: true,
         }))
     }
 }

@@ -748,6 +748,16 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain a checked owning module's logical computed-field tag. This does
+    /// not create a cached representation or select a runtime implementation.
+    pub fn register_computed_field(
+        mut self,
+        declaration: &Name,
+    ) -> Result<Self, crate::NatDefinitionElabError> {
+        self.env = crate::computed_fields::tags::register_imported(&self.env, declaration)?;
+        Ok(self)
+    }
+
     /// Retain a checked owning module's pattern-expansion tag without changing
     /// cached class or instance metadata. Registration requires a visible definition.
     pub fn register_match_pattern(

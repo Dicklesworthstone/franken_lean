@@ -12,7 +12,7 @@ use crate::lctx::LocalDecl;
 use crate::records::{Builder, RecordBudget, RecordError, app, fv};
 use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId};
 use fln_core::level::Level;
-use fln_core::name::Name;
+use fln_core::name::{LeafView, Name};
 use fln_core::options::KVMap;
 use fln_env::constants::{
     ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
@@ -23,6 +23,7 @@ use fln_kernel::{Declaration, InductiveBlock};
 use std::collections::HashSet;
 
 mod journal;
+pub mod tags;
 pub use journal::{
     ComputedFieldEntry, decode_entry, families, journal_name, register, register_projected,
     supports, validated_family,
@@ -399,11 +400,19 @@ impl<'a> Build<'a> {
             .fields
             .iter()
             .map(|field| {
-                self.local(
-                    field.name.clone(),
-                    field.result_type.clone(),
-                    BinderInfo::Default,
-                )
+                // The pin uses `fieldDeclName.updatePrefix .anonymous` for
+                // each cache binder. Keep the declaration's qualified name in
+                // the model, but preserve this short name in the generated
+                // constructor, recursor and replacement telescopes.
+                let binder = match field.name.leaf_view() {
+                    LeafView::Anonymous => return Err(ComputedFieldError::InvalidInventory),
+                    LeafView::Str(value) => Name::str(Name::anonymous(), value),
+                    LeafView::Num(value) if field.name.component_overflowed() => {
+                        Name::num_overflowing(Name::anonymous(), value)
+                    }
+                    LeafView::Num(value) => Name::num(Name::anonymous(), value),
+                };
+                self.local(binder, field.result_type.clone(), BinderInfo::Default)
             })
             .collect()
     }

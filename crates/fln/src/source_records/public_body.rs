@@ -263,6 +263,7 @@ impl Engine {
         Ok(Outcome::Complete(PublicSourceAdmission {
             public: prepend_auxiliaries(public, auxiliaries.public),
             private_implementation: Some(prepend_auxiliaries(private, auxiliaries.private)),
+            metadata_complete: false,
         }))
     }
 
@@ -380,6 +381,7 @@ impl Engine {
                 Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
                     public,
                     private_implementation: Some(private_implementation),
+                    metadata_complete: false,
                 }),
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -505,6 +507,7 @@ impl Engine {
                 Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
                     public: prepend_auxiliaries(public, auxiliaries.public),
                     private_implementation: Some(private_implementation),
+                    metadata_complete: false,
                 }),
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),

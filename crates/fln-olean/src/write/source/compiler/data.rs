@@ -14,6 +14,9 @@
 //! Runtime builtin families and Name's computed-field layout are also excluded.
 //! Object fields precede Bool scalar bytes; each group preserves source order.
 //! The layout records are extracted from `ToImpureType.lean` and `Irrelevant.lean`.
+//! A separate metadata-only projection covers computed implementations with
+//! fixed-width unsigned caches and fields retaining their logical family type.
+//! It does not widen the ordinary runtime signature/constructor ABI classifier.
 
 use super::*;
 use fln_core::expr::BinderInfo;
@@ -35,6 +38,25 @@ struct DataConstructor {
     name: Name,
     mono_type: Expr,
     fields: Vec<IrType>,
+}
+
+#[derive(Clone, Copy)]
+enum DataProfile<'a> {
+    Runtime,
+    Computed {
+        logical: &'a Name,
+        carrier: Option<&'a IrType>,
+    },
+}
+
+fn scalar_size(ty: &IrType) -> Option<u64> {
+    match ty {
+        IrType::UInt8 => Some(1),
+        IrType::UInt16 => Some(2),
+        IrType::UInt32 => Some(4),
+        IrType::UInt64 => Some(8),
+        _ => None,
+    }
 }
 
 fn without_metadata<'a, E>(
@@ -75,6 +97,11 @@ fn runtime_special_family(name: &Name) -> bool {
 }
 
 impl CompilerData {
+    /// The declaration owning these compiler caches.
+    pub fn name(&self) -> &Name {
+        &self.name
+    }
+
     /// Whether constructors contain direct occurrences of their own family.
     pub fn is_recursive(&self) -> bool {
         self.recursive
@@ -121,10 +148,78 @@ impl CompilerData {
         mut find: impl FnMut(&Name) -> Option<&'a ConstantInfo>,
         mut charge: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Option<Self>, E> {
+        Self::project(inductive, &mut find, &mut charge, DataProfile::Runtime)
+    }
+
+    /// Project compiler metadata for a checked computed-field family or its
+    /// generated implementation. The caller must separately validate the
+    /// complete computed-field declaration and attribute inventory before
+    /// publishing an artifact. This method proves only the constructor layout.
+    ///
+    /// A computed implementation retains its original logical field types.
+    /// Resolve those fields through the complete logical family's carrier;
+    /// never infer a heap layout from the `_impl` spelling alone. Wider unsigned
+    /// fields are supported here without authorizing their use by native FIR.
+    pub fn from_computed_inductive<'a, E>(
+        inductive: &InductiveVal,
+        logical: &InductiveVal,
+        mut find: impl FnMut(&Name) -> Option<&'a ConstantInfo>,
+        mut charge: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<Option<Self>, E> {
+        charge(1)?;
+        if logical.ctors.len() < 2 {
+            return Ok(None);
+        }
+        let Some(logical_data) = Self::project(
+            logical,
+            &mut find,
+            &mut charge,
+            DataProfile::Computed {
+                logical: &logical.base.name,
+                carrier: None,
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        if inductive.base.name == logical.base.name {
+            return Ok((inductive == logical).then_some(logical_data));
+        }
+        if inductive.base.name != Name::str(logical.base.name.clone(), "_impl")
+            || inductive.is_rec
+            || inductive.ctors.len() != logical.ctors.len()
+        {
+            return Ok(None);
+        }
+        for (implementation, original) in inductive.ctors.iter().zip(&logical.ctors) {
+            charge(1)?;
+            if implementation != &Name::str(original.clone(), "_impl") {
+                return Ok(None);
+            }
+        }
+        Self::project(
+            inductive,
+            &mut find,
+            &mut charge,
+            DataProfile::Computed {
+                logical: &logical.base.name,
+                carrier: Some(&logical_data.carrier),
+            },
+        )
+    }
+
+    fn project<'a, E>(
+        inductive: &InductiveVal,
+        find: &mut impl FnMut(&Name) -> Option<&'a ConstantInfo>,
+        charge: &mut impl FnMut(usize) -> Result<(), E>,
+        profile: DataProfile<'_>,
+    ) -> Result<Option<Self>, E> {
         charge(1)?;
         let name = &inductive.base.name;
+        let computed_name = matches!(profile, DataProfile::Computed { logical, .. }
+            if name == logical && name == &Name::from_components(["Lean", "Name"]));
         if name.is_anonymous()
-            || runtime_special_family(name)
+            || (runtime_special_family(name) && !computed_name)
             || !inductive.base.level_params.is_empty()
             || inductive.num_params != 0
             || inductive.num_indices != 0
@@ -133,7 +228,7 @@ impl CompilerData {
             || inductive.all.as_slice() != std::slice::from_ref(name)
             || inductive.ctors.is_empty()
             || inductive.ctors.len() > usize::from(fln_rt::abi::TAG_MAX_CTOR_TAG) + 1
-            || !matches!(without_metadata(&inductive.base.type_, &mut charge)?.node(),
+            || !matches!(without_metadata(&inductive.base.type_, charge)?.node(),
                 ExprNode::Sort { level } if level == &Level::one())
         {
             return Ok(None);
@@ -167,7 +262,7 @@ impl CompilerData {
             let mut ty = &ctor.base.type_;
             loop {
                 charge(1)?;
-                ty = without_metadata(ty, &mut charge)?;
+                ty = without_metadata(ty, charge)?;
                 let ExprNode::ForallE {
                     binder_name,
                     binder_type,
@@ -207,6 +302,30 @@ impl CompilerData {
                         if levels.is_empty() && name == &Name::from_components(["Bool"]) =>
                     {
                         IrType::UInt8
+                    }
+                    ExprNode::Const {
+                        name: field_name,
+                        levels,
+                    } if levels.is_empty() && matches!(profile, DataProfile::Computed { .. }) => {
+                        match field_name {
+                            name if name == &Name::from_components(["UInt8"]) => IrType::UInt8,
+                            name if name == &Name::from_components(["UInt16"]) => IrType::UInt16,
+                            name if name == &Name::from_components(["UInt32"]) => IrType::UInt32,
+                            name if name == &Name::from_components(["UInt64"]) => IrType::UInt64,
+                            name => {
+                                let DataProfile::Computed {
+                                    logical,
+                                    carrier: Some(carrier),
+                                } = profile
+                                else {
+                                    return Ok(None);
+                                };
+                                if name != logical {
+                                    return Ok(None);
+                                }
+                                carrier.clone()
+                            }
+                        }
                     }
                     _ => return Ok(None),
                 };
@@ -372,6 +491,19 @@ impl Encoder {
                 let mut fields = Vec::with_capacity(ctor.fields.len());
                 let mut objects = 0_u64;
                 let mut scalar_bytes = 0_u64;
+                let mut scalar_offsets = [0_u64; 4];
+                // ToImpureType groups scalars by decreasing width, preserving
+                // source order within each width. Object indices are assigned
+                // independently; offsets within the scalar area start at zero.
+                for width in [8_u64, 4, 2, 1] {
+                    scalar_offsets[width.trailing_zeros() as usize] = scalar_bytes;
+                    scalar_bytes += width
+                        * ctor
+                            .fields
+                            .iter()
+                            .filter(|ty| scalar_size(ty) == Some(width))
+                            .count() as u64;
+                }
                 for ty in &ctor.fields {
                     let field = match ty {
                         IrType::Object | IrType::TObject => {
@@ -383,15 +515,18 @@ impl Encoder {
                             objects += 1;
                             self.ctor(ir::LCNF_CTOR_FIELD_OBJECT, slots, &[])?
                         }
-                        IrType::UInt8 => {
+                        IrType::UInt8 | IrType::UInt16 | IrType::UInt32 | IrType::UInt64 => {
+                            let width = scalar_size(ty).ok_or(WriteError::Contract {
+                                what: "unsupported checked scalar width",
+                            })?;
+                            let offset = &mut scalar_offsets[width.trailing_zeros() as usize];
                             let mut slots = (0..ir::LCNF_CTOR_FIELD_SCALAR_POINTERS)
                                 .map(|_| Obj::mk_nat(0))
                                 .collect::<Vec<_>>();
-                            slots[ir::LCNF_CTOR_FIELD_SCALAR_SZ] = Obj::mk_nat(1);
-                            slots[ir::LCNF_CTOR_FIELD_SCALAR_OFFSET] =
-                                self.nat_u64(scalar_bytes)?;
+                            slots[ir::LCNF_CTOR_FIELD_SCALAR_SZ] = self.nat_u64(width)?;
+                            slots[ir::LCNF_CTOR_FIELD_SCALAR_OFFSET] = self.nat_u64(*offset)?;
                             slots[ir::LCNF_CTOR_FIELD_SCALAR_TYPE] = self.compiler_type(ty)?;
-                            scalar_bytes += 1;
+                            *offset += width;
                             self.ctor(ir::LCNF_CTOR_FIELD_SCALAR, slots, &[])?
                         }
                         _ => {

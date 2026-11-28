@@ -18,9 +18,9 @@ use std::collections::BTreeSet;
 
 pub use format::{
     ALIAS_EXTENSION, APP_UNEXPANDER_EXTENSION, AUX_RECURSOR_EXTENSION, BACKWARD_DEFEQ_EXTENSION,
-    CLASS_EXTENSION, COE_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION, DEPRECATED_EXTENSION,
-    ELAB_AS_ELIM_EXTENSION, EXTERN_EXTENSION, GRIND_DONT_CARE, GRIND_EXTENSION,
-    GRIND_GROUND_PATTERN_ANNOTATION, IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION,
+    CLASS_EXTENSION, COE_EXTENSION, COMPUTED_FIELD_EXTENSION, DEFAULT_EXTENSION, DEFEQ_EXTENSION,
+    DEPRECATED_EXTENSION, ELAB_AS_ELIM_EXTENSION, EXTERN_EXTENSION, GRIND_DONT_CARE,
+    GRIND_EXTENSION, GRIND_GROUND_PATTERN_ANNOTATION, IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION,
     INSTANCE_EXTENSION, MATCH_PATTERN_EXTENSION, NEVER_EXTRACT_EXTENSION, NONCOMPUTABLE_EXTENSION,
     PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION, PROTECTED_EXTENSION,
     REDUCIBILITY_EXTENSION, REDUCIBILITY_EXTRA_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
@@ -242,6 +242,8 @@ pub struct SourceExtensions {
     pub unbox: Vec<Name>,
     /// Owning-module tags preventing closed-call extraction and CSE.
     pub never_extract: Vec<Name>,
+    /// Owning-module computed-field tags, awaiting checked definition validation.
+    pub computed_fields: Vec<Name>,
     /// Definitions marked for pattern expansion, still awaiting checked ownership
     /// and visible-body validation before a source consumer can unfold them.
     pub match_patterns: Vec<Name>,
@@ -796,6 +798,7 @@ fn decode_batch(
         name(format::COE_EXTENSION),
         name(format::GRIND_EXTENSION),
         name(format::NEVER_EXTRACT_EXTENSION),
+        name(format::COMPUTED_FIELD_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -809,6 +812,7 @@ fn decode_batch(
     let mut noncomputable = BTreeSet::new();
     let mut unbox = BTreeSet::new();
     let mut never_extract = BTreeSet::new();
+    let mut computed_fields = BTreeSet::new();
     let mut match_patterns = BTreeSet::new();
     let mut defeq = BTreeSet::new();
     let mut backward_defeq = BTreeSet::new();
@@ -1005,7 +1009,14 @@ fn decode_batch(
                     }
                     out.never_extract.push(declaration);
                 }
-                _ => unreachable!("thirty-one selected extension families"),
+                31 => {
+                    let declaration = reader.name(&obj)?;
+                    if declaration.is_anonymous() || !computed_fields.insert(declaration.clone()) {
+                        return Err(shape("anonymous or repeated computed-field declaration"));
+                    }
+                    out.computed_fields.push(declaration);
+                }
+                _ => unreachable!("thirty-two selected extension families"),
             }
         }
         if grind_deferred {

@@ -36,6 +36,8 @@ pub(super) fn supports_artifact_extension(descriptor: &ExtensionDescriptor) -> b
         || fln_elab::noncomputable::supports(descriptor)
         || fln_elab::unbox::supports(descriptor)
         || fln_elab::never_extract::supports(descriptor)
+        || fln_elab::computed_fields::supports(descriptor)
+        || fln_elab::computed_fields::tags::supports(descriptor)
         || fln_elab::match_pattern::supports(descriptor)
         || fln_elab::symm::supports(descriptor)
         || fln_elab::grind_patterns::supports(descriptor)

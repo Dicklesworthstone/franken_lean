@@ -599,31 +599,38 @@ impl<'a> PublicWorld<'a> {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         }
-        // The private successor already contains its checked theorem, including
-        // a proof-valued instance. Replay only metadata, never the same-name
-        // public axiom over that checked implementation. Both worlds retain identical
-        // instance priorities and reducibility without exposing a private body.
-        let metadata = replay::Export::capture(
-            &self.module,
-            equations.public.environment(),
-            staged.public.engine.environment(),
-            Vec::new(),
-            self.meter,
-        )
-        .map_err(execution_error)?;
-        let engine = match metadata
-            .replay(
-                checked.engine.clone(),
+        let engine = if staged.metadata_complete {
+            // Computed families validate and register their complete metadata
+            // separately in both worlds. Replaying that suffix would duplicate
+            // noncomputable/auxiliary tags. Both successors already descend from
+            // the staged equation predecessors above.
+            checked.engine.clone()
+        } else {
+            // The private successor already contains its checked body. Replay
+            // only metadata, never its same-name public axiom, so ordinary
+            // hidden bodies retain public priorities and reducibility.
+            let metadata = replay::Export::capture(
                 &self.module,
-                options,
+                equations.public.environment(),
+                staged.public.engine.environment(),
+                Vec::new(),
                 self.meter,
-                self.cancellation,
             )
-            .map_err(execution_error)?
-        {
-            Outcome::Complete(engine) => engine,
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            .map_err(execution_error)?;
+            match metadata
+                .replay(
+                    checked.engine.clone(),
+                    &self.module,
+                    options,
+                    self.meter,
+                    self.cancellation,
+                )
+                .map_err(execution_error)?
+            {
+                Outcome::Complete(engine) => engine,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
         };
         if self
             .cancellation
