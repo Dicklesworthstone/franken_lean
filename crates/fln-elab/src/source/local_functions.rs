@@ -652,7 +652,7 @@ impl Context {
         }
         value = self.close_recursive_lambdas(&build.lambdas, value)?;
         if let Some(written) = &build.written_result_type {
-            value.type_ = self.instantiate(written)?;
+            value.type_ = self.local_function_header_type(written, &value.type_)?;
         }
         // Header parameters close here rather than through finish_telescope.
         // Goals solved by the continuation must keep their local dictionaries
@@ -700,6 +700,95 @@ impl Context {
         // An explicit result remains in the let-bound function's full type.
         // K1 therefore checks it even when the enclosing body never calls f.
         Ok(value)
+    }
+
+    /// Closing the actual lambdas supplies a function telescope even while a
+    /// header hole's universe constraints await the continuation's arguments.
+    /// Keep the written prefix's names, domains and implicitness, but expose a
+    /// known inferred Pi at an assignable type-hole tail. The original header
+    /// equations from `finish_telescope` remain obligations; this inspection
+    /// makes no assignments and cannot disclose an opaque local type.
+    fn local_function_header_type(
+        &mut self,
+        written: &Expr,
+        inferred: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let written = self.instantiate(written)?;
+        let saved = self.txn.lctx.clone();
+        let result = (|| {
+            let mut declared = written.clone();
+            let mut inferred = inferred.clone();
+            let mut prefix = Vec::new();
+            loop {
+                self.tick()?;
+                let actual = self.whnf(&inferred)?;
+                let ExprNode::ForallE {
+                    body: actual_body, ..
+                } = actual.node()
+                else {
+                    return Ok(written.clone());
+                };
+                let formal = self.whnf(&declared)?;
+                if let ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } = formal.node()
+                {
+                    // Open both telescopes at the same fresh local. Reduction
+                    // must never inspect their dependent bodies as loose terms.
+                    let id = FVarId(self.fresh_name()?);
+                    self.txn.lctx.add_param(
+                        id.clone(),
+                        binder_name.clone(),
+                        binder_type.clone(),
+                        *binder_info,
+                    );
+                    prefix.push((
+                        id.clone(),
+                        binder_name.clone(),
+                        binder_type.clone(),
+                        *binder_info,
+                    ));
+                    let local = Expr::fvar(id);
+                    declared = self.substitute(body, &local)?;
+                    inferred = self.substitute(actual_body, &local)?;
+                    continue;
+                }
+                let mut head = &formal;
+                while let ExprNode::App { f, .. } = head.node() {
+                    self.tick()?;
+                    head = f;
+                }
+                let ExprNode::MVar { id } = head.node() else {
+                    return Ok(written.clone());
+                };
+                if !self.txn.mvars.assignment_permitted(id)
+                    || self.txn.mvars.is_assigned(id)
+                    || !self.txn.mvars.get_decl(id).is_some_and(|declaration| {
+                        declaration.kind == MetavarKind::Natural && declaration.delayed.is_none()
+                    })
+                {
+                    return Ok(written.clone());
+                }
+                let mut type_ = actual;
+                for (id, name, domain, style) in prefix.into_iter().rev() {
+                    self.tick()?;
+                    type_ = Expr::forall_e(
+                        name,
+                        domain,
+                        type_
+                            .abstract_fvar(&id, 0)
+                            .map_err(|_| failure(SourceInferenceError::Scope))?,
+                        style,
+                    );
+                }
+                return Ok(type_);
+            }
+        })();
+        self.txn.lctx = saved;
+        result
     }
 }
 

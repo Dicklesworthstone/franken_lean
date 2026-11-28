@@ -739,6 +739,77 @@ theorem computed : (collect (Chain.cons 2 (Chain.cons 3 Chain.nil))).count = 5 :
 }
 
 #[test]
+fn inferred_equation_local_recursion_preserves_polymorphic_record_accumulators() {
+    // List in the original Prelude is universe polymorphic. A fixed Type
+    // family does not expose the delayed application failure at toByteArray.
+    for annotation in ["", " : _", " : Chain Nat -> _"] {
+        execute(
+            &format!(
+                r#"
+universe u
+inductive Chain (A : Type u) where
+  | nil : Chain A
+  | cons (head : A) (tail : Chain A) : Chain A
+structure Buffer where
+  count : Nat
+def Buffer.push (r : Buffer) (n : Nat) : Buffer := ⟨r.count + n⟩
+def collect (xs : Chain Nat) : Buffer :=
+  let rec loop{annotation}
+    | Chain.nil, r => r
+    | Chain.cons n tail, r => loop tail (r.push n)
+  loop xs ⟨0⟩
+theorem computed : (collect (Chain.cons 2 (Chain.cons 3 Chain.nil))).count = 5 := by rfl
+#eval (collect (Chain.cons 2 (Chain.cons 3 Chain.nil))).count
+"#
+            ),
+            "5",
+        );
+    }
+}
+
+#[test]
+fn inferred_recursive_headers_preserve_dependent_names_and_opaque_tails() {
+    execute(
+        r#"
+universe u
+inductive Chain (A : Type u) where
+  | nil : Chain A
+  | cons (head : A) (tail : Chain A) : Chain A
+structure Buffer where
+  count : Nat
+def Buffer.push {A : Type u} (r : Buffer) (n : A) : Buffer := ⟨Nat.succ r.count⟩
+def collect {A : Type u} (bs : Chain A) : Buffer :=
+  let rec loop : (A : Type u) → (xs : Chain A) → _ := fun B items r =>
+    match items with
+    | Chain.nil => r
+    | Chain.cons b tail => loop B tail (r.push b)
+  loop (xs := bs) A ⟨0⟩
+theorem computed : (collect (Chain.cons 2 (Chain.cons 3 Chain.nil))).count = 2 := by rfl
+#eval (collect (Chain.cons 2 (Chain.cons 3 Chain.nil))).count
+"#,
+        "2",
+    );
+    let base = engine();
+    let before = base.logical_root(&KVMap::new());
+    let source = r#"
+def bad : Nat :=
+  let rec hidden : Type := Nat → Nat
+  let rec get : Nat → hidden := fun n r => r
+  get 0 1
+"#;
+    let problem = base
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err("an opaque local type is not an assignable header hole");
+    assert_eq!(problem.disposition(), ("elaboration", false, 1));
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+    assert!(!base.environment().contains(&Name::from_components(["bad"])));
+}
+
+#[test]
 fn inferred_equation_local_recursion_preserves_nat_accumulators() {
     execute(
         r#"
