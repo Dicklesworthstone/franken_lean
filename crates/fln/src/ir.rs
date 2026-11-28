@@ -2071,6 +2071,117 @@ impl SourceUses<'_, '_> {
         Ok(Some([left, right]))
     }
 
+    /// A checked case that selects a constructor field necessarily retains its
+    /// dynamic major. Follow that dependency through an unknown callback too,
+    /// while leaving constant-arm and known-constructor specialization outside
+    /// this profile. Motives are erased; actual minor captures remain relevant.
+    fn projection_case(
+        &mut self,
+        head: &fln_core::expr::Expr,
+        arguments: &[&fln_core::expr::Expr],
+        locals: &mut Vec<SourceUseBinding>,
+        depth: usize,
+    ) -> Result<Option<SourceUse>> {
+        use fln_core::expr::ExprNode;
+        use fln_env::constants::ConstantInfo;
+
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Rec(recursor)) = self.environment.find(name) else {
+            return Ok(None);
+        };
+        let [family] = recursor.all.as_slice() else {
+            return Ok(None);
+        };
+        if recursor.is_unsafe
+            || recursor.num_params != 0
+            || recursor.num_indices != 0
+            || recursor.num_motives != 1
+            || levels.len() != recursor.base.level_params.len()
+            || arguments.len() != recursor.num_minors as usize + 2
+        {
+            return Ok(None);
+        }
+        let Some(layout) = source_data_layout(family, self.environment, self.meter)? else {
+            return Ok(None);
+        };
+        if layout.constructors().len() != recursor.num_minors as usize
+            || recursor.rules.len() != recursor.num_minors as usize
+        {
+            return Ok(None);
+        }
+        // The spine is reversed: major, last minor, ..., first minor, motive.
+        // A parameter-headed application cannot expose a known constructor to
+        // the pin's simplifier. A let alias or an explicit constructor can.
+        let major = arguments[0];
+        let mut major_head = source_without_metadata(major, self.meter)?;
+        while let ExprNode::App { f, .. } = major_head.node() {
+            self.meter.charge(1)?;
+            major_head = source_without_metadata(f, self.meter)?;
+        }
+        let ExprNode::BVar { idx } = major_head.node() else {
+            return Ok(None);
+        };
+        let index = locals
+            .len()
+            .checked_sub(*idx as usize + 1)
+            .ok_or_else(|| unsupported("open source case"))?;
+        if !locals[index].parameter {
+            return Ok(None);
+        }
+        let mut projects_field = false;
+        for (index, (constructor, fields)) in layout.constructors().enumerate() {
+            self.meter.charge(1)?;
+            let rule = &recursor.rules[index];
+            if &rule.ctor != constructor || rule.nfields as usize != fields.len() {
+                return Ok(None);
+            }
+            let mut body = arguments[recursor.num_minors as usize - index];
+            let mut binders = 0;
+            loop {
+                body = source_without_metadata(body, self.meter)?;
+                let ExprNode::Lam { body: next, .. } = body.node() else {
+                    break;
+                };
+                self.meter.charge(1)?;
+                binders += 1;
+                body = next;
+            }
+            if binders < fields.len() {
+                return Ok(None);
+            }
+            if let ExprNode::BVar { idx } = body.node() {
+                if (*idx as usize) < binders {
+                    // Constructor fields precede the induction hypotheses in
+                    // the checked minor telescope. An IH is not a projection.
+                    let field = binders - *idx as usize - 1;
+                    if field >= fields.len() {
+                        return Ok(None);
+                    }
+                    projects_field = true;
+                }
+            } else if body.has_loose_bvars() {
+                return Ok(None);
+            }
+        }
+        if !projects_field {
+            return Ok(None);
+        }
+        self.metadata()?;
+        if self.externs.as_ref().unwrap().get(name).is_some()
+            || self.replacements.as_ref().unwrap().get(name).is_some()
+        {
+            return Err(unsupported("source case replacement"));
+        }
+        let mut used = self.value(major, locals, depth + 1)?;
+        for minor in &arguments[1..arguments.len() - 1] {
+            let capture = self.value(minor, locals, depth + 1)?;
+            self.merge(&mut used, &capture)?;
+        }
+        Ok(Some(used))
+    }
+
     fn value(
         &mut self,
         expression: &fln_core::expr::Expr,
@@ -2123,6 +2234,9 @@ impl SourceUses<'_, '_> {
                         .map_err(|_| CompileError::Allocation)?;
                     arguments.push(a);
                     head = source_without_metadata(f, self.meter)?;
+                }
+                if let Some(used) = self.projection_case(head, &arguments, locals, depth)? {
+                    return Ok(used);
                 }
                 if let ExprNode::Const { name, levels } = head.node()
                     && levels.is_empty()

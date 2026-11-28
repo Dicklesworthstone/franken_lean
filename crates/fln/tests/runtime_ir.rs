@@ -743,7 +743,7 @@ fn recursive_export_cases() -> Vec<BoxedExportCase> {
         },
         BoxedExportCase {
             ty: "IRRecursive -> Nat",
-            body: "fun p => IRRecursive.rec (motive := fun _ => Nat) 0 (fun n _ total => n + total) p",
+            body: "fun p => let rec total (xs : IRRecursive) : Nat := match xs with | .empty => 0 | .next n tail => n + total tail; total p",
             application: "let p := IRRecursive.next large (.next 2 (.next 3 .empty)); (compiled .empty, compiled p, (match p with | .next n _ => n | _ => 0))",
             expected: "(0, 184467440737095516165, 184467440737095516160)",
             parameters: vec![IrType::TObject],
@@ -783,6 +783,27 @@ fn recursive_export_cases() -> Vec<BoxedExportCase> {
             application: "let p := IRRecursiveTree.leaf large heap; (compiled (fun t => .node t true t) p, (match p with | .leaf n s => (n, s) | _ => (0, \"wrong\")))",
             expected: "(true, 184467440737095516160, \"boxed heap payload\")",
             parameters: vec![IrType::Object, IrType::Object],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Nat -> (IRRecursiveTree -> IRRecursiveTree) -> IRRecursiveTree -> Bool",
+            body: "fun _ f p => match f p with | .node _ b _ => b | .leaf _ _ => false",
+            application: "let p := IRRecursiveTree.leaf large heap; (compiled 99 (fun t => .node t true t) p, (match p with | .leaf n s => (n, s) | _ => (0, \"wrong\")))",
+            expected: "(true, 184467440737095516160, \"boxed heap payload\")",
+            parameters: vec![IrType::TObject, IrType::Object, IrType::Object],
+            result: IrType::UInt8,
+            reduced: Some((
+                "(IRRecursiveTree -> IRRecursiveTree) -> IRRecursiveTree -> Bool",
+                "let p := IRRecursiveTree.leaf large heap; (compiled (fun t => .node t true t) p, (match p with | .leaf n s => (n, s) | _ => (0, \"wrong\")))",
+            )),
+        },
+        BoxedExportCase {
+            ty: "Bool -> (IRRecursiveTree -> IRRecursiveTree) -> IRRecursiveTree -> Bool",
+            body: "fun fallback f p => match f p with | .node _ b _ => b | .leaf _ _ => fallback",
+            application: "let p := IRRecursiveTree.leaf large heap; (compiled true (fun t => t) p, compiled false (fun t => t) p, compiled false (fun t => .node t true t) p, (match p with | .leaf n s => (n, s) | _ => (0, \"wrong\")))",
+            expected: "(true, false, true, 184467440737095516160, \"boxed heap payload\")",
+            parameters: vec![IrType::UInt8, IrType::Object, IrType::Object],
             result: IrType::UInt8,
             reduced: None,
         },
@@ -1339,11 +1360,11 @@ fn assert_definition_admission(
     compiled: &ir::DefinitionCompilation,
     options: &KVMap,
 ) {
-    // Source checking also records equation information for matches. The IR
-    // API receives only the Declaration, so its receipt must instead equal an
+    // Source checking also records equations and local-recursion auxiliaries.
+    // The IR API receives only the Declaration, so its receipt must equal an
     // independent admission of that exact declaration. Keep the full source
-    // snapshot as the execution oracle, and compare every logical declaration
-    // in both directions before checking the separate admission roots.
+    // snapshot as the execution oracle; compare the complete independent and
+    // compiler admission environments in both directions.
     let fln::Declaration::Defn(definition) = &compiled.admission.declaration else {
         panic!("compiled source definition")
     };
@@ -1355,21 +1376,6 @@ fn assert_definition_admission(
         definition, source,
         "compiler must admit the unchanged source body"
     );
-    let admitted = compiled.admission.engine.environment();
-    for (name, value) in checked.environment().constants() {
-        assert_eq!(
-            admitted.find(name),
-            Some(value),
-            "source declaration {name:?}"
-        );
-    }
-    for (name, value) in admitted.constants() {
-        assert_eq!(
-            checked.environment().find(name),
-            Some(value),
-            "unexpected compiler declaration {name:?}",
-        );
-    }
     let original = base.logical_root(options);
     let expected = base
         .admit_declaration(
@@ -1380,6 +1386,21 @@ fn assert_definition_admission(
         .unwrap()
         .into_complete()
         .unwrap();
+    let admitted = compiled.admission.engine.environment();
+    for (name, value) in expected.engine.environment().constants() {
+        assert_eq!(
+            admitted.find(name),
+            Some(value),
+            "independently admitted declaration {name:?}"
+        );
+    }
+    for (name, value) in admitted.constants() {
+        assert_eq!(
+            expected.engine.environment().find(name),
+            Some(value),
+            "unexpected compiler declaration {name:?}",
+        );
+    }
     assert_eq!(compiled.admission.base_logical_root, original);
     assert_eq!(compiled.admission.admissions.len(), 1);
     assert_eq!(
@@ -1759,6 +1780,14 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
         (
             "def compiled (_ : IRRecursiveLoop) (n : Nat) : Nat := n",
             "unused recursive source parameter",
+        ),
+        (
+            "def compiled (f : IRRecursiveTree -> IRRecursiveTree) (p : IRRecursiveTree) : Bool := match f p with | .node _ _ _ => false | .leaf _ _ => false",
+            "specializable source call",
+        ),
+        (
+            "def compiled (p : IRRecursiveTree) (_ : Nat) : Bool := match IRRecursiveTree.node p true p with | .node _ b _ => b | .leaf _ _ => false",
+            "specializable source call",
         ),
         (
             "def compiled (x : IRBoxedParam Nat) : IRBoxedParam Nat := x",
@@ -3083,6 +3112,15 @@ fn consume_boxed_ir(
 
 #[test]
 fn the_pin_executes_boxed_data_exports_and_observes_payloads() {
+    check_pin_boxed_data_exports(boxed_export_cases());
+}
+
+#[test]
+fn the_pin_executes_recursive_data_exports_and_observes_payloads() {
+    check_pin_boxed_data_exports(recursive_export_cases());
+}
+
+fn check_pin_boxed_data_exports(cases: Vec<BoxedExportCase>) {
     let Some(lean) = reference() else {
         assert!(
             std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
@@ -3106,11 +3144,7 @@ fn the_pin_executes_boxed_data_exports_and_observes_payloads() {
     let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    for (index, case) in boxed_export_cases()
-        .into_iter()
-        .chain(recursive_export_cases())
-        .enumerate()
-    {
+    for (index, case) in cases.into_iter().enumerate() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3172,7 +3206,7 @@ fn the_pin_executes_boxed_data_exports_and_observes_payloads() {
                 );
             }
         }
-        if index == 0 {
+        if index == 0 && case.ty == "IRBoxedRecord" {
             let mut mutant = compiled.module.clone();
             let IrDecl::Function { body, .. } = mutant
                 .decls
@@ -3224,6 +3258,42 @@ fn the_pin_executes_boxed_data_exports_and_observes_payloads() {
                 &dir,
                 "changed-payload",
                 "(99, \"changed payload\")\n(99, \"changed payload\")",
+            );
+        }
+        if case.ty == "IRRecursive" {
+            // Keep the logical declaration fixed and change only its native
+            // executable body. The recursive consumer must observe the empty
+            // constructor instead of reconstructing the source-level chain.
+            let mut mutant = compiled.module.clone();
+            let IrDecl::Function { body, .. } = mutant
+                .decls
+                .iter_mut()
+                .find(|declaration| declaration.name() == &name("compiled"))
+                .unwrap()
+            else {
+                panic!("recursive source entry")
+            };
+            *body = IrBody {
+                stmts: vec![IrStmt::VDecl {
+                    x: 1,
+                    ty: IrType::TObject,
+                    expr: IrExpr::Lit(IrLit::Num(IrNat::Small(0))),
+                }],
+                terminal: Box::new(IrTerminal::Ret(IrArg::Var(1))),
+            };
+            std::fs::write(dir.join("NativeIrCase.ir"), encode(&mutant, &original)).unwrap();
+            assert_probe(
+                consume_boxed_ir(
+                    &lean,
+                    &dir,
+                    "changed-recursive-tag",
+                    case.ty,
+                    case.application,
+                    "compiled",
+                ),
+                &dir,
+                "changed-recursive-tag",
+                "0\n0",
             );
         }
         if case.ty == "IRScalarBox" {
