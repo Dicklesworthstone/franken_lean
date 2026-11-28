@@ -461,7 +461,11 @@ fn elaborated_numerals_and_successors_have_literal_keys_with_exact_budgeting() {
         ("zero", c("Nat.zero"), NatLit::from_u64(0)),
         ("literal", literal(7), NatLit::from_u64(7)),
         ("elaborated", numeral.clone(), NatLit::from_u64(7)),
-        ("successor", app("Nat.succ", numeral), NatLit::from_u64(8)),
+        (
+            "successor",
+            app("Nat.succ", numeral.clone()),
+            NatLit::from_u64(8),
+        ),
         (
             "wide",
             app("Nat.succ", literal(u64::MAX)),
@@ -481,6 +485,12 @@ fn elaborated_numerals_and_successors_have_literal_keys_with_exact_budgeting() {
                 discr_tree::Key::Lit(Literal::Nat(expected))
             ]
         );
+        assert_eq!(
+            registry.captured_instance_index(&n(name)),
+            Some(Some(&index)),
+            "captured numeral {name}; OfNat.ofNat status: {:?}",
+            crate::reducibility::known_status(&env, &n("OfNat.ofNat")).unwrap()
+        );
         let work = 100_000 - remaining;
         let mut exact = work;
         assert_eq!(
@@ -493,6 +503,57 @@ fn elaborated_numerals_and_successors_have_literal_keys_with_exact_budgeting() {
             Err(InstanceRegistryError::Limit)
         );
     }
+
+    // The literal can become visible only after reducing an alias. A single
+    // check before normalization, followed by the old head reducer, still
+    // loses this row at the unrecorded OfNat.ofNat projection.
+    let alias = n("aliasSeven");
+    let env = env
+        .add_decl(ConstantInfo::Defn(fln_env::constants::DefinitionVal {
+            base: ConstantVal {
+                name: alias.clone(),
+                level_params: vec![],
+                type_: c("Nat"),
+            },
+            value: Expr::let_e(Name::anonymous(), c("Nat"), numeral, b(0), true),
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![alias.clone()],
+        }))
+        .unwrap();
+    let env =
+        crate::reducibility::register(&env, &alias, crate::reducibility::Reducibility::Reducible)
+            .unwrap();
+    let registered = register(&env, "aliased", app("At", c("aliasSeven")));
+    let registry = InstanceRegistry::read(&registered).unwrap();
+    let expected = DerivedIndex {
+        keys: vec![
+            discr_tree::Key::Const(n("At"), 1),
+            discr_tree::Key::Lit(Literal::Nat(NatLit::from_u64(7))),
+        ],
+        synth_order: vec![],
+    };
+    assert_eq!(
+        registry.captured_instance_index(&n("aliased")),
+        Some(Some(&expected))
+    );
+    let mut remaining = 100_000;
+    assert_eq!(
+        derive_registration_index(&registered, &registry, &n("aliased"), &mut remaining).unwrap(),
+        Some(expected.clone())
+    );
+    let work = 100_000 - remaining;
+    let mut exact = work;
+    assert_eq!(
+        derive_registration_index(&registered, &registry, &n("aliased"), &mut exact).unwrap(),
+        Some(expected)
+    );
+    assert_eq!(exact, 0);
+    assert_eq!(
+        derive_registration_index(&registered, &registry, &n("aliased"), &mut (work - 1)),
+        Err(InstanceRegistryError::Limit)
+    );
+    assert_eq!(derive(&registered, "aliased"), None);
 }
 
 #[test]
@@ -1071,6 +1132,165 @@ fn registration_delta_beta_instantiates_levels_and_keeps_exact_fuel_limits() {
         app("Pick", Expr::app(c("AppliedAlias"), c("Nat"))),
     );
     assert_eq!(registration_model(&malformed, "wrongLevels"), None);
+    assert_eq!(env.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn borrowed_registration_types_and_aliases_preserve_exact_paths_and_work_limits() {
+    use fln_env::constants::DefinitionVal;
+    let borrowed = |expr| {
+        Expr::mdata(
+            KVMap::from_entries(vec![(n("borrowed"), DataValue::OfBool(true))]),
+            expr,
+        )
+    };
+    let env = axiom(&Environment::new(), "Nat", ty());
+    let env = class(&env, "Rel", pi("A", ty(), ty(), BinderInfo::Default));
+    let env = class(
+        &env,
+        "Decision",
+        pi("p", Expr::sort(Level::zero()), ty(), BinderInfo::Default),
+    );
+    let env = axiom(
+        &env,
+        "Rel.rel",
+        pi(
+            "A",
+            ty(),
+            pi(
+                "dictionary",
+                app("Rel", b(0)),
+                pi(
+                    "n",
+                    b(1),
+                    pi("m", b(2), Expr::sort(Level::zero()), BinderInfo::Default),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::InstImplicit,
+            ),
+            BinderInfo::Implicit,
+        ),
+    );
+    let env = axiom(&env, "relation", app("Rel", c("Nat")));
+    let env = env
+        .add_decl(ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: n("BorrowedNat"),
+                level_params: vec![],
+                type_: ty(),
+            },
+            value: borrowed(c("Nat")),
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![n("BorrowedNat")],
+        }))
+        .unwrap();
+    let env = crate::reducibility::register(
+        &env,
+        &n("BorrowedNat"),
+        crate::reducibility::Reducibility::Reducible,
+    )
+    .unwrap();
+    let domain = borrowed(c("BorrowedNat"));
+    let predicate = [domain.clone(), c("relation"), b(1), b(0)]
+        .into_iter()
+        .fold(c("Rel.rel"), Expr::app);
+    let type_ = borrowed(pi(
+        "n",
+        domain.clone(),
+        pi("m", domain, app("Decision", predicate), BinderInfo::Default),
+        BinderInfo::Default,
+    ));
+    let root = env.logical_root(&KVMap::new());
+    let registered = register(&env, "borrowedDecision", type_.clone());
+    let registry = InstanceRegistry::read(&registered).unwrap();
+    let mut remaining = 1_000_000;
+    let model = derive_registration_index(
+        &registered,
+        &registry,
+        &n("borrowedDecision"),
+        &mut remaining,
+    )
+    .unwrap()
+    .unwrap();
+    // The pin's Nat.decLe/Nat.decLt shape: the type argument remains
+    // concrete, the dictionary and both telescope variables are wildcards.
+    assert_eq!(
+        model.keys,
+        [
+            discr_tree::Key::Const(n("Decision"), 1),
+            discr_tree::Key::Const(n("Rel.rel"), 4),
+            discr_tree::Key::Const(n("Nat"), 0),
+            discr_tree::Key::Star,
+            discr_tree::Key::Star,
+            discr_tree::Key::Star,
+        ]
+    );
+    assert!(model.synth_order.is_empty());
+    let work = 1_000_000 - remaining;
+    let mut exact = work;
+    assert_eq!(
+        derive_registration_index(&registered, &registry, &n("borrowedDecision"), &mut exact)
+            .unwrap(),
+        Some(model.clone())
+    );
+    assert_eq!(exact, 0);
+    assert_eq!(
+        derive_registration_index(
+            &registered,
+            &registry,
+            &n("borrowedDecision"),
+            &mut (work - 1),
+        ),
+        Err(InstanceRegistryError::Limit)
+    );
+    let (rows, _) = registrations(&env, &registered, 1_000_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rows.instances.len(), 1);
+    assert_eq!(rows.instances[0].keys, model.keys);
+    assert_eq!(rows.instances[0].synth_order, model.synth_order);
+    assert_eq!(derive(&registered, "borrowedDecision"), None);
+    assert_eq!(
+        registered
+            .find(&n("borrowedDecision"))
+            .unwrap()
+            .constant_val()
+            .type_,
+        type_,
+        "index normalization must not erase the compiler's annotations"
+    );
+    assert_eq!(env.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn noncanonical_and_index_changing_annotations_remain_unsupported() {
+    let env = local_alias_fixture();
+    let root = env.logical_root(&KVMap::new());
+    for entries in [
+        vec![(n("borrowed"), DataValue::OfBool(false))],
+        vec![(n("borrowed"), DataValue::OfNat(1))],
+        vec![(n("noindex"), DataValue::OfBool(true))],
+        vec![(n("unknown"), DataValue::OfBool(true))],
+        vec![
+            (n("borrowed"), DataValue::OfBool(true)),
+            (n("noindex"), DataValue::OfBool(true)),
+        ],
+        vec![
+            (n("borrowed"), DataValue::OfBool(true)),
+            (n("borrowed"), DataValue::OfBool(true)),
+        ],
+    ] {
+        let inner = Expr::mdata(KVMap::from_entries(entries), c("Nat"));
+        // A supported outer annotation cannot hide an unsupported inner map.
+        let annotated = Expr::mdata(
+            KVMap::from_entries(vec![(n("borrowed"), DataValue::OfBool(true))]),
+            inner,
+        );
+        let registered = register(&env, "annotated", app("Pick", annotated));
+        assert_eq!(registration_model(&registered, "annotated"), None);
+        assert_eq!(registrations(&env, &registered, 1_000_000).unwrap(), None);
+    }
     assert_eq!(env.logical_root(&KVMap::new()), root);
 }
 

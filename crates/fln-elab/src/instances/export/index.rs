@@ -1,13 +1,15 @@
 //! Exact, bounded indexing for immutable direct instance type telescopes.
 //!
 //! Telescope variables represent the pin's fresh assignable metavariables and
-//! index as Star. Definition, recursor, projection, eta and nonempty annotation
+//! index as Star. Definition, recursor, projection, eta and unknown annotation
 //! normalization are explicit unsupported results, never guessed paths. This
 //! keeps an exported path independent of later reducibility changes.
 //! Local registrations can additionally capture reducible alias keys once;
 //! those keys must travel with their lexical registration, never be re-derived.
 //! Native registration captures additionally normalize direct reducible
 //! telescopes and retain known non-reducible definition heads in that world.
+//! Their canonical borrowed-type annotations are transparent to this index,
+//! while the admitted expressions retain the annotations for the compiler.
 use super::*;
 use fln_core::expr::{FVarId, Literal, NatLit};
 
@@ -130,6 +132,18 @@ impl Indexer<'_> {
         tick(self.remaining).map_err(Error::from)
     }
 
+    /// `mkBorrowedAnnotation` is exactly `mkAnnotation borrowed`: a singleton
+    /// boolean-true map (Lean/Compiler/BorrowedAnnotation.lean). `whnfCore`
+    /// consumes it before discrimination-tree indexing. Do not generalize this
+    /// to arbitrary metadata: in particular, `noindex` has a distinct wildcard
+    /// meaning that this bounded registration model does not yet implement.
+    fn transparent_metadata(&self, data: &fln_core::options::KVMap) -> bool {
+        data.is_empty()
+            || (self.registration
+                && data.len() == 1
+                && data.get_bool(&Name::from_components(["borrowed"]), false))
+    }
+
     fn instance(
         &mut self,
         expected_class: Option<&Name>,
@@ -182,7 +196,9 @@ impl Indexer<'_> {
                 self.tick()?;
                 match value.node() {
                     ExprNode::Lam { body, .. } => value = body,
-                    ExprNode::MData { data, expr } if data.is_empty() => value = expr,
+                    ExprNode::MData { data, expr } if self.transparent_metadata(data) => {
+                        value = expr
+                    }
                     ExprNode::App { f, .. } => value = f,
                     ExprNode::Proj { .. } if projection_self.is_none() => {
                         return Err(Error::Unsupported);
@@ -194,7 +210,7 @@ impl Indexer<'_> {
         loop {
             self.tick()?;
             if self.registration {
-                target = self.registration_head(&target)?;
+                target = self.registration_head(&target, false)?;
             }
             match target.node() {
                 ExprNode::ForallE {
@@ -216,7 +232,9 @@ impl Indexer<'_> {
                     });
                     target = self.substitute(&body, &argument)?;
                 }
-                ExprNode::MData { data, expr } if data.is_empty() => target = expr.clone(),
+                ExprNode::MData { data, expr } if self.transparent_metadata(data) => {
+                    target = expr.clone();
+                }
                 _ => break,
             }
         }
@@ -272,7 +290,7 @@ impl Indexer<'_> {
                     args.push(without_ascription(a));
                     head = f;
                 }
-                ExprNode::MData { data, expr } if data.is_empty() => head = expr,
+                ExprNode::MData { data, expr } if self.transparent_metadata(data) => head = expr,
                 ExprNode::MData { .. } => return Err(Error::Unsupported),
                 _ => {
                     args.reverse();
@@ -362,11 +380,13 @@ impl Indexer<'_> {
         loop {
             self.tick()?;
             if self.registration {
-                target = self.registration_head(&target)?;
+                target = self.registration_head(&target, false)?;
             }
             match target.node() {
                 ExprNode::ForallE { body, .. } => target = body.clone(),
-                ExprNode::MData { data, expr } if data.is_empty() => target = expr.clone(),
+                ExprNode::MData { data, expr } if self.transparent_metadata(data) => {
+                    target = expr.clone();
+                }
                 _ => break,
             }
         }
@@ -517,7 +537,7 @@ impl Indexer<'_> {
             ExprNode::App { f, a } => {
                 let mut type_ = self.infer(f, depth + 1)?;
                 if self.registration {
-                    type_ = self.registration_head(&type_)?;
+                    type_ = self.registration_head(&type_, false)?;
                 }
                 let ExprNode::ForallE { body, .. } = type_.node() else {
                     return Err(Error::Unsupported);
@@ -568,7 +588,9 @@ impl Indexer<'_> {
                 }]),
                 Vec::new(),
             )),
-            ExprNode::MData { data, expr } if data.is_empty() => self.infer(expr, depth + 1),
+            ExprNode::MData { data, expr } if self.transparent_metadata(data) => {
+                self.infer(expr, depth + 1)
+            }
             _ => Err(Error::Unsupported),
         }
     }
@@ -774,10 +796,25 @@ impl Indexer<'_> {
     /// have Abbrev hints too, but stay folded at their semireducible status.
     /// Recursors, projections, smart unfolding and eta reduction are not
     /// implemented here; their resulting shapes keep the typed refusal.
-    fn registration_head(&mut self, expr: &Expr) -> Result<Expr> {
+    fn registration_head(&mut self, expr: &Expr, literal_key: bool) -> Result<Expr> {
         let mut current = without_ascription(expr);
         loop {
             self.tick()?;
+            if let ExprNode::MData { data, expr } = current.node() {
+                if !self.transparent_metadata(data) {
+                    return Err(Error::Unsupported);
+                }
+                current = without_ascription(expr);
+                continue;
+            }
+            // A nested numeral has its literal key independently of the
+            // OfNat dictionary's reducibility. Stop before inspecting that
+            // projection's policy, including when delta/beta just revealed
+            // the numeral through an alias. Telescope/type reduction never
+            // uses this indexing-only exception.
+            if literal_key && self.numeral(&current)?.is_some() {
+                return Ok(current);
+            }
             let (head, args) = self.spine(&current)?;
             let value = match head.node() {
                 ExprNode::Lam { .. } if !args.is_empty() => head,
@@ -837,7 +874,7 @@ impl Indexer<'_> {
             };
             let mut expr = without_ascription(&expr);
             if self.registration {
-                expr = self.registration_head(&expr)?;
+                expr = self.registration_head(&expr, !root)?;
             } else if self.capture_aliases && !root {
                 expr = self.local_alias(&expr)?;
             }

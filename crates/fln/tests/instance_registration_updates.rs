@@ -152,7 +152,9 @@ fn bad_registrations_and_malformed_update_rows_fail_closed() {
         .unwrap()
         .payload
         .to_vec();
-    assert_eq!(payload[8], 2);
+    // Native updates now carry their registration-time index in tag 5;
+    // malformed captured trailers must still fail closed.
+    assert_eq!(payload[8], 5);
     let mut unknown = payload.clone();
     unknown[8] = 255;
     let truncated = payload[..payload.len() - 1].to_vec();

@@ -13,6 +13,10 @@ mod defaults;
 mod executable;
 #[path = "instance_aliases.rs"]
 mod instance_aliases;
+#[path = "instance_borrowed.rs"]
+mod instance_borrowed;
+#[path = "instance_numerals.rs"]
+mod instance_numerals;
 #[path = "instances.rs"]
 mod instances;
 #[path = "macro_inline.rs"]

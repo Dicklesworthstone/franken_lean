@@ -571,8 +571,8 @@ fn local_reducibility_restores_without_persisting_the_override() {
     assert!(result.environment().contains(&n("outside")));
     assert_eq!(
         fln_elab::reducibility::known_status(result.environment(), &n("value")),
-        Ok(None),
-        "a local override must not create a persistent status entry"
+        Ok(Some(fln_elab::reducibility::Reducibility::Semireducible)),
+        "leaving a local override must restore the admitted source definition's default"
     );
     assert_eq!(before, base.logical_root(&KVMap::new()));
 }

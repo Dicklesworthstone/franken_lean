@@ -326,9 +326,19 @@ fn execution_uses_the_same_local_transparency_without_publishing_it() {
         fln_vm::interpreter::nat_decimal(&result.value).as_deref(),
         Some("5")
     );
+    // The checked #eval helper receives an ordinary source default. Its one
+    // new row is allowed; the local override of `hidden` must never persist.
+    let fln::Declaration::Defn(helper) = &executed.batch.executions[index].declaration else {
+        panic!("expected the checked evaluation helper to be a definition");
+    };
+    let expected = base
+        .environment()
+        .add_decl(fln::ConstantInfo::Defn(helper.clone()))
+        .unwrap();
+    let expected = fln_elab::reducibility::register_default(&expected, &helper.base.name).unwrap();
     assert_eq!(
         fln_elab::reducibility::journal_digest(executed.batch.engine.environment()),
-        fln_elab::reducibility::journal_digest(base.environment())
+        fln_elab::reducibility::journal_digest(&expected)
     );
 }
 
