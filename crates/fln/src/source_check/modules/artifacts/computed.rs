@@ -15,9 +15,10 @@ pub(super) struct Family {
 #[derive(Default)]
 pub(super) struct Captured {
     pub(super) owned: Vec<Family>,
-    /// Includes imported native families: until the executable artifact ABI
-    /// supports cache-bearing data, a consuming module must refuse it too.
-    pub(super) visible_family: Option<Name>,
+    /// An owned cache-bearing family still needs generated executable entries.
+    /// Imported families are checked separately when a source ABI or runtime
+    /// preparation actually reaches their representation.
+    pub(super) owned_family: Option<Name>,
 }
 
 fn error(module: &Name, reason: &'static str) -> SourceModuleCheckError {
@@ -87,12 +88,8 @@ pub(super) fn models(
     let (claims, work) = computed_fields::families_with_work(private, budget(meter, 1, 1))
         .map_err(|failure| failed(module, meter, failure))?;
     meter.work(work)?;
-    let visible_family = claims.first().cloned();
     if unchanged {
-        return Ok(Captured {
-            owned: Vec::new(),
-            visible_family,
-        });
+        return Ok(Captured::default());
     }
     let mut owned = Vec::new();
     for family in claims {
@@ -110,6 +107,7 @@ pub(super) fn models(
         }
     }
     let mut models = Vec::with_capacity(owned.len());
+    let owned_family = owned.first().cloned();
     let mut words_checked = BTreeSet::new();
     for (index, family) in owned.iter().enumerate() {
         let budget = budget(
@@ -170,7 +168,7 @@ pub(super) fn models(
     }
     Ok(Captured {
         owned: models,
-        visible_family,
+        owned_family,
     })
 }
 

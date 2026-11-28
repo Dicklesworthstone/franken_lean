@@ -29,6 +29,9 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+#[path = "source_computed_fields/ir.rs"]
+mod ir;
+
 const IMPORT_STACK: usize = 64 * 1024 * 1024;
 const SOURCE_STACK: usize = 2 * 1024 * 1024;
 const SINGLE: &str = r#"
@@ -839,7 +842,7 @@ fn public_computed_family_admits_following_instances_without_duplicate_metadata(
 }
 
 fn assert_computed_ir_boundary(artifact: &mut SourceModuleArtifact, family: &str) {
-    let public = artifact.bytes.clone();
+    let before = ir::logical_artifacts(artifact);
     let error = artifact
         .compile_ir(SourceModuleIrLimits::new(limits()))
         .expect_err("logical computed artifacts do not claim an implemented pinned IR ABI");
@@ -852,7 +855,8 @@ fn assert_computed_ir_boundary(artifact: &mut SourceModuleArtifact, family: &str
         "unexpected computed IR boundary: {error:?}"
     );
     assert_eq!(
-        artifact.bytes, public,
+        ir::logical_artifacts(artifact),
+        before,
         "a refused IR facet must preserve its logical artifact"
     );
 }
@@ -1068,7 +1072,7 @@ run_cmd do
             .into_complete()
             .unwrap();
         assert_eq!(consumer_build.artifacts.len(), 1);
-        assert_computed_ir_boundary(&mut consumer_build.artifacts[0], "Cache");
+        ir::assert_inherited_ir_boundary(&mut consumer_build.artifacts[0], "payload");
         assert_eq!(fixture.imported.engine.logical_root(&options), before);
     });
 }

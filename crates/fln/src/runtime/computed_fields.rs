@@ -25,6 +25,64 @@ fn metadata_error(error: ComputedFieldError) -> IngressError {
 }
 
 impl Preparation<'_> {
+    /// Source signatures retain every runtime slot, even when its value is
+    /// unused or only passed through a callback. Discover claimed computed
+    /// carriers in that interface before expression preparation can erase
+    /// their last use. Proof and type slots are erased in their checked
+    /// contexts first; they carry no computed object across the ABI.
+    ///
+    /// This follows the closed Const/arrow/metadata profile accepted by the
+    /// source IR signature classifier. Other forms retain that classifier's
+    /// ordinary refusal; this query grants no additional carrier support.
+    pub(crate) fn track_source_abi_computed_fields(
+        &mut self,
+        input: &Expr,
+    ) -> Result<(), IngressError> {
+        let erased = self.erase_runtime_type(input)?;
+        let mut pending = vec![&erased];
+        while let Some(expression) = pending.pop() {
+            self.tick()?;
+            match expression.node() {
+                ExprNode::Const { name, .. } => {
+                    self.computed_family_for_type(name)?;
+                }
+                ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    reserve(&mut pending, self.limits.max_nodes)?;
+                    pending.push(body);
+                    reserve(&mut pending, self.limits.max_nodes)?;
+                    pending.push(binder_type);
+                }
+                ExprNode::MData { expr, .. } => {
+                    reserve(&mut pending, self.limits.max_nodes)?;
+                    pending.push(expr);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Completed representation discovery, constructor/recursor lowering and
+    /// generated replacement selection all validate their computed family in
+    /// this store. Keep the deterministic first family as a conservative IR
+    /// capability requirement, even if later simplification removes its use.
+    pub(crate) fn used_computed_family(&mut self) -> Result<Option<Name>, IngressError> {
+        self.tick()?;
+        let mut first = None;
+        for family in self.computed_fields.families.keys() {
+            charge_catalog_node(&mut self.visited, self.limits)?;
+            if first
+                .as_ref()
+                .is_none_or(|previous| family.quick_cmp(previous).is_lt())
+            {
+                first = Some(family.clone());
+            }
+        }
+        Ok(first)
+    }
+
     /// Each generator phase has its own bounded traversal. Reserve its whole
     /// allowance before entering it, so validation cannot escape the aggregate
     /// ingress limit even when a failed comparison visits its last node.

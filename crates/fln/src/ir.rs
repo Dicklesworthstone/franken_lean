@@ -3431,6 +3431,11 @@ pub(crate) fn compile_checked_source_definition(
         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
     };
+    if prepared.computed_family.is_some() {
+        return Err(DefinitionCompileError::Ir(unsupported(
+            "computed-field source representation requires cached constructor and replacement ABI lowering",
+        )));
+    }
     let value_entry = Name::str(name.clone(), "_fln_value");
     let mut module = compile_module(
         &prepared.fir,
@@ -3512,6 +3517,11 @@ fn compile_definition_impl(
         Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
         Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
         Outcome::Complete(prepared) => {
+            if signature.is_some() && prepared.computed_family.is_some() {
+                return Err(DefinitionCompileError::Ir(unsupported(
+                    "computed-field source representation requires cached constructor and replacement ABI lowering",
+                )));
+            }
             let exported = signature.as_ref().map(|s| s.name.clone());
             let entry = entry.cloned().or(exported).ok_or_else(|| {
                 DefinitionCompileError::Ir(invariant("admitted source definition"))

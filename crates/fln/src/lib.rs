@@ -7310,6 +7310,7 @@ impl Engine {
             io_result_types,
             fir,
             runtime_root,
+            computed_family: _,
         } = prepared;
         // Optimization may change cost, never whether the program lowers.
         let lowered = fln_comp::fir::optimize(&fir, limits.ingress.fir)
@@ -7515,6 +7516,11 @@ impl Engine {
         let runtime_type = preparation
             .normalize_type(&declared_type)
             .map_err(EngineExecutionError::Ingress)?;
+        if matches!(entry, source_evaluation::Entry::SourceValue) {
+            preparation
+                .track_source_abi_computed_fields(&runtime_type)
+                .map_err(EngineExecutionError::Ingress)?;
+        }
         let root_result = preparation.root_result(&runtime_type);
         let expression = preparation
             .expression_at_type(&expression, Some(declared_type.clone()))
@@ -7554,12 +7560,20 @@ impl Engine {
             limits.ingress,
         )
         .map_err(EngineExecutionError::Ingress)?;
+        let computed_family = if matches!(entry, source_evaluation::Entry::SourceValue) {
+            preparation
+                .used_computed_family()
+                .map_err(EngineExecutionError::Ingress)?
+        } else {
+            None
+        };
         Ok(Outcome::Complete(PreparedDefinition {
             admission,
             runtime_type,
             io_result_types,
             fir: ingress.into_fir(),
             runtime_root,
+            computed_family,
         }))
     }
 }
@@ -7570,6 +7584,10 @@ struct PreparedDefinition {
     io_result_types: Option<source_evaluation::IoResultTypes>,
     fir: fln_comp::fir::ValidatedProgram,
     runtime_root: LogicalRoot,
+    /// A validated computed representation reached by a source ABI or its
+    /// completed executable preparation. Boxed value execution does not use
+    /// this source-export capability guard.
+    computed_family: Option<Name>,
 }
 
 /// Execute a validated FLBC program on the Golem VM with the given option map

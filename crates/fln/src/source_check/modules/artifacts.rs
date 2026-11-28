@@ -1360,7 +1360,7 @@ impl PendingArtifact {
             options: options.clone(),
             name: name.clone(),
             is_module: header.module_system,
-            computed_family: computed.visible_family,
+            owned_computed_family: computed.owned_family,
             imports: implementation.imports.clone(),
             constants: implementation.constants.clone(),
             public: Arc::clone(&public),
