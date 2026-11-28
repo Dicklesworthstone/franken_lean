@@ -169,6 +169,48 @@ run_cmd do
 }
 
 #[test]
+fn pre_notation_coe_attribute_registers_coercion() {
+    use fln_elab::delaborator_tags::{CoeFnInfo, CoeFnKind, DelaboratorTags};
+
+    // Mirrors `Init/Data/Cast.lean`: a `module` + `prelude` file with imports that do not
+    // include `Init.Notation`, so `fln-parse` reads `@[coe]` as `Attr.simple("coe", [])`.
+    let built = compiled(&[
+        (
+            "Main",
+            r#"module
+prelude
+public import Init.Prelude
+public section
+class CastBox (R : Type) where
+  protected castBox : Nat → R
+@[coe, expose, reducible, match_pattern, inherit_doc CastBox]
+protected def castVal {R : Type} [CastBox R] : Nat → R :=
+  CastBox.castBox
+"#,
+        ),
+        (
+            "Init.Prelude",
+            r#"module
+prelude
+public section
+inductive Nat where
+  | zero
+  | succ (n : Nat)
+"#,
+        ),
+    ]);
+    let tags = DelaboratorTags::read(built.checked.checked.engine.environment()).unwrap();
+    assert_eq!(
+        tags.coercion(&name("castVal")),
+        Some(&CoeFnInfo {
+            num_args: 3,
+            coercee: 2,
+            kind: CoeFnKind::Coe,
+        })
+    );
+}
+
+#[test]
 fn anonymous_constructor_tags_survive_owned_artifacts_and_diamond_imports() {
     let built = compiled(&[
         ("Main", "prelude\nimport Left\nimport Right"),

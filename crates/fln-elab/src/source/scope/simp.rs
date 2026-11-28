@@ -97,8 +97,10 @@ fn priority_value_bounded(
 }
 
 /// Validate a named `@[method_specs_simp]` attribute (`Init/Tactics.lean:2481`,
-/// `Lean/Meta/MethodSpecs.lean:123`). Entries belong to the separate `method_specs_simp`
-/// simp set and must never enter the default `simp` set.
+/// `Lean/Meta/MethodSpecs.lean:123`). Before `Init.Tactics` is imported (as in
+/// `Init/MethodSpecsSimp.lean`), the parser emits `Attr.simple("method_specs_simp", [])`;
+/// once `Init.Tactics` is in scope, it emits `Attr.method_specs_simp`. Entries belong to
+/// the separate `method_specs_simp` simp set and must never enter the default `simp` set.
 fn method_specs_simp_attribute(
     attribute: &fln_syntax::tree::Syntax,
 ) -> Result<bool, crate::NatDefinitionElabError> {
@@ -109,7 +111,15 @@ fn method_specs_simp_attribute(
         2,
         "attribute instance",
     )?;
-    if instance[1].kind() != Some(&parser_kind(&["Attr", "method_specs_simp"])) {
+    let is_simple = matches!(
+        &instance[1],
+        Syntax::Node { kind, args, .. }
+            if kind == &parser_kind(&["Attr", "simple"])
+                && matches!(args.as_slice(), [Syntax::Ident { val, .. }, _]
+                    if val == &Name::from_components(["method_specs_simp"]))
+    );
+    let is_extended = instance[1].kind() == Some(&parser_kind(&["Attr", "method_specs_simp"]));
+    if !is_simple && !is_extended {
         return Ok(false);
     }
     let scope = expect_node(
@@ -138,6 +148,26 @@ fn method_specs_simp_attribute(
                 expected: "global, local, or scoped method_specs_simp attribute",
             });
         }
+    }
+    if is_simple {
+        let parts = expect_node(
+            &instance[1],
+            &parser_kind(&["Attr", "simple"]),
+            2,
+            "simple method_specs_simp attribute",
+        )?;
+        match expect_null_args(&parts[1], "method_specs_simp priority")? {
+            [] => {}
+            [priority] => {
+                priority_value(priority)?;
+            }
+            _ => {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "numeric priority",
+                });
+            }
+        }
+        return Ok(true);
     }
     let parts = expect_node(
         &instance[1],
@@ -556,31 +586,57 @@ pub fn registration(
         "attribute scope",
     )?;
     expect_empty_null(&scope[0], "global attribute")?;
-    let parts = expect_node(
+    let (reverse, priority) = if matches!(
         &instance[1],
-        &parser_kind(&["Attr", "simp"]),
-        4,
-        "simp attribute",
-    )?;
-    expect_atom(&parts[0], "simp", "simp attribute keyword")?;
-    expect_empty_null(&parts[1], "default simp phase")?;
-    let reverse = match expect_null_args(&parts[2], "simp direction")? {
-        [] => false,
-        [Syntax::Atom { val, .. }] if val == "←" || val == "<-" => true,
-        _ => {
-            return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "simp direction",
-            });
-        }
-    };
-    let priority = match expect_null_args(&parts[3], "simp priority")? {
-        [] => 1000,
-        [priority] => priority_value(priority)?,
-        _ => {
-            return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "numeric priority",
-            });
-        }
+        Syntax::Node { kind, args, .. }
+            if kind == &parser_kind(&["Attr", "simple"])
+                && matches!(args.as_slice(), [Syntax::Ident { val, .. }, _]
+                    if val == &Name::from_components(["simp"]))
+    ) {
+        let parts = expect_node(
+            &instance[1],
+            &parser_kind(&["Attr", "simple"]),
+            2,
+            "simple simp attribute",
+        )?;
+        let priority = match expect_null_args(&parts[1], "simp priority")? {
+            [] => 1000,
+            [priority] => priority_value(priority)?,
+            _ => {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "numeric priority",
+                });
+            }
+        };
+        (false, priority)
+    } else {
+        let parts = expect_node(
+            &instance[1],
+            &parser_kind(&["Attr", "simp"]),
+            4,
+            "simp attribute",
+        )?;
+        expect_atom(&parts[0], "simp", "simp attribute keyword")?;
+        expect_empty_null(&parts[1], "default simp phase")?;
+        let reverse = match expect_null_args(&parts[2], "simp direction")? {
+            [] => false,
+            [Syntax::Atom { val, .. }] if val == "←" || val == "<-" => true,
+            _ => {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "simp direction",
+                });
+            }
+        };
+        let priority = match expect_null_args(&parts[3], "simp priority")? {
+            [] => 1000,
+            [priority] => priority_value(priority)?,
+            _ => {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "numeric priority",
+                });
+            }
+        };
+        (reverse, priority)
     };
     if declaration[1].kind() == Some(&parser_kind(&["Command", "instance"])) {
         // The pin applies simp to the admitted constant: proof instances are

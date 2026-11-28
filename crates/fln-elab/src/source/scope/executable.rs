@@ -139,6 +139,11 @@ pub(in crate::source) fn attribute(
             } else if val == &Name::from_components(["match_pattern"]) {
                 expect_empty_null(argument, "match_pattern without arguments")?;
                 Attribute::MatchPattern
+            } else if val == &Name::from_components(["coe"]) {
+                // Before `Init.Notation` declares `syntax (name := Attr.coe) "coe" : attr`,
+                // `fln-parse` emits `Attr.simple("coe", [])` (as in `Init/Data/Cast.lean`).
+                expect_empty_null(argument, "coe without arguments")?;
+                Attribute::Coe
             } else if val == &Name::from_components(["pp_using_anonymous_constructor"]) {
                 expect_empty_null(argument, "pp_using_anonymous_constructor without arguments")?;
                 Attribute::AnonymousConstructor

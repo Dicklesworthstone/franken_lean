@@ -1547,6 +1547,44 @@ fn method_specs_simp_attribute_validates_targets_without_entering_default_simp()
         active.is_empty(),
         "method_specs_simp must stay out of the default simp set: {active:?}"
     );
+    // Also exercise the pre-Init.Tactics `Attr.simple` paths used by `Init/MethodSpecsSimp.lean`
+    // and other `prelude` modules that import `Init.Prelude` before `Init.Tactics`.
+    let pre_tactics = compiled(&[
+        (
+            "Main",
+            "module\nprelude\npublic import Init.Prelude\npublic section\n\
+             @[method_specs_simp] theorem idN_simple (n : N) : Same (idN n) n := Same.refl\n\
+             @[simp 123] def idN_simp (n : N) : N := n\n",
+        ),
+        (
+            "Init.Prelude",
+            "module\nprelude\npublic section\n\
+             inductive N : Type where | z : N | s : N -> N\n\
+             inductive Same {α : Type} (a : α) : α -> Prop where | refl : Same a a\n\
+             def idN (n : N) : N := n\n",
+        ),
+    ]);
+    assert!(
+        pre_tactics
+            .checked
+            .checked
+            .engine
+            .environment()
+            .contains(&name("idN_simple"))
+    );
+    let pre_tactics_simp = simp::read(pre_tactics.checked.checked.engine.environment()).unwrap();
+    assert!(
+        pre_tactics_simp
+            .iter()
+            .all(|entry| entry.declaration != name("idN_simple")),
+        "pre-Init.Tactics method_specs_simp must stay out of default simp: {pre_tactics_simp:?}"
+    );
+    assert!(
+        pre_tactics_simp
+            .iter()
+            .any(|entry| entry.declaration == name("idN_simp") && entry.priority == 123),
+        "pre-Init.Tactics `@[simp 123]` must register with priority 123: {pre_tactics_simp:?}"
+    );
     for bad in [
         "prelude\n@[method_specs_simp] inductive Bad where | a\n",
         "prelude\n@[method_specs_simp] structure Bad where\n  x : Prop\n",
