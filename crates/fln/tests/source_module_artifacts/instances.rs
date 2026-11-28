@@ -399,6 +399,126 @@ fn generic_instance_prerequisites_keep_absolute_telescope_positions() {
 }
 
 #[test]
+fn dependent_function_prerequisites_survive_public_artifacts_and_physical_imports() {
+    let source = r#"module
+prelude
+public section
+universe u v
+inductive ExportToken where
+  | left
+  | right
+class ExportSupply (A : Type u) where
+  value : A
+instance pointwiseSupply {A : Type u} {B : A -> Type v}
+    [family : (a : A) -> ExportSupply (B a)] : ExportSupply ((a : A) -> B a) :=
+  ExportSupply.mk (fun a => @ExportSupply.value (B a) (family a))
+"#;
+    let built = compiled(&[("Main", source)]);
+    let artifact = &built.artifacts[0];
+    let rows = metadata(&artifact.bytes).instances;
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.declaration, name("pointwiseSupply"));
+    assert_eq!(row.priority, 1000);
+    assert!(row.scope.is_none());
+    // Exact lean4-4.32.0 computeSynthOrder/mkInstanceKey results for this
+    // declaration: the dependent prerequisite is telescope argument 2.
+    assert_eq!(row.synth_order, [2]);
+    assert_eq!(
+        row.keys,
+        [
+            source_extensions::DiscrTreeKey::Const(name("ExportSupply"), 1),
+            source_extensions::DiscrTreeKey::Arrow,
+            source_extensions::DiscrTreeKey::Star,
+        ]
+    );
+    assert_eq!(
+        metadata(&artifact.companions.as_ref().unwrap().private).instances,
+        rows,
+        "public and private products retain the same public registration"
+    );
+
+    let receipt = imported(&built);
+    assert_eq!(receipt.modules[0].instances, 1);
+    let original = receipt.engine.logical_root(&KVMap::new());
+    let use_name = name("Use");
+    let consumer = r#"module
+prelude
+public import Main
+public section
+@[expose] section
+universe u v
+def pointwiseChoice {A : Type u} {B : A -> Type v}
+    [family : (a : A) -> ExportSupply (B a)] : (a : A) -> B a := ExportSupply.value
+theorem pointwiseCorrect {A : Type u} {B : A -> Type v}
+    (family : (a : A) -> ExportSupply (B a)) (a : A)
+    (P : B a -> Prop) (h : P (@ExportSupply.value (B a) (family a))) :
+    P (@pointwiseChoice A B family a) := h
+def chosen : ExportToken :=
+  @pointwiseChoice ExportToken (fun _ => ExportToken)
+    (fun _ => ExportSupply.mk ExportToken.right) ExportToken.left
+theorem chosenCorrect (P : ExportToken -> Prop) (h : P ExportToken.right) : P chosen := h
+"#;
+    let checked = receipt
+        .check_source_modules(
+            &[SourceModuleInput {
+                name: &use_name,
+                source: consumer.as_bytes(),
+            }],
+            &use_name,
+            &KVMap::new(),
+            limits(),
+            None,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(
+        checked
+            .checked
+            .engine
+            .environment()
+            .contains(&name("pointwiseCorrect"))
+    );
+    assert!(
+        checked
+            .checked
+            .engine
+            .environment()
+            .contains(&name("chosenCorrect"))
+    );
+    let failures = [
+        "def bad : (a : ExportToken) -> ExportToken := ExportSupply.value",
+        "def bad [family : (A : Type) -> ExportSupply (A -> A)] : (A : Type) -> A := ExportSupply.value",
+        "theorem bad (P : ExportToken -> Prop) (h : P ExportToken.left) : P chosen := h",
+    ];
+    for failure in failures {
+        let refused =
+            format!("{consumer}\ndef sentinelPrefix : ExportToken := ExportToken.left\n{failure}");
+        assert!(
+            matches!(
+                receipt.check_source_modules(
+                    &[SourceModuleInput {
+                        name: &use_name,
+                        source: refused.as_bytes(),
+                    }],
+                    &use_name,
+                    &KVMap::new(),
+                    limits(),
+                    None,
+                ),
+                Err(SourceModuleCheckError::Source { .. })
+            ),
+            "{failure}"
+        );
+        assert_eq!(receipt.engine.logical_root(&KVMap::new()), original);
+        for uncommitted in ["pointwiseChoice", "chosen", "sentinelPrefix", "bad"] {
+            assert!(!receipt.engine.environment().contains(&name(uncommitted)));
+        }
+    }
+}
+
+#[test]
 fn output_parameters_preserve_the_dependency_order_of_instance_prerequisites() {
     for (annotation, expected_outputs) in [("outParam", &[0u32][..]), ("semiOutParam", &[][..])] {
         let source = format!(
@@ -437,6 +557,73 @@ fn output_parameters_preserve_the_dependency_order_of_instance_prerequisites() {
         );
         let receipt = imported(&built);
         assert_choice(&receipt.engine, "right");
+    }
+}
+
+#[test]
+fn dependent_function_prerequisites_schedule_outputs_before_waiting_inputs() {
+    for annotation in ["outParam", "semiOutParam"] {
+        let source = format!(
+            r#"prelude
+inductive Token where
+  | left
+  | right
+def {annotation}.{{u}} (A : Sort u) : Sort u := A
+class Ready (A : Type) where
+  value : Token
+class OutAt {{A : Type}} (a : A) (B : {annotation} Type) where
+  value : B
+class Goal (A : Type) where
+  value : Token
+instance readyToken : Ready Token := Ready.mk Token.right
+instance outToken (a : Token) : OutAt a Token := OutAt.mk a
+instance combined {{A B : Type}} [ready : Ready B]
+    [family : (a : A) -> OutAt a B] : Goal A :=
+  Goal.mk (@Ready.value B ready)
+"#
+        );
+        let built = compiled(&[("Main", &source)]);
+        let rows = metadata(&built.artifacts[0].bytes).instances;
+        let combined = rows
+            .iter()
+            .find(|row| row.declaration == name("combined"))
+            .unwrap();
+        assert_eq!(
+            combined.synth_order,
+            [3, 2],
+            "the function-valued family supplies B before Ready B can run"
+        );
+        assert_eq!(
+            combined.keys,
+            [
+                source_extensions::DiscrTreeKey::Const(name("Goal"), 1),
+                source_extensions::DiscrTreeKey::Star,
+            ]
+        );
+        let receipt = imported(&built);
+        for engine in [&built.checked.checked.engine, &receipt.engine] {
+            let original = engine.logical_root(&KVMap::new());
+            engine
+                .check_source_files(
+                    &[b"def chosen : Token := Goal.value (A := Token)\ntheorem correct (P : Token -> Prop) (h : P Token.right) : P chosen := h"],
+                    &KVMap::new(),
+                    limits().source,
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            assert!(
+                engine
+                    .check_source_files(
+                        &[b"def chosen : Token := Goal.value (A := Token)\ntheorem wrong (P : Token -> Prop) (h : P Token.left) : P chosen := h"],
+                        &KVMap::new(),
+                        limits().source,
+                    )
+                    .is_err(),
+                "{annotation}: the imported schedule must select the same dictionary"
+            );
+            assert_eq!(engine.logical_root(&KVMap::new()), original);
+        }
     }
 }
 

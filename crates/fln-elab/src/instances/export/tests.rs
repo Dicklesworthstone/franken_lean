@@ -158,6 +158,150 @@ fn generic_paths_and_authoritative_imported_out_parameters_determine_the_schedul
     );
 }
 
+#[test]
+fn dependent_function_prerequisites_keep_exact_keys_order_and_work_boundary() {
+    let base = class(
+        &Environment::new(),
+        "Need",
+        pi("A", ty(), ty(), BinderInfo::Default),
+    );
+    // {A} {B : A -> Type} [(a : A) -> Need (B a)] : Need ((a : A) -> B a).
+    // This is the dependency shape of Pi.instNonempty/Pi.instInhabited.
+    let instance_type = pi(
+        "A",
+        ty(),
+        pi(
+            "B",
+            pi("a", b(0), ty(), BinderInfo::Default),
+            pi(
+                "family",
+                pi(
+                    "a",
+                    b(1),
+                    app("Need", Expr::app(b(1), b(0))),
+                    BinderInfo::Default,
+                ),
+                app(
+                    "Need",
+                    pi("a", b(2), Expr::app(b(2), b(0)), BinderInfo::Default),
+                ),
+                BinderInfo::InstImplicit,
+            ),
+            BinderInfo::Implicit,
+        ),
+        BinderInfo::Implicit,
+    );
+    let env = register(&base, "pointwise", instance_type);
+    let root = env.logical_root(&KVMap::new());
+    let registry = InstanceRegistry::read(&env).unwrap();
+    let mut remaining = 100_000;
+    let expected = derive_index(&env, &registry, &n("pointwise"), &mut remaining)
+        .unwrap()
+        .unwrap();
+    assert_eq!(expected.synth_order, [2]);
+    assert_eq!(
+        expected.keys,
+        [
+            discr_tree::Key::Const(n("Need"), 1),
+            discr_tree::Key::Arrow,
+            discr_tree::Key::Star,
+        ]
+    );
+    let work = 100_000 - remaining;
+    let mut exact = work;
+    assert_eq!(
+        derive_index(&env, &registry, &n("pointwise"), &mut exact).unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(exact, 0);
+    assert_eq!(
+        derive_index(&env, &registry, &n("pointwise"), &mut (work - 1)),
+        Err(InstanceRegistryError::Limit)
+    );
+    let (rows, _) = registrations(&base, &env, 1_000_000).unwrap().unwrap();
+    assert_eq!(rows.instances.len(), 1);
+    assert_eq!(rows.instances[0].keys, expected.keys);
+    assert_eq!(rows.instances[0].synth_order, expected.synth_order);
+    assert_eq!(env.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn higher_order_prerequisites_preserve_output_readiness_and_stall_on_unknown_inputs() {
+    let generic = pi("A", ty(), ty(), BinderInfo::Default);
+    let dependent = pi(
+        "A",
+        ty(),
+        pi(
+            "a",
+            b(0),
+            pi("B", ty(), ty(), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let env = class(&Environment::new(), "Goal", generic.clone());
+    let env = class(&env, "Ready", generic);
+    let env = class(
+        &class(&env, "OutAt", dependent.clone()),
+        "NeedAt",
+        dependent,
+    );
+    let base = imported::register_class(
+        &env,
+        &n("OutAt"),
+        &imported::ClassParameters {
+            out_params: vec![2],
+            out_level_params: vec![],
+        },
+    )
+    .unwrap();
+    // {A B} [Ready B] [(a : A) -> OutAt a B] : Goal A.
+    // The pin selects the dependent family first, which supplies output B.
+    let instance_type = |family: &str| {
+        pi(
+            "A",
+            ty(),
+            pi(
+                "B",
+                ty(),
+                pi(
+                    "wait",
+                    app("Ready", b(0)),
+                    pi(
+                        "family",
+                        pi(
+                            "a",
+                            b(2),
+                            Expr::app(Expr::app(app(family, b(3)), b(0)), b(2)),
+                            BinderInfo::Default,
+                        ),
+                        app("Goal", b(3)),
+                        BinderInfo::InstImplicit,
+                    ),
+                    BinderInfo::InstImplicit,
+                ),
+                BinderInfo::Implicit,
+            ),
+            BinderInfo::Implicit,
+        )
+    };
+    let env = register(&base, "scheduled", instance_type("OutAt"));
+    let derived = derive(&env, "scheduled").unwrap();
+    assert_eq!(derived.synth_order, [3, 2]);
+    assert_eq!(
+        derived.keys,
+        [discr_tree::Key::Const(n("Goal"), 1), discr_tree::Key::Star]
+    );
+    let (rows, _) = registrations(&base, &env, 1_000_000).unwrap().unwrap();
+    assert_eq!(rows.instances[0].synth_order, [3, 2]);
+
+    // Keeping B as an input must still stall: opening a rigid inner binder
+    // cannot assign the unresolved outer input or discard its obligation.
+    let env = register(&base, "stalled", instance_type("NeedAt"));
+    assert_eq!(derive(&env, "stalled"), None);
+    assert_eq!(registrations(&base, &env, 1_000_000).unwrap(), None);
+}
+
 /// The pin's `checkOutParam` (`Lean/Class.lean`), run by `addClass` on every new class.
 #[test]
 fn a_regular_parameter_may_not_depend_on_an_out_parameter() {

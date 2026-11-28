@@ -320,7 +320,23 @@ impl Indexer<'_> {
     }
 
     fn input_dependencies(&mut self, type_: &Expr) -> Result<BTreeSet<usize>> {
-        let (class, args) = self.class_application(type_)?;
+        // computeSynthOrder opens each prerequisite's forall telescope before
+        // inspecting the terminal class arguments (Lean/Meta/Instances.lean).
+        // Those inner binders are rigid, unlike the instance's outer argument
+        // metavariables. Keeping their bound variables here preserves exactly
+        // that distinction: dependencies collects only our outer local FVars.
+        // Once a prerequisite is selected, synth_order still assigns from its
+        // complete original type, including dependencies of these domains.
+        let mut target = type_;
+        loop {
+            self.tick()?;
+            match target.node() {
+                ExprNode::ForallE { body, .. } => target = body,
+                ExprNode::MData { data, expr } if data.is_empty() => target = expr,
+                _ => break,
+            }
+        }
+        let (class, args) = self.class_application(target)?;
         let class_type = self
             .env
             .find(&class)
