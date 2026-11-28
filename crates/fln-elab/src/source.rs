@@ -2730,8 +2730,11 @@ impl Context {
             BinderDomain(binders::Telescope<'a>),
             BinderBody(binders::Telescope<'a>),
             LocalFunctionAnnotation(Box<local_functions::Build<'a>>),
+            LocalFunctionCheck(Box<local_functions::Build<'a>>),
             LocalFunctionStart(Box<local_functions::Build<'a>>, Option<usize>),
             LocalFunctionValue(Box<local_functions::Build<'a>>, usize),
+            LocalInferenceContinuation(Box<local_functions::inference::Replay<'a>>),
+            LocalInferenceFinish(Box<local_functions::inference::Replay<'a>>, Typed, usize),
             LocalCourseOriginal(
                 Box<local_functions::Build<'a>>,
                 Box<recursion::OriginalBody>,
@@ -2818,6 +2821,14 @@ impl Context {
                 postponed::Queue<'a>,
             ),
             LocalFunction(Box<local_functions::Checkpoint<'a>>, postponed::Queue<'a>),
+            LocalInference(
+                Box<local_functions::inference::Checkpoint<'a>>,
+                postponed::Queue<'a>,
+            ),
+            LocalReplay(
+                Box<local_functions::inference::ReplayCheckpoint>,
+                postponed::Queue<'a>,
+            ),
             Argument(Box<postponed::Checkpoint<'a>>),
         }
         // A generated descendant can reenter this evaluator. Return from the
@@ -2844,6 +2855,7 @@ impl Context {
         loop {
             let mut blocked_application = None;
             let mut containing_argument = None;
+            let mut containing_local_replay = None;
             let mut blocked_initial_application = None;
             let mut escaping_owned_blocker = None;
             let mut resume = None;
@@ -2867,6 +2879,7 @@ impl Context {
                                         | Task::MatrixAbstraction(..)
                                         | Task::PrivateDecl(..)
                                         | Task::LocalFunctionValue(..)
+                                        | Task::LocalInferenceFinish(..)
                                         | Task::LocalCourseOriginal(..)
                                         | Task::LocalCourseValue(..)
                                         | Task::MatchBranch(..)
@@ -2953,6 +2966,7 @@ impl Context {
                                     | Task::MatrixAbstraction(..)
                                     | Task::PrivateDecl(..)
                                     | Task::LocalFunctionValue(..)
+                                    | Task::LocalInferenceFinish(..)
                                     | Task::LocalCourseOriginal(..)
                                     | Task::LocalCourseValue(..)
                                     | Task::MatchBranch(..)
@@ -3912,12 +3926,7 @@ impl Context {
                                                 });
                                                 tasks.push(Task::LocalFunctionAnnotation(build));
                                             } else {
-                                                let value = build.binding.value;
-                                                tasks.push(Task::LocalFunctionValue(
-                                                    build,
-                                                    self.postponed_application_errors.len(),
-                                                ));
-                                                tasks.push(Task::Visit(value, None, true));
+                                                tasks.push(Task::LocalFunctionCheck(build));
                                             }
                                             continue;
                                         }
@@ -4402,6 +4411,14 @@ impl Context {
                             }
                             Task::MatchDiscriminant(parts, expected, explicit_motive) => {
                                 let major = values.pop().expect("match discriminant visit");
+                                if let Some(blocker) =
+                                    self.postponed_field_type_blocker(&major.type_)?
+                                {
+                                    blocked_application = Some(blocker);
+                                    return Err(failure(SourceInferenceError::Match(
+                                        matching::MatchError::ExpectedInductive,
+                                    )));
+                                }
                                 tasks.push(
                                     match self.start_match(
                                         parts,
@@ -5680,13 +5697,44 @@ impl Context {
                                     ));
                                     tasks.push(Task::LocalFunctionStart(Box::new(build), column));
                                 } else {
-                                    let value = build.binding.value;
-                                    tasks.push(Task::LocalFunctionValue(
-                                        build,
-                                        self.postponed_application_errors.len(),
-                                    ));
-                                    tasks.push(Task::Visit(value, Some(annotation.value), true));
+                                    tasks.push(Task::LocalFunctionCheck(build));
                                 }
+                            }
+                            Task::LocalFunctionCheck(mut build) => {
+                                let mut active = 0;
+                                for attempt in &attempts {
+                                    self.tick()?;
+                                    if matches!(
+                                        attempt,
+                                        Attempt::LocalInference(..) | Attempt::LocalReplay(..)
+                                    ) {
+                                        active += 1;
+                                    }
+                                }
+                                if active >= 256 {
+                                    return Err(failure(SourceInferenceError::ResourceLimit));
+                                }
+                                if let Some(checkpoint) =
+                                    local_functions::inference::Checkpoint::new(
+                                        self,
+                                        &mut build,
+                                        tasks.len(),
+                                        values.len(),
+                                    )?
+                                {
+                                    build.checkpoint = Some(attempts.len());
+                                    attempts.push(Attempt::LocalInference(
+                                        Box::new(checkpoint),
+                                        pending.clone(),
+                                    ));
+                                }
+                                let value = build.binding.value;
+                                let expected = build.result_type.clone();
+                                tasks.push(Task::LocalFunctionValue(
+                                    build,
+                                    self.postponed_application_errors.len(),
+                                ));
+                                tasks.push(Task::Visit(value, expected, true));
                             }
                             Task::LocalFunctionStart(mut build, column) => {
                                 self.start_local_function_value(&mut build, column)?;
@@ -5742,14 +5790,16 @@ impl Context {
                                     if index + 1 != attempts.len() {
                                         return Err(failure(SourceInferenceError::Scope));
                                     }
-                                    let Some(Attempt::LocalFunction(checkpoint, _)) =
-                                        attempts.pop()
-                                    else {
-                                        return Err(failure(SourceInferenceError::Scope));
+                                    let (saved_tasks, saved_values) = match attempts.pop() {
+                                        Some(Attempt::LocalFunction(checkpoint, _)) => {
+                                            (checkpoint.tasks, checkpoint.values)
+                                        }
+                                        Some(Attempt::LocalInference(checkpoint, _)) => {
+                                            (checkpoint.tasks, checkpoint.values)
+                                        }
+                                        _ => return Err(failure(SourceInferenceError::Scope)),
                                     };
-                                    if checkpoint.tasks != tasks.len()
-                                        || checkpoint.values != values.len()
-                                    {
+                                    if saved_tasks != tasks.len() || saved_values != values.len() {
                                         return Err(failure(SourceInferenceError::Scope));
                                     }
                                 }
@@ -5784,6 +5834,39 @@ impl Context {
                                     build.expected,
                                     binding_kind,
                                 ));
+                            }
+                            Task::LocalInferenceContinuation(replay) => {
+                                let continuation = values.pop().expect("local continuation visit");
+                                let index = attempts.len();
+                                attempts.push(Attempt::LocalReplay(
+                                    Box::new(local_functions::inference::ReplayCheckpoint::new(
+                                        self,
+                                        &continuation,
+                                        tasks.len(),
+                                        values.len(),
+                                    )),
+                                    pending.clone(),
+                                ));
+                                let (syntax, expected) = replay.begin(self);
+                                tasks.push(Task::LocalInferenceFinish(replay, continuation, index));
+                                tasks.push(Task::Visit(syntax, expected, true));
+                            }
+                            Task::LocalInferenceFinish(replay, continuation, index) => {
+                                let value = values.pop().expect("resumed local function value");
+                                let value = replay.finish(self, value, continuation)?;
+                                if index + 1 != attempts.len() {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                }
+                                let Some(Attempt::LocalReplay(checkpoint, _)) = attempts.pop()
+                                else {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                };
+                                if checkpoint.tasks != tasks.len()
+                                    || checkpoint.values != values.len()
+                                {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                }
+                                values.push(value);
                             }
                             Task::LetAnnotation(name, value, body, expected, binding_kind) => {
                                 let annotation = values.pop().expect("let annotation visit");
@@ -5954,6 +6037,16 @@ impl Context {
                                             .iter()
                                             .map(|(_, _, val, ty)| (val.clone(), ty.clone()))
                                             .collect();
+                                        for (_, type_) in &discriminants {
+                                            if let Some(blocker) =
+                                                self.postponed_field_type_blocker(type_)?
+                                            {
+                                                blocked_application = Some(blocker);
+                                                return Err(failure(SourceInferenceError::Match(
+                                                    matching::MatchError::ExpectedInductive,
+                                                )));
+                                            }
+                                        }
                                         self.check_pattern_typing(&discriminants, &alternatives)?;
                                         // When a multi-discriminant match has a non-local
                                         // discriminant (e.g. `match System.Platform.numBits,
@@ -6293,6 +6386,47 @@ impl Context {
                         blocked_application = Some(blocker);
                         problem = *original;
                     }
+                    if let Some(blocker) = &blocked_application {
+                        let mut owner = None;
+                        for (index, attempt) in attempts.iter().enumerate().rev() {
+                            self.tick()?;
+                            if let Attempt::LocalInference(checkpoint, _) = attempt
+                                && checkpoint.owns(self, blocker)?
+                            {
+                                owner = Some(index);
+                                break;
+                            }
+                        }
+                        if let Some(index) = owner {
+                            if !tactics::backtrack::recoverable(&problem) {
+                                return Err(problem);
+                            }
+                            let Attempt::LocalInference(checkpoint, queue) = attempts.remove(index)
+                            else {
+                                return Err(failure(SourceInferenceError::Scope));
+                            };
+                            attempts.truncate(index);
+                            tasks.truncate(checkpoint.tasks);
+                            values.truncate(checkpoint.values);
+                            checkpoint.restore(self);
+                            pending = queue;
+                            let (replay, placeholder) = checkpoint.suspend(self)?;
+                            let binding = replay.binding();
+                            let (name, body, opaque) =
+                                (binding.name.clone(), binding.body, binding.opaque);
+                            let expected = replay.expected();
+                            values.push(placeholder);
+                            tasks.push(Task::LocalInferenceContinuation(Box::new(replay)));
+                            tasks.push(Task::LetValue(
+                                name,
+                                None,
+                                body,
+                                expected,
+                                if opaque { LetKind::Have } else { LetKind::Let },
+                            ));
+                            continue;
+                        }
+                    }
                     if let Some(blocker) = &blocked_application
                         && containing_argument.is_none()
                     {
@@ -6311,31 +6445,42 @@ impl Context {
                             }
                         }
                         if containing_argument.is_none() {
-                            if let Some(application) = blocked_initial_application
-                                && self.resolve_next_default_instance()?
-                            {
-                                // The pin retries postponed initial applications
-                                // between default-instance rounds. Do not close
-                                // their locals, drop pending argument work, or
-                                // refund the unsuccessful attempt's budget.
-                                tasks.push(application);
-                                continue;
-                            }
-                            if self.tactic_macro_depth != 0 {
-                                return Err(failure(SourceInferenceError::OwnedMacroSuspension {
-                                    blocker: blocked_application
-                                        .expect("unowned blocked application"),
-                                    problem: Box::new(problem),
-                                }));
-                            }
-                            if suspended {
-                                return Err(failure(SourceInferenceError::TacticMacro(
+                            containing_local_replay = attempts
+                                .iter()
+                                .rposition(|attempt| matches!(attempt, Attempt::LocalReplay(..)));
+                            if containing_local_replay.is_some() {
+                                if !tactics::backtrack::recoverable(&problem) {
+                                    return Err(problem);
+                                }
+                            } else {
+                                if let Some(application) = blocked_initial_application
+                                    && self.resolve_next_default_instance()?
+                                {
+                                    // The pin retries postponed initial applications
+                                    // between default-instance rounds. Do not close
+                                    // their locals, drop pending argument work, or
+                                    // refund the unsuccessful attempt's budget.
+                                    tasks.push(application);
+                                    continue;
+                                }
+                                if self.tactic_macro_depth != 0 {
+                                    return Err(failure(
+                                        SourceInferenceError::OwnedMacroSuspension {
+                                            blocker: blocked_application
+                                                .expect("unowned blocked application"),
+                                            problem: Box::new(problem),
+                                        },
+                                    ));
+                                }
+                                if suspended {
+                                    return Err(failure(SourceInferenceError::TacticMacro(
                                     crate::tactic_macros::TacticMacroError::Unsupported(
                                         "a generated term awaits an argument outside the current source driver".into(),
                                     ),
                                 )));
+                                }
+                                return Err(problem);
                             }
-                            return Err(problem);
                         }
                     }
                     if blocked_application.is_none() && !tactics::backtrack::recoverable(&problem) {
@@ -6354,6 +6499,17 @@ impl Context {
                                 continue;
                             }
                             if attempts.len() != target || !matches!(&attempt, Attempt::Argument(_))
+                            {
+                                return Err(failure(SourceInferenceError::Scope));
+                            }
+                        }
+                        if let Some(target) = containing_local_replay {
+                            if attempts.len() > target {
+                                self.tick()?;
+                                continue;
+                            }
+                            if attempts.len() != target
+                                || !matches!(&attempt, Attempt::LocalReplay(..))
                             {
                                 return Err(failure(SourceInferenceError::Scope));
                             }
@@ -6414,6 +6570,22 @@ impl Context {
                                     tasks.push(Task::LocalFunctionStart(Box::new(build), column));
                                     break;
                                 }
+                            }
+                            Attempt::LocalInference(checkpoint, queue) => {
+                                tasks.truncate(checkpoint.tasks);
+                                values.truncate(checkpoint.values);
+                                checkpoint.restore(self);
+                                pending = queue;
+                                self.tick()?;
+                            }
+                            Attempt::LocalReplay(checkpoint, queue) => {
+                                tasks.truncate(checkpoint.tasks);
+                                values.truncate(checkpoint.values);
+                                pending = queue;
+                                let continuation = checkpoint.fail(self, problem.clone());
+                                self.tick()?;
+                                values.push(continuation);
+                                break;
                             }
                             Attempt::Proof(mut checkpoint, queue) => {
                                 tasks.truncate(checkpoint.tasks);

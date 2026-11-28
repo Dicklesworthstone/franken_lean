@@ -149,7 +149,24 @@ impl Context {
         &mut self,
         syntax: &Syntax,
     ) -> Result<Vec<Syntax>, NatDefinitionElabError> {
-        let binder = self.copy_pattern_syntax(syntax)?;
+        let mut binder = self.copy_pattern_syntax(syntax)?;
+        // `toBinderViews` also accepts an unbracketed identifier or `_`.
+        // Give it the ordinary explicit-binder path with an inferred domain;
+        // keeping the original identifier preserves its lexical identity.
+        if matches!(binder, Syntax::Ident { .. })
+            || binder.kind() == Some(&parser_kind(&["Term", "hole"]))
+        {
+            binder = Syntax::node(
+                parser_kind(&["Term", "explicitBinder"]),
+                vec![
+                    Syntax::atom(SourceInfo::None, "("),
+                    null(vec![binder]),
+                    null(Vec::new()),
+                    null(Vec::new()),
+                    Syntax::atom(SourceInfo::None, ")"),
+                ],
+            );
+        }
         let mut grouped = self.expand_grouped_tactic_binders(null(vec![binder]))?;
         let Syntax::Node { args, .. } = &mut grouped else {
             unreachable!("constructed null binder telescope");

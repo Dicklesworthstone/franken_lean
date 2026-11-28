@@ -5,6 +5,7 @@
 use super::*;
 use std::collections::HashSet;
 
+pub(super) mod inference;
 pub(super) mod lifting;
 
 /// A local recursive value is checked before its continuation, but remains

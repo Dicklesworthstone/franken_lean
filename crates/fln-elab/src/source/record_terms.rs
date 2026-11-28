@@ -203,6 +203,34 @@ fn owned_args(mut syntax: Syntax) -> Result<Vec<Syntax>, NatDefinitionElabError>
 }
 
 impl Context {
+    /// A match cannot audit constructor patterns against a field's unresolved
+    /// result before the receiver determines which projection it denotes.
+    /// Report the actual receiver blocker so an enclosing inference checkpoint
+    /// can resume the whole source value in its original scope.
+    pub(super) fn postponed_field_type_blocker(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<Option<MVarId>, NatDefinitionElabError> {
+        if self.application_type_unavailable(type_)?.is_none() {
+            return Ok(None);
+        }
+        let type_ = self.instantiate(type_)?;
+        let fields: Vec<_> = self
+            .postponed_fields
+            .iter()
+            .map(|field| (field.expected.clone(), field.receiver.type_.clone()))
+            .collect();
+        for (expected, receiver) in fields {
+            self.tick()?;
+            if self.instantiate(&expected)? == type_
+                && let Some(blocker) = self.application_type_unavailable(&receiver)?
+            {
+                return Ok(Some(blocker));
+            }
+        }
+        Ok(None)
+    }
+
     /// The whole application is synthetic, not just its unresolved field head.
     /// Its arguments cannot be checked before lookup supplies their telescope.
     pub(super) fn postpone_field_application(
