@@ -250,7 +250,8 @@ pub const ROWS: &[Row] = &[
         "Lean/Util/RecDepth.lean:15",
         AtLeastDefault,
     ),
-    // Read by a definition header (`auto_bound_name` in source.rs).
+    // Read by declaration term and universe headers (`auto_bound_name` in
+    // source.rs and `auto_bound_level_name` in source/level_syntax.rs).
     row(
         "autoImplicit",
         Bool(true),
@@ -261,10 +262,7 @@ pub const ROWS: &[Row] = &[
         "relaxedAutoImplicit",
         Bool(true),
         "Lean/Elab/AutoBound.lean:22",
-        Inert(
-            "this engine auto-binds only strict names (one character and a suffix) either way; \
-             `false` is exactly that, and under `true` it binds a subset of the pin's names",
-        ),
+        Honored,
     ),
     // Read by the names `native_decide` gives its axioms: a lone theorem's body is elaborated
     // in a forked name generator when it holds (`elabAsync`, Lean/Elab/MutualDef.lean:1237-1243),
@@ -1081,7 +1079,8 @@ mod tests {
         // `presented_evaluations_do_not_escape_their_command_streams` sets it false.
         // `stderrAsMessages`: the source executor's stderr routing (`fln`, `lib.rs`);
         // runtime/stdout/tests/input/stderr.rs exercises scoped and persistent values.
-        // `autoImplicit`: `auto_bound_name` (source.rs); `source_auto_bound_implicits` sets it false.
+        // `autoImplicit` and `relaxedAutoImplicit`: `auto_bound_name` (source.rs);
+        // the source auto-implicit tests exercise their header eligibility rules.
         // `Elab.async`: the names `native_decide` gives its axioms (source.rs,
         // tactics/decision.rs); `source_native_decide` sets it false.
         // `linter.*`: the missing-docs, unused-variables, deprecated-syntax, defProp and checkUnivs warnings
@@ -1122,6 +1121,7 @@ mod tests {
                 "synthInstance.maxSize",
                 "maxSynthPendingDepth",
                 "autoImplicit",
+                "relaxedAutoImplicit",
                 "Elab.async",
                 "linter.all",
                 "linter.unusedVariables",

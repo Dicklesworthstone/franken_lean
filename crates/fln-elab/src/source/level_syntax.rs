@@ -47,6 +47,16 @@ fn error(error: LevelSyntaxError) -> NatDefinitionElabError {
     failure(SourceInferenceError::LevelSyntax(error))
 }
 
+/// Level.elabLevel receives the header's autoImplicit setting, then applies
+/// isValidAutoBoundLevelName. Strict universe names additionally start with an
+/// ASCII lowercase letter (the pin's Char.isLower); declared names bypass this.
+fn auto_bound_level_name(name: &Name, options: &KVMap) -> bool {
+    auto_bound_name(name, options)
+        && (options.get_bool(&Name::from_components(["relaxedAutoImplicit"]), true)
+            || matches!(name.leaf_view(), LeafView::Str(spelled)
+                if spelled.as_bytes().first().is_some_and(u8::is_ascii_lowercase)))
+}
+
 /// The pinned `declId` suffix is optional `[.{, sepBy1 ident, }]`.
 /// Called by both elaboration and post-admission instance registration.
 pub(super) fn explicit_parameters(syntax: &Syntax) -> Result<Vec<Name>, NatDefinitionElabError> {
@@ -141,8 +151,7 @@ impl Context {
                     if let Syntax::Ident { val, .. } = syntax {
                         if !self.level_params.contains(val) {
                             if !self.infer_level_params
-                                || val.is_anonymous()
-                                || !val.parent().is_anonymous()
+                                || !auto_bound_level_name(val, &self.txn.options)
                             {
                                 return Err(error(LevelSyntaxError::Unknown(val.clone())));
                             }

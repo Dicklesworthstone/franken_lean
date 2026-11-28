@@ -7241,13 +7241,13 @@ fn definition_scoped_elaboration(
     })
 }
 
-/// Whether the pin would auto-bind `name` in a header: `autoImplicit` is on (its default) and
-/// `name` is atomic, without macro scopes, and a strict name, one character followed only by
-/// digits, subscripts, `_` or `'` (`checkValidAutoBoundImplicitName`,
-/// Lean/Elab/AutoBound.lean:31-63; `isSubScriptAlnum`, Init/Meta/Defs.lean:111-118). The pin's
-/// default `relaxedAutoImplicit` also binds any other atomic name; this engine does not, because
-/// its seed lacks names Init has (`IO`, `Int`, `Unit`), and binding those would make a variable
-/// of a constant. Such a name stays an unknown identifier: a refusal where the pin may accept.
+/// The pin's `checkValidAutoBoundImplicitName` (Lean/Elab/AutoBound.lean): only
+/// nonempty atomic names without macro scopes are eligible. With both options
+/// at their defaults, any such unknown header name may become an implicit.
+/// `relaxedAutoImplicit := false` restricts it to one character followed only
+/// by digits, subscripts, `_` or `'` (`isSubScriptAlnum`, Init/Meta/Defs.lean).
+/// Existing constants are resolved before this test; inference and ordinary
+/// admission still determine whether the resulting complete telescope is valid.
 fn auto_bound_name(name: &Name, options: &KVMap) -> bool {
     if !options.get_bool(&Name::from_components(["autoImplicit"]), true)
         || name.has_macro_scopes()
@@ -7258,6 +7258,12 @@ fn auto_bound_name(name: &Name, options: &KVMap) -> bool {
     let LeafView::Str(spelled) = name.leaf_view() else {
         return false;
     };
+    if spelled.is_empty() {
+        return false;
+    }
+    if options.get_bool(&Name::from_components(["relaxedAutoImplicit"]), true) {
+        return true;
+    }
     let subscript = |c: char| {
         let c = u32::from(c);
         (0x2080..=0x2089).contains(&c)
