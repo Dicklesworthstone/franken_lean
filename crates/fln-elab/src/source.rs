@@ -768,6 +768,9 @@ struct Context {
     simp_discharge_depth: usize,
     // Host-owned generated trees nest only while their evaluator is alive.
     tactic_macro_depth: usize,
+    // Owned imported autoParam tactic trees may enter nested term evaluators.
+    // Keep this host nesting bounded independently of each proof worklist.
+    auto_param_depth: usize,
     // Term macro dispatch is active inside by proofs, including native tactics.
     tactic_macro_terms: usize,
     // Rejection-model checks observe actual macro expansions without executing
@@ -1035,6 +1038,7 @@ impl Context {
             attempt_depth: 0,
             simp_discharge_depth: 0,
             tactic_macro_depth: 0,
+            auto_param_depth: 0,
             tactic_macro_terms: 0,
             application_syntax: pattern_typing::ApplicationSyntax::default(),
             opaque_locals: std::collections::HashSet::new(),
@@ -2718,8 +2722,14 @@ impl Context {
             BinderDomain(binders::Telescope<'a>),
             BinderBody(binders::Telescope<'a>),
             LocalFunctionAnnotation(Box<local_functions::Build<'a>>),
-            LocalFunctionStart(Box<local_functions::Build<'a>>, local_functions::Candidate),
+            LocalFunctionStart(Box<local_functions::Build<'a>>, Option<usize>),
             LocalFunctionValue(Box<local_functions::Build<'a>>, usize),
+            LocalCourseOriginal(
+                Box<local_functions::Build<'a>>,
+                Box<recursion::OriginalBody>,
+                usize,
+            ),
+            LocalCourseValue(Box<recursion::CourseBuild>, Typed, usize),
             LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>, LetKind),
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>, LetKind),
             LetBody(LocalContext, FVarId, Name, Typed, LetKind),
@@ -2849,6 +2859,8 @@ impl Context {
                                         | Task::MatrixAbstraction(..)
                                         | Task::PrivateDecl(..)
                                         | Task::LocalFunctionValue(..)
+                                        | Task::LocalCourseOriginal(..)
+                                        | Task::LocalCourseValue(..)
                                         | Task::MatchBranch(..)
                                         | Task::DoBindJoinBody(..)
                                         | Task::DoBindJoinValue(..)
@@ -2933,6 +2945,8 @@ impl Context {
                                     | Task::MatrixAbstraction(..)
                                     | Task::PrivateDecl(..)
                                     | Task::LocalFunctionValue(..)
+                                    | Task::LocalCourseOriginal(..)
+                                    | Task::LocalCourseValue(..)
                                     | Task::MatchBranch(..)
                                     | Task::DoBindJoinBody(..)
                                     | Task::DoBindJoinValue(..)
@@ -5384,7 +5398,8 @@ impl Context {
                                     // explicit argument when the codomain does not depend
                                     // on that argument (e.g. Inhabited.mk (fun x => ...)),
                                     // unless it is an instance's output, which the pin
-                                    // leaves to the instance (`resultIsOutParamSupport`).
+                                    // leaves to the instance (`resultIsOutParamSupport`),
+                                    // or Prop, which may need a Boolean result coercion.
                                     if rest.is_empty()
                                         && propagates
                                         && !codomain.has_loose_bvar(0)
@@ -5392,6 +5407,7 @@ impl Context {
                                         && self
                                             .application_result_out_param(&function, explicit)?
                                             .is_none()
+                                        && self.instantiate(expected)? != Expr::sort(Level::zero())
                                     {
                                         self.do_operation_result_hint(
                                             &function, &codomain, expected,
@@ -5659,35 +5675,45 @@ impl Context {
                                     tasks.push(Task::Visit(value, Some(annotation.value), true));
                                 }
                             }
-                            Task::LocalFunctionStart(mut build, candidate) => match candidate {
-                                local_functions::Candidate::Course { decreasing } => {
-                                    let postponed_start = self.postponed_application_errors.len();
-                                    let value =
-                                        self.run_local_function_course(&mut build, decreasing)?;
-                                    values.push(value);
-                                    tasks.push(Task::LocalFunctionValue(build, postponed_start));
-                                }
-                                local_functions::Candidate::NonRecursive => {
-                                    self.start_local_function_value(&mut build, None)?;
-                                    let value = build.value_syntax;
-                                    let expected = build.result_type.clone();
-                                    tasks.push(Task::LocalFunctionValue(
+                            Task::LocalFunctionStart(mut build, column) => {
+                                self.start_local_function_value(&mut build, column)?;
+                                let value = build.value_syntax;
+                                let expected = build.result_type.clone();
+                                let postponed_start = self.postponed_application_errors.len();
+                                tasks.push(if build.course_parameter.is_some() {
+                                    Task::LocalCourseOriginal(
                                         build,
-                                        self.postponed_application_errors.len(),
-                                    ));
-                                    tasks.push(Task::Visit(value, expected, true));
-                                }
-                                local_functions::Candidate::MatchColumn { column, .. } => {
-                                    self.start_local_function_value(&mut build, Some(column))?;
-                                    let value = build.value_syntax;
-                                    let expected = build.result_type.clone();
-                                    tasks.push(Task::LocalFunctionValue(
-                                        build,
-                                        self.postponed_application_errors.len(),
-                                    ));
-                                    tasks.push(Task::Visit(value, expected, true));
-                                }
-                            },
+                                        Box::new(self.start_recursive_body_obligation()),
+                                        postponed_start,
+                                    )
+                                } else {
+                                    Task::LocalFunctionValue(build, postponed_start)
+                                });
+                                tasks.push(Task::Visit(value, expected, true));
+                            }
+                            Task::LocalCourseOriginal(build, saved, postponed_start) => {
+                                self.require_no_postponed_recursion_since(postponed_start)?;
+                                let original = values.pop().expect("local course original body");
+                                let obligation =
+                                    self.finish_recursive_body_obligation(*saved, original)?;
+                                let expected =
+                                    build.result_type.clone().expect("local course result");
+                                let course = self.start_course_of_values(expected.clone())?;
+                                let value = build.value_syntax;
+                                tasks.push(Task::LocalFunctionValue(build, postponed_start));
+                                tasks.push(Task::LocalCourseValue(
+                                    Box::new(course),
+                                    obligation,
+                                    postponed_start,
+                                ));
+                                tasks.push(Task::Visit(value, Some(expected), true));
+                            }
+                            Task::LocalCourseValue(course, obligation, postponed_start) => {
+                                self.require_no_postponed_recursion_since(postponed_start)?;
+                                let term = values.pop().expect("local course functional body");
+                                values
+                                    .push(self.finish_course_of_values(*course, obligation, term)?);
+                            }
                             Task::LocalFunctionValue(build, postponed_start) => {
                                 if build.checkpoint.is_some() {
                                     // Completed local bodies hand selected errors
@@ -8416,6 +8442,12 @@ fn definition_elaboration(
                 && (state.reference.is_some() || state.group.is_some())
         })
     {
+        // `addPreDefinitions` sends a nonrecursive opaque to `addNonRecAux`,
+        // preserving its unsafe flag. Its value still passes the opaque
+        // declaration's ordinary safe checker. A surviving unsafe self-edge
+        // or mutual unsafe group instead takes `addAndCompileUnsafe` below,
+        // retaining the executable recursive body as an unsafe definition
+        // with opaque hints.
         Ok(Declaration::Opaque(fln_env::constants::OpaqueVal {
             base,
             value: term.value,

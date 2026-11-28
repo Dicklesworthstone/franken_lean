@@ -7,8 +7,25 @@
 use super::*;
 use fln_env::constants::{ConstantInfo, DefinitionSafety};
 
+/// The checked recursor application and its open functional. The source driver
+/// owns the body continuation, so nested local functions stay on its heap stack.
+pub(in crate::source) struct Build {
+    recursion: Recursion,
+    expected: Expr,
+    major: LocalDecl,
+    family_type: Expr,
+    indices: Vec<LocalDecl>,
+    below_id: FVarId,
+    below_type: Expr,
+    saved: LocalContext,
+    recursor: Typed,
+    functional_type: Expr,
+    neutral: Typed,
+    num_nested: u32,
+}
+
 impl Context {
-    pub(super) fn course_spine(
+    pub(in crate::source) fn course_spine(
         &mut self,
         value: &Expr,
     ) -> Result<(Expr, Vec<Expr>), NatDefinitionElabError> {
@@ -113,12 +130,22 @@ impl Context {
         self.match_apply(function, Typed { value, type_ })
     }
 
-    pub(in crate::source) fn course_of_values_body(
+    pub(super) fn course_of_values_body(
         &mut self,
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
         let expected = expected.ok_or_else(|| error(RecursionError::ResultTypeRequired))?;
+        let obligation = self.original_recursive_body_obligation(syntax, Some(expected.clone()))?;
+        let build = self.start_course_of_values(expected.clone())?;
+        let term = self.term(syntax, Some(expected))?;
+        self.finish_course_of_values(build, obligation, term)
+    }
+
+    pub(in crate::source) fn start_course_of_values(
+        &mut self,
+        expected: Expr,
+    ) -> Result<Build, NatDefinitionElabError> {
         let recursion = self
             .recursion
             .clone()
@@ -161,9 +188,6 @@ impl Context {
         if definition.safety != DefinitionSafety::Safe {
             return Err(error(RecursionError::NotDecreasing));
         }
-        // Preserve the original source obligation before adding any induction
-        // dictionary. It must not make invalid original typing disappear.
-        let obligation = self.original_recursive_body_obligation(syntax, Some(expected.clone()))?;
         self.recursive_indices(name, parameters, &indices)?;
         let recursion = self
             .recursion
@@ -294,7 +318,42 @@ impl Context {
         state.pending = false;
         state.course_name = Some(below_name.clone());
         state.matrix_hidden.insert(below_name);
-        let term = self.term(syntax, Some(expected.clone()))?;
+        Ok(Build {
+            recursion,
+            expected,
+            major,
+            family_type,
+            indices,
+            below_id,
+            below_type: below_type.clone(),
+            saved,
+            recursor,
+            functional_type: functional_type.clone(),
+            neutral,
+            num_nested: family.num_nested,
+        })
+    }
+
+    pub(in crate::source) fn finish_course_of_values(
+        &mut self,
+        build: Build,
+        obligation: Typed,
+        term: Typed,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let Build {
+            recursion,
+            expected,
+            major,
+            family_type,
+            indices,
+            below_id,
+            below_type,
+            saved,
+            recursor,
+            functional_type,
+            neutral,
+            num_nested,
+        } = build;
         self.resolve_instances_with_defaults()?;
         self.flush(true)?;
         let mut value = self.instantiate(&term.value)?;
@@ -352,7 +411,7 @@ impl Context {
                 type_: functional_type.clone(),
             },
         )?;
-        for _ in 0..family.num_nested {
+        for _ in 0..num_nested {
             self.tick()?;
             let type_ = self.whnf(&result.type_)?;
             let ExprNode::ForallE { binder_type, .. } = type_.node() else {

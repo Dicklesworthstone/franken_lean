@@ -15,6 +15,8 @@ pub(crate) enum Operation {
     Wait,
     MapTask,
     BindTask,
+    GetTaskState,
+    WaitAny,
 }
 
 impl Operation {
@@ -26,6 +28,8 @@ impl Operation {
             Self::Wait,
             Self::MapTask,
             Self::BindTask,
+            Self::GetTaskState,
+            Self::WaitAny,
         ]
         .into_iter()
         .find(|operation| requested == &model::name(operation.label()))
@@ -39,6 +43,8 @@ impl Operation {
             Self::Wait => "IO.wait",
             Self::MapTask => "BaseIO.mapTask",
             Self::BindTask => "BaseIO.bindTask",
+            Self::GetTaskState => "IO.getTaskState",
+            Self::WaitAny => "IO.waitAny",
         }
     }
 }
@@ -99,7 +105,12 @@ pub(crate) fn operation_matches(
     }
     if matches!(
         operation,
-        Operation::AsTask | Operation::Wait | Operation::MapTask | Operation::BindTask
+        Operation::AsTask
+            | Operation::Wait
+            | Operation::MapTask
+            | Operation::BindTask
+            | Operation::GetTaskState
+            | Operation::WaitAny
     ) && !io::io_world_contract_matches(environment, externs, visited, limits)?
     {
         return Err(unsupported());
@@ -125,7 +136,7 @@ pub(crate) fn operation_matches(
     }
     if matches!(
         operation,
-        Operation::Wait | Operation::MapTask | Operation::BindTask
+        Operation::Wait | Operation::WaitAny | Operation::MapTask | Operation::BindTask
     ) {
         // The opaque model references this exact getter. The continuation's
         // native operation reads the task payload directly, so an absent
@@ -137,6 +148,27 @@ pub(crate) fn operation_matches(
             visited,
             limits,
         )?;
+    }
+    if operation == Operation::GetTaskState {
+        // Native state ordinals are rebuilt with these checked constructors;
+        // a selected foreign layout or default must not be bypassed.
+        for label in [
+            "IO.TaskState",
+            "IO.TaskState.waiting",
+            "IO.TaskState.running",
+            "IO.TaskState.finished",
+            "IO.TaskState.rec",
+            "IO.instInhabitedTaskState",
+            "IO.instInhabitedTaskState.default",
+        ] {
+            check_selected_extern_attribute(
+                environment,
+                &model::name(label),
+                externs,
+                visited,
+                limits,
+            )?;
+        }
     }
     Ok(true)
 }

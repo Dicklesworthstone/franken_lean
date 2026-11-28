@@ -19,7 +19,9 @@ mod mutual_structural;
 mod obligation;
 mod well_founded;
 pub(super) use constrained::ConstrainedBranch;
+pub(super) use course::Build as CourseBuild;
 pub(in crate::source) use mutual_structural::{StructuralMember, StructuralPlan};
+pub(super) use obligation::OriginalBody;
 use std::collections::{HashMap, HashSet};
 pub(super) use well_founded::Executable as WellFoundedExecutable;
 pub(super) use well_founded::State as WellFounded;
@@ -1655,6 +1657,8 @@ impl Context {
             Err(problem) => return Err(problem),
         };
         let mut first_error = None;
+        let mut tried_any = false;
+        let mut tried_course = HashSet::new();
         if let Some((selected, context)) = matched_root {
             let columns = self.recursion_columns(parameters, selected)?;
             let matched: Vec<_> = columns.iter().map(|(_, position)| *position).collect();
@@ -1662,9 +1666,13 @@ impl Context {
                 if hinted_parameter.is_some_and(|position| position != decreasing) {
                     continue;
                 }
+                tried_any = true;
                 let mut generalized = HashSet::new();
                 let mut course = false;
                 loop {
+                    if course {
+                        tried_course.insert(decreasing);
+                    }
                     let spent = self.txn.budget.heartbeats_consumed;
                     *self = snapshot.clone();
                     self.txn.budget.heartbeats_consumed = spent;
@@ -1780,14 +1788,23 @@ impl Context {
                     }
                 }
             }
-        } else {
-            // A structural match may sit under a binder such as `dite` or `let`
-            // (e.g. `Array.appendCore`/`Array.extract`). Course-of-values
-            // (`brecOn`) does not require a root-level match: `below` is
-            // generalized by ordinary dependent matching wherever `match` runs.
+        }
+        // A structural match may sit under a binder such as `dite`, `let`, or
+        // an outer match on a non-decreasing parameter. Course-of-values
+        // (`brecOn`) does not require a root-level match on the decreasing
+        // parameter: `below` is generalized wherever `match` runs. Only scan
+        // un-matched parameters when no root-match candidate ran or the user
+        // explicitly hinted a structural parameter, so ordinary well-founded
+        // definitions with a root match do not pay extra course attempts.
+        if !tried_any || hinted_parameter.is_some() {
+            let spent = self.txn.budget.heartbeats_consumed;
+            *self = snapshot.clone();
+            self.txn.budget.heartbeats_consumed = spent;
             let candidates = self.course_candidate_parameters(parameters)?;
             for decreasing in candidates {
-                if hinted_parameter.is_some_and(|position| position != decreasing) {
+                if tried_course.contains(&decreasing)
+                    || hinted_parameter.is_some_and(|position| position != decreasing)
+                {
                     continue;
                 }
                 let mut generalized = HashSet::new();
@@ -1795,8 +1812,17 @@ impl Context {
                     let spent = self.txn.budget.heartbeats_consumed;
                     *self = snapshot.clone();
                     self.txn.budget.heartbeats_consumed = spent;
-                    let result = self
-                        .prepare_course_recursion(name, parameters, decreasing, expected.as_ref())
+                    let result = expected
+                        .as_ref()
+                        .ok_or_else(|| error(RecursionError::ResultTypeRequired))
+                        .and_then(|expected_expr| {
+                            self.prepare_recursion_parameter(
+                                name,
+                                parameters,
+                                expected_expr,
+                                decreasing,
+                            )
+                        })
                         .and_then(|()| {
                             self.recursion
                                 .as_mut()
@@ -1947,16 +1973,6 @@ impl Context {
         Ok(candidates)
     }
 
-    pub(super) fn prepare_course_recursion(
-        &mut self,
-        name: &Name,
-        parameters: &[LocalDecl],
-        decreasing: usize,
-        expected: Option<&Expr>,
-    ) -> Result<(), NatDefinitionElabError> {
-        self.prepare_recursion_for_parameter(name, parameters, expected, 0, decreasing, &[])
-    }
-
     pub(super) fn prepare_recursion(
         &mut self,
         name: &Name,
@@ -1966,6 +1982,7 @@ impl Context {
         column: usize,
         matched: &[usize],
     ) -> Result<(), NatDefinitionElabError> {
+        let expected = expected.ok_or_else(|| error(RecursionError::ResultTypeRequired))?;
         while let Some(inner) = parenthesized_inner(syntax)? {
             self.tick()?;
             syntax = inner;
@@ -1998,21 +2015,29 @@ impl Context {
             .iter()
             .rposition(|local| &local.user_name == val)
             .ok_or_else(|| error(RecursionError::RootMatchRequired))?;
-        self.prepare_recursion_for_parameter(
-            name, parameters, expected, column, decreasing, matched,
-        )
+        self.prepare_recursion_parameter(name, parameters, expected, decreasing)?;
+        let recursion = self
+            .recursion
+            .as_mut()
+            .expect("prepared structural parameter");
+        recursion.column = column;
+        recursion.matched_parameters = matched.iter().copied().collect();
+        Ok(())
     }
 
-    fn prepare_recursion_for_parameter(
+    /// Prepare a real telescope parameter without inventing a source match.
+    /// Primitive candidates add their matrix column; course candidates use the
+    /// same typed self and parameter identities with no pending root split.
+    pub(super) fn prepare_recursion_parameter(
         &mut self,
         name: &Name,
         parameters: &[LocalDecl],
-        expected: Option<&Expr>,
-        column: usize,
+        expected: &Expr,
         decreasing: usize,
-        matched: &[usize],
     ) -> Result<(), NatDefinitionElabError> {
-        let expected = expected.ok_or_else(|| error(RecursionError::ResultTypeRequired))?;
+        if decreasing >= parameters.len() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
         let reference = self.reference_result(expected);
         let mut full_type = self.instantiate(&reference)?;
         for local in parameters.iter().rev() {
@@ -2043,8 +2068,8 @@ impl Context {
             marker,
             parameters: parameters.to_vec(),
             decreasing,
-            column,
-            matched_parameters: matched.iter().copied().collect(),
+            column: 0,
+            matched_parameters: HashSet::new(),
             generalized_parameters: HashSet::new(),
             pending: true,
             matrix: false,

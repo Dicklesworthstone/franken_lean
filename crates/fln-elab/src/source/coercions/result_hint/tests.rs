@@ -1,6 +1,6 @@
 use super::*;
 use fln_env::constants::{
-    ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
+    AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
 };
 
 fn name(label: &str) -> Name {
@@ -50,6 +50,73 @@ fn reader_fixture() -> Environment {
             BinderInfo::Default,
         ),
     )
+}
+
+#[test]
+fn early_result_hints_leave_the_application_carrier_for_its_arguments() {
+    // App.propagateExpectedType calls isDefEq expectedType fTypeBody
+    // (vendored Lean/Elab/App.lean:595). The orientation is observable when
+    // both are holes: the expected carrier aliases the application's carrier,
+    // which later arguments must still determine. Exercise both ordinary
+    // paths, selected by the actual class registry, and the first-order path
+    // for two applied family holes.
+    for coercions_enabled in [false, true] {
+        let mut env = reader_fixture();
+        if coercions_enabled {
+            let class = name("CoeT");
+            env = env
+                .add_decl(ConstantInfo::Axiom(AxiomVal {
+                    base: ConstantVal {
+                        name: class.clone(),
+                        level_params: vec![],
+                        type_: universe(),
+                    },
+                    is_unsafe: false,
+                }))
+                .unwrap();
+            env = crate::instances::register_class(&env, &class).unwrap();
+        }
+        for applied in [false, true] {
+            let mut context = Context::new(&env, budget());
+            assert_eq!(
+                context.has_coercion_class("CoeT").unwrap(),
+                coercions_enabled
+            );
+            let type_ = if applied {
+                constructor_type()
+            } else {
+                universe()
+            };
+            let expected = context.hole(type_.clone()).unwrap();
+            let actual = context.hole(type_).unwrap();
+            let (result, hint) = if applied {
+                (
+                    Expr::app(actual.clone(), nat()),
+                    Expr::app(expected.clone(), nat()),
+                )
+            } else {
+                (actual.clone(), expected.clone())
+            };
+            context.constrain_result_hint(&result, &hint).unwrap();
+            assert_eq!(
+                context.instantiate(&expected).unwrap(),
+                actual,
+                "expected-first propagation with coercions={coercions_enabled}, applied={applied}"
+            );
+            assert_eq!(context.instantiate(&actual).unwrap(), actual);
+
+            // Propagation does not discharge the application's remaining type
+            // obligation. Information from its argument still fixes both carriers.
+            let resolved = if applied {
+                Expr::const_(name("ReaderLike"), vec![])
+            } else {
+                nat()
+            };
+            context.constrain(&actual, &resolved).unwrap();
+            assert_eq!(context.instantiate(&actual).unwrap(), resolved);
+            assert_eq!(context.instantiate(&expected).unwrap(), resolved);
+        }
+    }
 }
 
 #[test]

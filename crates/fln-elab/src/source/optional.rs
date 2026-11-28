@@ -4,6 +4,9 @@
 use super::*;
 use fln_syntax::source::{ByteSpan, SourceInfo};
 
+mod tactic;
+pub(super) use tactic::AutoParameter;
+
 fn null(args: Vec<Syntax>) -> Syntax {
     Syntax::node(Name::from_components(["null"]), args)
 }
@@ -23,15 +26,20 @@ pub(super) fn default_value(domain: &Expr) -> Option<&Expr> {
 }
 
 /// `Expr.isAutoParam` is syntactic, matching `default_value` and `App.lean:472`.
-pub(super) fn is_auto_param(domain: &Expr) -> bool {
-    let ExprNode::App { f, .. } = domain.node() else {
-        return false;
+pub(super) fn auto_tactic(domain: &Expr) -> Option<&Expr> {
+    let ExprNode::App { f, a: tactic } = domain.node() else {
+        return None;
     };
     let ExprNode::App { f, .. } = f.node() else {
-        return false;
+        return None;
     };
     matches!(f.node(), ExprNode::Const { name, .. }
         if name == &Name::from_components(["autoParam"]))
+    .then_some(tactic)
+}
+
+pub(super) fn is_auto_param(domain: &Expr) -> bool {
+    auto_tactic(domain).is_some()
 }
 
 impl Context {
@@ -108,11 +116,11 @@ impl Context {
         &mut self,
         type_: &Expr,
     ) -> Result<bool, NatDefinitionElabError> {
-        self.has_optional_parameter_with(type_, false)
+        self.has_optional_parameter_with(type_, true)
     }
 
     /// `hasOptAutoParams` (`Lean/Elab/App.lean:484`): like
-    /// `has_optional_parameter`, also recognizing `autoParam` domains when
+    /// `has_optional_parameter`, recognizing both annotation forms when
     /// deciding whether early expected-type propagation must postpone.
     pub(super) fn has_optional_or_auto_parameter(
         &mut self,
@@ -180,8 +188,8 @@ impl Context {
         let saved = self.txn.lctx.clone();
         let mut state = self.start_named_application(term, &[], expected.cloned(), false)?;
         // There are no written arguments. The common telescope loop supplies
-        // defaults, implicits and fresh eta binders without recursively
-        // entering source elaboration.
+        // defaults, implicits and fresh eta binders. Quoted tactic defaults
+        // run at application completion, after its type constraints are known.
         let result = (|| {
             if self.next_named_argument(&mut state)?.is_some() {
                 return Err(failure(SourceInferenceError::Scope));

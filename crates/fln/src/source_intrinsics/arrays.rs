@@ -242,6 +242,41 @@ pub(crate) fn operation_matches(
     Ok(true)
 }
 
+/// The Task wait-any bridge shares this exact List lookup contract. Reuse the
+/// existing immutable inventory without requiring any Array declaration or
+/// native Array representation in the caller's environment.
+pub(crate) fn list_lookup_matches(
+    environment: &Environment,
+    implementations: &ImplementedByTable,
+    initializers: Option<&BTreeSet<Name>>,
+    externs: &mut Option<fln_elab::externs::ExternTable>,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    check_closure(
+        environment,
+        [
+            name("List.rec"),
+            name("GetElem.getElem"),
+            name("List.instGetElemNatLtLength"),
+            name("GT.gt"),
+        ],
+        implementations,
+        initializers,
+        externs,
+        visited,
+        limits,
+    )
+    .map_err(|error| match error {
+        IngressError::UnsupportedNode {
+            kind: "native Array differs from its complete pinned logical and execution contract",
+        } => IngressError::UnsupportedNode {
+            kind: "native List lookup differs from its complete pinned logical and execution contract",
+        },
+        other => other,
+    })
+}
+
 pub(crate) fn modify_matches(
     environment: &Environment,
     implementations: &ImplementedByTable,
