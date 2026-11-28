@@ -14,8 +14,8 @@
 
 use super::{
     ErasedOperands, GeneratedExternRow, IrDecl, IrExecutionError, IrParam, IrType, Name, Ownership,
-    array_proofs, erased_type_runtime_arity, extern_row, natural_division_operands, primitives,
-    state_runtime_arity, string_proofs, tasks,
+    array_proofs, base_io_tasks, erased_type_runtime_arity, extern_row, natural_division_operands,
+    primitives, state_runtime_arity, string_proofs, tasks,
 };
 
 /// Recognize the compiler's structural suffix, not a dotted-name string or
@@ -63,6 +63,16 @@ impl BoxedNative {
                 parameters: signature.parameters,
                 result: signature.result,
                 exact_borrowed: None,
+            }));
+        }
+        if let Some(signature) = base_io_tasks::signature(row)? {
+            return Ok(Some(Self {
+                erased_prefix: signature.erased_prefix,
+                erased_suffix: signature.erased_proofs,
+                world_suffix: true,
+                parameters: signature.parameters,
+                result: signature.result,
+                exact_borrowed: Some(signature.borrowed),
             }));
         }
         if let Some(signature) = primitives::signature(row)? {

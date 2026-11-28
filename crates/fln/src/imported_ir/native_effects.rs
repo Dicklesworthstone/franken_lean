@@ -13,6 +13,9 @@
 //! The four Task constructors/combinators use Golem's completed, managerless
 //! path. Their callbacks remain ordinary budgeted VM calls, and their Task
 //! effect is preserved. This grants no scheduler or additional host I/O.
+//! BaseIO task creation/composition and completed-task observation share that
+//! same path. Their IO effect remains explicit, including callback cell writes;
+//! the inert world does not authorize other IO primitives.
 
 use super::{
     EntryArgument, GeneratedExternRow, IrExecutionError, IrExecutionLimits, Name, Native, fir,
@@ -138,6 +141,15 @@ pub(super) fn classify(
             "task",
             "extern:Task.pure" | "extern:Task.spawn" | "extern:Task.map" | "extern:Task.bind",
         ) => Ok(fir::EffectClass::Task),
+        (
+            "io",
+            "extern:BaseIO.asTask"
+            | "extern:BaseIO.mapTask"
+            | "extern:BaseIO.bindTask"
+            | "extern:IO.wait"
+            | "extern:IO.getTaskState"
+            | "extern:IO.waitAny",
+        ) => Ok(fir::EffectClass::Io),
         (
             "state",
             "extern:ST.Prim.mkRef"

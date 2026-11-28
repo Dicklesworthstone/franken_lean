@@ -58,6 +58,9 @@ mod names_reference;
 #[path = "tests/tasks.rs"]
 mod tasks;
 
+#[path = "tests/base_io_tasks.rs"]
+mod base_io_tasks;
+
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }

@@ -348,12 +348,7 @@ fn task_contracts_bind_full_and_native_telescopes_boxing_and_effects() {
             ));
         }
     }
-    for target in [
-        "BaseIO.asTask",
-        "BaseIO.mapTask",
-        "BaseIO.bindTask",
-        "IO.getTaskState",
-    ] {
+    for target in ["IO.cancel", "IO.checkCanceled", "IO.monoMsNow"] {
         let row = crate::imported_ir::native_row(&name(target)).unwrap();
         assert!(native_effects::classify(row, false).is_err(), "{target}");
     }

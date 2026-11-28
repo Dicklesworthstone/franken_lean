@@ -1142,6 +1142,7 @@ struct Native {
     ir_arity: usize,
     boxed: Option<native_signature::BoxedNative>,
     reference_state_telescope: bool,
+    reference_base_io_task_telescope: bool,
     state_runtime_arity: Option<usize>,
     arguments: Vec<flbc::ArgumentOwnership>,
     result: flbc::ResultOwnership,
@@ -1155,6 +1156,7 @@ impl Native {
             ir_arity: row.borrowed.len(),
             boxed: None,
             reference_state_telescope: false,
+            reference_base_io_task_telescope: false,
             state_runtime_arity: None,
             arguments: row.argument_ownership(),
             result: row.result_ownership(),
@@ -1206,6 +1208,8 @@ impl Native {
         let state_runtime_arity = native_signature::state_runtime_arity(row)?;
         let reference_state_telescope =
             state_runtime_arity.is_some_and(|runtime| arity == runtime + 3);
+        let reference_base_io_task_telescope =
+            native_signature::base_io_task_reference_telescope(row, arity)?;
         let arguments = contract
             .argument_ownership(native_signature::inferred_arity(row)?)
             .map_err(error)?
@@ -1228,6 +1232,7 @@ impl Native {
             ir_arity,
             boxed: None,
             reference_state_telescope,
+            reference_base_io_task_telescope,
             state_runtime_arity,
             arguments,
             result,
