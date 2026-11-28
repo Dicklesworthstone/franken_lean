@@ -141,6 +141,7 @@ pub(super) fn encode(
             && metadata.externs.is_empty()
             && metadata.deprecations.is_empty()
             && metadata.structures.is_empty()
+            && metadata.projections.is_empty()
             && metadata.compiler_signatures.is_empty()
             && metadata.compiler_data.is_empty()
         {

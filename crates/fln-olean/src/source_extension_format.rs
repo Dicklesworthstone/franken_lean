@@ -47,6 +47,7 @@
 //! stage0/stdlib/Lean/HeadIndex.c: sha256 357a938edda3ae067fb3d6d541a99e1c87467892a67b1de1e9d3f94aaf547524
 //! src/Lean/Compiler/NeverExtractAttr.lean: sha256 d8d3696924e8de7a22bef04fe1bda5d3e31a34e286f3144a500117b45b7034f7
 //! src/Lean/Elab/ComputedFields.lean: sha256 a4a9b6b03c1950d3f2a805cb8af786c2cf70faec3e3a46e26203244f32f6846a
+//! src/Lean/ProjFns.lean: sha256 d168495ed452a0360885935a1c9f951767009ade38f057a9601fbdbb27bb6c25
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -115,6 +116,14 @@ pub const COE_FN_TYPE_SCALAR: usize = 0;
 pub const COE_FN_POINTERS: usize = 2;
 pub const COE_FN_SCALAR_BYTES: usize = 1;
 
+pub const PROJECTION_CTOR_NAME: usize = 0;
+pub const PROJECTION_NUM_PARAMS: usize = 1;
+pub const PROJECTION_I: usize = 2;
+pub const PROJECTION_FROM_CLASS_SCALAR: usize = 0;
+pub const PROJECTION_POINTERS: usize = 3;
+pub const PROJECTION_SCALAR_BYTES: usize = 1;
+
+pub const PROJECTION_EXTENSION: &str = "Lean.projectionFnInfoExt";
 pub const SCOPE_GLOBAL: u8 = 0;
 pub const SCOPE_SCOPED: u8 = 1;
 pub const ATTRIBUTE_GLOBAL: u8 = 0;

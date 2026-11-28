@@ -1182,6 +1182,18 @@ impl ArtifactData {
         })?;
         meter.work(structures.work)?;
         meter.bytes(structures.bytes_examined)?;
+        meter.work(structures.projections.len())?;
+        metadata
+            .projections
+            .extend(structures.projections.into_iter().map(|row| {
+                fln_olean::source_extensions::ProjectionEntry {
+                    declaration: row.declaration,
+                    constructor: row.constructor,
+                    num_params: row.num_params,
+                    field_index: row.field_index,
+                    from_class: row.from_class,
+                }
+            }));
         for row in structures.structures {
             meter.work(1 + row.fields.len() + row.parents.len())?;
             metadata

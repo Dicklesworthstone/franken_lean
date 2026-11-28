@@ -1,5 +1,59 @@
 use super::super::tests::{base, c, local, n, publish, record, rows};
 use super::*;
+use crate::records::{RecordSpec, record_declarations_with_member_names};
+use fln_core::options::KVMap;
+use fln_kernel::Declaration;
+
+fn projection(
+    declaration: &str,
+    constructor: &str,
+    num_params: u32,
+    field_index: u32,
+    from_class: bool,
+) -> ProjectionFunction {
+    ProjectionFunction {
+        declaration: n(declaration),
+        constructor: n(constructor),
+        num_params,
+        field_index,
+        from_class,
+    }
+}
+
+fn descriptor_record(
+    env: &Environment,
+    spec: &RecordSpec,
+    constructor: &Name,
+    projections: &[Name],
+) -> Environment {
+    let mut env = env.clone();
+    for declaration in record_declarations_with_member_names(
+        spec,
+        constructor,
+        projections,
+        RecordBudget::default(),
+    )
+    .unwrap()
+    {
+        env = publish(&env, declaration);
+    }
+    let row = StructureEntry {
+        name: spec.name.clone(),
+        fields: spec
+            .fields
+            .iter()
+            .zip(projections)
+            .map(|(field, projection)| StructureField {
+                name: field.user_name.clone(),
+                projection: projection.clone(),
+                subobject: None,
+                binder_info: field.binder_info,
+            })
+            .collect(),
+        parents: vec![],
+    };
+    register(&env, &[row]).unwrap()
+}
 
 fn replay_journals(
     mut into: Environment,
@@ -214,6 +268,15 @@ fn complete_interfaces_export_only_owned_rows_with_exact_work_limits() {
     let empty = Environment::new();
     let exported = registrations(&empty, &registered, MAX_NODES).unwrap();
     assert_eq!(exported.structures, rows);
+    assert_eq!(
+        exported.projections,
+        vec![
+            projection("Parent.value", "Parent.mk", 0, 0, false),
+            projection("Child.toParent", "Child.mk", 0, 0, false),
+            projection("Child.extra", "Child.mk", 0, 1, false),
+            projection("Box.value", "Box.mk", 1, 0, false),
+        ]
+    );
     assert!(exported.bytes_examined > 0);
     assert!(exported.structures.iter().all(|row| row.name != n("Nat")));
     assert_eq!(
@@ -228,6 +291,12 @@ fn complete_interfaces_export_only_owned_rows_with_exact_work_limits() {
         registrations(&registered, &registered, MAX_NODES)
             .unwrap()
             .structures
+            .is_empty()
+    );
+    assert!(
+        registrations(&registered, &registered, MAX_NODES)
+            .unwrap()
+            .projections
             .is_empty()
     );
     assert!(
@@ -262,6 +331,13 @@ fn an_imported_parent_and_owned_child_export_the_child_interface_only() {
     let child = register(&child, &rows[1..2]).unwrap();
     let exported = registrations(&parent, &child, MAX_NODES).unwrap();
     assert_eq!(exported.structures, rows[1..2]);
+    assert_eq!(
+        exported.projections,
+        vec![
+            projection("Child.toParent", "Child.mk", 0, 0, false),
+            projection("Child.extra", "Child.mk", 0, 1, false),
+        ]
+    );
     assert_eq!(
         registrations(&parent, &child, exported.work).unwrap(),
         exported
@@ -332,4 +408,252 @@ fn malformed_inherited_payloads_and_foreign_descriptors_do_not_gain_validity() {
         registrations(&Environment::new(), &duplicate, MAX_NODES),
         Err(RecordError::DuplicateField)
     );
+}
+
+#[test]
+fn projection_class_origin_is_immutable_under_later_class_registration() {
+    let parameter = local("A", Expr::sort(Level::one()), BinderInfo::Default);
+    let carrier = Expr::fvar(parameter.id.clone());
+    let function = Expr::forall_e(n("x"), carrier.clone(), carrier, BinderInfo::Default);
+    let mut env = Environment::new();
+    for (name, is_class) in [("Ordinary", false), ("DeclaredClass", true)] {
+        let spec = RecordSpec {
+            name: n(name),
+            level_params: vec![],
+            parameters: vec![parameter.clone()],
+            fields: vec![local("run", function.clone(), BinderInfo::Default)],
+            result_level: Level::one(),
+            is_class,
+        };
+        env = descriptor_record(
+            &env,
+            &spec,
+            &n(&format!("{name}.mk")),
+            &[n(&format!("{name}.run"))],
+        );
+    }
+    let expected = vec![
+        projection("Ordinary.run", "Ordinary.mk", 1, 0, false),
+        projection("DeclaredClass.run", "DeclaredClass.mk", 1, 0, true),
+    ];
+    assert_eq!(
+        registrations(&Environment::new(), &env, MAX_NODES)
+            .unwrap()
+            .projections,
+        expected
+    );
+    let classified = crate::instances::register_class(&env, &n("Ordinary")).unwrap();
+    let classified = crate::instances::register_class(&classified, &n("DeclaredClass")).unwrap();
+    assert!(env.has_same_declarations(&classified));
+    assert_eq!(
+        registrations(&Environment::new(), &classified, MAX_NODES)
+            .unwrap()
+            .projections,
+        expected,
+        "the receiver convention comes from generation, not the final class registry"
+    );
+}
+
+#[test]
+fn proof_projection_descriptors_retain_constructor_field_indices() {
+    let parameter = local("P", Expr::sort(Level::zero()), BinderInfo::Default);
+    let proposition = Expr::fvar(parameter.id.clone());
+    let spec = RecordSpec {
+        name: n("ProofClass"),
+        level_params: vec![],
+        parameters: vec![parameter],
+        fields: vec![
+            local("first", proposition.clone(), BinderInfo::Default),
+            local("second", proposition, BinderInfo::Default),
+        ],
+        result_level: Level::zero(),
+        is_class: true,
+    };
+    let env = descriptor_record(
+        &Environment::new(),
+        &spec,
+        &n("ProofClass.mk"),
+        &[n("ProofClass.first"), n("ProofClass.second")],
+    );
+    for name in ["ProofClass.first", "ProofClass.second"] {
+        assert!(matches!(env.find(&n(name)), Some(ConstantInfo::Thm(_))));
+    }
+    let exported = registrations(&Environment::new(), &env, MAX_NODES).unwrap();
+    assert_eq!(
+        exported.projections,
+        vec![
+            projection("ProofClass.first", "ProofClass.mk", 1, 0, true),
+            projection("ProofClass.second", "ProofClass.mk", 1, 1, true),
+        ]
+    );
+    assert_eq!(
+        registrations(&Environment::new(), &env, exported.work).unwrap(),
+        exported
+    );
+    assert_eq!(
+        registrations(&Environment::new(), &env, exported.work - 1),
+        Err(RecordError::ResourceLimit)
+    );
+}
+
+#[test]
+fn private_projection_descriptors_use_authenticated_bodies_and_visible_names() {
+    let nat = publish(
+        &Environment::new(),
+        crate::seed::nat_inductive_seed_declaration(),
+    );
+    let private = Name::num(n("_private.ProjectionMetadata"), 0);
+    let constructor = private.append_core(&n("PublicRecord.mk"));
+    let secret = private.append_core(&n("PublicRecord.secret"));
+    let spec = RecordSpec {
+        name: n("PublicRecord"),
+        level_params: vec![],
+        parameters: vec![],
+        fields: vec![
+            local("visible", c("Nat"), BinderInfo::Default),
+            local("secret", c("Nat"), BinderInfo::Default),
+        ],
+        result_level: Level::one(),
+        is_class: false,
+    };
+    let complete = descriptor_record(
+        &nat,
+        &spec,
+        &constructor,
+        &[n("PublicRecord.visible"), secret.clone()],
+    );
+    let visible_projection = ProjectionFunction {
+        declaration: n("PublicRecord.visible"),
+        constructor: constructor.clone(),
+        num_params: 0,
+        field_index: 0,
+        from_class: false,
+    };
+    assert_eq!(
+        registrations(&nat, &complete, MAX_NODES)
+            .unwrap()
+            .projections,
+        vec![
+            visible_projection.clone(),
+            ProjectionFunction {
+                declaration: secret.clone(),
+                constructor: constructor.clone(),
+                num_params: 0,
+                field_index: 1,
+                from_class: false,
+            },
+        ]
+    );
+    let mut public = Environment::new();
+    for (name, _) in complete.constants() {
+        if name != &secret {
+            public = public.with_entry(complete.entry(name).unwrap()).unwrap();
+        }
+    }
+    let public = replay_journals(public, &complete, |_| {});
+    assert!(registrations(&nat, &public, MAX_NODES).is_err());
+    let bound = public.with_imported_metadata_validation(&complete);
+    let exported = registrations(&nat, &bound, MAX_NODES).unwrap();
+    assert_eq!(exported.projections, vec![visible_projection]);
+    assert!(bound.contains(&constructor));
+    assert!(!bound.contains(&secret));
+    assert_eq!(exported.structures[0].fields[1].projection, secret);
+    assert_eq!(
+        registrations(&nat, &bound, exported.work).unwrap(),
+        exported
+    );
+    assert_eq!(
+        registrations(&nat, &bound, exported.work - 1),
+        Err(RecordError::ResourceLimit)
+    );
+}
+
+#[test]
+fn admitted_receiver_style_changes_do_not_gain_projection_metadata() {
+    let nat = publish(
+        &Environment::new(),
+        crate::seed::nat_inductive_seed_declaration(),
+    );
+    let spec = RecordSpec {
+        name: n("Altered"),
+        level_params: vec![],
+        parameters: vec![],
+        fields: vec![local("value", c("Nat"), BinderInfo::Default)],
+        result_level: Level::one(),
+        is_class: false,
+    };
+    let row = StructureEntry {
+        name: n("Altered"),
+        fields: vec![StructureField {
+            name: n("value"),
+            projection: n("Altered.value"),
+            subobject: None,
+            binder_info: BinderInfo::Default,
+        }],
+        parents: vec![],
+    };
+    for (type_style, value_style) in [
+        (BinderInfo::Default, BinderInfo::InstImplicit),
+        (BinderInfo::Implicit, BinderInfo::Implicit),
+        (BinderInfo::StrictImplicit, BinderInfo::StrictImplicit),
+    ] {
+        let mut env = nat.clone();
+        let declarations = record_declarations_with_member_names(
+            &spec,
+            &n("Altered.mk"),
+            &[n("Altered.value")],
+            RecordBudget::default(),
+        )
+        .unwrap();
+        for mut declaration in declarations {
+            if let Declaration::Defn(definition) = &mut declaration {
+                let ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    ..
+                } = definition.base.type_.node()
+                else {
+                    panic!("the generated projection has one receiver");
+                };
+                definition.base.type_ = Expr::forall_e(
+                    binder_name.clone(),
+                    binder_type.clone(),
+                    body.clone(),
+                    type_style,
+                );
+                let ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    ..
+                } = definition.value.node()
+                else {
+                    panic!("the generated projection body has one receiver");
+                };
+                definition.value = Expr::lam(
+                    binder_name.clone(),
+                    binder_type.clone(),
+                    body.clone(),
+                    value_style,
+                );
+            }
+            // Binder conventions do not grant kernel authority: the changed
+            // declarations must still pass the ordinary admission path.
+            env = publish(&env, declaration);
+        }
+        let env = register(&env, std::slice::from_ref(&row)).unwrap();
+        assert!(
+            ImportedStructures::read(&env)
+                .unwrap()
+                .get(&row.name)
+                .is_some()
+        );
+        let before = env.logical_root(&KVMap::new());
+        assert_eq!(
+            registrations(&nat, &env, MAX_NODES),
+            Err(RecordError::InvalidTelescope)
+        );
+        assert_eq!(env.logical_root(&KVMap::new()), before);
+    }
 }

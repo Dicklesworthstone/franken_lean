@@ -22,9 +22,9 @@ pub use format::{
     DEPRECATED_EXTENSION, ELAB_AS_ELIM_EXTENSION, EXTERN_EXTENSION, GRIND_DONT_CARE,
     GRIND_EXTENSION, GRIND_GROUND_PATTERN_ANNOTATION, IMPLEMENTED_BY_EXTENSION, INLINE_EXTENSION,
     INSTANCE_EXTENSION, MATCH_PATTERN_EXTENSION, NEVER_EXTRACT_EXTENSION, NONCOMPUTABLE_EXTENSION,
-    PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION, PROTECTED_EXTENSION,
-    REDUCIBILITY_EXTENSION, REDUCIBILITY_EXTRA_EXTENSION, SIMP_EXTENSION, STRUCTURE_EXTENSION,
-    SYMM_EXTENSION, UNBOX_EXTENSION,
+    PP_ANONYMOUS_CONSTRUCTOR_EXTENSION, PP_NODOT_EXTENSION, PROJECTION_EXTENSION,
+    PROTECTED_EXTENSION, REDUCIBILITY_EXTENSION, REDUCIBILITY_EXTRA_EXTENSION, SIMP_EXTENSION,
+    STRUCTURE_EXTENSION, SYMM_EXTENSION, UNBOX_EXTENSION,
 };
 mod deprecations;
 pub use deprecations::DeprecationEntry;
@@ -36,6 +36,8 @@ pub mod macros;
 pub mod parsers;
 mod simp;
 pub use simp::{SimpEntry, SimpKind, SimpTheorem};
+mod projections;
+pub use projections::ProjectionEntry;
 mod structures;
 pub use structures::{StructureEntry, StructureField, StructureParent};
 
@@ -264,6 +266,9 @@ pub struct SourceExtensions {
     /// Structure fields and extends-clause metadata, still awaiting checked
     /// constructor/projection validation by the source importer.
     pub structures: Vec<StructureEntry>,
+    /// Untrusted generated projection descriptors; constructor/body validation
+    /// remains the source consumer's responsibility.
+    pub projections: Vec<ProjectionEntry>,
     /// Reducibility statuses (the pin's `reducibilityCore`), in journal order.
     pub reducibility: Vec<ReducibilityEntry>,
     /// Chronological extra updates, kept separate from the per-module core map.
@@ -799,6 +804,7 @@ fn decode_batch(
         name(format::GRIND_EXTENSION),
         name(format::NEVER_EXTRACT_EXTENSION),
         name(format::COMPUTED_FIELD_EXTENSION),
+        name(format::PROJECTION_EXTENSION),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -819,6 +825,7 @@ fn decode_batch(
     let mut pp_anonymous_constructor = BTreeSet::new();
     let mut pp_nodot = BTreeSet::new();
     let mut structures = BTreeSet::new();
+    let mut previous_projection: Option<Name> = None;
     let mut inline = BTreeSet::new();
     let mut deprecated = BTreeSet::new();
     for block in blocks {
@@ -1016,7 +1023,17 @@ fn decode_batch(
                     }
                     out.computed_fields.push(declaration);
                 }
-                _ => unreachable!("thirty-two selected extension families"),
+                32 => {
+                    let row = reader.projection(&obj)?;
+                    if previous_projection.as_ref().is_some_and(|previous| {
+                        previous.quick_cmp(&row.declaration) != std::cmp::Ordering::Less
+                    }) {
+                        return Err(shape("projection map is not strictly sorted"));
+                    }
+                    previous_projection = Some(row.declaration.clone());
+                    out.projections.push(row);
+                }
+                _ => unreachable!("thirty-three selected extension families"),
             }
         }
         if grind_deferred {

@@ -25,6 +25,8 @@ mod macro_inline;
 mod match_patterns;
 #[path = "never_extract.rs"]
 mod never_extract;
+#[path = "projection_metadata.rs"]
+mod projection_metadata;
 #[path = "reducibility.rs"]
 mod reducibility;
 #[path = "simp.rs"]

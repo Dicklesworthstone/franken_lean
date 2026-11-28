@@ -8,8 +8,8 @@ use crate::source_extension_format as layout;
 use crate::source_extensions::{
     AliasEntry, ClassEntry, CoeEntry, DefaultEntry, DeprecationEntry, DiscrTreeKey,
     ExternAttribute, ExternEntry, GrindPatternEntry, ImplementedByEntry, InlineEntry,
-    InstanceEntry, ReducibilityEntry, ReducibilityExtraEntry, SimpEntry, SimpKind, SimpTheorem,
-    StructureEntry, StructureField, StructureParent, SymmEntry,
+    InstanceEntry, ProjectionEntry, ReducibilityEntry, ReducibilityExtraEntry, SimpEntry, SimpKind,
+    SimpTheorem, StructureEntry, StructureField, StructureParent, SymmEntry,
 };
 use std::collections::HashSet;
 
@@ -23,6 +23,7 @@ mod grind;
 mod inlining;
 mod instances;
 mod namespaces;
+mod projections;
 mod reducibility;
 mod simp;
 mod structures;
@@ -107,6 +108,9 @@ pub struct SourceMetadata {
     /// Module-owned structure interfaces, including physical parent subobjects.
     /// The writer preserves field/parent order and sorts only the pin's indexes.
     pub structures: Vec<StructureEntry>,
+    /// Owned, checked projection descriptions, sorted by Name.quickLt on disk.
+    /// The from_class bit records the generated receiver, not later class tags.
+    pub projections: Vec<ProjectionEntry>,
     /// Exact compiled calling conventions, with opaque IR headers for downstream
     /// compilation. Empty on declaration-only builds. These are serialized data,
     /// not evidence of admission, termination, or an executable implementation.
@@ -203,6 +207,9 @@ impl Encoder {
         }
         if !metadata.structures.is_empty() {
             blocks.push(self.structure_block(&metadata.structures)?);
+        }
+        if !metadata.projections.is_empty() {
+            blocks.push(self.projection_block(&metadata.projections)?);
         }
         if !metadata.compiler_signatures.is_empty() {
             blocks.extend(self.compiler_blocks(&metadata.compiler_signatures)?);

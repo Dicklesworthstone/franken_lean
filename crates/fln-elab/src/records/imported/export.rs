@@ -80,9 +80,20 @@ pub fn supports(candidate: &ExtensionDescriptor) -> bool {
     *candidate == descriptor() || *candidate == inheritance::descriptor()
 }
 
+/// The pin's descriptor for one authenticated generated physical field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionFunction {
+    pub declaration: Name,
+    pub constructor: Name,
+    pub num_params: u32,
+    pub field_index: u32,
+    pub from_class: bool,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Registrations {
     pub structures: Vec<StructureEntry>,
+    pub projections: Vec<ProjectionFunction>,
     pub work: usize,
     pub bytes_examined: usize,
 }
@@ -195,6 +206,81 @@ fn owned(
     Ok(())
 }
 
+/// Preserve the generated receiver convention before any later class tags.
+/// `validate` has authenticated the complete type/value and terminal field
+/// projection against this unique constructor in this exact validation world.
+fn projection_functions(
+    validation: &Environment,
+    visible: &Environment,
+    row: &StructureEntry,
+    meter: &mut Meter,
+) -> Result<Vec<ProjectionFunction>, RecordError> {
+    meter.charge(1)?;
+    let child = family(validation, &row.name)?;
+    let mut projections = Vec::new();
+    for (index, field) in row.fields.iter().enumerate() {
+        meter.charge(1)?;
+        if !visible.contains(&field.projection) {
+            continue;
+        }
+        let (base, mut value) = match validation.find(&field.projection) {
+            Some(ConstantInfo::Defn(definition)) => (&definition.base, &definition.value),
+            Some(ConstantInfo::Thm(theorem)) => (&theorem.base, &theorem.value),
+            _ => return Err(RecordError::InvalidTelescope),
+        };
+        let mut type_ = &base.type_;
+        for _ in 0..child.num_params {
+            meter.charge(1)?;
+            let (
+                ExprNode::ForallE {
+                    body: type_body, ..
+                },
+                ExprNode::Lam {
+                    body: value_body, ..
+                },
+            ) = (type_.node(), value.node())
+            else {
+                return Err(RecordError::InvalidTelescope);
+            };
+            type_ = type_body;
+            value = value_body;
+        }
+        meter.charge(1)?;
+        let (
+            ExprNode::ForallE {
+                binder_info: type_info,
+                ..
+            },
+            ExprNode::Lam {
+                binder_info: value_info,
+                ..
+            },
+        ) = (type_.node(), value.node())
+        else {
+            return Err(RecordError::InvalidTelescope);
+        };
+        if type_info != value_info {
+            return Err(RecordError::InvalidTelescope);
+        }
+        let from_class = match type_info {
+            BinderInfo::Default => false,
+            BinderInfo::InstImplicit => true,
+            _ => return Err(RecordError::InvalidTelescope),
+        };
+        meter.charge(1)?;
+        projections.push(ProjectionFunction {
+            declaration: field.projection.clone(),
+            constructor: child.ctors[0].clone(),
+            num_params: child.num_params,
+            field_index: u32::try_from(index).map_err(|_| RecordError::ResourceLimit)?,
+            from_class,
+        });
+    }
+    // Non-subobject copied parent coercions are constructor-building functions;
+    // the pin records those in auxParentProjInfoExt, not this field map.
+    Ok(projections)
+}
+
 /// Export the exact owned suffix after validating constructors, projection
 /// bodies, binder styles, direct parent order, and the native traversal journal.
 /// No ordinary inductive is guessed to be a structure from its kernel shape.
@@ -211,6 +297,7 @@ pub fn registrations(
     let mut entries = BTreeMap::new();
     let mut expected = BTreeMap::new();
     let mut structures = Vec::new();
+    let mut projections = Vec::new();
     let mut owned_names = BTreeSet::new();
     visit(
         base,
@@ -223,6 +310,7 @@ pub fn registrations(
             let parents = validate(validation, &row, &mut meter.remaining)?;
             if is_owned {
                 owned(base, validation, &row)?;
+                projections.extend(projection_functions(validation, result, &row, meter)?);
                 owned_names.insert(row.name.clone());
                 structures.push(row.clone());
             }
@@ -280,6 +368,7 @@ pub fn registrations(
     acyclic(&entries, entries.keys(), &mut meter.remaining)?;
     Ok(Registrations {
         structures,
+        projections,
         work: max_work - meter.remaining,
         bytes_examined: meter.bytes,
     })
