@@ -6,7 +6,7 @@ use crate::records::RecordBudget;
 use crate::records::inheritance::{RecordParents, direct_fields};
 use fln_core::name::LeafView;
 use fln_env::constants::ConstantInfo;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 mod imported;
 
@@ -168,6 +168,12 @@ pub(super) struct PostponedField {
     lctx: LocalContext,
     options: KVMap,
     scope: SourceScope,
+    /// A selected structural self is not an ordinary closure parameter. Its
+    /// original branch still governs checked recursive calls during replay.
+    recursion: Option<(recursion::Recursion, Vec<recursion::Recursion>)>,
+    /// Replay syntax once. Later inference may settle holes in this term, but
+    /// must not repeat a tactic or create another set of synthetic obligations.
+    replayed: Option<Typed>,
 }
 
 /// Field methods are syntax sugar for a checked lambda. A field's result
@@ -227,6 +233,21 @@ impl Context {
         application: Option<DeferredFieldApplication>,
     ) -> Result<Typed, NatDefinitionElabError> {
         let mut captured = self.txn.lctx.decls().to_vec();
+        let recursion = self
+            .recursion
+            .as_ref()
+            .filter(|recursion| {
+                recursion.selected_primitive() && self.txn.lctx.contains(&recursion.marker)
+            })
+            .map(|recursion| (recursion.clone(), self.enclosing_recursions.clone()));
+        if let Some((recursion, _)) = &recursion {
+            // Passing an unused self to this opaque placeholder looks like an
+            // escaping recursive value before the continuation can infer the
+            // receiver type. Omit it from both telescopes and both argument
+            // spines. The full lexical context remains available for replay,
+            // whose completed term must discharge the dependency check below.
+            captured.retain(|local| local.id != recursion.marker);
+        }
         let outer = LocalContext::new();
         // The closed holes below also abstract the types of their parameters.
         // An unresolved receiver type can still capture earlier parameters in
@@ -316,6 +337,8 @@ impl Context {
             lctx: self.txn.lctx.clone(),
             options: self.txn.options.clone(),
             scope: self.source_scope.clone(),
+            recursion,
+            replayed: None,
         });
         Ok(Typed {
             value,
@@ -331,19 +354,30 @@ impl Context {
         let pending = std::mem::take(&mut self.postponed_fields);
         let mut waiting = Vec::new();
         let mut progressed = false;
-        for record in pending {
+        for mut record in pending {
             self.tick()?;
             let saved = std::mem::replace(&mut self.txn.lctx, record.lctx.clone());
             let options = std::mem::replace(&mut self.txn.options, record.options.clone());
             let scope = std::mem::replace(&mut self.source_scope, record.scope.clone());
+            let recursion = record.recursion.as_ref().map(|(active, enclosing)| {
+                (
+                    std::mem::replace(&mut self.recursion, Some(active.clone())),
+                    std::mem::replace(&mut self.enclosing_recursions, enclosing.clone()),
+                )
+            });
+            let mut elaborated = false;
             let result = (|| {
-                if self
-                    .application_type_unavailable(&record.receiver.type_)?
-                    .is_some()
+                if record.replayed.is_none()
+                    && self
+                        .application_type_unavailable(&record.receiver.type_)?
+                        .is_some()
                 {
                     return Ok(false);
                 }
-                let mut term = if let Some(application) = &record.application {
+                let mut term = if let Some(term) = record.replayed.take() {
+                    term
+                } else if let Some(application) = &record.application {
+                    elaborated = true;
                     let at = record
                         .at
                         .as_ref()
@@ -377,6 +411,10 @@ impl Context {
                         record.at.as_ref(),
                         from_ident,
                     )?;
+                    if matches!(&field, FieldResolution::Blocked { .. }) {
+                        return Ok(false);
+                    }
+                    elaborated = true;
                     self.field_value(field, Some(&record.expected))?
                 };
                 let type_ = self.instantiate(&term.type_)?;
@@ -384,11 +422,26 @@ impl Context {
                 // A replayed application has already used its original
                 // finishing policy. In particular, do not insert implicits
                 // into an explicit application or an unfinished callee.
-                let mut term = if record.application.is_none() {
+                let mut term = if elaborated && record.application.is_none() {
                     self.finish_optional_term(term, Some(&record.expected))?
                 } else {
                     term
                 };
+                if let Some((recursion, _)) = &record.recursion
+                    && !self.postponed_field_scope_ready(
+                        &recursion.marker,
+                        &term,
+                        &record.expected,
+                        &record.locals,
+                        &record.lctx,
+                    )?
+                {
+                    // A hole may later become independent of self. Retain the
+                    // actual replay and its obligation rather than rejecting
+                    // uncertainty or assigning an unchecked closed lambda.
+                    record.replayed = Some(term);
+                    return Ok(false);
+                }
                 // Replay can create goals after the original helper's binders
                 // closed. Their later solutions still belong inside the field
                 // placeholder's closed telescope, just as in finish_telescope.
@@ -430,14 +483,134 @@ impl Context {
             self.txn.lctx = saved;
             self.txn.options = options;
             self.source_scope = scope;
+            if let Some((active, enclosing)) = recursion {
+                self.recursion = active;
+                self.enclosing_recursions = enclosing;
+            }
             if result? {
                 progressed = true;
             } else {
+                // First replay can introduce instance or coercion work even
+                // while its final closure remains pending.
+                progressed |= elaborated;
                 waiting.push(record);
             }
         }
         self.postponed_fields.extend(waiting);
         Ok(progressed)
+    }
+
+    /// A postponed field may cross its structural self binder only after its
+    /// completed value, type, and captured declarations are independent of it.
+    /// Follow aliases and hole dependencies with an explicit, budgeted walk.
+    /// An unassigned hole's saved context is a possible dependency, not proof
+    /// that the final term reads self. Keep such work pending until resolved;
+    /// this also covers opaque closures whose delayed assignments live outside
+    /// the ordinary metavariable store. Assigned holes use their actual value
+    /// and type, never unrelated historical locals from their saved context.
+    fn postponed_field_scope_ready(
+        &mut self,
+        marker: &FVarId,
+        term: &Typed,
+        expected: &Expr,
+        locals: &[LocalDecl],
+        context: &LocalContext,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let mut contexts = vec![context.clone()];
+        let mut tasks = vec![
+            (term.value.clone(), 0usize, false),
+            (term.type_.clone(), 0, false),
+            (expected.clone(), 0, false),
+        ];
+        for local in locals {
+            self.tick()?;
+            tasks.push((local.type_.clone(), 0, false));
+            if let Some(value) = &local.value {
+                tasks.push((value.clone(), 0, false));
+            }
+        }
+        let mut nodes = HashSet::new();
+        let mut visited_locals = HashSet::new();
+        let mut metavars = HashSet::new();
+        let mut waiting = false;
+        while let Some((expression, scope, latent)) = tasks.pop() {
+            self.tick()?;
+            if !nodes.insert((expression.allocation_identity(), scope, latent)) {
+                continue;
+            }
+            match expression.node() {
+                ExprNode::FVar { id } => {
+                    if id == marker {
+                        if latent {
+                            waiting = true;
+                            continue;
+                        }
+                        return Err(failure(SourceInferenceError::Recursion(
+                            recursion::RecursionError::NotDecreasing,
+                        )));
+                    }
+                    if !visited_locals.insert((id.clone(), scope, latent)) {
+                        continue;
+                    }
+                    let local = contexts[scope]
+                        .find(id)
+                        .cloned()
+                        .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                    tasks.push((local.type_, scope, latent));
+                    if let Some(value) = local.value {
+                        tasks.push((value, scope, latent));
+                    }
+                }
+                ExprNode::MVar { id } => {
+                    if !metavars.insert((id.clone(), latent)) {
+                        continue;
+                    }
+                    let declaration = self
+                        .txn
+                        .mvars
+                        .get_decl(id)
+                        .cloned()
+                        .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                    let inner = contexts.len();
+                    contexts.push(declaration.lctx.clone());
+                    tasks.push((declaration.type_, inner, latent));
+                    if let Some(value) = self.txn.mvars.get_assigned_expr(id) {
+                        tasks.push((value.clone(), inner, latent));
+                    } else {
+                        waiting = true;
+                        for local in declaration.lctx.decls() {
+                            self.tick()?;
+                            tasks.push((Expr::fvar(local.id.clone()), inner, true));
+                        }
+                    }
+                }
+                ExprNode::App { f, a } => {
+                    tasks.push((f.clone(), scope, latent));
+                    tasks.push((a.clone(), scope, latent));
+                }
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    tasks.push((binder_type.clone(), scope, latent));
+                    tasks.push((body.clone(), scope, latent));
+                }
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => {
+                    tasks.push((type_.clone(), scope, latent));
+                    tasks.push((value.clone(), scope, latent));
+                    tasks.push((body.clone(), scope, latent));
+                }
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    tasks.push((expr.clone(), scope, latent));
+                }
+                _ => {}
+            }
+        }
+        Ok(!waiting)
     }
 
     pub(super) fn finish_postponed_fields(&self) -> Result<(), NatDefinitionElabError> {

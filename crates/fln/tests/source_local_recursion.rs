@@ -821,3 +821,116 @@ def bad (xs : Chain Nat) : Nat :=
     }
 }
 
+#[test]
+fn inferred_equation_local_recursion_preserves_delayed_field_arguments_and_captures() {
+    for (definition, expected) in [
+        (
+            r#"
+def collect (xs : Chain Nat) : Buffer :=
+  let initial := Buffer.mk 7
+  let rec loop
+    | Chain.nil, r => r
+    | Chain.cons n tail, r =>
+      let next := r.push (n + 1)
+      loop tail next
+  loop xs initial
+theorem computed : (collect (Chain.cons 2 (Chain.cons 3 Chain.nil))).count = 14 := by rfl
+#eval (collect (Chain.cons 2 (Chain.cons 3 Chain.nil))).count
+"#,
+            "14",
+        ),
+        (
+            r#"
+def collect (xs : Chain Nat) : Buffer :=
+  let rec loop
+    | Chain.nil, r => r
+    | Chain.cons n tail, r => loop tail (r.push ((fun x => x + 1) n))
+  loop xs ⟨0⟩
+theorem computed : (collect (Chain.cons 2 (Chain.cons 3 Chain.nil))).count = 7 := by rfl
+#eval (collect (Chain.cons 2 (Chain.cons 3 Chain.nil))).count
+"#,
+            "7",
+        ),
+        (
+            r#"
+def collect (xs : Chain Nat) : Buffer :=
+  let rec loop
+    | Chain.nil, r => r
+    | Chain.cons _ tail, r => loop tail (r.push ((loop tail r).count))
+  loop xs ⟨1⟩
+theorem computed : (collect (Chain.cons 2 (Chain.cons 3 Chain.nil))).count = 6 := by rfl
+#eval (collect (Chain.cons 2 (Chain.cons 3 Chain.nil))).count
+"#,
+            "6",
+        ),
+    ] {
+        execute(&format!("{INFERRED_EQUATION_DATA}\n{definition}"), expected);
+    }
+}
+
+#[test]
+fn inferred_equation_local_recursion_checks_delayed_fields_even_in_unused_values() {
+    let base = checked(&engine(), INFERRED_EQUATION_DATA);
+    let before = base.logical_root(&KVMap::new());
+    for (source, recursive) in [
+        (
+            r#"
+def bad (xs : Chain Nat) : Buffer :=
+  let rec loop
+    | Chain.nil, r => r
+    | Chain.cons n tail, r => loop tail (r.push ((loop (Chain.cons n tail) r).count))
+  loop xs ⟨0⟩
+"#,
+            true,
+        ),
+        (
+            r#"
+def bad (xs : Chain Nat) : Nat :=
+  let rec loop
+    | Chain.nil, r => r
+    | Chain.cons _ tail, r => loop tail (r.push "wrong")
+  let unused : Buffer := loop xs ⟨0⟩
+  0
+"#,
+            false,
+        ),
+        (
+            r#"
+def bad (xs : Chain Nat) : Nat :=
+  let rec loop
+    | Chain.nil, r => r
+    | Chain.cons n tail, r => loop tail (r.push ((loop (Chain.cons n tail) r).count))
+  let unused : Buffer := loop xs ⟨0⟩
+  0
+"#,
+            true,
+        ),
+    ] {
+        let problem = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err(source);
+        assert_eq!(
+            problem.disposition(),
+            ("elaboration", false, 1),
+            "{source}: {problem:?}"
+        );
+        let diagnostic = format!("{problem:?}");
+        if recursive {
+            assert!(
+                diagnostic.contains("Recursion(NotDecreasing)"),
+                "{source}: {diagnostic}"
+            );
+        } else {
+            assert!(
+                diagnostic.contains("TypeMismatch") || diagnostic.contains("ConversionRefused"),
+                "{source}: {diagnostic}"
+            );
+        }
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+        assert!(!base.environment().contains(&Name::from_components(["bad"])));
+    }
+}

@@ -123,12 +123,27 @@ impl<'a> Checkpoint<'a> {
         context.open_local_recursive_lambdas(&mut build)?;
         let mut candidates = vec![Candidate::Nonrecursive];
         let body = original(context, build.value_syntax)?;
+        let prepared = prepared(context, build.value_syntax)?;
         match context.recursion_columns(&build.parameters, body) {
-            Ok(columns) => candidates.extend(
-                columns
-                    .into_iter()
-                    .map(|(column, decreasing)| Candidate::Primitive { column, decreasing }),
-            ),
+            Ok(columns) => {
+                for (column, decreasing) in columns {
+                    context.tick()?;
+                    if let Syntax::Node { kind, args, .. } = prepared
+                        && kind == &parser_kind(&["Term", "localRecValue"])
+                        && args
+                            .get(column + 2)
+                            .ok_or_else(|| failure(SourceInferenceError::Scope))?
+                            .is_missing()
+                    {
+                        // Matrix preprocessing already proved this column has
+                        // no structural split. It cannot rescue a failing real
+                        // candidate and must not replace its termination error
+                        // with the absent candidate's RootMatchRequired.
+                        continue;
+                    }
+                    candidates.push(Candidate::Primitive { column, decreasing });
+                }
+            }
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
                 recursion::RecursionError::RootMatchRequired,
             ))) => {}

@@ -913,6 +913,16 @@ pub(super) struct Recursion {
     course_name: Option<Name>,
     pub(super) equation_goals: HashMap<MVarId, ConstrainedBranch>,
 }
+
+impl Recursion {
+    /// Only a selected primitive split may postpone work beyond its private
+    /// self binder. Ordinary candidates must still expose self to select a
+    /// recursive retry; course-of-values candidates have a different closure.
+    pub(super) fn selected_primitive(&self) -> bool {
+        !self.pending && self.family.is_some() && self.course_name.is_none()
+    }
+}
+
 impl Context {
     /// Roll back a failed body without losing the editor's terminal observation.
     /// The observation owns its provisional terms and local context; it is not
@@ -1417,12 +1427,18 @@ impl Context {
             if let Some(omitted) = omitted {
                 self.settle_omitted_result(&omitted)?;
             }
-            // Resolve delayed ordinary work before inspecting use. Registered
-            // let-rec closures remain opaque here; their captures are explicit
-            // arguments, so the bounded walk still sees a captured self.
+            // Resolve all ordinary body constraints before inspecting use.
+            // A deferred field can conservatively capture the outer self even
+            // when its eventual value does not use it. Inspect the completed
+            // local closures only in a temporary view: beta substitution drops
+            // those unused captures while retaining actual recursive calls.
+            // Source elaboration has already finished with let-rec opacity,
+            // and the original closures remain opaque after this read.
             let body = self.finish_open_universes(body)?;
-            let recursive = self.elimination_reads(&body.value)?.contains(&marker)
-                || self.elimination_reads(&body.type_)?.contains(&marker);
+            let recursive = self.with_closed_local_function_header(|context| {
+                Ok(context.elimination_reads(&body.value)?.contains(&marker)
+                    || context.elimination_reads(&body.type_)?.contains(&marker))
+            })?;
             if recursive {
                 Ok(InitialBody::Recursive)
             } else {
