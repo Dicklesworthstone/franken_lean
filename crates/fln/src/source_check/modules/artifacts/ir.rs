@@ -139,6 +139,228 @@ impl SourceModuleIrError {
     }
 }
 
+/// The pin adds these logical constructions after scheduling an inductive's
+/// executable declarations. Unlike recOn/casesOn, not all carry the auxiliary
+/// recursor tag. A name, reducibility hint or eliminator tag cannot establish
+/// that origin: reconstruct the complete definition from its checked family.
+fn logical_inductive_auxiliary(
+    input: &CompilerInput,
+    constant: &ConstantInfo,
+    limits: CompileLimits,
+) -> Result<bool, CompileError> {
+    use fln_core::name::LeafView;
+    use fln_elab::inductive::auxiliaries::{
+        AuxiliaryError, below_declaration, brec_on_declarations, cases_on_declaration,
+        ctor_elim_declarations, no_confusion_declarations,
+    };
+    use fln_elab::records::RecordBudget;
+    use fln_env::constants::{DefinitionSafety, ReducibilityHints};
+
+    let ConstantInfo::Defn(definition) = constant else {
+        return Ok(false);
+    };
+    let (family, kind) = match definition.base.name.leaf_view() {
+        LeafView::Str(kind @ ("noConfusion" | "noConfusionType" | "ctorElimType")) => {
+            (definition.base.name.parent(), kind)
+        }
+        LeafView::Str("go")
+            if definition.base.name.parent().leaf_view() == LeafView::Str("brecOn") =>
+        {
+            (definition.base.name.parent().parent(), "brecOn.go")
+        }
+        _ => return Ok(false),
+    };
+    if definition.safety != DefinitionSafety::Safe || definition.hints != ReducibilityHints::Abbrev
+    {
+        return Ok(false);
+    }
+    let environment = input.engine.environment();
+    let Some(ConstantInfo::Induct(inductive)) = environment.find(&family) else {
+        return Ok(false);
+    };
+    let mut remaining = limits.max_work;
+    let charge = |remaining: &mut u64, amount: usize| {
+        *remaining = remaining
+            .checked_sub(u64::try_from(amount).map_err(|_| CompileError::Limit)?)
+            .ok_or(CompileError::Limit)?;
+        Ok::<(), CompileError>(())
+    };
+    // Keep this omission profile aligned with the data layouts the standalone
+    // compiler actually exports. Mutual, indexed and nested families retain
+    // the ordinary compiler's explicit refusal until their ABI is supported.
+    if CompilerData::from_inductive(
+        inductive,
+        |name| environment.find(name),
+        |amount| charge(&mut remaining, amount),
+    )?
+    .is_none()
+    {
+        return Ok(false);
+    }
+    let Some(ConstantInfo::Rec(recursor)) = environment.find(&Name::str(family.clone(), "rec"))
+    else {
+        return Ok(false);
+    };
+    let Some(ConstantInfo::Defn(cases_on)) =
+        environment.find(&Name::str(family.clone(), "casesOn"))
+    else {
+        return Ok(false);
+    };
+    // Reserve bounded work before each native construction and its comparison.
+    // The generator's own node/binder counters remain active as usual.
+    let reserve = |remaining: &mut u64| {
+        let defaults = RecordBudget::default();
+        let max_nodes = defaults
+            .max_nodes
+            .min(usize::try_from(*remaining / 2).unwrap_or(usize::MAX));
+        if max_nodes == 0 {
+            return Err(CompileError::Limit);
+        }
+        charge(remaining, max_nodes)?;
+        charge(remaining, max_nodes)?;
+        Ok(RecordBudget {
+            max_nodes,
+            max_binders: defaults.max_binders.min(max_nodes),
+        })
+    };
+    fn candidate<T>(generated: Result<T, AuxiliaryError>) -> Result<Option<T>, CompileError> {
+        match generated {
+            Ok(value) => Ok(Some(value)),
+            Err(AuxiliaryError::ResourceLimit) => Err(CompileError::Limit),
+            Err(_) => Ok(None),
+        }
+    }
+    let families = std::slice::from_ref(inductive);
+    let Some(canonical_cases) = candidate(cases_on_declaration(
+        inductive,
+        recursor,
+        families,
+        reserve(&mut remaining)?,
+    ))?
+    else {
+        return Ok(false);
+    };
+    if &canonical_cases != cases_on {
+        return Ok(false);
+    }
+    let constructors: Vec<_> = inductive
+        .ctors
+        .iter()
+        .filter_map(|name| match environment.find(name) {
+            Some(ConstantInfo::Ctor(constructor)) => Some(constructor.clone()),
+            _ => None,
+        })
+        .collect();
+    let matches = match kind {
+        "noConfusion" | "noConfusionType" => {
+            let mut matches = false;
+            let enum_helper_available = constructors
+                .iter()
+                .all(|constructor| constructor.num_fields == 0)
+                && [
+                    "noConfusionEnum",
+                    "noConfusionTypeEnum",
+                    "Nat",
+                    "instDecidableEqNat",
+                ]
+                .into_iter()
+                .all(|name| environment.contains(&Name::from_components([name])));
+            // Early bootstrap families precede the enum helper. Either native
+            // construction must still match the admitted definition exactly.
+            // Prefer the available compact enum form before constructing its
+            // potentially much larger ordinary case-analysis alternative.
+            for use_enum_helper in [enum_helper_available, !enum_helper_available] {
+                if use_enum_helper && !enum_helper_available {
+                    continue;
+                }
+                let Some(Some(generated)) = candidate(no_confusion_declarations(
+                    inductive,
+                    &constructors,
+                    cases_on,
+                    use_enum_helper,
+                    reserve(&mut remaining)?,
+                    |name| environment.find(name),
+                ))?
+                else {
+                    continue;
+                };
+                let canonical = if kind == "noConfusion" {
+                    generated.no_confusion
+                } else {
+                    generated.no_confusion_type
+                };
+                if &canonical == definition {
+                    matches = true;
+                    break;
+                }
+            }
+            matches
+        }
+        "ctorElimType" => candidate(ctor_elim_declarations(
+            inductive,
+            &constructors,
+            cases_on,
+            reserve(&mut remaining)?,
+            |name| environment.find(name),
+        ))?
+        .flatten()
+        .is_some_and(|generated| &generated.ctor_elim_type == definition),
+        "brecOn.go" if inductive.is_rec => {
+            let Some(ConstantInfo::Defn(below)) = environment.find(&Name::str(family, "below"))
+            else {
+                return Ok(false);
+            };
+            let Some(canonical_below) = candidate(below_declaration(
+                recursor,
+                families,
+                reserve(&mut remaining)?,
+            ))?
+            else {
+                return Ok(false);
+            };
+            &canonical_below == below
+                && candidate(brec_on_declarations(
+                    recursor,
+                    families,
+                    reserve(&mut remaining)?,
+                ))?
+                .is_some_and(|[go, _]| &go == definition)
+        }
+        _ => false,
+    };
+    if !matches {
+        return Ok(false);
+    }
+    // A later explicit executable replacement is not a logical construction.
+    let externs = fln_elab::externs::ExternTable::read_metered(environment, |amount| {
+        charge(&mut remaining, amount)
+    })
+    .map_err(|error| match error {
+        fln_elab::externs::ExternReadError::Budget(error) => error,
+        fln_elab::externs::ExternReadError::Registry(fln_elab::externs::ExternError::Limit) => {
+            CompileError::Limit
+        }
+        _ => CompileError::Unsupported {
+            what: "invalid source extern metadata",
+        },
+    })?;
+    let replacements =
+        fln_elab::implemented_by::ImplementedByTable::read_metered(environment, |amount| {
+            charge(&mut remaining, amount)
+        })
+        .map_err(|error| match error {
+            fln_elab::implemented_by::ImplementedByReadError::Budget(error) => error,
+            fln_elab::implemented_by::ImplementedByReadError::Registry(
+                fln_elab::implemented_by::ImplementedByError::Limit,
+            ) => CompileError::Limit,
+            _ => CompileError::Unsupported {
+                what: "invalid source executable replacement metadata",
+            },
+        })?;
+    Ok(externs.get(&definition.base.name).is_none()
+        && replacements.get(&definition.base.name).is_none())
+}
+
 impl SourceModuleArtifact {
     /// Compile every computable definition owned by this module and encode the
     /// pinned `.ir` companion. The compiler sees the exact checked implementation
@@ -154,8 +376,9 @@ impl SourceModuleArtifact {
     /// standalone companion is refused. Unsupported executable definitions refuse
     /// the entire facet. Safe opaque bodies use their checked implementation
     /// without changing the logical declaration. Theorems, declaration-only
-    /// constants and tagged auxiliary recursors need no standalone executable
-    /// entries; explicit `noncomputable` definitions are omitted as at the pin.
+    /// constants, tagged auxiliary recursors and exactly reconstructed logical
+    /// inductive auxiliaries need no standalone executable entries; explicit
+    /// `noncomputable` definitions are omitted as at the pin.
     /// Ordinary `.olean` compilation does not require this facet.
     pub fn compile_ir(
         &mut self,
@@ -222,6 +445,15 @@ impl SourceModuleArtifact {
             if noncomputable.contains(constant.name())
                 || auxiliary_recursors.contains(constant.name())
             {
+                continue;
+            }
+            if logical_inductive_auxiliary(input, constant, limits.compiler).map_err(|error| {
+                SourceModuleIrError::Compile {
+                    module: input.name.clone(),
+                    declaration: constant.name().clone(),
+                    error: Box::new(DefinitionCompileError::Ir(error)),
+                }
+            })? {
                 continue;
             }
             if matches!(constant,
