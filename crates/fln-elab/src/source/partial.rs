@@ -490,7 +490,10 @@ impl Context {
         for parameter in parameters {
             roots.push(self.instantiate(&parameter.type_)?);
         }
-        let levels = self.declaration_levels(&roots)?;
+        let levels = match self.partial_local_levels() {
+            Some(levels) => levels,
+            None => self.declaration_levels(&roots)?,
+        };
         let executable_name = if self
             .partial
             .as_ref()

@@ -8497,7 +8497,10 @@ fn definition_elaboration(
     } else {
         instance_type.unwrap_or(term.type_)
     };
-    let level_params = context.declaration_levels(&[type_.clone(), term.value.clone()])?;
+    let level_params = match context.partial_local_levels() {
+        Some(levels) => levels,
+        None => context.declaration_levels(&[type_.clone(), term.value.clone()])?,
+    };
     // `PreDefinition.letToHaveType`: later elaboration observes the published
     // type, including the opacity of lets whose bodies check without unfolding
     // their local values. Keep the final kernel admission as the authority.

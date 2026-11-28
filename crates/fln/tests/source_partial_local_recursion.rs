@@ -380,3 +380,77 @@ fn nonterminating_local_helpers_exhaust_the_vm_without_running_inhabitants() {
         ["42", "7"]
     );
 }
+
+#[test]
+fn unused_helpers_share_owner_universes_before_component_partitioning() {
+    let base = checked(
+        &seed(),
+        r#"
+universe u
+partial def keepUniverse (A : Type u) (x : A) : A :=
+  let rec echo (i : Nat) : Nat := i
+  let rec loop (i : Nat) : Nat := loop (i + 1)
+  x
+def inheritedLoop : Nat -> Nat := keepUniverse.loop.{0}
+"#,
+    );
+    ordinary_owner(&base, "keepUniverse");
+    ordinary_owner(&base, "keepUniverse.echo");
+    partial_group(&base, &["keepUniverse.loop"]);
+    for declaration in [
+        "keepUniverse",
+        "keepUniverse.echo",
+        "keepUniverse.loop",
+        "keepUniverse.loop._unsafe_rec",
+    ] {
+        assert_eq!(
+            base.environment()
+                .find(&name(declaration))
+                .unwrap()
+                .constant_val()
+                .level_params,
+            [name("u")],
+            "{declaration}"
+        );
+    }
+    assert_eq!(
+        values(
+            &base,
+            "#eval keepUniverse.{0} Nat 37\n#eval keepUniverse.echo.{0} 19"
+        ),
+        ["37", "19"]
+    );
+}
+
+#[test]
+fn owner_retains_ordered_universes_used_only_by_an_unused_helper() {
+    let base = checked(
+        &seed(),
+        r#"
+partial def unusedUniverse.{v, u} (n : Nat) : Nat :=
+  let rec loop (A : Type u) (B : Type v) (x : A) (y : B) (i : Nat) : A :=
+    loop A B x y (i + 1)
+  n
+def explicitHelper (A B : Type) (x : A) (y : B) : Nat -> A :=
+  unusedUniverse.loop.{0, 0} A B x y
+"#,
+    );
+    ordinary_owner(&base, "unusedUniverse");
+    partial_group(&base, &["unusedUniverse.loop"]);
+    for declaration in [
+        "unusedUniverse",
+        "unusedUniverse.loop",
+        "unusedUniverse.loop._unsafe_rec",
+    ] {
+        assert_eq!(
+            base.environment()
+                .find(&name(declaration))
+                .unwrap()
+                .constant_val()
+                .level_params,
+            [name("v"), name("u")],
+            "{declaration}"
+        );
+    }
+    assert_eq!(values(&base, "#eval unusedUniverse.{0, 0} 23"), ["23"]);
+}

@@ -16,6 +16,7 @@ pub(in crate::source) struct Locals {
     owner: Option<Closure>,
     definitions: Vec<DefinitionVal>,
     failed_codegen: Vec<bool>,
+    common_levels: Option<Vec<Name>>,
 }
 
 #[derive(Clone)]
@@ -142,6 +143,10 @@ fn substitution(
 }
 
 impl Context {
+    pub(in crate::source) fn partial_local_levels(&self) -> Option<Vec<Name>> {
+        self.partial.as_ref()?.locals.common_levels.clone()
+    }
+
     pub(in crate::source) fn collect_partial_locals(&self) -> bool {
         self.partial.as_ref().is_some_and(|state| {
             state.kind == Kind::Partial
@@ -447,65 +452,34 @@ impl Context {
             .chain(locals.owner.iter())
             .cloned()
             .collect();
-        let explicit = self.explicit_levels;
-        self.explicit_levels = 0;
-        let result =
-            (|| {
-                let mut levels = Vec::new();
-                let mut dependencies = Vec::new();
-                for closed in &mut all {
-                    closed.term.value = self.instantiate(&closed.term.value)?;
-                    closed.term.type_ = self.instantiate(&closed.term.type_)?;
-                    levels.push(self.declaration_levels(&[
-                        closed.term.type_.clone(),
-                        closed.term.value.clone(),
-                    ])?);
-                    dependencies.push(self.txn.mvars.collect_mvars(&closed.term.value));
-                }
-                loop {
-                    let mut next = levels.clone();
-                    for (index, dependencies) in dependencies.iter().enumerate() {
-                        for (peer, target) in all.iter().enumerate() {
-                            self.tick()?;
-                            if dependencies.contains(&target.id) {
-                                for level in &levels[peer] {
-                                    if !next[index].contains(level) {
-                                        next[index].push(level.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if next == levels {
-                        break;
-                    }
-                    levels = next;
-                }
-                for (index, closed) in all.iter().enumerate() {
-                    let roots: Vec<_> = levels[index]
-                        .iter()
-                        .map(|name| Expr::sort(Level::param(name.clone())))
-                        .collect();
-                    // Explicit owner universes must be used, including by a helper
-                    // its surviving body calls. Helpers have no written universe list.
-                    self.explicit_levels = if index + 1 == all.len() { explicit } else { 0 };
-                    levels[index] = self.declaration_levels(&roots)?;
-                    let value = Expr::const_(
-                        Name::str(closed.name.clone(), "_unsafe_rec"),
-                        levels[index].iter().cloned().map(Level::param).collect(),
-                    );
-                    self.txn
-                        .mvars
-                        .assign(closed.id.clone(), value, AssignmentJustification::UserGiven)
-                        .map_err(|_| failure(SourceInferenceError::Scope))?;
-                }
-                Ok::<_, NatDefinitionElabError>(levels)
-            })();
-        self.explicit_levels = explicit;
-        let levels = result?;
+        // The pin fixes one ordered universe list for every predefinition
+        // before SCC partitioning (PreDefinition/Basic.lean::fixLevelParams).
+        // An unused helper still belongs to that group. Reachability-based
+        // propagation would change its public universe telescope, and could
+        // also drop an owner universe used only by the unused helper.
+        let mut roots = Vec::new();
+        for closed in &mut all {
+            self.tick()?;
+            closed.term.value = self.instantiate(&closed.term.value)?;
+            closed.term.type_ = self.instantiate(&closed.term.type_)?;
+            roots.push(closed.term.type_.clone());
+            roots.push(closed.term.value.clone());
+        }
+        let levels = self.declaration_levels(&roots)?;
+        for closed in &all {
+            self.tick()?;
+            let value = Expr::const_(
+                Name::str(closed.name.clone(), "_unsafe_rec"),
+                levels.iter().cloned().map(Level::param).collect(),
+            );
+            self.txn
+                .mvars
+                .assign(closed.id.clone(), value, AssignmentJustification::UserGiven)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+        }
         let mut definitions = Vec::new();
         let mut failed_codegen = Vec::new();
-        for (closed, levels) in all[..all.len() - 1].iter().zip(&levels) {
+        for closed in &all[..all.len() - 1] {
             let term = self.finish(closed.term.clone())?;
             if term.value.has_fvar()
                 || term.type_.has_fvar()
@@ -533,6 +507,7 @@ impl Context {
         let locals = &mut self.partial.as_mut().expect("partial body").locals;
         locals.definitions = definitions;
         locals.failed_codegen = failed_codegen;
+        locals.common_levels = Some(levels);
         Ok(())
     }
 }
