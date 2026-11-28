@@ -61,6 +61,8 @@ pub fn registrations(
     let mut remaining = max_work;
     let mut classes = BTreeSet::new();
     let mut positions = BTreeMap::<Name, (Name, Option<Name>)>::new();
+    let mut captured_models = BTreeMap::<Name, Option<DerivedIndex>>::new();
+    let mut captured_rows = Vec::new();
     let mut exported = Registrations::default();
     let (imported_classes, imported_bytes) = imported::export_classes(result, &mut remaining)?;
     exported.bytes_examined = imported_bytes;
@@ -128,32 +130,52 @@ pub fn registrations(
             }
             continue;
         }
-        if !(1..=3).contains(&tag) || !classes.contains(&class) {
+        if !(1..=6).contains(&tag) || !classes.contains(&class) {
             return Err(InstanceRegistryError::Malformed);
         }
+        let operation = (tag - 1) % 3 + 1;
         let declaration = read_name(&mut bytes)?;
         let priority = u32::from_le_bytes(
             take(&mut bytes, 4)?
                 .try_into()
                 .map_err(|_| InstanceRegistryError::Malformed)?,
         );
-        let scope = if tag == 3 {
+        let scope = if operation == 3 {
             Some(read_name(&mut bytes)?)
         } else {
             None
         };
-        if !bytes.is_empty()
-            || declaration.is_anonymous()
+        if declaration.is_anonymous()
             || scope.as_ref().is_some_and(Name::is_anonymous)
             || !validation.contains(&declaration)
         {
+            return Err(InstanceRegistryError::Malformed);
+        }
+        if tag >= 4 {
+            let model = captured::read(&mut bytes)?;
+            captured::validate_with_budget(
+                validation,
+                &class,
+                &declaration,
+                model.as_ref(),
+                &mut remaining,
+            )?;
+            if captured_models.get(&declaration).is_some_and(|previous| {
+                !matches!((previous.as_ref(), model.as_ref()),
+                    (Some(previous), Some(model)) if previous == model)
+            }) {
+                return Err(InstanceRegistryError::Malformed);
+            }
+            captured_models.insert(declaration.clone(), model);
+        }
+        if !bytes.is_empty() {
             return Err(InstanceRegistryError::Malformed);
         }
         if !owned && !base.contains(&declaration) && std::ptr::eq(validation, result) {
             return Err(InstanceRegistryError::Malformed);
         }
         if let Some((old_class, old_scope)) = positions.get(&declaration) {
-            if tag == 1 || old_class != &class || old_scope != &scope {
+            if operation == 1 || old_class != &class || old_scope != &scope {
                 return Err(InstanceRegistryError::Malformed);
             }
         } else {
@@ -162,18 +184,31 @@ pub fn registrations(
         if !owned {
             continue;
         }
-        // Derive against the class registrations visible at THIS journal row.
-        // A later `[class]` registration must not rewrite an earlier key.
-        let Some(derived) = index::derive(
-            result,
-            &classes,
-            &imported_classes,
-            Some(&class),
-            &declaration,
-            &mut remaining,
-        )?
-        else {
-            return Ok(None);
+        let captured = captured_models.get(&declaration);
+        let derived = match captured {
+            Some(Some(model)) => {
+                charge(&mut remaining, model.keys.len() + model.synth_order.len())?;
+                model.clone()
+            }
+            // Unsupported-at-registration is immutable too. Recomputing here
+            // would give this old row a path from a different attribute epoch.
+            Some(None) => return Ok(None),
+            None => {
+                // Legacy rows lack a snapshot. Retain their conservative
+                // derivation and the final-class consistency guard below.
+                let Some(derived) = index::derive(
+                    result,
+                    &classes,
+                    &imported_classes,
+                    Some(&class),
+                    &declaration,
+                    &mut remaining,
+                )?
+                else {
+                    return Ok(None);
+                };
+                derived
+            }
         };
         let info = result
             .find(&declaration)
@@ -196,11 +231,11 @@ pub fn registrations(
             synth_order: derived.synth_order,
             keys: derived.keys,
         });
+        captured_rows.push(captured.is_some());
     }
-    // Source search derives supported native models from the final registry.
-    // Refuse a later class registration that would change an earlier stored
-    // path or schedule, rather than letting artifact reimport select a different
-    // dictionary. Inherited-name class changes were already refused above.
+    // Legacy source search derives models from the final registry; retain its
+    // conservative later-class guard. Captured rows instead carry the exact
+    // model source search already uses, across reducibility and class epochs.
     let mut inherited = BTreeSet::new();
     for row in &exported.instances {
         tick(&mut remaining)?;
@@ -212,7 +247,7 @@ pub fn registrations(
         imported::export_instances(result, &inherited, &mut remaining)?;
     exported.bytes_examined += imported_bytes;
     let mut final_models = BTreeMap::new();
-    for row in &exported.instances {
+    for (row, captured) in exported.instances.iter().zip(captured_rows) {
         tick(&mut remaining)?;
         // A source priority update retains an imported instance's original
         // tree slot, index and synthesis schedule. Emitting a different model
@@ -230,6 +265,9 @@ pub fn registrations(
             {
                 return Ok(None);
             }
+        }
+        if captured {
+            continue;
         }
         if !final_models.contains_key(&row.declaration) {
             let Some(model) = index::derive(

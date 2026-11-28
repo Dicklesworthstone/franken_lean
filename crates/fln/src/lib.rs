@@ -2549,6 +2549,7 @@ impl Engine {
             Outcome::Complete(mut admitted) => {
                 source_records::apply_admission_effects(
                     &mut admitted,
+                    registration.is_some(),
                     elaborated.irreducible,
                     elaborated.equation_info.as_ref(),
                     options,
@@ -5180,6 +5181,7 @@ impl Engine {
                     };
                     source_records::apply_batch_effects(
                         &mut admission,
+                        is_instance,
                         irreducible,
                         equation_info.as_ref(),
                         options,
@@ -5417,6 +5419,7 @@ impl Engine {
                 }
                 source_records::apply_execution_effects(
                     &mut execution,
+                    is_instance,
                     irreducible,
                     equation_info.as_ref(),
                     scoped_options.as_ref().unwrap_or(options),
@@ -6552,6 +6555,7 @@ impl Engine {
                 Outcome::Complete(mut execution) => {
                     source_records::apply_execution_effects(
                         &mut execution,
+                        false,
                         elaborated.irreducible,
                         elaborated.equation_info.as_ref(),
                         options,

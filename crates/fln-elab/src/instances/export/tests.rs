@@ -656,9 +656,35 @@ fn a_later_class_registration_cannot_rewrite_an_earlier_exported_key() {
     let env = axiom(&empty, "D", ty());
     let env = axiom(&env, "h", c("D"));
     let env = class(&env, "C", pi("x", c("D"), ty(), BinderInfo::InstImplicit));
-    let env = register(&env, "earlier", app("C", c("h")));
+    let declared = axiom(&env, "earlier", app("C", c("h")));
+    let env = register_instance(&declared, &n("earlier"), 1000).unwrap();
+    let original = derive(&env, "earlier").unwrap();
+    assert_eq!(
+        original.keys,
+        [
+            discr_tree::Key::Const(n("C"), 1),
+            discr_tree::Key::Const(n("h"), 0),
+        ]
+    );
     let changed = register_class(&env, &n("D")).unwrap();
-    assert_eq!(registrations(&empty, &changed, 1_000_000).unwrap(), None);
+    let (rows, _) = registrations(&empty, &changed, 1_000_000).unwrap().unwrap();
+    assert_eq!(rows.instances[0].keys, original.keys);
+    assert_eq!(rows.instances[0].synth_order, original.synth_order);
+    assert_ne!(derive(&changed, "earlier").unwrap().keys, original.keys);
+    assert_eq!(
+        set_instance(&changed, &n("earlier"), 2000),
+        Err(InstanceRegistryError::UnsupportedIndexUpdate(n("earlier")))
+    );
+
+    // Old rows have no registration snapshot. Their original conservative
+    // export gate remains: a changed class policy cannot be guessed away.
+    let legacy = append(
+        &declared,
+        instance_payload(1, &n("C"), &n("earlier"), 1000, None).unwrap(),
+    )
+    .unwrap();
+    let legacy = register_class(&legacy, &n("D")).unwrap();
+    assert_eq!(registrations(&empty, &legacy, 1_000_000).unwrap(), None);
 }
 
 #[test]
@@ -747,10 +773,11 @@ fn imported_priority_exports_require_the_live_index_and_prerequisite_schedule() 
             _ => {}
         }
         let imported = imported::register_instance(&base, &n("candidate"), &parameters).unwrap();
-        let updated = set_instance(&imported, &n("candidate"), 2000).unwrap();
-        let root = updated.logical_root(&KVMap::new());
-        let result = registrations(&imported, &updated, usize::MAX).unwrap();
+        let root = imported.logical_root(&KVMap::new());
+        let update = set_instance(&imported, &n("candidate"), 2000);
         if changed == 0 {
+            let updated = update.unwrap();
+            let result = registrations(&imported, &updated, usize::MAX).unwrap();
             let (rows, work) = result.unwrap();
             assert!(rows.classes.is_empty());
             assert_eq!(rows.instances.len(), 1);
@@ -770,11 +797,14 @@ fn imported_priority_exports_require_the_live_index_and_prerequisite_schedule() 
             );
         } else {
             assert_eq!(
-                result, None,
-                "a physical import must not silently change the live source model"
+                update,
+                Err(InstanceRegistryError::UnsupportedIndexUpdate(n(
+                    "candidate"
+                ))),
+                "a source priority change must not replace a physical import's model"
             );
         }
-        assert_eq!(updated.logical_root(&KVMap::new()), root);
+        assert_eq!(imported.logical_root(&KVMap::new()), root);
     }
 }
 
@@ -828,6 +858,220 @@ fn local_alias_fixture() -> Environment {
             ),
         ),
     )
+}
+
+fn registration_model(env: &Environment, declaration: &str) -> Option<DerivedIndex> {
+    derive_registration_index(
+        env,
+        &InstanceRegistry::read(env).unwrap(),
+        &n(declaration),
+        &mut 1_000_000,
+    )
+    .unwrap()
+}
+
+#[test]
+fn registration_keys_retain_the_actual_definition_transparency_epoch() {
+    use crate::reducibility::{self, Reducibility};
+    use fln_env::constants::DefinitionVal;
+    let empty = Environment::new();
+    let env = axiom(&empty, "Nat", ty());
+    let env = class(&env, "Pick", pi("A", ty(), ty(), BinderInfo::Default));
+    let env = env
+        .add_decl(ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: n("Carrier"),
+                level_params: vec![],
+                type_: ty(),
+            },
+            value: c("Nat"),
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![n("Carrier")],
+        }))
+        .unwrap();
+    let env = axiom(&env, "before", app("Pick", c("Carrier")));
+    assert_eq!(registration_model(&env, "before"), None);
+    let env = reducibility::register_default(&env, &n("Carrier")).unwrap();
+    let folded = registration_model(&env, "before").unwrap();
+    assert_eq!(
+        folded.keys,
+        [
+            discr_tree::Key::Const(n("Pick"), 1),
+            discr_tree::Key::Const(n("Carrier"), 0),
+        ]
+    );
+    assert!(folded.synth_order.is_empty());
+    assert_eq!(
+        derive(&env, "before"),
+        None,
+        "legacy derivation stays conservative"
+    );
+    let env = register_instance(&env, &n("before"), 1000).unwrap();
+    let changed = reducibility::register(&env, &n("Carrier"), Reducibility::Reducible).unwrap();
+    let unfolded = registration_model(&changed, "before").unwrap();
+    assert_eq!(
+        unfolded.keys,
+        [
+            discr_tree::Key::Const(n("Pick"), 1),
+            discr_tree::Key::Const(n("Nat"), 0),
+        ]
+    );
+    // The later source epoch captures a different leaf. The original row
+    // retains its old folded leaf, exactly as the pinned discrimination tree.
+    let changed = register(&changed, "after", app("Pick", c("Carrier")));
+    let (rows, _) = registrations(&empty, &changed, 1_000_000).unwrap().unwrap();
+    assert_eq!(rows.instances.len(), 2);
+    assert_eq!(rows.instances[0].keys, folded.keys);
+    assert_eq!(rows.instances[1].keys, unfolded.keys);
+    assert_eq!(
+        set_instance(&changed, &n("before"), 2000),
+        Err(InstanceRegistryError::UnsupportedIndexUpdate(n("before")))
+    );
+    for status in [Reducibility::Irreducible, Reducibility::ImplicitReducible] {
+        let view = reducibility::register(&env, &n("Carrier"), status).unwrap();
+        assert_eq!(registration_model(&view, "before").unwrap(), folded);
+    }
+    // Smart unfolding needs its own exact computation; it is never guessed.
+    let smart = axiom(&changed, "Carrier._sunfold", ty());
+    assert_eq!(registration_model(&smart, "before"), None);
+}
+
+#[test]
+fn registration_reduces_decidable_equality_telescope_and_prerequisite_aliases() {
+    use fln_env::constants::DefinitionVal;
+    let env = axiom(&Environment::new(), "Bool", ty());
+    let env = axiom(
+        &env,
+        "Eq",
+        pi(
+            "A",
+            ty(),
+            pi(
+                "a",
+                b(0),
+                pi("b", b(1), Expr::sort(Level::zero()), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Implicit,
+        ),
+    );
+    let env = class(
+        &env,
+        "Decidable",
+        pi("p", Expr::sort(Level::zero()), ty(), BinderInfo::Default),
+    );
+    let env = class(&env, "BEq", pi("A", ty(), ty(), BinderInfo::Default));
+    let equality = Expr::app(Expr::app(app("Eq", b(2)), b(1)), b(0));
+    let env = env
+        .add_decl(ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: n("DecisionEq"),
+                level_params: vec![],
+                type_: pi("A", ty(), ty(), BinderInfo::Default),
+            },
+            value: Expr::lam(
+                n("A"),
+                ty(),
+                pi(
+                    "a",
+                    b(0),
+                    pi("b", b(1), app("Decidable", equality), BinderInfo::Default),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![n("DecisionEq")],
+        }))
+        .unwrap();
+    let env = crate::reducibility::register(
+        &env,
+        &n("DecisionEq"),
+        crate::reducibility::Reducibility::Reducible,
+    )
+    .unwrap();
+    let env = axiom(&env, "boolDecision", app("DecisionEq", c("Bool")));
+    let env = axiom(
+        &env,
+        "fromDecision",
+        pi(
+            "A",
+            ty(),
+            pi(
+                "dictionary",
+                app("DecisionEq", b(0)),
+                app("BEq", b(1)),
+                BinderInfo::InstImplicit,
+            ),
+            BinderInfo::Implicit,
+        ),
+    );
+    let direct = registration_model(&env, "boolDecision").unwrap();
+    assert_eq!(
+        direct.keys,
+        [
+            discr_tree::Key::Const(n("Decidable"), 1),
+            discr_tree::Key::Const(n("Eq"), 3),
+            discr_tree::Key::Const(n("Bool"), 0),
+            discr_tree::Key::Star,
+            discr_tree::Key::Star,
+        ]
+    );
+    assert!(direct.synth_order.is_empty());
+    let dependent = registration_model(&env, "fromDecision").unwrap();
+    assert_eq!(dependent.synth_order, [1]);
+    assert_eq!(
+        dependent.keys,
+        [discr_tree::Key::Const(n("BEq"), 1), discr_tree::Key::Star]
+    );
+    assert_eq!(derive(&env, "boolDecision"), None);
+    assert_eq!(derive(&env, "fromDecision"), None);
+    let opaque = crate::reducibility::register(
+        &env,
+        &n("DecisionEq"),
+        crate::reducibility::Reducibility::Irreducible,
+    )
+    .unwrap();
+    assert_eq!(registration_model(&opaque, "boolDecision"), None);
+    assert_eq!(registration_model(&opaque, "fromDecision"), None);
+}
+
+#[test]
+fn registration_delta_beta_instantiates_levels_and_keeps_exact_fuel_limits() {
+    let env = local_alias_fixture();
+    let root = env.logical_root(&KVMap::new());
+    let registry = InstanceRegistry::read(&env).unwrap();
+    let mut remaining = 1_000_000;
+    let model = derive_registration_index(&env, &registry, &n("aliasChoice"), &mut remaining)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        model.keys,
+        [
+            discr_tree::Key::Const(n("Pick"), 1),
+            discr_tree::Key::Const(n("Nat"), 0)
+        ]
+    );
+    let work = 1_000_000 - remaining;
+    let mut exact = work;
+    assert_eq!(
+        derive_registration_index(&env, &registry, &n("aliasChoice"), &mut exact).unwrap(),
+        Some(model)
+    );
+    assert_eq!(exact, 0);
+    assert_eq!(
+        derive_registration_index(&env, &registry, &n("aliasChoice"), &mut (work - 1)),
+        Err(InstanceRegistryError::Limit)
+    );
+    let malformed = axiom(
+        &env,
+        "wrongLevels",
+        app("Pick", Expr::app(c("AppliedAlias"), c("Nat"))),
+    );
+    assert_eq!(registration_model(&malformed, "wrongLevels"), None);
+    assert_eq!(env.logical_root(&KVMap::new()), root);
 }
 
 #[test]
@@ -898,7 +1142,9 @@ fn local_alias_keys_stay_frozen_when_reducibility_changes() {
     );
     assert_eq!(
         scopes.register_local(&changed, &n("aliasChoice"), 2000),
-        Err(InstanceRegistryError::InvalidInstance(n("aliasChoice")))
+        Err(InstanceRegistryError::UnsupportedIndexUpdate(n(
+            "aliasChoice"
+        )))
     );
     assert_eq!(scopes, original, "failed re-registration is atomic");
     assert!(
@@ -946,7 +1192,9 @@ fn local_reregistration_preserves_imported_paths_or_refuses_atomically() {
         } else {
             assert_eq!(
                 result,
-                Err(InstanceRegistryError::InvalidInstance(n("aliasChoice")))
+                Err(InstanceRegistryError::UnsupportedIndexUpdate(n(
+                    "aliasChoice"
+                )))
             );
             assert_eq!(scopes, original);
         }

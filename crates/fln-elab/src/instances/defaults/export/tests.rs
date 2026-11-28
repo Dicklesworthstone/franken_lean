@@ -53,6 +53,27 @@ fn fixture() -> Environment {
 }
 
 #[test]
+fn defaults_export_alongside_captured_global_and_scoped_registrations() {
+    let base = fixture();
+    let env = instances::register_instance(&base, &n("first"), 1000).unwrap();
+    let env = instances::set_instance(&env, &n("first"), 1500).unwrap();
+    let env = instances::scoped::register(&env, &n("Regional"), &n("second"), 2000).unwrap();
+    let result = super::super::register(&env, &n("first"), 500).unwrap();
+    let root = result.logical_root(&KVMap::new());
+    let rows = registrations(&base, &result, 10_000).unwrap();
+    assert_eq!(rows.entries.len(), 1);
+    assert_eq!(rows.entries[0].class, n("C"));
+    assert_eq!(rows.entries[0].candidate.declaration, n("first"));
+    assert_eq!(rows.entries[0].candidate.priority, 500);
+    assert_eq!(registrations(&base, &result, rows.work).unwrap(), rows);
+    assert_eq!(
+        registrations(&base, &result, rows.work - 1),
+        Err(InstanceRegistryError::Limit)
+    );
+    assert_eq!(result.logical_root(&KVMap::new()), root);
+}
+
+#[test]
 fn suffix_ownership_preserves_repeated_imported_candidates_and_exact_work() {
     let empty = fixture();
     let base = super::super::register(&empty, &n("first"), 2000).unwrap();

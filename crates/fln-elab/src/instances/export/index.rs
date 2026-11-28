@@ -6,6 +6,8 @@
 //! keeps an exported path independent of later reducibility changes.
 //! Local registrations can additionally capture reducible alias keys once;
 //! those keys must travel with their lexical registration, never be re-derived.
+//! Native registration captures additionally normalize direct reducible
+//! telescopes and retain known non-reducible definition heads in that world.
 use super::*;
 use fln_core::expr::{FVarId, Literal, NatLit};
 
@@ -32,6 +34,7 @@ struct Indexer<'a> {
     remaining: &'a mut usize,
     locals: Vec<Local>,
     capture_aliases: bool,
+    registration: bool,
 }
 
 /// The source driver keeps an ascription `(e : T)` as the identity let `let _ : T := e; #0`
@@ -67,6 +70,7 @@ pub(super) fn derive(
         remaining,
         locals: Vec::new(),
         capture_aliases: false,
+        registration: false,
     };
     match indexer.instance(expected_class, declaration) {
         Ok(result) => Ok(Some(result)),
@@ -89,6 +93,30 @@ pub(super) fn derive_local(
         remaining,
         locals: Vec::new(),
         capture_aliases: true,
+        registration: false,
+    };
+    match indexer.instance(None, declaration) {
+        Ok(result) => Ok(Some(result)),
+        Err(Error::Unsupported) => Ok(None),
+        Err(Error::Registry(error)) => Err(error),
+    }
+}
+
+pub(super) fn derive_registration(
+    env: &Environment,
+    classes: &BTreeSet<Name>,
+    imported_classes: &BTreeMap<Name, imported::ClassParameters>,
+    declaration: &Name,
+    remaining: &mut usize,
+) -> std::result::Result<Option<DerivedIndex>, InstanceRegistryError> {
+    let mut indexer = Indexer {
+        env,
+        classes,
+        imported_classes,
+        remaining,
+        locals: Vec::new(),
+        capture_aliases: false,
+        registration: true,
     };
     match indexer.instance(None, declaration) {
         Ok(result) => Ok(Some(result)),
@@ -165,6 +193,9 @@ impl Indexer<'_> {
         }
         loop {
             self.tick()?;
+            if self.registration {
+                target = self.registration_head(&target)?;
+            }
             match target.node() {
                 ExprNode::ForallE {
                     binder_type,
@@ -327,16 +358,19 @@ impl Indexer<'_> {
         // that distinction: dependencies collects only our outer local FVars.
         // Once a prerequisite is selected, synth_order still assigns from its
         // complete original type, including dependencies of these domains.
-        let mut target = type_;
+        let mut target = type_.clone();
         loop {
             self.tick()?;
+            if self.registration {
+                target = self.registration_head(&target)?;
+            }
             match target.node() {
-                ExprNode::ForallE { body, .. } => target = body,
-                ExprNode::MData { data, expr } if data.is_empty() => target = expr,
+                ExprNode::ForallE { body, .. } => target = body.clone(),
+                ExprNode::MData { data, expr } if data.is_empty() => target = expr.clone(),
                 _ => break,
             }
         }
-        let (class, args) = self.class_application(target)?;
+        let (class, args) = self.class_application(&target)?;
         let class_type = self
             .env
             .find(&class)
@@ -481,7 +515,10 @@ impl Indexer<'_> {
                 )
             }
             ExprNode::App { f, a } => {
-                let type_ = self.infer(f, depth + 1)?;
+                let mut type_ = self.infer(f, depth + 1)?;
+                if self.registration {
+                    type_ = self.registration_head(&type_)?;
+                }
                 let ExprNode::ForallE { body, .. } = type_.node() else {
                     return Err(Error::Unsupported);
                 };
@@ -721,6 +758,73 @@ impl Indexer<'_> {
         }
     }
 
+    fn known_status(&mut self, name: &Name) -> Result<Option<crate::reducibility::Reducibility>> {
+        self.tick()?;
+        crate::reducibility::known_status(self.env, name).map_err(|error| {
+            Error::Registry(match error {
+                crate::reducibility::ReducibilityError::Limit => InstanceRegistryError::Limit,
+                crate::reducibility::ReducibilityError::Instances(error) => error,
+                _ => InstanceRegistryError::Malformed,
+            })
+        })
+    }
+
+    /// The reducible delta/beta fragment used only while capturing a new
+    /// registration. Hints alone never authorize unfolding: class projections
+    /// have Abbrev hints too, but stay folded at their semireducible status.
+    /// Recursors, projections, smart unfolding and eta reduction are not
+    /// implemented here; their resulting shapes keep the typed refusal.
+    fn registration_head(&mut self, expr: &Expr) -> Result<Expr> {
+        let mut current = without_ascription(expr);
+        loop {
+            self.tick()?;
+            let (head, args) = self.spine(&current)?;
+            let value = match head.node() {
+                ExprNode::Lam { .. } if !args.is_empty() => head,
+                ExprNode::Const { name, levels } => {
+                    let Some(ConstantInfo::Defn(definition)) = self.env.find(name) else {
+                        return Ok(current);
+                    };
+                    if definition.safety != DefinitionSafety::Safe
+                        || self.env.contains(&Name::str(name.clone(), "_sunfold"))
+                    {
+                        return Err(Error::Unsupported);
+                    }
+                    let parameters = definition.base.level_params.clone();
+                    let value = definition.value.clone();
+                    let status = self.known_status(name)?;
+                    match status {
+                        Some(crate::reducibility::Reducibility::Reducible) => {}
+                        Some(_) => return Ok(current),
+                        None => return Err(Error::Unsupported),
+                    }
+                    *self.remaining = self
+                        .remaining
+                        .checked_sub(parameters.len())
+                        .ok_or(InstanceRegistryError::Limit)?;
+                    crate::universe::parameters::instantiate(
+                        || tick(self.remaining).map_err(Error::from),
+                        || Error::Unsupported,
+                        &value,
+                        &parameters,
+                        levels,
+                    )?
+                }
+                _ => return Ok(current),
+            };
+            let mut value = value;
+            for argument in args {
+                self.tick()?;
+                value = without_ascription(&value);
+                value = match value.node() {
+                    ExprNode::Lam { body, .. } => self.substitute(body, &argument)?,
+                    _ => Expr::app(value, argument),
+                };
+            }
+            current = without_ascription(&value);
+        }
+    }
+
     fn path(&mut self, target: &Expr) -> Result<Vec<discr_tree::Key>> {
         use discr_tree::Key;
         let mut keys = Vec::new();
@@ -732,7 +836,9 @@ impl Indexer<'_> {
                 continue;
             };
             let mut expr = without_ascription(&expr);
-            if self.capture_aliases && !root {
+            if self.registration {
+                expr = self.registration_head(&expr)?;
+            } else if self.capture_aliases && !root {
                 expr = self.local_alias(&expr)?;
             }
             if !root && let Some(literal) = self.numeral(&expr)? {
@@ -765,6 +871,15 @@ impl Indexer<'_> {
                         Some(ConstantInfo::Axiom(value)) if !value.is_unsafe => {}
                         Some(ConstantInfo::Induct(value)) if !value.is_unsafe => {}
                         Some(ConstantInfo::Ctor(value)) if !value.is_unsafe => {}
+                        Some(ConstantInfo::Defn(value))
+                            if self.registration && value.safety == DefinitionSafety::Safe =>
+                        {
+                            if !self.known_status(name)?.is_some_and(|status| {
+                                status != crate::reducibility::Reducibility::Reducible
+                            }) {
+                                return Err(Error::Unsupported);
+                            }
+                        }
                         _ => return Err(Error::Unsupported),
                     }
                     let ignored = self.ignored_arguments(&head, &args)?;

@@ -247,6 +247,9 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
             | SourceInferenceError::GrindPattern(
                 fln_elab::grind_patterns::GrindPatternError::Unsupported(_),
             )
+            | SourceInferenceError::InstanceRegistry(
+                fln_elab::instances::InstanceRegistryError::UnsupportedIndexUpdate(_),
+            )
             | SourceInferenceError::PreresolvedReference { .. } => ("capability", false, 5),
             SourceInferenceError::SimpSet(
                 fln_elab::source::scope::simp::SimpSetError::Malformed,

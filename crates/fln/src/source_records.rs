@@ -1031,7 +1031,13 @@ impl Engine {
             .map_err(EngineExecutionError::from)?;
         Ok(match result {
             Outcome::Complete(mut batch) => {
-                apply_batch_effects(&mut batch, irreducible, equation_info.as_ref(), options)?;
+                apply_batch_effects(
+                    &mut batch,
+                    registration.is_some(),
+                    irreducible,
+                    equation_info.as_ref(),
+                    options,
+                )?;
                 if fln_elab::source::scope::simp::defeq::direct_rfl(syntax) {
                     for admitted in &batch.admissions {
                         let name = match &admitted.declaration {
@@ -1348,7 +1354,7 @@ impl Engine {
             let mut work_left = usize::try_from(kernel.steps)
                 .unwrap_or(usize::MAX)
                 .min(1_000_000);
-            if fln_elab::instances::export::derive_local_index(
+            if fln_elab::instances::export::derive_registration_index(
                 engine.environment(),
                 &registry,
                 name,

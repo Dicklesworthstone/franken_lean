@@ -448,6 +448,10 @@ impl Engine {
         };
         apply_batch_effects(
             &mut private_implementation,
+            fln_elab::source::instance_registration(syntax)
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?
+                .is_some(),
             candidate.irreducible,
             None,
             options,

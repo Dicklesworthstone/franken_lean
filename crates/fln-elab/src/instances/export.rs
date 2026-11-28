@@ -35,6 +35,26 @@ pub fn derive_index(
     )
 }
 
+/// Capture exact indexing at a validated native registration's current world.
+/// Unlike [`derive_index`], this normalizes the bounded reducible delta/beta
+/// fragment and retains known non-reducible definition heads. The caller must
+/// persist the returned model (including unsupported results) with that event:
+/// deriving it again after a transparency change can change instance selection.
+pub fn derive_registration_index(
+    env: &Environment,
+    registry: &InstanceRegistry,
+    declaration: &Name,
+    work_left: &mut usize,
+) -> Result<Option<DerivedIndex>, InstanceRegistryError> {
+    index::derive_registration(
+        env,
+        &registry.classes,
+        &registry.imported.classes,
+        declaration,
+        work_left,
+    )
+}
+
 /// Derive a local registration's keys at the moment it is registered. Unlike
 /// [`derive_index`], this may normalize reducible aliases in nested keys. The
 /// caller must retain the returned metadata with the lexical registration:

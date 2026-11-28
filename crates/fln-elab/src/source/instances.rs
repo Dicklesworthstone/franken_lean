@@ -1305,14 +1305,18 @@ impl Context {
             let mut ordered = Vec::with_capacity(subgoals.len());
             for index in synth_order {
                 self.tick()?;
-                let slot = positions
-                    .iter()
-                    .position(|position| position == index)
-                    .ok_or_else(|| registry_error(InstanceRegistryError::Malformed))?;
+                let Some(slot) = positions.iter().position(|position| position == index) else {
+                    // The registry already validated this saved order against
+                    // the immutable declaration. A later irreducibility change
+                    // can hide its original telescope from current reduction.
+                    // This candidate then cannot apply; keep its stored model
+                    // and let search try the next candidate in the same frame.
+                    return Ok(None);
+                };
                 ordered.push(subgoals[slot].clone());
             }
             if ordered.len() != subgoals.len() {
-                return Err(registry_error(InstanceRegistryError::Malformed));
+                return Ok(None);
             }
             subgoals = ordered;
         }

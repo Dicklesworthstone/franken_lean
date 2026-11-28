@@ -158,21 +158,28 @@ fn class_memberships(
                 validate_class(validation, &class)?;
                 continue;
             }
-            if !(1..=3).contains(&tag) || !classes.contains(&class) {
+            if !(1..=6).contains(&tag) || !classes.contains(&class) {
                 return Err(InstanceRegistryError::Malformed);
             }
+            let operation = (tag - 1) % 3 + 1;
             let declaration = read_name(&mut bytes)?;
             take(&mut bytes, 4)?;
-            let scope = if tag == 3 {
+            let scope = if operation == 3 {
                 Some(read_name(&mut bytes)?)
             } else {
                 None
             };
+            if tag >= 4 {
+                // Default export uses only class membership. Consume the
+                // bounded captured-model trailer without re-normalizing an
+                // unrelated ordinary instance under a later attribute state.
+                let _ = instances::captured::read(&mut bytes)?;
+            }
             if !bytes.is_empty() || !validation.contains(&declaration) {
                 return Err(InstanceRegistryError::Malformed);
             }
             if let Some((old_class, old_scope)) = positions.get(&declaration) {
-                if tag == 1 || old_class != &class || old_scope != &scope {
+                if operation == 1 || old_class != &class || old_scope != &scope {
                     return Err(InstanceRegistryError::Malformed);
                 }
             } else {

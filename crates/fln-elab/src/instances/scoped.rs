@@ -107,7 +107,7 @@ impl ActiveScopes {
         if !registry.is_class(&class) {
             return Err(InstanceRegistryError::UnknownClass(class));
         }
-        let index = export::derive_local_index(env, &registry, declaration, &mut 1_000_000)?;
+        let index = export::derive_registration_index(env, &registry, declaration, &mut 1_000_000)?;
         // The pin keeps an older tree path when the same declaration is
         // registered under a different one. This single-slot lexical model
         // can replace priority only after proving that the path and schedule
@@ -116,12 +116,23 @@ impl ActiveScopes {
             if index.as_ref().is_none_or(|index| {
                 index.keys != previous.keys || index.synth_order != previous.synth_order
             }) {
-                return Err(InstanceRegistryError::InvalidInstance(declaration.clone()));
+                return Err(InstanceRegistryError::UnsupportedIndexUpdate(
+                    declaration.clone(),
+                ));
+            }
+        } else if let Some(previous) = registry.captured_instance_index(declaration) {
+            if !matches!((previous, index.as_ref()), (Some(previous), Some(index)) if previous == index)
+            {
+                return Err(InstanceRegistryError::UnsupportedIndexUpdate(
+                    declaration.clone(),
+                ));
             }
         } else if registry.updates.contains_key(declaration) {
             let previous = export::derive_index(env, &registry, declaration, &mut 1_000_000)?;
             if !matches!((&previous, &index), (Some(previous), Some(index)) if previous == index) {
-                return Err(InstanceRegistryError::InvalidInstance(declaration.clone()));
+                return Err(InstanceRegistryError::UnsupportedIndexUpdate(
+                    declaration.clone(),
+                ));
             }
         }
         for activation in self.activations.iter() {
@@ -134,7 +145,9 @@ impl ActiveScopes {
                 && !matches!((previous.as_deref(), index.as_ref()),
                     (Some(previous), Some(index)) if previous == index)
             {
-                return Err(InstanceRegistryError::InvalidInstance(declaration.clone()));
+                return Err(InstanceRegistryError::UnsupportedIndexUpdate(
+                    declaration.clone(),
+                ));
             }
         }
         // The pin's addLocalEntry inserts or replaces in the current scoped
@@ -283,7 +296,7 @@ impl InstanceRegistry {
         // but addInstanceEntry still clears the name from the erased set.
         let mut selected = BTreeMap::new();
         let mut erased: BTreeMap<Name, SelectionClock> = BTreeMap::new();
-        let mut local_indices: BTreeMap<Name, (SelectionClock, Arc<export::DerivedIndex>)> =
+        let mut local_indices: BTreeMap<Name, (SelectionClock, Option<Arc<export::DerivedIndex>>)> =
             BTreeMap::new();
         for (class, rows) in &registry.instances {
             for row in rows {
@@ -316,23 +329,20 @@ impl InstanceRegistry {
                     if validate_instance(env, declaration)? != *class || !registry.is_class(class) {
                         return Err(InstanceRegistryError::Malformed);
                     }
-                    if let Some(index) = index {
-                        if local_indices
-                            .get(declaration)
-                            .is_some_and(|(_, previous)| previous.as_ref() != index.as_ref())
-                        {
-                            // A different path would leave multiple tree entries
-                            // at the pin. This single-slot model must not guess
-                            // their priority or traversal order.
-                            return Err(InstanceRegistryError::InvalidInstance(
-                                declaration.clone(),
-                            ));
-                        }
-                        local_indices.insert(
+                    if local_indices.get(declaration).is_some_and(|(_, previous)| {
+                        !matches!((previous.as_deref(), index.as_deref()),
+                            (Some(previous), Some(index)) if previous == index)
+                    }) {
+                        // A different or unknown path may leave multiple tree
+                        // entries. This single-slot model must not guess them.
+                        return Err(InstanceRegistryError::UnsupportedIndexUpdate(
                             declaration.clone(),
-                            ((activation.at, 0, activation_index), Arc::clone(index)),
-                        );
+                        ));
                     }
+                    local_indices.insert(
+                        declaration.clone(),
+                        ((activation.at, 0, activation_index), index.clone()),
+                    );
                     record_registration(
                         &mut selected,
                         declaration,
@@ -415,21 +425,30 @@ impl InstanceRegistry {
                     // selection. An imported entry keeps its saved index when a
                     // namespace opens; otherwise require the same immutable path.
                     // Never replace an alias's captured path with broad search.
-                    let same =
-                        if let Some(previous) = registry.imported.instances.get(&row.declaration) {
+                    let same = if let Some(previous) =
+                        registry.imported.instances.get(&row.declaration)
+                    {
+                        index.as_ref().is_some_and(|index| {
                             previous.keys == index.keys && previous.synth_order == index.synth_order
-                        } else {
-                            export::derive_index(env, &registry, &row.declaration, &mut 1_000_000)?
-                                .as_ref()
-                                == Some(index.as_ref())
-                        };
+                        })
+                    } else if let Some(previous) =
+                        registry.captured_instance_index(&row.declaration)
+                    {
+                        matches!((previous, index.as_deref()),
+                                (Some(previous), Some(index)) if previous == index)
+                    } else {
+                        matches!((export::derive_index(env, &registry, &row.declaration, &mut 1_000_000)?.as_ref(), index.as_deref()),
+                                (Some(previous), Some(index)) if previous == index)
+                    };
                     if !same {
-                        return Err(InstanceRegistryError::InvalidInstance(row.declaration));
+                        return Err(InstanceRegistryError::UnsupportedIndexUpdate(
+                            row.declaration,
+                        ));
                     }
                 }
                 registry
                     .local_indices
-                    .insert(row.declaration.clone(), Arc::clone(index));
+                    .insert(row.declaration.clone(), index.clone());
             }
             registry.instances.entry(class).or_default().push(row);
         }
@@ -474,9 +493,18 @@ pub fn register(
             declaration.clone(),
         ));
     }
+    let model = captured::derive(env, &registry, declaration)?;
+    captured::validate(env, &class, declaration, model.as_ref())?;
     append(
         env,
-        instance_payload(3, &class, declaration, priority, Some(namespace))?,
+        captured::payload(
+            3,
+            &class,
+            declaration,
+            priority,
+            Some(namespace),
+            model.as_ref(),
+        )?,
     )
 }
 

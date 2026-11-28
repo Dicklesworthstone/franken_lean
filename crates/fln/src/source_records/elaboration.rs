@@ -2,37 +2,42 @@
 //! elaboration results, never guesses from a declaration's name or body.
 use super::*;
 
-fn is_source_abbreviation(declaration: &Declaration) -> bool {
+fn has_source_reducibility(declaration: &Declaration, is_instance: bool) -> bool {
     matches!(declaration, Declaration::Defn(definition)
-        if definition.hints == fln_env::constants::ReducibilityHints::Abbrev)
+        if definition.hints == fln_env::constants::ReducibilityHints::Abbrev
+            || (!is_instance && definition.safety != DefinitionSafety::Partial))
 }
 
-/// Source elaboration emits Abbrev hints only for an abbreviation. Record its
-/// default status at this source-only boundary, after ordinary admission and
-/// before explicit attributes. An imported definition's hints alone must not
-/// authorize unfolding in a consumer such as the instance index.
-fn register_abbreviation(
+/// Record the checked source declaration's default before explicit attributes.
+/// Source elaboration emits Abbrev hints only for an abbreviation; ordinary
+/// definitions start semireducible. Data instances retain their separate
+/// implicit-reducibility effect instead of acquiring an ordinary default.
+/// An imported definition's hints alone must not authorize a consumer to infer
+/// either status.
+fn register_source_reducibility(
     engine: &mut Engine,
     declaration: &Declaration,
+    is_instance: bool,
 ) -> Result<bool, EngineExecutionError> {
-    if !is_source_abbreviation(declaration) {
+    if !has_source_reducibility(declaration, is_instance) {
         return Ok(false);
     }
     let Declaration::Defn(definition) = declaration else {
-        unreachable!("source abbreviation is a definition")
+        unreachable!("source definition effects require a definition")
     };
     if !matches!(engine.environment().find(&definition.base.name),
         Some(ConstantInfo::Defn(checked)) if checked == definition)
     {
         return Err(EngineExecutionError::UnexpectedPublication {
-            detail: "source abbreviation effects require the exact admitted definition",
+            detail: "source reducibility effects require the exact admitted definition",
         });
     }
-    engine.environment = set_reducibility(
-        engine,
-        &definition.base.name,
-        fln_elab::reducibility::Reducibility::Reducible,
-    )?;
+    let status = if definition.hints == fln_env::constants::ReducibilityHints::Abbrev {
+        fln_elab::reducibility::Reducibility::Reducible
+    } else {
+        fln_elab::reducibility::Reducibility::Semireducible
+    };
+    engine.environment = set_reducibility(engine, &definition.base.name, status)?;
     Ok(true)
 }
 
@@ -98,11 +103,12 @@ pub(crate) fn record_equation_info(
 
 pub(crate) fn apply_admission_effects(
     admission: &mut DeclarationAdmission,
+    is_instance: bool,
     irreducible: bool,
     equations: Option<&fln_elab::source::equation_theorems::journal::Record>,
     options: &KVMap,
 ) -> Result<(), EngineExecutionError> {
-    if register_abbreviation(&mut admission.engine, &admission.declaration)? {
+    if register_source_reducibility(&mut admission.engine, &admission.declaration, is_instance)? {
         admission.result_logical_root = admission.engine.logical_root(options);
     }
     if irreducible {
@@ -118,6 +124,7 @@ pub(crate) fn apply_admission_effects(
 
 pub(crate) fn apply_batch_effects(
     batch: &mut DeclarationBatchAdmission,
+    is_instance: bool,
     irreducible: bool,
     equations: Option<&fln_elab::source::equation_theorems::journal::Record>,
     options: &KVMap,
@@ -127,14 +134,14 @@ pub(crate) fn apply_batch_effects(
         || batch
             .admissions
             .iter()
-            .any(|admission| is_source_abbreviation(&admission.declaration))
+            .any(|admission| has_source_reducibility(&admission.declaration, is_instance))
     {
         let [admission] = batch.admissions.as_mut_slice() else {
             return Err(EngineExecutionError::UnexpectedPublication {
                 detail: "a source definition effect requires one admitted declaration",
             });
         };
-        apply_admission_effects(admission, irreducible, equations, options)?;
+        apply_admission_effects(admission, is_instance, irreducible, equations, options)?;
         batch.engine = admission.engine.clone();
         batch.result_logical_root = admission.result_logical_root;
     }
@@ -143,11 +150,12 @@ pub(crate) fn apply_batch_effects(
 
 pub(crate) fn apply_execution_effects(
     execution: &mut DefinitionExecution,
+    is_instance: bool,
     irreducible: bool,
     equations: Option<&fln_elab::source::equation_theorems::journal::Record>,
     options: &KVMap,
 ) -> Result<(), EngineExecutionError> {
-    if register_abbreviation(&mut execution.engine, &execution.declaration)? {
+    if register_source_reducibility(&mut execution.engine, &execution.declaration, is_instance)? {
         execution.result_logical_root = execution.engine.logical_root(options);
     }
     if irreducible {

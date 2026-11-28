@@ -5,6 +5,7 @@
 //! or proof authority. No negative cache outlives a search. Reading a malformed
 //! journal is a refusal, not an empty instance set.
 
+mod captured;
 pub mod coercions;
 pub mod defaults;
 pub mod discr_tree;
@@ -42,6 +43,8 @@ pub enum InstanceRegistryError {
     UnknownClass(Name),
     InvalidInstance(Name),
     DuplicateInstance(Name),
+    /// Multiple stored paths for one declaration are not represented yet.
+    UnsupportedIndexUpdate(Name),
     /// Erasure requires an instance active in the current lexical view.
     NotAnInstance(Name),
 }
@@ -85,6 +88,11 @@ impl std::fmt::Display for InstanceRegistryError {
                 "instance {} is already registered",
                 n.to_display_string()
             ),
+            Self::UnsupportedIndexUpdate(n) => write!(
+                f,
+                "changing the registration index of instance {} is unsupported",
+                n.to_display_string()
+            ),
         }
     }
 }
@@ -123,7 +131,10 @@ pub struct InstanceRegistry {
     inactive: Vec<InstanceEntry>,
     /// Registration-time metadata of active local instances. Reducibility
     /// changes cannot replace these keys with a newly derived or fallback path.
-    local_indices: BTreeMap<Name, std::sync::Arc<export::DerivedIndex>>,
+    local_indices: BTreeMap<Name, Option<std::sync::Arc<export::DerivedIndex>>>,
+    /// A missing entry is a legacy row; a present `None` records that indexing
+    /// was unsupported at registration and must not be retried in a later epoch.
+    captured_indices: BTreeMap<Name, Option<std::sync::Arc<export::DerivedIndex>>>,
     /// The pin's discrimination tree over `imported`, built on first use.
     index: discr_tree::IndexCell,
 }
@@ -243,6 +254,7 @@ impl InstanceRegistry {
         out.instance_classes
             .retain(|name, class| env.contains(name) && env.contains(class));
         out.updates.retain(|name, _| env.contains(name));
+        out.captured_indices.retain(|name, _| env.contains(name));
         for entries in out.instances.values_mut() {
             entries.sort_by(|a, b| {
                 b.priority
@@ -308,6 +320,14 @@ impl InstanceRegistry {
             if registered_scope != parameters.scope.as_ref() {
                 return Err(InstanceRegistryError::Malformed);
             }
+            if let Some(captured) = out.captured_instance_index(name)
+                && captured.is_none_or(|captured| {
+                    captured.keys != parameters.keys
+                        || captured.synth_order != parameters.synth_order
+                })
+            {
+                return Err(InstanceRegistryError::Malformed);
+            }
         }
         Ok((out, positions))
     }
@@ -337,11 +357,11 @@ impl InstanceRegistry {
                     return Err(InstanceRegistryError::Malformed);
                 }
             }
-            // Tag 1 is the original strict registration operation. Tag 2
-            // is a global attribute upsert; tag 3 is a namespace-scoped
-            // upsert. Old readers refuse new tags instead of treating
-            // dormant registrations as ordinary global instances.
-            1..=3 => {
+            // Tags 4/5/6 retain the same strict/global/scoped operations as
+            // 1/2/3, with a registration-time model trailer. Old readers reject
+            // these tags instead of silently deriving a different current path.
+            1..=6 => {
+                let operation = (tag - 1) % 3 + 1;
                 let declaration = read_name(&mut bytes)?;
                 let priority = u32::from_le_bytes(
                     take(&mut bytes, 4)?
@@ -352,13 +372,38 @@ impl InstanceRegistry {
                 {
                     return Err(InstanceRegistryError::Malformed);
                 }
+                if self
+                    .instance_classes
+                    .get(&declaration)
+                    .is_some_and(|previous| previous != &class)
+                {
+                    return Err(InstanceRegistryError::Malformed);
+                }
                 self.instance_classes
                     .insert(declaration.clone(), class.clone());
-                let scope = if tag == 3 {
+                let scope = if operation == 3 {
                     Some(read_name(&mut bytes)?)
                 } else {
                     None
                 };
+                if scope.as_ref().is_some_and(Name::is_anonymous) {
+                    return Err(InstanceRegistryError::Malformed);
+                }
+                if tag >= 4 {
+                    let model = captured::read(&mut bytes)?;
+                    captured::validate(env, &class, &declaration, model.as_ref())?;
+                    if self
+                        .captured_instance_index(&declaration)
+                        .is_some_and(|previous| {
+                            !matches!((previous, model.as_ref()),
+                            (Some(previous), Some(model)) if previous == model)
+                        })
+                    {
+                        return Err(InstanceRegistryError::Malformed);
+                    }
+                    self.captured_indices
+                        .insert(declaration.clone(), model.map(std::sync::Arc::new));
+                }
                 let entries = match &scope {
                     Some(scope) => self
                         .scoped
@@ -371,7 +416,7 @@ impl InstanceRegistry {
                 self.updates
                     .insert(declaration.clone(), (order, scope.clone()));
                 if let Some((previous_scope, slot)) = positions.get(&declaration) {
-                    if tag == 1 || previous_scope != &scope {
+                    if operation == 1 || previous_scope != &scope {
                         return Err(InstanceRegistryError::Malformed);
                     }
                     let previous: &mut InstanceEntry = entries
@@ -427,7 +472,21 @@ impl InstanceRegistry {
         self.imported.classes.get(class)
     }
     pub(crate) fn local_instance_index(&self, declaration: &Name) -> Option<&export::DerivedIndex> {
-        self.local_indices.get(declaration).map(AsRef::as_ref)
+        self.local_indices
+            .get(declaration)
+            .and_then(Option::as_deref)
+    }
+    pub(crate) fn local_registration_index(
+        &self,
+        declaration: &Name,
+    ) -> Option<Option<&export::DerivedIndex>> {
+        self.local_indices.get(declaration).map(Option::as_deref)
+    }
+    pub(crate) fn captured_instance_index(
+        &self,
+        declaration: &Name,
+    ) -> Option<Option<&export::DerivedIndex>> {
+        self.captured_indices.get(declaration).map(Option::as_deref)
     }
     pub fn imported_instance_parameters(
         &self,
@@ -698,9 +757,11 @@ pub fn register_instance(
             declaration.clone(),
         ));
     }
+    let model = captured::derive(env, &registry, declaration)?;
+    captured::validate(env, &class, declaration, model.as_ref())?;
     append(
         env,
-        instance_payload(1, &class, declaration, priority, None)?,
+        captured::payload(1, &class, declaration, priority, None, model.as_ref())?,
     )
 }
 
@@ -728,9 +789,11 @@ pub fn set_instance(
     if !registry.is_class(&class) {
         return Err(InstanceRegistryError::UnknownClass(class));
     }
+    let model = captured::derive(env, &registry, declaration)?;
+    captured::validate(env, &class, declaration, model.as_ref())?;
     append(
         env,
-        instance_payload(2, &class, declaration, priority, None)?,
+        captured::payload(2, &class, declaration, priority, None, model.as_ref())?,
     )
 }
 

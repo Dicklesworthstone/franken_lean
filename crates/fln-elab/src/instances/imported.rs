@@ -456,29 +456,12 @@ pub fn register_instance(
     declaration: &Name,
     parameters: &InstanceParameters,
 ) -> Result<Environment, InstanceRegistryError> {
-    validate_order(env, declaration, parameters)?;
-    let registry = InstanceRegistry::read(env)?;
-    let class = validate_instance(env, declaration)?;
-    if !registry.is_class(&class) {
-        return Err(InstanceRegistryError::UnknownClass(class));
-    }
-    let env = if let Some(scope) = &parameters.scope {
-        if registry
-            .candidates(&class)
-            .iter()
-            .any(|entry| &entry.declaration == declaration)
-        {
-            // Do not leave an earlier global registration visible after a scope
-            // change. Scope-changing erasure requires a separate journal event.
-            return Err(InstanceRegistryError::DuplicateInstance(
-                declaration.clone(),
-            ));
-        }
-        super::scoped::register(env, scope, declaration, parameters.priority)?
-    } else {
-        super::set_instance(env, declaration, parameters.priority)?
-    };
-    append(&env, instance_metadata_payload(declaration, parameters)?)
+    // Foreign models already carry their registration-time path and schedule.
+    // Use the same legacy ordinary rows as batched activation; native capture
+    // must not derive a replacement from the importing environment's statuses.
+    ImportActivation::new(env.clone())
+        .register_instance(declaration, parameters)?
+        .finish()
 }
 
 /// Activation of an import's class, instance and default-instance journals while

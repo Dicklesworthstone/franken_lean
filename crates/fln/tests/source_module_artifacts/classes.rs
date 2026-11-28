@@ -11,6 +11,8 @@ mod aliases;
 mod defaults;
 #[path = "executable.rs"]
 mod executable;
+#[path = "instance_aliases.rs"]
+mod instance_aliases;
 #[path = "instances.rs"]
 mod instances;
 #[path = "macro_inline.rs"]
