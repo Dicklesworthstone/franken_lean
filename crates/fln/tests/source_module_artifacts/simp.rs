@@ -37,6 +37,514 @@ fn refused(engine: &Engine, source: &str) {
     assert_eq!(engine.logical_root(&KVMap::new()), before);
 }
 
+const PINNED_STACK: usize = 256 * 1024 * 1024;
+const PINNED_BYTES: usize = 256 * 1024 * 1024;
+
+struct PinnedSimpArtifact {
+    name: Name,
+    public: Vec<u8>,
+    server: Option<Vec<u8>>,
+    private: Option<Vec<u8>>,
+}
+
+struct PinnedSimpFixture {
+    engine: Engine,
+    artifacts: Vec<PinnedSimpArtifact>,
+}
+
+impl PinnedSimpFixture {
+    fn inputs(&self) -> Vec<OleanModuleInput<'_>> {
+        self.artifacts
+            .iter()
+            .map(|artifact| OleanModuleInput {
+                name: &artifact.name,
+                artifact: &artifact.public,
+                server_artifact: artifact.server.as_deref(),
+                private_artifact: artifact.private.as_deref(),
+            })
+            .collect()
+    }
+
+    fn import(&self, built: &SourceModuleBuild) -> SourceOleanImport {
+        let mut inputs = self.inputs();
+        inputs.extend(built.artifacts.iter().map(|artifact| {
+            OleanModuleInput {
+                name: &artifact.name,
+                artifact: &artifact.bytes,
+                server_artifact: artifact
+                    .companions
+                    .as_ref()
+                    .map(|parts| parts.server.as_slice()),
+                private_artifact: artifact
+                    .companions
+                    .as_ref()
+                    .map(|parts| parts.private.as_slice()),
+            }
+        }));
+        // Re-admit the actual dependency closure and our physical delta into
+        // an empty engine. No source-session snapshot authorizes this import.
+        Engine::builder()
+            .build_empty()
+            .import_olean_modules_for_source(
+                &inputs,
+                &[name("Main")],
+                &KVMap::new(),
+                SourceOleanImportLimits::new(OleanCheckLimits::new(
+                    PINNED_BYTES,
+                    Budget::for_stack_bytes(PINNED_STACK),
+                )),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+    }
+}
+
+fn with_pinned_simp(run: impl FnOnce(&PinnedSimpFixture) + Send + 'static) {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Mutex, OnceLock};
+
+    static FIXTURE: OnceLock<Option<PinnedSimpFixture>> = OnceLock::new();
+    static SERIAL: Mutex<()> = Mutex::new(());
+    std::thread::Builder::new()
+        .stack_size(PINNED_STACK)
+        .spawn(move || {
+            let _serial = SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let fixture = FIXTURE.get_or_init(|| {
+                let compiler = aliases::pinned_lean()?;
+                let library = compiler
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("lib/lean");
+                let root = name("Init.SimpLemmas");
+                let mut pending = vec![(root.clone(), false)];
+                let mut seen = BTreeSet::new();
+                let mut ordered = Vec::new();
+                let mut artifacts = BTreeMap::new();
+                while let Some((module, finished)) = pending.pop() {
+                    if finished {
+                        ordered.push(module);
+                        continue;
+                    }
+                    if !seen.insert(module.clone()) {
+                        continue;
+                    }
+                    assert!(
+                        seen.len() <= 512,
+                        "bounded actual simp-helper import closure"
+                    );
+                    let path = library
+                        .join(module.to_display_string().replace('.', "/"))
+                        .with_extension("olean");
+                    let optional = |path| match std::fs::read(path) {
+                        Ok(bytes) => Some(bytes),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => panic!("reading a pinned companion: {error}"),
+                    };
+                    let public = std::fs::read(&path).unwrap();
+                    let dependencies = fln::olean_module_imports(
+                        &public,
+                        fln::OleanDecodeLimits::new(PINNED_BYTES),
+                    )
+                    .unwrap();
+                    artifacts.insert(
+                        module.clone(),
+                        PinnedSimpArtifact {
+                            name: module.clone(),
+                            public,
+                            server: optional(path.with_extension("olean.server")),
+                            private: optional(path.with_extension("olean.private")),
+                        },
+                    );
+                    pending.push((module, true));
+                    pending.extend(dependencies.into_iter().rev().map(|module| (module, false)));
+                }
+                let mut fixture = PinnedSimpFixture {
+                    engine: Engine::builder().build_empty(),
+                    artifacts: ordered
+                        .into_iter()
+                        .map(|module| artifacts.remove(&module).unwrap())
+                        .collect(),
+                };
+                fixture.engine = fixture
+                    .engine
+                    .import_olean_modules_for_source(
+                        &fixture.inputs(),
+                        &[root],
+                        &KVMap::new(),
+                        SourceOleanImportLimits::new(OleanCheckLimits::new(
+                            PINNED_BYTES,
+                            Budget::for_stack_bytes(PINNED_STACK),
+                        )),
+                    )
+                    .unwrap()
+                    .into_complete()
+                    .unwrap()
+                    .engine;
+                // These are the pin's checked declarations, not fixture axioms
+                // with trusted helper names and arbitrary statements.
+                for helper in [
+                    "eq_true",
+                    "eq_false",
+                    "Bool.of_not_eq_true",
+                    "Bool.of_not_eq_false",
+                ] {
+                    assert!(
+                        matches!(
+                            fixture.engine.environment().find(&name(helper)),
+                            Some(fln::ConstantInfo::Thm(_))
+                        ),
+                        "actual checked helper {helper}"
+                    );
+                }
+                Some(fixture)
+            });
+            if let Some(fixture) = fixture {
+                run(fixture);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// Keep the small native fixtures, but give the Reference consumer its genuine
+/// tactic/notation import. Importing Init beside their synthetic root Eq would
+/// collide; rebuild the same user declarations on checked Init instead. The
+/// simp journal must be identical, and Lean still sees only native artifacts.
+fn reference_simp_artifacts(
+    native: &SourceModuleBuild,
+    files: &[(&str, &str)],
+    probes: &[(&str, bool)],
+) {
+    let expected: Vec<_> = native
+        .artifacts
+        .iter()
+        .map(|artifact| (artifact.name.clone(), metadata(&artifact.bytes).simps))
+        .collect();
+    let files: Vec<_> = files
+        .iter()
+        .map(|(module, source)| {
+            let source = if let Some(rest) = source
+                .strip_prefix("prelude\n")
+                .and_then(|source| source.strip_prefix(EQUALITY))
+            {
+                format!("prelude\nimport Init.SimpLemmas\n{rest}")
+            } else {
+                (*source).to_owned()
+            };
+            ((*module).to_owned(), source)
+        })
+        .collect();
+    assert!(
+        files
+            .iter()
+            .any(|(_, source)| source.contains("import Init.SimpLemmas"))
+    );
+    let probes: Vec<_> = probes
+        .iter()
+        .map(|(source, accepted)| ((*source).to_owned(), *accepted))
+        .collect();
+    with_pinned_simp(move |fixture| {
+        let files: Vec<_> = files
+            .iter()
+            .map(|(module, source)| (module.as_str(), source.as_str()))
+            .collect();
+        let built = build(&fixture.engine, &files, OleanWriteBudget::default())
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let actual: Vec<_> = built
+            .artifacts
+            .iter()
+            .map(|artifact| (artifact.name.clone(), metadata(&artifact.bytes).simps))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "the genuine Init import cannot change the tested simp entries"
+        );
+        for (source, accepted) in probes {
+            aliases::reference_import(&built, &source, accepted);
+        }
+    });
+}
+
+const PREPROCESSED: &str = r#"prelude
+import Init.SimpLemmas
+namespace SimpExport
+def positive : Prop := True
+def negative : Prop := False
+def differentLeft : Prop := False
+def differentRight : Prop := True
+def falseNe : Bool := Bool.false
+def trueNe : Bool := Bool.true
+def falseNot : Bool := Bool.false
+def trueNot : Bool := Bool.true
+def iffLeft : Prop := True
+def iffRight : Prop := True
+theorem positiveRule : positive := True.intro
+theorem negativeRule : Not negative := fun h => h
+theorem differentRule : Ne differentLeft differentRight := false_ne_true
+theorem falseNeRule : Ne falseNe Bool.true := fun h => Bool.noConfusion h
+theorem trueNeRule : Ne trueNe Bool.false := fun h => Bool.noConfusion h
+theorem falseNotRule : Not (Eq falseNot Bool.true) := fun h => Bool.noConfusion h
+theorem trueNotRule : Not (Eq trueNot Bool.false) := fun h => Bool.noConfusion h
+theorem iffRule : Iff iffLeft iffRight := Iff.intro (fun h => h) (fun h => h)
+attribute [irreducible] positive negative differentLeft differentRight falseNe trueNe falseNot trueNot iffLeft iffRight
+attribute [simp 1100] positiveRule negativeRule differentRule falseNeRule trueNeRule falseNotRule trueNotRule iffRule
+def first.{u} {A : Sort u} (_x : A) : Prop := True
+def second.{u} {A : Sort u} (_x _y : A) : Prop := True
+def echo.{u} {A : Sort u} (x : A) : A := x
+theorem grouped.{u} {A : Sort u} (x : A) :
+    And (first x) (And (Eq (echo x) x) (forall y : A, second x y)) :=
+  And.intro True.intro (And.intro rfl (fun _y => True.intro))
+attribute [irreducible] first second
+attribute [simp 900] grouped
+attribute [irreducible] echo
+attribute [-simp] grouped
+attribute [simp 1200] grouped
+def repeated.{u} {A : Sort u} (_x : A) : Prop := True
+theorem duplicate.{u} {A : Sort u} (x : A) : And (repeated x) (repeated x) :=
+  And.intro True.intro True.intro
+attribute [irreducible] repeated
+attribute [simp 1150] duplicate
+def collision._simp_1 : Nat := Nat.succ Nat.zero
+def collisionProp : Prop := True
+theorem collision : collisionProp := True.intro
+attribute [irreducible] collisionProp
+attribute [simp 1175] collision
+end SimpExport
+"#;
+
+const PREPROCESSED_CONSUMER: &str = r#"theorem consumerPositive : SimpExport.positive := by simp
+theorem consumerNegative : Not SimpExport.negative := by simp
+theorem consumerDifferent : Not (Eq SimpExport.differentLeft SimpExport.differentRight) := by simp
+theorem consumerFalseNe : Eq SimpExport.falseNe Bool.false := by simp
+theorem consumerTrueNe : Eq SimpExport.trueNe Bool.true := by simp
+theorem consumerFalseNot : Eq SimpExport.falseNot Bool.false := by simp
+theorem consumerTrueNot : Eq SimpExport.trueNot Bool.true := by simp
+theorem consumerIff : Iff SimpExport.iffLeft SimpExport.iffRight := by simp
+theorem consumerFirst.{u} {A : Sort u} (x : A) : SimpExport.first x := by simp
+theorem consumerSecond.{u} {A : Sort u} (x y : A) : SimpExport.second x y := by simp
+theorem consumerEcho.{u} {A : Sort u} (x : A) : Eq (SimpExport.echo x) x := by simp
+theorem consumerDuplicate.{u} {A : Sort u} (x : A) : SimpExport.repeated x := by simp
+theorem consumerCollision : SimpExport.collisionProp := by simp
+theorem helperPositive : Eq SimpExport.positive True := SimpExport.positiveRule._simp_1
+theorem helperNegative : Eq SimpExport.negative False := SimpExport.negativeRule._simp_1
+theorem helperDifferent : Eq (Eq SimpExport.differentLeft SimpExport.differentRight) False := SimpExport.differentRule._simp_1
+theorem helperFirst.{u} {A : Sort u} (x : A) : Eq (SimpExport.first x) True := SimpExport.grouped._simp_1 x
+theorem helperEcho.{u} {A : Sort u} (x : A) : Eq (SimpExport.echo x) x := SimpExport.grouped._simp_2 x
+theorem helperSecond.{u} {A : Sort u} (x y : A) : Eq (SimpExport.second x y) True := SimpExport.grouped._simp_3 x y
+theorem occupiedNameUnchanged : Eq SimpExport.collision._simp_1 (Nat.succ Nat.zero) := rfl
+"#;
+
+#[test]
+fn forward_propositions_and_conjunctions_survive_native_artifacts_and_the_pin() {
+    with_pinned_simp(|fixture| {
+        let before = fixture.engine.logical_root(&KVMap::new());
+        let built = build(
+            &fixture.engine,
+            &[("Main", PREPROCESSED)],
+            OleanWriteBudget::default(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+        assert_eq!(
+            built.artifacts.len(),
+            1,
+            "the native output is a module delta"
+        );
+        let rows = metadata(&built.artifacts[0].bytes).simps;
+        let leaf = |head: &str, arity: usize| {
+            std::iter::once(DiscrTreeKey::Const(name(head), arity as u32))
+                .chain(std::iter::repeat_n(DiscrTreeKey::Star, arity))
+                .collect::<Vec<_>>()
+        };
+        let mut expected = vec![
+            ("positiveRule", 1, 1100, leaf("SimpExport.positive", 0)),
+            ("negativeRule", 1, 1100, leaf("SimpExport.negative", 0)),
+            (
+                "differentRule",
+                1,
+                1100,
+                vec![
+                    DiscrTreeKey::Const(name("Eq"), 3),
+                    DiscrTreeKey::Other,
+                    DiscrTreeKey::Const(name("SimpExport.differentLeft"), 0),
+                    DiscrTreeKey::Const(name("SimpExport.differentRight"), 0),
+                ],
+            ),
+            ("falseNeRule", 1, 1100, leaf("SimpExport.falseNe", 0)),
+            ("trueNeRule", 1, 1100, leaf("SimpExport.trueNe", 0)),
+            ("falseNotRule", 1, 1100, leaf("SimpExport.falseNot", 0)),
+            ("trueNotRule", 1, 1100, leaf("SimpExport.trueNot", 0)),
+            ("iffRule", 1, 1100, leaf("SimpExport.iffLeft", 0)),
+        ];
+        for priority in [900, 1200] {
+            expected.extend([
+                ("grouped", 1, priority, leaf("SimpExport.first", 2)),
+                ("grouped", 2, priority, leaf("SimpExport.echo", 2)),
+                ("grouped", 3, priority, leaf("SimpExport.second", 3)),
+            ]);
+        }
+        expected.extend([
+            ("duplicate", 1, 1150, leaf("SimpExport.repeated", 2)),
+            ("duplicate", 1, 1150, leaf("SimpExport.repeated", 2)),
+            ("collision", 2, 1175, leaf("SimpExport.collisionProp", 0)),
+        ]);
+        assert_eq!(rows.len(), expected.len());
+        for (row, (origin, suffix, priority, keys)) in rows.iter().zip(&expected) {
+            assert_eq!(row.scope, None);
+            let SimpKind::Theorem(theorem) = &row.kind else {
+                panic!("proposition preprocessing must emit a checked theorem: {row:?}")
+            };
+            let origin = name(&format!("SimpExport.{origin}"));
+            let proof = Name::str(origin.clone(), format!("_simp_{suffix}"));
+            assert_eq!(theorem.origin, origin);
+            assert_eq!(theorem.proof, fln::Expr::const_(proof.clone(), vec![]));
+            assert!(theorem.level_params.is_empty());
+            assert_eq!(theorem.priority, *priority);
+            assert_eq!(&theorem.keys, keys);
+            assert!(theorem.post);
+            assert!(!theorem.origin_reverse);
+            assert!(!theorem.permutation);
+            // The actual pin leaves these proofs untagged, including the
+            // equality projected from grouped: its type alone is not rfl.
+            assert!(!theorem.reflexive);
+            assert!(!theorem.backward_reflexive);
+            let Some(fln::ConstantInfo::Thm(checked)) =
+                built.checked.checked.engine.environment().find(&proof)
+            else {
+                panic!("every selected helper is an admitted theorem: {proof:?}")
+            };
+            assert_eq!(checked.all, [proof]);
+            for expression in [&checked.base.type_, &checked.value] {
+                assert!(!expression.has_fvar());
+                assert!(!expression.has_expr_mvar());
+                assert!(!expression.has_level_mvar());
+                assert!(!expression.has_loose_bvars());
+            }
+            assert_eq!(
+                checked.base.level_params,
+                if matches!(
+                    origin.to_display_string().as_str(),
+                    "SimpExport.grouped" | "SimpExport.duplicate"
+                ) {
+                    vec![name("u")]
+                } else {
+                    vec![]
+                },
+            );
+        }
+        for absent in [
+            "SimpExport.grouped._simp_4",
+            "SimpExport.duplicate._simp_2",
+            "SimpExport.collision._simp_3",
+        ] {
+            assert!(
+                !built
+                    .checked
+                    .checked
+                    .engine
+                    .environment()
+                    .contains(&name(absent))
+            );
+        }
+        let physical = fixture.import(&built);
+        let report = physical
+            .modules
+            .iter()
+            .find(|module| module.module == name("Main"))
+            .unwrap();
+        assert_eq!(report.simps, expected.len());
+        assert_eq!(report.activated_simps, expected.len());
+        assert_eq!(report.deferred_simps, 0);
+        let active = simp::read(physical.engine.environment()).unwrap();
+        let group: Vec<_> = active
+            .iter()
+            .filter(|row| row.declaration == name("SimpExport.grouped"))
+            .collect();
+        assert_eq!(group.len(), 3);
+        assert!(group.iter().all(|row| row.priority == 1200));
+        assert_eq!(
+            active
+                .iter()
+                .filter(|row| row.declaration == name("SimpExport.duplicate"))
+                .count(),
+            1
+        );
+
+        let source = format!("prelude\nimport Main\n{PREPROCESSED_CONSUMER}");
+        let consumer = name("Consumer");
+        physical
+            .engine
+            .check_source_modules(
+                &[SourceModuleInput {
+                    name: &consumer,
+                    source: source.as_bytes(),
+                }],
+                &consumer,
+                &KVMap::new(),
+                limits(),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        aliases::reference_import(&built, &source, true);
+
+        for goal in [
+            "theorem absentFirst.{u} {A : Sort u} (x : A) : SimpExport.first x := by simp",
+            "theorem absentEcho.{u} {A : Sort u} (x : A) : Eq (SimpExport.echo x) x := by simp",
+            "theorem absentSecond.{u} {A : Sort u} (x y : A) : SimpExport.second x y := by simp",
+        ] {
+            let erased = format!("attribute [-simp] SimpExport.grouped\n{goal}");
+            refused(&physical.engine, &erased);
+            aliases::reference_import(&built, &format!("prelude\nimport Main\n{erased}"), false);
+        }
+        let false_goal = "theorem rejectedFalse : SimpExport.negative := by simp";
+        refused(&physical.engine, false_goal);
+        aliases::reference_import(
+            &built,
+            &format!("prelude\nimport Main\n{false_goal}"),
+            false,
+        );
+        assert_eq!(fixture.engine.logical_root(&KVMap::new()), before);
+    });
+}
+
+#[test]
+fn proposition_preprocessing_never_exports_false_or_unsafe_proofs() {
+    with_pinned_simp(|fixture| {
+        let before = fixture.engine.logical_root(&KVMap::new());
+        for invalid in [
+            "@[simp] theorem falseProposition : False := True.intro",
+            "unsafe def unsafeProposition : True := True.intro\nattribute [simp] unsafeProposition",
+            "@[simp] theorem falseConjunction : And True False := And.intro True.intro True.intro",
+        ] {
+            let source = format!("prelude\nimport Init.SimpLemmas\n{invalid}");
+            let error = build(
+                &fixture.engine,
+                &[("Main", &source)],
+                OleanWriteBudget::default(),
+            )
+            .expect_err("a false or unsafe source proof must not produce an artifact");
+            assert!(
+                !matches!(
+                    error.disposition().0,
+                    "resource" | "inconclusive" | "internal-fault"
+                ),
+                "{error:?}"
+            );
+            assert_eq!(fixture.engine.logical_root(&KVMap::new()), before);
+        }
+    });
+}
+
 #[test]
 fn registered_definition_unfolding_survives_physical_import() {
     let built = compiled(&[("Main", WRAP)]);
@@ -874,11 +1382,16 @@ fn simp_erasures_remain_local_while_owned_and_imported_additions_persist() {
         let physical = imported(&owned);
         accepted(&physical.engine, probe);
         refused(&physical.engine, false_goal);
-        aliases::reference_import(&owned, &format!("prelude\nimport Main\n{probe}"), true);
-        aliases::reference_import(
+        reference_simp_artifacts(
             &owned,
-            &format!("prelude\nimport Main\nattribute [-simp] {origin}\n{probe}"),
-            false,
+            &[("Main", &erased)],
+            &[
+                (&format!("prelude\nimport Main\n{probe}"), true),
+                (
+                    &format!("prelude\nimport Main\nattribute [-simp] {origin}\n{probe}"),
+                    false,
+                ),
+            ],
         );
 
         // An adapter containing only an erasure exports no simp operations.
@@ -900,7 +1413,15 @@ fn simp_erasures_remain_local_while_owned_and_imported_additions_persist() {
             accepted(engine, probe);
             refused(engine, false_goal);
         }
-        aliases::reference_import(&graph, &format!("prelude\nimport Main\n{probe}"), true);
+        reference_simp_artifacts(
+            &graph,
+            &[
+                ("Main", &consumer),
+                ("Adapter", &adapter),
+                ("Base", &library),
+            ],
+            &[(&format!("prelude\nimport Main\n{probe}"), true)],
+        );
 
         let invalid = format!("{erased}\n{probe}");
         assert!(matches!(
@@ -925,7 +1446,11 @@ fn erasing_and_readding_simp_preserves_original_tie_slots_and_new_priorities() {
          attribute [irreducible] choose first second\n\
          attribute [-simp] pickFirst"
     );
-    for (priority, selected, rejected) in [(900, "second", "first"), (1200, "first", "second")] {
+    for (priority, selected, rejected) in [
+        (900, "first", "second"),
+        (1200, "first", "second"),
+        (700, "second", "first"),
+    ] {
         let source = format!("{declarations}\nattribute [simp {priority}] pickFirst");
         let built = compiled(&[("Main", &source)]);
         let rows = metadata(&built.artifacts[0].bytes).simps;
@@ -954,8 +1479,14 @@ fn erasing_and_readding_simp_preserves_original_tie_slots_and_new_priorities() {
             accepted(engine, &good);
             refused(engine, &bad);
         }
-        aliases::reference_import(&built, &format!("prelude\nimport Main\n{good}"), true);
-        aliases::reference_import(&built, &format!("prelude\nimport Main\n{bad}"), false);
+        reference_simp_artifacts(
+            &built,
+            &[("Main", &source)],
+            &[
+                (&format!("prelude\nimport Main\n{good}"), true),
+                (&format!("prelude\nimport Main\n{bad}"), false),
+            ],
+        );
     }
 }
 

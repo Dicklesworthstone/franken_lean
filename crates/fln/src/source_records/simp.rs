@@ -220,34 +220,57 @@ impl Engine {
                 if source_owned
                     && equations.is_empty()
                     && let Some((priority, false)) = rule
-                    && let Some(aux_decl) =
-                        source_simp::export::prepare_iff_auxiliary(batch.engine.environment(), name)
-                            .map_err(metadata_error)?
                 {
-                    let Declaration::Thm(theorem) = &aux_decl else {
-                        return Err(EngineExecutionError::UnexpectedPublication {
-                            detail: "a source iff simp auxiliary must be a theorem",
-                        });
-                    };
-                    let aux_name = theorem.base.name.clone();
-                    let admitted = match batch
-                        .engine
-                        .admit_declaration(aux_decl, options, limits)?
-                    {
-                        Outcome::Complete(admitted) => admitted,
-                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                    };
-                    batch.engine = admitted.engine.clone();
-                    batch.admissions.push(admitted);
-                    batch.engine.environment = source_simp::register_proof(
-                        batch.engine.environment(),
-                        name,
-                        &aux_name,
-                        priority,
-                    )
-                    .map_err(metadata_error)?;
-                    registered_aux_proof = true;
+                    let auxiliaries =
+                        source_simp::export::prepare_auxiliaries(batch.engine.environment(), name)
+                            .map_err(metadata_error)?;
+                    for auxiliary in auxiliaries {
+                        let Declaration::Thm(theorem) = &auxiliary.declaration else {
+                            return Err(EngineExecutionError::UnexpectedPublication {
+                                detail: "a source simp auxiliary must be a theorem",
+                            });
+                        };
+                        let aux_name = theorem.base.name.clone();
+                        if !auxiliary.existing {
+                            let admitted = match batch.engine.admit_declaration(
+                                auxiliary.declaration,
+                                options,
+                                limits,
+                            )? {
+                                Outcome::Complete(admitted) => admitted,
+                                Outcome::Inconclusive(reason) => {
+                                    return Ok(Outcome::Inconclusive(reason));
+                                }
+                                Outcome::InternalFault(fault) => {
+                                    return Ok(Outcome::InternalFault(fault));
+                                }
+                            };
+                            batch.engine = admitted.engine.clone();
+                            batch.admissions.push(admitted);
+                        }
+                        batch.engine.environment =
+                            match elaboration_outcome(source_simp::defeq::infer_generated(
+                                batch.engine.environment(),
+                                &aux_name,
+                                limits.kernel,
+                            ))? {
+                                Outcome::Complete(environment) => environment,
+                                Outcome::Inconclusive(reason) => {
+                                    return Ok(Outcome::Inconclusive(reason));
+                                }
+                                Outcome::InternalFault(fault) => {
+                                    return Ok(Outcome::InternalFault(fault));
+                                }
+                            };
+                        batch.engine.environment = source_simp::register_proof(
+                            batch.engine.environment(),
+                            name,
+                            &aux_name,
+                            priority,
+                        )
+                        .map_err(metadata_error)?;
+                        registered_aux_proof = true;
+                    }
                 }
                 if !registered_aux_proof {
                     batch.engine.environment =

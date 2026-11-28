@@ -75,7 +75,7 @@ fn empty_namespaces_and_dotted_aliases_keep_distinct_physical_import_semantics()
     }
 }
 
-fn pinned_lean() -> Option<std::path::PathBuf> {
+pub(super) fn pinned_lean() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
     let row = include_str!("../../../../SUITE.lock")
         .lines()

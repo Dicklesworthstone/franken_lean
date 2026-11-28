@@ -906,8 +906,9 @@ fn decode_entry(payload: &[u8], order: usize) -> Result<JournalEntry, SimpSetErr
     }
 }
 
-/// Read active rows in deterministic priority order (newer first registrations
-/// win ties). Re-registering a proof updates its original discrimination slot.
+/// Read active rows in deterministic priority order. The pin visits a
+/// discrimination leaf in insertion order and sorts priorities stably, so
+/// first registrations win ties. Re-registering a proof updates its original slot.
 /// Corrupt entries and dangling references are errors, never an empty simp set.
 pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
     Ok(read_state(env)?.rows)
@@ -1042,7 +1043,7 @@ fn read_state(env: &Environment) -> Result<SimpState, SimpSetError> {
     rows.sort_by(|a, b| {
         b.priority
             .cmp(&a.priority)
-            .then_with(|| b.order.cmp(&a.order))
+            .then_with(|| a.order.cmp(&b.order))
     });
     Ok(SimpState {
         rows,

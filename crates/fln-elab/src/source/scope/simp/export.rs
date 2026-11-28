@@ -9,8 +9,9 @@ use crate::instances::discr_tree::Key;
 use std::sync::Arc;
 
 mod keys;
+mod preprocess;
 mod theorems;
-pub use theorems::prepare_iff_auxiliary;
+pub use preprocess::prepare_auxiliaries;
 
 pub fn journal_name() -> Name {
     descriptor().name
