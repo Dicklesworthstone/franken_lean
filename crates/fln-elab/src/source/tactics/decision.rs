@@ -31,6 +31,14 @@ impl AuxNames {
         }
     }
 
+    pub(in crate::source) fn advance(&mut self, count: u64) -> Result<(), NatDefinitionElabError> {
+        self.idx = self
+            .idx
+            .checked_add(count)
+            .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+        Ok(())
+    }
+
     /// `curr`: `<prefix>.<infix>`, then each parent index and the current one, outermost first,
     /// each appended to the last component as `_<index>` (`Name.appendIndexAfter`).
     fn current(&self, base: &Name) -> Name {

@@ -980,6 +980,9 @@ struct Context {
     aux_lemma_cache: tactics::AuxLemmaCache,
     // The pin's `DeclNameGenerator` for the declaration being elaborated (`mkAuxDeclName`).
     aux_names: Option<tactics::AuxNames>,
+    // Header quotations share their own generator before the body starts its
+    // declaration scope (and, for a theorem, its asynchronous child scope).
+    header_aux_names: Option<tactics::AuxNames>,
     /// The definition's root `match`, read for its equation theorems
     /// (`equation_theorems::capture`), once the definition is elaborated.
     equation_info: Option<equation_theorems::journal::Record>,
@@ -1117,6 +1120,7 @@ impl Context {
             private_auxiliary_declarations: false,
             aux_lemma_cache: Default::default(),
             aux_names: None,
+            header_aux_names: None,
             equation_info: None,
             equation_pattern_source: None,
             equation_patterns: None,
@@ -9327,7 +9331,9 @@ pub fn protected_registration(syntax: &Syntax) -> Result<Option<Name>, NatDefini
     }
 }
 
-pub use inductive::{class_inductive_registration, elaborate_inductive, is_inductive};
+pub use inductive::{
+    SourceInductive, class_inductive_registration, elaborate_inductive, is_inductive,
+};
 /// A source record/class expands to a block and projections, not one definition.
 /// These are untrusted candidates. The caller must admit the whole sequence
 /// before registering the class or exposing any successor.

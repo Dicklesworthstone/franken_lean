@@ -59,6 +59,28 @@ pub(in crate::source) fn elaborate_mutual(
     budget: RecordBudget,
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    elaborate_mutual_core(syntax, env, kernel, budget, scope, false)
+        .map(|result| result.declaration)
+}
+
+pub(in crate::source) fn elaborate_mutual_with_effects(
+    syntax: &[Syntax],
+    env: &Environment,
+    kernel: Budget,
+    budget: RecordBudget,
+    scope: &SourceScope,
+) -> Result<SourceInductive, NatDefinitionElabError> {
+    elaborate_mutual_core(syntax, env, kernel, budget, scope, true)
+}
+
+fn elaborate_mutual_core(
+    syntax: &[Syntax],
+    env: &Environment,
+    kernel: Budget,
+    budget: RecordBudget,
+    scope: &SourceScope,
+    allow_auxiliary_declarations: bool,
+) -> Result<SourceInductive, NatDefinitionElabError> {
     if !(2..=8).contains(&syntax.len()) {
         return Err(invalid());
     }
@@ -69,10 +91,31 @@ pub(in crate::source) fn elaborate_mutual(
             expected: "mutual inductive blocks without classes",
         });
     }
-    let mut headers = syntax
-        .iter()
-        .map(|s| header(s, env, kernel, budget, scope))
-        .collect::<Result<Vec<_>, _>>()?;
+    // The pin elaborates all headers before all constructors under the first
+    // family's withDeclName scope. Keep that one generator and the checked
+    // quotation predecessor across otherwise isolated local contexts.
+    let mut headers = Vec::with_capacity(syntax.len());
+    let mut auxiliary_environment = env.clone();
+    let mut auxiliary_declarations = Vec::new();
+    let mut aux_names = None;
+    for syntax in syntax {
+        let mut parsed = header(
+            syntax,
+            &auxiliary_environment,
+            kernel,
+            budget,
+            scope,
+            allow_auxiliary_declarations,
+            aux_names,
+        )?;
+        aux_names = parsed.context.aux_names.clone();
+        auxiliary_environment = parsed.context.txn.env.clone();
+        auxiliary_declarations.append(&mut parsed.context.auxiliary_declarations);
+        headers.push(parsed);
+    }
+    for header in &mut headers {
+        header.context.txn.env = auxiliary_environment.clone();
+    }
     let mut names = HashSet::new();
     for h in &headers {
         if !names.insert(h.name.clone()) {
@@ -250,6 +293,8 @@ pub(in crate::source) fn elaborate_mutual(
     let mut inferred = Level::one();
     let mut base = LocalContext::new();
     for (i, h) in headers.iter_mut().enumerate() {
+        h.context.txn.env = auxiliary_environment.clone();
+        h.context.aux_names = aux_names.clone();
         h.context.protected_declarations = protected_families.clone();
         for ((id, name), ty) in ids.iter().zip(&family_names).zip(&initial_types) {
             h.context.tick()?;
@@ -269,6 +314,9 @@ pub(in crate::source) fn elaborate_mutual(
             h.ctors,
             budget,
         )?;
+        auxiliary_environment = h.context.txn.env.clone();
+        aux_names = h.context.aux_names.clone();
+        auxiliary_declarations.append(&mut h.context.auxiliary_declarations);
         // A universe hole only a constructor mentions stays refused, as in a single family.
         for ctor in &mut result.constructors {
             for field in &mut ctor.fields {
@@ -290,6 +338,9 @@ pub(in crate::source) fn elaborate_mutual(
             }
         }
         all_bodies.push(result);
+    }
+    for header in &mut headers {
+        header.context.txn.env = auxiliary_environment.clone();
     }
     // The pin promotes a prefix of indices fixed across the whole block to
     // parameters (`fixedIndicesToParams` over every member): measured at the pin,
@@ -450,12 +501,21 @@ pub(in crate::source) fn elaborate_mutual(
             result_level: result_level.clone(),
         });
     }
-    if let Some(declaration) =
-        crate::inductive::nested_inductive_declaration(env, &specs, budget, &promoted)
-            .map_err(|e| failure(SourceInferenceError::Inductive(e)))?
+    let declaration = if let Some(declaration) = crate::inductive::nested_inductive_declaration(
+        &auxiliary_environment,
+        &specs,
+        budget,
+        &promoted,
+    )
+    .map_err(|e| failure(SourceInferenceError::Inductive(e)))?
     {
-        return Ok(declaration);
-    }
-    mutual_inductive_with_promoted_parameters(&specs, budget, &promoted)
-        .map_err(|e| failure(SourceInferenceError::Inductive(e)))
+        declaration
+    } else {
+        mutual_inductive_with_promoted_parameters(&specs, budget, &promoted)
+            .map_err(|e| failure(SourceInferenceError::Inductive(e)))?
+    };
+    Ok(SourceInductive {
+        declaration,
+        auxiliary_declarations,
+    })
 }

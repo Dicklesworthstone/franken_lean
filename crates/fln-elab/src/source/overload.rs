@@ -102,6 +102,7 @@ impl Context {
             trial.tactic_macro_terms = macro_terms;
             self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
             self.aux_names = trial.aux_names.clone();
+            self.header_aux_names = trial.header_aux_names.clone();
             self.next = trial.next;
             match outcome? {
                 Some(Ok(term)) => successes.push((index, trial, term)),

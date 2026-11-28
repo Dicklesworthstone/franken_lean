@@ -485,8 +485,8 @@ theorem source_capture (wanted later : Nat) :
         }
         for label in [
             "sourceGrouped._auto_1",
-            "sourceGrouped._auto_2",
             "sourceGrouped._auto_3",
+            "sourceGrouped._auto_5",
         ] {
             checked_quote(&engine, label);
         }

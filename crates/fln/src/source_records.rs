@@ -791,7 +791,7 @@ impl Engine {
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         let candidate = elaboration_outcome(if members.len() == 1 {
-            fln_elab::source::scope::elaborate_inductive(
+            fln_elab::source::scope::elaborate_inductive_with_effects(
                 &members[0],
                 self.environment(),
                 limits.kernel,
@@ -799,7 +799,7 @@ impl Engine {
                 scope,
             )
         } else {
-            fln_elab::source::scope::elaborate_mutual_inductives(
+            fln_elab::source::scope::elaborate_mutual_inductives_with_effects(
                 members,
                 self.environment(),
                 limits.kernel,
@@ -813,7 +813,7 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
         let result = self
-            .admit_declarations(&[candidate], options, limits)
+            .admit_declarations(&candidate.into_declarations(), options, limits)
             .map_err(EngineExecutionError::from)?;
         // Multi-family mutual blocks never contain classes (`mutual.rs`), but a
         // single-member `mutual class inductive ... end` routes through this path.
@@ -1371,20 +1371,21 @@ impl Engine {
             .as_ref()
             .map_or_else(|| parsed.syntax(), |request| &request.syntax);
         if fln_elab::source::is_inductive(syntax) {
-            let candidate =
-                match elaboration_outcome(fln_elab::source::scope::elaborate_inductive(
+            let candidate = match elaboration_outcome(
+                fln_elab::source::scope::elaborate_inductive_with_effects(
                     syntax,
                     self.environment(),
                     limits.kernel,
                     fln_elab::records::RecordBudget::default(),
                     scope,
-                ))? {
-                    Outcome::Complete(candidate) => candidate,
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                };
+                ),
+            )? {
+                Outcome::Complete(candidate) => candidate,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
             let result = self
-                .admit_declarations(&[candidate], options, limits)
+                .admit_declarations(&candidate.into_declarations(), options, limits)
                 .map_err(EngineExecutionError::from)?;
             let is_class = fln_elab::source::class_inductive_registration(syntax, scope)
                 .map_err(DefinitionFrontendError::Elaborate)

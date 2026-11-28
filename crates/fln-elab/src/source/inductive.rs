@@ -7,7 +7,22 @@ use crate::inductive::{
 use crate::records::{Builder, RecordBudget};
 
 mod mutual;
-pub(super) use mutual::elaborate_mutual;
+pub(super) use mutual::{elaborate_mutual, elaborate_mutual_with_effects};
+
+/// An untrusted data declaration together with the checked local predecessors
+/// its types reference. The caller admits the entire ordered batch atomically.
+#[derive(Debug)]
+pub struct SourceInductive {
+    pub declaration: Declaration,
+    pub auxiliary_declarations: Vec<Declaration>,
+}
+
+impl SourceInductive {
+    pub fn into_declarations(mut self) -> Vec<Declaration> {
+        self.auxiliary_declarations.push(self.declaration);
+        self.auxiliary_declarations
+    }
+}
 
 pub fn is_inductive(syntax: &Syntax) -> bool {
     matches!(syntax,Syntax::Node { kind,args,.. } if kind == &parser_kind(&["Command","declaration"])
@@ -501,6 +516,8 @@ fn header<'a>(
     kernel: Budget,
     budget: RecordBudget,
     scope: &SourceScope,
+    allow_auxiliary_declarations: bool,
+    aux_names: Option<tactics::AuxNames>,
 ) -> Result<Header<'a>, NatDefinitionElabError> {
     let root = expect_node(
         syntax,
@@ -572,6 +589,10 @@ fn header<'a>(
     }
     let short_name = name.clone();
     let name = context.enter_declaration(name)?;
+    context.allow_auxiliary_declarations = allow_auxiliary_declarations;
+    context.diagnostic_declaration = Some(name.clone());
+    context.aux_names =
+        Some(aux_names.unwrap_or_else(|| tactics::AuxNames::new(name.clone(), false)));
     if env.contains(&name) {
         return Err(invalid());
     }
@@ -688,6 +709,28 @@ pub(super) fn elaborate_inductive_scoped(
     budget: RecordBudget,
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    elaborate_inductive_core(syntax, env, kernel, budget, scope, false)
+        .map(|result| result.declaration)
+}
+
+pub(super) fn elaborate_inductive_with_effects_scoped(
+    syntax: &Syntax,
+    env: &Environment,
+    kernel: Budget,
+    budget: RecordBudget,
+    scope: &SourceScope,
+) -> Result<SourceInductive, NatDefinitionElabError> {
+    elaborate_inductive_core(syntax, env, kernel, budget, scope, true)
+}
+
+fn elaborate_inductive_core(
+    syntax: &Syntax,
+    env: &Environment,
+    kernel: Budget,
+    budget: RecordBudget,
+    scope: &SourceScope,
+    allow_auxiliary_declarations: bool,
+) -> Result<SourceInductive, NatDefinitionElabError> {
     let Header {
         mut context,
         name,
@@ -698,7 +741,15 @@ pub(super) fn elaborate_inductive_scoped(
         explicit,
         family_type,
         ctors,
-    } = header(syntax, env, kernel, budget, scope)?;
+    } = header(
+        syntax,
+        env,
+        kernel,
+        budget,
+        scope,
+        allow_auxiliary_declarations,
+        None,
+    )?;
     if is_protected {
         context.protected_declarations.push(name.clone());
     }
@@ -888,18 +939,23 @@ pub(super) fn elaborate_inductive_scoped(
     context.publish_deprecated_uses()?;
     // A field nesting the family under another inductive (`List T`) is built through the
     // kernel's nested translation, which the ordinary single-family builder refuses.
-    if let Some(declaration) = crate::inductive::nested_inductive_declaration(
-        env,
+    let declaration = if let Some(declaration) = crate::inductive::nested_inductive_declaration(
+        &context.txn.env,
         std::slice::from_ref(&specification),
         budget,
         std::slice::from_ref(&promoted),
     )
     .map_err(|e| failure(SourceInferenceError::Inductive(e)))?
     {
-        return Ok(declaration);
-    }
-    inductive_with_promoted_parameters(&specification, budget, &field_universes, &promoted)
-        .map_err(|e| failure(SourceInferenceError::Inductive(e)))
+        declaration
+    } else {
+        inductive_with_promoted_parameters(&specification, budget, &field_universes, &promoted)
+            .map_err(|e| failure(SourceInferenceError::Inductive(e)))?
+    };
+    Ok(SourceInductive {
+        declaration,
+        auxiliary_declarations: context.auxiliary_declarations,
+    })
 }
 
 /// Select actual type/constructor dependencies, not theorem-only include/omit

@@ -29,6 +29,14 @@ impl Context {
         &mut self,
         syntax: &Syntax,
     ) -> Result<Name, NatDefinitionElabError> {
+        self.declare_auto_tactic_with_name(syntax, None)
+    }
+
+    fn declare_auto_tactic_with_name(
+        &mut self,
+        syntax: &Syntax,
+        name: Option<Name>,
+    ) -> Result<Name, NatDefinitionElabError> {
         if !self.allow_auxiliary_declarations && self.declaration_header_probe.is_none() {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "an entry point preserving autoParam auxiliary declarations",
@@ -43,13 +51,28 @@ impl Context {
                 .diagnostic_declaration
                 .clone()
                 .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-            self.aux_names = Some(tactics::AuxNames::new(owner, false));
+            self.aux_names = Some(
+                self.header_aux_names
+                    .take()
+                    .unwrap_or_else(|| tactics::AuxNames::new(owner, false)),
+            );
         }
-        let name = self.aux_decl_name(&Name::from_components(["_auto"]));
+        let result = self.declare_auto_tactic_data(syntax, name);
         if temporary_names {
-            self.aux_names = None;
+            self.header_aux_names = self.aux_names.take();
         }
-        let name = name?;
+        result
+    }
+
+    fn declare_auto_tactic_data(
+        &mut self,
+        syntax: &Syntax,
+        name: Option<Name>,
+    ) -> Result<Name, NatDefinitionElabError> {
+        let name = match name {
+            Some(name) => name,
+            None => self.aux_decl_name(&Name::from_components(["_auto"]))?,
+        };
         let value = self.quote_auto_tactic(syntax)?;
         let declaration = Declaration::Defn(DefinitionVal {
             base: ConstantVal {
@@ -96,6 +119,17 @@ impl Context {
                     *environment = checked;
                 }
             }
+        }
+        // The pin forks once for addDecl's check and once for compileDecl.
+        // Both advance the enclosing name generator even with one worker;
+        // Elab.async=false instead reuses it until the next name collision.
+        if self
+            .txn
+            .options
+            .get_bool(&Name::from_components(["Elab", "async"]), true)
+            && let Some(names) = &mut self.aux_names
+        {
+            names.advance(2)?;
         }
         self.auxiliary_declarations.push(declaration);
         Ok(name)

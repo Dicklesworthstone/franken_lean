@@ -1237,6 +1237,18 @@ pub fn elaborate_inductive(
     inductive::elaborate_inductive_scoped(syntax, env, kernel, budget, scope)
 }
 
+/// Preserve every quotation predecessor used by a data declaration's header
+/// and constructor types. None of the returned candidates is published here.
+pub fn elaborate_inductive_with_effects(
+    syntax: &Syntax,
+    env: &Environment,
+    kernel: Budget,
+    budget: crate::records::RecordBudget,
+    scope: &SourceScope,
+) -> Result<SourceInductive, NatDefinitionElabError> {
+    inductive::elaborate_inductive_with_effects_scoped(syntax, env, kernel, budget, scope)
+}
+
 /// Elaborate a mutual family group into one candidate, with no provisional
 /// global declarations. The caller must admit the whole result atomically.
 pub fn elaborate_mutual_inductives(
@@ -1247,6 +1259,16 @@ pub fn elaborate_mutual_inductives(
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
     inductive::elaborate_mutual(syntax, env, kernel, budget, scope)
+}
+
+pub fn elaborate_mutual_inductives_with_effects(
+    syntax: &[Syntax],
+    env: &Environment,
+    kernel: Budget,
+    budget: crate::records::RecordBudget,
+    scope: &SourceScope,
+) -> Result<SourceInductive, NatDefinitionElabError> {
+    inductive::elaborate_mutual_with_effects(syntax, env, kernel, budget, scope)
 }
 
 #[cfg(test)]
