@@ -8,7 +8,8 @@
 
 use fln::source_check::modules::imported::{SourceOleanImport, SourceOleanImportLimits};
 use fln::source_check::modules::{
-    SourceModuleBuildError, SourceModuleCheckError, SourceModuleCheckLimits,
+    SourceModuleArtifact, SourceModuleBuildError, SourceModuleCheckError, SourceModuleCheckLimits,
+    SourceModuleIrError, SourceModuleIrLimits,
 };
 use fln::{
     Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, Environment, KVMap, Name,
@@ -60,6 +61,29 @@ with
     | .empty => UInt64.ofNatLT 1 (of_decide_eq_true rfl)
     | .add n tail => mixHash tail.hash n
 "#;
+const PACKED: &str = r#"
+inductive PackedCache where
+  | empty
+  | mk (flag : Bool) (word : UInt64) (payload : Nat)
+with
+  @[computed_field, inline] wide : PackedCache → UInt64
+    | .empty => UInt64.ofNatLT 1 (of_decide_eq_true rfl)
+    | .mk _ n _ => n
+  @[computed_field] flag : PackedCache → Bool
+    | .empty => false
+    | .mk f _ _ => match f with
+      | false => true
+      | true => false
+"#;
+const WIDTHS: &str = r#"
+inductive Widths where
+  | empty
+  | pack (a : UInt8) (b : UInt16) (c : UInt32) (d : UInt64)
+with
+  @[computed_field] tally : Widths → Nat
+    | .empty => 0
+    | .pack _ _ _ _ => 42
+"#;
 
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
@@ -74,6 +98,8 @@ fn check_limits() -> SourceCheckLimits {
 struct Fixture {
     imported: SourceOleanImport,
     compiler: PathBuf,
+    library: PathBuf,
+    prelude: [Vec<u8>; 3],
 }
 
 fn with_fixture(test: impl FnOnce(&Fixture) + Send + 'static) {
@@ -138,7 +164,18 @@ fn with_fixture(test: impl FnOnce(&Fixture) + Send + 'static) {
                     .expect("the original pinned Prelude passes checked import")
                     .into_complete()
                     .expect("checked Prelude import completes within its separate import budget");
-                Some(Fixture { imported, compiler })
+                let native_families = fln_elab::computed_fields::families(
+                    imported.engine.environment(),
+                    Default::default(),
+                )
+                .expect("imported computed-field provenance has a valid journal");
+                eprintln!("pinned Prelude recovered native computed families: {native_families:?}");
+                Some(Fixture {
+                    imported,
+                    compiler,
+                    library,
+                    prelude: parts,
+                })
             });
             if let Some(fixture) = fixture {
                 test(fixture);
@@ -662,7 +699,377 @@ fn generated_inventory_refuses_changed_override_and_constructor_layout() {
                 !error.is_resource_limit(),
                 "the complete mutated model must be rejected: {error:?}"
             );
+            let mut inert = Environment::new();
+            for (label, _) in altered.constants() {
+                inert = inert.with_entry(altered.entry(label).unwrap()).unwrap();
+            }
+            for (journal, state) in altered.extensions() {
+                if journal == &fln_elab::computed_fields::journal_name() {
+                    continue;
+                }
+                inert = inert.register_extension(state.descriptor.clone()).unwrap();
+                for entry in state.entries() {
+                    inert = inert
+                        .push_extension_entry(journal, entry.payload.clone())
+                        .unwrap();
+                }
+            }
+            assert!(
+                fln_elab::computed_fields::tags::read_tags(&inert)
+                    .unwrap()
+                    .contains(&name("Cache.total"))
+            );
+            assert!(
+                fln_elab::computed_fields::recover_imported(
+                    &inert,
+                    &name("Cache"),
+                    &[name("Cache.total")],
+                    &[name("Cache.total")],
+                    limits().kernel,
+                    Default::default(),
+                )
+                .expect("a changed generated model is an inert foreign candidate")
+                .is_none()
+            );
+            assert!(
+                inert
+                    .extension(&fln_elab::computed_fields::journal_name())
+                    .is_none()
+            );
         }
+        let error = fln_elab::computed_fields::recover_imported(
+            original,
+            &name("Cache"),
+            &[name("Cache.total")],
+            &[name("Cache.total")],
+            limits().kernel,
+            fln_elab::records::RecordBudget {
+                max_nodes: 1,
+                ..Default::default()
+            },
+        )
+        .expect_err("recovery exhaustion must not be reported as an inert candidate");
+        assert!(error.is_resource_limit());
+    });
+}
+
+#[test]
+fn pinned_name_import_keeps_a_consistent_native_representation() {
+    with_fixture(|fixture| {
+        let env = fixture.imported.engine.environment();
+        let families = fln_elab::computed_fields::families(env, Default::default()).unwrap();
+        let model = fln_elab::computed_fields::validated_family(
+            env,
+            &name("Lean.Name"),
+            limits().kernel,
+            Default::default(),
+        )
+        .expect("pin import either recovers an exact Name model or retains inert tags");
+        assert_eq!(model.is_some(), families.contains(&name("Lean.Name")));
+        let source = r#"
+def inspectImportedName (value : Lean.Name) : Nat := match value with
+  | .anonymous => 0
+  | .num _ n => n
+  | .str parent _ => match parent with
+    | .anonymous => 1
+    | .str _ _ => 2
+    | .num _ n => n
+"#;
+        let evaluations = r#"#eval inspectImportedName (Lean.Name.str (Lean.Name.num Lean.Name.anonymous 7) "cache")
+#eval inspectImportedName (Lean.Name.num (Lean.Name.str Lean.Name.anonymous "cache") 11)
+#eval inspectImportedName Lean.Name.anonymous
+"#;
+        reference(
+            &fixture.compiler,
+            &format!("{source}{evaluations}"),
+            Some("7\n11\n0"),
+        );
+        let engine = checked(&fixture.imported.engine, source);
+        execute(&engine, evaluations, &["7", "11", "0"]);
+        if model.is_some() {
+            let hash = "#eval BitVec.toNat (UInt64.toBitVec Lean.Name.anonymous.hash)\n";
+            reference(&fixture.compiler, hash, Some("1723"));
+            execute(&engine, hash, &["1723"]);
+        }
+    });
+}
+
+#[test]
+fn public_computed_family_admits_following_instances_without_duplicate_metadata() {
+    with_fixture(|fixture| {
+        let module = name("ComputedContinuation");
+        let source = format!(
+            "module\nprelude\npublic import Init.Prelude\npublic section\n{SINGLE}\ninstance : Inhabited Cache where\n  default := Cache.empty\n"
+        );
+        let files = [SourceModuleInput {
+            name: &module,
+            source: source.as_bytes(),
+        }];
+        let options = KVMap::new();
+        let before = fixture.imported.engine.logical_root(&options);
+        let checked = fixture
+            .imported
+            .check_source_modules(
+                &files,
+                &module,
+                &options,
+                SourceModuleCheckLimits::new(check_limits()),
+                None,
+            )
+            .expect("an ordinary public instance must not re-register the hidden computed getter")
+            .into_complete()
+            .unwrap();
+        assert!(
+            checked
+                .checked
+                .engine
+                .environment()
+                .contains(&name("instInhabitedCache"))
+        );
+        assert!(matches!(
+            checked
+                .checked
+                .engine
+                .environment()
+                .find(&name("Cache.total")),
+            Some(ConstantInfo::Defn(_))
+        ));
+        assert_eq!(fixture.imported.engine.logical_root(&options), before);
+    });
+}
+
+fn assert_computed_ir_boundary(artifact: &mut SourceModuleArtifact, family: &str) {
+    let public = artifact.bytes.clone();
+    let error = artifact
+        .compile_ir(SourceModuleIrLimits::new(limits()))
+        .expect_err("logical computed artifacts do not claim an implemented pinned IR ABI");
+    assert!(
+        matches!(&error, SourceModuleIrError::Unsupported {
+        module, declaration, reason,
+    } if module == &artifact.name
+        && declaration == &name(family)
+        && *reason == "computed-field source IR requires cached constructor and replacement ABI lowering"),
+        "unexpected computed IR boundary: {error:?}"
+    );
+    assert_eq!(
+        artifact.bytes, public,
+        "a refused IR facet must preserve its logical artifact"
+    );
+}
+
+#[test]
+fn physical_module_roundtrip_recovers_cached_execution_and_scalar_field_order() {
+    with_fixture(|fixture| {
+        let module = name("ComputedRoundtrip");
+        let source = format!(
+            "module\nprelude\npublic import Init.Prelude\npublic section\n{SINGLE}{CROSS}{WORD}{PACKED}{WIDTHS}"
+        );
+        let options = KVMap::new();
+        let before = fixture.imported.engine.logical_root(&options);
+        // This fixture deliberately combines five families and all four word
+        // widths. Reserve a finite aggregate allowance for six inventory phases
+        // per family plus the scalar shape/bound checks; every declaration
+        // keeps the ordinary kernel budget and production defaults are unchanged.
+        let mut module_limits = SourceModuleCheckLimits::new(check_limits());
+        module_limits.max_work = 5_000_000;
+        let mut built = fixture
+            .imported
+            .compile_source_modules(
+                &[SourceModuleInput {
+                    name: &module,
+                    source: source.as_bytes(),
+                }],
+                &module,
+                &options,
+                module_limits,
+                OleanWriteBudget::default(),
+            )
+            .expect("all supported cached fields publish complete logical artifacts")
+            .into_complete()
+            .unwrap();
+        assert_eq!(built.artifacts.len(), 1);
+        assert_computed_ir_boundary(&mut built.artifacts[0], "Cache");
+
+        let directory = std::env::temp_dir().join(format!(
+            "fln-computed-roundtrip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let artifact = &built.artifacts[0];
+        let companions = artifact
+            .companions
+            .as_ref()
+            .expect("modern module companions");
+        let paths = [
+            "ComputedRoundtrip.olean",
+            "ComputedRoundtrip.olean.server",
+            "ComputedRoundtrip.olean.private",
+        ];
+        for (path, bytes) in paths.iter().zip([
+            artifact.bytes.as_slice(),
+            companions.server.as_slice(),
+            companions.private.as_slice(),
+        ]) {
+            std::fs::write(directory.join(path), bytes).unwrap();
+        }
+        let parts = paths.map(|path| std::fs::read(directory.join(path)).unwrap());
+        let prelude = name("Init.Prelude");
+        let empty = Engine::builder().build_empty();
+        let fresh = empty
+            .import_olean_modules_for_source(
+                &[
+                    OleanModuleInput {
+                        name: &prelude,
+                        artifact: &fixture.prelude[0],
+                        server_artifact: Some(&fixture.prelude[1]),
+                        private_artifact: Some(&fixture.prelude[2]),
+                    },
+                    OleanModuleInput {
+                        name: &module,
+                        artifact: &parts[0],
+                        server_artifact: Some(&parts[1]),
+                        private_artifact: Some(&parts[2]),
+                    },
+                ],
+                std::slice::from_ref(&module),
+                &options,
+                SourceOleanImportLimits::new(OleanCheckLimits::new(
+                    IMPORT_STACK,
+                    Budget::for_stack_bytes(IMPORT_STACK),
+                )),
+            )
+            .expect("physical native companions pass independent checked import")
+            .into_complete()
+            .unwrap();
+        assert!(empty.environment().is_empty());
+        for (family, fields) in [
+            ("Cache", vec!["total"]),
+            ("Cross", vec!["first", "second"]),
+            ("Digest", vec!["hash"]),
+            // Tags are a name set. Cache order must come from the fully
+            // regenerated representation, not this alphabetically sorted set.
+            ("PackedCache", vec!["wide", "flag"]),
+            ("Widths", vec!["tally"]),
+        ] {
+            let loaded = fln_elab::computed_fields::validated_family(
+                fresh.engine.environment(),
+                &name(family),
+                limits().kernel,
+                Default::default(),
+            )
+            .expect("recovered model can be validated with the ordinary source budget")
+            .expect("a full native artifact recovers its generated representation");
+            assert_eq!(
+                loaded
+                    .fields
+                    .iter()
+                    .map(|field| field.name.clone())
+                    .collect::<Vec<_>>(),
+                fields
+                    .iter()
+                    .map(|field| name(&format!("{family}.{field}")))
+                    .collect::<Vec<_>>()
+            );
+            let original = fln_elab::computed_fields::validated_family(
+                built.checked.checked.engine.environment(),
+                &name(family),
+                limits().kernel,
+                Default::default(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                loaded, original,
+                "physical module recovery changed {family}"
+            );
+        }
+        let samples = r#"
+def importedCache : Cache := .add 2 (.add 3 .empty)
+def importedCross : Cross := .add 2 (.add 3 (.add 4 .empty))
+def importedDigest : Digest := .add (UInt64.ofNatLT 2 (of_decide_eq_true rfl))
+  (.add (UInt64.ofNatLT 3 (of_decide_eq_true rfl)) .empty)
+def importedPacked : PackedCache := .mk true (UInt64.ofNatLT 2 (of_decide_eq_true rfl)) 7
+"#;
+        let controls = r#"#eval importedCache.total
+#eval importedCross.first
+#eval importedCross.second
+#eval BitVec.toNat (UInt64.toBitVec importedDigest.hash)
+#eval BitVec.toNat (UInt64.toBitVec importedPacked.wide)
+#eval match importedPacked.flag with | false => 11 | true => 13
+#eval match importedPacked with | .empty => 0 | .mk _ _ payload => payload
+"#;
+        reference(
+            &fixture.compiler,
+            &format!("{SINGLE}{CROSS}{WORD}{PACKED}{WIDTHS}{samples}{controls}"),
+            Some("5\n19\n29\n5467619628213459297\n2\n11\n7"),
+        );
+        let sample_engine = checked(&fresh.engine, samples);
+        let bytecode = execute(
+            &sample_engine,
+            controls,
+            &["5", "19", "29", "5467619628213459297", "2", "11", "7"],
+        );
+        execute_stored_cache_control(
+            &fln_comp::flbc::decode_canonical(&bytecode[0], Default::default()).unwrap(),
+        );
+
+        // The Reference reads our actual emitted maps. UInt64 slots precede
+        // Bool bytes in the scalar area, independently of declaration order.
+        let inspector = r#"module
+import Lean
+import all Lean.Compiler.LCNF.ToImpureType
+public import ComputedRoundtrip
+open Lean Elab Command
+run_cmd do
+  for n in [`PackedCache.mk, `PackedCache.mk._impl] do
+    let layout ← liftCoreM <| Compiler.LCNF.getCtorLayout n
+    let fields := layout.fieldInfo.toList.map fun f => toString (Compiler.LCNF.CtorFieldInfo.format f)
+    liftIO <| IO.println s!"LAYOUT {n} {reprStr layout.ctorInfo} {fields}"
+"#;
+        std::fs::write(directory.join("Inspect.lean"), inspector).unwrap();
+        let pin = Command::new(&fixture.compiler)
+            .current_dir(&directory)
+            .env(
+                "LEAN_PATH",
+                std::env::join_paths([&directory, &fixture.library]).unwrap(),
+            )
+            .args(["-j1", "Inspect.lean"])
+            .output()
+            .unwrap();
+        assert!(
+            pin.status.success(),
+            "the pin refused our mixed cache layouts: {pin:?}"
+        );
+        assert!(pin.stderr.is_empty(), "{pin:?}");
+        assert_eq!(
+            String::from_utf8(pin.stdout).unwrap().trim(),
+            "LAYOUT PackedCache.mk { name := `PackedCache.mk, cidx := 1, size := 1, usize := 0, ssize := 9 } [scalar#1@8:UInt8, scalar#8@0:UInt64, obj@0:tobj]\nLAYOUT PackedCache.mk._impl { name := `PackedCache.mk._impl, cidx := 1, size := 1, usize := 0, ssize := 18 } [scalar#8@0:UInt64, scalar#1@16:UInt8, scalar#1@17:UInt8, scalar#8@8:UInt64, obj@0:tobj]"
+        );
+        assert!(!directory.join("ComputedRoundtrip.ir").exists());
+
+        let consumer = name("ComputedConsumer");
+        let consumer_source = "module\nprelude\npublic import ComputedRoundtrip\npublic def payload (value : Cache) : Nat := match value with\n  | .empty => 0\n  | .add n _ => n\n";
+        let mut consumer_build = fresh
+            .compile_source_modules(
+                &[SourceModuleInput {
+                    name: &consumer,
+                    source: consumer_source.as_bytes(),
+                }],
+                &consumer,
+                &options,
+                SourceModuleCheckLimits::new(check_limits()),
+                OleanWriteBudget::default(),
+            )
+            .expect("a downstream source module can use the fresh imported family")
+            .into_complete()
+            .unwrap();
+        assert_eq!(consumer_build.artifacts.len(), 1);
+        assert_computed_ir_boundary(&mut consumer_build.artifacts[0], "Cache");
+        assert_eq!(fixture.imported.engine.logical_root(&options), before);
     });
 }
 

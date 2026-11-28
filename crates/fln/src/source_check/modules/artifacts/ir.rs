@@ -12,6 +12,9 @@ pub(super) struct CompilerInput {
     pub options: KVMap,
     pub name: Name,
     pub is_module: bool,
+    /// A checked native cache-bearing family in the implementation world,
+    /// including imported families. Inert foreign computed tags do not set it.
+    pub computed_family: Option<Name>,
     pub imports: Vec<OleanModuleImport>,
     pub constants: Vec<ConstantInfo>,
     pub public: Arc<ArtifactData>,
@@ -405,6 +408,12 @@ impl SourceModuleArtifact {
             return Err(refuse(
                 &input.name,
                 "standalone IR requires a module-system file; legacy modules require executable entries embedded in their .olean",
+            ));
+        }
+        if let Some(family) = &input.computed_family {
+            return Err(refuse(
+                family,
+                "computed-field source IR requires cached constructor and replacement ABI lowering",
             ));
         }
         if input.constants.len() > limits.writer.max_entries {

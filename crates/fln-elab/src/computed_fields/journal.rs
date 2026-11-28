@@ -222,7 +222,7 @@ pub fn families(env: &Environment, budget: RecordBudget) -> Result<Vec<Name>, Co
     Ok(read(env, budget)?.into_keys().collect())
 }
 
-fn append(
+pub(super) fn append(
     env: &Environment,
     entry: ComputedFieldEntry,
     budget: RecordBudget,

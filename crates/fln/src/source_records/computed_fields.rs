@@ -498,6 +498,7 @@ mod tests {
             ).unwrap().into_complete().unwrap();
             let mut source = b"module\nprelude\npublic import Init.Prelude\npublic section\n".to_vec();
             source.extend_from_slice(SOURCE);
+            source.extend_from_slice(b"\ninstance : Inhabited VisibilityCache where\n  default := VisibilityCache.empty\n");
             let module = name("ComputedVisibility");
             let kernel = Budget::for_stack_bytes(2 * 1024 * 1024);
             let checked = imported.check_source_modules(
@@ -509,6 +510,7 @@ mod tests {
             ).unwrap().into_complete().unwrap();
             let public = checked.public_environment.as_ref().expect("module public predecessor");
             let private = checked.checked.engine.environment();
+            assert!(fln_elab::noncomputable::read(private).unwrap().contains(&name("VisibilityCache.total")));
             for getter in ["VisibilityCache.total", "VisibilityCache.total._sunfold"] {
                 assert!(matches!(public.find(&name(getter)), Some(ConstantInfo::Axiom(header)) if !header.is_unsafe), "{getter} must expose only its signature");
                 assert!(matches!(private.find(&name(getter)), Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe), "{getter} must retain its checked private body");

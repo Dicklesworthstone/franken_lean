@@ -347,14 +347,23 @@ fn cached_fields_survive_source_artifacts_and_owned_metadata_reimport() {
                 .unwrap();
             assert_eq!(loaded.modules[0].computed_fields, 1);
             assert_bundle(loaded.engine.environment(), "Flag", "value", &["off", "on"]);
-            assert!(
-                loaded
-                    .engine
-                    .environment()
-                    .extension(&fln_elab::computed_fields::journal_name())
-                    .is_none(),
-                "imported membership tags must not reconstruct checked generation provenance"
-            );
+            let recovered = fln_elab::computed_fields::validated_family(
+                loaded.engine.environment(),
+                &name("Flag"),
+                limits().kernel,
+                Default::default(),
+            )
+            .unwrap()
+            .expect("complete native declarations must regenerate their representation authority");
+            let original = fln_elab::computed_fields::validated_family(
+                built.checked.checked.engine.environment(),
+                &name("Flag"),
+                limits().kernel,
+                Default::default(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(recovered, original);
             assert_eq!(
                 computed_fields::read_tags(loaded.engine.environment()).unwrap(),
                 BTreeSet::from([name("Flag.value")])
@@ -362,6 +371,130 @@ fn cached_fields_survive_source_artifacts_and_owned_metadata_reimport() {
             checked(
                 &loaded.engine,
                 "noncomputable def downstream : Bool := Flag.value (Flag.on Bool.true)\n",
+            );
+        }
+    });
+}
+
+#[test]
+fn inert_computed_tags_share_recovery_work_across_families_and_modules() {
+    use fln_core::{expr::Expr, level::Level};
+    use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
+    use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
+
+    on_stack(|| {
+        let constants = (0..16)
+            .map(|index| {
+                let declaration = name(&format!("Foreign{index}.hash"));
+                ConstantInfo::Defn(DefinitionVal {
+                    base: ConstantVal {
+                        name: declaration.clone(),
+                        level_params: Vec::new(),
+                        type_: Expr::sort(Level::succ(Level::zero()).unwrap()),
+                    },
+                    value: Expr::sort(Level::zero()),
+                    hints: ReducibilityHints::Abbrev,
+                    safety: DefinitionSafety::Safe,
+                    all: vec![declaration],
+                })
+            })
+            .collect::<Vec<_>>();
+        for (split_modules, constant_count) in [(false, 0), (false, 16), (true, 16)] {
+            let constants = &constants[..constant_count];
+            let expected = constants
+                .iter()
+                .map(|info| info.name().clone())
+                .collect::<BTreeSet<_>>();
+            let groups = if split_modules {
+                constants
+                    .iter()
+                    .cloned()
+                    .map(|info| vec![info])
+                    .collect::<Vec<_>>()
+            } else {
+                vec![constants.to_vec()]
+            };
+            let modules = (0..groups.len())
+                .map(|index| name(&format!("ForeignTags{index}")))
+                .collect::<Vec<_>>();
+            let artifacts = groups
+                .iter()
+                .map(|constants| {
+                    encode_module_with_source_metadata(
+                        OleanModuleWriteInput {
+                            is_module: false,
+                            imports: &[],
+                            constants,
+                            extra_const_names: &[],
+                        },
+                        &SourceMetadata {
+                            computed_fields: constants
+                                .iter()
+                                .map(|info| info.name().clone())
+                                .collect(),
+                            ..Default::default()
+                        },
+                        OleanWriteHeader {
+                            version: fln_olean::format::OLEAN_ACCEPTED_VERSIONS[0],
+                            flags: 1,
+                            lean_version: fln_olean::format::PIN_TAG.strip_prefix('v').unwrap(),
+                            githash: fln_olean::format::PIN_COMMIT,
+                            base_addr: 2 * fln_olean::format::REGION_ALIGN as u64,
+                        },
+                        OleanWriteBudget::default(),
+                    )
+                    .unwrap()
+                    .bytes
+                })
+                .collect::<Vec<_>>();
+            let inputs = modules
+                .iter()
+                .zip(&artifacts)
+                .map(|(module, bytes)| OleanModuleInput {
+                    name: module,
+                    artifact: bytes,
+                    server_artifact: None,
+                    private_artifact: None,
+                })
+                .collect::<Vec<_>>();
+            let initial = Engine::builder().build_empty();
+            let mut import_limits =
+                SourceOleanImportLimits::new(OleanCheckLimits::new(STACK, limits().kernel));
+            if constant_count == 0 {
+                import_limits.metadata.max_objects = 0;
+            }
+            let imported = initial
+                .import_olean_modules_for_source(&inputs, &modules, &KVMap::new(), import_limits)
+                .expect("inert tags must not consume a full recovery allowance per family")
+                .into_complete()
+                .unwrap();
+            assert!(initial.environment().is_empty());
+            assert_eq!(
+                imported
+                    .modules
+                    .iter()
+                    .map(|module| module.computed_fields)
+                    .sum::<usize>(),
+                constant_count
+            );
+            assert_eq!(
+                computed_fields::read_tags(imported.engine.environment()).unwrap(),
+                expected
+            );
+            assert!(
+                fln_elab::computed_fields::families(
+                    imported.engine.environment(),
+                    Default::default()
+                )
+                .unwrap()
+                .is_empty()
+            );
+            assert!(
+                imported
+                    .engine
+                    .environment()
+                    .extension(&fln_elab::computed_fields::journal_name())
+                    .is_none()
             );
         }
     });
@@ -407,5 +540,51 @@ fn hidden_public_fields_keep_their_bodies_private_and_expose_checked_adapters() 
             );
         }
         assert!(built.artifacts[0].companions.is_some());
+        let original = built.checked.checked.engine.environment();
+        let getter = name("Flag.value");
+        let public_getter = public
+            .constants
+            .iter()
+            .find(|info| info.name() == &getter)
+            .unwrap();
+        let mut header_only = Environment::new();
+        for (label, _) in original.constants() {
+            if label != &getter {
+                header_only = header_only
+                    .with_entry(original.entry(label).unwrap())
+                    .unwrap();
+            }
+        }
+        header_only = header_only.add_decl(public_getter.clone()).unwrap();
+        for (journal, state) in original.extensions() {
+            header_only = header_only
+                .register_extension(state.descriptor.clone())
+                .unwrap();
+            for entry in state.entries() {
+                header_only = header_only
+                    .push_extension_entry(journal, entry.payload.clone())
+                    .unwrap();
+            }
+        }
+        let error = fln_elab::computed_fields::validated_family(
+            &header_only,
+            &name("Flag"),
+            limits().kernel,
+            Default::default(),
+        )
+        .expect_err("public headers and a journal claim cannot authorize private cached execution");
+        assert!(!error.is_resource_limit(), "{error:?}");
+        assert!(
+            fln_elab::computed_fields::recover_imported(
+                &header_only,
+                &name("Flag"),
+                &[getter],
+                &[],
+                limits().kernel,
+                Default::default(),
+            )
+            .unwrap()
+            .is_none()
+        );
     });
 }

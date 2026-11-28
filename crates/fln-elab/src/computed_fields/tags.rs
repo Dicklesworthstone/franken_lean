@@ -166,3 +166,92 @@ pub fn read_tags(env: &Environment) -> Result<BTreeSet<Name>, NatDefinitionElabE
     names.retain(|name| env.contains(name));
     Ok(names)
 }
+
+/// The same tag contract with a caller-owned work allowance. Charge one initial
+/// tick and every payload byte plus one tick per row before decoding any data.
+/// This does not reinterpret membership as native generation provenance.
+pub fn read(
+    env: &Environment,
+    budget: crate::records::RecordBudget,
+) -> Result<Vec<Name>, super::ComputedFieldError> {
+    let mut remaining = budget
+        .max_nodes
+        .checked_sub(1)
+        .ok_or(super::ComputedFieldError::ResourceLimit)?;
+    if let Some(extension) = env.extension(&journal_name()) {
+        for entry in extension.entries() {
+            remaining = remaining
+                .checked_sub(entry.payload.len().saturating_add(1))
+                .ok_or(super::ComputedFieldError::ResourceLimit)?;
+        }
+    }
+    read_tags(env)
+        .map(|names| names.into_iter().collect())
+        .map_err(|error| match error {
+            NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit) => {
+                super::ComputedFieldError::ResourceLimit
+            }
+            NatDefinitionElabError::Inference(SourceInferenceError::Unification(error)) => {
+                super::ComputedFieldError::Reduction(error)
+            }
+            _ => super::ComputedFieldError::InvalidInventory,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::records::RecordBudget;
+    use fln_core::{expr::Expr, level::Level};
+    use fln_env::constants::{ConstantVal, DefinitionVal, ReducibilityHints};
+
+    #[test]
+    fn imported_tag_does_not_create_native_generation_provenance() {
+        let field = Name::from_components(["Foreign", "hash"]);
+        let env = Environment::new()
+            .add_decl(ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: field.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                value: Expr::sort(Level::zero()),
+                hints: ReducibilityHints::Abbrev,
+                safety: DefinitionSafety::Safe,
+                all: vec![field.clone()],
+            }))
+            .unwrap();
+        let tagged = register_imported(&env, &field).unwrap();
+        let budget = RecordBudget::default();
+        assert_eq!(read(&tagged, budget).unwrap(), vec![field.clone()]);
+        assert!(super::super::families(&tagged, budget).unwrap().is_empty());
+        let payload_work = tagged
+            .extension(&journal_name())
+            .unwrap()
+            .entries()
+            .map(|entry| entry.payload.len() + 1)
+            .sum::<usize>();
+        assert_eq!(
+            read(
+                &tagged,
+                RecordBudget {
+                    max_nodes: payload_work,
+                    ..budget
+                }
+            ),
+            Err(super::super::ComputedFieldError::ResourceLimit)
+        );
+        assert_eq!(
+            read(
+                &tagged,
+                RecordBudget {
+                    max_nodes: payload_work + 1,
+                    ..budget
+                }
+            )
+            .unwrap(),
+            vec![field]
+        );
+        assert!(read_tags(&env).unwrap().is_empty());
+    }
+}

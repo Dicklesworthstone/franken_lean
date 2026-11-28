@@ -5,6 +5,7 @@ use fln_olean::write::source::{
 };
 use std::sync::Arc;
 
+mod computed;
 mod computed_fields;
 mod ir;
 pub use ir::{SourceModuleIrError, SourceModuleIrLimits};
@@ -173,9 +174,9 @@ impl ArtifactData {
         header: &SourceHeader,
         base: &Environment,
         checked: &Environment,
+        computed: &[computed::Family],
         meter: &mut Meter,
     ) -> Result<Self, SourceModuleCheckError> {
-        let computed = computed_fields::capture(name, base, checked, meter)?;
         // Default equation policies and realization provenance are local
         // compilation facts: the pin reconstructs their result from the actual
         // checked equation declarations. Nondefault definition-time options
@@ -782,30 +783,8 @@ impl ArtifactData {
                 metadata.never_extract.push(tagged);
             }
         }
-        let computed_fields = |env: &Environment, meter: &mut Meter| {
-            use fln_elab::computed_fields::tags as fields;
-            if let Some(journal) = env.extension(&fields::journal_name()) {
-                for entry in journal.entries() {
-                    meter.work(1)?;
-                    meter.bytes(entry.payload.len())?;
-                }
-            }
-            fields::read_tags(env).map_err(|error| match error {
-                fln_elab::NatDefinitionElabError::Inference(
-                    fln_elab::source::SourceInferenceError::ResourceLimit,
-                ) => SourceModuleCheckError::Limit {
-                    resource: "native computed-field tags",
-                    limit: fields::MAX_TAGS,
-                },
-                _ => SourceModuleCheckError::Extension {
-                    module: name.clone(),
-                    extension: fields::journal_name(),
-                    reason: "invalid computed-field journal",
-                },
-            })
-        };
-        let inherited = computed_fields(base, meter)?;
-        for tagged in computed_fields(checked, meter)? {
+        let inherited = computed::inert_tags(name, base, meter)?;
+        for tagged in computed::inert_tags(name, checked, meter)? {
             meter.work(1)?;
             if !inherited.contains(&tagged) {
                 if base.contains(&tagged) {
@@ -1235,43 +1214,27 @@ impl ArtifactData {
         // just like the pin's compileInductives entries. Project only constants
         // in this independently checked public/private view; imported or sibling
         // declarations never acquire local layout ownership here.
-        let mut layouts = BTreeSet::new();
+        let mut layouts = computed::append(name, base, checked, computed, &mut metadata, meter)?;
         for constant in &constants {
             let ConstantInfo::Induct(inductive) = constant else {
                 continue;
             };
-            meter.work(computed.len().saturating_add(1))?;
-            let computed_owner = computed.iter().find(|entry| {
-                entry.family == inductive.base.name
-                    || Name::str(entry.family.clone(), "_impl") == inductive.base.name
-            });
-            let data = if let Some(owner) = computed_owner {
-                let Some(ConstantInfo::Induct(logical)) = checked.find(&owner.family) else {
-                    return Err(SourceModuleCheckError::Extension {
-                        module: name.clone(),
-                        extension: fln_elab::computed_fields::journal_name(),
-                        reason: "missing checked logical family for computed-field layouts",
-                    });
-                };
-                CompilerData::from_computed_inductive(
-                    inductive,
-                    logical,
-                    |name| checked.find(name),
-                    |work| meter.work(work),
-                )?
-            } else {
-                CompilerData::from_inductive(
-                    inductive,
-                    |name| checked.find(name),
-                    |work| meter.work(work),
-                )?
-            };
+            meter.work(1)?;
+            if layouts.contains(&inductive.base.name) {
+                continue;
+            }
+            let data = CompilerData::from_inductive(
+                inductive,
+                |name| checked.find(name),
+                |work| meter.work(work),
+            )?;
             if let Some(data) = data {
                 layouts.insert(inductive.base.name.clone());
                 metadata.compiler_data.push(data);
             }
         }
-        computed_fields::finish(name, &computed, checked, &layouts, &mut metadata, meter)?;
+        let entries = computed::entries(computed, meter)?;
+        computed_fields::finish(name, &entries, checked, &layouts, &mut metadata, meter)?;
         Ok(Self {
             name: name.clone(),
             imports,
@@ -1339,18 +1302,34 @@ impl PendingArtifact {
         options: &KVMap,
         meter: &mut Meter,
     ) -> Result<Self, SourceModuleCheckError> {
+        let computed = computed::models(name, base, checked.environment(), meter)?;
         let (public, private) = match (header.module_system, public) {
             (false, None) => (
-                ArtifactData::capture(name, header, base, checked.environment(), meter)?,
+                ArtifactData::capture(
+                    name,
+                    header,
+                    base,
+                    checked.environment(),
+                    &computed.owned,
+                    meter,
+                )?,
                 None,
             ),
             (true, Some((public_base, public_checked))) => (
-                ArtifactData::capture(name, header, public_base, public_checked, meter)?,
+                ArtifactData::capture(
+                    name,
+                    header,
+                    public_base,
+                    public_checked,
+                    &computed.owned,
+                    meter,
+                )?,
                 Some(ArtifactData::capture(
                     name,
                     header,
                     base,
                     checked.environment(),
+                    &computed.owned,
                     meter,
                 )?),
             ),
@@ -1369,6 +1348,7 @@ impl PendingArtifact {
             options: options.clone(),
             name: name.clone(),
             is_module: header.module_system,
+            computed_family: computed.visible_family,
             imports: implementation.imports.clone(),
             constants: implementation.constants.clone(),
             public: Arc::clone(&public),

@@ -22,6 +22,8 @@ use super::*;
 use fln_core::expr::BinderInfo;
 use fln_env::constants::InductiveVal;
 
+mod words;
+
 /// A projected data interface. Its fields are private so callers cannot attach
 /// an arbitrary layout to an admitted declaration. Construction checks the
 /// exact supported shape; it does not itself admit the supplied constants.
@@ -132,7 +134,7 @@ impl CompilerData {
 
     /// Canonical constructor order and its field carriers in source order.
     /// Consumers can reserve these layouts without another shape classifier;
-    /// UInt8 fields occupy packed scalar bytes, not object slots.
+    /// Unsigned fields occupy packed scalar bytes, not object slots.
     pub fn constructors(&self) -> impl ExactSizeIterator<Item = (&Name, &[IrType])> {
         self.constructors
             .iter()
@@ -206,6 +208,45 @@ impl CompilerData {
                 carrier: Some(&logical_data.carrier),
             },
         )
+    }
+
+    /// Capture both logical and implementation interfaces before a public
+    /// projection hides implementation bodies. The ordinary runtime ABI
+    /// classifier remains unchanged; all computed scalar widths are retained.
+    pub fn from_computed_family<'a, E>(
+        logical: &InductiveVal,
+        implementation: &InductiveVal,
+        mut find: impl FnMut(&Name) -> Option<&'a ConstantInfo>,
+        mut charge: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<Option<[Self; 2]>, E> {
+        charge(1)?;
+        if implementation.base.name != Name::str(logical.base.name.clone(), "_impl") {
+            return Ok(None);
+        }
+        let Some(original) =
+            Self::from_computed_inductive(logical, logical, &mut find, &mut charge)?
+        else {
+            return Ok(None);
+        };
+        let Some(physical) =
+            Self::from_computed_inductive(implementation, logical, &mut find, &mut charge)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some([original, physical]))
+    }
+
+    /// Validate an admitted structural UIntN/BitVec/Fin carrier before a
+    /// native source module publishes packed word fields. The caller also
+    /// reduces the actual finite bound and relation with its checked reducer.
+    /// Metadata-only readers may inspect pin layouts without granting any
+    /// executable or cast authority from those layouts.
+    pub fn validate_unsigned_word_model<'a, E>(
+        width: u32,
+        mut find: impl FnMut(&Name) -> Option<&'a ConstantInfo>,
+        mut charge: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        words::unsigned_word_matches(width, &mut find, &mut charge)
     }
 
     fn project<'a, E>(

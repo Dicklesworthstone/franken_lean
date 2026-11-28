@@ -124,6 +124,7 @@ pub(super) fn encode(
             && metadata.elab_as_elim.is_empty()
             && metadata.sparse_cases_on.is_empty()
             && metadata.noncomputable.is_empty()
+            && metadata.computed_fields.is_empty()
             && metadata.unbox.is_empty()
             && metadata.never_extract.is_empty()
             && metadata.match_patterns.is_empty()

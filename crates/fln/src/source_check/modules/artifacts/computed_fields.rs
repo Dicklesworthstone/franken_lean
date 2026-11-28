@@ -1,5 +1,5 @@
 //! Export the pin's computed-field attributes only with the complete checked
-//! representation. Imported membership tags never recreate runtime provenance.
+//! representation. Imported membership tags alone never recreate runtime provenance.
 use super::*;
 use fln_elab::computed_fields::{self as fields, ComputedFieldEntry};
 use fln_olean::source_extensions::{InlineEntry, InlineKind, ReducibilityStatus};
@@ -10,71 +10,6 @@ fn invalid(module: &Name, reason: &'static str) -> SourceModuleCheckError {
         extension: fields::journal_name(),
         reason,
     }
-}
-
-pub(super) fn capture(
-    module: &Name,
-    base: &Environment,
-    checked: &Environment,
-    meter: &mut Meter,
-) -> Result<Vec<ComputedFieldEntry>, SourceModuleCheckError> {
-    let Some(journal) = checked.extension(&fields::journal_name()) else {
-        return Ok(Vec::new());
-    };
-    let inherited = base.extension(&fields::journal_name());
-    let mut unchanged = inherited.is_some_and(|previous| previous.len() == journal.len());
-    let mut prior = inherited
-        .into_iter()
-        .flat_map(|previous| previous.entries());
-    for entry in journal.entries() {
-        meter.work(1)?;
-        meter.bytes(entry.payload.len())?;
-        unchanged &= prior.next() == Some(entry);
-    }
-    if unchanged {
-        return Ok(Vec::new());
-    }
-    let remaining = meter.limits.max_work.saturating_sub(meter.work);
-    let allowance = (remaining / 2).min(100_000);
-    meter.work(allowance)?;
-    let families: BTreeSet<_> = fields::families(
-        checked,
-        fln_elab::records::RecordBudget {
-            max_binders: allowance,
-            max_nodes: allowance,
-        },
-    )
-    .map_err(|error| match error {
-        fields::ComputedFieldError::ResourceLimit => SourceModuleCheckError::Limit {
-            resource: "module work",
-            limit: meter.limits.max_work,
-        },
-        _ => invalid(module, "invalid computed-field generation provenance"),
-    })?
-    .into_iter()
-    .collect();
-    let mut owned = BTreeMap::new();
-    for stored in journal.entries() {
-        meter.work(stored.payload.len().saturating_add(1))?;
-        let entry = fields::decode_entry(&stored.payload)
-            .map_err(|_| invalid(module, "invalid computed-field generation provenance"))?;
-        if !families.contains(&entry.family) {
-            continue;
-        }
-        let implementation = Name::str(entry.family.clone(), "_impl");
-        match (base.contains(&entry.family), base.contains(&implementation)) {
-            (true, true) => continue,
-            (false, false) => {}
-            _ => {
-                return Err(invalid(
-                    module,
-                    "a computed-field module must own its complete implementation family",
-                ));
-            }
-        }
-        owned.insert(entry.family.clone(), entry);
-    }
-    Ok(owned.into_values().collect())
 }
 
 /// Source generation already checked every candidate. This final export gate

@@ -854,6 +854,31 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Recover a native computed family only after its complete logical and
+    /// generated implementation inventory has been checked and regenerated.
+    pub fn recover_computed_family(
+        mut self,
+        family: &Name,
+        fields: &[Name],
+        inline_fields: &[Name],
+        kernel: fln_kernel::verdict::Budget,
+        budget: crate::records::RecordBudget,
+    ) -> Result<(Self, bool), crate::computed_fields::ComputedFieldError> {
+        let recovered = crate::computed_fields::recover_imported(
+            &self.env,
+            family,
+            fields,
+            inline_fields,
+            kernel,
+            budget,
+        )?;
+        let present = recovered.is_some();
+        if let Some(environment) = recovered {
+            self.env = environment;
+        }
+        Ok((self, present))
+    }
+
     /// Retain a compatible imported executable replacement. Logical constants
     /// and the kept class/instance registries remain unchanged.
     pub fn register_implemented_by(

@@ -12,6 +12,8 @@ use fln_olean::region::{OleanView, OpaqueExtensionBlock, SelectedExtensionBlock}
 use fln_olean::source_extensions::{self as metadata, DecodeLimits};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[path = "imported/computed_fields.rs"]
+mod computed_fields;
 #[path = "imported/grind.rs"]
 mod grind;
 #[path = "imported/implemented_by.rs"]
@@ -540,6 +542,12 @@ pub enum SourceOleanImportError {
         module: Name,
         error: fln_elab::eliminator_tags::EliminatorTagError,
     },
+    /// Native generation recovery retains reduction failures separately from
+    /// malformed attribute membership; a resource stop is never an absent model.
+    ComputedFields {
+        module: Name,
+        error: fln_elab::computed_fields::ComputedFieldError,
+    },
     Internal(&'static str),
 }
 impl std::fmt::Display for SourceOleanImportError {
@@ -597,6 +605,11 @@ impl std::fmt::Display for SourceOleanImportError {
                 "module {} eliminator metadata: {error}",
                 module.to_display_string(),
             ),
+            Self::ComputedFields { module, error } => write!(
+                f,
+                "module {} computed-field metadata: {error}",
+                module.to_display_string(),
+            ),
             Self::Internal(reason) => write!(f, "source import invariant: {reason}"),
         }
     }
@@ -633,6 +646,20 @@ impl SourceOleanImportError {
                 );
                 crate::source_check::classify(&wrapped).2 == 3
             }
+            Self::ComputedFields { error, .. } => match error {
+                fln_elab::computed_fields::ComputedFieldError::ResourceLimit => true,
+                fln_elab::computed_fields::ComputedFieldError::Reduction(error) => {
+                    let wrapped = EngineExecutionError::Frontend(
+                        fln_elab::NatDefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::Unification(error.clone()),
+                            ),
+                        ),
+                    );
+                    crate::source_check::classify(&wrapped).2 == 3
+                }
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -1519,6 +1546,13 @@ impl Engine {
         let mut noncomputable = decoded.noncomputable.into_iter();
         let mut unbox = decoded.unbox.into_iter();
         let mut never_extract = decoded.never_extract.into_iter();
+        let mut computed_work_left =
+            usize::try_from(limits.metadata.max_objects).unwrap_or(usize::MAX);
+        let mut computed_families_left = computed_fields::candidate_count(
+            &reports,
+            &decoded.computed_fields,
+            &mut computed_work_left,
+        )?;
         let mut computed_fields = decoded.computed_fields.into_iter();
         let mut match_patterns = decoded.match_patterns.into_iter();
         let mut symm_scopes =
@@ -1981,6 +2015,12 @@ impl Engine {
                         .map_err(|error| never_extract_error(&report.module, error))?;
                 }
             }
+            let mut module_computed_fields = Vec::new();
+            module_computed_fields
+                .try_reserve_exact(report.computed_fields)
+                .map_err(|_| {
+                    SourceOleanImportError::Limit("computed-field recovery ownership allocation")
+                })?;
             if report.computed_fields != 0 {
                 let mut owners = AttributeOwners::new(
                     &checked.modules[index].decoded.constants,
@@ -2000,6 +2040,7 @@ impl Engine {
                     activation = activation
                         .register_computed_field(&declaration)
                         .map_err(|error| computed_field_error(&report.module, error))?;
+                    module_computed_fields.push(declaration);
                 }
             }
             if report.match_patterns != 0 {
@@ -2319,6 +2360,7 @@ impl Engine {
             // Enumeration attributes, like parametric ones, can be set only in the
             // declaring module (Lean/Attributes.lean, registerEnumAttributes), so each
             // `macro_inline` row must name this module's own checked declaration.
+            let mut computed_inline = BTreeMap::new();
             if report.inline != 0 {
                 cancelled!("source-olean/inline-owner-index");
                 let mut owners = AttributeOwners::new(
@@ -2332,10 +2374,23 @@ impl Engine {
                     let row = inline.next().ok_or(SourceOleanImportError::Internal(
                         "inline attribute count changed during decode",
                     ))?;
+                    if !module_computed_fields.is_empty() {
+                        owners.validate(
+                            activation.environment(),
+                            &report.module,
+                            &row.declaration,
+                        )?;
+                        computed_inline.insert(row.declaration.clone(), row.kind);
+                    } else if row.kind == metadata::InlineKind::MacroInline {
+                        owners.validate(
+                            activation.environment(),
+                            &report.module,
+                            &row.declaration,
+                        )?;
+                    }
                     if row.kind != metadata::InlineKind::MacroInline {
                         continue;
                     }
-                    owners.validate(activation.environment(), &report.module, &row.declaration)?;
                     use fln_elab::macro_inline::MacroInlineError;
                     let reason = |error| match error {
                         MacroInlineError::Limit => "macro_inline journal limit",
@@ -2353,6 +2408,22 @@ impl Engine {
                                 reason: reason(error),
                             })?;
                 }
+            }
+            if !module_computed_fields.is_empty() {
+                cancelled!("source-olean/computed-field-recovery");
+                activation = match computed_fields::activate(
+                    activation,
+                    &report.module,
+                    &module_computed_fields,
+                    &computed_inline,
+                    limits.check.admission.kernel,
+                    &mut computed_work_left,
+                    &mut computed_families_left,
+                )? {
+                    Outcome::Complete(activation) => activation,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
             }
             // Parametric attributes export their complete journal in the private
             // part (Lean/Attributes.lean, registerParametricAttribute). Capture
@@ -2485,6 +2556,7 @@ impl Engine {
             || unbox.next().is_some()
             || never_extract.next().is_some()
             || computed_fields.next().is_some()
+            || computed_families_left != 0
             || match_patterns.next().is_some()
             || symms.next().is_some()
             || defeq.next().is_some()
@@ -2842,6 +2914,14 @@ trait Registrar: Sized {
         declaration: &Name,
         implementation: &Name,
     ) -> std::result::Result<Self, fln_elab::implemented_by::ImplementedByError>;
+    fn recover_computed_family(
+        self,
+        family: &Name,
+        fields: &[Name],
+        inline_fields: &[Name],
+        kernel: fln_kernel::verdict::Budget,
+        budget: fln_elab::records::RecordBudget,
+    ) -> std::result::Result<(Self, bool), fln_elab::computed_fields::ComputedFieldError>;
     fn register_macro_inline(
         self,
         declaration: &Name,
@@ -3017,6 +3097,16 @@ impl Registrar for instances::imported::ImportActivation {
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::macro_inline::MacroInlineError> {
         self.register_macro_inline(declaration)
+    }
+    fn recover_computed_family(
+        self,
+        family: &Name,
+        fields: &[Name],
+        inline_fields: &[Name],
+        kernel: fln_kernel::verdict::Budget,
+        budget: fln_elab::records::RecordBudget,
+    ) -> std::result::Result<(Self, bool), fln_elab::computed_fields::ComputedFieldError> {
+        self.recover_computed_family(family, fields, inline_fields, kernel, budget)
     }
     fn register_structures(
         self,
@@ -5079,6 +5169,27 @@ pub(super) mod tests {
             declaration: &Name,
         ) -> std::result::Result<Self, fln_elab::macro_inline::MacroInlineError> {
             fln_elab::macro_inline::register(&self.0, declaration).map(Sequential)
+        }
+        fn recover_computed_family(
+            self,
+            family: &Name,
+            fields: &[Name],
+            inline_fields: &[Name],
+            kernel: fln_kernel::verdict::Budget,
+            budget: fln_elab::records::RecordBudget,
+        ) -> std::result::Result<(Self, bool), fln_elab::computed_fields::ComputedFieldError>
+        {
+            match fln_elab::computed_fields::recover_imported(
+                &self.0,
+                family,
+                fields,
+                inline_fields,
+                kernel,
+                budget,
+            )? {
+                Some(env) => Ok((Sequential(env), true)),
+                None => Ok((self, false)),
+            }
         }
         fn register_structures(
             self,

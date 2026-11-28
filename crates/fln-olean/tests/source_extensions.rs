@@ -179,6 +179,14 @@ fn real_prelude_decodes_class_outputs_instance_order_and_defaults() {
     );
 }
 
+#[test]
+fn real_computed_field_tags_preserve_the_prelude_name_getter() {
+    use fln_olean::source_extensions::COMPUTED_FIELD_EXTENSION;
+    let decoded = read(blocks()).unwrap();
+    assert_eq!(decoded.computed_fields, vec![n("Lean.Name.hash")]);
+    assert!(!decoded.uninterpreted.contains(&n(COMPUTED_FIELD_EXTENSION)));
+}
+
 /// The pinned Reference reports 317 auxRecExt entries for Init.Prelude. Unlike
 /// the general isAuxRecursor query, the journal itself does not include Eq.ndrec:
 /// that declaration is one of the pin's three explicit legacy exceptions.

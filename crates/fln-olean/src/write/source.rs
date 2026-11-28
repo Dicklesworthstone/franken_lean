@@ -437,6 +437,57 @@ mod tests {
             ..SourceMetadata::default()
         }
     }
+    #[test]
+    fn computed_field_tags_roundtrip_and_refuse_duplicate_or_anonymous_names() {
+        let names: Vec<_> = ["Cache.total", "Other.hash", "Cache.second"]
+            .into_iter()
+            .map(|name| Name::from_components(name.split('.')))
+            .collect();
+        let encoded = encode_module_with_source_metadata(
+            input(),
+            &SourceMetadata {
+                computed_fields: names.clone(),
+                ..SourceMetadata::default()
+            },
+            header(),
+            WriteBudget::default(),
+        )
+        .unwrap();
+        let mut blocks = crate::region::OleanView::parse(&encoded.bytes)
+            .unwrap()
+            .extension_payloads(crate::region::WalkBudget::default(), 1024 * 1024)
+            .unwrap();
+        assert_eq!(blocks.len(), 1, "tag-only metadata must survive encoding");
+        assert_eq!(
+            blocks[0].name,
+            Name::from_components(layout::COMPUTED_FIELD_EXTENSION.split('.'))
+        );
+        let decoded = source_extensions::decode(&blocks, DecodeLimits::default()).unwrap();
+        let mut sorted = names.clone();
+        sorted.sort_by(Name::quick_cmp);
+        assert_eq!(decoded.computed_fields, sorted);
+        assert!(decoded.uninterpreted.is_empty());
+        for invalid in [
+            vec![Name::anonymous()],
+            vec![names[0].clone(), names[0].clone()],
+        ] {
+            assert!(matches!(
+                encode_module_with_source_metadata(
+                    input(),
+                    &SourceMetadata {
+                        computed_fields: invalid,
+                        ..SourceMetadata::default()
+                    },
+                    header(),
+                    WriteBudget::default(),
+                ),
+                Err(WriteError::Contract { .. })
+            ));
+        }
+        let duplicate = blocks[0].entries[0].clone();
+        blocks[0].entries.push(duplicate);
+        assert!(source_extensions::decode(&blocks, DecodeLimits::default()).is_err());
+    }
     /// Protected names round-trip, alone and beside classes, in `Name.quickLt`
     /// order whatever order they were supplied in; a repeat or an anonymous name
     /// is refused, never written.

@@ -23,16 +23,32 @@ use fln_kernel::{Declaration, InductiveBlock};
 use std::collections::HashSet;
 
 mod journal;
+mod recovery;
 pub mod tags;
 pub use journal::{
     ComputedFieldEntry, decode_entry, families, journal_name, register, register_projected,
     supports, validated_family,
 };
+pub use recovery::{RECOVERY_PHASES, recover_imported};
 
 /// Consumers can reserve this many `RecordBudget::max_nodes` units before a
 /// complete model validation. Each generation, metadata and comparison phase
 /// has its own explicit bound; exhaustion never means an absent model.
 pub const VALIDATION_PHASES: usize = 6;
+
+/// The pin removes the declaration prefix from a cache-slot binder. A shared
+/// spelling rule lets import recover a candidate order without treating that
+/// spelling as evidence that the generated representation is valid.
+fn cache_binder_name(field: &Name) -> Result<Name, ComputedFieldError> {
+    match field.leaf_view() {
+        LeafView::Anonymous => Err(ComputedFieldError::InvalidInventory),
+        LeafView::Str(value) => Ok(Name::str(Name::anonymous(), value)),
+        LeafView::Num(value) if field.component_overflowed() => {
+            Ok(Name::num_overflowing(Name::anonymous(), value))
+        }
+        LeafView::Num(value) => Ok(Name::num(Name::anonymous(), value)),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComputedFieldError {
@@ -404,14 +420,7 @@ impl<'a> Build<'a> {
                 // each cache binder. Keep the declaration's qualified name in
                 // the model, but preserve this short name in the generated
                 // constructor, recursor and replacement telescopes.
-                let binder = match field.name.leaf_view() {
-                    LeafView::Anonymous => return Err(ComputedFieldError::InvalidInventory),
-                    LeafView::Str(value) => Name::str(Name::anonymous(), value),
-                    LeafView::Num(value) if field.name.component_overflowed() => {
-                        Name::num_overflowing(Name::anonymous(), value)
-                    }
-                    LeafView::Num(value) => Name::num(Name::anonymous(), value),
-                };
+                let binder = cache_binder_name(&field.name)?;
                 self.local(binder, field.result_type.clone(), BinderInfo::Default)
             })
             .collect()
@@ -825,7 +834,6 @@ fn validate_inventory(
     let Declaration::Inductive(block) = implementation else {
         return Err(ComputedFieldError::InvalidInventory);
     };
-    let generated = replacements(env, family, fields, kernel, budget)?;
     let mut build = Build::new(env, kernel, budget);
     let mut model = profile(&mut build, family, fields)?;
     compare_block(&mut build, &block)?;
@@ -859,6 +867,10 @@ fn validate_inventory(
             return Err(ComputedFieldError::InvalidInventory);
         }
     }
+    // Imported membership can describe another compiler's representation.
+    // Reject a different telescope or eliminator before reducing its getters;
+    // only a matching checked representation needs equation regeneration.
+    let generated = replacements(env, family, fields, kernel, budget)?;
     for declaration in generated.declarations {
         let Declaration::Defn(definition) = declaration else {
             return Err(ComputedFieldError::InvalidInventory);

@@ -38,8 +38,8 @@ fn seed() -> Engine {
 /// theorem's signature, where the pin's `autoImplicit` binds an unknown identifier as
 /// a variable before applying it (its hint: "The identifier `add` is unknown"; with
 /// `set_option autoImplicit false` the pin reports `Unknown identifier `add`` there
-/// too). FrankenLean binds no auto-implicits, so all three are refused as the unknown
-/// identifier the pin finds.
+/// too). Header auto-binding does not turn that unconstrained variable into a
+/// function; body lookup still refuses the unknown identifier directly.
 const REFUSED: &[(&str, &str)] = &[
     (
         "open Nat\ndef u : Nat := add 1 2",
@@ -51,7 +51,7 @@ const REFUSED: &[(&str, &str)] = &[
     ),
     (
         "open Nat\ntheorem t : add 1 2 = 3 := by decide",
-        "Unknown identifier `add`",
+        "requires a function type",
     ),
 ];
 
