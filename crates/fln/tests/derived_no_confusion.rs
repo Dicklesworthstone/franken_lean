@@ -492,6 +492,70 @@ fn retained_prelude_no_confusion_family_is_identical() {
 }
 
 #[test]
+fn wide_recursive_family_matches_the_pin_with_default_generation_limits() {
+    let prelude = retained_prelude();
+    let ConstantInfo::Induct(inductive) = prelude.get(&name("Lean.ParserDescr")).unwrap() else {
+        panic!("ParserDescr inductive missing");
+    };
+    let ConstantInfo::Defn(cases_on) = prelude.get(&name("Lean.ParserDescr.casesOn")).unwrap()
+    else {
+        panic!("ParserDescr.casesOn missing");
+    };
+    let constructors: Vec<_> = inductive
+        .ctors
+        .iter()
+        .map(|constructor| match prelude.get(constructor).unwrap() {
+            ConstantInfo::Ctor(constructor) => constructor.clone(),
+            _ => panic!("expected constructor"),
+        })
+        .collect();
+    assert_eq!(constructors.len(), 13);
+    assert_eq!(
+        constructors
+            .iter()
+            .map(|constructor| constructor.num_fields)
+            .sum::<u32>(),
+        33
+    );
+    let generated = no_confusion_declarations(
+        inductive,
+        &constructors,
+        cases_on,
+        false,
+        RecordBudget::default(),
+        |name| prelude.get(name),
+    )
+    .expect("reusing constructor equality templates fits the ordinary generation limits")
+    .expect("ParserDescr has noConfusion");
+    for actual in [&generated.no_confusion_type, &generated.no_confusion] {
+        let Some(ConstantInfo::Defn(expected)) = prelude.get(&actual.base.name) else {
+            panic!("retained noConfusion declaration missing");
+        };
+        compare_def(actual, expected, false).unwrap();
+    }
+
+    // Reuse removes repeated construction work; neither exhausted resource
+    // dimension becomes a successful or partial candidate.
+    for budget in [
+        RecordBudget {
+            max_binders: 8,
+            ..RecordBudget::default()
+        },
+        RecordBudget {
+            max_nodes: 64,
+            ..RecordBudget::default()
+        },
+    ] {
+        assert_eq!(
+            no_confusion_declarations(inductive, &constructors, cases_on, false, budget, |name| {
+                prelude.get(name)
+            },),
+            Err(AuxiliaryError::ResourceLimit)
+        );
+    }
+}
+
+#[test]
 fn no_confusion_mutants_and_guards_are_killed() {
     let prelude = retained_prelude();
     let ConstantInfo::Induct(nat_ind) = prelude.get(&name("Nat")).unwrap() else {

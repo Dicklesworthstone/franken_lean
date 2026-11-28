@@ -521,22 +521,63 @@ where
     }
 }
 
-/// `NoConfusion.lean::mkNoConfusionCtorArg`, directly instantiated at concrete
-/// `(xs1_con, zs1_con, xs2_con, zs2_con)` while deciding `Eq` vs `HEq` on
-/// abstract parameter/field telescopes as the pin requires.
-#[allow(clippy::too_many_arguments)]
-fn mk_no_confusion_ctor_arg_beta<'a, F>(
+/// The field equalities of `mkNoConfusionCtorArg`, before applying either
+/// constructor telescope. Both generated declarations reuse these same
+/// abstract equality decisions. In particular, identifying the two concrete
+/// parameter lists later must not turn an abstract `HEq` into an `Eq`.
+struct CtorEqualityTemplate {
+    parameters: [Vec<LocalDecl>; 2],
+    fields: [Vec<LocalDecl>; 2],
+    equalities: Vec<(Name, Expr)>,
+}
+
+impl CtorEqualityTemplate {
+    fn instantiate(
+        &self,
+        work: &mut Builder,
+        p_expr: &Expr,
+        xs1: &[LocalDecl],
+        zs1: &[LocalDecl],
+        xs2: &[LocalDecl],
+        zs2: &[LocalDecl],
+    ) -> Result<Expr, AuxiliaryError> {
+        let groups = [
+            (self.parameters[0].as_slice(), xs1),
+            (self.fields[0].as_slice(), zs1),
+            (self.parameters[1].as_slice(), xs2),
+            (self.fields[1].as_slice(), zs2),
+        ];
+        let mut replacements = HashMap::new();
+        for (abstract_locals, concrete_locals) in groups {
+            if abstract_locals.len() != concrete_locals.len() {
+                return Err(AuxiliaryError::InvalidTelescope);
+            }
+            // Proof fields remain in this map even though they introduce no
+            // equality: later dependent field types may still refer to them.
+            for (abstract_local, concrete_local) in abstract_locals.iter().zip(concrete_locals) {
+                work.tick()?;
+                replacements.insert(abstract_local.id.clone(), fv(concrete_local));
+            }
+        }
+        let mut result = p_expr.clone();
+        for (name, domain) in self.equalities.iter().rev() {
+            work.tick()?;
+            result = Expr::forall_e(name.clone(), domain.clone(), result, BinderInfo::Default);
+        }
+        subst_fvars(work, &result, &replacements)
+    }
+}
+
+/// Open the two abstract constructor telescopes once per constructor, instead
+/// of repeating this work for `noConfusionType` and `noConfusion`. Equality
+/// domains depend on these checked constructor types and universe arguments,
+/// not on the eventual concrete fields or the return proposition `P`.
+fn ctor_equality_template<'a, F>(
     build: &mut Build,
-    outer_locals: &[LocalDecl],
     ctor: &ConstructorVal,
     us: &[Level],
-    p_expr: &Expr,
-    xs1_con: &[LocalDecl],
-    zs1_con: &[LocalDecl],
-    xs2_con: &[LocalDecl],
-    zs2_con: &[LocalDecl],
     lookup_const: &F,
-) -> Result<Expr, AuxiliaryError>
+) -> Result<CtorEqualityTemplate, AuxiliaryError>
 where
     F: Fn(&Name) -> Option<&'a ConstantInfo>,
 {
@@ -551,21 +592,13 @@ where
     let (xs2_abs, t2) = bounded_telescope(build, &ctor_ty, ctor.num_params as usize)?;
     let (fields2_abs, _) = forall_telescope_reducing(build, &t2, lookup_const)?;
 
-    if xs1_abs.len() != xs1_con.len()
-        || fields1_abs.len() != zs1_con.len()
-        || xs2_abs.len() != xs2_con.len()
-        || fields2_abs.len() != zs2_con.len()
-    {
-        return Err(AuxiliaryError::InvalidTelescope);
-    }
-
-    let mut abs_locals = outer_locals.to_vec();
+    let mut abs_locals = Vec::new();
     abs_locals.extend(xs1_abs.iter().cloned());
     abs_locals.extend(fields1_abs.iter().cloned());
     abs_locals.extend(xs2_abs.iter().cloned());
     abs_locals.extend(fields2_abs.iter().cloned());
 
-    let mut t = p_expr.clone();
+    let mut equalities = Vec::new();
     for (f1, f2) in fields1_abs.iter().rev().zip(fields2_abs.iter().rev()) {
         build.work.tick()?;
         let field_sort = infer_sort_level(build, &abs_locals, &f1.type_, lookup_const)?;
@@ -577,23 +610,14 @@ where
             Name::anonymous(),
             format!("{}_eq", f1.user_name.to_display_string()),
         );
-        t = Expr::forall_e(eq_name, eq_ty, t, BinderInfo::Default);
+        equalities.push((eq_name, eq_ty));
     }
-
-    let mut repl = HashMap::new();
-    for (a, c) in xs1_abs.iter().zip(xs1_con) {
-        repl.insert(a.id.clone(), fv(c));
-    }
-    for (a, c) in fields1_abs.iter().zip(zs1_con) {
-        repl.insert(a.id.clone(), fv(c));
-    }
-    for (a, c) in xs2_abs.iter().zip(xs2_con) {
-        repl.insert(a.id.clone(), fv(c));
-    }
-    for (a, c) in fields2_abs.iter().zip(zs2_con) {
-        repl.insert(a.id.clone(), fv(c));
-    }
-    subst_fvars(&mut build.work, &t, &repl)
+    equalities.reverse();
+    Ok(CtorEqualityTemplate {
+        parameters: [xs1_abs, xs2_abs],
+        fields: [fields1_abs, fields2_abs],
+        equalities,
+    })
 }
 
 /// Build the constant motive `fun ys => p_type` matching `motive_binder_domain`.
@@ -1003,6 +1027,10 @@ where
     let mut cases_v_levels = Vec::with_capacity(level_params.len());
     cases_v_levels.push(v.clone());
     cases_v_levels.extend(us.iter().cloned());
+    let ctor_equalities: Vec<_> = constructors
+        .iter()
+        .map(|ctor| ctor_equality_template(&mut build, ctor, &us, &lookup_const))
+        .collect::<Result<_, _>>()?;
 
     let use_linear = constructors.len() > 2
         && lookup_const(&Name::str(family.clone(), "ctorElim")).is_some()
@@ -1095,17 +1123,13 @@ where
                 return Err(AuxiliaryError::InvalidTelescope);
             };
             let (zs2, _) = forall_telescope_reducing(&mut build, alt2_dom, &lookup_const)?;
-            let k = mk_no_confusion_ctor_arg_beta(
-                &mut build,
-                &then_locals,
-                &constructors[i],
-                &us,
+            let k = ctor_equalities[i].instantiate(
+                &mut build.work,
                 &fv(&p_local),
                 &xs1,
                 &zs1,
                 &xs2,
                 &zs2,
-                &lookup_const,
             )?;
             let k_arrow_p = Expr::forall_e(Name::anonymous(), k, fv(&p_local), BinderInfo::Default);
             let inner_alt = build.close(&zs2, k_arrow_p, true)?;
@@ -1135,17 +1159,13 @@ where
             for (j, alt_type2) in alt_types2.iter().enumerate() {
                 let (zs2, _) = forall_telescope_plain(&mut build, alt_type2)?;
                 let body2 = if i == j {
-                    let k = mk_no_confusion_ctor_arg_beta(
-                        &mut build,
-                        &branch_locals,
-                        &constructors[i],
-                        &us,
+                    let k = ctor_equalities[i].instantiate(
+                        &mut build.work,
                         &fv(&p_local),
                         &xs1,
                         &zs1,
                         &xs2,
                         &zs2,
-                        &lookup_const,
                     )?;
                     Expr::forall_e(Name::anonymous(), k, fv(&p_local), BinderInfo::Default)
                 } else {
@@ -1239,7 +1259,7 @@ where
 
     let params1_fvs: Vec<Expr> = params1.iter().map(fv).collect();
     let mut nc_alts = Vec::with_capacity(num_ctors);
-    for ctor in constructors {
+    for (ctor, equalities) in constructors.iter().zip(&ctor_equalities) {
         let ctor_ty_u = subst_expr_level_params(
             &mut build.work,
             &ctor.base.type_,
@@ -1248,20 +1268,8 @@ where
         )?;
         let ctor_ty_inst = instantiate_forall(&mut build.work, &ctor_ty_u, &params1_fvs)?;
         let (fs1, _) = forall_telescope_reducing(&mut build, &ctor_ty_inst, &lookup_with_nct)?;
-        let mut alt_locals = nc_base_locals.clone();
-        alt_locals.extend(fs1.iter().cloned());
-        let k_type = mk_no_confusion_ctor_arg_beta(
-            &mut build,
-            &alt_locals,
-            ctor,
-            &us,
-            &fv(&p_nc),
-            params1,
-            &fs1,
-            params1,
-            &fs1,
-            &lookup_with_nct,
-        )?;
+        let k_type =
+            equalities.instantiate(&mut build.work, &fv(&p_nc), params1, &fs1, params1, &fs1)?;
         let k_local = build.local(
             Name::from_components(["k"]),
             k_type.clone(),
