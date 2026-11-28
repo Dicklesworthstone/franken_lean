@@ -745,6 +745,9 @@ struct Context {
     // Separate private module world retained for `private_decl%` inside exposed
     // public declarations (`Lean/Elab/BuiltinTerm.lean:465-482`).
     private_decl_world: Option<(Environment, SourceScope)>,
+    // An exported data header may deny accidental auto-binding of an existing
+    // private name without enabling private lookup or `private_decl%` bodies.
+    auto_bound_private_names: Option<Environment>,
     // A public deriving command resolves and checks in the exported world,
     // while fresh generated names must also avoid its private predecessor.
     // This snapshot is consulted only by name generation.
@@ -1032,6 +1035,7 @@ impl Context {
             unnamed_fields: std::collections::HashSet::new(),
             private_proof_body: None,
             private_decl_world: None,
+            auto_bound_private_names: None,
             generated_name_environment: None,
             public_theorem_signature: None,
             private_definition_body: false,
@@ -7580,7 +7584,11 @@ impl Context {
         if !self.source_scope.exports_declaration() {
             return Ok(false);
         }
-        let Some((environment, _)) = self.private_decl_world.as_ref() else {
+        let Some(environment) = self.auto_bound_private_names.as_ref().or_else(|| {
+            self.private_decl_world
+                .as_ref()
+                .map(|(environment, _)| environment)
+        }) else {
             return Ok(false);
         };
         let environment = environment.clone();
@@ -7594,6 +7602,7 @@ impl Context {
                     .len(),
             )
             .saturating_add(1)
+            .saturating_mul(self.source_scope.import_all_modules.len().saturating_add(1))
         {
             self.tick()?;
         }
@@ -9699,7 +9708,7 @@ pub use inductive::{
 /// A source record/class expands to a block and projections, not one definition.
 /// These are untrusted candidates. The caller must admit the whole sequence
 /// before registering the class or exposing any successor.
-pub use record::{SourceRecord, elaborate_record, is_record};
+pub use record::{SourceRecord, elaborate_record, elaborate_record_with_private_names, is_record};
 
 #[cfg(test)]
 mod conversion_tests;

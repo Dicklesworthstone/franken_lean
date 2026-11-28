@@ -11,6 +11,7 @@ pub(crate) use equation_theorems::{may_name_equation_theorems, push_command_admi
 mod library;
 mod local_functions;
 mod public_body;
+mod record_members;
 mod simp;
 pub(crate) mod traces;
 pub use local_functions::SourceDeclarationAdmission;
@@ -535,6 +536,17 @@ impl Engine {
         let mut private_scope = private_scope.clone();
         private_scope.computability = self.computability_provider();
         let private_scope = &private_scope;
+        if let ScopedCommandSyntax::Definition(parsed) = &parsed
+            && fln_elab::source::is_record(parsed.syntax())
+        {
+            return self.admit_public_source_record(
+                public,
+                parsed.syntax(),
+                options,
+                limits,
+                public_scope,
+            );
+        }
         // Computed getters have hidden logical bodies in a public section,
         // while their cached representation and executable overrides remain
         // exported. The complete pair must be staged before either is visible.
@@ -1513,7 +1525,7 @@ impl Engine {
                 },
             );
         }
-        let mut record = match elaboration_outcome(fln_elab::source::scope::elaborate_record(
+        let record = match elaboration_outcome(fln_elab::source::scope::elaborate_record(
             syntax,
             self.environment(),
             limits.kernel,
@@ -1524,192 +1536,7 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let mut result = self
-            .admit_declarations(&record.declarations, options, limits)
-            .map_err(EngineExecutionError::from)?;
-        if let Outcome::Complete(batch) = &result {
-            // The pin emits proof projections as theorems, not definitions
-            // (Lean/Meta/Structure.lean:99–116). Ask K1 under its supplied budget
-            // against each projection's exact, already checked predecessor;
-            // the actual declaration name is still fresh in that environment.
-            // Defaults and flat constructors remain ordinary definitions even
-            // when they return proofs; consumers must instantiate their bodies.
-            let mut predecessor = self;
-            let mut proof_projection = false;
-            for (index, admission) in batch.admissions.iter().enumerate() {
-                if let Declaration::Defn(definition) = &admission.declaration
-                    && definition.base.name != record.flat_constructor
-                    && !record.default_helpers.contains(&definition.base.name)
-                {
-                    let theorem = Declaration::Thm(TheoremVal {
-                        base: definition.base.clone(),
-                        value: definition.value.clone(),
-                        all: definition.all.clone(),
-                    });
-                    match fln_kernel::check(predecessor.environment(), &theorem, limits.kernel) {
-                        Outcome::Complete(Verdict::Accepted { .. }) => {
-                            record.declarations[index] = theorem;
-                            proof_projection = true;
-                        }
-                        Outcome::Complete(Verdict::Rejected {
-                            class: RejectClass::TheoremNotProp,
-                            ..
-                        }) => {}
-                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                        other => {
-                            return Err(EngineExecutionError::Frontend(
-                                DefinitionFrontendError::Elaborate(
-                                    fln_elab::NatDefinitionElabError::Inference(
-                                        fln_elab::source::SourceInferenceError::TypeObligation(
-                                            Box::new(other),
-                                        ),
-                                    ),
-                                ),
-                            ));
-                        }
-                    }
-                }
-                predecessor = &admission.engine;
-            }
-            if proof_projection {
-                // The classification probe grants no publication authority.
-                // Recheck the corrected batch from the original predecessor so
-                // both checkers certify every final declaration's actual kind.
-                result = self
-                    .admit_declarations(&record.declarations, options, limits)
-                    .map_err(EngineExecutionError::from)?;
-            }
-        }
-        // Complete the declaration stream before adding any record journals,
-        // so adjacent council receipts retain their exact predecessor roots.
-        let result = self.finish_source_inductive_auxiliaries(
-            result,
-            options,
-            limits,
-            scope,
-            record.is_class,
-        )?;
-        let result = match result {
-            Outcome::Complete(mut batch) => {
-                // Projection hints and reducibility status are different facts.
-                // Non-class data projections are reducible, class fields remain
-                // semireducible, and parent instances are implicitReducible.
-                // Default helpers remain semireducible despite Abbrev hints
-                // (Lean/Elab/Structure.lean:1363–1386).
-                for declaration in &record.declarations {
-                    let Declaration::Defn(definition) = declaration else {
-                        continue;
-                    };
-                    let status = if record.parent_instances.contains(&definition.base.name) {
-                        fln_elab::reducibility::Reducibility::ImplicitReducible
-                    } else if definition.base.name == record.flat_constructor {
-                        fln_elab::reducibility::Reducibility::Reducible
-                    } else if record.is_class
-                        || record.default_helpers.contains(&definition.base.name)
-                    {
-                        fln_elab::reducibility::Reducibility::Semireducible
-                    } else {
-                        fln_elab::reducibility::Reducibility::Reducible
-                    };
-                    let registered =
-                        if status == fln_elab::reducibility::Reducibility::Semireducible {
-                            fln_elab::reducibility::register_default(
-                                batch.engine.environment(),
-                                &definition.base.name,
-                            )
-                        } else {
-                            fln_elab::reducibility::register(
-                                batch.engine.environment(),
-                                &definition.base.name,
-                                status,
-                            )
-                        };
-                    batch.engine.environment = registered.map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::Unification(Box::new(
-                                    fln_elab::constraint::unify::UnificationError::Reducibility(
-                                        error,
-                                    ),
-                                )),
-                            ),
-                        ))
-                    })?;
-                }
-                batch.engine.environment = fln_elab::records::defaults::register_defaults(
-                    batch.engine.environment(),
-                    &record.defaults,
-                )
-                .map_err(|error| {
-                    EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                        fln_elab::NatDefinitionElabError::Inference(
-                            fln_elab::source::SourceInferenceError::Record(error),
-                        ),
-                    ))
-                })?;
-                batch.engine.environment = fln_elab::records::imported::register(
-                    batch.engine.environment(),
-                    std::slice::from_ref(&record.structure),
-                )
-                .map_err(|error| {
-                    EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                        fln_elab::NatDefinitionElabError::Inference(
-                            fln_elab::source::SourceInferenceError::Record(error),
-                        ),
-                    ))
-                })?;
-                if record.is_class {
-                    batch.engine.environment = fln_elab::instances::register_class(
-                        batch.engine.environment(),
-                        &record.name,
-                    )
-                    .map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::InstanceRegistry(error),
-                            ),
-                        ))
-                    })?;
-                }
-                for parent in &record.parent_instances {
-                    batch.engine = match batch.engine.register_checked_source_instance(
-                        parent,
-                        1000,
-                        None,
-                        false,
-                        limits.kernel,
-                    )? {
-                        Outcome::Complete(engine) => engine,
-                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                    };
-                }
-                if !record.protected_projections.is_empty() {
-                    batch.engine.environment = fln_elab::protected_names::register_module(
-                        batch.engine.environment(),
-                        &record.protected_projections,
-                    )
-                    .map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::ProtectedJournal(error),
-                            ),
-                        ))
-                    })?;
-                }
-                batch.result_logical_root = batch.engine.logical_root(options);
-                Outcome::Complete(batch)
-            }
-            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
-            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
-        };
-        let result = self.finish_source_data_attributes(
-            result,
-            std::slice::from_ref(syntax),
-            options,
-            scope,
-        )?;
+        let result = self.admit_prepared_source_record(syntax, record, options, limits, scope)?;
         self.finish_source_deriving(result, deriving.as_ref(), options, limits, scope)
     }
 

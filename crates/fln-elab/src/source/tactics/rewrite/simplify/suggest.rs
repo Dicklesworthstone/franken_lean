@@ -2482,6 +2482,20 @@ impl Context {
                 if self.simulated_names_local(&candidate, goal)? {
                     continue;
                 }
+                for _ in 0..self
+                    .source_scope
+                    .opened
+                    .len()
+                    .saturating_add(
+                        scope::components(&self.source_scope.namespace)
+                            .map_err(|error| failure(SourceInferenceError::NameScope(error)))?
+                            .len(),
+                    )
+                    .saturating_add(1)
+                    .saturating_mul(self.source_scope.import_all_modules.len().saturating_add(1))
+                {
+                    self.tick()?;
+                }
                 let resolved = self.source_scope.resolve_with_aliases(
                     &candidate,
                     |declaration| self.txn.env.contains(declaration),

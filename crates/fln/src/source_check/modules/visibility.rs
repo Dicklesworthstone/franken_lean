@@ -7,8 +7,10 @@ use crate::source_records::ScopedCommandSyntax;
 
 mod deriving;
 
-/// This receipt is private to the source module driver. Its public engine never
-/// contains a private dependency or a module-local private declaration.
+/// This receipt is private to the source module driver. Public source interfaces
+/// are checked against the exported predecessor. A private-named constructor
+/// may remain in an exported inductive's kernel family; its presence grants no
+/// source access and does not expose private projections or helper bodies.
 pub(crate) struct PublicWorld<'a> {
     module: Name,
     initial: Environment,
@@ -600,7 +602,7 @@ impl<'a> PublicWorld<'a> {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         }
         let engine = if staged.metadata_complete {
-            // Computed families validate and register their complete metadata
+            // Paired families validate and register their complete metadata
             // separately in both worlds. Replaying that suffix would duplicate
             // noncomputable/auxiliary tags. Both successors already descend from
             // the staged equation predecessors above.

@@ -372,15 +372,45 @@ pub fn record_declarations_with_constructor(
     if spec.name.is_anonymous() || constructor_name.is_anonymous() {
         return Err(RecordError::InvalidName);
     }
-    let ctor = spec.name.append_core(constructor_name);
+    if spec.parameters.len().saturating_add(spec.fields.len()) > budget.max_binders
+        || spec.level_params.len() > budget.max_binders
+    {
+        return Err(RecordError::ResourceLimit);
+    }
+    let projections: Vec<_> = spec
+        .fields
+        .iter()
+        .map(|field| spec.name.append_core(&field.user_name))
+        .collect();
+    record_declarations_with_member_names(
+        spec,
+        &spec.name.append_core(constructor_name),
+        &projections,
+        budget,
+    )
+}
+
+/// Source visibility can give a constructor or projection a private name outside
+/// the family's namespace. These identities affect only generated candidates;
+/// the complete block and every projection still require ordinary admission.
+pub(crate) fn record_declarations_with_member_names(
+    spec: &RecordSpec,
+    constructor_name: &Name,
+    projection_names: &[Name],
+    budget: RecordBudget,
+) -> Result<Vec<Declaration>, RecordError> {
+    let ctor = constructor_name.clone();
     let rec = Name::str(spec.name.clone(), "rec");
-    if ctor == rec {
+    if spec.name.is_anonymous() || ctor.is_anonymous() || ctor == spec.name || ctor == rec {
         return Err(RecordError::InvalidName);
     }
     if spec.parameters.len().saturating_add(spec.fields.len()) > budget.max_binders
         || spec.level_params.len() > budget.max_binders
     {
         return Err(RecordError::ResourceLimit);
+    }
+    if projection_names.len() != spec.fields.len() {
+        return Err(RecordError::InvalidTelescope);
     }
     let proposition = spec.result_level.normalize_fixpoint().is_zero();
     if spec.result_level.has_mvar() || (!proposition && !spec.result_level.is_never_zero()) {
@@ -391,6 +421,13 @@ pub fn record_declarations_with_constructor(
     };
     let mut used = HashSet::new();
     let mut labels = HashSet::new();
+    let mut members = HashSet::from([spec.name.clone(), ctor.clone(), rec.clone()]);
+    for name in projection_names {
+        builder.tick()?;
+        if name.is_anonymous() || !members.insert(name.clone()) {
+            return Err(RecordError::InvalidName);
+        }
+    }
     for local in spec.parameters.iter().chain(&spec.fields) {
         builder.tick()?;
         if local.is_let() || used.contains(&local.id) {
@@ -403,11 +440,7 @@ pub fn record_declarations_with_constructor(
         let LeafView::Str(label) = field.user_name.leaf_view() else {
             return Err(RecordError::InvalidName);
         };
-        if !field.user_name.parent().is_anonymous()
-            || label.is_empty()
-            || spec.name.append_core(&field.user_name) == ctor
-            || label == "rec"
-        {
+        if !field.user_name.parent().is_anonymous() || label.is_empty() {
             return Err(RecordError::InvalidName);
         }
         if !labels.insert(field.user_name.clone()) {
@@ -455,8 +488,28 @@ pub fn record_declarations_with_constructor(
         false,
     )?;
     let mut minor = fresh(&mut used, "mk", minor_type, BinderInfo::Default);
-    // kernel/inductive.cpp uses the complete suffix after the family name.
-    minor.user_name = constructor_name.clone();
+    // kernel/inductive.cpp replaces a matching family prefix with anonymous.
+    // A private constructor of a public family has no such prefix.
+    let mut suffix = Vec::new();
+    let mut cursor = ctor.clone();
+    while !cursor.is_anonymous() && cursor != spec.name {
+        builder.tick()?;
+        suffix.push(cursor.clone());
+        cursor = cursor.parent();
+    }
+    minor.user_name = if cursor == spec.name {
+        let mut name = Name::anonymous();
+        for part in suffix.into_iter().rev() {
+            name = match part.leaf_view() {
+                LeafView::Str(component) => Name::str(name, component),
+                LeafView::Num(component) => Name::num(name, component),
+                LeafView::Anonymous => return Err(RecordError::InvalidName),
+            };
+        }
+        name
+    } else {
+        ctor.clone()
+    };
     let rec_type = builder.close(
         std::slice::from_ref(&major),
         Expr::app(fv(&motive), fv(&major)),
@@ -550,12 +603,11 @@ pub fn record_declarations_with_constructor(
         // of the same receiver. Raw Expr::proj belongs in the projection body:
         // putting it here loses the named type expression that instance
         // synthesis must preserve (for example, OfNat package.carrier).
-        for prior_field in &spec.fields[..index] {
+        for (prior_field, projection_name) in
+            spec.fields[..index].iter().zip(&projection_names[..index])
+        {
             builder.tick()?;
-            let mut projection = Expr::const_(
-                spec.name.append_core(&prior_field.user_name),
-                levels.clone(),
-            );
+            let mut projection = Expr::const_(projection_name.clone(), levels.clone());
             for parameter in &spec.parameters {
                 builder.tick()?;
                 projection = Expr::app(projection, fv(parameter));
@@ -577,7 +629,7 @@ pub fn record_declarations_with_constructor(
         // mkProjections' lambda uses the reset local telescope; inferImplicit
         // changes the declaration type only, not the value's binder metadata.
         let value = builder.close(&projection_parameters, value, true, false)?;
-        let name = spec.name.append_core(&field.user_name);
+        let name = projection_names[index].clone();
         let base = ConstantVal {
             name: name.clone(),
             level_params: spec.level_params.clone(),

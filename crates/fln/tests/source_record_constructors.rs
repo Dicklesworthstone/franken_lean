@@ -516,18 +516,54 @@ fn invalid_constructor_names_and_uses_do_not_publish_partial_records() {
 }
 
 #[test]
-fn unsupported_constructor_visibility_is_a_capability_stop() {
+fn private_constructor_visibility_is_supported_without_accepting_parameter_overrides() {
     let base = engine();
     let root = base.logical_root(&KVMap::new());
-    let source = "structure Hidden where\n  private create ::\n  value : Nat\n";
-    let error = base
-        .check_source_files(
-            &[source.as_bytes()],
+    let module = name("Main");
+    let source = "prelude\nstructure Hidden where\n  private create ::\n  value : Nat\n\
+        def selected : Hidden := Hidden.create 17\n\
+        theorem selectedValue : Eq selected.value 17 := rfl\n";
+    let checked = base
+        .check_source_modules(
+            &[SourceModuleInput {
+                name: &module,
+                source: source.as_bytes(),
+            }],
+            &module,
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let private_constructor =
+        Name::num(name("_private.Main"), 0).append_core(&name("Hidden.create"));
+    assert!(matches!(
+        checked
+            .checked
+            .engine
+            .environment()
+            .find(&private_constructor),
+        Some(ConstantInfo::Ctor(_))
+    ));
+    assert!(
+        !checked
+            .checked
+            .engine
+            .environment()
+            .contains(&name("Hidden.create"))
+    );
+    // Changing constructor parameter binder styles is a distinct unsupported
+    // feature; implementing visibility must not silently discard the override.
+    let unsupported = "structure Override (A : Type) where\n  create {A} ::\n  value : A\n";
+    assert!(
+        base.check_source_files(
+            &[unsupported.as_bytes()],
             &KVMap::new(),
             SourceCheckLimits::new(limits()),
         )
-        .expect_err(source);
-    assert_eq!(error.disposition(), ("capability", false, 5), "{error:?}");
+        .is_err()
+    );
     assert!(!base.environment().contains(&name("Hidden")));
     assert_eq!(base.logical_root(&KVMap::new()), root);
 }
@@ -556,12 +592,6 @@ fn constructor_visibility_and_name_checks_distinguish_authored_private_from_modu
                 "prelude\n{compiler_markers}private structure TwiceProtected where\n  protected build ::\n  value : Type\n"
             ),
             false,
-        ),
-        (
-            format!(
-                "module\nprelude\npublic section\n{compiler_markers}end\nstructure Hidden where\n  private create ::\n  value : Type\n"
-            ),
-            true,
         ),
     ] {
         let error = base
@@ -614,6 +644,31 @@ fn constructor_visibility_and_name_checks_distinguish_authored_private_from_modu
     assert!(
         protected.contains(&ctor_name),
         "module-default structure protected constructor must be recorded in ProtectedNames"
+    );
+    let module_private = module_protected.replace("protected create", "private create");
+    let private = base
+        .check_source_modules(
+            &[SourceModuleInput {
+                name: &module,
+                source: module_private.as_bytes(),
+            }],
+            &module,
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(matches!(
+        private.checked.engine.environment().find(&ctor_name),
+        Some(ConstantInfo::Ctor(_))
+    ));
+    assert!(
+        !private
+            .checked
+            .engine
+            .environment()
+            .contains(&name("Hidden.create"))
     );
 }
 

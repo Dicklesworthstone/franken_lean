@@ -3,6 +3,7 @@
 //! constructor telescope so later field types see the actual earlier values.
 use super::*;
 use crate::records::RecordBudget;
+use crate::records::imported::ImportedStructures;
 use crate::records::inheritance::{RecordParents, direct_fields};
 use fln_core::name::LeafView;
 use fln_env::constants::ConstantInfo;
@@ -1382,7 +1383,12 @@ impl Context {
             let mut lookup = self.source_scope.clone();
             lookup.namespace = Name::anonymous();
             let method = lookup.user_name(&method);
-            for _ in 0..=lookup.opened.len() {
+            for _ in 0..lookup
+                .opened
+                .len()
+                .saturating_add(1)
+                .saturating_mul(lookup.import_all_modules.len().saturating_add(1))
+            {
                 self.tick()?;
             }
             let aliases = self
@@ -1395,11 +1401,12 @@ impl Context {
                 .map_err(|_| failure(SourceInferenceError::Scope))?;
             match lookup.resolve_with_aliases(
                 &method,
-                |name| self.txn.env.contains(name),
+                |name| self.txn.env.contains(name) && self.private_member_accessible(name),
                 &aliases,
                 &protected,
             ) {
                 Ok(Some(method)) => {
+                    self.require_private_member_access(&method)?;
                     self.note_deprecated(&method, span)?;
                     return Ok(FieldResolution::Method {
                         function: self.constant(&method)?,
@@ -1512,8 +1519,28 @@ impl Context {
         receiver: Typed,
         field: &Name,
     ) -> Result<Typed, NatDefinitionElabError> {
+        self.record_field_with_access(receiver, field, true)
+    }
+
+    /// Record construction and patterns already check their constructor's
+    /// visibility. Their inserted projections copy fields without naming a
+    /// source-visible getter, as the pin's `mkProjection` does for update sources.
+    pub(super) fn record_field_from_record(
+        &mut self,
+        receiver: Typed,
+        field: &Name,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        self.record_field_with_access(receiver, field, false)
+    }
+
+    fn record_field_with_access(
+        &mut self,
+        receiver: Typed,
+        field: &Name,
+        check_access: bool,
+    ) -> Result<Typed, NatDefinitionElabError> {
         let receiver = self.insert_implicits(receiver, ImplicitInsertion::FieldReceiver)?;
-        match self.physical_record_field(receiver.clone(), field) {
+        match self.physical_record_field(receiver.clone(), field, check_access) {
             Err(NatDefinitionElabError::Inference(SourceInferenceError::RecordTerm(
                 RecordTermError::UnknownField(_),
             ))) => {}
@@ -1545,7 +1572,7 @@ impl Context {
             let (label, _) = fields
                 .get(index as usize)
                 .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-            receiver = self.physical_record_field(receiver, label)?;
+            receiver = self.physical_record_field(receiver, label, check_access)?;
         }
         Ok(receiver)
     }
@@ -1554,6 +1581,7 @@ impl Context {
         &mut self,
         receiver: Typed,
         field: &Name,
+        check_access: bool,
     ) -> Result<Typed, NatDefinitionElabError> {
         // Field access opens ordinary implicit/instance arguments, but is not
         // an explicit argument that would trigger strict-implicit insertion.
@@ -1610,7 +1638,24 @@ impl Context {
         if !found {
             return Err(error(RecordTermError::UnknownField(field.clone())));
         }
-        let projection_name = name.append_core(field);
+        let structures = ImportedStructures::read(&self.txn.env)
+            .map_err(|problem| failure(SourceInferenceError::Record(problem)))?;
+        let projection_name = if let Some(structure) = structures.get(name) {
+            let mut projection = None;
+            for entry in &structure.fields {
+                self.tick()?;
+                if &entry.name == field {
+                    projection = Some(entry.projection.clone());
+                    break;
+                }
+            }
+            projection.ok_or_else(|| error(RecordTermError::UnknownField(field.clone())))?
+        } else {
+            name.append_core(field)
+        };
+        if check_access {
+            self.require_private_member_access(&projection_name)?;
+        }
         let projection = match self.txn.env.find(&projection_name).cloned() {
             Some(ConstantInfo::Defn(projection)) if projection.safety == DefinitionSafety::Safe => {
                 projection.base
@@ -1841,6 +1886,7 @@ impl Context {
         if ctor.is_unsafe || ctor.induct != *name || ctor.num_params != family.num_params {
             return Err(error(RecordTermError::ExpectedRecordType));
         }
+        self.require_private_member_access(&ctor.base.name)?;
         let mut constructor = Typed {
             value: Expr::const_(ctor.base.name.clone(), levels.clone()),
             type_: self.instantiate_params(&ctor.base.type_, &ctor.base.level_params, levels)?,
@@ -2229,7 +2275,7 @@ impl Context {
             // Copied fields remain real constructor arguments; K1 checks any
             // dependency invalidated by a preceding explicit replacement.
             for source in &state.sources {
-                match self.record_field(source.clone(), binder_name) {
+                match self.record_field_from_record(source.clone(), binder_name) {
                     Ok(value) => {
                         let value = self.finish_term(value, Some(binder_type))?;
                         return Ok(RecordStep::Copy {

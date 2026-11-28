@@ -593,7 +593,7 @@ impl ImportedStructures {
         Ok(registry)
     }
 
-    fn read_all(env: &Environment) -> Result<Self, RecordError> {
+    pub(super) fn read_all(env: &Environment) -> Result<Self, RecordError> {
         let Some(extension) = env.extension(&extension_name()) else {
             return Ok(Self::default());
         };

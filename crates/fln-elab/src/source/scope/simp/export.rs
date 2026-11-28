@@ -37,6 +37,25 @@ pub fn persistent_source_entry(env: &Environment, payload: &[u8]) -> Result<bool
     }
 }
 
+/// Select a checked journal row for a module's public declaration view. This
+/// does not validate or install the row: the complete implementation must
+/// already have admitted its proof, and ordinary journal validation still runs
+/// against that checked implementation. An unavailable proof is never exported
+/// merely because its public owner has a visible signature.
+pub fn source_entry_visible(env: &Environment, payload: &[u8]) -> Result<bool, SimpSetError> {
+    Ok(match decode_entry(payload, 0)? {
+        JournalEntry::Add { entry, .. } => {
+            env.contains(&entry.declaration)
+                && entry.proof.as_ref().is_none_or(|proof| env.contains(proof))
+        }
+        JournalEntry::UnfoldTheorems {
+            declaration,
+            theorems,
+        } => env.contains(&declaration) && theorems.iter().all(|name| env.contains(name)),
+        JournalEntry::Erase(declaration) => env.contains(&declaration),
+    })
+}
+
 /// Omit local `[-simp]` erasures from a completed source module's suffix before
 /// downstream source modules import `result`.
 pub fn export_source_module(

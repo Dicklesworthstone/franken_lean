@@ -4,6 +4,7 @@
 //! from candidate construction and only refers to already admitted definitions.
 //! This schema is native, not the Reference structure-extension serialization.
 use super::RecordError;
+use super::imported::ImportedStructures;
 use crate::instances::{InstanceRegistryError, read_name, write_name};
 use fln_core::expr::{Expr, ExprNode};
 use fln_core::name::Name;
@@ -114,6 +115,8 @@ fn validate(
     env: &Environment,
     row: &RecordDefault,
     remaining: &mut usize,
+    metadata_env: &Environment,
+    structures: &mut Option<ImportedStructures>,
 ) -> Result<(), RecordError> {
     let Some(ConstantInfo::Induct(family)) = env.find(&row.record) else {
         return Err(RecordError::InvalidTelescope);
@@ -175,7 +178,25 @@ fn validate(
     if row.helper != helper_name(&row.record, binder_name)
         && row.helper != inherited_helper_name(&row.record, binder_name)
     {
-        return Err(RecordError::InvalidName);
+        // A private projection has a separate actual identity. A suffix is not
+        // enough to authorize its helper: bind it to the independently checked
+        // structure row, including its physical constructor-field position.
+        // Decode the complete metadata once, including rows whose declarations
+        // are hidden by the current public projection of the environment.
+        if structures.is_none() {
+            *structures = Some(ImportedStructures::read_all(metadata_env)?);
+        }
+        let field = structures
+            .as_ref()
+            .and_then(|structures| structures.get(&row.record))
+            .and_then(|record| record.fields.get(row.field as usize))
+            .filter(|field| &field.name == binder_name)
+            .ok_or(RecordError::InvalidName)?;
+        if row.helper != Name::str(field.projection.clone(), "_default")
+            && row.helper != Name::str(field.projection.clone(), "_fln_inherited_default")
+        {
+            return Err(RecordError::InvalidName);
+        }
     }
     let mut expected = binder_type.clone();
     for (name, domain, style) in prefix.into_iter().rev() {
@@ -204,6 +225,7 @@ impl RecordDefaults {
         let mut remaining = MAX_NODES;
         let mut bytes_left = MAX_BYTES;
         let mut registry = Self::default();
+        let mut structures = None;
         for (entry, validation) in env.metadata_validation_entries(&extension_name()) {
             if entry.payload.len() > MAX_PAYLOAD {
                 return Err(RecordError::ResourceLimit);
@@ -230,7 +252,7 @@ impl RecordDefaults {
                 field,
                 helper,
             };
-            validate(validation, &row, &mut remaining)?;
+            validate(validation, &row, &mut remaining, env, &mut structures)?;
             if registry
                 .helpers
                 .insert((row.record, row.field), row.helper)
@@ -274,8 +296,9 @@ pub fn register_defaults(
         }
     }
     let mut payloads = Vec::new();
+    let mut structures = None;
     for row in rows {
-        validate(env, row, &mut remaining)?;
+        validate(env, row, &mut remaining, env, &mut structures)?;
         if registry
             .helpers
             .insert((row.record.clone(), row.field), row.helper.clone())

@@ -298,7 +298,7 @@ impl Context {
                         break;
                     }
                     if field.subobject.is_some() {
-                        let parent = self.record_field(current.clone(), &field.name)?;
+                        let parent = self.record_field_from_record(current.clone(), &field.name)?;
                         pending.push_back((parent, next));
                     }
                 }
@@ -311,7 +311,7 @@ impl Context {
             })?;
             result.extend(path);
             if position + 1 < components.len() {
-                receiver = self.record_field(owner, &field)?;
+                receiver = self.record_field_from_record(owner, &field)?;
             }
         }
         if result.is_empty() {
@@ -361,6 +361,14 @@ impl Context {
     ) -> Result<Vec<Vec<Name>>, NatDefinitionElabError> {
         let structures = ImportedStructures::read(&self.txn.env).map_err(metadata_error)?;
         let family = self.pattern_record_family(&receiver)?;
+        let Some(ConstantInfo::Induct(info)) = self.txn.env.find(&family) else {
+            return Err(invalid());
+        };
+        let [constructor] = info.ctors.as_slice() else {
+            return Err(invalid());
+        };
+        let constructor = constructor.clone();
+        self.require_private_member_access(&constructor)?;
         if structures.get(&family).is_none() {
             return Err(field_error(
                 record_terms::RecordTermError::ExpectedRecordType,
@@ -404,7 +412,7 @@ impl Context {
                         continue;
                     }
                     if field.subobject.is_some() || nested {
-                        let child = self.record_field(current.clone(), &field.name)?;
+                        let child = self.record_field_from_record(current.clone(), &field.name)?;
                         pending.push((child, path));
                     } else {
                         return Err(field_error(record_terms::RecordTermError::MissingField(
@@ -542,7 +550,7 @@ impl Context {
                 };
                 for label in path {
                     self.tick()?;
-                    value = self.record_field(value, &label)?;
+                    value = self.record_field_from_record(value, &label)?;
                 }
                 value.value = self.whnf(&value.value)?;
                 let id = FVarId(self.fresh_name()?);

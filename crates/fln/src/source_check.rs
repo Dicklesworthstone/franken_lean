@@ -1070,7 +1070,17 @@ impl Engine {
         limits: SourceCheckLimits,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
         self.check_source_files_recording(
-            sources, options, limits, None, None, None, None, None, None, None,
+            sources,
+            options,
+            limits,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -1099,6 +1109,7 @@ impl Engine {
         mut declarations: Option<&mut Vec<Declaration>>,
         private_module: Option<&Name>,
         source_module: Option<&Name>,
+        import_all_modules: &[Name],
         mut public: Option<&mut modules::visibility::PublicWorld<'_>>,
         original_source: Option<(&[u8], fln_parse::BytePos)>,
         mut macros: Option<&mut crate::imported_macros::source::FileSession<'_>>,
@@ -1147,6 +1158,7 @@ impl Engine {
             let mut scopes = scopes::Scopes::new(&engine);
             scopes.current.private_module = private_module.cloned();
             scopes.current.source_module = source_module.cloned();
+            scopes.current.import_all_modules = import_all_modules.to_vec();
             if let Some(session) = macros.as_deref() {
                 scopes.set_imported_macros(session.registry());
             }

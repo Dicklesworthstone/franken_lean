@@ -1563,6 +1563,7 @@ impl Context {
                     .len(),
             )
             .saturating_add(1)
+            .saturating_mul(self.source_scope.import_all_modules.len().saturating_add(1))
         {
             self.tick()?;
         }

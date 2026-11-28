@@ -185,7 +185,8 @@ impl Context {
         head: &Name,
         id: &Name,
     ) -> Result<Result<Typed, DottedIdentError>, NatDefinitionElabError> {
-        let full = head.append_core(id);
+        self.require_private_member_access(head)?;
+        let full = self.source_scope.user_name(head).append_core(id);
         let aliases = self
             .alias_cache
             .read(&self.txn.env)
@@ -194,28 +195,47 @@ impl Context {
             .protected_cache
             .read(&self.txn.env)
             .map_err(|_| failure(SourceInferenceError::Scope))?;
-        let root = SourceScope {
-            opened: self.source_scope.opened.clone(),
-            open_exclusions: self.source_scope.open_exclusions.clone(),
-            explicit_opens: self.source_scope.explicit_opens.clone(),
-            ..SourceScope::default()
-        };
-        for _ in 0..root.opened.len().saturating_add(1) {
+        let mut root = self.source_scope.clone();
+        root.namespace = Name::anonymous();
+        for _ in 0..root
+            .opened
+            .len()
+            .saturating_add(1)
+            .saturating_mul(root.import_all_modules.len().saturating_add(1))
+        {
             self.tick()?;
         }
         match root.resolve_with_aliases(
             &full,
-            |candidate| self.txn.env.contains(candidate),
+            |candidate| {
+                self.txn.env.contains(candidate) && self.private_member_accessible(candidate)
+            },
             &aliases,
             &protected,
         ) {
-            Ok(Some(name)) => return Ok(Ok(self.constant(&name)?)),
+            Ok(Some(name)) => {
+                self.require_private_member_access(&name)?;
+                return Ok(Ok(self.constant(&name)?));
+            }
             Ok(None) => {}
             Err(scope::ScopeError::Ambiguous(_, candidates)) => {
-                return Ok(Err(DottedIdentError::Overloaded {
-                    id: id.clone(),
-                    candidates,
-                }));
+                let candidates: Vec<_> = candidates
+                    .into_iter()
+                    .filter(|name| self.private_member_accessible(name))
+                    .collect();
+                match candidates.as_slice() {
+                    [] => {}
+                    [name] => {
+                        self.require_private_member_access(name)?;
+                        return Ok(Ok(self.constant(name)?));
+                    }
+                    _ => {
+                        return Ok(Err(DottedIdentError::Overloaded {
+                            id: id.clone(),
+                            candidates,
+                        }));
+                    }
+                }
             }
             Err(_) => return Err(failure(SourceInferenceError::Scope)),
         }

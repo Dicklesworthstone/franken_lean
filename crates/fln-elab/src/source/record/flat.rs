@@ -222,6 +222,7 @@ impl Context {
         &mut self,
         spec: &RecordSpec,
         constructor_name: &Name,
+        names: &MemberNames,
         inheritance: &Inheritance,
         overrides: &[DefaultOverride],
         auto_parameters: &mut std::collections::BTreeMap<Name, Expr>,
@@ -339,7 +340,7 @@ impl Context {
                     2,
                     "inherited field tactic",
                 )?;
-                let name = Name::str(spec.name.append_core(&field.user_name), "_autoParam");
+                let name = names.helper(&field.user_name, "_autoParam");
                 let name = self.declare_named_auto_tactic(&tactic[1], name)?;
                 auto_parameters.insert(field.user_name.clone(), Expr::const_(name, Vec::new()));
                 continue;
@@ -424,7 +425,7 @@ impl Context {
                 spec,
                 &fields,
                 selected,
-                helper_name(&spec.name, &field.user_name),
+                names.helper(&field.user_name, "_default"),
                 &mut closer,
             )?);
         }
@@ -572,6 +573,7 @@ impl Context {
         &mut self,
         spec: &RecordSpec,
         constructor_name: &Name,
+        names: &MemberNames,
         inheritance: &Inheritance,
         helpers: &mut [Declaration],
         defaults: &mut Vec<RecordDefault>,
@@ -580,7 +582,7 @@ impl Context {
         if !defaults.iter().any(|row| {
             spec.fields
                 .get(row.field as usize)
-                .is_some_and(|field| row.helper == helper_name(&spec.name, &field.user_name))
+                .is_some_and(|field| row.helper == names.helper(&field.user_name, "_default"))
         }) {
             return Ok(());
         }
@@ -602,7 +604,7 @@ impl Context {
                     .fields
                     .get(row.field as usize)
                     .ok_or_else(|| problem(crate::records::RecordError::InvalidTelescope))?;
-                if row.helper != helper_name(&spec.name, &field.user_name) {
+                if row.helper != names.helper(&field.user_name, "_default") {
                     retained.push(row.clone());
                     continue;
                 }
@@ -654,6 +656,7 @@ impl Context {
         &mut self,
         spec: &RecordSpec,
         constructor_name: &Name,
+        names: &MemberNames,
         inheritance: &Inheritance,
         declared_defaults: &[Name],
         auto_parameters: &std::collections::BTreeMap<Name, Expr>,
@@ -682,6 +685,7 @@ impl Context {
                 auto_parameters,
             } = self.record_flat_inherited_defaults(
                 spec,
+                names,
                 inheritance,
                 DeclaredDefaults {
                     values: declared_defaults,
@@ -730,6 +734,7 @@ impl Context {
     fn record_flat_inherited_defaults(
         &mut self,
         spec: &RecordSpec,
+        names: &MemberNames,
         inheritance: &Inheritance,
         defaults: DeclaredDefaults<'_>,
         fields: &mut [LocalDecl],
@@ -837,7 +842,7 @@ impl Context {
         for target in fields.iter_mut() {
             self.tick()?;
             let field = target.clone();
-            let declared = helper_name(&spec.name, &field.user_name);
+            let declared = names.helper(&field.user_name, "_default");
             if defaults.values.contains(&declared)
                 || defaults.tactics.contains_key(&field.user_name)
             {
@@ -850,7 +855,12 @@ impl Context {
                 if !self.record_has_flat_field(&structures, owner, &field.user_name)? {
                     continue;
                 }
-                let helper = helper_name(owner, &field.user_name);
+                let projection = structures
+                    .get(owner)
+                    .and_then(|row| row.fields.iter().find(|row| row.name == field.user_name))
+                    .map(|row| row.projection.clone())
+                    .unwrap_or_else(|| owner.append_core(&field.user_name));
+                let helper = Name::str(projection.clone(), "_default");
                 if self.txn.env.contains(&helper) {
                     let receiver = self.source_record_parent_view(&structures, &parents, owner)?;
                     selected = self.instantiate_record_default(&helper, &receiver, &arguments)?;
@@ -858,11 +868,6 @@ impl Context {
                         break;
                     }
                 }
-                let projection = structures
-                    .get(owner)
-                    .and_then(|row| row.fields.iter().find(|row| row.name == field.user_name))
-                    .map(|row| row.projection.clone())
-                    .unwrap_or_else(|| owner.append_core(&field.user_name));
                 let quote = Name::str(projection, "_autoParam");
                 if self.txn.env.contains(&quote) {
                     selected_auto = Some(Expr::const_(quote, Vec::new()));
@@ -880,10 +885,7 @@ impl Context {
             if !self.defeq_guarded(&selected.type_, &field.type_)? {
                 return Err(problem(crate::records::RecordError::InvalidTelescope));
             }
-            let name = Name::str(
-                spec.name.append_core(&field.user_name),
-                "_inherited_default",
-            );
+            let name = names.helper(&field.user_name, "_inherited_default");
             declarations.push(self.close_record_flat_default(
                 spec,
                 &plain_fields,

@@ -68,6 +68,10 @@ pub struct SourceScope {
     /// `module` one. A legacy file's declarations stay public by default, but an explicit
     /// `private` one is named under this identity, as `mkPrivateName` names it.
     pub source_module: Option<Name>,
+    /// Modules whose private declarations are accessible through this modern
+    /// module's checked `import all` closure, in import resolution order.
+    /// Legacy imports may load private implementations without granting access.
+    pub import_all_modules: Vec<Name>,
     /// Location used by source terms such as `panic!` that embed their own position.
     /// This is not an exported environment effect or admission authority.
     /// Scope equality excludes this presentation-only metadata.
@@ -137,6 +141,7 @@ impl PartialEq for SourceScope {
             namespace,
             private_module,
             source_module,
+            import_all_modules,
             source_site: _,
             public_declarations,
             expose_definitions,
@@ -162,6 +167,7 @@ impl PartialEq for SourceScope {
         namespace == &other.namespace
             && private_module == &other.private_module
             && source_module == &other.source_module
+            && import_all_modules == &other.import_all_modules
             && public_declarations == &other.public_declarations
             && expose_definitions == &other.expose_definitions
             && noncomputable_section == &other.noncomputable_section
@@ -195,6 +201,7 @@ pub enum ScopeError {
     ProtectedOutsideNamespace,
     PrivateShadowsPublic(Name),
     PublicShadowsPrivate(Name),
+    InaccessiblePrivate(Name),
     /// One of the pin's reserved-name predicates claims the name ([`reserved`]).
     ReservedName(Name),
     /// The pin declares this auxiliary with its definition (`reserved::is_declared_auxiliary`).
@@ -246,6 +253,11 @@ impl std::fmt::Display for ScopeError {
             Self::PublicShadowsPrivate(name) => write!(
                 f,
                 "public declaration `{}` conflicts with an existing private declaration",
+                name.to_display_string()
+            ),
+            Self::InaccessiblePrivate(name) => write!(
+                f,
+                "private declaration `{}` is not accessible in the current context",
                 name.to_display_string()
             ),
             Self::ReservedName(name) => {
@@ -348,6 +360,32 @@ impl SourceScope {
             .map(|name| self.visible_name(&name))
     }
 
+    /// The pin recognizes private names by their leading `_private` component.
+    pub fn is_private_name(name: &Name) -> bool {
+        let mut root = name.clone();
+        while !root.parent().is_anonymous() {
+            root = root.parent();
+        }
+        root == Name::from_components(["_private"])
+    }
+
+    /// Recover the defining module from the pin's `_private.<module>.0` prefix.
+    /// A malformed private spelling receives no module access capability.
+    pub fn private_module_of(name: &Name) -> Option<Name> {
+        let private = Name::from_components(["_private"]);
+        let mut prefix = name.clone();
+        let mut defining_module = None;
+        while !prefix.is_anonymous() {
+            if matches!(prefix.leaf_view(), LeafView::Num(0))
+                && let Some(module) = strip_name_prefix(&prefix.parent(), &private)
+            {
+                defining_module = Some(module);
+            }
+            prefix = prefix.parent();
+        }
+        defining_module
+    }
+
     /// Apply effective visibility to an already qualified generated name. Only a `module`
     /// file's identity names declarations here: a legacy file's explicit `private` declaration
     /// carries its file's identity in `private_module` ([`Self::for_declaration`]), while its
@@ -379,23 +417,35 @@ impl SourceScope {
         )
     }
 
-    /// Recover a local declaration's user-facing namespace for scope tracking.
-    /// An unrelated module's private names are never aliases in this scope.
+    /// Recover an accessible private declaration's user-facing namespace.
+    /// Unrelated modules' private names are never aliases in this scope.
     pub fn user_name(&self, name: &Name) -> Name {
-        let Some(module) = self.private_identity() else {
+        let Some(module) = Self::private_module_of(name) else {
             return name.clone();
         };
-        let prefix = Name::num(Name::from_components(["_private"]).append_core(module), 0);
+        if self.private_identity() != Some(&module)
+            && !(self.private_module.is_some() && self.import_all_modules.contains(&module))
+        {
+            return name.clone();
+        }
+        let prefix = Name::num(Name::from_components(["_private"]).append_core(&module), 0);
         let mut cursor = name.clone();
         let mut suffix = Vec::new();
         while cursor != prefix {
-            match cursor.leaf_view() {
-                LeafView::Str(part) => suffix.push(part.to_owned()),
-                _ => return name.clone(),
+            if cursor.is_anonymous() {
+                return name.clone();
             }
+            suffix.push(cursor.clone());
             cursor = cursor.parent();
         }
-        Name::from_components(suffix.iter().rev().map(String::as_str))
+        suffix
+            .iter()
+            .rev()
+            .fold(Name::anonymous(), |prefix, part| match part.leaf_view() {
+                LeafView::Str(component) => Name::str(prefix, component),
+                LeafView::Num(component) => Name::num(prefix, component),
+                LeafView::Anonymous => prefix,
+            })
     }
 
     pub(super) fn user_declaration_name(&self, name: &Name) -> Result<Name, ScopeError> {
@@ -488,12 +538,24 @@ impl SourceScope {
             return Ok(exists(name).then(|| name.clone()));
         }
         let resolve = |candidate: &Name, exists: &mut dyn FnMut(&Name) -> bool| {
+            if exists(candidate) {
+                return Some(candidate.clone());
+            }
             let private = self.private_name(candidate);
             if private != *candidate && exists(&private) {
-                Some(private)
-            } else {
-                exists(candidate).then(|| candidate.clone())
+                return Some(private);
             }
+            if self.private_module.is_some() {
+                for module in &self.import_all_modules {
+                    let private =
+                        Name::num(Name::from_components(["_private"]).append_core(module), 0)
+                            .append_core(candidate);
+                    if exists(&private) {
+                        return Some(private);
+                    }
+                }
+            }
+            None
         };
         let parts = components(name)?;
         if parts.first().is_some_and(|p| p == "_root_") {
@@ -510,7 +572,9 @@ impl SourceScope {
                     found.push(target);
                 }
                 for target in aliases.targets(&candidate) {
-                    if !(atomic && protected.contains(target)) {
+                    if !(atomic && protected.contains(target))
+                        && (!Self::is_private_name(target) || exists(target))
+                    {
                         found.push(target.clone());
                     }
                 }
@@ -559,7 +623,7 @@ impl SourceScope {
                 Ok(opened) => qualified(opened, &mut here, &mut exists),
                 // `resolveOpenDecls`'s `OpenDecl.explicit openedId resolvedId`.
                 Err((opened_id, resolved)) => {
-                    if opened_id == name {
+                    if opened_id == name && (!Self::is_private_name(resolved) || exists(resolved)) {
                         here.push(resolved.clone());
                     } else if let Some(rest) = strip_name_prefix(name, opened_id) {
                         let candidate = resolved.append_core(&rest);
@@ -575,6 +639,7 @@ impl SourceScope {
         let mut pooled: Vec<Name> = aliases
             .targets(name)
             .iter()
+            .filter(|target| !Self::is_private_name(target) || exists(target))
             .filter(|target| !(atomic && protected.contains(target)))
             .cloned()
             .collect();
@@ -596,6 +661,42 @@ fn strip_name_prefix(name: &Name, prefix: &Name) -> Option<Name> {
 }
 
 impl Context {
+    pub(in crate::source) fn private_member_accessible(&self, name: &Name) -> bool {
+        if !SourceScope::is_private_name(name) {
+            return true;
+        }
+        if self.source_scope.exports_declaration() && !self.private_auxiliary_declarations {
+            return false;
+        }
+        let Some(module) = SourceScope::private_module_of(name) else {
+            return false;
+        };
+        self.source_scope.private_identity() == Some(&module)
+            || (self.source_scope.private_module.is_some()
+                && self.source_scope.import_all_modules.contains(&module))
+    }
+
+    /// Source notation may discover a private member through checked structure
+    /// metadata or an inductive's constructor array. Neither grants source access.
+    pub(in crate::source) fn require_private_member_access(
+        &mut self,
+        name: &Name,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut cursor = name.clone();
+        while !cursor.is_anonymous() {
+            self.tick()?;
+            cursor = cursor.parent();
+        }
+        for _ in 0..self.source_scope.import_all_modules.len() {
+            self.tick()?;
+        }
+        if self.private_member_accessible(name) {
+            Ok(())
+        } else {
+            Err(error(ScopeError::InaccessiblePrivate(name.clone())))
+        }
+    }
+
     /// Some specialized pattern/tactic paths still consume only identifier names.
     /// They may consume the native parser's already anchored exact spelling, but
     /// must not discard other declaration metadata.
@@ -876,6 +977,7 @@ impl Context {
                     .len(),
             )
             .saturating_add(1)
+            .saturating_mul(self.source_scope.import_all_modules.len().saturating_add(1))
         {
             self.tick()?;
         }
@@ -945,15 +1047,26 @@ impl Context {
             // The pin's `containsDeclOrReserved`: an equation-like name of a definition
             // resolves before it is generated (`equation_theorems`).
             |candidate| {
-                self.txn.env.contains(candidate)
-                    || local(candidate)
-                    || super::equation_theorems::target(&self.txn.env, candidate).is_some()
+                local(candidate)
+                    || (self.txn.env.contains(candidate)
+                        || super::equation_theorems::target(&self.txn.env, candidate).is_some())
+                        && self.private_member_accessible(candidate)
             },
             &aliases,
             &protected,
         ) {
-            Ok(found) => Ok(Ok(found)),
-            Err(ScopeError::Ambiguous(_, candidates)) => Ok(Err(candidates)),
+            Ok(found) => Ok(Ok(found.filter(|name| self.private_member_accessible(name)))),
+            Err(ScopeError::Ambiguous(_, candidates)) => {
+                let mut candidates: Vec<_> = candidates
+                    .into_iter()
+                    .filter(|name| self.private_member_accessible(name))
+                    .collect();
+                match candidates.len() {
+                    0 => Ok(Ok(None)),
+                    1 => Ok(Ok(candidates.pop())),
+                    _ => Ok(Err(candidates)),
+                }
+            }
             Err(other) => Err(error(other)),
         }
     }
@@ -1330,6 +1443,7 @@ mod tests {
             namespace: n("Outer"),
             private_module: None,
             source_module: None,
+            import_all_modules: Vec::new(),
             source_site: None,
             public_declarations: false,
             expose_definitions: false,
@@ -1531,6 +1645,7 @@ mod tests {
         let scope = |namespace: &str, opened: &[&str]| SourceScope {
             private_module: None,
             source_module: None,
+            import_all_modules: Vec::new(),
             source_site: None,
             public_declarations: false,
             expose_definitions: false,
@@ -1615,6 +1730,7 @@ mod tests {
         let scope = SourceScope {
             private_module: None,
             source_module: None,
+            import_all_modules: Vec::new(),
             source_site: None,
             public_declarations: false,
             expose_definitions: false,

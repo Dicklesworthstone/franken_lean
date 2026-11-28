@@ -92,6 +92,17 @@ pub(super) fn prepare(
     if publications
         .iter()
         .all(|publication| *publication == HandlerPublication::Exposed)
+        && !base
+            .as_ref()
+            .is_some_and(|base| fln_elab::source::is_record(base.syntax()))
+        // A standalone deriving command has no base syntax to classify. Keep
+        // it in paired publication when an existing target has a private
+        // constructor, so it cannot bypass the handler's visibility policy.
+        && !request.targets.iter().any(|target| {
+            matches!(private.environment().find(&target.name),
+                Some(ConstantInfo::Induct(family))
+                    if family.ctors.iter().any(SourceScope::is_private_name))
+        })
     {
         return Ok(Outcome::Complete(None));
     }
@@ -136,22 +147,64 @@ impl PublicWorld<'_> {
             body_scope.expose_definitions = public_scope.expose_definitions;
         }
         if let Some(base) = plan.base {
-            let checked = match staged.public.admit_scoped_command_syntax_with_base(
-                source,
-                ScopedCommandSyntax::Definition(base),
-                options,
-                limits,
-                public_scope,
-                Some(&self.initial),
-            )? {
-                Outcome::Complete(checked) => checked,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            };
-            match self.stage_derived_data(&mut staged, checked, options, limits)? {
-                Outcome::Complete(()) => {}
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            if fln_elab::source::is_record(base.syntax()) {
+                let checked = match staged.private.admit_public_scoped_command_syntax(
+                    &staged.public,
+                    source,
+                    ScopedCommandSyntax::Definition(base),
+                    options,
+                    limits,
+                    public_scope,
+                    private_scope,
+                )? {
+                    Outcome::Complete(checked) => checked,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                if let Some(private) = checked.private_implementation {
+                    if !checked.metadata_complete {
+                        return Err(EngineExecutionError::UnexpectedPublication {
+                            detail: "a paired record base must finish both metadata worlds before deriving",
+                        });
+                    }
+                    self.meter
+                        .work(checked.public.admissions.len())
+                        .map_err(execution_error)?;
+                    staged.declarations.extend(
+                        checked
+                            .public
+                            .admissions
+                            .into_iter()
+                            .map(|admitted| admitted.declaration),
+                    );
+                    staged.public = checked.public.engine;
+                    staged.private = private.engine;
+                    staged.admissions.extend(private.admissions);
+                } else {
+                    match self.stage_derived_data(&mut staged, checked.public, options, limits)? {
+                        Outcome::Complete(()) => {}
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
+                }
+            } else {
+                let checked = match staged.public.admit_scoped_command_syntax_with_base(
+                    source,
+                    ScopedCommandSyntax::Definition(base),
+                    options,
+                    limits,
+                    public_scope,
+                    Some(&self.initial),
+                )? {
+                    Outcome::Complete(checked) => checked,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                match self.stage_derived_data(&mut staged, checked, options, limits)? {
+                    Outcome::Complete(()) => {}
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                }
             }
         }
         for (handler, publication) in plan.request.handlers.iter().zip(plan.publications) {
@@ -165,23 +218,65 @@ impl PublicWorld<'_> {
                         "source-module/deriving",
                     )));
                 }
+                let Some(ConstantInfo::Induct(family)) =
+                    staged.private.environment().find(&target.name)
+                else {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "derivation requires its admitted inductive target",
+                    });
+                };
+                let has_private_constructor = family.ctors.iter().any(SourceScope::is_private_name);
+                if has_private_constructor
+                    && publication == HandlerPublication::Inhabited
+                    && family.ctors.len() != 1
+                {
+                    return Err(EngineExecutionError::NotImplemented {
+                        feature: "paired Inhabited derivation over mixed private constructor alternatives",
+                    });
+                }
+                if has_private_constructor && publication == HandlerPublication::Exposed {
+                    return Err(EngineExecutionError::NotImplemented {
+                        feature: "paired public deriving helpers for this private-constructor handler",
+                    });
+                }
+                let exposed = publication == HandlerPublication::Exposed
+                    || publication == HandlerPublication::Inhabited && !has_private_constructor;
+                let mut selected_scope = if exposed {
+                    public_scope.clone()
+                } else {
+                    body_scope.clone()
+                };
+                if has_private_constructor && publication == HandlerPublication::Inhabited {
+                    // withoutExposeFromCtors removes inherited section exposure
+                    // for the private default implementation; its dictionary
+                    // still passes an independent ordinary public admission.
+                    selected_scope.expose_definitions = false;
+                }
                 let request = ExistingDeriving {
                     handlers: vec![handler.clone()],
                     targets: vec![target.clone()],
-                    scope: if publication == HandlerPublication::Exposed {
-                        public_scope.clone()
-                    } else {
-                        body_scope.clone()
-                    },
+                    scope: selected_scope,
                 };
                 let outcome = match publication {
                     HandlerPublication::Proof => {
                         self.stage_derived_proof(&mut staged, &request, options, limits)?
                     }
-                    HandlerPublication::HiddenHashHelper => {
-                        self.stage_derived_hashable(&mut staged, &request, options, limits)?
-                    }
-                    HandlerPublication::Exposed => {
+                    HandlerPublication::HiddenHashHelper => self.stage_derived_hidden_helper(
+                        &mut staged,
+                        &request,
+                        "hash",
+                        options,
+                        limits,
+                    )?,
+                    HandlerPublication::Inhabited if has_private_constructor => self
+                        .stage_derived_hidden_helper(
+                            &mut staged,
+                            &request,
+                            "default",
+                            options,
+                            limits,
+                        )?,
+                    HandlerPublication::Exposed | HandlerPublication::Inhabited => {
                         let checked = match staged.public.admit_existing_deriving(
                             &request,
                             Some(staged.private.environment()),
@@ -347,16 +442,17 @@ impl PublicWorld<'_> {
         Ok(Outcome::Complete(()))
     }
 
-    fn stage_derived_hashable(
+    fn stage_derived_hidden_helper(
         &mut self,
         staged: &mut Staged,
         request: &ExistingDeriving,
+        helper_suffix: &str,
         options: &KVMap,
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<()>, EngineExecutionError> {
-        // The pin emits @[no_expose] on the hash helper, so its body can use
-        // private constructors and instances. The public dictionary only names
-        // that helper and must still pass both judges in the public world.
+        // Hashable always hides its hash implementation. Inhabited does the
+        // same for a private constructor's default. The public dictionary only
+        // names that checked helper and must pass both public checking seats.
         let checked = match staged
             .private
             .admit_existing_deriving(request, None, options, limits)?
@@ -367,22 +463,22 @@ impl PublicWorld<'_> {
         };
         let [helper, dictionary] = checked.admissions.as_slice() else {
             return Err(EngineExecutionError::UnexpectedPublication {
-                detail: "Hashable deriving must admit its complete helper and dictionary",
+                detail: "hidden-helper deriving must admit its complete helper and dictionary",
             });
         };
         let (Declaration::Defn(helper), Declaration::Defn(dictionary)) =
             (&helper.declaration, &dictionary.declaration)
         else {
             return Err(EngineExecutionError::UnexpectedPublication {
-                detail: "Hashable deriving must retain its checked definition kinds",
+                detail: "hidden-helper deriving must retain its checked definition kinds",
             });
         };
         if helper.safety != DefinitionSafety::Safe
             || dictionary.safety != DefinitionSafety::Safe
-            || helper.base.name != Name::str(dictionary.base.name.clone(), "hash")
+            || helper.base.name != Name::str(dictionary.base.name.clone(), helper_suffix)
         {
             return Err(EngineExecutionError::UnexpectedPublication {
-                detail: "Hashable deriving requires its actual safe auxiliary definition",
+                detail: "hidden-helper deriving requires its actual safe auxiliary definition",
             });
         }
         let name = dictionary.base.name.clone();

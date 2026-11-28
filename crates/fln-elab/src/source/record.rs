@@ -3,11 +3,13 @@
 use super::*;
 mod constructor;
 mod flat;
+mod names;
 mod parents;
-use crate::records::defaults::{RecordDefault, helper_name, inherited_helper_name};
+use crate::records::defaults::{RecordDefault, inherited_helper_name};
 use crate::records::imported::{StructureEntry, StructureField, StructureParent};
 use crate::records::inheritance::RecordParent;
-use crate::records::{RecordBudget, RecordSpec, record_declarations_with_constructor};
+use crate::records::{RecordBudget, RecordSpec, record_declarations_with_member_names};
+use names::MemberNames;
 
 #[derive(Debug)]
 pub struct SourceRecord {
@@ -31,6 +33,10 @@ pub struct SourceRecord {
     pub structure: StructureEntry,
     /// Field projections marked `protected` (authored or copied from a protected parent field).
     pub protected_projections: Vec<Name>,
+    /// User aliases for generated private members. These are candidate identities;
+    /// the caller publishes them only after checking the complete record batch.
+    /// Private constructors remain part of the checked public inductive closure.
+    pub private_members: Vec<(Name, Name)>,
 }
 
 pub fn is_record(syntax: &Syntax) -> bool {
@@ -42,10 +48,16 @@ pub fn is_record(syntax: &Syntax) -> bool {
 
 /// Validate structure field modifiers against `checkValidFieldModifier` and
 /// `expandFields` in vendored `Lean/Elab/Structure.lean:320-364`.
+#[derive(Clone, Copy)]
+struct FieldModifiers {
+    protected: bool,
+    private: bool,
+}
+
 fn field_modifiers(
     syntax: &Syntax,
     structure_modifiers: &Syntax,
-) -> Result<bool, NatDefinitionElabError> {
+) -> Result<FieldModifiers, NatDefinitionElabError> {
     let parts = expect_node(
         syntax,
         &parser_kind(&["Command", "declModifiers"]),
@@ -72,12 +84,10 @@ fn field_modifiers(
             crate::records::RecordError::InvalidName,
         )));
     }
-    if visibility.is_some() {
-        return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "absent record field visibility modifier",
-        });
-    }
-    Ok(is_protected)
+    Ok(FieldModifiers {
+        protected: is_protected,
+        private: visibility == Some(false),
+    })
 }
 
 /// Expand grouped fields while preserving their constructor binder style. The
@@ -221,6 +231,36 @@ pub(super) fn elaborate_record_scoped(
     budget: RecordBudget,
     scope: &SourceScope,
 ) -> Result<SourceRecord, NatDefinitionElabError> {
+    elaborate_record_in_world(syntax, environment, None, kernel, budget, scope)
+}
+
+/// Elaborate a modern exported record using only public declarations. The
+/// complete predecessor is consulted solely to deny auto-binding a private
+/// spelling as a fresh implicit; it grants no private term or body lookup.
+pub fn elaborate_record_with_private_names(
+    syntax: &Syntax,
+    public: &Environment,
+    private: &Environment,
+    kernel: Budget,
+    budget: RecordBudget,
+    scope: &SourceScope,
+) -> Result<SourceRecord, NatDefinitionElabError> {
+    if !scope.for_declaration(syntax)?.exports_declaration() {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "a public record in a module file",
+        });
+    }
+    elaborate_record_in_world(syntax, public, Some(private), kernel, budget, scope)
+}
+
+fn elaborate_record_in_world(
+    syntax: &Syntax,
+    environment: &Environment,
+    private_names: Option<&Environment>,
+    kernel: Budget,
+    budget: RecordBudget,
+    scope: &SourceScope,
+) -> Result<SourceRecord, NatDefinitionElabError> {
     let root = expect_node(
         syntax,
         &parser_kind(&["Command", "declaration"]),
@@ -276,6 +316,7 @@ pub(super) fn elaborate_record_scoped(
     )?;
     let own = super::own_short_name(name);
     let mut context = Context::scoped(environment, kernel, &scope)?;
+    context.auto_bound_private_names = private_names.cloned();
     if is_protected {
         context.check_protected_declaration_name(name)?;
     }
@@ -324,39 +365,65 @@ pub(super) fn elaborate_record_scoped(
         .transpose()?;
     let record_header = context.txn.lctx.clone();
     let mut inheritance = context.record_parents(&parts[3], name, is_class, budget)?;
+    context.check_record_parent_member_names(&inheritance)?;
     let mut labels = std::mem::take(&mut inheritance.labels);
     let mut inferred = inheritance.level.clone();
-    let (constructor, constructor_protected, fields) =
-        match expect_null_args(&parts[4], "record body")? {
-            [] => (Name::from_components(["mk"]), false, &[][..]),
-            [keyword, ctor, fields] => {
-                // `where`, or the pin's older `:=` (`" := " <|> " where "`), for which the pin's
-                // `expandFields` only logs a deprecation lint, a warning.
-                if expect_atom(keyword, ":=", "record body keyword").is_err() {
-                    expect_atom(keyword, "where", "record body keyword")?;
-                }
-                let (constructor, constructor_protected) = constructor::name(ctor, &root[0])?;
-                let fields = expect_node(
-                    fields,
-                    &parser_kind(&["Command", "structFields"]),
-                    1,
-                    "record fields",
-                )?;
-                (
-                    constructor,
-                    constructor_protected,
-                    expect_null_args(&fields[0], "record field array")?,
-                )
+    let (constructor, fields) = match expect_null_args(&parts[4], "record body")? {
+        [] => (constructor::Constructor::default(), &[][..]),
+        [keyword, ctor, fields] => {
+            // `where`, or the pin's older `:=` (`" := " <|> " where "`), for which the pin's
+            // `expandFields` only logs a deprecation lint, a warning.
+            if expect_atom(keyword, ":=", "record body keyword").is_err() {
+                expect_atom(keyword, "where", "record body keyword")?;
             }
-            _ => return Err(failure(SourceInferenceError::Scope)),
-        };
-    let constructor_name = context.record_constructor_name(name, &user_name, &constructor)?;
+            let constructor = constructor::name(ctor, &root[0])?;
+            let fields = expect_node(
+                fields,
+                &parser_kind(&["Command", "structFields"]),
+                1,
+                "record fields",
+            )?;
+            (
+                constructor,
+                expect_null_args(&fields[0], "record field array")?,
+            )
+        }
+        _ => return Err(failure(SourceInferenceError::Scope)),
+    };
     let fields = &simple_fields(fields)?;
     if parameters.len().saturating_add(fields.len()) > budget.max_binders {
         return Err(failure(SourceInferenceError::Record(
             crate::records::RecordError::ResourceLimit,
         )));
     }
+    // Choose visibility before constructing any dependent projection or helper.
+    // The written field label remains the constructor binder and structure key;
+    // only its separately recorded projection identity is made private.
+    let mut member_names = MemberNames::new(name.clone());
+    let mut private_fields = false;
+    for (field, _) in fields {
+        context.tick()?;
+        let parts = expect_node(
+            field,
+            &parser_kind(&["Command", "structSimpleBinder"]),
+            4,
+            "named structure field",
+        )?;
+        let modifiers = field_modifiers(&parts[0], &root[0])?;
+        let Syntax::Ident { val: field, .. } = &parts[1] else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        if modifiers.private && labels.contains(field) {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "private visibility on a newly declared record field",
+            });
+        }
+        let projection = context.record_member_name(name, &user_name, field, modifiers.private)?;
+        member_names.insert(field.clone(), projection);
+        private_fields |= modifiers.private;
+    }
+    let constructor_name =
+        context.record_constructor_name(name, &user_name, &constructor, private_fields)?;
     let mut output = std::mem::take(&mut inheritance.fields);
     let parent_count = output.len();
     let mut defaults = Vec::new();
@@ -422,7 +489,7 @@ pub(super) fn elaborate_record_scoped(
     let mut written_fields = std::collections::HashSet::new();
     let mut overrides = Vec::new();
     let mut protected_projections = std::mem::take(&mut inheritance.protected_fields);
-    if constructor_protected && !protected_projections.contains(&constructor_name) {
+    if constructor.protected && !protected_projections.contains(&constructor_name) {
         protected_projections.push(constructor_name.clone());
     }
     for (field, style) in fields {
@@ -433,7 +500,7 @@ pub(super) fn elaborate_record_scoped(
             4,
             "named structure field",
         )?;
-        let field_protected = field_modifiers(&parts[0], &root[0])?;
+        let field_protected = field_modifiers(&parts[0], &root[0])?.protected;
         // The pin quotes a binder tactic after all field types are available.
         // It is not a proof of this generic field: the selected constructor or
         // record application runs it with that application's actual arguments.
@@ -488,7 +555,7 @@ pub(super) fn elaborate_record_scoped(
                 .find_by_user_name(user_name)
                 .ok_or_else(|| failure(SourceInferenceError::Scope))?;
             if field_protected && inherited.value.is_none() {
-                let projection = name.append_core(user_name);
+                let projection = member_names.projection(user_name);
                 if !protected_projections.contains(&projection) {
                     protected_projections.push(projection);
                 }
@@ -506,7 +573,7 @@ pub(super) fn elaborate_record_scoped(
             continue;
         }
         if field_protected {
-            let projection = name.append_core(user_name);
+            let projection = member_names.projection(user_name);
             if !protected_projections.contains(&projection) {
                 protected_projections.push(projection);
             }
@@ -612,7 +679,7 @@ pub(super) fn elaborate_record_scoped(
                 );
                 term.type_ = Expr::forall_e(local.user_name.clone(), local_type, term.type_, style);
             }
-            let helper = helper_name(name, user_name);
+            let helper = member_names.helper(user_name, "_default");
             helpers.push(Declaration::Defn(DefinitionVal {
                 base: ConstantVal {
                     name: helper.clone(),
@@ -671,7 +738,7 @@ pub(super) fn elaborate_record_scoped(
     }
     for (field, tactic) in pending_auto_parameters {
         context.tick()?;
-        let quote = Name::str(name.append_core(&field), "_autoParam");
+        let quote = member_names.helper(&field, "_autoParam");
         let quote = context.declare_named_auto_tactic(&tactic, quote)?;
         auto_parameters.insert(field, Expr::const_(quote, Vec::new()));
     }
@@ -725,6 +792,7 @@ pub(super) fn elaborate_record_scoped(
         let generated = context.record_default_overrides(
             &provisional,
             &constructor_name,
+            &member_names,
             &inheritance,
             &overrides,
             &mut auto_parameters,
@@ -867,6 +935,7 @@ pub(super) fn elaborate_record_scoped(
     context.record_flat_defaults(
         &spec,
         &constructor_name,
+        &member_names,
         &inheritance,
         &mut helpers,
         &mut defaults,
@@ -879,6 +948,7 @@ pub(super) fn elaborate_record_scoped(
     } = context.record_flat_constructor(
         &spec,
         &constructor_name,
+        &member_names,
         &inheritance,
         &declared_defaults,
         &auto_parameters,
@@ -894,9 +964,18 @@ pub(super) fn elaborate_record_scoped(
                 context.record_auto_parameter_type(field.type_.clone(), tactic.clone())?;
         }
     }
-    let mut declarations =
-        record_declarations_with_constructor(&constructor_spec, &constructor, budget)
-            .map_err(|e| failure(SourceInferenceError::Record(e)))?;
+    let projection_names: Vec<_> = spec
+        .fields
+        .iter()
+        .map(|field| member_names.projection(&field.user_name))
+        .collect();
+    let mut declarations = record_declarations_with_member_names(
+        &constructor_spec,
+        &constructor_name,
+        &projection_names,
+        budget,
+    )
+    .map_err(|e| failure(SourceInferenceError::Record(e)))?;
     let mut default_helpers = Vec::new();
     for helper in &helpers {
         context.tick()?;
@@ -943,7 +1022,7 @@ pub(super) fn elaborate_record_scoped(
         context.tick()?;
         fields.push(StructureField {
             name: field.user_name.clone(),
-            projection: spec.name.append_core(&field.user_name),
+            projection: member_names.projection(&field.user_name),
             subobject: subobjects.get(&index).copied().cloned(),
             binder_info: field.binder_info,
         });
@@ -976,6 +1055,12 @@ pub(super) fn elaborate_record_scoped(
         fields,
         parents,
     };
+    let private_members = context.record_private_members(
+        [constructor_name, flat_constructor.clone()]
+            .into_iter()
+            .chain(projection_names)
+            .chain(default_helpers.iter().cloned()),
+    )?;
     context.publish_deprecated_uses()?;
     Ok(SourceRecord {
         name: name.clone(),
@@ -988,5 +1073,6 @@ pub(super) fn elaborate_record_scoped(
         flat_constructor,
         structure,
         protected_projections,
+        private_members,
     })
 }

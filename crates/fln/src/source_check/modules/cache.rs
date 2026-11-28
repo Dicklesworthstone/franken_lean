@@ -486,6 +486,23 @@ pub(super) fn run_collecting(
             Some(contexts) => contexts.order(index, &plan, modules, &mut meter)?,
             None => contexts::source_order(index, &plan, modules, &mut meter, false)?,
         };
+        // Loading implementations for a legacy root does not grant source access
+        // to their private names. Modern `all` flags already describe the exact
+        // transitive import closure, including later upgrades of an earlier edge.
+        let import_all_modules: Vec<_> = if plan.headers[index].module_system {
+            steps
+                .iter()
+                .filter_map(|step| match step {
+                    contexts::Step::Source(dependency, true) => {
+                        Some(modules[*dependency].name.clone())
+                    }
+                    contexts::Step::External(name, true) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let dependencies: Vec<_> = steps
             .iter()
             .filter_map(|step| match step {
@@ -782,6 +799,7 @@ pub(super) fn run_collecting(
                         .module_system
                         .then(|| module.name.clone()),
                     source_module: Some(module.name.clone()),
+                    import_all_modules: import_all_modules.clone(),
                     ..hit.engine.base_source_scope()
                 };
                 let checked = SourceFileCheck {
@@ -881,6 +899,7 @@ pub(super) fn run_collecting(
                                         .module_system
                                         .then(|| module.name.clone()),
                                     source_module: Some(module.name.clone()),
+                                    import_all_modules: import_all_modules.clone(),
                                     ..imported.base_source_scope()
                                 },
                             }))
@@ -892,6 +911,7 @@ pub(super) fn run_collecting(
                                 Some(&mut declarations),
                                 header.module_system.then_some(module.name),
                                 Some(module.name),
+                                &import_all_modules,
                                 public.as_mut(),
                                 Some((module.source, header.body_start)),
                                 session,

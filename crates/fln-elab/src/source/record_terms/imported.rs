@@ -82,6 +82,22 @@ fn limit() -> NatDefinitionElabError {
     failure(SourceInferenceError::ResourceLimit)
 }
 
+fn field_helper_name(
+    structures: &ImportedStructures,
+    owner: &Name,
+    field: &Name,
+    suffix: &str,
+) -> Name {
+    let projection = structures
+        .get(owner)
+        .and_then(|structure| structure.fields.iter().find(|entry| &entry.name == field))
+        .map(|entry| entry.projection.clone())
+        // An override of a field stored inside a subobject has no physical
+        // projection in the child and keeps the child's ordinary helper name.
+        .unwrap_or_else(|| owner.append_core(field));
+    Name::str(projection, suffix)
+}
+
 impl Context {
     pub(super) fn imported_record_layout(
         &mut self,
@@ -150,14 +166,15 @@ impl Context {
         let mut flat_defaults = Vec::new();
         for field in &leaves {
             self.tick()?;
-            let direct = crate::records::defaults::helper_name(&root, &field.name);
+            let direct = field_helper_name(&structures, &root, &field.name, "_default");
             if self.txn.env.contains(&direct) {
                 if !native_helpers.contains(&direct) {
                     flat_defaults.push(field);
                 }
                 continue;
             }
-            let inherited = Name::str(root.append_core(&field.name), "_inherited_default");
+            let inherited =
+                field_helper_name(&structures, &root, &field.name, "_inherited_default");
             if !self.txn.env.contains(&inherited) {
                 continue;
             }
@@ -167,7 +184,7 @@ impl Context {
             // Registered native prefixes remain usable by the physical path.
             for owner in order.iter().skip(1) {
                 self.tick()?;
-                let helper = crate::records::defaults::helper_name(owner, &field.name);
+                let helper = field_helper_name(&structures, owner, &field.name, "_default");
                 if !self.txn.env.contains(&helper)
                     || !self.record_has_flat_field(&structures, owner, &field.name)?
                 {
@@ -182,8 +199,10 @@ impl Context {
         if native
             && flat_defaults.is_empty()
             && !leaves.iter().any(|field| {
-                self.txn.env.contains(&Name::str(
-                    root.append_core(&field.name),
+                self.txn.env.contains(&field_helper_name(
+                    &structures,
+                    &root,
+                    &field.name,
                     "_inherited_default",
                 ))
             })
@@ -221,7 +240,7 @@ impl Context {
                 }
                 let mut supplied = false;
                 for source in &frame.sources {
-                    match self.record_field(source.clone(), &field.name) {
+                    match self.record_field_from_record(source.clone(), &field.name) {
                         Ok(_) => {
                             supplied = true;
                             break;
@@ -329,7 +348,7 @@ impl Context {
             if input.is_none() {
                 for source in &frame.sources {
                     self.tick()?;
-                    match self.record_field(source.clone(), &leaf.name) {
+                    match self.record_field_from_record(source.clone(), &leaf.name) {
                         Ok(value) => {
                             input = Some(Input::Copy(value));
                             break;
@@ -562,8 +581,13 @@ impl Context {
         {
             return Ok(None);
         }
-        let declared = crate::records::defaults::helper_name(&constructor.induct, field);
-        let inherited = Name::str(constructor.induct.append_core(field), "_inherited_default");
+        let declared = field_helper_name(&structures, &constructor.induct, field, "_default");
+        let inherited = field_helper_name(
+            &structures,
+            &constructor.induct,
+            field,
+            "_inherited_default",
+        );
         let helper = if self.txn.env.contains(&declared) {
             declared
         } else if self.txn.env.contains(&inherited) {
@@ -597,7 +621,7 @@ impl Context {
                     };
                     for label in labels {
                         self.tick()?;
-                        let value = self.record_field(receiver.clone(), label)?;
+                        let value = self.record_field_from_record(receiver.clone(), label)?;
                         fields.push((label.clone(), value.value));
                     }
                 } else {

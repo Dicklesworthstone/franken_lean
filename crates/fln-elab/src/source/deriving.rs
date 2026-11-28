@@ -119,6 +119,10 @@ pub fn is_command(syntax: &Syntax) -> bool {
 pub enum HandlerPublication {
     Exposed,
     HiddenHashHelper,
+    /// The selected structure constructor decides whether its default helper
+    /// has an exported body. The module driver resolves this after admission
+    /// of the base family, including an implicit private structure constructor.
+    Inhabited,
     Proof,
 }
 
@@ -137,6 +141,8 @@ pub fn handler_publication(
         HandlerPublication::Proof
     } else if handler.as_ref() == Some(&named("Hashable")) {
         HandlerPublication::HiddenHashHelper
+    } else if handler.as_ref() == Some(&named("Inhabited")) {
+        HandlerPublication::Inhabited
     } else {
         HandlerPublication::Exposed
     })
@@ -532,6 +538,14 @@ fn candidate_in_context(
     is_record: bool,
     add_hypotheses: bool,
 ) -> Result<DerivedInstance, NatDefinitionElabError> {
+    // The pin elaborates a private constructor's Inhabited implementation with
+    // exporting disabled, while keeping the generated instance name public.
+    // The lexical module/import-all capability is still required; a constructor
+    // retained in the public kernel family grants no foreign source access.
+    if SourceScope::is_private_name(constructor) {
+        context.private_auxiliary_declarations = true;
+    }
+    context.require_private_member_access(constructor)?;
     let levels: Vec<_> = family
         .base
         .level_params
@@ -619,6 +633,23 @@ fn candidate_in_context(
     } else {
         None
     };
+    let structures = if is_record {
+        Some(
+            crate::records::imported::ImportedStructures::read(&context.txn.env)
+                .map_err(|error| failure(SourceInferenceError::Record(error)))?,
+        )
+    } else {
+        None
+    };
+    let structure = structures
+        .as_ref()
+        .and_then(|structures| structures.get(&family.base.name));
+    let field_arguments: Vec<_> = structure
+        .into_iter()
+        .flat_map(|structure| structure.fields.iter())
+        .zip(&fields)
+        .map(|(field, (hole, _))| (field.name.clone(), hole.clone()))
+        .collect();
     let mut values = Vec::new();
     // StructInst.synthDefaultFields selects every default before it assigns any
     // pending field. In particular an earlier default must not manufacture an
@@ -647,6 +678,32 @@ fn candidate_in_context(
                 &arguments,
             )?
             .value
+        } else if let Some(field) = structure.and_then(|structure| structure.fields.get(index)) {
+            // Source records publish the pin's named flat helpers rather than
+            // physical-prefix journal entries. Their actual projection can be
+            // private, and their lambda prefix contains only the field values
+            // selected by the checked default body. Instantiate that body using
+            // every pending field hole before assigning any of those holes.
+            let direct = Name::str(field.projection.clone(), "_default");
+            let inherited = Name::str(field.projection.clone(), "_inherited_default");
+            let helper = if context.txn.env.contains(&direct) {
+                Some(direct)
+            } else if context.txn.env.contains(&inherited) {
+                Some(inherited)
+            } else {
+                None
+            };
+            if let Some(helper) = helper {
+                let selected = context
+                    .instantiate_record_default(&helper, &value, &field_arguments)?
+                    .ok_or_else(|| unsupported(&family.base.name))?;
+                context
+                    .equations
+                    .push(SourceEquation::selection(selected.type_, type_.clone()));
+                selected.value
+            } else {
+                default_value(context, type_)?
+            }
         } else {
             default_value(context, type_)?
         };

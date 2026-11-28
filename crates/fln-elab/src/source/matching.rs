@@ -1317,7 +1317,10 @@ impl Context {
             let constructor_name = if head == &patterns::anonymous_head() {
                 // `⟨…⟩` names the family's only constructor (`elabAnonymousCtor`).
                 match constructors {
-                    [only] => Some(only.clone()),
+                    [only] => {
+                        self.require_private_member_access(only)?;
+                        Some(only.clone())
+                    }
                     [] => {
                         return Err(failure(SourceInferenceError::AnonymousCtor(
                             anonymous_ctor::AnonymousCtorError::NoConstructors,
@@ -1337,7 +1340,14 @@ impl Context {
                 let Syntax::Ident { val, .. } = &fields[1] else {
                     return Err(error(MatchError::InvalidPattern));
                 };
-                Some(name.append_core(val))
+                let written = self.source_scope.user_name(name).append_core(val);
+                let actual = constructors
+                    .iter()
+                    .find(|constructor| self.source_scope.user_name(constructor) == written)
+                    .cloned()
+                    .unwrap_or(written);
+                self.require_private_member_access(&actual)?;
+                Some(actual)
             } else if let Syntax::Ident { val, .. } = head {
                 let resolved = if name == &Name::from_components(["Bool"])
                     && matches!(val.to_display_string().as_str(), "true" | "false")

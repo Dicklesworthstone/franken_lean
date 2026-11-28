@@ -1755,7 +1755,16 @@ impl Model<'_> {
                 let expected = self.reduce_head(&expected)?;
                 let (family, _) = spine(&expected);
                 match const_name(family).filter(|name| self.inductive(name).is_some()) {
-                    Some(family) => family.clone().append_core(val),
+                    Some(family) => {
+                        let written = self.cx.source_scope.user_name(family).append_core(val);
+                        self.inductive(family)
+                            .and_then(|info| {
+                                info.ctors
+                                    .into_iter()
+                                    .find(|name| self.cx.source_scope.user_name(name) == written)
+                            })
+                            .unwrap_or(written)
+                    }
                     None => return Ok(Err(Stop::Unknown)),
                 }
             }
@@ -1824,6 +1833,7 @@ impl Model<'_> {
         // or turn a rigid named index into an inferred wildcard.
         let (base, parameters, definition, arguments) =
             if let Some(info) = self.constructor(constructor) {
+                self.cx.require_private_member_access(&info.base.name)?;
                 let arguments = patterns::arguments::normalize(self.cx, arguments, &info)?;
                 (info.base, info.num_params, false, arguments)
             } else if let Some(info) = self.cx.pattern_definition(constructor)? {

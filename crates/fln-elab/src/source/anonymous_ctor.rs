@@ -127,6 +127,7 @@ impl Context {
             [] => return Err(refuse(AnonymousCtorError::NoConstructors)),
             _ => return Err(refuse(AnonymousCtorError::ManyConstructors)),
         };
+        self.require_private_member_access(&ctor)?;
         let Some(ConstantInfo::Ctor(info)) = self.txn.env.find(&ctor).cloned() else {
             return Err(failure(SourceInferenceError::Scope));
         };

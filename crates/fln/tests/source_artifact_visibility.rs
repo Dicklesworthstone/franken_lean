@@ -203,8 +203,44 @@ fn legacy_and_explicit_all_imports_replay_bodies_without_creating_short_private_
             assert!(env.contains(&private("Producer", "privateValue")));
             assert!(!env.contains(&n("privateValue")));
         }
-        rejected(&format!("{header}\ndef leak : Token := privateValue\n"));
     }
+    rejected("prelude\nimport Producer\ndef leak : Token := privateValue\n");
+    rejected("module\nprelude\nimport Producer\ndef leak : Token := privateValue\n");
+    // The pin resolves the actual private declaration through a modern
+    // `import all`, while no public constant or exported alias is invented.
+    for (header, visibility, selected) in [
+        (
+            "module\nprelude\nimport all Producer",
+            "",
+            private("Main", "selected"),
+        ),
+        (
+            "module\nprelude\npublic import Producer\nimport all Producer",
+            "public ",
+            n("selected"),
+        ),
+    ] {
+        let source = format!("{header}\n{visibility}def selected : Token := privateValue\n");
+        for result in both(&source) {
+            let result = complete(result);
+            let env = result.checked.engine.environment();
+            let Some(ConstantInfo::Defn(definition)) = env.find(&selected) else {
+                panic!("missing selected private implementation");
+            };
+            assert!(
+                matches!(definition.value.node(), fln_core::expr::ExprNode::Const { name, .. }
+                if name == &private("Producer", "privateValue"))
+            );
+            assert!(!env.contains(&n("privateValue")));
+        }
+    }
+    let all = "module\nprelude\npublic import Producer\nimport all Producer\n";
+    rejected(&format!(
+        "{all}@[expose] public def leak : Token := privateValue\n"
+    ));
+    rejected(&format!(
+        "{all}public def leak (P : Token -> Type) (x : P privateValue) : Token := Token.left\n"
+    ));
 }
 
 #[test]
