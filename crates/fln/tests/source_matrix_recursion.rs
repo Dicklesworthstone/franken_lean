@@ -362,6 +362,39 @@ fn recursive_markers_cannot_escape_as_unapplied_or_nonroot_functions() {
 }
 
 #[test]
+fn course_recursion_preserves_authored_let_discriminants() {
+    // The pin accepts a genuine decreasing input underneath a source let.
+    // The let remains captured; it does not become the matched parameter.
+    check(
+        "def good (n : Nat) (b : Bool) : Nat :=
+          let saved := n
+          match n, b with
+          | .zero, _ => saved
+          | .succ k, _ => good k b + 1
+        theorem computed : good 4 true = 4 := by rfl",
+    );
+
+    // Matching the authored alias instead must not specialize the compiler's
+    // below dictionary for n, in either a single-column match or a matrix.
+    // Both programs are refused by the exact pin's termination checker.
+    reject(
+        "def bad (n : Nat) (b : Bool) : Nat :=
+          let saved := n
+          match saved with
+          | .zero => 0
+          | .succ k => bad k b",
+    );
+    reject(
+        "def bad (n : Nat) (b : Bool) : Nat :=
+          let first := n
+          let saved := first
+          match saved, b with
+          | .zero, _ => 0
+          | .succ k, _ => bad k b",
+    );
+}
+
+#[test]
 fn resource_stops_and_invalid_suffixes_do_not_publish_a_prefix() {
     use fln::Outcome;
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));

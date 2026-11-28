@@ -915,6 +915,10 @@ pub(super) struct Recursion {
 }
 
 impl Recursion {
+    pub(super) fn uses_course_of_values(&self) -> bool {
+        self.course_name.is_some()
+    }
+
     /// Only a selected primitive split may postpone work beyond its private
     /// self binder. Ordinary candidates must still expose self to select a
     /// recursive retry; course-of-values candidates have a different closure.

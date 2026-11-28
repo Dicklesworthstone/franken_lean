@@ -718,9 +718,28 @@ impl Context {
             // Matrix columns are checked single-evaluation lets. Follow
             // exact aliases, not arbitrary reduction, so abstraction also
             // refines later inputs whose types mention the original local.
+            let course = self
+                .recursion
+                .iter()
+                .chain(&self.enclosing_recursions)
+                .any(recursion::Recursion::uses_course_of_values);
             let mut visited = HashSet::new();
             while let Some(value) = &local.value {
                 self.tick()?;
+                // A source `let saved := n` is not the structural input `n`.
+                // Following it would generalize `below n` over `saved` and
+                // manufacture a recursive dictionary the pin cannot obtain.
+                // Only the matrix compiler's unspellable aliases may cross
+                // this boundary, as in `well_founded_match_input`.
+                if course
+                    && (!local.user_name.parent().is_anonymous()
+                        || !matches!(
+                            local.user_name.leaf_view(),
+                            fln_core::name::LeafView::Num(_)
+                        ))
+                {
+                    break;
+                }
                 let ExprNode::FVar { id } = value.node() else {
                     break;
                 };
